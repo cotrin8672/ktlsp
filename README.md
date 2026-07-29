@@ -171,6 +171,10 @@ dev/ktlsp-harness.sh basic
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
 `library`, `java`, `semantic`, `gradle-live`, or `comprehensive`.
 
+`gradle-live` also verifies classpath discovery against a disposable Gradle project that creates
+`compileClasspath` from a late `afterEvaluate` callback. The probe requires cold and warm
+configuration-cache runs to preserve unresolved-dependency output and reuse the cache entry.
+
 ## License
 
 MIT

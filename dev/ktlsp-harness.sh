@@ -15,7 +15,7 @@ scenarios:
   project        existing project health check; requires --root and --file; optionally probes implementation
   java-project   existing Java project goto/references probe; requires --root, --file, and --token
   emacs-project  existing project health/perf probe through batch Emacs + Eglot
-  gradle-live    dev/gradle-sample live probe
+  gradle-live    dev/gradle-sample live probe + classpath configuration-cache probe
   gradle-compile alias for gradle-live
   comprehensive  dev/gradle-sample broad library/project probe
 
@@ -238,6 +238,70 @@ KOTLIN
   printf '%s\n' "$project"
 }
 
+write_classpath_config_cache_project() {
+  local project="$projects/classpath-config-cache"
+  mkdir -p "$project/app" "$project/gradle/wrapper"
+  cp "$repo/dev/gradle-wrapper-template/gradlew" "$project/gradlew"
+  cp "$repo/dev/gradle-wrapper-template/gradlew.bat" "$project/gradlew.bat"
+  cp "$repo/dev/gradle-wrapper-template/gradle/wrapper/gradle-wrapper.jar" \
+    "$project/gradle/wrapper/gradle-wrapper.jar"
+  cp "$repo/dev/gradle-wrapper-template/gradle/wrapper/gradle-wrapper.properties" \
+    "$project/gradle/wrapper/gradle-wrapper.properties"
+  chmod +x "$project/gradlew"
+  cat > "$project/settings.gradle.kts" <<'KOTLIN'
+rootProject.name = "ktlsp-classpath-config-cache"
+include(":app")
+KOTLIN
+  cat > "$project/app/build.gradle.kts" <<'KOTLIN'
+repositories {
+    mavenCentral()
+}
+
+// The init script registers its observer before this callback. The classpath dump task must still
+// appear when a plugin creates compileClasspath this late in the project lifecycle.
+afterEvaluate {
+    pluginManager.apply("java")
+    dependencies.add("implementation", "com.example:ktlsp-harness-missing:0.0.0")
+}
+KOTLIN
+  printf '%s\n' "$project"
+}
+
+run_classpath_config_cache_probe() {
+  local project="$1"
+  local cold_out="$artifacts/classpath-config-cache-cold.out"
+  local warm_out="$artifacts/classpath-config-cache-warm.out"
+  local status=0
+
+  (
+    cd "$project"
+    ./gradlew -I "$repo/scripts/classpath-dump.init.gradle.kts" \
+      :app:ktlspDumpClasspath -q --console=plain --configuration-cache \
+      --configuration-cache-problems=fail --offline
+  ) >"$cold_out" 2>&1 || status=$?
+  cat "$cold_out"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  grep -q $'^PROJECT\t:app\t' "$cold_out" || return 1
+  grep -q $'^UNRESOLVED\tcom.example:ktlsp-harness-missing:0.0.0\t' "$cold_out" || return 1
+
+  (
+    cd "$project"
+    ./gradlew -I "$repo/scripts/classpath-dump.init.gradle.kts" \
+      :app:ktlspDumpClasspath --console=plain --configuration-cache \
+      --configuration-cache-problems=fail --offline --info
+  ) >"$warm_out" 2>&1 || status=$?
+  cat "$warm_out"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  grep -q '^Reusing configuration cache\.$' "$warm_out" || return 1
+  grep -q '^Configuration cache entry reused\.$' "$warm_out" || return 1
+  grep -q $'^UNRESOLVED\tcom.example:ktlsp-harness-missing:0.0.0\t' "$warm_out" || return 1
+  echo "PASS  classpath dump handles late configuration creation and reuses configuration cache"
+}
+
 write_java_project() {
   local project="$projects/java"
   mkdir -p "$project/app"
@@ -384,11 +448,19 @@ case "$scenario" in
     ;;
   gradle-live)
     project="${root_arg:-$repo/dev/gradle-sample}"
-    run_and_capture gradle-live nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
+    classpath_project="$(write_classpath_config_cache_project)"
+    run_classpath_config_cache_probe "$classpath_project" || run_status=$?
+    if [ "$run_status" -eq 0 ]; then
+      run_and_capture gradle-live nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
+    fi
     ;;
   gradle-compile)
     project="${root_arg:-$repo/dev/gradle-sample}"
-    run_and_capture gradle-compile nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
+    classpath_project="$(write_classpath_config_cache_project)"
+    run_classpath_config_cache_probe "$classpath_project" || run_status=$?
+    if [ "$run_status" -eq 0 ]; then
+      run_and_capture gradle-compile nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
+    fi
     ;;
   comprehensive)
     project="${root_arg:-$repo/dev/gradle-sample}"

@@ -599,9 +599,14 @@ END\t:lib\n";
     }
 
     #[test]
-    fn embedded_script_registers_the_task() {
+    fn embedded_script_registers_late_configurations_with_supported_resolution_provider() {
         assert!(INIT_SCRIPT.contains("ktlspDumpClasspath"));
         assert!(INIT_SCRIPT.contains("compileClasspath"));
+        assert!(INIT_SCRIPT.contains("configurations.matching"));
+        assert!(INIT_SCRIPT.contains("resolutionResult.rootComponent"));
+        assert!(INIT_SCRIPT.contains("UnresolvedDependencyResult"));
+        assert!(!INIT_SCRIPT.contains("afterEvaluate {"));
+        assert!(!INIT_SCRIPT.contains("resolvedConfiguration"));
     }
 
     #[test]
