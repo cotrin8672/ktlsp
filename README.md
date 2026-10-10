@@ -245,6 +245,11 @@ Set `KTLSP_UI_CASES` to an absolute UI manifest path to run the existing native 
 accepted-text probe after corpus requests; `compiler-plugins-ui.json` checks Kotlin's generated
 getter property. See [the fixture instructions](dev/corpus/README.md) for pins and remaining checks.
 
+`dev/processor_project.lua` creates a separate, compiler-verified KAPT/KSP fixture for the same
+`corpus` route. Its `processor-generated.json` manifest checks actual generated Java/Kotlin
+declarations, incomplete member completion and paired known/unknown receivers in both languages.
+Compile the fixture first; generated targets are hash-pinned and are never handwritten.
+
 `gradle-live` also verifies classpath discovery against a disposable Gradle project that creates
 `compileClasspath` from a late `afterEvaluate` callback. The probe requires cold and warm
 configuration-cache runs to preserve unresolved-dependency output and reuse the cache entry.

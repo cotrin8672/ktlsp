@@ -1,0 +1,476 @@
+{
+  "schema_version": 1,
+  "project_id": "kapt-ksp-generated-sources",
+  "build_tool": "gradle",
+  "scope": "Actual KAPT Java and KSP Java/Kotlin output at generationLabel=v1. Six golden completion/goto pairs, twelve partial/dot requests, six unknown receivers each paired with a useful generated receiver. Processor OFF and same-client generation changes require separate evidence.",
+  "probes": [
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspkotlin-golden",
+      "anchor": "KspKotlin().value()",
+      "token": "value",
+      "completion_token": "value",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "target_file": "app/build/generated/ksp/main/kotlin/generated/KspKotlin.kt",
+      "target_anchor": "fun value(): String",
+      "target_token": "value",
+      "target_sha256": "658008caa02935a007a6b045f6df805c4c1f58d21decac0bb78bac5f30871966"
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspkotlin-partial",
+      "anchor": "KspKotlin().versionO",
+      "token": "versionO",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KspKotlin().value()",
+          "replacement": "KspKotlin().versionO",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspkotlin-dangling-dot",
+      "anchor": "KspKotlin().",
+      "token": ".",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KspKotlin().value()",
+          "replacement": "KspKotlin().",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspkotlin-unknown",
+      "anchor": "MissingGeneratedType().",
+      "token": ".",
+      "completion_token": false,
+      "completion_excludes": [
+        "value",
+        "versionOne"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KspKotlin().value()",
+          "replacement": "MissingGeneratedType().",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ],
+      "known_control": {
+        "anchor": "KspJava().value()",
+        "token": "value",
+        "completion_token": "value"
+      }
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspjava-golden",
+      "anchor": "KspJava().value()",
+      "token": "value",
+      "completion_token": "value",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "target_file": "app/build/generated/ksp/main/java/generated/KspJava.java",
+      "target_anchor": "public String value()",
+      "target_token": "value",
+      "target_sha256": "7199846ebc3d805593f677715d7e73a97c0a1bb6adf7c3975fdf091fbf2485e6"
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspjava-partial",
+      "anchor": "KspJava().versionO",
+      "token": "versionO",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KspJava().value()",
+          "replacement": "KspJava().versionO",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspjava-dangling-dot",
+      "anchor": "KspJava().",
+      "token": ".",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KspJava().value()",
+          "replacement": "KspJava().",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kspjava-unknown",
+      "anchor": "MissingGeneratedType().",
+      "token": ".",
+      "completion_token": false,
+      "completion_excludes": [
+        "value",
+        "versionOne"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KspJava().value()",
+          "replacement": "MissingGeneratedType().",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ],
+      "known_control": {
+        "anchor": "KspKotlin().value()",
+        "token": "value",
+        "completion_token": "value"
+      }
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kaptjava-golden",
+      "anchor": "KaptJava().value()",
+      "token": "value",
+      "completion_token": "value",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "target_file": "app/build/generated/source/kapt/main/generated/KaptJava.java",
+      "target_anchor": "public String value()",
+      "target_token": "value",
+      "target_sha256": "fe946b028ecdfe58271c53562bac45e0b61f905ff1bdc74be62c437f81104142"
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kaptjava-partial",
+      "anchor": "KaptJava().versionO",
+      "token": "versionO",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KaptJava().value()",
+          "replacement": "KaptJava().versionO",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kaptjava-dangling-dot",
+      "anchor": "KaptJava().",
+      "token": ".",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KaptJava().value()",
+          "replacement": "KaptJava().",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/kotlin/fixture/KotlinUse.kt",
+      "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748",
+      "id": "kotlin-kaptjava-unknown",
+      "anchor": "MissingGeneratedType().",
+      "token": ".",
+      "completion_token": false,
+      "completion_excludes": [
+        "value",
+        "versionOne"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "KaptJava().value()",
+          "replacement": "MissingGeneratedType().",
+          "source_sha256": "0f847de8ea94c64e2f4e479b37b7da24412da2fcc9fcb75018483c9051fc8748"
+        }
+      ],
+      "known_control": {
+        "anchor": "KspKotlin().value()",
+        "token": "value",
+        "completion_token": "value"
+      }
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspkotlin-golden",
+      "anchor": "new KspKotlin().value()",
+      "token": "value",
+      "completion_token": "value",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "target_file": "app/build/generated/ksp/main/kotlin/generated/KspKotlin.kt",
+      "target_anchor": "fun value(): String",
+      "target_token": "value",
+      "target_sha256": "658008caa02935a007a6b045f6df805c4c1f58d21decac0bb78bac5f30871966"
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspkotlin-partial",
+      "anchor": "new KspKotlin().versionO",
+      "token": "versionO",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KspKotlin().value()",
+          "replacement": "new KspKotlin().versionO",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspkotlin-dangling-dot",
+      "anchor": "new KspKotlin().",
+      "token": ".",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KspKotlin().value()",
+          "replacement": "new KspKotlin().",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspkotlin-unknown",
+      "anchor": "new MissingGeneratedType().",
+      "token": ".",
+      "completion_token": false,
+      "completion_excludes": [
+        "value",
+        "versionOne"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KspKotlin().value()",
+          "replacement": "new MissingGeneratedType().",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ],
+      "known_control": {
+        "anchor": "new KspJava().value()",
+        "token": "value",
+        "completion_token": "value"
+      }
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspjava-golden",
+      "anchor": "new KspJava().value()",
+      "token": "value",
+      "completion_token": "value",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "target_file": "app/build/generated/ksp/main/java/generated/KspJava.java",
+      "target_anchor": "public String value()",
+      "target_token": "value",
+      "target_sha256": "7199846ebc3d805593f677715d7e73a97c0a1bb6adf7c3975fdf091fbf2485e6"
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspjava-partial",
+      "anchor": "new KspJava().versionO",
+      "token": "versionO",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KspJava().value()",
+          "replacement": "new KspJava().versionO",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspjava-dangling-dot",
+      "anchor": "new KspJava().",
+      "token": ".",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KspJava().value()",
+          "replacement": "new KspJava().",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kspjava-unknown",
+      "anchor": "new MissingGeneratedType().",
+      "token": ".",
+      "completion_token": false,
+      "completion_excludes": [
+        "value",
+        "versionOne"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KspJava().value()",
+          "replacement": "new MissingGeneratedType().",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ],
+      "known_control": {
+        "anchor": "new KspKotlin().value()",
+        "token": "value",
+        "completion_token": "value"
+      }
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kaptjava-golden",
+      "anchor": "new KaptJava().value()",
+      "token": "value",
+      "completion_token": "value",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "target_file": "app/build/generated/source/kapt/main/generated/KaptJava.java",
+      "target_anchor": "public String value()",
+      "target_token": "value",
+      "target_sha256": "fe946b028ecdfe58271c53562bac45e0b61f905ff1bdc74be62c437f81104142"
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kaptjava-partial",
+      "anchor": "new KaptJava().versionO",
+      "token": "versionO",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KaptJava().value()",
+          "replacement": "new KaptJava().versionO",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kaptjava-dangling-dot",
+      "anchor": "new KaptJava().",
+      "token": ".",
+      "completion_token": "versionOne",
+      "completion_excludes": [
+        "versionTwo"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KaptJava().value()",
+          "replacement": "new KaptJava().",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ]
+    },
+    {
+      "source": "app/src/main/java/fixture/JavaUse.java",
+      "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc",
+      "id": "java-kaptjava-unknown",
+      "anchor": "new MissingGeneratedType().",
+      "token": ".",
+      "completion_token": false,
+      "completion_excludes": [
+        "value",
+        "versionOne"
+      ],
+      "definition": false,
+      "buffer_edits": [
+        {
+          "anchor": "new KaptJava().value()",
+          "replacement": "new MissingGeneratedType().",
+          "source_sha256": "925b3c74ac99f31b61202674beea712c0ce033d6047f363c22298ddb4d73b2fc"
+        }
+      ],
+      "known_control": {
+        "anchor": "new KspKotlin().value()",
+        "token": "value",
+        "completion_token": "value"
+      }
+    }
+  ]
+}

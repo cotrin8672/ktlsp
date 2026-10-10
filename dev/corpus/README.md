@@ -150,3 +150,38 @@ Use the same isolated temporary IntelliJ setup as the other corpus scenarios.
 The current ktlsp baseline fails all twelve generated-method completion checks.
 These fixtures expose that gap; they do not establish plugin configuration
 refresh, generated-symbol navigation, diagnostics, KAPT or KSP acceptance.
+
+## Actual KAPT and KSP generated sources
+
+`dev/processor_project.lua` creates three Gradle projects: a Java annotation
+processor, a Kotlin KSP processor and their mixed Java/Kotlin consumer. The
+processors use the actual Filer and KSP CodeGenerator APIs. It pins Gradle 7.4.2,
+Kotlin JVM/KAPT 1.8.21, KSP 1.8.21-1.0.11 and JDK 17. No generated member is
+written into the fixture's authored input sources.
+
+```powershell
+$processorRoot = 'C:/path/to/new/disposable/processor-project'
+$env:JAVA_HOME = 'C:/path/to/jdk-17'
+rtk proxy nvim --headless -l dev/processor_project.lua $processorRoot
+rtk proxy "$processorRoot/gradlew.bat" --project-dir $processorRoot :app:classes --no-daemon --console=plain
+rtk proxy "$env:JAVA_HOME/bin/java.exe" --class-path "$processorRoot/app/build/classes/kotlin/main;$processorRoot/app/build/classes/java/main" "$processorRoot/oracle/RuntimeCheck.java" v1
+$env:KTLSP_CORPUS_WAIT_INDEX = '1'
+rtk proxy C:/path/to/git/bin/bash.exe dev/ktlsp-harness.sh corpus --root $processorRoot --file dev/corpus/processor-generated.json --bin <immutable-release>/ktlsp.exe --no-build
+```
+
+Use `--offline` on Gradle commands after the wrapper, plugins and dependencies
+are cached. The runtime control checks six Java/Kotlin calls and the presence
+and absence of versioned members on all three generated types, reporting twelve
+assertions. `processor-generated.json` requires the default `generationLabel=v1`
+output. Its 24 cases make 30 completion requests and six exact declaration
+requests: six compiled golden uses, twelve partial/dangling-dot edits and six
+unknown receivers, each paired with a useful generated receiver. All edits stay
+in buffers and use the existing first-response/delivery checks.
+
+Building with `-PgenerationLabel=v2` replaces `versionOne` with `versionTwo` in
+all three generated APIs; the runtime control then takes `v2`. Building
+`:app:clean :app:classes -PprocessingDisabled` must fail because all three APIs
+are missing. Rebuild the default v1 output before using the pinned manifest.
+These compiler/runtime transitions independently establish the expected API.
+The corpus probe alone does not establish same-client build-event refresh,
+processor-off diagnostics, or extension-provided generated symbols.
