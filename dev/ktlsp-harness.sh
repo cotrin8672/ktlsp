@@ -51,6 +51,7 @@ mixed/corpus environment:
 
 gradle-live environment:
   KTLSP_GRADLE_RELOAD=1    disposable offline dependency/generated-source reload probe
+  KTLSP_PROCESSOR_RELOAD=1 real KAPT/KSP option changes on one client (JDK 17)
   GRADLE_USER_HOME        existing Gradle wrapper/plugin cache for that probe
 USAGE
 }
@@ -697,7 +698,15 @@ case "$scenario" in
     fi
     ;;
   gradle-live|gradle-compile)
-    if [ "${KTLSP_GRADLE_RELOAD:-0}" = "1" ]; then
+    if [ "${KTLSP_PROCESSOR_RELOAD:-0}" = "1" ]; then
+      if [ -n "$root_arg" ]; then
+        echo "Processor reload probe requires a new disposable project; omit --root" >&2
+        run_status=2
+      else
+        run_and_capture "$scenario" nvim -l "$repo/dev/nvim_processor_reload.lua" \
+          "$projects/processor-reload" "$bin_arg" "$artifacts" || run_status=$?
+      fi
+    elif [ "${KTLSP_GRADLE_RELOAD:-0}" = "1" ]; then
       if [ -n "$root_arg" ]; then
         echo "Gradle reload probe requires its generated disposable project; omit --root" >&2
         run_status=2

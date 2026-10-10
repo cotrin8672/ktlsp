@@ -264,7 +264,15 @@ The same editor connection checks useful completion, exact definitions, diagnost
 unsaved Kotlin changes. Removal requires a previously useful result. The fixture remaps `:app`
 to `modules/editing`; it requires its generated project, so omit `--root`. Results and build logs
 are recorded in `artifacts/gradle-reload.json` and `artifacts/gradle-phase*-compile.out`.
-This probes ordinary generation; KAPT, KSP and Lombok need their own compiler-plugin cases.
+Set `KTLSP_GRADLE_RELOAD_AUTOWATCH=1` to require Neovim's native watched-file notifications;
+the default is an explicit standard-notification control.
+
+`KTLSP_PROCESSOR_RELOAD=1 dev/ktlsp-harness.sh gradle-live` creates the real KAPT/KSP fixture
+and keeps one client through v1, v2, disabled processing and restored v1. Use JDK 17 and a populated
+Gradle 7.4.2/Kotlin 1.8.21/KSP cache, and omit `--root`. Actual builds and runtime controls accompany
+native watch delivery, completion, exact generated-source targets, obsolete-API diagnostics and
+preserved unsaved Java/Kotlin buffers. Results are in `artifacts/processor-reload.json`.
+Transformed APIs such as Lombok remain covered by their separate compiler-plugin cases.
 
 ## License
 
