@@ -157,6 +157,23 @@ a semantic-equivalence score.
 See [BENCHMARK.md](BENCHMARK.md) for exact revisions, host details, cold/warm cache rules, feature
 results, memory methodology, reproduction steps, and limitations.
 
+The current `dev/bench_initialize.py` starts initialization/indexing timing immediately before
+process creation and reports `spawn_ms` separately. Compare old and new binaries with this same
+script; its time origin differs from earlier runs that began after process creation. Missing
+readiness or an unsuccessful shutdown produces `success: false` and a nonzero exit status. The
+client waits for the shutdown response before sending `exit`, and reaps a timed-out process.
+`success` describes protocol readiness and process lifecycle; scenario assertions establish
+semantic correctness and dependency coverage separately.
+
+On Windows, `memory` records resident working-set samples every 100 ms for one second after
+readiness (`--steady-memory-seconds`), their median as `steady_working_set_bytes`, and the OS
+`peak_working_set_bytes` through the final pre-shutdown sample. These are server-process values;
+the sampling window does not establish long-term stability. Incomplete readiness has no steady
+value, and other platforms report measurement unavailability. The distinction follows the
+[Windows process memory counters](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters).
+Run `python3 -B -W error::ResourceWarning dev/test_bench_initialize.py` for focused shutdown,
+readiness and native memory checks, including a real protocol peer process.
+
 ## Development
 
 The workspace contains the shared semantic engine (`ktcore`), language server (`ktlsp`), and

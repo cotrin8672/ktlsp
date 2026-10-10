@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import statistics
 import subprocess
 import sys
 import threading
@@ -75,6 +76,98 @@ def wait_for_message(
     return None, None
 
 
+def stop_process(proc, messages, stash, timeout_s: float = 3.0) -> Dict[str, Any]:
+    status = {"shutdown_response_received": False, "shutdown_ok": False,
+              "exit_sent": False, "forced_termination": False}
+    try:
+        send_message(proc, {"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": None})
+        _, response = wait_for_message(messages, lambda msg: msg.get("id") == 99, timeout_s, stash)
+        status["shutdown_response_received"] = response is not None
+        status["shutdown_ok"] = bool(response is not None and "result" in response
+                                     and response["result"] is None and "error" not in response)
+        if response is None:
+            status["error"] = "shutdown response timeout"
+        else:
+            if "error" in response:
+                status["error"] = response["error"]
+            send_message(proc, {"jsonrpc": "2.0", "method": "exit", "params": None})
+            status["exit_sent"] = True
+            proc.wait(timeout=timeout_s)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        status["error"] = str(exc)
+    finally:
+        if proc.poll() is None:
+            status["forced_termination"] = True
+            proc.kill()
+        proc.wait()  # Reap after both graceful exit and forced termination.
+    status["exit_code"] = proc.returncode
+    status["graceful"] = (status["shutdown_ok"] and status["exit_sent"]
+                          and not status["forced_termination"] and proc.returncode == 0)
+    return status
+
+
+def process_memory(pid: int) -> Dict[str, Any]:
+    if os.name != "nt":
+        return {"available": False, "reason": "working-set measurement is implemented for Windows only"}
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                "PagefileUsage", "PeakPagefileUsage")]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    memory = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+    memory.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+    memory.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return {"available": False, "reason": str(ctypes.WinError(ctypes.get_last_error()))}
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not memory(handle, ctypes.byref(counters), counters.cb):
+            return {"available": False, "reason": str(ctypes.WinError(ctypes.get_last_error()))}
+        return {"available": True, "working_set_bytes": counters.WorkingSetSize,
+                "peak_working_set_bytes": counters.PeakWorkingSetSize}
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def sample_memory(pid: int, ready: bool, window_s: float) -> Dict[str, Any]:
+    sample = process_memory(pid)
+    if not sample["available"]:
+        return sample
+    start = time.monotonic()
+    samples = [sample["working_set_bytes"]]
+    peak = sample["peak_working_set_bytes"]
+    deadline = start + (window_s if ready else 0)
+    while time.monotonic() < deadline:
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        sample = process_memory(pid)
+        if not sample["available"]:
+            break
+        samples.append(sample["working_set_bytes"])
+        peak = max(peak, sample["peak_working_set_bytes"])
+    result = {"available": True, "source": "GetProcessMemoryInfo",
+              "phase": "post-readiness" if ready else "incomplete-readiness",
+              "sample_window_ms": round((time.monotonic() - start) * 1000, 1),
+              "working_set_samples_bytes": samples,
+              "steady_working_set_bytes": int(statistics.median(samples)) if ready else None,
+              "peak_working_set_bytes": peak,
+              "peak_scope": "process lifetime through final pre-shutdown sample"}
+    if not sample["available"]:
+        result["sampling_error"] = sample["reason"]
+    return result
+
+
 def benchmark(
     binary: Path,
     root: Path,
@@ -84,7 +177,10 @@ def benchmark(
     request_document_diagnostic: bool,
     request_workspace_diagnostic: bool,
     diagnostics_scope: str,
+    memory_window_s: float = 1.0,
 ) -> Dict[str, Any]:
+    probe_text = probe_file.read_text(encoding="utf-8") if probe_file is not None else None
+    start = time.monotonic()
     proc = subprocess.Popen(
         [str(binary)],
         cwd=str(root),
@@ -92,6 +188,7 @@ def benchmark(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    spawn_ms = round((time.monotonic() - start) * 1000, 1)
     assert proc.stdout is not None
     assert proc.stderr is not None
     messages: "queue.Queue[Tuple[float, Dict[str, Any]]]" = queue.Queue()
@@ -106,7 +203,6 @@ def benchmark(
     stderr_thread = threading.Thread(target=read_stderr, daemon=True)
     stderr_thread.start()
 
-    start = time.monotonic()
     init_id = 1
     send_message(
         proc,
@@ -136,9 +232,24 @@ def benchmark(
         timeout_s,
         stash,
     )
-    if init_msg is None:
-        proc.kill()
-        raise RuntimeError("initialize response timeout")
+    if init_msg is None or "error" in init_msg or not isinstance(init_msg.get("result"), dict):
+        memory = sample_memory(proc.pid, False, memory_window_s)
+        shutdown = stop_process(proc, messages, stash)
+        reader.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+        return {"binary": str(binary), "root": str(root), "spawn_ms": spawn_ms,
+                "time_origin": "immediately before process spawn",
+                "initialize_ms": round((init_ts - start) * 1000, 1) if init_ts else None,
+                "initialize_response": init_msg,
+                "response_events": [{"t_ms": round((ts - start) * 1000, 1), "response": message}
+                                    for ts, message in stash if message.get("id") in (init_id, 99)],
+                "error": "initialize response timeout" if init_msg is None else "initialize failed",
+                "readiness_complete": False, "missing_readiness": ["initialize"],
+                "success": False, "shutdown": shutdown, "memory": memory,
+                "stderr_tail": stderr_lines[-20:]}
 
     send_message(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
@@ -153,7 +264,6 @@ def benchmark(
     workspace_diagnostic_response_ts = None
     workspace_diagnostic_response = None
     if probe_file is not None:
-        text = probe_file.read_text()
         send_message(
             proc,
             {
@@ -162,9 +272,9 @@ def benchmark(
                 "params": {
                     "textDocument": {
                         "uri": uri_for(probe_file),
-                        "languageId": "kotlin",
+                        "languageId": "java" if probe_file.suffix == ".java" else "kotlin",
                         "version": 1,
-                        "text": text,
+                        "text": probe_text,
                     }
                 },
             },
@@ -258,19 +368,42 @@ def benchmark(
         ):
             break
 
-    try:
-        send_message(proc, {"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": None})
-        send_message(proc, {"jsonrpc": "2.0", "method": "exit", "params": None})
-    except BrokenPipeError:
-        pass
-    try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    readiness = {"project_index": project_index_ts is not None}
+    if wait_for_libraries:
+        readiness["library_index"] = library_index_ts is not None
+    responses = {}
+    if probe_file is not None:
+        responses["semantic_tokens"] = semantic_response
+    if request_document_diagnostic:
+        responses["document_diagnostic"] = document_diagnostic_response
+    if request_workspace_diagnostic:
+        responses["workspace_diagnostic"] = workspace_diagnostic_response
+    response_errors = {}
+    for name, response in responses.items():
+        readiness[name] = response is not None and response.get("result") is not None and "error" not in response
+        if response is not None and "error" in response:
+            response_errors[name] = response["error"]
+    missing = [name for name, complete in readiness.items() if not complete]
+    memory = sample_memory(proc.pid, not missing, memory_window_s)
+    shutdown = stop_process(proc, messages, stash)
+    reader.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
 
     result: Dict[str, Any] = {
         "binary": str(binary),
         "root": str(root),
+        "time_origin": "immediately before process spawn",
+        "spawn_ms": spawn_ms,
+        "readiness": readiness,
+        "readiness_complete": not missing,
+        "missing_readiness": missing,
+        "response_errors": response_errors,
+        "shutdown": shutdown,
+        "memory": memory,
+        "success": not missing and shutdown["graceful"],
         "initialize_ms": round((init_ts - start) * 1000, 1) if init_ts is not None else None,
         "project_index_ms": round((project_index_ts - start) * 1000, 1) if project_index_ts else None,
         "library_index_ms": round((library_index_ts - start) * 1000, 1) if library_index_ts else None,
@@ -305,7 +438,7 @@ def benchmark(
             else None
         )
         if semantic_response is not None:
-            data = semantic_response.get("result", {}).get("data")
+            data = (semantic_response.get("result") or {}).get("data")
             result["semantic_tokens_count"] = len(data) // 5 if isinstance(data, list) else None
             result["semantic_ok"] = "result" in semantic_response and "error" not in semantic_response
     if request_document_diagnostic:
@@ -316,13 +449,13 @@ def benchmark(
         )
         if document_diagnostic_response is not None:
             items = (
-                document_diagnostic_response.get("result", {})
+                (document_diagnostic_response.get("result") or {})
                 .get("fullDocumentDiagnosticReport", {})
                 .get("items")
             )
             if items is None:
                 items = (
-                    document_diagnostic_response.get("result", {})
+                    (document_diagnostic_response.get("result") or {})
                     .get("Full", {})
                     .get("fullDocumentDiagnosticReport", {})
                     .get("items")
@@ -340,7 +473,7 @@ def benchmark(
             else None
         )
         if workspace_diagnostic_response is not None:
-            items = workspace_diagnostic_response.get("result", {}).get("items")
+            items = (workspace_diagnostic_response.get("result") or {}).get("items")
             result["workspace_diagnostic_ok"] = (
                 "result" in workspace_diagnostic_response and "error" not in workspace_diagnostic_response
             )
@@ -356,6 +489,8 @@ def main() -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--probe-file", type=Path)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--steady-memory-seconds", type=float, default=1.0,
+                        help="Windows working-set sampling window after readiness (default: 1 second)")
     parser.add_argument(
         "--project-only",
         action="store_true",
@@ -369,6 +504,8 @@ def main() -> int:
         default="openFilesOnly",
     )
     args = parser.parse_args()
+    if args.timeout <= 0 or args.steady_memory_seconds < 0:
+        parser.error("--timeout must be positive and --steady-memory-seconds nonnegative")
 
     result = benchmark(
         args.binary,
@@ -379,10 +516,11 @@ def main() -> int:
         args.document_diagnostic,
         args.workspace_diagnostic,
         args.diagnostics_scope,
+        args.steady_memory_seconds,
     )
     json.dump(result, sys.stdout, indent=2)
     sys.stdout.write("\n")
-    return 0
+    return 0 if result["success"] else 1
 
 
 if __name__ == "__main__":
