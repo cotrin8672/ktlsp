@@ -325,7 +325,7 @@ run_classpath_config_cache_probe() {
 
 write_java_project() {
   local project="$projects/java"
-  mkdir -p "$project/app"
+  mkdir -p "$project/app" "$project/support"
   cat > "$project/app/Helper.java" <<'JAVA'
 package app;
 
@@ -387,6 +387,58 @@ public class Main {
     public void runAgain() { }
 }
 JAVA
+  cat > "$project/support/ImportedBase.java" <<'JAVA'
+package support;
+
+public class ImportedBase {
+    public void baseOnly() { }
+    public void accept(String value) { }
+}
+JAVA
+  cat > "$project/app/ImportedBase.java" <<'JAVA'
+package app;
+
+public class ImportedBase {
+    public void baseWrong() { }
+    public void accept(int value) { }
+}
+JAVA
+  cat > "$project/app/ImportedChild.java" <<'JAVA'
+package app;
+
+import support.ImportedBase;
+
+public class ImportedChild extends ImportedBase { }
+JAVA
+  cat > "$project/app/KotlinImportedChild.kt" <<'KOTLIN'
+package app
+
+import support.ImportedBase
+
+class KotlinImportedChild : ImportedBase()
+KOTLIN
+  cat > "$project/app/SuperUse.java" <<'JAVA'
+package app;
+
+public class SuperUse {
+    public void run(ImportedChild child, KotlinImportedChild kotlin) {
+        child.baseOnly();
+        child.accept("ok");
+        kotlin.baseOnly();
+        kotlin.accept("ok");
+    }
+}
+JAVA
+  cat > "$project/app/SuperUse.kt" <<'KOTLIN'
+package app
+
+fun useSuperclasses(child: ImportedChild, kotlin: KotlinImportedChild) {
+    child.baseOnly()
+    child.accept("ok")
+    kotlin.baseOnly()
+    kotlin.accept("ok")
+}
+KOTLIN
   printf '%s\n' "$project"
 }
 

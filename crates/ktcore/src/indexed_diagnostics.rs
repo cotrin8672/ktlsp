@@ -4,6 +4,7 @@
 //! index, so every diagnostic here is gated by explicit completeness facts.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use tree_sitter::{Node, Tree};
 
@@ -385,22 +386,15 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
 }
 
 fn member_call_entries(index: &Index, recv_ty: &Type, name: &str, vis: &Visibility) -> Vec<Entry> {
-    let Some(root) = recv_ty.name() else {
-        return Vec::new();
-    };
-    let root_pkg = recv_ty.package().map(str::to_string);
-    let root_key = receiver_root_key(index, recv_ty).unwrap_or_else(|| root.to_string());
-    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> = vec![(root_key, root_pkg, 0)];
     let mut members: Vec<Entry> = Vec::new();
     let mut extensions: Vec<Entry> = Vec::new();
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
-            continue;
-        }
+    let _ = infer::walk_supertypes(index, recv_ty, 32, |current| {
+        let Some(cur) = infer::receiver_root_key(index, current) else {
+            return ControlFlow::Continue(());
+        };
         for e in index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = current.package() {
+                if e.sym.package != p {
                     continue;
                 }
             }
@@ -421,45 +415,12 @@ fn member_call_entries(index: &Index, recv_ty: &Type, name: &str, vis: &Visibili
                 extensions.push(e.clone());
             }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            let sup_pkg = match &cur_pkg {
-                Some(p)
-                    if index
-                        .lookup_by_name(&sup)
-                        .iter()
-                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
-                {
-                    Some(p.clone())
-                }
-                _ => None,
-            };
-            frontier.push((sup, sup_pkg, depth + 1));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     if !members.is_empty() {
         members
     } else {
         extensions
-    }
-}
-
-fn receiver_root_key(index: &Index, recv_ty: &Type) -> Option<String> {
-    let root = recv_ty.name()?;
-    if let Some(container) = recv_ty.container() {
-        return Some(format!("{container}.{root}"));
-    }
-    let pkg = recv_ty.package()?;
-    let matches = index
-        .lookup_type(root)
-        .into_iter()
-        .filter(|entry| entry.sym.package == pkg)
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [only] => Some(match only.sym.container.as_deref() {
-            Some(container) => format!("{container}.{root}"),
-            None => root.to_string(),
-        }),
-        _ => Some(root.to_string()),
     }
 }
 

@@ -190,6 +190,8 @@ Editor-facing changes should also run the smallest relevant harness scenario: `f
 
 `java` covers incomplete member completion, inherited members, Java receivers of Kotlin types,
 and an unsaved Kotlin declaration edit observed from an unsaved Java buffer on the same client.
+It checks imported superclass identity despite same-name types, exact inherited-member definitions,
+valid and invalid call diagnostics, and first responses after unsaved superclass import changes.
 The harness also runs with native Windows Neovim through Git Bash and selects `.exe` binaries.
 
 `library` checks stdlib/JDK definitions and opened dependency sources. Unsaved method renames and
@@ -216,6 +218,11 @@ probes on a real project. The manifest supplies relative source files, unique an
 and expected declaration files/anchors. `KTLSP_PROBE_SERVER=intellij` uses the same official
 plugin configuration as `mixed`, with successful Gradle import required. Source hashes, working-tree
 status, first/last responses and bounded indexing retries are recorded; retries are not timing samples.
+Set `KTLSP_CORPUS_WAIT_INDEX=1` to require both project and dependency indexing notifications and
+check the first response without retries. Missing dependency sources remain a failed coverage check;
+the selected semantic probes still run after completed indexing and explicitly record incomplete inputs.
+Definition requests use the identifier start; completion requests use its end, or the manifest's
+`completion_prefix`, so an unfiltered first page does not obscure the requested member.
 See [the corpus record](docs/fork-corpus.md) for pinned projects, candidate probes and remaining coverage.
 
 `gradle-live` also verifies classpath discovery against a disposable Gradle project that creates

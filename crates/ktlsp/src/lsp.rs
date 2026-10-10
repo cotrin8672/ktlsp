@@ -614,6 +614,7 @@ fn index_dependencies(
             stats.skipped += 1;
         }
         if result.missing_source {
+            tracing::warn!(coordinate = %result.label, "dependency source unavailable");
             stats.missing_sources += 1;
         }
         if result

@@ -1,6 +1,25 @@
 -- Shared editor boundary for the mixed fixture and real-project corpus scenarios.
 local M = {}
 
+function M.sanitize_environment()
+  local removed = {}
+  local suffixes = { 'TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'PASSWD', 'ACCESS_KEY', 'PRIVATE_KEY' }
+  for name in pairs(vim.fn.environ()) do
+    local upper = name:upper()
+    for _, suffix in ipairs(suffixes) do
+      if upper == suffix or upper:sub(-#suffix - 1) == '_' .. suffix then
+        -- Clear this disposable editor process too: removing a cmd_env override
+        -- alone would still let its child inherit the original credential.
+        vim.env[name] = nil
+        removed[#removed + 1] = name
+        break
+      end
+    end
+  end
+  table.sort(removed)
+  return removed
+end
+
 function M.path_key(path)
   path = vim.fs.normalize(vim.uv.fs_realpath(path) or path)
   return vim.fn.has('win32') == 1 and path:lower() or path
@@ -48,6 +67,7 @@ function M.outside_project(project, artifacts)
 end
 
 function M.config(project, bin, artifacts, build_tool)
+  M.removed_environment = M.sanitize_environment()
   local mode = vim.env.KTLSP_PROBE_SERVER or vim.env.KTLSP_MIXED_SERVER or 'ktlsp'
   assert(mode == 'ktlsp' or mode == 'intellij', 'probe server must be ktlsp or intellij')
   if mode == 'ktlsp' then

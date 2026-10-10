@@ -8,6 +8,7 @@ local artifacts = vim.fs.normalize((assert(arg[4], 'missing artifact directory')
 probe.outside_project(project, artifacts)
 local manifest = vim.json.decode(table.concat(vim.fn.readfile(manifest_path), '\n'))
 assert(type(manifest.probes) == 'table' and #manifest.probes > 0, 'manifest needs at least one probe')
+local wait_index = vim.env.KTLSP_CORPUS_WAIT_INDEX == '1'
 vim.fn.mkdir(artifacts, 'p')
 vim.opt.hidden = true
 vim.cmd('filetype plugin indent on')
@@ -38,12 +39,21 @@ for _, case in ipairs(manifest.probes) do
     sources[path] = { buf = buf, disk = disk, sha256 = vim.fn.sha256(table.concat(disk, '\n')) }
   end
   local source = sources[path]
+  assert(not case.source_sha256 or case.source_sha256 == source.sha256, 'source changed since oracle: ' .. case.id)
   local position = probe.find(source.disk, assert(case.anchor), assert(case.token))
+  local completion_prefix = case.completion_prefix or case.token
+  assert(case.token:sub(1, #completion_prefix) == completion_prefix, 'completion prefix must match token: ' .. case.id)
+  local completion_position = { line = position.line,
+    character = position.character + vim.str_utfindex(completion_prefix, 'utf-16') }
   local target = full_path(assert(case.target_file or case.target, 'probe needs target'))
-  local _, expected_range = probe.find(vim.fn.readfile(target), assert(case.target_anchor),
+  local target_lines = vim.fn.readfile(target)
+  assert(not case.target_sha256 or case.target_sha256 == vim.fn.sha256(table.concat(target_lines, '\n')),
+    'target changed since oracle: ' .. case.id)
+  local _, expected_range = probe.find(target_lines, assert(case.target_anchor),
     case.target_token or case.token)
   local expected = probe.location_key(vim.uri_from_fname(target), expected_range)
   prepared[#prepared + 1] = { case = case, buf = source.buf, position = position,
+    completion_position = completion_position,
     expected = expected, range = expected_range, target = target }
 end
 
@@ -57,6 +67,24 @@ local function git_snapshot()
 end
 local before_git = git_snapshot()
 local config, mode = probe.config(project, vim.env.KTLSP_BIN or arg[3], artifacts, manifest.build_tool or 'gradle')
+local index_state = { project = false, libraries = false, messages = {} }
+local semantic_phase = 'not-measured'
+if mode == 'ktlsp' then
+  local handler = vim.lsp.handlers['window/logMessage']
+  config.handlers = { ['window/logMessage'] = function(err, params, ctx, handler_config)
+    local message = params and params.message or ''
+    local project_files = message:match('^ktlsp indexed (%d+) project files')
+    local library_files = message:match('^ktlsp indexed (%d+) library files')
+    if project_files or library_files then index_state.messages[#index_state.messages + 1] = message end
+    if project_files then index_state.project, index_state.project_files = true, tonumber(project_files) end
+    if library_files then
+      index_state.libraries, index_state.library_files = true, tonumber(library_files)
+      local failed, missing = message:match('(%d+) failed, (%d+) missing sources')
+      index_state.failed, index_state.missing_sources = tonumber(failed), tonumber(missing)
+    end
+    if handler then return handler(err, params, ctx, handler_config) end
+  end }
+end
 vim.api.nvim_set_current_buf(prepared[1].buf)
 local id = vim.lsp.start(config, { bufnr = prepared[1].buf })
 local client, import_state
@@ -80,9 +108,12 @@ local function finish()
     manifest_path = manifest_path, checks = checks, failures = failures, source_sha256 = hashes,
     server = client and client.server_info, binary = vim.env.KTLSP_BIN or arg[3],
     plugin = vim.env.IJLS_PLUGIN, server_executable = vim.env.IJLS_SERVER,
+    removed_environment_names = probe.removed_environment,
     jdk = vim.env.IJLS_JDK or vim.env.JAVA_HOME, gradle_user_home = vim.env.GRADLE_USER_HOME,
     import_state = import_state, git_before = before_git, git_after = after_git, neovim = vim.version(),
-    performance = 'bounded indexing retries; not timing or freshness acceptance' })
+    index_state = index_state, wait_index = wait_index, semantic_phase = semantic_phase,
+    query_positions = 'definition at identifier start; completion after completion_prefix or full identifier',
+    performance = 'separate startup observation and post-index first response; not timing acceptance' })
   print(#failures == 0 and '\nALL CORPUS CHECKS PASSED' or ('\nFAILED: ' .. table.concat(failures, ', ')))
   vim.cmd(#failures == 0 and 'qa!' or 'cq!')
 end
@@ -99,10 +130,26 @@ if mode == 'intellij' then
   imported, import_state = probe.import_ready(client, manifest.build_tool or 'gradle',
     tonumber(vim.env.KTLSP_CORPUS_READY_TIMEOUT_MS) or 600000, check)
   if not imported then finish() end
+elseif wait_index then
+  -- Same readiness meaning as dev/bench_initialize.py: both log messages must arrive.
+  local ready = vim.wait(tonumber(vim.env.KTLSP_CORPUS_READY_TIMEOUT_MS) or 600000,
+    function() return index_state.project and index_state.libraries end, 100)
+  check('ktlsp project and dependency indexing finishes', ready, vim.inspect(index_state))
+  local inputs = ready and index_state.failed == 0 and index_state.missing_sources == 0
+  check('ktlsp dependency source inputs are complete', inputs, vim.inspect(index_state))
+  -- Coverage remains a failed acceptance check, while completed indexing still permits
+  -- useful, explicitly limited semantic observations of the selected probes.
+  if not ready then finish() end
+end
+local strict_first = wait_index or mode == 'intellij'
+semantic_phase = strict_first and 'first-response-after-indexing' or 'startup-with-bounded-retries'
+if wait_index and mode == 'ktlsp' and (index_state.failed ~= 0 or index_state.missing_sources ~= 0) then
+  semantic_phase = 'first-response-after-indexing-with-incomplete-inputs'
 end
 
 local function request(prep, method, accepts)
-  local params = { textDocument = { uri = vim.uri_from_bufnr(prep.buf) }, position = prep.position }
+  local position = method == 'textDocument/completion' and prep.completion_position or prep.position
+  local params = { textDocument = { uri = vim.uri_from_bufnr(prep.buf) }, position = position }
   if method == 'textDocument/completion' then params.context = { triggerKind = 1 } end
   local deadline = vim.uv.hrtime() + (tonumber(vim.env.KTLSP_CORPUS_REQUEST_TIMEOUT_MS) or 15000) * 1000000
   local attempts, result, error, matched, first = 0, nil, nil, false, nil
@@ -112,10 +159,11 @@ local function request(prep, method, accepts)
     result, error = response and response.result, response and response.err or err
     matched = result ~= nil and accepts(result)
     if not first then first = { result = result, error = error, matched = matched } end
-    if not matched then vim.wait(200) end
-  until matched or vim.uv.hrtime() >= deadline
+    if not matched and not strict_first then vim.wait(200) end
+  until matched or strict_first or vim.uv.hrtime() >= deadline
   vim.fn.writefile({ vim.json.encode({ case = prep.case.id, method = method, params = params,
-    attempts = attempts, matched = matched, result = result, error = error, first = first }) },
+    attempts = attempts, matched = matched, result = result, error = error, first = first,
+    phase = semantic_phase }) },
     artifacts .. '/corpus-requests.jsonl', 'a')
   print(('REQUEST %s %s attempts=%d first_matched=%s matched=%s'):format(
     prep.case.id, method, attempts, tostring(first.matched), tostring(matched)))

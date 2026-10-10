@@ -1549,22 +1549,15 @@ fn member_call_entries<'a>(
     name: &str,
     ctx: &FileCtx,
 ) -> Vec<&'a Entry> {
-    let Some(root) = recv_ty.name() else {
-        return Vec::new();
-    };
-    let root_pkg = recv_ty.package().map(str::to_string);
-    let root_key = receiver_root_key(index, recv_ty).unwrap_or_else(|| root.to_string());
-    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> = vec![(root_key, root_pkg, 0)];
     let mut members: Vec<&Entry> = Vec::new();
     let mut extensions: Vec<&Entry> = Vec::new();
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > SUPERTYPE_CAP {
-            continue;
-        }
+    let _ = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
+        let Some(cur) = receiver_root_key(index, current) else {
+            return ControlFlow::Continue(());
+        };
         for e in index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = current.package() {
+                if e.sym.package != p {
                     continue;
                 }
             }
@@ -1585,14 +1578,8 @@ fn member_call_entries<'a>(
                 extensions.push(e);
             }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            frontier.push((
-                sup.clone(),
-                same_pkg_supertype(index, &sup, cur_pkg.as_deref()),
-                depth + 1,
-            ));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     if !members.is_empty() {
         members
     } else {
@@ -2324,6 +2311,8 @@ fn type_declaration<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a 
 }
 
 /// Visit a receiver and its instantiated supertypes, stopping when `visit` breaks.
+/// Unresolved supertypes visit `Unknown` so consumers cannot mistake an incomplete hierarchy
+/// for a closed source world when proving absence.
 /// Declaration identity is path-local: cycles cannot grow arguments indefinitely, while
 /// separate inheritance paths may still carry conflicting bindings to the same declaration.
 pub fn walk_supertypes(
@@ -2336,6 +2325,9 @@ pub fn walk_supertypes(
     let mut frontier = vec![(receiver.clone(), Vec::new())];
     while let Some((current, mut path)) = frontier.pop() {
         let Some(name) = current.name() else {
+            if visited.insert(current.clone()) {
+                visit(&current)?;
+            }
             continue;
         };
         let identity = (
@@ -2343,7 +2335,13 @@ pub fn walk_supertypes(
             current.package().map(str::to_string),
             current.container().map(str::to_string),
         );
-        if path.len() > max_depth || path.contains(&identity) || !visited.insert(current.clone()) {
+        if path.len() > max_depth || path.contains(&identity) {
+            if visited.insert(Type::Unknown) {
+                visit(&Type::Unknown)?;
+            }
+            continue;
+        }
+        if !visited.insert(current.clone()) {
             continue;
         }
         visit(&current)?;
@@ -2358,7 +2356,7 @@ pub fn walk_supertypes(
 /// Instantiate a type's direct superclasses/interfaces using its actual type arguments.
 pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
     let Some(declaration) = type_declaration(index, ty) else {
-        return Vec::new();
+        return vec![Type::Unknown];
     };
     let params: HashSet<_> = declaration.sym.type_params.iter().cloned().collect();
     let subst: HashMap<_, _> = if declaration.sym.type_params.len() == ty.args().len() {
@@ -2386,7 +2384,6 @@ pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
         .supertype_refs
         .iter()
         .map(|tr| resolve_with_subst(index, tr, &ctx, &params, &subst, 0))
-        .filter(|ty| ty.name().is_some())
         .collect()
 }
 
@@ -2559,6 +2556,41 @@ mod tests {
     use super::named_type_params;
     use crate::index::{Index, Tier};
     use crate::symbol::{IndexedSymbol, SymbolKind};
+
+    #[test]
+    fn supertype_walk_reports_cycles_and_depth_limits_as_incomplete() {
+        use crate::types::{Type, TypeRef};
+        use std::ops::ControlFlow;
+        let mut index = Index::new();
+        let mut a = IndexedSymbol::new("A", SymbolKind::Class, "demo", None, 0, 1);
+        a.supertype_refs = vec![TypeRef::simple("B")];
+        let mut b = IndexedSymbol::new("B", SymbolKind::Class, "demo", None, 2, 3);
+        b.supertype_refs = vec![TypeRef::simple("A")];
+        index.replace_file("Cycle.kt", vec![a, b], Tier::Volatile);
+        for (limit, expected) in [
+            (0, vec![Some("A"), None]),
+            (32, vec![Some("A"), Some("B"), None]),
+        ] {
+            let mut visited = Vec::new();
+            let result = super::walk_supertypes(
+                &index,
+                &Type::class("A", Some("demo".into())),
+                limit,
+                |ty| {
+                    visited.push(ty.name().map(str::to_string));
+                    ControlFlow::Continue(())
+                },
+            );
+            assert_eq!(result, ControlFlow::Continue(()));
+            assert_eq!(
+                visited
+                    .iter()
+                    .map(|name| name.as_deref())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn inference_stops_a_generic_cycle_before_expanding_the_same_declaration() {

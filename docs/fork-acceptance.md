@@ -41,22 +41,59 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. First slice: 711 pass / 3 ignored. Generic, dependency-buffer and cycle-guard slice: 735 pass / 3 ignored across 30 suites | Current Rust suite verified | Root `rtk cargo test --workspace --no-fail-fast`, exit 0; original failures retained below |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Original basic passes 9; extended Java fails 5 useful member cases; features fails 3 then stalls. Third fixed release: basic 9, Java 65, features 80, semantic 18, library 13, mixed 36 pass | Current focused editor suite verified | 221 assertions; artifact summaries and mixed compiler snapshots inspected; real-project acceptance continues |
-| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Copy resolves 101 materialized classpath entries; offline Kotlin/Java compile succeeds; real Neovim hover and superclass goto reach Create Java source | Partial | Generic member, override, diagnostics and performance cases remain; class goto alone is insufficient |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. First slice: 711 pass / 3 ignored. Fourth slice: 746 pass / 3 ignored across 30 suites | Current Rust suite verified | Root `rtk cargo test --workspace --no-fail-fast`, exit 0; original failures retained below |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Original basic passes 9; extended Java fails 5 useful member cases; features fails 3 then stalls. Third release passes 221 assertions. Fourth release: expanded Java 99, mixed 36 and semantic 18 pass | Current focused editor suite verified | Fourth release 153 assertions across three affected scenarios; unchanged third-release basic/features/library evidence retained separately; real-project acceptance continues |
+| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Copy resolves 101 materialized classpath entries; offline Kotlin/Java compile succeeds; broad Neovim hover/class-goto smoke passes | Partial | Broad scan also includes extracted Java outside Gradle source roots; class-goto smoke does not independently prove dependency attribution. Exact archive-backed probes, source scope, overrides, diagnostics and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Inheritance and generics | Correct inherited members and substituted types across both languages | Baseline generic chains fail. Structured Java type arguments and typed Java/Kotlin superclasses resolve release mixed completion/goto both directions. Growing invalid cycles stop without repeated declaration expansion; matching diamonds work and conflicting bindings stay Unknown | Partial; focused repair verified | Direct inherited package collision reproduced: wrong completion and Kotlin goto/diagnostics. Method inference and bounded wildcards also remain |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Focused Java incomplete member recovery passes; complete-source corpus probes alone do not cover this requirement | Partial | Exercise unsaved incomplete buffers on real projects; require intended candidates and exclude unrelated ones, with first responses after change delivery recorded |
+| Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Not yet measured | Pending | Include invalid and ambiguous cases with independent expected results |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Not yet measured | Pending | Extend existing semantic/editor probes |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Baseline omits a Java generic-chain use and renamed snapshot fails compilation. Fixed release and adapted IDEA update all three exact semantic sites, preserve all three complete buffers and compile the renamed snapshot | Mixed fixture verified | Actual corpus, overloads, JVM facades, ambiguous names and extension-provided references remain pending |
-| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Not yet measured | Pending | Existing gradle-live/library plus real-project cases |
+| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Full indexing exposes wrong nested-type targets and project/dependency version duplicates in Moshi and Retrofit; actual Gradle remapped project ownership also fails | Failing; reproduced | Preserve module-specific classpaths and source ownership rather than adding all dependency symbols to one unscoped lookup; generated-source refresh still pending |
+| Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | No live classpath-refresh acceptance case verified | Pending | Build disposable versioned dependencies, keep the same LSP session, and verify new members/targets plus removal of obsolete facts; test watched-file/config invalidation without restarting |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | No Kotlin/Java compiler-plugin acceptance case verified | Pending | Independently verify compiler and IDEA expectations for Kotlin serialization/all-open/no-arg, KAPT/KSP outputs and Java Lombok or processor-generated APIs; distinguish generated source from source-less semantic transformations |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | No extension mechanism validated | Pending | Prove smallest contract after ordinary semantic slice; test config/source invalidation |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
 
+## Compiler-plugin expectations and first independent control
+
+Compiler-plugin coverage must include both emitted source and APIs transformed
+without a generated source file. KSP emits additional source rather than changing
+the input program; Lombok's javac processor transforms compiler trees. See the
+[KSP overview](https://kotlinlang.org/docs/ksp-overview.html) and
+[Lombok execution path](https://projectlombok.org/contributing/lombok-execution-path).
+The [all-open plugin](https://kotlinlang.org/docs/all-open-plugin.html) changes
+class/member openness, while the [no-arg plugin](https://kotlinlang.org/docs/no-arg-plugin.html)
+creates a synthetic constructor that direct Java/Kotlin calls cannot use. Do not
+invent a callable zero-argument constructor just because that plugin is enabled.
+Pin each fixture's actual plugin/compiler versions; current documentation does
+not substitute for that fixture's compiler and IDEA observations.
+
+Root independently verified a serialization control under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/plugin-oracle/serialization`.
+It uses Kotlin/compiler plugin 1.9.23, serialization core JVM 1.6.3 and JDK 17.
+`Model.kt` contains only `@Serializable data class Model(val label: String)`.
+With the plugin disabled, Kotlin's `Model.serializer()` fails with exit 1.
+With the actual compiler plugin enabled, that Kotlin call and Java's
+`Model.Companion.serializer()` compile. `javap` confirms the generated companion
+method returns `KSerializer<Model>`. `compile-oracle.ps1`, source files, compiler
+logs and generated class files retain the evidence. No serializer method was
+written into a source stub. This proves the expected API independently; LSP
+completion, diagnostics, navigation and unsaved invalidation are still unverified.
+
 ## Measurement policy and initial UX targets
+
+Compilation is an independent semantic oracle, not editing acceptance. The user
+explicitly requires useful unfinished-code completion, live Gradle library/build
+updates, and Kotlin/Java compiler-plugin behavior. Those checks must run through
+the existing real-editor harness, with completion, diagnostics, navigation,
+references and applied rename remaining consistent where applicable. A successful
+build, a server restart that hides stale facts, or an empty fast response cannot
+substitute for these checks.
 
 Before claiming speed, collect a native-host baseline and retain each sample alongside
 its semantic assertion. The following initial targets express the desired editor UX;
@@ -81,6 +118,49 @@ lower the accepted latency distribution. Sampling/profiling runs are separate fr
 timing runs. Initialization timing never substitutes for editor completion timing.
 
 ## Work log
+
+### Imported superclass identity: fourth checkpoint
+
+Remaining superclass readers now use the same typed, instantiated hierarchy for
+completion, callable selection, navigation and diagnostic completeness. Recovered
+incomplete-file declarations replace only the matching package/container identity.
+An unresolved superclass, cycle or depth cutoff retains an Unknown observation;
+it cannot prove that a member is absent while hierarchy inputs are incomplete.
+
+Root's `rtk cargo test --workspace --no-fail-fast` passes **746 / 3 ignored**
+across 30 suites. Targeted Rust formatting and `git diff --check` pass.
+Evidence is `C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/fourth-slice/`:
+`cargo-workspace.log` and `release-build.log`. The frozen release is
+`fourth-fixed/bin/ktlsp.exe`, SHA-256
+`8b9166c05d7769e8a3cecbfe18dcfad89acc7a0bf9fb96d51b925b08981a8c0c`.
+
+The existing Java scenario now passes **99/99**; its original 65 expectations
+remain. Running the expanded scenario against the third release gives 93 pass /
+6 fail: four completions choose the wrong superclass, and two Kotlin inherited
+calls navigate to it. Fourth-release mixed **36/36** and semantic **18/18** also
+pass. Root inspected all three summaries under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-semantic-gaps-20261010/`:
+`directsuper-fourth-fixed`, `mixed-fourth-fixed`, `semantic-fourth-fixed`.
+All 16 superclass requests record attempt 1 after outbound document changes.
+Valid complete caller diagnostics must actually arrive and be empty; switched
+complete callers must report exactly two argument mismatches. Compiler controls
+on the six generated files independently verify original and switched-valid
+superclasses, and reject the switched-invalid calls with exactly two errors per
+compiler. See `compile-generated-directsuper.ps1` and
+`compiler-generated-directsuper/{original,switched-valid,switched-invalid}`.
+Mixed original, edited and applied-rename compiler snapshots all exit 0.
+
+An external native-Neovim UI control uses builtin autocompletion and actual
+insert-mode `.` input in both languages. `popupmenu_show` contains the intended
+LSP member and excludes the other receiver's member; keyboard selection expands
+the method snippet to the exact expected buffer line. Source files remain
+unchanged and shutdown succeeds. Evidence is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/completion-ui/probe.json`.
+There is one sample per language in a disposable three-file project, with other
+investigations running; these observations are **not performance acceptance**.
+The popup event measures the editor's menu handoff, not physical screen pixels.
+Next integrate this control into the existing harness and collect repeated real
+project samples, keeping protocol and editor timings separate.
 
 ### Generic and dependency-buffer slice: Rust checkpoint
 
@@ -123,7 +203,7 @@ and the mixed result/compile records under the same harness evidence root,
 are bounded before expanding a repeated declaration; normal diamonds and
 conflicting generic bindings retain their focused regression expectations.
 
-### Next reproduced gap: imported superclass identity
+### Imported superclass identity: original reproduction
 
 Compiler-valid Java and Kotlin children explicitly inherit `base.Base` while
 an unrelated `app.Base` also exists. Javac 21 and Kotlin 1.9.23 accept both
@@ -137,10 +217,27 @@ Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-semantic-gaps-20261010/`
 `compile-superclass.ps1`, `superclass-baseline.rs`, `superclass-baseline.exe`,
 and `oracle/superclass`. Reproduce with RTK PowerShell `-File
 compile-superclass.ps1`, then run `superclass-baseline.exe` (expected exit 1
-before repair). Next: preserve typed superclass identities in the remaining
-shared completion, call-validation and resolution readers; add unsaved import
-switches and correct-target exclusions. This is an external reproduction,
-not yet a committed editor acceptance case.
+before repair). The fourth checkpoint above verifies the repair and adds the
+editor acceptance case. This original external probe retains the independent
+false-diagnostics reproduction; the older editor fixture itself did not show
+that diagnostic failure.
+
+### Next reproduced gaps: full-index source identity and call context
+
+Moshi's old startup observation passes three semantic checks, but after project
+and library indexing, only its member completion passes. `JsonAdapter.Factory`
+navigates to seven unrelated nested `Factory` types and omits the intended one;
+`reader.beginObject()` navigates to both project 1.15.2 and dependency 1.12.0
+declarations. The same indexed IDEA probes pass 3/3. Retrofit also returns project
+2.11 and dependency 2.9 targets together, and `Response.body()` includes both a
+private field and a method from both versions. These are correctness failures,
+separate from missing source coverage, and are not accepted as ambiguous source
+navigation. External evidence is under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-probes-20261010/`:
+`moshi-1.15.2-ktlsp-indexed-2/artifacts/corpus-requests.jsonl` and
+`retrofit-2.11.0-ktlsp-indexed-2/artifacts/corpus-requests.jsonl`.
+Next reduce owner-qualified nested types, callable-vs-field context and
+module-specific source/classpath selection into focused regressions.
 
 ### Initial investigation
 

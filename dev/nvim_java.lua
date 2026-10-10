@@ -609,6 +609,154 @@ do
   vim.wait(200)
 end
 
+-- Imported superclasses must keep their declaration context across both languages and edits.
+do
+  local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:gsub("^@", ""))
+  local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
+  local files = {
+    base = "support/ImportedBase.java", other = "app/ImportedBase.java",
+    child = "app/ImportedChild.java", kotlin = "app/KotlinImportedChild.kt",
+    java_use = "app/SuperUse.java", kotlin_use = "app/SuperUse.kt",
+  }
+  local buffers, original, notifications, sent_versions = {}, {}, {}, {}
+  local report = { requests = {}, diagnostics = {}, outbound = {} }
+  local previous_handler = client.handlers["textDocument/publishDiagnostics"]
+  local diagnostic_handler = previous_handler or vim.lsp.handlers["textDocument/publishDiagnostics"]
+  client.handlers["textDocument/publishDiagnostics"] = function(err, result, ctx, config)
+    if result then
+      local key = probe.path_key(vim.uri_to_fname(result.uri))
+      notifications[key] = result
+      report.diagnostics[#report.diagnostics + 1] = vim.deepcopy(result)
+    end
+    diagnostic_handler(err, result, ctx, config)
+  end
+  local rpc_notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = rpc_notify(method, params)
+    if sent and method == "textDocument/didChange" then
+      local document = params.textDocument
+      sent_versions[document.uri] = document.version
+      report.outbound[#report.outbound + 1] = vim.deepcopy(document)
+    end
+    return sent
+  end
+  for _, name in ipairs({ "base", "other", "child", "kotlin", "java_use", "kotlin_use" }) do
+    local buf = vim.fn.bufadd(project .. "/" .. files[name])
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = files[name]:match("%.kt$") and "kotlin" or "java"
+    buffers[name] = buf
+    original[name] = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    assert(vim.lsp.buf_attach_client(buf, id), "superclass fixture did not attach: " .. name)
+  end
+  local function lines(name)
+    return vim.api.nvim_buf_get_lines(buffers[name], 0, -1, false)
+  end
+  local function doc_uri(name)
+    return vim.uri_from_bufnr(buffers[name])
+  end
+  local function flush(name, assertion)
+    require("vim.lsp._changetracking").flush(client)
+    if assertion then
+      local expected = vim.lsp.util.buf_versions[buffers[name]]
+      check(assertion .. " didChange is outbound before the first request",
+        sent_versions[doc_uri(name)] == expected,
+        ("expected=%s sent=%s"):format(expected, sent_versions[doc_uri(name)]))
+    end
+  end
+  local function once(name, method, position, phase)
+    local params = { textDocument = { uri = doc_uri(name) }, position = position }
+    local response, err = client:request_sync(method, params, 3000, buffers[name])
+    local result = response and response.result
+    report.requests[#report.requests + 1] = {
+      phase = phase, method = method, params = params, attempts = 1,
+      result = result, error = response and response.err or err,
+      sent_versions = vim.deepcopy(sent_versions),
+    }
+    return result
+  end
+  -- A notification on complete valid source is required; an empty local diagnostic store is insufficient.
+  for _, name in ipairs({ "java_use", "kotlin_use" }) do
+    local key = probe.path_key(vim.api.nvim_buf_get_name(buffers[name]))
+    local received = vim.wait(5000, function() return notifications[key] ~= nil end, 50)
+    local result = notifications[key]
+    check(name .. " receives diagnostics for complete valid superclass calls", received, vim.inspect(result))
+    check(name .. " valid imported superclass calls have no false diagnostics",
+      received and #result.diagnostics == 0, vim.inspect(result))
+  end
+  local function definition(name, receiver, target, declaration, phase)
+    local position = probe.find(lines(name), receiver .. '.accept("ok")', "accept")
+    local _, range = probe.find(lines(target), declaration, "accept")
+    local expected = probe.location_key(doc_uri(target), range)
+    local result = once(name, "textDocument/definition", position, phase)
+    local locations = probe.locations(result)
+    local found = locations[1]
+    check(name .. " " .. phase .. " " .. receiver .. ".accept goes to exact declaration",
+      #locations == 1 and probe.location_key(found.uri or found.targetUri,
+        found.targetSelectionRange or found.range) == expected, vim.inspect(result))
+  end
+  local function completion(name, receiver, expected, excluded, phase)
+    local position = probe.find(lines(name), receiver .. ".baseOnly()", "baseOnly")
+    local before = vim.api.nvim_buf_get_lines(buffers[name], position.line, position.line + 1, false)
+    local text = before[1]:match("^%s*") .. receiver .. ".ba"
+    vim.api.nvim_buf_set_lines(buffers[name], position.line, position.line + 1, false, { text })
+    flush(name, name .. " " .. phase .. " " .. receiver .. ".ba")
+    local result = once(name, "textDocument/completion",
+      { line = position.line, character = #text }, phase)
+    check(name .. " " .. phase .. " " .. receiver .. ".ba offers " .. expected .. " and excludes " .. excluded,
+      probe.completion_has(result, expected) and not probe.completion_has(result, excluded), vim.inspect(result))
+    vim.api.nvim_buf_set_lines(buffers[name], position.line, position.line + 1, false, before)
+    flush(name)
+  end
+  for _, name in ipairs({ "java_use", "kotlin_use" }) do
+    for _, receiver in ipairs({ "child", "kotlin" }) do
+      definition(name, receiver, "base", "public void accept(String value)", "initial")
+      completion(name, receiver, "baseOnly", "baseWrong", "initial")
+    end
+  end
+  for _, receiver in ipairs({ "child", "kotlin" }) do
+    local position = probe.find(lines(receiver), "import support.ImportedBase", "support")
+    local text = lines(receiver)[position.line + 1]:gsub("support%.ImportedBase", "app.ImportedBase")
+    vim.api.nvim_buf_set_lines(buffers[receiver], position.line, position.line + 1, false, { text })
+    local phase = "unsaved " .. receiver .. " import switch"
+    flush(receiver, phase)
+    check(phase .. " keeps the declaration unsaved and disk unchanged",
+      vim.bo[buffers[receiver]].modified and vim.deep_equal(vim.fn.readfile(project .. "/" .. files[receiver]),
+        original[receiver]))
+    for _, name in ipairs({ "java_use", "kotlin_use" }) do
+      completion(name, receiver, "baseWrong", "baseOnly", phase)
+      definition(name, receiver, "other", "public void accept(int value)", phase)
+    end
+  end
+  -- After switching both imports, valid syntax must still report the two String-to-int errors.
+  for _, name in ipairs({ "java_use", "kotlin_use" }) do
+    local edited = lines(name)
+    for i, text in ipairs(edited) do edited[i] = text:gsub("%.baseOnly%(", ".baseWrong(") end
+    local key = probe.path_key(vim.api.nvim_buf_get_name(buffers[name]))
+    notifications[key] = nil
+    vim.api.nvim_buf_set_lines(buffers[name], 0, -1, false, edited)
+    flush(name)
+    local received = vim.wait(5000, function()
+      local result = notifications[key]
+      if not result or #result.diagnostics ~= 2 then return false end
+      for _, diagnostic in ipairs(result.diagnostics) do
+        if diagnostic.code ~= "call_shape_mismatch" then return false end
+      end
+      return true
+    end, 50)
+    check(name .. " changed superclass reports exactly two invalid accept arguments",
+      received, vim.inspect(notifications[key]))
+  end
+  for name, buf in pairs(buffers) do
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, original[name])
+  end
+  flush("child")
+  client.rpc.notify = rpc_notify
+  client.handlers["textDocument/publishDiagnostics"] = previous_handler
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-superclasses.json")
+  end
+end
+
 -- Signature help on a Java method call should include parameter and return types.
 do
   local l, c = find('helper.combine("Ada", 2)', "2")

@@ -5,13 +5,14 @@
 //! proof-bounded answer they can format for navigation, explainability, or diagnostics.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use tree_sitter::{Node, Tree};
 
 use crate::complete::{self, ScopeCompletion};
 use crate::hierarchy;
 use crate::imports::{self, ImportLayout, ImportStyle};
-use crate::index::{Entry, Index, Tier};
+use crate::index::{Entry, Index, InferenceIndex, Tier};
 use crate::infer;
 use crate::knowledge::Knowledge;
 use crate::language::{self, SourceLanguage};
@@ -317,9 +318,7 @@ pub fn member_completion_query_for_type(
         SourceLanguage::Java => ImportStyle::Java,
     };
     let layout = imports::import_layout_with_style(style, tree, src);
-    let Some(receiver_type_name) =
-        infer::receiver_root_key(index, &ty).or_else(|| ty.name().map(str::to_string))
-    else {
+    if ty.name().is_none() {
         return Some(CompletionQuery {
             context: complete::CompletionContext::AfterDot,
             prefix,
@@ -329,8 +328,7 @@ pub fn member_completion_query_for_type(
                 CompletionIncompletenessReason::UnknownReceiverType,
             ]),
         });
-    };
-    let receiver_type_package = ty.package().map(str::to_string);
+    }
     let vis = Visibility::for_file(language, tree, src);
     // Incomplete selectors can hide later declarations in the live index; use recovered file facts.
     let mut source_index = Index::new();
@@ -343,8 +341,7 @@ pub fn member_completion_query_for_type(
         index,
         Some(&source_index),
         language,
-        &receiver_type_name,
-        receiver_type_package.clone(),
+        &ty,
         &prefix,
         &vis,
         max_candidates,
@@ -561,18 +558,11 @@ pub fn scope_name_query(
     let vis = Visibility::new(&pkg, &imports);
     let file_ctx = infer::FileCtx::from_tree(tree, src);
     for recv_ty in infer::implicit_receiver_types(index, anchor, src, &file_ctx, 0) {
-        let Some(receiver_type_name) = infer::receiver_root_key(index, &recv_ty)
-            .or_else(|| recv_ty.name().map(str::to_string))
-        else {
-            continue;
-        };
-        let receiver_type_package = recv_ty.package().map(str::to_string);
         for candidate in member_candidates(
             index,
             None,
             SourceLanguage::Kotlin,
-            &receiver_type_name,
-            receiver_type_package,
+            &recv_ty,
             &prefix,
             &vis,
             max_candidates,
@@ -637,40 +627,73 @@ pub fn scope_name_query(
     })
 }
 
+// Recovery replaces only matching declaration identities; other packages' homonyms remain visible.
+struct RecoveredTypeIndex<'a> {
+    index: &'a Index,
+    source: &'a Index,
+}
+
+impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn lookup_by_name(&self, name: &str) -> &[Entry] {
+        self.index.lookup_by_name(name)
+    }
+    fn members_of(&self, name: &str) -> &[Entry] {
+        self.index.members_of(name)
+    }
+    fn extensions_for(&self, name: &str) -> &[Entry] {
+        self.index.extensions_for(name)
+    }
+    fn lookup_type(&self, name: &str) -> Vec<&Entry> {
+        let recovered = self.source.lookup_type(name);
+        let mut entries = self.index.lookup_type(name);
+        entries.retain(|entry| {
+            !recovered.iter().any(|recovered| {
+                recovered.sym.package == entry.sym.package
+                    && recovered.sym.container == entry.sym.container
+            })
+        });
+        entries.extend(recovered);
+        entries
+    }
+}
+
 fn member_candidates(
     index: &Index,
     source_index: Option<&Index>,
     language: SourceLanguage,
-    ty: &str,
-    ty_pkg: Option<String>,
+    ty: &Type,
     prefix: &str,
     vis: &Visibility,
     max_candidates: usize,
 ) -> Vec<ScopeCompletion> {
     let mut out: Vec<ScopeCompletion> = Vec::new();
     let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
-    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> = vec![(ty.to_string(), ty_pkg, 0)];
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
-            continue;
-        }
+    let recovered = source_index.map(|source| RecoveredTypeIndex { index, source });
+    let inference_index: &dyn InferenceIndex = match &recovered {
+        Some(recovered) => recovered,
+        None => index,
+    };
+    let _ = infer::walk_supertypes(inference_index, ty, 32, |current| {
+        let Some(cur) = infer::receiver_root_key(inference_index, current) else {
+            return ControlFlow::Continue(());
+        };
+        let cur_pkg = current.package();
         let members_index = source_index
             .filter(|source| {
                 let (container, simple) = match cur.rsplit_once('.') {
                     Some((container, simple)) => (Some(container), simple),
                     None => (None, cur.as_str()),
                 };
-                cur_pkg.as_ref().is_some_and(|pkg| {
+                cur_pkg.is_some_and(|pkg| {
                     source.lookup_type(simple).iter().any(|entry| {
-                        entry.sym.package == *pkg && entry.sym.container.as_deref() == container
+                        entry.sym.package == pkg && entry.sym.container.as_deref() == container
                     })
                 })
             })
             .unwrap_or(index);
         for e in members_index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = cur_pkg {
+                if e.sym.package != p {
                     continue;
                 }
             }
@@ -686,20 +709,8 @@ fn member_candidates(
                 push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
             }
         }
-        for sup in members_index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            let sup_pkg = match &cur_pkg {
-                Some(p)
-                    if [index, members_index].iter().any(|source| {
-                        source.lookup_type(&sup).iter().any(|e| &e.sym.package == p)
-                    }) =>
-                {
-                    Some(p.clone())
-                }
-                _ => None,
-            };
-            frontier.push((sup, sup_pkg, depth + 1));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     out.truncate(max_candidates);
     out
 }
@@ -710,21 +721,15 @@ fn member_call_entries<'a>(
     name: &str,
     vis: &Visibility,
 ) -> Vec<&'a Entry> {
-    let Some(root) = recv_ty.name() else {
-        return Vec::new();
-    };
-    let root_pkg = recv_ty.package().map(str::to_string);
-    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> = vec![(root.to_string(), root_pkg, 0)];
     let mut members: Vec<&Entry> = Vec::new();
     let mut extensions: Vec<&Entry> = Vec::new();
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
-            continue;
-        }
+    let _ = infer::walk_supertypes(index, recv_ty, 32, |current| {
+        let Some(cur) = infer::receiver_root_key(index, current) else {
+            return ControlFlow::Continue(());
+        };
         for e in index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = current.package() {
+                if e.sym.package != p {
                     continue;
                 }
             }
@@ -745,21 +750,8 @@ fn member_call_entries<'a>(
                 extensions.push(e);
             }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            let sup_pkg = match &cur_pkg {
-                Some(p)
-                    if index
-                        .lookup_by_name(&sup)
-                        .iter()
-                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
-                {
-                    Some(p.clone())
-                }
-                _ => None,
-            };
-            frontier.push((sup, sup_pkg, depth + 1));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     if !members.is_empty() {
         members
     } else {

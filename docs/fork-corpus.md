@@ -230,8 +230,190 @@ class directories, including modules outside the focused compiler task group.
 Dependency resolution alone therefore does not prove complete-root model readiness;
 missing project-output handling and source-set visibility remain to be verified.
 
+Root reproduced a concrete remapped-module identity error against the real Gradle
+dump. `:problems` has physical directory `platforms/ide/problems` and 82 classpath
+entries. For its existing `DefaultProblemsReportCreator.kt`, the public
+`daemon::module_path_for` returns `:platforms:ide:problems` instead of `:problems`.
+The external Rust assertion fails with exit 1, while `classpath::parse_dump`
+correctly retains `project_dir`. Evidence is under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/module-mapping/`:
+`baseline.rs`, `baseline.out`, and the UTF-8 copy `classpath.utf8.log` of the
+completed dump. The first attempt to read PowerShell's UTF-16 log failed before
+the assertion and is a probe setup error, not a product failure. Three callers
+derive module-specific import/classpath or compiler work from this helper;
+repair must consume Gradle's actual module-to-directory mapping. This reproduction
+does not by itself attribute a separate navigation timeout to the mapping error.
+
 The resolved project model, module visibility and generated source roots remain
 prerequisites for semantic acceptance. Entire root indexing and latency must be
 measured separately from focused submodule probes. Keep complete roots in the
 performance corpus and record source-set scope; a fast result from a small module
 is not a whole-project result.
+
+## Exact read-only corpus probes
+
+`dev/ktlsp-harness.sh corpus --root <project> --file <manifest.json>` runs the same
+assertions through ktlsp or the official IntelliJ plugin. `dev/nvim_lsp_probe.lua`
+shares engine configuration, import checks, file identity, UTF-16 anchor positions
+and completion matching with the compiled `mixed` fixture. The corpus scenario
+opens query source files only; expected declaration files are read as oracle data,
+not opened to make missing index entries available. It requires exactly one
+definition with the expected identifier range. It records first/last responses,
+indexing retries, source hashes, revision/status and graceful shutdown. These
+read-only probes do not prove unsaved editing, references, rename or latency on
+the real roots.
+
+Generated per-root manifests are outside the checkout at
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/probes/<directory>.json`.
+The 13 source/declaration anchor pairs were validated for uniqueness and UTF-16
+positions against the pinned sources. A portable minimal manifest is:
+
+```json
+{
+  "schema_version": 1,
+  "project_id": "moshi-1.15.2",
+  "build_tool": "gradle",
+  "probes": [{
+    "id": "moshi-jsonreader-member",
+    "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+    "anchor": "reader.beginObject()",
+    "token": "beginObject",
+    "target": "moshi/src/main/java/com/squareup/moshi/JsonReader.java",
+    "target_anchor": "public abstract void beginObject()",
+    "target_token": "beginObject"
+  }]
+}
+```
+
+Source/target paths are relative to the selected root. `completion: false` disables
+completion for the two interface-only navigation controls below. `target_token`
+can differ from `token`, as required by Kotlin's `@JvmName("awaitNullable")`.
+The following table preserves the portable candidate data; line numbers are
+one-based, while JSON/LSP positions are zero-based UTF-16 columns. Directory and
+file prefixes are the source roots documented above.
+
+| Root / source file | Query anchor and token | Exact declaration | Intended semantic coverage |
+| --- | --- | --- | --- |
+| CEM `.../drill/EnchantableDrillBlockEntity.kt:34` | `return super.getBreakSpeed()` / `getBreakSpeed` | Create `com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.java:157`, `protected float getBreakSpeed()` | Inherited protected Java member through `DrillBlockEntity` |
+| CEM same file `:32` | `holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)` / `getOrThrow` | NeoForge `net/minecraft/core/HolderGetter.java:10`, `default Holder.Reference<T> getOrThrow(ResourceKey<T> resourceKey)` | Kotlin extension result plus Java generic/overload selection; excludes the `TagKey<T>` overload |
+| OkHttp `samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java:35` | `client.newCall(request).enqueue(` / `enqueue` | `okhttp/src/main/kotlin/okhttp3/Call.kt:68`, `fun enqueue(responseCallback: Callback)` | Java chained receiver to Kotlin interface member |
+| OkHttp same file/anchor | `newCall` | `okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt:268`, `override fun newCall(request: Request): Call` | Java receiver to concrete Kotlin override |
+| Moshi `moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt:189` | `: JsonAdapter.Factory` / `Factory` (goto only) | `moshi/src/main/java/com/squareup/moshi/JsonAdapter.java:319`, `public interface Factory {` | Nested Java interface implemented by Kotlin |
+| Moshi same file `:69` | `reader.beginObject()` / `beginObject` | `moshi/src/main/java/com/squareup/moshi/JsonReader.java:328`, `public abstract void beginObject()` | Kotlin calls Java abstract contract |
+| Retrofit `retrofit/src/main/java/retrofit2/HttpServiceMethod.java:205` | `KotlinExtensions.awaitResponse(call, continuation)` / `awaitResponse` | `retrofit/src/main/java/retrofit2/KotlinExtensions.kt:92`, `suspend fun <T> Call<T>.awaitResponse()` | Java facade to Kotlin suspend extension |
+| Retrofit same Java file `:250` | `KotlinExtensions.awaitNullable(call, continuation)` / `awaitNullable` | Same Kotlin file `:65`, `suspend fun <T : Any> Call<T?>.await(): T?`, token `await` | JVM name maps specifically to nullable Kotlin overload |
+| Retrofit same Kotlin file `:39` | `= response.body()` / `body` | `retrofit/src/main/java/retrofit2/Response.java:151`, `public @Nullable T body()` | Kotlin calls Java nullable generic member; anchor starts after the local variable with the same name |
+| Spring `spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt:30` | `getBeanProvider<T>().getObject()` / `getObject` | `spring-beans/src/main/java/org/springframework/beans/factory/ObjectProvider.java:57`, `default T getObject()` | Reified Kotlin extension chain to zero-argument Java overload |
+| Spring same Kotlin file `:64` | `getBeanProvider(ResolvableType.forType(` / `getBeanProvider` | Same Java directory `BeanFactory.java:257`, `<T> ObjectProvider<T> getBeanProvider(ResolvableType requiredType)` | Select `ResolvableType`, excluding `Class<T>` and no-argument Kotlin extension |
+| Gradle `platforms/ide/problems/src/main/java/org/gradle/problems/internal/services/ProblemsBuildTreeServices.java:120` | `new DefaultProblemsReportCreator(` / `DefaultProblemsReportCreator` | `platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt:49`, `class DefaultProblemsReportCreator(` | Java constructs Kotlin class in `:problems` |
+| Gradle same Kotlin file `:56` | `) : ProblemReportCreator {` / `ProblemReportCreator` (goto only) | `platforms/ide/problems-api/src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java:26`, `public interface ProblemReportCreator {` | Kotlin implements another Gradle module's Java contract |
+
+CEM's declaration oracles are extracted outside the indexed root from the verified
+Create 6.0.10-280 and NeoForge 21.1.248 source archives. Its manifest uses
+`target_file` for that oracle text and `target_uri_suffix` for the complete qualified
+source path. A dependency may be returned as an archive URI or an extracted file;
+both its qualified path and exact identifier range must match. These oracles are
+never opened as editor buffers. Preserve or reconstruct them from the recorded
+archive versions before using the manifest on another machine.
+
+Example command after selecting an immutable release binary:
+
+```powershell
+rtk proxy C:/Users/gummy/scoop/apps/git/current/bin/bash.exe dev/ktlsp-harness.sh corpus --root C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/moshi-1.15.2 --file C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/probes/moshi-1.15.2.json --bin <release>/ktlsp.exe --no-build
+```
+
+For IntelliJ, set `KTLSP_PROBE_SERVER=intellij`, `IJLS_PLUGIN`, `IJLS_SERVER`
+and `IJLS_JDK`, with isolated XDG directories and server home. The scenario requires
+successful Gradle import; initialization/capabilities alone do not pass. The current
+comparison explicitly reuses `C:/Users/gummy/.gradle` through `GRADLE_USER_HOME`
+for already-compiled dependency/build-tool inputs and records that path. CEM uses
+JDK 21; the other roots use JDK 17. Sources remain unchanged, although build-tool
+import can write ignored model/build caches.
+
+The first ktlsp Moshi run passes 7/7 checks, including the three semantic checks.
+The first interface definition needs one indexing retry, which is retained in
+`corpus-requests.jsonl`; it is not a timing sample. Evidence is under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-probes-20261010/moshi-ktlsp-1`.
+The independent IntelliJ Moshi run passes its three semantic checks after a
+successful Gradle import, with one response per request. Its artifact directory is
+`moshi-intellij-1` beside the ktlsp run above. The actual Gradle module `:problems`
+is physically under `platforms/ide/problems`; URI navigation from a global source
+index alone will not prove that the correct module classpath was selected. Module
+visibility, generated outputs, diagnostics, invalid/ambiguous code and real-root
+editing/rename/performance remain acceptance gaps.
+
+### Startup observations and indexed controls
+
+`KTLSP_CORPUS_WAIT_INDEX=1` requires both project and dependency indexing log
+notifications, using the same readiness meaning as `dev/bench_initialize.py`.
+`KTLSP_CORPUS_READY_TIMEOUT_MS` changes the default 600-second readiness timeout.
+Timeout leaves semantic checks unmeasured. Failed indexing or missing dependency
+sources remain independent failed coverage checks. Once both phases finish, the
+selected semantic checks still run and label their phase
+`first-response-after-indexing-with-incomplete-inputs` when applicable. A subset
+passing under incomplete inputs does not pass whole-project acceptance.
+
+Indexed and IntelliJ requests each use exactly one response after readiness;
+startup retries are retained separately and do not count as freshness or timing
+evidence. Definition positions remain at the identifier start. Subsequent
+completion controls use the identifier end, or an explicit `completion_prefix`
+such as `"newC"`. This distinguishes a filtered member query from an unfiltered
+first page with `isIncomplete: true`; all request positions and raw results are
+retained. This control adjustment does not replace testing actual incomplete
+unsaved buffers.
+
+The initial IntelliJ runs use identifier-start completion positions and have
+these limited results, under `ktlsp-corpus-probes-20261010/<root>-intellij-1`:
+
+| Root | Observed semantic checks | Limitation / next action |
+| --- | --- | --- |
+| Moshi | 3/3 pass | Initial directory is `moshi-intellij-1`; complete-root coverage remains open |
+| Retrofit | 6/6 pass | Confirms facade, nullable `@JvmName` overload and Java generic `body()` targets |
+| Spring | 4/4 pass | Confirms the zero-argument `getObject` and `ResolvableType` provider overload |
+| OkHttp | 0/4 match configured expectations | `newCall` completion is an incomplete first page of 25 accessors; definition returns compiled `OkHttpClient.class` rather than source. Recheck filtered completion and source attachment; do not infer a missing method from this page |
+| CEM | 3/4 match configured expectations | Both exact archive definitions and `getOrThrow` completion pass. The unfiltered getter completion includes synthetic property `breakSpeed`, not `getBreakSpeed`; verify full prefix and compiler-backed property access separately |
+| Gradle | Unmeasured | Import fails because its build requires JDK 17 while the importer selects JDK 22 despite `JAVA_HOME` and `defaultSdk` 17. Fix the temporary importer JVM setup without changing tracked build files |
+
+Initial cold ktlsp queries on the other roots did not wait for library indexing;
+empty results and timeouts from those runs are startup observations. The first
+indexed series completes with zero failed dependency workers but missing-source
+counts of Moshi 4, OkHttp 13, Retrofit 30, Spring 27, Gradle 145 and CEM 6. Its first
+five roots stopped at the coverage check before a policy refinement; they do not
+contain indexed semantic measurements. CEM's indexed run continues and passes the
+exact inherited `getBreakSpeed` definition, while both completion checks and the
+`HolderGetter.getOrThrow` definition fail. A uniform series with filtered
+completion positions is the next comparison. The initial Retrofit `body` probe
+accidentally selected the local variable of the same name; the manifest anchor
+was corrected to `= response.body()` before the independent IntelliJ pass.
+
+### Compiler-plugin inventory and pending editing cases
+
+This inventory comes from the pinned build files and generated outputs. A plugin
+being present or a compiler task succeeding does not establish LSP support.
+
+| Root | Actual configuration / evidence | Useful next probe |
+| --- | --- | --- |
+| CEM | Kotlin JVM and ModDev; no KAPT, KSP, all-open, no-arg or serialization plugin in the current build | Generated NeoForge binary/source availability is a build-output case, not evidence of a CEM compiler transform |
+| OkHttp | `samples/guide/build.gradle` applies `kotlin-kapt`; `kapt deps.moshiKotlin` selects Moshi codegen. The focused guide build creates `build/generated/source/kapt/main/okhttp3/recipes/kt/ParseResponseWithMoshi_GistJsonAdapter.kt` and `..._GistFileJsonAdapter.kt` | Find the generated adapter and its `fromJson`/`toJson` members from an unsaved source use, using the configured generated source root without opening the target |
+| Moshi | `kotlin/tests/codegen-only/build.gradle.kts` defaults `kotlinTestMode` to KSP, with selectable KAPT. Kotlin 1.8.21 / KSP 1.8.21-1.0.11 are pinned; `GeneratedAdaptersTest.JsonAnnotation` is annotated with `@JsonClass(generateAdapter = true)` | First run the focused KSP test generation/compiler task; main-module compilation did not create these test adapters. Then verify the actual generated class name, source root and member targets |
+| Retrofit | `retrofit-response-type-keeper` applies KAPT with AutoService and Incap. `RetrofitResponseTypeKeepProcessor` writes `META-INF/proguard/retrofit-response-type-keeper-<type>.pro`; AutoService supplies service registration | Resource generation and processor discovery are relevant controls; do not invent generated members for this processor |
+| Spring | `spring-web`, `spring-webflux` and `spring-messaging` apply `kotlinx-serialization`. No all-open application was found in this pin. `KotlinSerializationJsonHttpMessageConverterTests` contains `@Serializable SerializableBean` and unannotated `NotSerializableBean` | Compare generated `serializer()` completion with the unannotated negative control. Its declaration is synthetic; inspect IDEA navigation before fixing an expected source range |
+| Gradle | Build logic registers `org.gradle.api.HasImplicitReceiver` for `kotlin-sam-with-receiver`; Java `Action<T>` has that annotation. Kotlin DSL compiler setup also installs the assignment plugin | Verify implicit receiver members in an annotated Java SAM lambda and reject the same receiver in an unannotated control. Assignment behavior is a separate semantic transform |
+
+[KSP generates new code and cannot modify existing source](https://kotlinlang.org/docs/ksp-overview.html).
+[SAM-with-receiver changes how the first Java SAM parameter is exposed to a Kotlin lambda](https://kotlinlang.org/docs/sam-with-receiver-plugin.html).
+[All-open changes class and member openness, including meta-annotations and annotated superclasses](https://kotlinlang.org/docs/all-open-plugin.html).
+[No-arg generates a synthetic constructor callable through reflection, not direct Java/Kotlin calls](https://kotlinlang.org/docs/no-arg-plugin.html).
+These transformations require distinct positive and negative expectations. In
+particular, completion must not advertise `new Foo()` merely because no-arg is
+enabled. Separate disposable fixtures are required for transformations absent
+from the selected real roots.
+
+The proposed incomplete-code slice preserves a compiled disk golden, applies
+buffer-only edits, then checks useful expected members and excluded unrelated
+members for Java and Kotlin: a partial member, a dangling dot, a syntax error in
+an unrelated peer and an unknown receiver alongside a known typed receiver.
+Outgoing `didChange` versions and first responses after a delivery barrier must
+be recorded, then buffers restored and source hashes checked. These cases are
+pending; their RPC correctness phase must remain separate from later actual
+Neovim popup-display measurements.

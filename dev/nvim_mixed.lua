@@ -151,6 +151,7 @@ local function finish()
     failures = failures, server = client and client.server_info, compiler = compiler,
     binary = vim.env.KTLSP_BIN or arg[2], plugin = vim.env.IJLS_PLUGIN,
     server_executable = vim.env.IJLS_SERVER, jdk = vim.env.IJLS_JDK or vim.env.JAVA_HOME,
+    removed_environment_names = probe.removed_environment,
     project = project, maven_repository = maven_repo, neovim = vim.version() }) })
   print(#failures == 0 and '\nALL MIXED CHECKS PASSED' or ('\nFAILED: ' .. table.concat(failures, ', ')))
   vim.cmd(#failures == 0 and 'qa!' or 'cq!')

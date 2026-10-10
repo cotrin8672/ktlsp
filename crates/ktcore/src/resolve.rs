@@ -15,6 +15,7 @@
 //! several wrong ones.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 
 use tree_sitter::{Node, Tree};
 
@@ -227,7 +228,9 @@ pub(crate) fn reference_status_node(
             }
             simple_name_status_a(index, file, src, usage, ancestors, uk, facts, ctx)
         }
-        UseKind::MemberSelector => member_name_status_a(index, file, src, usage, parent, facts, ctx),
+        UseKind::MemberSelector => {
+            member_name_status_a(index, file, src, usage, parent, facts, ctx)
+        }
     }
 }
 
@@ -277,7 +280,16 @@ fn simple_type_name_status_with_ctx(
     if !is_simple_user_type_identifier_in(usage, parent, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleTypeName]);
     }
-    simple_name_status_a(index, file, src, usage, ancestors, UseKind::Type, facts, ctx)
+    simple_name_status_a(
+        index,
+        file,
+        src,
+        usage,
+        ancestors,
+        UseKind::Type,
+        facts,
+        ctx,
+    )
 }
 
 fn is_simple_user_type_identifier_in(usage: Node, parent: Option<Node>, src: &str) -> bool {
@@ -406,7 +418,7 @@ fn member_name_status_a(
         ]);
     };
 
-    let mut reasons = hierarchy_package_reasons(index, root, root_pkg, recv_ty.container(), facts);
+    let mut reasons = hierarchy_package_reasons(index, &recv_ty, facts);
     reasons.extend(visible_package_reasons_with_ctx(
         file,
         name,
@@ -516,35 +528,37 @@ fn imported_external_name_with_ctx(name: &str, current_pkg: &str, imports: &[Imp
 
 fn hierarchy_package_reasons(
     index: &Index,
-    root: &str,
-    root_pkg: &str,
-    root_container: Option<&str>,
+    receiver: &Type,
     facts: &CompletenessFacts,
 ) -> Vec<IncompletenessReason> {
     let mut reasons = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut frontier = vec![(
-        qualified_type_key(root, root_container),
-        root_pkg.to_string(),
-    )];
-    while let Some((name, pkg)) = frontier.pop() {
-        if !visited.insert(format!("{pkg}:{name}")) {
-            continue;
-        }
+    let root_pkg = receiver.package().unwrap_or_default();
+    let _ = infer::walk_supertypes(index, receiver, 32, |current| {
+        let Some(name) = current.name() else {
+            reasons.push(IncompletenessReason::UnknownReceiverType);
+            return ControlFlow::Continue(());
+        };
+        let Some(pkg) = current.package() else {
+            reasons.push(IncompletenessReason::AmbiguousReceiverTypePackage(
+                name.to_string(),
+            ));
+            return ControlFlow::Continue(());
+        };
         let entries: Vec<&Entry> = index
-            .lookup_type(&name)
+            .lookup_type(name)
             .into_iter()
-            .filter(|e| e.sym.package == pkg)
+            .filter(|e| e.sym.package == pkg && e.sym.container.as_deref() == current.container())
             .collect();
         if entries.is_empty() {
             reasons.push(IncompletenessReason::ReceiverTypeNotIndexed(format!(
-                "{pkg}.{name}"
+                "{pkg}.{}",
+                infer::receiver_root_key(index, current).unwrap_or_else(|| name.to_string())
             )));
-            continue;
+            return ControlFlow::Continue(());
         }
         for entry in &entries {
             package_world_reasons(
-                &pkg,
+                pkg,
                 Some(*entry),
                 entry.path.as_ref(),
                 root_pkg,
@@ -552,15 +566,8 @@ fn hierarchy_package_reasons(
                 &mut reasons,
             );
         }
-        for sup in index.supertypes_of_in(&name, Some(&pkg)) {
-            let sup_pkg = if index.lookup_type(&sup).iter().any(|e| e.sym.package == pkg) {
-                pkg.clone()
-            } else {
-                pkg.clone()
-            };
-            frontier.push((sup, sup_pkg));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     dedup_reasons(&mut reasons);
     reasons
 }
@@ -646,13 +653,13 @@ pub fn member_call_completeness_reasons(
     let Some(root) = recv_ty.name() else {
         return vec![IncompletenessReason::UnknownReceiverType];
     };
-    let Some(root_pkg) = recv_ty.package() else {
+    let Some(_) = recv_ty.package() else {
         return vec![IncompletenessReason::AmbiguousReceiverTypePackage(
             root.to_string(),
         )];
     };
 
-    let mut reasons = hierarchy_package_reasons(index, root, root_pkg, recv_ty.container(), facts);
+    let mut reasons = hierarchy_package_reasons(index, &recv_ty, facts);
     reasons.extend(visible_package_reasons(file, tree, src, name, facts));
     dedup_reasons(&mut reasons);
     reasons
@@ -698,13 +705,13 @@ pub(crate) fn member_call_completeness_reasons_in(
     let Some(root) = recv_ty.name() else {
         return vec![IncompletenessReason::UnknownReceiverType];
     };
-    let Some(root_pkg) = recv_ty.package() else {
+    let Some(_) = recv_ty.package() else {
         return vec![IncompletenessReason::AmbiguousReceiverTypePackage(
             root.to_string(),
         )];
     };
 
-    let mut reasons = hierarchy_package_reasons(index, root, root_pkg, recv_ty.container(), facts);
+    let mut reasons = hierarchy_package_reasons(index, &recv_ty, facts);
     reasons.extend(visible_package_reasons_with_ctx(
         file,
         name,
@@ -719,36 +726,6 @@ pub(crate) fn member_call_completeness_reasons_in(
 fn push_visible_package(out: &mut Vec<String>, package: String) {
     if !out.iter().any(|p| p == &package) {
         out.push(package);
-    }
-}
-
-fn qualified_type_key(name: &str, container: Option<&str>) -> String {
-    match container {
-        Some(container) => format!("{container}.{name}"),
-        None => name.to_string(),
-    }
-}
-
-fn receiver_root_key(
-    index: &Index,
-    ty_name: &str,
-    ty_pkg: Option<&str>,
-    ty_container: Option<&str>,
-) -> String {
-    if let Some(container) = ty_container {
-        return qualified_type_key(ty_name, Some(container));
-    }
-    let Some(pkg) = ty_pkg else {
-        return ty_name.to_string();
-    };
-    let matches = index
-        .lookup_type(ty_name)
-        .into_iter()
-        .filter(|entry| entry.sym.package == pkg)
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [only] => qualified_type_key(ty_name, only.sym.container.as_deref()),
-        _ => ty_name.to_string(),
     }
 }
 
@@ -899,7 +876,8 @@ pub(crate) fn goto_node_with_ctx(
     if let Some(def) = resolve_local_a(ident, ancestors, name, uk, src, file) {
         return vec![def];
     }
-    if let Some(defs) = resolve_implicit_receiver_member_with_ctx_a(index, ancestors, name, src, ctx)
+    if let Some(defs) =
+        resolve_implicit_receiver_member_with_ctx_a(index, ancestors, name, src, ctx)
     {
         if !defs.is_empty() {
             return defs;
@@ -963,17 +941,7 @@ fn resolve_implicit_receiver_member_with_ctx_a(
 ) -> Option<Vec<Def>> {
     let receivers = infer::implicit_receiver_types_with_ancestors(index, ancestors, src, &ctx, 0);
     for recv_ty in receivers {
-        let Some(ty_name) = recv_ty.name() else {
-            continue;
-        };
-        let hits = member_defs(
-            index,
-            &receiver_root_key(index, ty_name, recv_ty.package(), recv_ty.container()),
-            recv_ty.package(),
-            name,
-            &ctx.imports,
-            &ctx.package,
-        );
+        let hits = member_defs_for_type(index, &recv_ty, name, &ctx.imports, &ctx.package);
         if !hits.is_empty() {
             return Some(hits);
         }
@@ -1055,26 +1023,6 @@ fn resolve_member_with_ctx(
     }
 }
 
-pub fn member_defs_for_type(
-    index: &Index,
-    ty: &Type,
-    name: &str,
-    imports: &[Import],
-    current_pkg: &str,
-) -> Vec<Def> {
-    let Some(ty_name) = ty.name() else {
-        return Vec::new();
-    };
-    member_defs(
-        index,
-        &receiver_root_key(index, ty_name, ty.package(), ty.container()),
-        ty.package(),
-        name,
-        imports,
-        current_pkg,
-    )
-}
-
 fn member_exists_in(
     index: &Index,
     _selector: Node,
@@ -1087,15 +1035,8 @@ fn member_exists_in(
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
                 let ty = infer::infer(index, receiver, src, ctx);
-                if let Some(ty_name) = ty.name() {
-                    if member_entries_exist(
-                        index,
-                        &receiver_root_key(index, ty_name, ty.package(), ty.container()),
-                        ty.package(),
-                        name,
-                        &ctx.imports,
-                        &ctx.package,
-                    ) {
+                if ty.name().is_some() {
+                    if member_entries_exist(index, &ty, name, &ctx.imports, &ctx.package) {
                         return true;
                     }
                 }
@@ -1105,30 +1046,28 @@ fn member_exists_in(
     index.lookup_by_name(name).len() == 1
 }
 
-/// All definitions of a member named `name` reachable on type `ty` (package `ty_pkg` when known):
+/// All definitions of a member named `name` reachable on type `ty`:
 /// own members, members inherited through the supertype closure, and extensions keyed on the type
 /// or a supertype. Package-filtered so a same-named type in a different package can't contribute.
 /// Bounded against deep / cyclic hierarchies.
-fn member_defs(
+pub fn member_defs_for_type(
     index: &Index,
-    ty: &str,
-    ty_pkg: Option<&str>,
+    ty: &Type,
     name: &str,
     imports: &[Import],
     current_pkg: &str,
 ) -> Vec<Def> {
+    if ty.name().is_none() {
+        return Vec::new();
+    }
     let mut out: Vec<&Entry> = Vec::new();
-    let mut visited: std::collections::HashSet<(String, Option<String>)> =
-        std::collections::HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> =
-        vec![(ty.to_string(), ty_pkg.map(str::to_string), 0)];
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
-            continue;
-        }
+    let _ = infer::walk_supertypes(index, ty, 32, |current| {
+        let Some(cur) = infer::receiver_root_key(index, current) else {
+            return ControlFlow::Continue(());
+        };
         for e in index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = current.package() {
+                if e.sym.package != p {
                     continue;
                 }
             }
@@ -1141,22 +1080,8 @@ fn member_defs(
                 out.push(e);
             }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            // Prefer a same-package supertype; otherwise leave unfiltered rather than guess.
-            let sup_pkg = match &cur_pkg {
-                Some(p)
-                    if index
-                        .lookup_by_name(&sup)
-                        .iter()
-                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
-                {
-                    Some(p.clone())
-                }
-                _ => None,
-            };
-            frontier.push((sup, sup_pkg, depth + 1));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     for e in generic_receiver_extensions(index, name, imports, current_pkg) {
         out.push(e);
     }
@@ -1165,51 +1090,33 @@ fn member_defs(
 
 fn member_entries_exist(
     index: &Index,
-    ty: &str,
-    ty_pkg: Option<&str>,
+    ty: &Type,
     name: &str,
     imports: &[Import],
     current_pkg: &str,
 ) -> bool {
-    let mut visited: std::collections::HashSet<(String, Option<String>)> =
-        std::collections::HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> =
-        vec![(ty.to_string(), ty_pkg.map(str::to_string), 0)];
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
-            continue;
-        }
+    let walked = infer::walk_supertypes(index, ty, 32, |current| {
+        let Some(cur) = infer::receiver_root_key(index, current) else {
+            return ControlFlow::Continue(());
+        };
         for e in index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = current.package() {
+                if e.sym.package != p {
                     continue;
                 }
             }
             if e.sym.name == name {
-                return true;
+                return ControlFlow::Break(());
             }
         }
         for e in index.extensions_for(&cur) {
             if e.sym.name == name && extension_is_visible(e, imports, current_pkg) {
-                return true;
+                return ControlFlow::Break(());
             }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            let sup_pkg = match &cur_pkg {
-                Some(p)
-                    if index
-                        .lookup_by_name(&sup)
-                        .iter()
-                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
-                {
-                    Some(p.clone())
-                }
-                _ => None,
-            };
-            frontier.push((sup, sup_pkg, depth + 1));
-        }
-    }
-    !generic_receiver_extensions(index, name, imports, current_pkg).is_empty()
+        ControlFlow::Continue(())
+    });
+    walked.is_break() || !generic_receiver_extensions(index, name, imports, current_pkg).is_empty()
 }
 
 fn generic_receiver_extensions<'a>(
@@ -1262,7 +1169,6 @@ pub(crate) fn enclosing_type_name(node: Node, src: &str) -> Option<String> {
     }
     None
 }
-
 
 fn decl_in_scope<'t>(
     scope: Node<'t>,
@@ -1561,7 +1467,12 @@ fn is_specific_main_source_set(source_set: &str) -> bool {
     source_set.ends_with("Main") && source_set != "Main" && source_set != "commonMain"
 }
 
-fn resolve_import_target_a(index: &Index, usage: Node, ancestors: &[Node], src: &str) -> Option<Vec<Def>> {
+fn resolve_import_target_a(
+    index: &Index,
+    usage: Node,
+    ancestors: &[Node],
+    src: &str,
+) -> Option<Vec<Def>> {
     let import = ancestor_of_kind_a(ancestors, "import")?;
     let qid = child_of_kind(import, "qualified_identifier")?;
     let parts = direct_identifier_parts(qid, src);

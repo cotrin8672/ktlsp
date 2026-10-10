@@ -14,6 +14,23 @@ const OTHER: &str = "package app\nclass Other {\n fun usefulWrong() {}\n}\n";
 const JAVA_BOX: &str = "package app; public class Box<T> { public T get() { return null; } }";
 const KOTLIN_BOX: &str =
     "package app\nclass KotlinBox<T> {\n fun get(): T = error(\"fixture\")\n}\n";
+const IMPORTED_BASE: &str = "package base; public class Base { public void baseOnly() {} public void accept(String value) {} }";
+const WRONG_BASE: &str = "package app; public class Base { public void baseWrong() {} public void accept(int value) {} }";
+const JAVA_CHILD: &str = "package app; import base.Base; public class Child extends Base {}";
+const KOTLIN_CHILD: &str = "package app\nimport base.Base\nclass KotlinChild : Base()\n";
+const JAVA_CHILD_USE: &str = "package app; class Use { void run(Child child, KotlinChild kotlin) { child.baseOnly(); child.accept(\"ok\"); kotlin.baseOnly(); kotlin.accept(\"ok\"); } }";
+const KOTLIN_CHILD_USE: &str = "package app\nfun run(child: Child, kotlin: KotlinChild) { child.baseOnly(); child.accept(\"ok\"); kotlin.baseOnly(); kotlin.accept(\"ok\") }\n";
+
+fn imported_superclass_workspace() -> Workspace {
+    workspace(&[
+        ("base/Base.java", IMPORTED_BASE),
+        ("app/Base.java", WRONG_BASE),
+        ("app/Child.java", JAVA_CHILD),
+        ("app/KotlinChild.kt", KOTLIN_CHILD),
+        ("app/Use.java", JAVA_CHILD_USE),
+        ("app/Use.kt", KOTLIN_CHILD_USE),
+    ])
+}
 
 fn workspace(files: &[(&str, &str)]) -> Workspace {
     let mut ws = Workspace::new();
@@ -441,4 +458,280 @@ fn ambiguous_imported_type_arguments_do_not_merge_unrelated_members() {
     for file in ["Use.kt", "Use.java"] {
         assert!(labels(&mut ws, file, "factory.make().get().use").is_empty());
     }
+}
+
+#[test]
+fn imported_superclass_completion_uses_the_declarations_own_imports() {
+    let mut ws = imported_superclass_workspace();
+    for file in ["app/Use.java", "app/Use.kt"] {
+        for receiver in ["child", "kotlin"] {
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.ba"),
+                "baseOnly",
+                "baseWrong",
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_superclass_navigation_uses_the_declarations_own_imports() {
+    let mut ws = imported_superclass_workspace();
+    for file in ["app/Use.java", "app/Use.kt"] {
+        let source = ws.doc_text(file).unwrap();
+        for receiver in ["child", "kotlin"] {
+            for member in ["baseOnly", "accept"] {
+                let offset =
+                    source.find(&format!("{receiver}.{member}")).unwrap() + receiver.len() + 1;
+                let defs = ws.goto_definition(file, offset);
+                assert_eq!(defs.len(), 1, "{file} {receiver}.{member}: {defs:?}");
+                assert_eq!(
+                    defs[0].file, "base/Base.java",
+                    "{file} {receiver}.{member}: {defs:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_superclass_call_diagnostics_use_the_declarations_own_imports() {
+    let mut ws = imported_superclass_workspace();
+    ws.assume_index_complete_for_tests();
+    for file in ["app/Use.java", "app/Use.kt"] {
+        assert!(
+            ws.diagnostics(file).is_empty(),
+            "{file}: {:?}",
+            ws.diagnostics(file)
+        );
+    }
+}
+
+#[test]
+fn unsaved_superclass_import_edits_update_both_languages() {
+    let mut ws = imported_superclass_workspace();
+    for (declaration, changed, receiver) in [
+        (
+            "app/Child.java",
+            JAVA_CHILD.replace("import base.Base", "import app.Base"),
+            "child",
+        ),
+        (
+            "app/KotlinChild.kt",
+            KOTLIN_CHILD.replace("import base.Base", "import app.Base"),
+            "kotlin",
+        ),
+    ] {
+        for file in ["app/Use.java", "app/Use.kt"] {
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.ba"),
+                "baseOnly",
+                "baseWrong",
+            );
+        }
+        ws.change(declaration, changed);
+        for file in ["app/Use.java", "app/Use.kt"] {
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.ba"),
+                "baseWrong",
+                "baseOnly",
+            );
+            let source = ws.doc_text(file).unwrap();
+            let offset = source.find(&format!("{receiver}.accept")).unwrap() + receiver.len() + 1;
+            let defs = ws.goto_definition(file, offset);
+            assert_eq!(defs.len(), 1, "{file}: {defs:?}");
+            assert_eq!(
+                defs[0].file, "app/Base.java",
+                "stale superclass after {declaration} edit"
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_imported_superclass_facts_keep_member_absence_unknown() {
+    use ktlsp::resolve::{self, CompletenessFacts, ResolutionStatus};
+    let mut ws = workspace(&[
+        ("app/Base.java", WRONG_BASE),
+        ("app/Child.java", JAVA_CHILD),
+        ("app/KotlinChild.kt", KOTLIN_CHILD),
+        ("app/Use.kt", KOTLIN_CHILD_USE),
+    ]);
+    ws.assume_index_complete_for_tests();
+    let source = ws.doc_text("app/Use.kt").unwrap();
+    let tree = KotlinParser::new().parse(&source);
+    let offset = source.find("child.baseOnly").unwrap() + "child.".len();
+    let usage = ktlsp::parser::identifier_at(&tree, offset).unwrap();
+    let status = resolve::reference_status(
+        &ws.index,
+        "app/Use.kt",
+        &tree,
+        &source,
+        usage,
+        &CompletenessFacts::complete(),
+    );
+    assert!(
+        matches!(status, ResolutionStatus::Unknown(_)),
+        "missing superclass: {status:?}"
+    );
+    assert!(
+        ws.diagnostics("app/Use.kt").is_empty(),
+        "missing dependency symbols cannot prove an invalid call"
+    );
+}
+
+#[test]
+fn imported_superclass_invalid_arguments_still_report_call_errors() {
+    use ktlsp::diagnostics::DiagnosticCode;
+    let mut ws = imported_superclass_workspace();
+    ws.assume_index_complete_for_tests();
+    for (file, source) in [
+        ("app/Use.java", JAVA_CHILD_USE),
+        ("app/Use.kt", KOTLIN_CHILD_USE),
+    ] {
+        ws.change(file, source.replace("\"ok\"", "1"));
+        let diagnostics = ws.diagnostics(file);
+        assert_eq!(diagnostics.len(), 2, "{file}: {diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == Some(DiagnosticCode::CallShapeMismatch)),
+            "{file}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn imported_superclass_library_completeness_follows_its_actual_package() {
+    use ktlsp::index::Tier;
+    use ktlsp::resolve::{self, CompletenessFacts, IncompletenessReason};
+    let mut ws = imported_superclass_workspace();
+    ws.index.replace_file(
+        "base/Base.java",
+        java::extract_symbols(&JavaParser::new().parse(IMPORTED_BASE), IMPORTED_BASE),
+        Tier::Durable,
+    );
+    let source = ws.doc_text("app/Use.kt").unwrap();
+    let tree = KotlinParser::new().parse(&source);
+    let offset = source.find("child.accept").unwrap() + "child.".len();
+    let usage = ktlsp::parser::identifier_at(&tree, offset).unwrap();
+    let facts = CompletenessFacts {
+        library_index_complete: false,
+        ..CompletenessFacts::complete()
+    };
+    let reasons = resolve::member_call_completeness_reasons(
+        &ws.index,
+        "app/Use.kt",
+        &tree,
+        &source,
+        usage,
+        &facts,
+    );
+    assert!(
+        reasons.contains(&IncompletenessReason::LibraryPackageIncomplete(
+            "base".into()
+        )),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn recovered_this_completion_keeps_typed_superclasses_and_later_own_members() {
+    let java_child = "package app; import base.Base; public class Child extends Base { void run() { this. } void javaOwn() {} }";
+    let kotlin_child = "package app\nimport base.Base\nclass KotlinChild : Base() {\n fun run() { this. }\n fun kotlinOwn() {}\n}\n";
+    let mut ws = workspace(&[
+        ("base/Base.java", IMPORTED_BASE),
+        ("app/Base.java", WRONG_BASE),
+        ("app/Child.java", java_child),
+        ("app/KotlinChild.kt", kotlin_child),
+    ]);
+    for (file, own, unrelated) in [
+        ("app/Child.java", "javaOwn", "kotlinOwn"),
+        ("app/KotlinChild.kt", "kotlinOwn", "javaOwn"),
+    ] {
+        let original = ws.doc_text(file).unwrap();
+        let candidates = labels(&mut ws, file, "this.");
+        assert!(candidates.contains("baseOnly"), "{file}: {candidates:?}");
+        assert!(
+            candidates.contains(own),
+            "later recovered own member missing in {file}: {candidates:?}"
+        );
+        assert!(
+            !candidates.contains("baseWrong"),
+            "wrong same-package superclass in {file}: {candidates:?}"
+        );
+        assert!(
+            !candidates.contains(unrelated),
+            "unrelated type member in {file}: {candidates:?}"
+        );
+        assert_eq!(
+            ws.doc_text(file).unwrap(),
+            original,
+            "recovery must preserve canonical source"
+        );
+    }
+}
+
+#[test]
+fn qualified_nested_superclasses_keep_package_and_container_identity() {
+    let mut ws = imported_superclass_workspace();
+    ws.open("base/Outer.java", "package base; public class Outer { public static class Base { public void baseOnly() {} public void accept(String value) {} } }".into());
+    ws.open("base/OtherOuter.java", "package base; public class OtherOuter { public static class Base { public void baseWrong() {} public void accept(int value) {} } }".into());
+    ws.change(
+        "app/Child.java",
+        "package app; public class Child extends base.Outer.Base {}".into(),
+    );
+    ws.change(
+        "app/KotlinChild.kt",
+        "package app\nclass KotlinChild : base.Outer.Base()\n".into(),
+    );
+    ws.assume_index_complete_for_tests();
+    for file in ["app/Use.java", "app/Use.kt"] {
+        let source = ws.doc_text(file).unwrap();
+        for receiver in ["child", "kotlin"] {
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.ba"),
+                "baseOnly",
+                "baseWrong",
+            );
+            let offset = source.find(&format!("{receiver}.accept")).unwrap() + receiver.len() + 1;
+            let defs = ws.goto_definition(file, offset);
+            assert_eq!(defs.len(), 1, "{file}: {defs:?}");
+            assert_eq!(defs[0].file, "base/Outer.java", "{file}: {defs:?}");
+        }
+        assert!(
+            ws.diagnostics(file).is_empty(),
+            "{file}: {:?}",
+            ws.diagnostics(file)
+        );
+    }
+}
+
+#[test]
+fn imported_superclass_receiver_lambdas_use_the_declaration_context() {
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM), ("Other.kt", OTHER),
+        ("base/Base.kt", "package base\nimport app.Item\nopen class Base {\n fun withItem(block: Item.() -> Unit) { Item().block() }\n}\n"),
+        ("app/Base.kt", "package app\nopen class Base {\n fun withItem(block: Other.() -> Unit) {}\n}\n"),
+        ("app/Child.java", JAVA_CHILD), ("app/KotlinChild.kt", KOTLIN_CHILD),
+        ("app/Use.kt", "package app\nfun run(child: Child, kotlin: KotlinChild) {\n child.withItem { useful() }\n kotlin.withItem { useful() }\n}\n"),
+    ]);
+    ws.assume_index_complete_for_tests();
+    for receiver in ["child", "kotlin"] {
+        let prefix = format!("{receiver}.withItem {{ use");
+        assert_member(&mut ws, "app/Use.kt", &prefix, "useful", "usefulWrong");
+    }
+    let diagnostics = ws.diagnostics("app/Use.kt");
+    assert!(
+        diagnostics.is_empty(),
+        "valid inherited receiver lambda: {diagnostics:?}"
+    );
 }
