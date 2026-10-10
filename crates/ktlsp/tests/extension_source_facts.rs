@@ -5,10 +5,21 @@ use ktlsp::index::{Index, Tier};
 use ktlsp::language::{self, LanguageParsers, SourceLanguage};
 
 fn facts(file: &str, source: &str) -> Vec<SourceDeclaration> {
-    let language = SourceLanguage::for_key(file);
-    let tree = LanguageParsers::new().parse(language, source);
-    let file_facts = language::file_facts(language, &tree, source);
+    facts_with_types(file, source, &[])
+}
+
+fn facts_with_types(file: &str, source: &str, types: &[(&str, &str)]) -> Vec<SourceDeclaration> {
     let mut index = Index::new();
+    let mut parsers = LanguageParsers::new();
+    for &(file, source) in types {
+        let language = SourceLanguage::for_key(file);
+        let tree = parsers.parse(language, source);
+        let file_facts = language::file_facts(language, &tree, source);
+        index.replace_file(file, file_facts.symbols, Tier::Volatile);
+    }
+    let language = SourceLanguage::for_key(file);
+    let tree = parsers.parse(language, source);
+    let file_facts = language::file_facts(language, &tree, source);
     index.replace_file(file, file_facts.symbols, Tier::Volatile);
     language::extension_source_facts(&index, file, &tree, source)
 }
@@ -235,5 +246,66 @@ fn java_post_name_dimensions_do_not_become_scalar_signatures() {
             ),
             "{name}"
         );
+    }
+}
+
+// The real JDK 17 and Kotlin 1.8.21 source reduction has these two top-level identities.
+const STRING_TYPES: &[(&str, &str)] = &[
+    ("KotlinString.kt", "package kotlin\nclass String\n"),
+    (
+        "JavaString.java",
+        "package java.lang; public final class String {}",
+    ),
+];
+
+#[test]
+fn mixed_jdk_kotlin_string_signatures_are_known_in_both_languages() {
+    for (file, source) in [
+        ("Target.kt", "package oracle\nclass Target {\n fun twice(value: Int): Int = value * 2\n fun twice(value: String): String = value\n}\n"),
+        ("Target.java", "package oracle; class Target { int twice(int value) { return value * 2; } String twice(String value) { return value; } }"),
+    ] {
+        let facts = facts_with_types(file, source, STRING_TYPES);
+        let signatures: Vec<_> = facts.iter()
+            .filter(|fact| &source[fact.definition.start_byte..fact.definition.end_byte] == "twice")
+            .map(descriptor)
+            .collect();
+        assert_eq!(signatures, ["(I)I", "(Ljava/lang/String;)Ljava/lang/String;"], "{file}");
+    }
+}
+
+#[test]
+fn user_string_declarations_and_imports_do_not_become_jvm_builtins() {
+    for (file, source) in [
+        ("Target.kt", "package oracle\nclass String\nclass Target { fun probe(value: String): String = value }\n"),
+        ("Target.java", "package oracle; class String {} class Target { String probe(String value) { return value; } }"),
+        ("Target.kt", "package oracle\nimport other.String\nclass Target { fun probe(value: String): String = value }\n"),
+        ("Target.java", "package oracle; import other.String; class Target { String probe(String value) { return value; } }"),
+        ("Target.kt", "package oracle\nimport other.String as Text\nclass Target { fun probe(value: Text): Text = value }\n"),
+        ("Target.kt", "package oracle\nimport other.*\nclass Target { fun probe(value: String): String = value }\n"),
+        ("Target.kt", "package oracle\nclass Target { class String\n fun probe(value: String): String = value }\n"),
+        ("Target.java", "package oracle; class Target { class String {} String probe(String value) { return value; } }"),
+    ] {
+        let mut types = STRING_TYPES.to_vec();
+        types.push(("OtherString.kt", "package other\nclass String\n"));
+        let facts = facts_with_types(file, source, &types);
+        assert!(matches!(named(&facts, source, "probe").member.as_ref().unwrap().signature, Knowledge::Unknown(_)), "{file}: {source}");
+    }
+}
+
+#[test]
+fn nested_java_lang_string_is_not_the_top_level_jvm_builtin() {
+    let types = &[
+        ("KotlinString.kt", "package kotlin\nclass String\n"),
+        (
+            "JavaString.java",
+            "package java.lang; public class Outer { public class String {} }",
+        ),
+    ];
+    for (file, source) in [
+        ("Target.kt", "package oracle\nimport java.lang.Outer.String\nclass Target { fun probe(value: String): String = value }\n"),
+        ("Target.java", "package oracle; import java.lang.Outer.String; class Target { String probe(String value) { return value; } }"),
+    ] {
+        let facts = facts_with_types(file, source, types);
+        assert!(matches!(named(&facts, source, "probe").member.as_ref().unwrap().signature, Knowledge::Unknown(_)), "{file}");
     }
 }

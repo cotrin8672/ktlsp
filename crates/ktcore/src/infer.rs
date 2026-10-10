@@ -2330,7 +2330,7 @@ pub(crate) fn type_head_is_known(index: &dyn InferenceIndex, ty: &Type) -> bool 
     })
 }
 
-fn primitive_type_name(name: &str) -> &str {
+pub(crate) fn primitive_type_name(name: &str) -> &str {
     match name {
         "int" => "Int",
         "long" => "Long",
@@ -2929,6 +2929,10 @@ pub(crate) fn is_intrinsic_type_ref(
     }
     !index.lookup_type(&tr.name).iter().any(|entry| {
         entry.sym.package != "kotlin"
+            // The top-level JVM String represents Kotlin String, not a competing user type.
+            && !(tr.name == "String"
+                && entry.sym.package == "java.lang"
+                && entry.sym.container.is_none())
             && if tr.package_candidates.is_empty() {
                 entry.sym.package == ctx.package
                     || ctx

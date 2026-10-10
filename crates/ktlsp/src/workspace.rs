@@ -2,7 +2,7 @@
 //! the LSP layer drives. All keys are the caller's canonical identity string (a path or URI
 //! string); we never re-derive identity from the filesystem at query time.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -41,6 +41,7 @@ struct ProjectFileIndex {
     key: String,
     package: String,
     symbols: Vec<IndexedSymbol>,
+    jvm: Option<ktcore::jvm::SourceFileFacts>,
     usages: Vec<Usage>,
     clean: bool,
     stamp: Option<SourceStamp>,
@@ -312,6 +313,8 @@ impl Workspace {
             );
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
+            self.index
+                .replace_jvm_source(&batch.key, batch.jvm, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
             self.salsa.forget(&batch.key);
             self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
@@ -442,7 +445,13 @@ impl Workspace {
         if metadata_changed {
             self.analysis_extensions.mark_index_changed();
         }
-        self.index_dependency_file(&batch.file, batch.symbols)
+        if self.index_dependency_file(&batch.file, batch.symbols) {
+            self.index
+                .replace_jvm_source(&batch.file, batch.jvm, Tier::Durable);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn index_dependency_batch_for_generation(
@@ -563,6 +572,8 @@ impl Workspace {
             self.index.set_file_origin(key, origin);
         }
         self.index.replace_file(key, facts.symbols, Tier::Volatile);
+        self.index
+            .replace_jvm_source(key, facts.jvm, Tier::Volatile);
         self.index.replace_file_refs(key, facts.usages);
         self.bump_index_revision();
         self.record_project_file_meta(key, facts.package, facts.clean);
@@ -628,9 +639,9 @@ impl Workspace {
             self.recompute_project_completeness();
             return;
         }
-        match std::fs::read_to_string(key) {
-            Ok(text) => self.reindex(key, &text),
-            Err(_) => {
+        match self.doc_text(key) {
+            Some(text) => self.reindex(key, &text),
+            None => {
                 self.index.remove_file(key);
                 self.analysis_extensions.remove_source(&self.index, key);
                 self.annotated_type_owners.remove(key);
@@ -700,6 +711,8 @@ impl Workspace {
             }
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
+            self.index
+                .replace_jvm_source(&batch.key, batch.jvm, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
             self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
             if !self.analysis_extensions.is_empty() {
@@ -1255,7 +1268,36 @@ impl Workspace {
                 },
             });
         }
+        if let Some(member) = self.jvm_rename_subject(key, offset) {
+            let fixed = member.fixed_name.as_ref()?;
+            member.identity.as_ref()?;
+            if member.tier == Tier::Durable {
+                return None;
+            }
+            let range = if fixed.definition.file == key
+                && fixed.definition.start_byte <= offset
+                && offset <= fixed.definition.end_byte
+            {
+                fixed.definition.clone()
+            } else {
+                let site = self.index.lookup_refs(&member.name).iter().find(|site| {
+                    site.path.as_ref() == key
+                        && site.start_byte <= offset
+                        && offset <= site.end_byte
+                })?;
+                Def {
+                    file: key.into(),
+                    start_byte: site.start_byte,
+                    end_byte: site.end_byte,
+                }
+            };
+            return Some(crate::rename::PreparedRename {
+                range,
+                placeholder: member.name,
+            });
+        }
         let target = self.rename_target(key, offset)?;
+        self.rename_member_family(&target)?;
         let text = self.doc_text(&target.file)?;
         let placeholder = text.get(target.start_byte..target.end_byte)?.to_string();
         Some(crate::rename::PreparedRename {
@@ -1277,16 +1319,377 @@ impl Workspace {
         if let Some(subject) = self.extension_rename_subject(key, offset) {
             return self.rename_contribution(key, offset, subject, new_name);
         }
+        if let Some(member) = self.jvm_rename_subject(key, offset) {
+            return self.rename_jvm_alias(key, offset, member, new_name);
+        }
         let target = self.rename_target(key, offset)?;
         let name = self.name_at(key, offset)?;
         if self.index.lookup_refs(&name).len() > RENAME_REF_CAP {
             return None;
         }
-        let refs = self.references(key, offset, true);
+        let family = self.rename_member_family(&target)?;
+        if family.len() > 1 {
+            let candidates = self.index.lookup_refs(&name).to_vec();
+            for candidate in candidates {
+                let definitions = self.goto_definition(&candidate.path, candidate.start_byte);
+                if definitions.len() > 1
+                    && definitions
+                        .iter()
+                        .any(|definition| family.contains(definition))
+                {
+                    return None;
+                }
+            }
+        }
+        let mut refs = BTreeSet::new();
+        for member in family {
+            for site in self.references(&member.file, member.start_byte, true) {
+                // A fixed JVM export name is independent of the authored Kotlin identifier.
+                if self
+                    .jvm_member_at(&site.file, site.start_byte)
+                    .is_none_or(|member| member.fixed_name.is_none())
+                {
+                    refs.insert(site);
+                }
+            }
+        }
         if refs.is_empty() || !refs.iter().any(|r| *r == target) {
             return None;
         }
-        let edits = crate::rename::edits_for_refs(refs, new_name);
+        let edits = crate::rename::edits_for_refs(refs.into_iter().collect(), new_name);
+        crate::edit::validate_non_overlapping(&edits).ok()?;
+        for file in edits
+            .iter()
+            .map(|edit| edit.file.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            if self
+                .index
+                .entries_for_file(&file)
+                .iter()
+                .any(|entry| entry.tier == Tier::Durable)
+                || !language::is_valid_identifier(SourceLanguage::for_key(&file), new_name)
+            {
+                return None;
+            }
+            crate::edit::apply_to_text(&file, &self.doc_text(&file)?, &edits).ok()?;
+        }
+        Some(edits)
+    }
+
+    fn rename_member_family(&mut self, target: &Def) -> Option<Vec<Def>> {
+        use ktcore::extensions::{Dispatch, Visibility};
+        let Some(entry) = hierarchy::entry_for_name_range(
+            &self.index,
+            &target.file,
+            target.start_byte,
+            target.end_byte,
+        ) else {
+            return Some(vec![target.clone()]);
+        };
+        if entry.sym.kind != SymbolKind::Function || entry.sym.container.is_none() {
+            return Some(vec![target.clone()]);
+        }
+        let mut source_facts = BTreeMap::new();
+        let flags = self
+            .rename_member_facts(&entry, &mut source_facts)
+            .and_then(|facts| facts.member);
+        if flags.is_some_and(|facts| {
+            matches!(facts.dispatch, Knowledge::Found(Dispatch::Static))
+                || matches!(facts.visibility, Knowledge::Found(Visibility::Private))
+        }) {
+            return Some(vec![target.clone()]);
+        }
+        let candidates: Vec<_> = self
+            .index
+            .lookup_by_name(&entry.sym.name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.sym.kind == SymbolKind::Function && candidate.sym.container.is_some()
+            })
+            .cloned()
+            .collect();
+        if candidates.len() > RENAME_REF_CAP {
+            return None;
+        }
+        let mut family = vec![entry];
+        let mut definitions = BTreeSet::from([target.clone()]);
+        let mut next = 0;
+        while next < family.len() {
+            let current = family[next].clone();
+            next += 1;
+            for candidate in &candidates {
+                let definition = rename_definition(candidate);
+                if definitions.contains(&definition) {
+                    continue;
+                }
+                let mut connected = false;
+                for (child, parent) in [(candidate, &current), (&current, candidate)] {
+                    let Some(owner) = self.rename_member_owner(child) else {
+                        return None;
+                    };
+                    let receiver = rename_type(&owner);
+                    let scoped = self.index.scoped_for_file(&child.path);
+                    if !scoped
+                        .lookup_by_name(&parent.sym.name)
+                        .iter()
+                        .any(|visible| rename_definition(visible) == rename_definition(parent))
+                    {
+                        continue;
+                    }
+                    let ctx = infer::FileCtx::new(child.sym.package.clone(), Vec::new());
+                    let relation = ktcore::members::inherited_method_relation(
+                        &scoped, &receiver, child, parent, &ctx,
+                    );
+                    if relation.is_definitely_absent() {
+                        continue;
+                    }
+                    let child_flags = self.rename_member_facts(child, &mut source_facts)?.member?;
+                    let parent_flags = self
+                        .rename_member_facts(parent, &mut source_facts)?
+                        .member?;
+                    let (
+                        Knowledge::Found(child_dispatch),
+                        Knowledge::Found(parent_dispatch),
+                        Knowledge::Found(child_visibility),
+                        Knowledge::Found(parent_visibility),
+                    ) = (
+                        child_flags.dispatch,
+                        parent_flags.dispatch,
+                        child_flags.visibility,
+                        parent_flags.visibility,
+                    )
+                    else {
+                        return None;
+                    };
+                    if child_dispatch != Dispatch::Instance
+                        || parent_dispatch != Dispatch::Instance
+                        || child_visibility == Visibility::Private
+                        || parent_visibility == Visibility::Private
+                        || parent_visibility == Visibility::Package
+                            && child.sym.package != parent.sym.package
+                    {
+                        continue;
+                    }
+                    if !relation.is_found()
+                        || child.tier == Tier::Durable
+                        || parent.tier == Tier::Durable
+                    {
+                        return None;
+                    }
+                    connected = true;
+                }
+                if connected {
+                    definitions.insert(definition);
+                    family.push(candidate.clone());
+                }
+            }
+        }
+        // An inherited implementation can satisfy an unrelated interface owner. Until that edge
+        // has a shared identity, refuse a partial rename whenever a common descendant exposes it.
+        let mut owners = VecDeque::new();
+        for member in &family {
+            owners.push_back(hierarchy::item_from_entry(
+                &self.rename_member_owner(member)?,
+            ));
+        }
+        let mut visited = BTreeSet::new();
+        while let Some(owner) = owners.pop_front() {
+            if !visited.insert((owner.file.clone(), owner.start_byte, owner.end_byte)) {
+                continue;
+            }
+            if visited.len() > RENAME_REF_CAP {
+                return None;
+            }
+            owners.extend(hierarchy::subtypes(&self.index, &owner));
+            let entry = hierarchy::entry_for_name_range(
+                &self.index,
+                &owner.file,
+                owner.start_byte,
+                owner.end_byte,
+            )?;
+            let receiver = rename_type(&entry);
+            let scoped = self.index.scoped_for_file(&owner.file);
+            let ctx = infer::FileCtx::new(owner.package.clone(), Vec::new());
+            let members: Vec<_> =
+                ktcore::members::candidates(&scoped, &receiver, &family[0].sym.name, &ctx)
+                    .members
+                    .into_iter()
+                    .cloned()
+                    .collect();
+            let Some(implementation) = members
+                .iter()
+                .find(|member| definitions.contains(&rename_definition(member)))
+            else {
+                continue;
+            };
+            let signature =
+                ktcore::members::method_signature(&scoped, &receiver, implementation, &ctx);
+            let competing: Vec<_> = members
+                .iter()
+                .filter(|member| {
+                    !definitions.contains(&rename_definition(member))
+                        && member.sym.kind == SymbolKind::Function
+                })
+                .map(|candidate| {
+                    (
+                        candidate.clone(),
+                        ktcore::members::method_signature(&scoped, &receiver, candidate, &ctx),
+                    )
+                })
+                .collect();
+            for (candidate, candidate_signature) in &competing {
+                if implementation
+                    .sym
+                    .arity
+                    .zip(candidate.sym.arity)
+                    .is_some_and(|(own, other)| own != other)
+                    || matches!((&signature, candidate_signature), (Some(own), Some(other)) if own != other)
+                {
+                    continue;
+                }
+                let flags = self
+                    .rename_member_facts(candidate, &mut source_facts)?
+                    .member?;
+                match (flags.dispatch, flags.visibility) {
+                    (Knowledge::Found(Dispatch::Static), _)
+                    | (_, Knowledge::Found(Visibility::Private)) => continue,
+                    (
+                        Knowledge::Found(Dispatch::Instance),
+                        Knowledge::Found(Visibility::Package),
+                    ) if candidate.sym.package != owner.package => continue,
+                    _ => return None,
+                }
+            }
+        }
+        Some(definitions.into_iter().collect())
+    }
+
+    fn rename_member_facts(
+        &mut self,
+        entry: &crate::index::Entry,
+        files: &mut BTreeMap<String, Vec<ktcore::extensions::source::SourceDeclaration>>,
+    ) -> Option<ktcore::extensions::source::SourceDeclaration> {
+        if !files.contains_key(entry.path.as_ref()) {
+            let (text, tree) = if let Some(doc) = self.open_docs.get(entry.path.as_ref()) {
+                (doc.text.clone(), doc.tree.clone())
+            } else {
+                self.parsed_closed_doc(&entry.path)?
+            };
+            let scoped = self.index.scoped_for_file(&entry.path);
+            files.insert(
+                entry.path.to_string(),
+                language::extension_source_facts(&scoped, &entry.path, &tree, &text),
+            );
+        }
+        files
+            .get(entry.path.as_ref())?
+            .iter()
+            .find(|fact| fact.definition == rename_definition(entry))
+            .cloned()
+    }
+
+    fn rename_member_owner(&self, member: &crate::index::Entry) -> Option<crate::index::Entry> {
+        let owner = member.sym.container.as_deref()?;
+        let (container, name) = owner
+            .rsplit_once('.')
+            .map_or((None, owner), |(container, name)| (Some(container), name));
+        let scoped = self.index.scoped_for_file(&member.path);
+        let candidates: Vec<_> = scoped
+            .lookup_type(name)
+            .into_iter()
+            .filter(|entry| {
+                entry.path == member.path
+                    && entry.sym.package == member.sym.package
+                    && entry.sym.container.as_deref() == container
+            })
+            .collect();
+        let [entry] = candidates.as_slice() else {
+            return None;
+        };
+        Some((*entry).clone())
+    }
+
+    fn jvm_member_at(&mut self, key: &str, offset: usize) -> Option<ktcore::jvm::ResolvedMember> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return language::jvm_member_at(
+                &self.index.scoped_for_file(key),
+                key,
+                &doc.text,
+                &doc.tree,
+                offset,
+            );
+        }
+        let (text, tree) = self.parsed_closed_doc(key)?;
+        language::jvm_member_at(&self.index.scoped_for_file(key), key, &text, &tree, offset)
+    }
+
+    fn jvm_rename_subject(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<ktcore::jvm::ResolvedMember> {
+        if let Some(member) = self
+            .jvm_member_at(key, offset)
+            .filter(|member| member.fixed_name.is_some())
+        {
+            return Some(member);
+        }
+        let source = self.index.jvm_source_for_file(key)?;
+        let facts = source.facts.callables.iter().find(|facts| {
+            facts.fixed_name.as_ref().is_some_and(|fixed| {
+                fixed.definition.start_byte <= offset && offset <= fixed.definition.end_byte
+            })
+        })?;
+        ktcore::jvm::CallableCandidate::Jvm {
+            owner: ktcore::jvm::JvmOwner::Source(source),
+            facts,
+        }
+        .resolved(&self.index.scoped_for_file(key))
+    }
+
+    fn rename_jvm_alias(
+        &mut self,
+        key: &str,
+        offset: usize,
+        member: ktcore::jvm::ResolvedMember,
+        new_name: &str,
+    ) -> Option<Vec<crate::edit::TextEdit>> {
+        if member.tier == Tier::Durable {
+            return None;
+        }
+        let identity = member.identity.as_ref()?;
+        let fixed = member.fixed_name.as_ref()?;
+        let target = member.definition.as_ref()?;
+        let source = self.doc_text(&fixed.definition.file)?;
+        // Validate the complete currently accepted annotation, not merely an equal substring.
+        let tree = self
+            .salsa
+            .parsed_tree(&fixed.definition.file, &source, Durability::LOW);
+        let symbols = language::symbol_facts(SourceLanguage::Kotlin, &tree, &source).symbols;
+        let verified = ktcore::jvm::source_facts(&fixed.definition.file, &tree, &source, &symbols)?;
+        if !verified.callables.iter().any(|facts| {
+            facts.definition.as_ref() == Some(target)
+                && facts.name == member.name
+                && facts.fixed_name.as_ref() == Some(fixed)
+        }) {
+            return None;
+        }
+        let mut sites = self.references(&target.file, target.start_byte, false);
+        sites.retain(|site| {
+            self.jvm_member_at(&site.file, site.start_byte)
+                .is_some_and(|candidate| candidate.identity.as_ref() == Some(identity))
+        });
+        // Renaming directly on the annotation has no identifier/goto usage at the cursor.
+        if key != fixed.definition.file
+            && !sites.iter().any(|site| {
+                site.file == key && site.start_byte <= offset && offset <= site.end_byte
+            })
+        {
+            return None;
+        }
+        sites.push(fixed.definition.clone());
+        let edits = crate::rename::edits_for_refs(sites, new_name);
         crate::edit::validate_non_overlapping(&edits).ok()?;
         Some(edits)
     }
@@ -1561,7 +1964,11 @@ impl Workspace {
     }
 
     fn rename_target(&mut self, key: &str, offset: usize) -> Option<Def> {
-        let target = self.goto_definition(key, offset).into_iter().next()?;
+        let definitions = self.goto_definition(key, offset);
+        let [target] = definitions.as_slice() else {
+            return None;
+        };
+        let target = target.clone();
         if self.is_library_def(&target) {
             return None;
         }
@@ -1710,6 +2117,7 @@ impl Workspace {
             active_parameter,
             mut entries,
             unqualified,
+            projected_signatures,
         } = language::signature_entries(
             &self.index.scoped_for_file(key),
             language,
@@ -1730,7 +2138,11 @@ impl Workspace {
                 .cloned()
                 .collect();
         }
-        crate::signature::signatures_for_entries(entries, active_parameter)
+        crate::signature::signatures_for_entries_with_extra(
+            entries,
+            projected_signatures,
+            active_parameter,
+        )
     }
 
     /// `textDocument/publishDiagnostics` source: name-based, high-confidence diagnostics for `key`,
@@ -2077,6 +2489,13 @@ impl Workspace {
         ) {
             names.insert(entry.sym.name.clone());
         }
+        if let Some(source) = self.index.jvm_source_for_file(&target.file) {
+            for callable in &source.facts.callables {
+                if callable.definition.as_ref() == Some(target) {
+                    names.insert(callable.name.clone());
+                }
+            }
+        }
         for (owner, set) in self.analysis_extensions.sets() {
             for resolution in set.requirements() {
                 let Knowledge::Found(binding) = &resolution.binding else {
@@ -2222,6 +2641,29 @@ const MAX_COMPLETIONS: usize = complete::RESULT_CAP;
 
 const RENAME_REF_CAP: usize = 5000;
 
+fn rename_definition(entry: &crate::index::Entry) -> Def {
+    Def {
+        file: entry.path.to_string(),
+        start_byte: entry.sym.start_byte,
+        end_byte: entry.sym.end_byte,
+    }
+}
+
+fn rename_type(entry: &crate::index::Entry) -> crate::types::Type {
+    crate::types::Type::Class {
+        name: entry.sym.name.clone(),
+        package: Some(entry.sym.package.clone()),
+        container: entry.sym.container.clone(),
+        nullable: false,
+        args: entry
+            .sym
+            .type_params
+            .iter()
+            .map(|_| crate::types::Type::Unknown)
+            .collect(),
+    }
+}
+
 /// A symbol's fully-qualified name (`package.name`), or the bare `name` when the package is empty.
 fn fqn(package: &str, name: &str) -> String {
     if package.is_empty() {
@@ -2360,6 +2802,7 @@ fn parse_project_file(path: &Path, parsers: &mut LanguageParsers) -> Option<Proj
         key: crate::paths::file_key(path),
         package: facts.package,
         symbols: facts.symbols,
+        jvm: facts.jvm,
         usages: facts.usages,
         clean: facts.clean,
         stamp: Some(stamp),
@@ -2944,6 +3387,7 @@ mod tests {
         let batch = |parsers: &mut LanguageParsers, key: &str, text: &str| {
             let tree = parsers.parse_for_key(key, text);
             crate::deps::FileSymbols {
+                jvm: None,
                 file: key.to_string(),
                 symbols: language::file_facts(SourceLanguage::for_key(key), &tree, text).symbols,
                 origin: Some(FileOrigin {

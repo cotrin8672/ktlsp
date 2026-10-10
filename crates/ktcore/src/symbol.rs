@@ -122,7 +122,7 @@ impl IndexedSymbol {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Def {
     pub file: String,
     pub start_byte: usize,

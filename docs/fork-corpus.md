@@ -784,3 +784,129 @@ and `cem-working-copy-ktlsp-eighth-{golden,incomplete}-1/artifacts/` under
 `C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-probes-20261010/`.
 Before/after controller guards cover the immutable binary, harness/helpers,
 manifests and every queried, edited peer and expected declaration source.
+
+### Ninth immutable release: CEM direct-supertype repair
+
+The input-matched ninth release is SHA-256
+`e4b726b8920be45ec06941c71c1fc5955bc327c393487ad9d3098b738e7e8ad1`,
+source revision `2b2325e`. The unchanged golden manifest now passes all four
+requests, including the exact Create superclass definition; all six incomplete
+requests and five cases also pass on their first response. Both indexing phases,
+dirty-buffer restoration, graceful shutdown and every source/helper/binary hash
+guard pass.
+
+Both complete runs still exit 1 for dependency coverage: four failed archives
+and three missing sources. The audit distinguishes three readable module-only
+compatibility source archives from one actual non-UTF8 Commons Compress source
+entry. Guava's empty compatibility binary needs no definitions. KFF has no
+top-level classes but contains eight nested JARs; each matches a separately
+selected binary in both main and test by SHA. Product completeness still treats
+that archive conservatively. Patchy's two-class binary still needs source or
+verified binary facts. These observations do not relabel the strict coverage
+assertion as passing.
+
+The later Commons Compress encoding audit follows the exact parent POM's javac
+declaration (`commons-parent:66`, ISO-8859-1), with 404/404 CRC and round-trip
+checks. Actual javac succeeds for the declared encoding and for normalized
+UTF-8 with identical class bytes, while raw UTF-8 fails. Two other source files
+have UTF-8 comment spellings; the policy is a declaration, not per-entry guessing.
+No product conversion has shipped. Evidence is
+`ktlsp-source-encoding-20261011/{archive-audit,javac-controls,other-archive-classification}.json`.
+
+Evidence is `cem-working-copy-ktlsp-ninth2-{golden,incomplete}-1/` under this
+corpus root and `ktlsp-goal-20261010/source-archives-cem/ninth-cem-and-archives.json`.
+The saved model has complete classpaths and four complete configured compiler
+tasks; output freshness is a separate requirement. The other five projects need
+current immutable rechecks, and no performance or aggregate IDEA-parity claim
+follows from this focused CEM result.
+
+### Tenth immutable release: CEM and Retrofit
+
+The input-matched tenth release has SHA-256
+`342dafb060cb7912b58b32a105bb3016f1ca64ae759ec8e926b87e8f95c01ee8`.
+All 270 guarded product inputs match before and after its 998-test Rust run and
+release build. The existing corpus manifests and semantic expectations are
+unchanged. These are concurrent correctness runs, with no latency acceptance.
+
+| Project | Golden requests | Incomplete requests | Incomplete cases | Failed / missing dependency sources | Routed exits |
+| --- | --- | --- | --- | --- | --- |
+| CEM, ordinary code | 4/4 | 6/6 | 5/5 | 1 / 5 | 1 / 1 |
+| Retrofit 2.11.0 | 6/6 | 6/6 | 5/5 | 1 / 5 | 1 / 1 |
+
+Every semantic request matches on its first response after both indexing phases.
+Incomplete-code cases include a useful known receiver paired with the expected
+empty unknown receiver; passing the negative alone earns no case pass. All
+delivered edit/restore controls, source/helper/binary guards and clean shutdown
+checks pass. The independent source-coverage assertion remains the only failure
+in each whole run: CEM golden 8/9 and incomplete 34/35; Retrofit golden 12/13 and
+incomplete 35/36.
+
+CEM retains 5,865 NeoForge source files with 103,029 symbols. Commons Compress's
+non-UTF8 source remains the one failed archive. Missing inputs are Patchy,
+Kotlin stdlib jdk7/jdk8 compatibility modules, coroutines jdk8 and KFF's outer
+nested archive. Readable empty compatibility source archives now succeed as IO,
+but module-bearing binaries still require definition-coverage evidence. The
+selected empty Guava compatibility binary now proves its empty surface. The
+strict missing-input count therefore changes independently of semantic results.
+
+Retrofit now resolves the Kotlin suspend facade and exported `@JvmName` names
+from Java while keeping Kotlin source names intact. Its failed archive is
+`stax:stax:1.2.0`, whose `com/wutka/dtd/Scanner.java` fails strict UTF-8 decoding.
+The five missing inputs are kotlin-stdlib-jdk7/jdk8 1.8.21, stax-api 1.0.1,
+xmlParserAPIs 2.6.2 and xpp3 1.1.3.3. Model extraction and completed indexing do
+not make these source artifacts complete.
+
+Evidence is under `C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-probes-20261010/`:
+`tenth-corpus-controller.json`,
+`cem-working-copy-ktlsp-tenth-{golden,incomplete}-1/artifacts/`,
+`retrofit-tenth-verified-report.json` and its referenced before/after guards.
+Retrofit's guarded final golden run is `tenth-golden-2`; the original golden-1
+controller assertion/interruption and launcher transition are retained separately.
+The corrected external launcher accepts the accurate
+`first-response-after-indexing-with-incomplete-inputs` phase only with independent
+both-index and first-attempt controls. No product probe or expectation was weakened.
+
+Moshi, OkHttp, Spring Framework and Gradle still need current immutable replays.
+The broad tenth Java scenario also exposes an inherited-override incoming-call
+regression; its repair must pass a fresh full/release and editor checkpoint.
+
+### Tenth hierarchy/source-refresh repair: current editor evidence
+
+The subsequent immutable `tenth-fixed-2` release has SHA-256
+`f42d3c6d60fd62e1f4c86916bc7f331bdbb16896acb812cb6e9721300908d331`.
+All 1,019 Rust tests pass, with three ignored; the same 270 inputs match before
+and after tests and release compilation. Its guarded CEM/Retrofit replays retain
+the exact existing manifests, incomplete edits and expected targets:
+
+| Project | Golden requests | Incomplete requests | Whole run checks | Failed / missing sources | Routed exits |
+| --- | --- | --- | --- | --- | --- |
+| CEM, ordinary code | 4/4 | 6/6 | 8/9 and 34/35 | 1 / 5 | 1 / 1 |
+| Retrofit 2.11.0 | 6/6 | 6/6 | 12/13 and 35/36 | 1 / 5 | 1 / 1 |
+
+All 22 semantic requests match on the first response, with both indexing phases
+complete. Every edit/restore delivery, useful known receiver control, graceful
+shutdown and source/manifest/helper/binary guard passes. Each routed run retains
+the independent coverage failure. Evidence is
+`ktlsp-corpus-probes-20261010/tenth2-verified-replay-report.json` and the fresh
+`{cem-working-copy,retrofit-2.11.0}-ktlsp-tenth2-{golden,incomplete}-1/artifacts/`.
+CEM retains 34,783 library files, including 5,865 NeoForge source files and no
+NeoForge stubs; Retrofit retains 26,405 library files. Source encoding, missing
+binary-only/nested inputs and configured-producer versus output freshness limits
+remain unchanged.
+
+The separate Java harness now passes 177/182 checks: the incoming-call regression
+is fixed and all seventeen complete override rename controls pass. Five previous
+diagnostic failures remain. Actual applied Java/Kotlin rename snapshots compile
+and preserve the expected bytecode targets; they are distinct from a nonempty
+edit-list assertion. Library lifecycle passes 13/13 and the portable JVM facade
+passes 81/81 plus nine compiler/runtime controls. See
+[fork-acceptance.md](fork-acceptance.md) for exact evidence and remaining rename
+limits. These concurrent runs still provide no latency acceptance or IDEA parity.
+
+The remaining four real-root replays are pending. An initial external controller
+stalled after its Moshi editor process completed; that raw attempt is preserved
+as incomplete controller evidence, and fresh guarded runs use new directories.
+No semantic expectation or shared harness was changed to address the wrapper.
+The final precommit `tenth-fixed-3` receipt repeats the full Rust/release checks
+after removing only the fixture generator's trailing blank line. Its generated
+four-file fixture and both release binaries are byte-identical to fixed-2.

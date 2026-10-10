@@ -63,6 +63,12 @@ fn push_entry(map: &mut FxHashMap<String, Vec<Entry>>, key: &str, entry: Entry) 
 }
 
 #[derive(Clone, Default)]
+struct JvmSources {
+    files: FxHashMap<String, Arc<crate::jvm::SourceFile>>,
+    owners: FxHashMap<String, Vec<Arc<crate::jvm::SourceFile>>>,
+}
+
+#[derive(Clone, Default)]
 pub struct Index {
     /// Source of truth: each file's tier + symbols (for whole-file replace/remove).
     files: FxHashMap<String, (Tier, Vec<Arc<IndexedSymbol>>)>,
@@ -81,6 +87,8 @@ pub struct Index {
     refs_by_name: FxHashMap<Arc<str>, Vec<RefEntry>>,
     origins: OriginFacts,
     contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
+    jvm_sources: Arc<JvmSources>,
+    jvm_revision: u64,
 }
 
 #[derive(Clone, Default)]
@@ -90,6 +98,7 @@ pub struct InferenceIndexSnapshot {
     ext_by_receiver: FxHashMap<String, Vec<Entry>>,
     origins: OriginFacts,
     contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
+    jvm_sources: Arc<JvmSources>,
 }
 
 /// Project ownership is separate from serialized symbols and per-symbol entries.
@@ -203,7 +212,17 @@ impl<'s, 'a> IntoIterator for &'s LookupEntries<'a> {
     }
 }
 
+impl OriginFacts {
+    pub fn file_origin(&self, file: &str) -> Option<&FileOrigin> {
+        self.files.get(file)
+    }
+}
+
 pub trait InferenceIndex {
+    fn jvm_sources(&self, _owner: &str) -> Vec<&crate::jvm::SourceFile> {
+        Vec::new()
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_>;
     fn members_of(&self, type_name: &str) -> LookupEntries<'_>;
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_>;
@@ -396,7 +415,70 @@ impl Index {
             ext_by_receiver: self.ext_by_receiver.clone(),
             origins: self.origins.clone(),
             contributions: self.contributions.clone(),
+            jvm_sources: self.jvm_sources.clone(),
         }
+    }
+
+    pub fn replace_jvm_source(
+        &mut self,
+        file: &str,
+        mut facts: Option<crate::jvm::SourceFileFacts>,
+        tier: Tier,
+    ) {
+        if let Some(facts) = &mut facts {
+            if facts.owner.is_empty() {
+                let Some(stem) = std::path::Path::new(file)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                else {
+                    return;
+                };
+                facts.owner = format!("{stem}Kt");
+            }
+            for callable in &mut facts.callables {
+                if let Some(def) = &mut callable.definition {
+                    def.file = file.into();
+                }
+                if let Some(fixed) = &mut callable.fixed_name {
+                    fixed.definition.file = file.into();
+                }
+            }
+        }
+        let previous = self.jvm_sources.files.get(file);
+        if previous
+            .is_some_and(|source| Some(&source.facts) == facts.as_ref() && source.tier == tier)
+            || previous.is_none() && facts.is_none()
+        {
+            return;
+        }
+        let sources = Arc::make_mut(&mut self.jvm_sources);
+        if let Some(previous) = sources.files.remove(file) {
+            if let Some(bucket) = sources.owners.get_mut(&previous.facts.owner) {
+                bucket.retain(|source| source.file != file);
+                if bucket.is_empty() {
+                    sources.owners.remove(&previous.facts.owner);
+                }
+            }
+        }
+        if let Some(facts) = facts {
+            self.jvm_revision = self.jvm_revision.wrapping_add(1).max(1);
+            let source = Arc::new(crate::jvm::SourceFile {
+                file: file.into(),
+                revision: self.jvm_revision,
+                tier,
+                facts,
+            });
+            sources
+                .owners
+                .entry(source.facts.owner.clone())
+                .or_default()
+                .push(source.clone());
+            sources.files.insert(file.into(), source);
+        }
+    }
+
+    pub fn jvm_source_for_file(&self, file: &str) -> Option<&crate::jvm::SourceFile> {
+        self.jvm_sources.files.get(file).map(Arc::as_ref)
     }
 
     pub fn replace_contributions(
@@ -487,6 +569,7 @@ impl Index {
     /// Replace all symbols contributed by `path`, recording them in the given tier.
     pub fn replace_file(&mut self, path: &str, symbols: Vec<IndexedSymbol>, tier: Tier) {
         self.record_source_type_changes(path, &symbols);
+        self.replace_jvm_source(path, None, tier);
         self.remove_symbols(path);
         let symbols: Vec<_> = symbols.into_iter().map(Arc::new).collect();
         let shared_path: Arc<str> = Arc::from(path);
@@ -534,6 +617,7 @@ impl Index {
         self.remove_symbols(path);
         self.remove_refs(path);
         self.remove_file_origin(path);
+        self.replace_jvm_source(path, None, Tier::Volatile);
     }
 
     fn record_source_type_changes(&mut self, path: &str, next: &[IndexedSymbol]) {
@@ -793,6 +877,16 @@ impl Index {
 }
 
 impl InferenceIndex for Index {
+    fn jvm_sources(&self, owner: &str) -> Vec<&crate::jvm::SourceFile> {
+        self.jvm_sources
+            .owners
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .map(Arc::as_ref)
+            .collect()
+    }
+
     fn contributions_for_file(&self, file: &str) -> &[crate::extensions::ContributionSet] {
         self.contributions
             .get(file)
@@ -834,6 +928,16 @@ impl InferenceIndex for Index {
 }
 
 impl InferenceIndex for InferenceIndexSnapshot {
+    fn jvm_sources(&self, owner: &str) -> Vec<&crate::jvm::SourceFile> {
+        self.jvm_sources
+            .owners
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .map(Arc::as_ref)
+            .collect()
+    }
+
     fn contributions_for_file(&self, file: &str) -> &[crate::extensions::ContributionSet] {
         self.contributions
             .get(file)
@@ -977,11 +1081,20 @@ impl<'a> ScopedIndex<'a> {
         own_origin: Option<&str>,
     ) -> Option<SelectedOwner<'a>> {
         let mut result: Option<(usize, SelectedOwner<'a>)> = None;
-        for entry in self.index.lookup_type(root) {
-            if entry.sym.package != package || entry.sym.container.is_some() {
-                continue;
-            }
-            let Some(origin) = self.file_origin(&entry.path) else {
+        let authored = self
+            .index
+            .lookup_type(root)
+            .into_iter()
+            .filter(|entry| entry.sym.package == package && entry.sym.container.is_none())
+            .map(|entry| self.file_origin(&entry.path));
+        let projected = self
+            .index
+            .jvm_sources(root)
+            .into_iter()
+            .filter(|source| source.facts.package == package)
+            .map(|source| self.file_origin(&source.file));
+        for origin in authored.chain(projected) {
+            let Some(origin) = origin else {
                 self.missing_ownership.set(true);
                 continue;
             };
@@ -1139,6 +1252,28 @@ impl<'a> ScopedIndex<'a> {
 }
 
 impl InferenceIndex for ScopedIndex<'_> {
+    fn jvm_sources(&self, owner: &str) -> Vec<&crate::jvm::SourceFile> {
+        self.index
+            .jvm_sources(owner)
+            .into_iter()
+            .filter(|source| {
+                if matches!(self.scope, QueryScope::Unscoped) {
+                    return true;
+                }
+                let Some(origin) = self.file_origin(&source.file) else {
+                    self.missing_ownership.set(true);
+                    return false;
+                };
+                self.origin_is_visible(&origin.origin_id)
+                    && self
+                        .selected_owner(&source.facts.package, owner)
+                        .is_some_and(|selected| {
+                            selected.origin_id == origin.origin_id && !selected.source_missing
+                        })
+            })
+            .collect()
+    }
+
     fn contributions_for_file(&self, file: &str) -> &[crate::extensions::ContributionSet] {
         self.index.contributions_for_file(file)
     }

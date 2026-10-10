@@ -135,6 +135,7 @@ struct ScannedFile {
     tree: tree_sitter::Tree,
     package: String,
     symbols: Vec<IndexedSymbol>,
+    jvm: Option<ktcore::jvm::SourceFileFacts>,
     usages: Vec<Usage>,
     /// Counts captured at scan time: `build_index` drains `symbols`/`usages` into the index
     /// (moving beats cloning 60k+ symbol structs), and the summary line reads these instead.
@@ -151,10 +152,13 @@ struct DurableLoad {
     jdk_index_complete: bool,
 }
 
+type DurableFileFacts = (Vec<IndexedSymbol>, Option<ktcore::jvm::SourceFileFacts>);
+
 #[derive(Serialize, Deserialize)]
 struct DurableSymbols {
     file: String,
     symbols: Vec<IndexedSymbol>,
+    jvm: Option<ktcore::jvm::SourceFileFacts>,
 }
 
 enum DurableResolveTask {
@@ -393,6 +397,7 @@ fn scan_file(
         usage_count: facts.usages.len(),
         package: facts.package,
         symbols: facts.symbols,
+        jvm: facts.jvm,
         usages: facts.usages,
         parser_diagnostics,
         clean: facts.clean,
@@ -516,10 +521,12 @@ fn build_index(scans: &mut [ScannedFile], durable: DurableLoad) -> Index {
     let mut index = Index::new();
     for file in durable.files {
         index.replace_file(&file.file, file.symbols, Tier::Durable);
+        index.replace_jvm_source(&file.file, file.jvm, Tier::Durable);
     }
     for scan in scans {
         let key = scan.path.to_string_lossy().to_string();
         index.replace_file(&key, std::mem::take(&mut scan.symbols), Tier::Volatile);
+        index.replace_jvm_source(&key, scan.jvm.take(), Tier::Volatile);
         index.replace_file_refs(&key, std::mem::take(&mut scan.usages));
     }
     index
@@ -594,7 +601,7 @@ fn record_annotation_surfaces(scans: &[ScannedFile], index: &Index, facts: &mut 
 
 // Java symbol extraction now includes record accessors and richer inheritance facts, so caches
 // produced before those facts existed cannot safely drive overload diagnostics.
-const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v8-kotlin-inline-member-termination";
+const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v10-jvm-projections-source-io-result";
 const MAX_DURABLE_SNAPSHOTS_PER_ROOT: usize = 2;
 
 fn load_durable_library_symbols_cached(roots: &[PathBuf], scans: &[ScannedFile]) -> DurableLoad {
@@ -839,7 +846,7 @@ fn load_durable_library_symbols(roots: &[PathBuf], scans: &[ScannedFile]) -> Dur
     let mut out = DurableLoad::default();
     let repos = Repos::defaults();
     let extract_root = deps::extract_root();
-    let mut files = HashMap::<String, Vec<IndexedSymbol>>::new();
+    let mut files = HashMap::<String, DurableFileFacts>::new();
     let mut stubbed_jars = BTreeSet::<PathBuf>::new();
     let explicit_imports = explicit_java_imports(scans);
     let mut import_candidate_coords = BTreeSet::new();
@@ -950,7 +957,7 @@ fn load_durable_library_symbols(roots: &[PathBuf], scans: &[ScannedFile]) -> Dur
 
     out.files = files
         .into_iter()
-        .map(|(file, symbols)| DurableSymbols { file, symbols })
+        .map(|(file, (symbols, jvm))| DurableSymbols { file, symbols, jvm })
         .collect();
     out.files.sort_by(|a, b| a.file.cmp(&b.file));
     out.library_index_complete = library_loaded;
@@ -1011,7 +1018,7 @@ fn prefetch_durable_downloads(coords: &[coords::Coordinate], repos: &Repos, extr
 fn resolve_durable_tasks(
     tasks: Vec<DurableResolveTask>,
     extract_root: &Path,
-) -> (HashMap<String, Vec<IndexedSymbol>>, bool, bool) {
+) -> (HashMap<String, DurableFileFacts>, bool, bool) {
     if tasks.is_empty() {
         return (HashMap::new(), false, false);
     }
@@ -1084,11 +1091,19 @@ fn resolve_durable_task(
     match task {
         DurableResolveTask::LibrarySource(source) => (
             DurableResolveKind::Library,
-            deps::resolve_library_source(&source, kotlin, java),
+            deps::resolve_library_source(&source, kotlin, java).unwrap_or_else(|error| {
+                eprintln!("ktcheck: source indexing failed: {error:#}");
+                Vec::new()
+            }),
         ),
         DurableResolveTask::LocalJar(jar) => (
             DurableResolveKind::Library,
-            deps::resolve_local_jar_stubs(&jar, extract_root, kotlin, java),
+            deps::resolve_local_jar_stubs(&jar, extract_root, kotlin, java).unwrap_or_else(
+                |error| {
+                    eprintln!("ktcheck: index {} failed: {error:#}", jar.display());
+                    Vec::new()
+                },
+            ),
         ),
         DurableResolveTask::Jdk(src_zip) => (
             DurableResolveKind::Jdk,
@@ -1098,26 +1113,26 @@ fn resolve_durable_task(
 }
 
 fn insert_durable_batches(
-    files: &mut HashMap<String, Vec<IndexedSymbol>>,
+    files: &mut HashMap<String, DurableFileFacts>,
     batches: Vec<deps::FileSymbols>,
 ) -> bool {
     let mut loaded = false;
     for file_symbols in batches {
         loaded = true;
-        files.insert(file_symbols.file, file_symbols.symbols);
+        files.insert(file_symbols.file, (file_symbols.symbols, file_symbols.jvm));
     }
     loaded
 }
 
 fn imports_missing_from_symbols(
     imports: &BTreeSet<String>,
-    files: &HashMap<String, Vec<IndexedSymbol>>,
+    files: &HashMap<String, DurableFileFacts>,
 ) -> BTreeSet<String> {
     if imports.is_empty() {
         return BTreeSet::new();
     }
     let mut resolved = BTreeSet::new();
-    for symbol in files.values().flatten() {
+    for symbol in files.values().flat_map(|(symbols, _)| symbols) {
         if !symbol.kind.is_type_like() {
             continue;
         }
@@ -1702,36 +1717,104 @@ mod tests {
     }
 
     #[test]
+    fn jvm_projection_survives_project_scan_and_durable_cache_publication() {
+        use ktcore::index::InferenceIndex;
+        let source = "@file:JvmName(\"KotlinExtensions\")\npackage interop\nclass Call<T> {}\n@JvmName(\"awaitNullable\")\nsuspend fun <T> Call<T>.await(): T? = null\n";
+        let root =
+            std::env::temp_dir().join(format!("ktcheck-jvm-projection-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("KotlinExtensions.kt");
+        std::fs::write(&path, source).unwrap();
+        let key = path.to_string_lossy().to_string();
+        for cached in [false, true] {
+            let mut scans = scan_files(vec![path.clone()]);
+            assert_eq!(scans.len(), 1);
+            let mut durable = DurableLoad::default();
+            if cached {
+                let scan = scans.pop().unwrap();
+                let mut files = HashMap::new();
+                assert!(insert_durable_batches(
+                    &mut files,
+                    vec![deps::FileSymbols {
+                        file: key.clone(),
+                        symbols: scan.symbols,
+                        jvm: scan.jvm,
+                        origin: None,
+                    }]
+                ));
+                durable.files = files
+                    .into_iter()
+                    .map(|(file, (symbols, jvm))| DurableSymbols { file, symbols, jvm })
+                    .collect();
+                durable = bincode::deserialize(&bincode::serialize(&durable).unwrap()).unwrap();
+            }
+            let index = build_index(&mut scans, durable);
+            let sources = index.jvm_sources("KotlinExtensions");
+            assert_eq!(sources.len(), 1);
+            let accepted = sources[0];
+            assert_eq!(accepted.file, key);
+            assert_eq!(
+                accepted.tier,
+                if cached {
+                    Tier::Durable
+                } else {
+                    Tier::Volatile
+                }
+            );
+            let callable = &accepted.facts.callables[0];
+            assert_eq!(callable.definition.as_ref().unwrap().file, key);
+            assert_eq!(
+                callable.definition.as_ref().unwrap().start_byte,
+                source.find(".await()").unwrap() + 1
+            );
+            let candidate = ktcore::jvm::CallableCandidate::Jvm {
+                owner: ktcore::jvm::JvmOwner::Source(accepted),
+                facts: callable,
+            };
+            assert_eq!(candidate.name(), "awaitNullable");
+            assert_eq!(candidate.arity(), Some(2));
+            assert_eq!(
+                candidate.identity(&index).unwrap().descriptor,
+                "(Linterop/Call;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn imports_missing_from_symbols_keeps_only_unresolved_type_imports() {
         let mut files = HashMap::new();
         files.insert(
             "jar:a".to_string(),
-            vec![
-                IndexedSymbol::new(
-                    "Resolved",
-                    ktcore::symbol::SymbolKind::Class,
-                    "com.example",
-                    None,
-                    0,
-                    0,
-                ),
-                IndexedSymbol::new(
-                    "Inner",
-                    ktcore::symbol::SymbolKind::Class,
-                    "com.example",
-                    Some("Outer".to_string()),
-                    0,
-                    0,
-                ),
-                IndexedSymbol::new(
-                    "helper",
-                    ktcore::symbol::SymbolKind::Function,
-                    "com.example",
-                    None,
-                    0,
-                    0,
-                ),
-            ],
+            (
+                vec![
+                    IndexedSymbol::new(
+                        "Resolved",
+                        ktcore::symbol::SymbolKind::Class,
+                        "com.example",
+                        None,
+                        0,
+                        0,
+                    ),
+                    IndexedSymbol::new(
+                        "Inner",
+                        ktcore::symbol::SymbolKind::Class,
+                        "com.example",
+                        Some("Outer".to_string()),
+                        0,
+                        0,
+                    ),
+                    IndexedSymbol::new(
+                        "helper",
+                        ktcore::symbol::SymbolKind::Function,
+                        "com.example",
+                        None,
+                        0,
+                        0,
+                    ),
+                ],
+                None,
+            ),
         );
 
         let missing = imports_missing_from_symbols(

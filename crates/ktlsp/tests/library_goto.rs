@@ -138,6 +138,226 @@ fn assert_goto_into_library(ws: &mut Workspace, key: &str, src: &str, token: &st
     );
 }
 
+const SNAPSHOT_V1: &str =
+    "package api;\npublic class Useful {\n    public int versionOne() { return 1; }\n}\n";
+const SNAPSHOT_V2: &str = "package api;\n// Snapshot version two moves every real source anchor and declares a different public member.\npublic class Useful {\n    public int versionTwoLong() { return 222; }\n}\n";
+
+fn snapshot_source(tmp: &Path) -> (Coordinate, Repos, PathBuf) {
+    let coordinate = Coordinate::parse("fixture:snapshot:1-SNAPSHOT").unwrap();
+    let repos = Repos {
+        gradle_cache: tmp.join("gradle"),
+        m2: tmp.join("m2"),
+        central_base: "http://127.0.0.1:0/unused".into(),
+        download_dir: tmp.join("download"),
+        allow_download: false,
+    };
+    let jar = repos
+        .m2
+        .join("fixture/snapshot/1-SNAPSHOT/snapshot-1-SNAPSHOT-sources.jar");
+    (coordinate, repos, jar)
+}
+
+#[test]
+fn snapshot_source_revision_refreshes_materialized_goto_cold_and_warm() {
+    let tmp = unique_tmp("snapshot_goto_revision");
+    let (coordinate, repos, jar) = snapshot_source(&tmp);
+    let extract = tmp.join("extracted");
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+    let mut ws = Workspace::new();
+    let mut previous_identity = None;
+    for (text, member, old_member) in [
+        (SNAPSHOT_V1, "versionOne", "versionTwoLong"),
+        (SNAPSHOT_V2, "versionTwoLong", "versionOne"),
+    ] {
+        write_sources_jar(&jar, &[("api/Useful.java", text)]);
+        let source = deps::coordinate_source(&coordinate, &repos, &extract).unwrap();
+        assert_ne!(previous_identity.as_ref(), Some(&source.identity()));
+        previous_identity = Some(source.identity());
+        for _ in 0..2 {
+            let batches = deps::resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+            assert_eq!(batches.len(), 1);
+            let file = batches[0].file.clone();
+            assert!(batches[0]
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == member));
+            assert!(!batches[0]
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == old_member));
+            for batch in batches {
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.bump_index_revision();
+            assert_eq!(ws.doc_text(&file).as_deref(), Some(text));
+            for (name, client) in [
+                ("Use.kt", format!("import api.Useful\nfun use(helper: Useful) = helper.{member}()\n")),
+                ("Use.java", format!("import api.Useful; class Use {{ int use(Useful helper) {{ return helper.{member}(); }} }}")),
+            ] {
+                let key = ktlsp::paths::file_key(&tmp.join(name));
+                ws.open(key.clone(), client.clone());
+                assert_goto_into_library(&mut ws, &key, &client, member, "api/Useful.java");
+            }
+            let definitions = ws.goto_definition(&file, text.find(member).unwrap());
+            assert_eq!(
+                definitions.len(),
+                1,
+                "closed source parsing must follow the current text"
+            );
+            assert_eq!(definitions[0].start_byte, text.find(member).unwrap());
+        }
+    }
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn snapshot_source_addition_and_removal_follow_model_refresh() {
+    let tmp = unique_tmp("snapshot_source_delta");
+    let (coordinate, repos, jar) = snapshot_source(&tmp);
+    let binary = jar.with_file_name("snapshot-1-SNAPSHOT.jar");
+    write_sources_jar(&binary, &[("api/Useful.class", "class-name fixture")]);
+    let model = || {
+        std::sync::Arc::new(ktlsp::classpath::ProjectSnapshot::new(
+            ktlsp::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfixture\tsnapshot\t1-SNAPSHOT\nEND\t:app\n",
+                tmp.join("app").display(), tmp.join("app/src").display(), binary.display(), binary.display(),
+            )),
+        ))
+    };
+    let mut ws = Workspace::new();
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+    write_sources_jar(
+        &jar,
+        &[
+            ("api/Useful.java", SNAPSHOT_V1),
+            ("api/Gone.java", "package api; public class Gone {}"),
+        ],
+    );
+    ws.set_project_model(model());
+    let first = deps::coordinate_source(&coordinate, &repos, &tmp.join("extracted")).unwrap();
+    let batches = deps::resolve_library_source(&first, &mut kotlin, &mut java).unwrap();
+    let gone = batches
+        .iter()
+        .find(|batch| Path::new(&batch.file).ends_with("api/Gone.java"))
+        .unwrap()
+        .file
+        .clone();
+    assert!(deps::materialize_source_file(Path::new(&gone)));
+    for batch in batches {
+        assert!(ws.index_dependency_batch(batch));
+    }
+    ws.bump_index_revision();
+    let key = ktlsp::paths::file_key(&tmp.join("app/src/Use.java"));
+    let client = "import api.Gone; class Use { Gone gone; }";
+    ws.open(key.clone(), client.into());
+    assert_goto_into_library(&mut ws, &key, client, "Gone", "api/Gone.java");
+
+    write_sources_jar(
+        &jar,
+        &[
+            ("api/Useful.java", SNAPSHOT_V2),
+            ("api/Added.java", "package api; public class Added {}"),
+        ],
+    );
+    ws.set_project_model(model());
+    assert!(
+        ws.index.entries_for_file(&gone).is_empty(),
+        "model refresh must remove closed obsolete facts"
+    );
+    let second = deps::coordinate_source(&coordinate, &repos, &tmp.join("extracted")).unwrap();
+    assert_ne!(first.identity(), second.identity());
+    for _ in 0..2 {
+        for batch in deps::resolve_library_source(&second, &mut kotlin, &mut java).unwrap() {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.bump_index_revision();
+        assert!(
+            !Path::new(&gone).exists(),
+            "removed source entries must not survive on disk"
+        );
+        assert_eq!(ws.doc_text(&gone), None);
+        assert!(ws
+            .goto_definition(&key, client.rfind("Gone").unwrap())
+            .is_empty());
+        let added_client = "import api.Added; class Use { Added added; }";
+        ws.change(&key, added_client.into());
+        assert_goto_into_library(&mut ws, &key, added_client, "Added", "api/Added.java");
+        ws.change(&key, client.into());
+    }
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn snapshot_dirty_source_close_rematerializes_current_archive() {
+    for navigate_before_close in [false, true] {
+        let tmp = unique_tmp(&format!("snapshot_dirty_close_{navigate_before_close}"));
+        let (coordinate, repos, jar) = snapshot_source(&tmp);
+        let extract = tmp.join("extracted");
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        write_sources_jar(&jar, &[("api/Useful.java", SNAPSHOT_V1)]);
+        let first = deps::coordinate_source(&coordinate, &repos, &extract).unwrap();
+        let batches = deps::resolve_library_source(&first, &mut kotlin, &mut java).unwrap();
+        let file = batches[0].file.clone();
+        assert!(deps::materialize_source_file(Path::new(&file)));
+        let mut ws = Workspace::new();
+        for batch in batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        let dirty =
+            "package api; public class Useful { public int editorUnsaved() { return 7; } }\n";
+        ws.open(file.clone(), SNAPSHOT_V1.into());
+        ws.change(&file, dirty.into());
+        // A materialized cache entry may be evicted while its editor buffer stays open.
+        fs::remove_file(&file).unwrap();
+        write_sources_jar(&jar, &[("api/Useful.java", SNAPSHOT_V2)]);
+        let second = deps::coordinate_source(&coordinate, &repos, &extract).unwrap();
+        for batch in deps::resolve_library_source(&second, &mut kotlin, &mut java).unwrap() {
+            assert!(!ws.index_dependency_batch(batch));
+        }
+        assert_eq!(ws.doc_text(&file).as_deref(), Some(dirty));
+        assert!(ws
+            .index
+            .entries_for_file(&file)
+            .iter()
+            .any(|entry| entry.sym.name == "editorUnsaved"));
+        assert!(
+            !Path::new(&file).exists(),
+            "reading an open buffer must not materialize over it"
+        );
+        if navigate_before_close {
+            let client = "import api.Useful; class Use { int use(Useful helper) { return helper.editorUnsaved(); } }";
+            let key = ktlsp::paths::file_key(&tmp.join("Use.java"));
+            ws.open(key.clone(), client.into());
+            let definitions = ws.goto_definition(&key, client.find("editorUnsaved").unwrap());
+            assert_eq!(definitions.len(), 1);
+            assert_eq!(ws.doc_text(&file).as_deref(), Some(dirty));
+            assert_eq!(fs::read_to_string(&file).unwrap(), SNAPSHOT_V2);
+        }
+        ws.close(&file);
+        let entries = ws.index.entries_for_file(&file);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.sym.name == "versionTwoLong"),
+            "close must restore current archive facts before any later request"
+        );
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.sym.name == "editorUnsaved"));
+        assert_eq!(ws.doc_text(&file).as_deref(), Some(SNAPSHOT_V2));
+        ws.open(file.clone(), ws.doc_text(&file).unwrap());
+        assert!(ws
+            .index
+            .entries_for_file(&file)
+            .iter()
+            .any(|entry| entry.sym.name == "versionTwoLong"));
+        fs::remove_dir_all(tmp).unwrap();
+    }
+}
+
 #[test]
 fn local_jar_source_refresh_preserves_scope_and_replaces_member_targets() {
     let tmp = unique_tmp("local_sources_scoped_refresh");
@@ -177,7 +397,8 @@ fn local_jar_source_refresh_preserves_scope_and_replaces_member_targets() {
             );
         }
         let batches =
-            deps::resolve_local_jar_stubs(&jar, &tmp.join("extracted"), &mut kotlin, &mut java);
+            deps::resolve_local_jar_stubs(&jar, &tmp.join("extracted"), &mut kotlin, &mut java)
+                .unwrap();
         assert!(!batches.is_empty());
         previous_source_files = batches.iter().map(|batch| batch.file.clone()).collect();
         for batch in batches {

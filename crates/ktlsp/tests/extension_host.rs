@@ -441,6 +441,7 @@ fn late_open_dependency_ownership(file: &str, source: &str) {
         };
         if change == "file" {
             assert!(ws.index_dependency_batch(ktlsp::deps::FileSymbols {
+                jvm: None,
                 file: ktlsp::paths::file_key(&root.join("cache/Seed.java")),
                 symbols: Vec::new(),
                 origin: Some(origin.clone()),
@@ -470,6 +471,7 @@ fn late_open_dependency_ownership(file: &str, source: &str) {
         let tree = parsers.parse(language, &stale);
         let symbols = ktlsp::language::file_facts(language, &tree, &stale).symbols;
         let batch = || ktlsp::deps::FileSymbols {
+            jvm: None,
             file: target_key.clone(),
             symbols: symbols.clone(),
             origin: Some(origin.clone()),

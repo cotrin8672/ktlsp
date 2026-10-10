@@ -377,7 +377,36 @@ run_classpath_config_cache_probe() {
 
 write_java_project() {
   local project="$projects/java"
-  mkdir -p "$project/app" "$project/support"
+  mkdir -p "$project/app" "$project/support" "$project/renamecase"
+  cat > "$project/renamecase/Contract.java" <<'JAVA'
+package renamecase;
+public interface Contract { void assist(); }
+JAVA
+  cat > "$project/renamecase/Provider.java" <<'JAVA'
+package renamecase;
+public class Provider implements Contract {
+    public void assist() { }
+    public void assist(String text) { }
+}
+JAVA
+  cat > "$project/renamecase/Unrelated.java" <<'JAVA'
+package renamecase;
+public class Unrelated { public void assist() { } }
+JAVA
+  cat > "$project/renamecase/JavaUse.java" <<'JAVA'
+package renamecase;
+public class JavaUse {
+    public void run(Provider provider, Contract contract, Unrelated unrelated) {
+        provider.assist(); contract.assist(); provider.assist("keep"); unrelated.assist();
+    }
+}
+JAVA
+  cat > "$project/renamecase/KotlinUse.kt" <<'KOTLIN'
+package renamecase
+fun runKt(provider: Provider, contract: Contract, unrelated: Unrelated) {
+    provider.assist(); contract.assist(); provider.assist("keep"); unrelated.assist()
+}
+KOTLIN
   cat > "$project/app/Helper.java" <<'JAVA'
 package app;
 
@@ -647,7 +676,7 @@ case "$scenario" in
     ;;
   java)
     project="${root_arg:-$(write_java_project)}"
-    run_and_capture java nvim -l "$repo/dev/nvim_java.lua" "$project" "$bin_arg" || run_status=$?
+    run_and_capture java nvim -l "$repo/dev/nvim_java.lua" "$project" "$bin_arg" "$artifacts" || run_status=$?
     ;;
   mixed)
     project="${root_arg:-$(write_mixed_project)}"

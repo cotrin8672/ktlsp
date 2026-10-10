@@ -644,6 +644,10 @@ struct RecoveredTypeIndex<'a> {
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn jvm_sources(&self, owner: &str) -> Vec<&ktcore::jvm::SourceFile> {
+        self.index.jvm_sources(owner)
+    }
+
     fn contributions_for_file(&self, file: &str) -> &[ktcore::extensions::ContributionSet] {
         self.index.contributions_for_file(file)
     }
@@ -735,6 +739,24 @@ fn member_candidates(
         }
         ControlFlow::Continue(())
     });
+    if language == SourceLanguage::Java {
+        for candidate in ktcore::jvm::member_candidates(index, ty, prefix) {
+            if let ktcore::jvm::CallableCandidate::Jvm {
+                owner: ktcore::jvm::JvmOwner::Source(source),
+                facts,
+            } = candidate
+            {
+                if seen.insert((facts.name.clone(), SymbolKind::Function)) {
+                    let mut item = ScopeCompletion::new(facts.name.clone(), SymbolKind::Function);
+                    item.arity = candidate.arity();
+                    item.tier = source.tier;
+                    item.package = source.facts.package.clone();
+                    item.container = Some(source.facts.owner.clone());
+                    out.push(item);
+                }
+            }
+        }
+    }
     out.truncate(max_candidates);
     out
 }

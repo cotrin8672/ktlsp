@@ -268,6 +268,22 @@ impl ProjectSnapshot {
         self.file_origins.get(&path_key(path)).map(String::as_str)
     }
 
+    pub fn coordinate_binaries(&self, coord: &Coordinate) -> Option<Vec<(PathBuf, String)>> {
+        self.modules
+            .iter()
+            .flat_map(|module| &module.source_sets)
+            .flat_map(|source| &source.artifacts)
+            .filter(|artifact| {
+                matches!(&artifact.component, ComponentId::Module { group, name, version }
+                    if group == &coord.group && name == &coord.artifact && version == &coord.version)
+            })
+            .map(|artifact| {
+                Some((artifact.path.clone(), self.artifact_origin(&artifact.path)?.to_string()))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(|paths| paths.into_iter().collect())
+    }
+
     pub fn coordinates_for_file(&self, file: &Path) -> Option<Vec<Coordinate>> {
         let (_, source) = self.owner_for(file)?;
         Some(

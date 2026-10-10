@@ -1132,9 +1132,26 @@ fn java_call_entries_with_imports(
     package: &str,
     imports: &[Import],
 ) -> Vec<Entry> {
-    let defs = if call.kind() == "method_invocation" && call.child_by_field_name("object").is_some()
-    {
-        receiver_member_defs(index, file, src, tree, name).unwrap_or_default()
+    let explicit_call =
+        call.kind() == "method_invocation" && call.child_by_field_name("object").is_some();
+    let defs = if explicit_call {
+        let Some(receiver) = receiver_type(
+            index,
+            file,
+            src,
+            tree,
+            call.child_by_field_name("object").unwrap(),
+        ) else {
+            return Vec::new();
+        };
+        jvm_call_candidates(index, file, src, tree, call, &receiver, symbol)
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| match candidate {
+                ktcore::jvm::CallableCandidate::Authored(_) => candidate.definition(),
+                _ => None,
+            })
+            .collect()
     } else {
         goto_definition_with_imports(index, file, src, tree, name.start_byte(), package, imports)
     };
@@ -1162,7 +1179,9 @@ fn java_call_entries_with_imports(
             .filter(|entry| entry.sym.kind == SymbolKind::Function)
             .collect::<Vec<_>>()
     };
-    expand_java_overloads(index, symbol, &mut entries);
+    if !explicit_call {
+        expand_java_overloads(index, symbol, &mut entries);
+    }
     entries.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -2374,7 +2393,19 @@ fn receiver_member_defs(
         "method_invocation" => Some(SymbolKind::Function),
         _ => None,
     }?;
-    let recv = receiver_type(index, file, src, tree, object)?;
+    let Some(recv) = receiver_type(index, file, src, tree, object) else {
+        return Some(Vec::new());
+    };
+    if kind == "method_invocation" {
+        let candidates = jvm_call_candidates(index, file, src, tree, parent, &recv, name);
+        return Some(
+            candidates
+                .navigation_candidates()
+                .iter()
+                .filter_map(|candidate| candidate.definition())
+                .collect(),
+        );
+    }
     let members = java_member_entries(index, &recv, name, expected_kind);
     let members = if kind == "method_invocation" {
         narrow_java_entries_by_call_arity(src, parent, members)
@@ -2580,9 +2611,149 @@ fn receiver_type_from_type_identifier(
     if name.is_empty() {
         return None;
     }
-    let package = same_file_type_package(index, file, name)
-        .or_else(|| visible_type_package(index, src, tree, name))?;
-    Some(Type::class(name, Some(package)))
+    if let Some(package) = same_file_type_package(index, file, name)
+        .or_else(|| visible_type_package(index, src, tree, name))
+    {
+        return Some(Type::class(name, Some(package)));
+    }
+    ktcore::jvm::visible_owner(
+        index,
+        name,
+        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+    )
+}
+
+fn jvm_call_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+    receiver: &Type,
+    name: &str,
+) -> ktcore::jvm::CallSelection<'a> {
+    ktcore::jvm::select_call(
+        index,
+        receiver,
+        ktcore::jvm::member_candidates(index, receiver, name),
+        name,
+        &java_call_arguments(index, file, src, tree, call),
+        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+    )
+}
+
+fn java_call_arguments(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+) -> ktcore::members::CallArguments {
+    let nodes = (!call.has_error())
+        .then(|| java_argument_nodes(src, call))
+        .flatten();
+    ktcore::members::CallArguments {
+        count: nodes.as_ref().map(Vec::len),
+        types: nodes
+            .into_iter()
+            .flatten()
+            .map(|node| java_argument_type(index, file, src, tree, node).unwrap_or(Type::Unknown))
+            .collect(),
+        trailing_lambda: false,
+    }
+}
+
+fn java_argument_type(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    node: Node<'_>,
+) -> Option<Type> {
+    if let Some(ty) = receiver_type(index, file, src, tree, node) {
+        return Some(ty);
+    }
+    if node.kind() == "parenthesized_expression" {
+        let child = node.named_child(0)?;
+        return java_argument_type(index, file, src, tree, child);
+    }
+    if matches!(
+        node.kind(),
+        "string_literal"
+            | "character_literal"
+            | "true"
+            | "false"
+            | "decimal_floating_point_literal"
+            | "hex_floating_point_literal"
+            | "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal"
+    ) {
+        let ty = java_expression_type(index, file, src, tree, node)?;
+        return Some(Type::class(ty.name, ty.package));
+    }
+    None
+}
+
+pub fn jvm_member_at(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Option<ktcore::jvm::ResolvedMember> {
+    let usage = identifier_at(tree, offset)?;
+    let call = usage.parent()?;
+    if call.kind() != "method_invocation" || call.child_by_field_name("name") != Some(usage) {
+        return None;
+    }
+    let receiver = receiver_type(index, file, src, tree, call.child_by_field_name("object")?)?;
+    let candidates = jvm_call_candidates(
+        index,
+        file,
+        src,
+        tree,
+        call,
+        &receiver,
+        node_text(usage, src),
+    );
+    let [candidate] = candidates.navigation_candidates() else {
+        return None;
+    };
+    candidate.resolved(index)
+}
+
+pub fn jvm_call_signatures(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+) -> Vec<crate::signature::Signature> {
+    let Some(object) = call.child_by_field_name("object") else {
+        return Vec::new();
+    };
+    let Some(receiver) = receiver_type(index, file, src, tree, object) else {
+        return Vec::new();
+    };
+    let Some(name) = call.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    jvm_call_candidates(
+        index,
+        file,
+        src,
+        tree,
+        call,
+        &receiver,
+        node_text(name, src),
+    )
+    .candidates
+    .into_iter()
+    .filter(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
+    .map(crate::signature::signature_for_callable)
+    .collect()
 }
 
 fn java_method_invocation_return_type(
@@ -2596,6 +2767,27 @@ fn java_method_invocation_return_type(
     let symbol = node_text(name, src);
     if symbol.is_empty() {
         return None;
+    }
+    if let Some(object) = call.child_by_field_name("object") {
+        if let Some(receiver) = receiver_type(index, file, src, tree, object) {
+            let candidates = jvm_call_candidates(index, file, src, tree, call, &receiver, symbol);
+            if candidates.applicability == ktcore::members::Applicability::Rejected {
+                return None;
+            }
+            if candidates
+                .candidates
+                .iter()
+                .any(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
+            {
+                let [candidate] = candidates.candidates.as_slice() else {
+                    return None;
+                };
+                if !candidate.accepts_count(java_argument_nodes(src, call).map(|args| args.len())) {
+                    return None;
+                }
+                return ktcore::jvm::projected_return_type(*candidate);
+            }
+        }
     }
     let package = package_of(tree, src);
     let imports = imports_of(tree, src);

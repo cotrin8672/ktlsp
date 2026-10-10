@@ -4,6 +4,7 @@
 //! lives in the root `ktlsp` crate; `ktcore` is the landing zone for parser, indexing, inference,
 //! project-model, and diagnostics modules as they are moved out of the LSP frontend.
 
+pub mod classfile;
 pub mod coords;
 pub mod defaults;
 pub mod diagnostics;
@@ -15,6 +16,7 @@ pub mod index;
 pub mod indexed_diagnostics;
 pub mod indexer;
 pub mod infer;
+pub mod jvm;
 pub mod knowledge;
 pub mod members;
 pub mod parser;

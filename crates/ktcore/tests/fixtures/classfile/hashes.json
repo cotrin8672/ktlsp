@@ -1,0 +1,37 @@
+[
+  {
+    "file": "noarg-off/NeedsLabel.class",
+    "sha256": "22c283c4bb5918864dd9c5c5c4e3da4864417887ee7375775dd6678e14e17695",
+    "bytes": 1001
+  },
+  {
+    "file": "noarg-on/NeedsLabel.class",
+    "sha256": "8fedc8525b31d6099dcad7939d178629bc06425e988a54cc1e423c68099f98e3",
+    "bytes": 1050
+  },
+  {
+    "file": "pluginfixture/Model$$serializer.class",
+    "sha256": "6e2f4dc696b4a6f4b6de8042580de6c54cbfcece360f256f85587933cf81edc5",
+    "bytes": 5199
+  },
+  {
+    "file": "pluginfixture/Model$Companion.class",
+    "sha256": "f0b14951eb170cf5cc2b65ad4209080d038c2f27471985b7b061c84cacb6d044",
+    "bytes": 1306
+  },
+  {
+    "file": "pluginfixture/Model.class",
+    "sha256": "bed03753fd9e5a481bbfce8c68dc02cf4ab66fda2d5ecb19d786b9b47ee428fc",
+    "bytes": 4317
+  },
+  {
+    "file": "pluginfixture/Person.class",
+    "sha256": "710382370e23cca9624dcb706067a888a9ebb88390f1e9a258cb651f5d59a59d",
+    "bytes": 450
+  },
+  {
+    "file": "unicodefixture/\u540d\u524d.class",
+    "sha256": "710b7f8954c101eef00c5aaac10ae841fe2d11c814d6becd119cdd1c2ab95f06",
+    "bytes": 298
+  }
+]

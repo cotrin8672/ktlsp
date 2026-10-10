@@ -124,7 +124,8 @@ fn goto_java_class_from_local_binary_jar_stub() {
     let mut kotlin = KotlinParser::new();
     let mut java = JavaParser::new();
     let batches =
-        deps::resolve_local_jar_stubs(&jar_path, &root.join("extracted"), &mut kotlin, &mut java);
+        deps::resolve_local_jar_stubs(&jar_path, &root.join("extracted"), &mut kotlin, &mut java)
+            .unwrap();
     assert!(
         batches.iter().any(|batch| batch
             .symbols

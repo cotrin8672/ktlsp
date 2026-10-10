@@ -24,6 +24,32 @@ fn open_archive(jar: &Path) -> anyhow::Result<zip::ZipArchive<io::Cursor<Vec<u8>
         .with_context(|| format!("read jar {}", jar.display()))
 }
 
+/// Empty compatibility artifacts need no source definitions. Metadata and nested archives do not
+/// prove emptiness, and unreadable archives stay errors.
+pub fn may_contain_definitions(jar: &Path) -> anyhow::Result<bool> {
+    let mut archive = open_archive(jar)?;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let name = entry.name();
+        if [
+            ".class",
+            ".kotlin_metadata",
+            ".kotlin_module",
+            ".kotlin_builtins",
+            ".knm",
+            ".klib",
+            ".jar",
+            ".zip",
+        ]
+        .iter()
+        .any(|extension| name.ends_with(extension))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Open an archive over bytes shared across shard workers — one allocation feeds every shard's
 /// own `ZipArchive` state (central-directory cursors are per-worker, the bytes are not copied).
 pub fn archive_shared(
@@ -205,19 +231,20 @@ pub fn extract_source_file(jar: &Path, out_dir: &Path, path: &Path) -> anyhow::R
 }
 
 /// Collect already-extracted `.kt`/`.java` files under a directory (for reusing a prior extraction).
-pub fn collect_sources(dir: &Path) -> Vec<PathBuf> {
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .filter(|p| {
-            matches!(
-                p.extension().and_then(|e| e.to_str()),
+pub fn collect_sources(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry.with_context(|| format!("enumerate sources {}", dir.display()))?;
+        if entry.file_type().is_file()
+            && matches!(
+                entry.path().extension().and_then(|e| e.to_str()),
                 Some("kt") | Some("java")
             )
-        })
-        .collect()
+        {
+            paths.push(entry.into_path());
+        }
+    }
+    Ok(paths)
 }
 
 /// Synthesize minimal Java source stubs for top-level `.class` entries in a binary jar.
@@ -252,6 +279,7 @@ pub fn extract_class_stubs(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<Pat
         }
     }
 
+    fs::create_dir_all(out_dir)?;
     let mut out = Vec::new();
     for class_path in classes {
         let mut parts = class_path.rsplitn(2, '/');
@@ -301,6 +329,16 @@ mod tests {
             zip.write_all(body.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn source_enumeration_distinguishes_empty_and_missing_directories() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_source_enumeration_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(collect_sources(&root.join("missing")).is_err());
+        assert!(collect_sources(&root).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -837,6 +837,134 @@ do
   end
 end
 
+-- A method rename must preserve its interface contract, both language callers and overloads.
+do
+  local probe = dofile(vim.fn.getcwd() .. "/dev/nvim_lsp_probe.lua")
+  if arg[3] then probe.outside_project(project, arg[3]) end
+  local files, by_path, delivered = {}, {}, {}
+  local original_notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    if method == "textDocument/didChange" then
+      delivered[probe.path_key(vim.uri_to_fname(params.textDocument.uri))] = {
+        version = params.textDocument.version, changes = vim.deepcopy(params.contentChanges),
+      }
+    end
+    return original_notify(method, params)
+  end
+  for _, name in ipairs({ "Contract.java", "Provider.java", "Unrelated.java", "JavaUse.java", "KotlinUse.kt" }) do
+    local path = project .. "/renamecase/" .. name
+    local buffer = vim.fn.bufadd(path)
+    vim.fn.bufload(buffer)
+    vim.bo[buffer].filetype = name:match("%.kt$") and "kotlin" or "java"
+    vim.lsp.buf_attach_client(buffer, id)
+    local file = { name = name, buffer = buffer, uri = vim.uri_from_bufnr(buffer), path = path }
+    file.before = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+    file.disk = vim.fn.readfile(path)
+    file.expected = vim.deepcopy(file.before)
+    for line, text in ipairs(file.expected) do
+      if name == "Contract.java" then
+        text = text:gsub("assist%(%)", "support()")
+      elseif name == "Provider.java" then
+        text = text:gsub("void assist%(%)", "void support()")
+      elseif name == "JavaUse.java" or name == "KotlinUse.kt" then
+        text = text:gsub("provider%.assist%(%)", "provider.support()")
+          :gsub("contract%.assist%(%)", "contract.support()")
+      end
+      file.expected[line] = text
+    end
+    files[#files + 1] = file
+    by_path[probe.path_key(path)] = file
+  end
+  local provider = by_path[probe.path_key(project .. "/renamecase/Provider.java")]
+  local position = probe.find(provider.before, "void assist()", "assist")
+  local result = client:request_sync("textDocument/rename", {
+    textDocument = { uri = provider.uri }, position = position, newName = "support",
+  }, 5000, provider.buffer)
+  local edit = result and result.result
+  local safe, count, sites = type(edit) == "table", 0, {}
+  local expected_sites = {}
+  for _, site in ipairs({
+    { "Contract.java", "void assist()" }, { "Provider.java", "void assist()" },
+    { "JavaUse.java", "provider.assist()" }, { "JavaUse.java", "contract.assist()" },
+    { "KotlinUse.kt", "provider.assist()" }, { "KotlinUse.kt", "contract.assist()" },
+  }) do
+    local file = by_path[probe.path_key(project .. "/renamecase/" .. site[1])]
+    local _, range = probe.find(file.before, site[2], "assist")
+    expected_sites[probe.location_key(file.uri, range)] = true
+  end
+  local normalized = vim.deepcopy(edit or {})
+  if normalized.changes then normalized.changes = {} end
+  local function collect(uri, edits)
+    local file = by_path[probe.path_key(vim.uri_to_fname(uri))]
+    if not file then safe = false; return end
+    for _, item in ipairs(edits) do
+      local range = item.range
+      if not probe.range_in_source(range, file.before) then safe = false; return end
+      local key = probe.location_key(file.uri, range)
+      safe = safe and item.newText == "support"
+        and expected_sites[key] == true and not sites[key]
+      sites[key], count = true, count + 1
+    end
+    return file.uri
+  end
+  for uri, edits in pairs(edit and edit.changes or {}) do
+    local canonical = collect(uri, edits)
+    if canonical then normalized.changes[canonical] = vim.list_extend(normalized.changes[canonical] or {}, edits) end
+  end
+  for index, change in ipairs(edit and edit.documentChanges or {}) do
+    if change.textDocument then
+      local canonical = collect(change.textDocument.uri, change.edits)
+      if canonical then normalized.documentChanges[index].textDocument.uri = canonical end
+    else safe = false end
+  end
+  safe = safe and count == 6
+  check("override rename includes both declarations and four Java/Kotlin calls", safe, vim.inspect(result))
+  local applied, message = false, "unsafe or incomplete edits"
+  if safe then
+    applied, message = pcall(vim.lsp.util.apply_workspace_edit, normalized, client.offset_encoding)
+    applied = applied and message ~= false
+  end
+  check("override rename applies in Neovim", applied, tostring(message))
+  local snapshots = { request = result, files = {}, applied = applied }
+  for _, file in ipairs(files) do
+    local actual = vim.api.nvim_buf_get_lines(file.buffer, 0, -1, false)
+    check("override rename preserves exact " .. file.name, vim.deep_equal(actual, file.expected), vim.inspect(actual))
+    snapshots.files[file.name] = { before = file.before, expected = file.expected, actual = actual }
+  end
+  require("vim.lsp._changetracking").flush(client)
+  snapshots.delivered = vim.deepcopy(delivered)
+  for _, file in ipairs(files) do
+    if not vim.deep_equal(file.before, file.expected) then
+      local sent = delivered[probe.path_key(file.path)]
+      local text = table.concat(file.expected, "\n") .. (vim.bo[file.buffer].eol and "\n" or "")
+      check("override rename changes delivered for " .. file.name, sent ~= nil and #sent.changes == 1
+        and sent.changes[1].range == nil and sent.changes[1].text == text, vim.inspect(sent))
+    end
+  end
+  if applied then
+    local use = by_path[probe.path_key(project .. "/renamecase/KotlinUse.kt")]
+    local current = vim.api.nvim_buf_get_lines(use.buffer, 0, -1, false)
+    local cursor = probe.find(current, "provider.support()", "support")
+    local target = client:request_sync("textDocument/definition", {
+      textDocument = { uri = use.uri }, position = cursor,
+    }, 5000, use.buffer)
+    local _, range = probe.find(provider.expected, "void support()", "support")
+    check("renamed Kotlin call navigates to current implementation",
+      probe.exact_definition(target and target.result, provider.path, { range }), vim.inspect(target))
+  else
+    check("renamed Kotlin call navigates to current implementation", false, "rename was not safely applied")
+  end
+  for _, file in ipairs(files) do
+    vim.api.nvim_buf_set_lines(file.buffer, 0, -1, false, file.before)
+    check("override rename leaves disk unchanged for " .. file.name, vim.deep_equal(vim.fn.readfile(file.path), file.disk))
+  end
+  require("vim.lsp._changetracking").flush(client)
+  client.rpc.notify = original_notify
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/override-rename-snapshots.json")
+  end
+end
+
 -- Java parser diagnostics should be published for syntax errors.
 do
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)

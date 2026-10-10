@@ -28,6 +28,12 @@ pub enum Applicability {
     Rejected,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallMode {
+    Kotlin,
+    Java,
+}
+
 pub struct Selection<'a> {
     pub entries: Vec<&'a Entry>,
     pub applicability: Applicability,
@@ -116,7 +122,7 @@ pub fn candidates<'a>(
     matching_candidates(index, receiver, MemberName::Exact(name), ctx)
 }
 
-fn matching_candidates<'a>(
+pub(crate) fn matching_candidates<'a>(
     index: &'a dyn InferenceIndex,
     receiver: &Type,
     name: MemberName<'_>,
@@ -163,10 +169,229 @@ fn matching_candidates<'a>(
                 && a.sym.end_byte == b.sym.end_byte
         });
     }
+    remove_overridden_members(index, receiver, &mut members, ctx);
     Candidates {
         members,
         extensions,
         hierarchy_complete,
+    }
+}
+
+// shortcut: static/visibility validity needs declaration metadata before invalid overrides can be diagnosed.
+fn remove_overridden_members(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    members: &mut Vec<&Entry>,
+    ctx: &FileCtx,
+) {
+    if members.len() < 2 {
+        return;
+    }
+    let signatures: Vec<Option<Vec<Type>>> = members
+        .iter()
+        .map(|entry| {
+            if !members.iter().any(|other| {
+                other.sym.name == entry.sym.name
+                    && other.sym.arity == entry.sym.arity
+                    && (other.sym.container != entry.sym.container
+                        || other.sym.package != entry.sym.package)
+            }) {
+                return None;
+            }
+            method_signature(index, receiver, entry, ctx)
+        })
+        .collect();
+    let mut keep = vec![true; members.len()];
+    for (position, inherited) in members.iter().enumerate() {
+        keep[position] = !members.iter().enumerate().any(|(other, nearer)| {
+            other != position
+                && signature_inheritance_relation(
+                    index,
+                    nearer,
+                    inherited,
+                    &signatures[other],
+                    &signatures[position],
+                )
+                .is_found()
+        });
+    }
+    let mut position = 0;
+    members.retain(|_| {
+        let retain = keep[position];
+        position += 1;
+        retain
+    });
+}
+
+/// Known parameter identities after substituting the receiver's owning-class arguments.
+/// Unbound type variables and incomplete parameter facts cannot prove an override relation.
+pub fn method_signature(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    ctx: &FileCtx,
+) -> Option<Vec<Type>> {
+    if entry.sym.kind != crate::symbol::SymbolKind::Function
+        || !entry.sym.type_params.is_empty()
+        || entry.sym.arity.map(usize::from) != Some(entry.sym.params.len())
+    {
+        return None;
+    }
+    entry
+        .sym
+        .params
+        .iter()
+        .map(|parameter| {
+            parameter_identity(
+                index,
+                infer::declared_member_type(index, receiver, entry, parameter, ctx),
+            )
+        })
+        .collect()
+}
+
+/// Signature and strict declaring-owner relationship, shared by lookup and host refactoring.
+/// Dispatch/access must be checked against accepted source facts before treating this as an override.
+pub fn inherited_method_relation(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    child: &Entry,
+    parent: &Entry,
+    ctx: &FileCtx,
+) -> resolve::ResolutionStatus<()> {
+    signature_inheritance_relation(
+        index,
+        child,
+        parent,
+        &method_signature(index, receiver, child, ctx),
+        &method_signature(index, receiver, parent, ctx),
+    )
+}
+
+fn signature_inheritance_relation(
+    index: &dyn InferenceIndex,
+    child: &Entry,
+    parent: &Entry,
+    child_signature: &Option<Vec<Type>>,
+    parent_signature: &Option<Vec<Type>>,
+) -> resolve::ResolutionStatus<()> {
+    use crate::knowledge::Knowledge;
+    if child.sym.kind != crate::symbol::SymbolKind::Function
+        || parent.sym.kind != crate::symbol::SymbolKind::Function
+        || child.sym.name != parent.sym.name
+        || child.sym.has_vararg != parent.sym.has_vararg
+        || child
+            .sym
+            .arity
+            .zip(parent.sym.arity)
+            .is_some_and(|(child, parent)| child != parent)
+        || child.sym.container == parent.sym.container && child.sym.package == parent.sym.package
+        || matches!((child_signature, parent_signature), (Some(child), Some(parent)) if child != parent)
+    {
+        return Knowledge::DefinitelyAbsent;
+    }
+    let owner = owner_inheritance(index, child, parent);
+    if owner.is_definitely_absent() {
+        return owner;
+    }
+    if owner.is_found()
+        && !owner_inheritance(index, parent, child).is_found()
+        && child_signature.is_some()
+        && parent_signature.is_some()
+    {
+        return Knowledge::Found(());
+    }
+    Knowledge::Unknown(vec![
+        resolve::IncompletenessReason::MemberSurfaceIncomplete(crate::symbol::Def {
+            file: child.path.to_string(),
+            start_byte: child.sym.start_byte,
+            end_byte: child.sym.end_byte,
+        }),
+    ])
+}
+
+fn parameter_identity(index: &dyn InferenceIndex, ty: Type) -> Option<Type> {
+    if !infer::type_head_is_known(index, &ty) {
+        return None;
+    }
+    let Type::Class {
+        name,
+        package,
+        container,
+        args,
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    let builtin = container.is_none()
+        && package.as_deref().is_none_or(|package| {
+            package == "kotlin" || package == "java.lang" && name == "String"
+        })
+        && crate::defaults::is_builtin_type(infer::primitive_type_name(&name));
+    Some(Type::Class {
+        name: if builtin {
+            infer::primitive_type_name(&name).to_string()
+        } else {
+            name
+        },
+        package: if builtin {
+            Some("kotlin".into())
+        } else {
+            package
+        },
+        container,
+        nullable: false,
+        args: args
+            .into_iter()
+            .map(|argument| parameter_identity(index, argument))
+            .collect::<Option<_>>()?,
+    })
+}
+
+fn owner_inheritance(
+    index: &dyn InferenceIndex,
+    child: &Entry,
+    parent: &Entry,
+) -> resolve::ResolutionStatus<()> {
+    use crate::knowledge::Knowledge;
+    let (Some(child_owner), Some(parent_owner)) = (&child.sym.container, &parent.sym.container)
+    else {
+        return Knowledge::DefinitelyAbsent;
+    };
+    if child_owner == parent_owner && child.sym.package == parent.sym.package {
+        return Knowledge::DefinitelyAbsent;
+    }
+    let (container, name) = child_owner
+        .rsplit_once('.')
+        .map_or((None, child_owner.as_str()), |(container, name)| {
+            (Some(container.to_string()), name)
+        });
+    let owner = Type::Class {
+        name: name.to_string(),
+        package: Some(child.sym.package.clone()),
+        container,
+        nullable: false,
+        args: Vec::new(),
+    };
+    let mut incomplete = false;
+    let found = infer::walk_supertypes(index, &owner, 32, |current| {
+        incomplete |= current.name().is_none();
+        if current.package() == Some(parent.sym.package.as_str())
+            && infer::receiver_root_key(index, current).as_ref() == Some(parent_owner)
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break();
+    if found {
+        Knowledge::Found(())
+    } else if incomplete {
+        Knowledge::Unknown(vec![resolve::IncompletenessReason::UnknownReceiverType])
+    } else {
+        Knowledge::DefinitelyAbsent
     }
 }
 
@@ -205,7 +430,14 @@ impl<'a> Candidates<'a> {
                         let mut uncertain = false;
                         for entry in entries.iter().copied() {
                             let applicability = if functions && entry.sym.kind.is_callable_like() {
-                                function_applicability(index, receiver, entry, args, ctx)
+                                function_applicability(
+                                    index,
+                                    receiver,
+                                    entry,
+                                    args,
+                                    ctx,
+                                    CallMode::Kotlin,
+                                )
                             } else if !functions && entry.sym.kind.is_value_like() {
                                 callable_value_applicability(index, receiver, entry, args, ctx)
                             } else {
@@ -268,15 +500,17 @@ pub fn function_accepts(
     args: &CallArguments,
     ctx: &FileCtx,
 ) -> bool {
-    function_applicability(index, receiver, entry, args, ctx) != Applicability::Rejected
+    function_applicability(index, receiver, entry, args, ctx, CallMode::Kotlin)
+        != Applicability::Rejected
 }
 
-fn function_applicability(
+pub(crate) fn function_applicability(
     index: &dyn InferenceIndex,
     receiver: &Type,
     entry: &Entry,
     args: &CallArguments,
     ctx: &FileCtx,
+    mode: CallMode,
 ) -> Applicability {
     let mut uncertain = args.count.is_none() || args.trailing_lambda;
     if let Some(count) = args.count {
@@ -299,6 +533,7 @@ fn function_applicability(
         &entry.sym.params,
         args,
         ctx,
+        mode,
         uncertain,
     )
 }
@@ -310,27 +545,49 @@ fn parameters_applicability(
     params: &[TypeRef],
     args: &CallArguments,
     ctx: &FileCtx,
+    mode: CallMode,
+    uncertain: bool,
+) -> Applicability {
+    arguments_applicability(
+        index,
+        args,
+        |position| {
+            let formal = params
+                .get(position)
+                .or_else(|| entry.sym.has_vararg.then(|| params.last()).flatten());
+            let Some(formal) = formal else {
+                return Type::Unknown;
+            };
+            if entry.sym.has_vararg
+                && position >= params.len().saturating_sub(1)
+                && formal.name.ends_with("[]")
+            {
+                // A legacy array reference has not retained a normalized component type.
+                return Type::Unknown;
+            }
+            infer::declared_member_type(index, receiver, entry, formal, ctx)
+        },
+        mode,
+        uncertain,
+    )
+}
+
+pub(crate) fn arguments_applicability(
+    index: &dyn InferenceIndex,
+    args: &CallArguments,
+    mut formal_type: impl FnMut(usize) -> Type,
+    mode: CallMode,
     mut uncertain: bool,
 ) -> Applicability {
     uncertain |= args.count.is_some_and(|count| args.types.len() < count);
     for (position, actual) in args.types.iter().enumerate() {
-        let formal = params
-            .get(position)
-            .or_else(|| entry.sym.has_vararg.then(|| params.last()).flatten());
-        let Some(formal) = formal else {
-            uncertain = true;
-            continue;
-        };
-        if entry.sym.has_vararg
-            && position >= params.len().saturating_sub(1)
-            && formal.name.ends_with("[]")
-        {
-            // A legacy array reference has not retained a normalized component type.
-            uncertain = true;
-            continue;
-        }
-        let formal = infer::declared_member_type(index, receiver, entry, formal, ctx);
+        let formal = formal_type(position);
         if !infer::types_consistent(index, actual, &formal) {
+            if mode == CallMode::Java && java_conversion_unmodeled(actual, &formal) {
+                // shortcut: preserve Java widening/boxing until phased overload specificity is modeled.
+                uncertain = true;
+                continue;
+            }
             return Applicability::Rejected;
         }
         uncertain |=
@@ -341,6 +598,53 @@ fn parameters_applicability(
     } else {
         Applicability::Applicable
     }
+}
+
+fn java_conversion_unmodeled(actual: &Type, formal: &Type) -> bool {
+    let builtin = |ty: &Type| {
+        ty.container().is_none()
+            && ty
+                .package()
+                .is_none_or(|package| matches!(package, "kotlin" | "java.lang"))
+    };
+    let numeric = |ty: &Type| {
+        builtin(ty)
+            && matches!(
+                ty.name(),
+                Some(
+                    "byte"
+                        | "Byte"
+                        | "short"
+                        | "Short"
+                        | "char"
+                        | "Char"
+                        | "Character"
+                        | "int"
+                        | "Int"
+                        | "Integer"
+                        | "long"
+                        | "Long"
+                        | "float"
+                        | "Float"
+                        | "double"
+                        | "Double"
+                )
+            )
+    };
+    let scalar = |ty: &Type| {
+        numeric(ty) || (builtin(ty) && matches!(ty.name(), Some("boolean" | "Boolean")))
+    };
+    (formal.name() == Some("Object")
+        && formal.package() == Some("java.lang")
+        && formal.container().is_none())
+        || (numeric(actual) && numeric(formal))
+        || (scalar(actual)
+            && !scalar(formal)
+            && formal.container().is_none()
+            && formal
+                .package()
+                .is_some_and(|package| package.starts_with("java."))
+            && formal.name() != Some("String"))
 }
 
 /// Kotlin function types are normalized into the existing `FunctionN<P..., R>` type representation.
@@ -381,6 +685,7 @@ fn callable_value_applicability(
             params,
             args,
             ctx,
+            CallMode::Kotlin,
             args.count.is_none() || args.trailing_lambda || ty.nullable,
         );
     }

@@ -103,6 +103,7 @@ impl Default for LanguageParsers {
 pub struct FileFacts {
     pub package: String,
     pub symbols: Vec<IndexedSymbol>,
+    pub jvm: Option<ktcore::jvm::SourceFileFacts>,
     pub usages: Vec<Usage>,
     pub clean: bool,
 }
@@ -111,6 +112,7 @@ pub struct FileFacts {
 pub struct SymbolFacts {
     pub package: String,
     pub symbols: Vec<IndexedSymbol>,
+    pub jvm: Option<ktcore::jvm::SourceFileFacts>,
     pub clean: bool,
 }
 
@@ -292,6 +294,7 @@ pub struct SignatureEntries {
     pub active_parameter: u32,
     pub entries: Vec<Entry>,
     pub unqualified: bool,
+    pub projected_signatures: Vec<crate::signature::Signature>,
 }
 
 pub fn signature_entries(
@@ -321,6 +324,7 @@ pub fn signature_entries(
                 active_parameter,
                 entries,
                 unqualified: callee.kind() == "identifier",
+                projected_signatures: Vec::new(),
             })
         }
         SourceLanguage::Java => {
@@ -330,6 +334,7 @@ pub fn signature_entries(
                 name,
                 active_parameter,
                 entries,
+                projected_signatures: java::jvm_call_signatures(index, file, text, tree, call),
                 unqualified: call.kind() == "method_invocation"
                     && call.child_by_field_name("object").is_none(),
             })
@@ -378,6 +383,7 @@ pub fn file_facts(language: SourceLanguage, tree: &Tree, text: &str) -> FileFact
     FileFacts {
         package: facts.package,
         symbols: facts.symbols,
+        jvm: facts.jvm,
         usages,
         clean: facts.clean,
     }
@@ -389,7 +395,9 @@ pub fn symbol_facts(language: SourceLanguage, tree: &Tree, text: &str) -> Symbol
         SourceLanguage::Kotlin => indexer::extract_symbols(tree, text, &package),
         SourceLanguage::Java => java::extract_symbols(tree, text),
     };
+    let jvm = ktcore::jvm::source_facts("", tree, text, &symbols);
     SymbolFacts {
+        jvm,
         package,
         symbols,
         clean: !tree.root_node().has_error(),
@@ -622,3 +630,17 @@ const KOTLIN_KEYWORDS: &[&str] = &[
     "suspend",
     "const",
 ];
+
+/// JVM projection lookup belongs to the language syntax adapter; feature consumers share identity.
+pub fn jvm_member_at(
+    index: &dyn InferenceIndex,
+    file: &str,
+    text: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Option<ktcore::jvm::ResolvedMember> {
+    match SourceLanguage::for_key(file) {
+        SourceLanguage::Java => java::jvm_member_at(index, file, text, tree, offset),
+        SourceLanguage::Kotlin => None,
+    }
+}

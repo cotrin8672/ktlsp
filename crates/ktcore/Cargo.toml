@@ -12,6 +12,8 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+noak.workspace = true
+sha2.workspace = true
 serde.workspace = true
 tree-sitter.workspace = true
 tree-sitter-java.workspace = true

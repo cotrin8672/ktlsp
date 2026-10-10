@@ -6,8 +6,8 @@
 //!
 //! Parsing a dependency's sources is the dominant startup cost (~10s for kotlin-stdlib). Source
 //! jars are parsed directly from ZIP entries; a source entry is only materialized on disk when an
-//! editor needs to open its goto target. Since a resolved jar is immutable, we persist the parsed
-//! symbols to a `symcache` keyed by a cheap jar fingerprint (path + mtime + size); a cache hit
+//! editor needs to open its goto target. We persist parsed symbols to a `symcache` keyed by a
+//! cheap jar fingerprint (path + mtime + size); a cache hit
 //! deserializes the symbols and skips parsing entirely, turning that ~10s into a one-time-per-jar
 //! cost.
 
@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
@@ -44,6 +45,7 @@ use crate::symbol::IndexedSymbol;
 pub struct FileSymbols {
     pub file: String,
     pub symbols: Vec<IndexedSymbol>,
+    pub jvm: Option<ktcore::jvm::SourceFileFacts>,
     /// Runtime project ownership is reapplied after loading the shared symbol cache.
     #[serde(skip)]
     pub origin: Option<FileOrigin>,
@@ -667,21 +669,21 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v18-kotlin-inline-member-termination";
+const SYMCACHE_VERSION: &[u8] = b"v20-jvm-projections-source-io-result";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// A cheap, stat-only fingerprint of a resolved jar (path + mtime + size). Published jars are
-/// immutable, so this is a stable cache key without reading the jar's contents; any content change
-/// (re-download, SNAPSHOT update) changes size/mtime and misses the cache.
+/// A cheap, stat-only fingerprint of a resolved jar (path + full mtime + size).
+/// shortcut: replacement bytes with identical size and preserved mtime are not detected;
+/// use a content identity if mutable artifact stores require that guarantee.
 fn jar_fingerprint(path: &Path) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
@@ -720,7 +722,7 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
     for batch in &mut cached {
         batch.file = crate::paths::file_key(Path::new(&batch.file));
     }
-    // A lazy source directory can recreate any indexed entry from its immutable source jar. Legacy
+    // A lazy source directory can recreate indexed entries from its recorded source identity. Legacy
     // fully-extracted directories still require each cached file to exist.
     if source_dir.join(SOURCE_JAR_MARKER).is_file()
         || cached.iter().all(|fs| Path::new(&fs.file).exists())
@@ -735,13 +737,25 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
     }
 }
 
-/// Replace a legacy extracted directory with a tiny marker that points to the immutable source
-/// jar. Changing source artifact paths for the same coordinate also refreshes the marker.
-fn prepare_lazy_source_dir(jar: &Path, dest: &Path) -> bool {
+#[derive(Serialize, Deserialize, PartialEq)]
+struct SourceJarMarker {
+    jar: PathBuf,
+    fingerprint: String,
+}
+
+/// Discard materialized text when its source identity changes, including legacy path-only markers.
+fn prepare_lazy_source_dir(jar: &Path, dest: &Path, fingerprint: &str) -> bool {
+    if jar_fingerprint(jar).as_deref() != Some(fingerprint) {
+        return false;
+    }
     let marker = dest.join(SOURCE_JAR_MARKER);
-    let expected = jar.to_string_lossy();
-    if fs::read_to_string(&marker)
+    let expected = SourceJarMarker {
+        jar: jar.to_path_buf(),
+        fingerprint: fingerprint.to_string(),
+    };
+    if fs::read(&marker)
         .ok()
+        .and_then(|bytes| serde_json::from_slice::<SourceJarMarker>(&bytes).ok())
         .is_some_and(|stored| stored == expected)
     {
         return true;
@@ -752,8 +766,11 @@ fn prepare_lazy_source_dir(jar: &Path, dest: &Path) -> bool {
     if fs::create_dir_all(dest).is_err() {
         return false;
     }
+    let Ok(bytes) = serde_json::to_vec(&expected) else {
+        return false;
+    };
     let tmp = dest.join(format!("{SOURCE_JAR_MARKER}.{}.tmp", std::process::id()));
-    fs::write(&tmp, expected.as_bytes()).is_ok() && fs::rename(tmp, marker).is_ok()
+    fs::write(&tmp, bytes).is_ok() && fs::rename(tmp, marker).is_ok()
 }
 
 /// Materialize a lazily indexed source path, if it belongs to a directory owned by a source-jar
@@ -762,12 +779,23 @@ fn prepare_lazy_source_dir(jar: &Path, dest: &Path) -> bool {
 pub fn materialize_source_file(path: &Path) -> bool {
     for source_dir in path.ancestors().skip(1) {
         let marker = source_dir.join(SOURCE_JAR_MARKER);
-        let Ok(jar) = fs::read_to_string(&marker) else {
+        let Ok(bytes) = fs::read(&marker) else {
             continue;
         };
-        return jar::extract_source_file(Path::new(&jar), source_dir, path)
+        let Ok(marker) = serde_json::from_slice::<SourceJarMarker>(&bytes) else {
+            return false;
+        };
+        if jar_fingerprint(&marker.jar).as_deref() != Some(marker.fingerprint.as_str()) {
+            return false;
+        }
+        let extracted = jar::extract_source_file(&marker.jar, source_dir, path)
             .inspect_err(|error| tracing::warn!("materialize {} failed: {error}", path.display()))
             .unwrap_or(false);
+        if jar_fingerprint(&marker.jar).as_deref() != Some(marker.fingerprint.as_str()) {
+            let _ = fs::remove_file(path);
+            return false;
+        }
+        return extracted;
     }
     false
 }
@@ -800,17 +828,20 @@ fn symcache_store(fingerprint: &str, data: &[FileSymbols]) {
 }
 
 /// Parse every extracted `.kt`/`.java` source under `dest` into per-file symbol batches.
-fn parse_dir(dest: &Path, kotlin: &mut KotlinParser, java: &mut JavaParser) -> Vec<FileSymbols> {
+fn parse_dir(
+    dest: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> anyhow::Result<Vec<FileSymbols>> {
     let mut out = Vec::new();
-    for path in jar::collect_sources(dest) {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
+    for path in jar::collect_sources(dest)? {
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("read source {}", path.display()))?;
         if let Some(file) = parse_source_file(&path, &text, kotlin, java) {
             out.push(file);
         }
     }
-    out
+    Ok(out)
 }
 
 fn parse_source_jar(
@@ -841,6 +872,7 @@ fn parse_source_file(
     };
     let facts = language::symbol_facts(language, &tree, text);
     (!facts.symbols.is_empty()).then(|| FileSymbols {
+        jvm: facts.jvm,
         file: crate::paths::file_key(path),
         symbols: facts.symbols,
         origin: None,
@@ -869,13 +901,15 @@ pub fn coordinate_source(
     };
 
     let Some(jar) = jar else {
-        // No sources jar available now — use a prior extraction if one exists, else give up.
-        return dest.is_dir().then_some(LibrarySource {
-            dest,
-            jar: None,
-            fingerprint: None,
-            origin_id: crate::classpath::maven_origin_id(coord),
-        });
+        // A lazy directory may contain only a marker or a materialized subset, not the library.
+        return (dest.is_dir() && !dest.join(SOURCE_JAR_MARKER).exists()).then_some(
+            LibrarySource {
+                dest,
+                jar: None,
+                fingerprint: None,
+                origin_id: crate::classpath::maven_origin_id(coord),
+            },
+        );
     };
 
     let fingerprint = jar_fingerprint(&jar);
@@ -893,14 +927,14 @@ pub fn resolve_library_source(
     source: &LibrarySource,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
-    let mut batches = resolve_library_source_unowned(source, kotlin, java);
+) -> anyhow::Result<Vec<FileSymbols>> {
+    let mut batches = resolve_library_source_unowned(source, None, kotlin, java)?;
     tag_batches(
         &mut batches,
         &source.origin_id,
         SourceRepresentation::Source,
     );
-    batches
+    Ok(batches)
 }
 
 fn tag_batches(batches: &mut [FileSymbols], origin_id: &str, representation: SourceRepresentation) {
@@ -915,38 +949,44 @@ fn tag_batches(batches: &mut [FileSymbols], origin_id: &str, representation: Sou
 
 fn resolve_library_source_unowned(
     source: &LibrarySource,
+    cache_fingerprint: Option<&str>,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> anyhow::Result<Vec<FileSymbols>> {
     let Some(jar) = &source.jar else {
         return parse_dir(&source.dest, kotlin, java);
     };
 
-    if !prepare_lazy_source_dir(jar, &source.dest) {
-        tracing::warn!(
+    let archive_fingerprint = source
+        .fingerprint
+        .as_deref()
+        .context("source archive identity unavailable")?;
+    if !prepare_lazy_source_dir(jar, &source.dest, archive_fingerprint) {
+        anyhow::bail!(
             "prepare lazy source directory {} failed",
             source.dest.display()
         );
-        return Vec::new();
     }
 
+    // Local companion sources retain the binary-origin cache partition and extraction path.
+    let fingerprint = cache_fingerprint.unwrap_or(archive_fingerprint);
     // Symbol cache: a hit skips the (dominant) parse cost entirely.
-    if let Some(fingerprint) = &source.fingerprint {
-        if let Some(cached) = symcache_load(&fingerprint, &source.dest) {
-            return cached;
-        }
+    if let Some(cached) = symcache_load(fingerprint, &source.dest) {
+        anyhow::ensure!(
+            jar_fingerprint(jar).as_deref() == Some(archive_fingerprint),
+            "source archive {} changed while loading cached symbols",
+            jar.display()
+        );
+        return Ok(cached);
     }
-    let symbols = match parse_source_jar(jar, &source.dest, kotlin, java) {
-        Ok(symbols) => symbols,
-        Err(error) => {
-            tracing::warn!("parse {} failed: {error}", jar.display());
-            return Vec::new();
-        }
-    };
-    if let Some(fingerprint) = &source.fingerprint {
-        symcache_store(fingerprint, &symbols);
-    }
-    symbols
+    let symbols = parse_source_jar(jar, &source.dest, kotlin, java)?;
+    anyhow::ensure!(
+        jar_fingerprint(jar).as_deref() == Some(archive_fingerprint),
+        "source archive {} changed while parsing symbols",
+        jar.display()
+    );
+    symcache_store(fingerprint, &symbols);
+    Ok(symbols)
 }
 
 /// Resolve one coordinate to indexed symbols: locate/download its sources jar, ensure it's
@@ -960,7 +1000,12 @@ pub fn resolve_coordinate(
     java: &mut JavaParser,
 ) -> Vec<FileSymbols> {
     coordinate_source(coord, repos, extract_root)
-        .map(|source| resolve_library_source(&source, kotlin, java))
+        .map(|source| {
+            resolve_library_source(&source, kotlin, java).unwrap_or_else(|error| {
+                tracing::warn!("index {} failed: {error:#}", coord.label());
+                Vec::new()
+            })
+        })
         .unwrap_or_default()
 }
 
@@ -973,7 +1018,7 @@ pub fn resolve_local_jar_stubs(
     extract_root: &Path,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> anyhow::Result<Vec<FileSymbols>> {
     resolve_local_jar_stubs_for_origin(
         jar_path,
         &crate::classpath::file_origin_id(jar_path),
@@ -989,10 +1034,12 @@ pub fn resolve_local_jar_stubs_for_origin(
     extract_root: &Path,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> anyhow::Result<Vec<FileSymbols>> {
     if !jar_path.is_file() || crate::classpath::file_origin_id(jar_path) != origin_id {
-        tracing::warn!(path = %jar_path.display(), "local artifact changed since project discovery");
-        return Vec::new();
+        anyhow::bail!(
+            "local artifact {} changed since project discovery",
+            jar_path.display()
+        );
     }
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
@@ -1004,26 +1051,28 @@ pub fn resolve_local_jar_stubs_for_origin(
     {
         let source = LibrarySource {
             dest: extract_root.join("local-jars").join(&fingerprint),
+            fingerprint: jar_fingerprint(&sources),
             jar: Some(sources),
-            fingerprint: Some(fingerprint),
             origin_id: origin_id.to_string(),
         };
         (
-            resolve_library_source_unowned(&source, kotlin, java),
+            resolve_library_source_unowned(&source, Some(&fingerprint), kotlin, java)?,
             SourceRepresentation::Source,
         )
     } else {
         (
-            resolve_local_jar_stubs_unowned(jar_path, extract_root, &fingerprint, kotlin, java),
+            resolve_local_jar_stubs_unowned(jar_path, extract_root, &fingerprint, kotlin, java)?,
             SourceRepresentation::Stub,
         )
     };
     if crate::classpath::file_origin_id(jar_path) != origin_id {
-        tracing::warn!(path = %jar_path.display(), "local artifact changed while indexing");
-        return Vec::new();
+        anyhow::bail!(
+            "local artifact {} changed while indexing",
+            jar_path.display()
+        );
     }
     tag_batches(&mut batches, origin_id, representation);
-    batches
+    Ok(batches)
 }
 
 fn resolve_local_jar_stubs_unowned(
@@ -1032,26 +1081,22 @@ fn resolve_local_jar_stubs_unowned(
     fingerprint: &str,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> anyhow::Result<Vec<FileSymbols>> {
     if !jar_path.is_file() {
-        return Vec::new();
+        anyhow::bail!("local artifact {} is missing", jar_path.display());
     }
     let dest = extract_root.join("local-jars").join(&fingerprint);
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
-        return cached;
+        return Ok(cached);
     }
 
-    if !dest.is_dir() {
-        if let Err(e) = jar::extract_class_stubs(jar_path, &dest) {
-            tracing::warn!("extract class stubs {} failed: {e}", jar_path.display());
-            return Vec::new();
-        }
-    }
+    // A previous interrupted extraction can leave a directory without a complete cache.
+    jar::extract_class_stubs(jar_path, &dest)?;
 
-    let symbols = parse_dir(&dest, kotlin, java);
+    let symbols = parse_dir(&dest, kotlin, java)?;
     symcache_store(&fingerprint, &symbols);
-    symbols
+    Ok(symbols)
 }
 
 /// Resolve the local classpath jar that declares `import_fqn`, using sources when available.
@@ -1071,8 +1116,19 @@ pub fn resolve_import_fqn_from_local_jars(
             .and_then(|model| model.artifact_origin(&jar_path))
             .map(str::to_string)
             .unwrap_or_else(|| crate::classpath::file_origin_id(&jar_path));
-        let batches =
-            resolve_local_jar_stubs_for_origin(&jar_path, &origin_id, extract_root, kotlin, java);
+        let batches = match resolve_local_jar_stubs_for_origin(
+            &jar_path,
+            &origin_id,
+            extract_root,
+            kotlin,
+            java,
+        ) {
+            Ok(batches) => batches,
+            Err(error) => {
+                tracing::warn!("index {} failed: {error:#}", jar_path.display());
+                continue;
+            }
+        };
         let matches = batches
             .into_iter()
             .filter(|batch| {
@@ -1321,9 +1377,11 @@ fn resolve_android_imports_from_location(
             let _guard = ANDROID_SOURCES_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let fingerprint = jar_fingerprint(&archive).unwrap_or_else(|| "unknown".to_string());
+            let Some(fingerprint) = jar_fingerprint(&archive) else {
+                return Vec::new();
+            };
             let dest = extract_root.join("android").join(&fingerprint);
-            if !prepare_lazy_source_dir(&archive, &dest) {
+            if !prepare_lazy_source_dir(&archive, &dest, &fingerprint) {
                 return Vec::new();
             }
             let mut paths = Vec::new();
@@ -1606,11 +1664,11 @@ pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPla
     if !src_zip.is_file() {
         return None;
     }
-    let fingerprint = jar_fingerprint(src_zip).unwrap_or_else(|| "unknown".to_string());
+    let fingerprint = jar_fingerprint(src_zip)?;
     let dest = extract_root.join("jdk").join(&fingerprint);
 
     // The lazy-dir marker write is not race-safe; it must happen once, before shards spawn.
-    if !prepare_lazy_source_dir(src_zip, &dest) {
+    if !prepare_lazy_source_dir(src_zip, &dest, &fingerprint) {
         tracing::warn!(
             "prepare lazy JDK source directory {} failed",
             dest.display()
@@ -1722,9 +1780,11 @@ fn resolve_jdk_imports_from_zip(
     if !src_zip.is_file() {
         return Vec::new();
     }
-    let fingerprint = jar_fingerprint(src_zip).unwrap_or_else(|| "unknown".to_string());
+    let Some(fingerprint) = jar_fingerprint(src_zip) else {
+        return Vec::new();
+    };
     let dest = extract_root.join("jdk").join(&fingerprint);
-    if !prepare_lazy_source_dir(src_zip, &dest) {
+    if !prepare_lazy_source_dir(src_zip, &dest, &fingerprint) {
         return Vec::new();
     }
     let suffixes = fqns
@@ -1857,6 +1917,7 @@ fn parse_java_source_file(path: &Path, java: &mut JavaParser) -> Option<FileSymb
         }),
     );
     (!facts.symbols.is_empty()).then(|| FileSymbols {
+        jvm: facts.jvm,
         file: crate::paths::file_key(path),
         symbols: facts.symbols,
         origin: None,
@@ -1885,6 +1946,169 @@ mod tests {
             zip.write_all(body.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn snapshot_same_second_same_length_update_misses_cache_and_invalidates_materialization() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_snapshot_nanos_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        let first = "package api; public class Only { public void first() {} }";
+        let second = "package api; public class Only { public void other() {} }";
+        let mut source = LibrarySource {
+            dest: tmp.join("extracted"),
+            jar: Some(jar.clone()),
+            fingerprint: None,
+            origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
+        };
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let mut previous_fingerprint = None;
+        let mut previous_length = None;
+        for (nanos, text, member, old_member) in [
+            (100_000_000, first, "first", "other"),
+            (200_000_000, second, "other", "first"),
+        ] {
+            write_sources_jar(&jar, &[("api/Only.java", text)]);
+            let modified = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, nanos);
+            fs::File::options()
+                .write(true)
+                .open(&jar)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let metadata = fs::metadata(&jar).unwrap();
+            assert_eq!(
+                metadata.modified().unwrap(),
+                modified,
+                "filesystem must preserve the controlled timestamp"
+            );
+            if let Some(length) = previous_length {
+                assert_eq!(
+                    metadata.len(),
+                    length,
+                    "the archive update must keep its byte length"
+                );
+            }
+            previous_length = Some(metadata.len());
+            source.fingerprint = jar_fingerprint(&jar);
+            assert!(source.fingerprint.is_some());
+            assert_ne!(
+                source.fingerprint, previous_fingerprint,
+                "distinct subsecond mtimes must have distinct cache identities"
+            );
+            previous_fingerprint = source.fingerprint.clone();
+            for attempt in 0..2 {
+                let batches = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+                assert_eq!(batches.len(), 1);
+                let path = Path::new(&batches[0].file);
+                if attempt == 0 {
+                    assert!(
+                        !path.exists(),
+                        "a changed marker must evict the previous materialized text"
+                    );
+                }
+                assert!(batches[0]
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.name == member));
+                assert!(!batches[0]
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.name == old_member));
+                assert!(materialize_source_file(path));
+                assert_eq!(fs::read_to_string(path).unwrap(), text);
+            }
+        }
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn snapshot_legacy_path_marker_is_migrated_before_a_warm_cache_hit() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_snapshot_legacy_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        write_sources_jar(
+            &jar,
+            &[("api/Only.java", "package api; public class Only {}")],
+        );
+        let source = LibrarySource {
+            dest: tmp.join("extracted"),
+            jar: Some(jar.clone()),
+            fingerprint: jar_fingerprint(&jar),
+            origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
+        };
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let cold = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+        assert_eq!(cold.len(), 1);
+        fs::write(
+            source.dest.join(SOURCE_JAR_MARKER),
+            jar.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let stale = source.dest.join("api/Removed.java");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "package api; public class Removed {}").unwrap();
+        let warm = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+        assert_eq!(warm.len(), 1);
+        assert!(
+            !stale.exists(),
+            "a legacy path-only marker cannot prove that materialized files match cached facts"
+        );
+        assert!(materialize_source_file(Path::new(&warm[0].file)));
+        assert_eq!(
+            fs::read_to_string(&warm[0].file).unwrap(),
+            "package api; public class Only {}"
+        );
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn snapshot_missing_or_replaced_archive_rejects_a_captured_warm_cache_identity() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_snapshot_missing_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        write_sources_jar(
+            &jar,
+            &[("api/Only.java", "package api; public class Only {}")],
+        );
+        let mut source = LibrarySource {
+            dest: tmp.join("extracted"),
+            jar: Some(jar.clone()),
+            fingerprint: jar_fingerprint(&jar),
+            origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
+        };
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let cold = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+        assert_eq!(cold.len(), 1);
+        fs::remove_file(&jar).unwrap();
+        assert!(
+            resolve_library_source(&source, &mut kotlin, &mut java).is_err(),
+            "a warm symbol cache cannot substitute for a missing selected archive"
+        );
+        assert!(!materialize_source_file(Path::new(&cold[0].file)));
+        write_sources_jar(
+            &jar,
+            &[(
+                "api/Only.java",
+                "package api; public class Only { public void restored() {} }",
+            )],
+        );
+        assert!(
+            resolve_library_source(&source, &mut kotlin, &mut java).is_err(),
+            "a captured identity cannot admit a replacement archive"
+        );
+        source.fingerprint = jar_fingerprint(&jar);
+        let recovered = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+        assert!(recovered[0]
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "restored"));
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
@@ -2147,7 +2371,7 @@ public interface ExecutorService {
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
-        let cold = resolve_library_source(&source, &mut kotlin, &mut java);
+        let cold = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
         assert_eq!(cold.len(), 1);
         assert!(cold[0].symbols.iter().any(|symbol| symbol.name == "useful"));
         assert_eq!(
@@ -2165,12 +2389,50 @@ public interface ExecutorService {
             "runtime ownership must not be persisted in symbol caches"
         );
         source.origin_id = "maven:vendor:alias:1".to_string();
-        let warm = resolve_library_source(&source, &mut kotlin, &mut java);
+        let warm = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
         assert_eq!(warm.len(), 1);
         assert_eq!(warm[0].origin.as_ref().unwrap().origin_id, source.origin_id);
         assert_eq!(warm[0].file, cold[0].file);
         assert_eq!(warm[0].symbols.len(), cold[0].symbols.len());
         fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn local_stub_cache_miss_repairs_incomplete_extractions() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("ktlsp_partial_stubs_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("api.jar");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&binary).unwrap());
+        for name in ["Useful", "Other"] {
+            archive
+                .start_file(
+                    format!("api/{name}.class"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.write_all(b"class-name-only fixture").unwrap();
+        }
+        archive.finish().unwrap();
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let initial =
+            resolve_local_jar_stubs(&binary, &root.join("extracted"), &mut kotlin, &mut java)
+                .unwrap();
+        assert_eq!(initial.len(), 2);
+        fs::remove_file(&initial[1].file).unwrap();
+        let repaired =
+            resolve_local_jar_stubs(&binary, &root.join("extracted"), &mut kotlin, &mut java)
+                .unwrap();
+        assert_eq!(
+            repaired.len(),
+            2,
+            "a cache miss cannot accept a partial extraction directory"
+        );
+        assert!(repaired
+            .iter()
+            .all(|batch| Path::new(&batch.file).is_file()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2191,7 +2453,8 @@ public interface ExecutorService {
                 &tmp.join("extract"),
                 &mut kotlin,
                 &mut java,
-            );
+            )
+            .unwrap();
             assert_eq!(batches.len(), 1);
             assert!(batches[0]
                 .symbols
@@ -2212,8 +2475,44 @@ public interface ExecutorService {
             &mut kotlin,
             &mut java
         )
-        .is_empty());
+        .is_err());
         fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn extracted_source_errors_do_not_publish_partial_libraries() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_extracted_source_errors_{}",
+            std::process::id()
+        ));
+        let source = LibrarySource {
+            dest: root.join("sources"),
+            jar: None,
+            fingerprint: None,
+            origin_id: "test-extracted-library".into(),
+        };
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        assert!(resolve_library_source(&source, &mut kotlin, &mut java).is_err());
+        fs::create_dir_all(&source.dest).unwrap();
+        fs::write(
+            source.dest.join("Good.java"),
+            "package api; public class Good {}",
+        )
+        .unwrap();
+        fs::write(source.dest.join("Bad.java"), b"\xff").unwrap();
+        assert!(resolve_library_source(&source, &mut kotlin, &mut java).is_err());
+        fs::write(
+            source.dest.join("Bad.java"),
+            "package api; public class Bad {}",
+        )
+        .unwrap();
+        let batches = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.origin.as_ref().unwrap().origin_id == source.origin_id));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2239,19 +2538,26 @@ public interface ExecutorService {
             archive.write_all(body).unwrap();
         }
         archive.finish().unwrap();
-        let source = LibrarySource {
+        let mut source = LibrarySource {
             dest: tmp.join("extract/library"),
             jar: Some(jar.clone()),
-            fingerprint: Some(format!("partial-source-test-{}", std::process::id())),
+            fingerprint: jar_fingerprint(&jar),
             origin_id: "test-library".into(),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
         for _ in 0..2 {
+            let error = resolve_library_source(&source, &mut kotlin, &mut java)
+                .err()
+                .expect("an unreadable entry cannot leave a partial library or cache hit");
+            let reason = format!("{error:#}");
             assert!(
-                resolve_library_source(&source, &mut kotlin, &mut java).is_empty(),
-                "an unreadable entry cannot leave a partial library or a partial cache hit"
+                reason.contains("Bad.java") && reason.contains("UTF-8"),
+                "the actual decode failure must be reached: {reason}"
             );
+            assert!(!symcache_dir()
+                .join(format!("{}.zst", source.fingerprint.as_ref().unwrap()))
+                .exists());
             assert!(
                 resolve_jdk_sources(&jar, &tmp.join("extract/jdk"), &mut kotlin, &mut java)
                     .is_empty(),
@@ -2265,9 +2571,12 @@ public interface ExecutorService {
                 ("api/Bad.java", "package api; public class Bad {}"),
             ],
         );
+        source.fingerprint = jar_fingerprint(&jar);
         for _ in 0..2 {
             assert_eq!(
-                resolve_library_source(&source, &mut kotlin, &mut java).len(),
+                resolve_library_source(&source, &mut kotlin, &mut java)
+                    .unwrap()
+                    .len(),
                 2,
                 "a failed parse must not cache an empty result that hides repaired sources"
             );
@@ -2305,7 +2614,8 @@ public interface ExecutorService {
                 &tmp.join("extract"),
                 &mut kotlin,
                 &mut java,
-            );
+            )
+            .unwrap();
             let symbols: Vec<_> = batches.iter().flat_map(|batch| &batch.symbols).collect();
             let lookup = symbols
                 .iter()
@@ -2377,7 +2687,7 @@ public interface ExecutorService {
                 &mut kotlin,
                 &mut java,
             )
-            .is_empty());
+            .is_err());
             for _ in 0..2 {
                 let batches = resolve_local_jar_stubs_for_origin(
                     &jar,
@@ -2385,7 +2695,8 @@ public interface ExecutorService {
                     &tmp.join("extract"),
                     &mut kotlin,
                     &mut java,
-                );
+                )
+                .unwrap();
                 let names: Vec<_> = batches
                     .iter()
                     .flat_map(|batch| &batch.symbols)
@@ -2408,8 +2719,9 @@ public interface ExecutorService {
             &mut kotlin,
             &mut java,
         )
-        .is_empty());
-        let fallback = resolve_local_jar_stubs(&jar, &tmp.join("extract"), &mut kotlin, &mut java);
+        .is_err());
+        let fallback =
+            resolve_local_jar_stubs(&jar, &tmp.join("extract"), &mut kotlin, &mut java).unwrap();
         assert!(!fallback.is_empty());
         assert!(fallback.iter().all(|batch| {
             batch.origin.as_ref().unwrap().representation == SourceRepresentation::Stub
@@ -2424,7 +2736,7 @@ public interface ExecutorService {
         );
         fs::remove_file(&jar).unwrap();
         assert!(
-            resolve_local_jar_stubs(&jar, &tmp.join("extract"), &mut kotlin, &mut java).is_empty(),
+            resolve_local_jar_stubs(&jar, &tmp.join("extract"), &mut kotlin, &mut java).is_err(),
             "an orphaned source jar must not add a missing binary dependency"
         );
         fs::remove_dir_all(tmp).unwrap();

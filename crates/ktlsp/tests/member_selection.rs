@@ -12,6 +12,894 @@ use ktlsp::symbol::{Def, SymbolKind};
 use ktlsp::types::Type;
 use ktlsp::workspace::Workspace;
 
+const OVERLOAD_JAVA: &str = "/selection/typed/JavaUse.java";
+const OVERLOAD_KOTLIN: &str = "/selection/typed/KotlinUse.kt";
+const OVERLOAD_USE: &str = "package typed; class JavaUse { void run(Target target, Decoy decoy, int number, String text) { target.twice(1); target.twice(\"x\"); target.twice(number); target.twice(text); decoy.twice(\"x\"); } }";
+
+fn overload_workspace(java_target: bool) -> (Workspace, &'static str) {
+    let mut ws = Workspace::new();
+    ws.open("/selection/typed/Results.kt", "package typed\nclass NumberResult { fun numberOnly() {} }\nclass TextResult { fun textOnly() {} }\nclass Decoy { fun twice(value: String): TextResult = TextResult() }\n".into());
+    let (file, source) = if java_target {
+        ("/selection/typed/Target.java", "package typed; public class Target { public NumberResult twice(int value) { return null; } public TextResult twice(String value) { return null; } public TextResult only(int value) { return null; } }")
+    } else {
+        ("/selection/typed/Target.kt", "package typed\nclass Target { fun twice(value: Int): NumberResult = NumberResult()\nfun twice(value: String): TextResult = TextResult()\nfun only(value: Int): TextResult = TextResult() }\n")
+    };
+    ws.open(file, source.into());
+    ws.open(OVERLOAD_JAVA, OVERLOAD_USE.into());
+    ws.open(OVERLOAD_KOTLIN, "package typed\nfun run(target: Target, decoy: Decoy) { target.twice(1); target.twice(\"x\"); decoy.twice(\"x\") }\n".into());
+    ws.assume_index_complete_for_tests();
+    (ws, file)
+}
+
+fn overload_target(ws: &Workspace, file: &str, parameter: &str) -> Def {
+    let entry = ws
+        .index
+        .lookup_by_name("twice")
+        .iter()
+        .find(|entry| {
+            entry.path.as_ref() == file
+                && entry
+                    .sym
+                    .params
+                    .first()
+                    .is_some_and(|ty| ty.name == parameter)
+        })
+        .unwrap();
+    Def {
+        file: file.into(),
+        start_byte: entry.sym.start_byte,
+        end_byte: entry.sym.end_byte,
+    }
+}
+
+#[test]
+fn java_known_arguments_select_exact_java_and_kotlin_overloads() {
+    for java_target in [false, true] {
+        let (mut ws, file) = overload_workspace(java_target);
+        for (needle, parameter) in [
+            ("target.twice(1)", if java_target { "int" } else { "Int" }),
+            ("target.twice(\"x\")", "String"),
+            (
+                "target.twice(number)",
+                if java_target { "int" } else { "Int" },
+            ),
+            ("target.twice(text)", "String"),
+        ] {
+            let expected = overload_target(&ws, file, parameter);
+            assert_eq!(
+                goto(&mut ws, OVERLOAD_JAVA, needle),
+                vec![expected],
+                "{file}: {needle}"
+            );
+        }
+    }
+}
+
+#[test]
+fn java_unknown_argument_keeps_both_authored_overloads() {
+    for java_target in [false, true] {
+        let (mut ws, file) = overload_workspace(java_target);
+        ws.change(
+            OVERLOAD_JAVA,
+            "package typed; class JavaUse { void run(Target target) { target.twice(missing); } }"
+                .into(),
+        );
+        let mut expected = vec![
+            overload_target(&ws, file, if java_target { "int" } else { "Int" }),
+            overload_target(&ws, file, "String"),
+        ];
+        expected.sort_by_key(|def| def.start_byte);
+        let mut actual = goto(&mut ws, OVERLOAD_JAVA, "target.twice(missing)");
+        actual.sort_by_key(|def| def.start_byte);
+        assert_eq!(actual, expected, "{file}");
+    }
+}
+
+#[test]
+fn java_selected_overload_result_is_not_expanded_again() {
+    for java_target in [false, true] {
+        let (mut ws, file) = overload_workspace(java_target);
+        ws.change(OVERLOAD_JAVA, "package typed; class JavaUse { void run(Target target) { target.twice(\"x\").textOnly(); target.twice(1).numberOnly(); } }".into());
+        assert!(
+            labels(&mut ws, OVERLOAD_JAVA, "target.twice(\"x\").textO").contains("textOnly"),
+            "{file}"
+        );
+        assert!(
+            labels(&mut ws, OVERLOAD_JAVA, "target.twice(1).numberO").contains("numberOnly"),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn java_unique_invalid_call_has_navigation_without_a_result_type() {
+    for java_target in [false, true] {
+        let (mut ws, file) = overload_workspace(java_target);
+        ws.change(OVERLOAD_JAVA, "package typed; class JavaUse { void run(Target target) { target.only(true).textOnly(); target.twice(true); } }".into());
+        let expected = target(&ws, file, "only", SymbolKind::Function);
+        assert_eq!(
+            goto(&mut ws, OVERLOAD_JAVA, "target.only(true)"),
+            vec![expected]
+        );
+        assert!(
+            !labels(&mut ws, OVERLOAD_JAVA, "target.only(true).textO").contains("textOnly"),
+            "{file}"
+        );
+        assert!(
+            goto(&mut ws, OVERLOAD_JAVA, "target.twice(true)").is_empty(),
+            "{file}"
+        );
+        let diagnostics = ws.diagnostics(OVERLOAD_JAVA);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code
+                    == Some(ktlsp::diagnostics::DiagnosticCode::CallShapeMismatch))
+                .count(),
+            2,
+            "{file}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn java_overload_references_and_applied_rename_preserve_other_calls() {
+    for java_target in [false, true] {
+        let (mut ws, file) = overload_workspace(java_target);
+        // An ambiguous call remains omitted; it must never be edited as one resolved overload.
+        ws.change(
+            OVERLOAD_JAVA,
+            OVERLOAD_USE.replace("decoy.twice", "target.twice(missing); decoy.twice"),
+        );
+        let declaration = overload_target(&ws, file, "String");
+        let refs = ws.references(file, declaration.start_byte, true);
+        assert_eq!(refs.len(), 4, "{file}: {refs:?}");
+        let edits = ws
+            .rename(file, declaration.start_byte, "textTwice")
+            .unwrap();
+        for changed_file in [
+            file,
+            OVERLOAD_JAVA,
+            OVERLOAD_KOTLIN,
+            "/selection/typed/Results.kt",
+        ] {
+            let source = ws.doc_text(changed_file).unwrap();
+            let expected = source
+                .replace(
+                    "twice(value: String): TextResult",
+                    "textTwice(value: String): TextResult",
+                )
+                .replace("twice(String value)", "textTwice(String value)")
+                .replace("target.twice(\"x\")", "target.textTwice(\"x\")")
+                .replace("target.twice(text)", "target.textTwice(text)");
+            let expected = if changed_file.ends_with("Results.kt") {
+                source.to_string()
+            } else {
+                expected
+            };
+            let changed = apply_to_text(changed_file, &source, &edits).unwrap();
+            assert_eq!(changed, expected, "{changed_file}");
+            ws.change(changed_file, changed);
+        }
+        let expected = target(&ws, file, "textTwice", SymbolKind::Function);
+        assert_eq!(
+            goto(&mut ws, OVERLOAD_JAVA, "target.textTwice(\"x\")"),
+            vec![expected]
+        );
+    }
+}
+
+#[test]
+fn java_jvm_facade_overloads_share_typed_argument_selection() {
+    let mut ws = Workspace::new();
+    let file = "/selection/typed/Functions.kt";
+    ws.open(file, "@file:JvmName(\"TypedApi\")\npackage typed\nsuspend fun choose(value: Int): Int = value\nsuspend fun choose(value: String): String = value\n".into());
+    ws.open(OVERLOAD_JAVA, "package typed; class JavaUse { void run(kotlin.coroutines.Continuation<?> c) { TypedApi.choose(1, c); TypedApi.choose(\"x\", c); TypedApi.choose(missing, c); } }".into());
+    for (needle, parameter) in [
+        ("TypedApi.choose(1, c)", "Int"),
+        ("TypedApi.choose(\"x\", c)", "String"),
+    ] {
+        let entry = ws
+            .index
+            .lookup_by_name("choose")
+            .iter()
+            .find(|entry| entry.sym.params[0].name == parameter)
+            .unwrap();
+        let expected = Def {
+            file: file.into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        };
+        assert_eq!(
+            goto(&mut ws, OVERLOAD_JAVA, needle),
+            vec![expected],
+            "{needle}"
+        );
+    }
+    assert_eq!(
+        goto(&mut ws, OVERLOAD_JAVA, "TypedApi.choose(missing, c)").len(),
+        2
+    );
+}
+
+#[test]
+fn java_unknown_formal_type_remains_a_competing_overload() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "/selection/typed/Target.java",
+        "package typed; class Target { void take(String value) {} void take(Missing value) {} }"
+            .into(),
+    );
+    ws.open(
+        OVERLOAD_JAVA,
+        "package typed; class JavaUse { void run(Target target) { target.take(\"x\"); } }".into(),
+    );
+    assert_eq!(goto(&mut ws, OVERLOAD_JAVA, "target.take(\"x\")").len(), 2);
+}
+
+#[test]
+fn java_nested_argument_types_preserve_their_declared_owner() {
+    let mut ws = Workspace::new();
+    let file = "/selection/typed/Target.java";
+    let source = "package typed; class Left { static class Value {} } class Right { static class Value {} } class Target { void take(Left.Value value) {} void take(Right.Value value) {} }";
+    ws.open(file, source.into());
+    ws.open(OVERLOAD_JAVA, "package typed; class JavaUse { void run(Target target, Left.Value left, Right.Value right) { target.take(left); target.take(right); target.take(new Left.Value()); } }".into());
+    for (needle, owner) in [
+        ("target.take(left)", "Left"),
+        ("target.take(right)", "Right"),
+        ("target.take(new Left.Value())", "Left"),
+    ] {
+        let start_byte = source.find(&format!("take({owner}.Value")).unwrap();
+        let offset = ws.doc_text(OVERLOAD_JAVA).unwrap().find(needle).unwrap() + "target.".len();
+        assert_eq!(
+            ws.goto_definition(OVERLOAD_JAVA, offset),
+            vec![Def {
+                file: file.into(),
+                start_byte,
+                end_byte: start_byte + 4
+            }],
+            "{needle}"
+        );
+    }
+}
+
+#[test]
+fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
+    use ktcore::members::{Applicability, CallArguments};
+    let mut ws = Workspace::new();
+    ws.open("/selection/typed/Target.java", "package typed; class Target { void widen(long value) {} void widen(String value) {} void box(Integer value) {} void box(String value) {} void boxRef(java.io.Serializable value) {} void boxRef(String value) {} }".into());
+    // Reduced declarations make the reference identities known without implementing conversions.
+    ws.open(
+        "/selection/java/lang/Integer.java",
+        "package java.lang; class Integer {}".into(),
+    );
+    ws.open(
+        "/selection/java/io/Serializable.java",
+        "package java.io; interface Serializable {}".into(),
+    );
+    let receiver = Type::class("Target", Some("typed".into()));
+    let ctx = FileCtx::new("typed".into(), Vec::new());
+    let args = CallArguments {
+        count: Some(1),
+        types: vec![Type::class("int", None)],
+        trailing_lambda: false,
+    };
+    for name in ["widen", "box", "boxRef"] {
+        let selected = ktcore::jvm::select_call(
+            &ws.index,
+            &receiver,
+            ktcore::jvm::member_candidates(&ws.index, &receiver, name),
+            name,
+            &args,
+            &ctx,
+        );
+        assert_eq!(selected.applicability, Applicability::Unknown, "{name}");
+        assert_eq!(selected.navigation_candidates().len(), 1, "{name}");
+        assert_ne!(selected.candidates[0].params()[0].name, "String");
+    }
+}
+
+#[test]
+fn java_overloaded_jvm_alias_rename_applies_only_to_its_exact_signature() {
+    let mut ws = Workspace::new();
+    let file = "/selection/typed/Functions.kt";
+    let source = "@file:JvmName(\"TypedApi\")\npackage typed\n@JvmName(\"choose\")\nsuspend fun takeInt(value: Int): Int = value\n@JvmName(\"choose\")\nsuspend fun takeText(value: String): String = value\n";
+    let java = "package typed; class JavaUse { void run(kotlin.coroutines.Continuation<?> c) { TypedApi.choose(1, c); TypedApi.choose(\"x\", c); TypedApi.choose(missing, c); } }";
+    let kotlin = "package typed\nsuspend fun use() { takeInt(1); takeText(\"x\") }\n";
+    ws.open(file, source.into());
+    ws.open(OVERLOAD_JAVA, java.into());
+    ws.open(OVERLOAD_KOTLIN, kotlin.into());
+    let offset = java.find("choose(\"x\"").unwrap();
+    let declaration = target(&ws, file, "takeText", SymbolKind::Function);
+    assert_eq!(
+        ws.goto_definition(OVERLOAD_JAVA, offset),
+        vec![declaration.clone()]
+    );
+    let refs = ws.references(OVERLOAD_JAVA, offset, true);
+    assert_eq!(refs.len(), 3, "{refs:?}");
+    assert!(refs.contains(&declaration));
+    let edits = ws.rename(OVERLOAD_JAVA, offset, "chooseText").unwrap();
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    let changed_source = apply_to_text(file, source, &edits).unwrap();
+    let changed_java = apply_to_text(OVERLOAD_JAVA, java, &edits).unwrap();
+    assert_eq!(
+        changed_source,
+        source.replace(
+            "@JvmName(\"choose\")\nsuspend fun takeText",
+            "@JvmName(\"chooseText\")\nsuspend fun takeText"
+        )
+    );
+    assert_eq!(
+        changed_java,
+        java.replace("TypedApi.choose(\"x\", c)", "TypedApi.chooseText(\"x\", c)")
+    );
+    assert_eq!(
+        apply_to_text(OVERLOAD_KOTLIN, kotlin, &edits).unwrap(),
+        kotlin
+    );
+    ws.change(file, changed_source);
+    ws.change(OVERLOAD_JAVA, changed_java);
+    let declaration = target(&ws, file, "takeText", SymbolKind::Function);
+    assert_eq!(
+        goto(&mut ws, OVERLOAD_JAVA, "TypedApi.chooseText(\"x\", c)"),
+        vec![declaration]
+    );
+}
+
+#[test]
+fn overridden_member_has_exact_goto_references_incoming_calls_and_applied_rename() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/override/Worker.java";
+    let helper = "/selection/override/Helper.java";
+    let java = "/selection/override/Use.java";
+    let kotlin = "/selection/override/Use.kt";
+    let worker_source = "package inherited; public interface Worker { void assist(); }";
+    let helper_source =
+        "package inherited; public class Helper implements Worker { public void assist() {} }";
+    let java_source = "package inherited; class Use { void run(Helper helper, Worker worker) { helper.assist(); worker.assist(); } }";
+    let kotlin_source = "package inherited\nfun runKt(helper: Helper, worker: Worker) { helper.assist(); worker.assist() }\n";
+    for (file, source) in [
+        (worker, worker_source),
+        (helper, helper_source),
+        (java, java_source),
+        (kotlin, kotlin_source),
+    ] {
+        ws.open(file, source.into());
+    }
+    let declaration = target(&ws, helper, "assist", SymbolKind::Function);
+    let base = target(&ws, worker, "assist", SymbolKind::Function);
+    for file in [java, kotlin] {
+        assert_eq!(
+            goto(&mut ws, file, "helper.assist()"),
+            vec![declaration.clone()]
+        );
+        assert_eq!(goto(&mut ws, file, "worker.assist()"), vec![base.clone()]);
+    }
+    let refs = ws.references(helper, declaration.start_byte, true);
+    assert_eq!(refs.len(), 3, "{refs:?}");
+    assert!(refs.contains(&declaration));
+    let item = ws
+        .hierarchy_item_at(helper, declaration.start_byte)
+        .unwrap();
+    let incoming = ws.incoming_calls(&item);
+    assert_eq!(incoming.len(), 2, "{incoming:?}");
+    assert!(incoming
+        .iter()
+        .any(|call| call.from.name == "run" && call.ranges.len() == 1));
+    assert!(incoming
+        .iter()
+        .any(|call| call.from.name == "runKt" && call.ranges.len() == 1));
+    let edits = ws
+        .rename(helper, declaration.start_byte, "support")
+        .unwrap();
+    assert_eq!(edits.len(), 6, "{edits:?}");
+    assert_eq!(
+        apply_to_text(helper, helper_source, &edits).unwrap(),
+        helper_source.replace("assist", "support")
+    );
+    for (file, source) in [(java, java_source), (kotlin, kotlin_source)] {
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            source.replace(".assist", ".support")
+        );
+    }
+    assert_eq!(
+        apply_to_text(worker, worker_source, &edits).unwrap(),
+        worker_source.replace("assist", "support")
+    );
+}
+
+#[test]
+fn overridden_member_keeps_different_inherited_overloads_and_unknown_signatures() {
+    let mut ws = Workspace::new();
+    let base = "/selection/override/Base.java";
+    let child = "/selection/override/Child.java";
+    let use_file = "/selection/override/Use.java";
+    ws.open(base, "package inherited; class Base { void ping(int value) {} void ping(String value) {} void probe(Missing value) {} }".into());
+    ws.open(child, "package inherited; class Child extends Base { void ping(int value) {} void probe(String value) {} }".into());
+    ws.open(use_file, "package inherited; class Use { void run(Child child) { child.ping(1); child.ping(\"x\"); child.ping(missing); child.probe(\"x\"); } }".into());
+    let own = target(&ws, child, "ping", SymbolKind::Function);
+    assert_eq!(goto(&mut ws, use_file, "child.ping(1)"), vec![own.clone()]);
+    let text = goto(&mut ws, use_file, "child.ping(\"x\")");
+    assert_eq!(text.len(), 1, "{text:?}");
+    assert_eq!(text[0].file, base);
+    let unknown = goto(&mut ws, use_file, "child.ping(missing)");
+    assert_eq!(unknown.len(), 2, "{unknown:?}");
+    assert!(unknown.contains(&own) && unknown.contains(&text[0]));
+    assert_eq!(goto(&mut ws, use_file, "child.probe(\"x\")").len(), 2);
+}
+
+#[test]
+fn overridden_member_substitutes_generic_owner_without_collapsing_sibling_contracts() {
+    let mut ws = Workspace::new();
+    let base = "/selection/override/Base.java";
+    let child = "/selection/override/Child.java";
+    let java = "/selection/override/Use.java";
+    ws.open(base, "package inherited; class Base<T> { void take(T value) {} } interface Left { void same(); } interface Right { void same(); } class Both implements Left, Right {}".into());
+    ws.open(
+        child,
+        "package inherited; class Child extends Base<String> { void take(String value) {} }".into(),
+    );
+    ws.open(java, "package inherited; class Use { void run(Child child, Both both) { child.take(\"x\"); both.same(); } }".into());
+    let own = target(&ws, child, "take", SymbolKind::Function);
+    assert_eq!(goto(&mut ws, java, "child.take(\"x\")"), vec![own]);
+    assert_eq!(goto(&mut ws, java, "both.same()").len(), 2);
+}
+
+#[test]
+fn overridden_member_normalizes_java_kotlin_primitives_and_preserves_qualified_homonyms() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/override/Worker.java";
+    let child = "/selection/override/Child.kt";
+    let java = "/selection/override/Use.java";
+    let kotlin = "/selection/override/Use.kt";
+    ws.open(worker, "package inherited; interface Worker { void take(int value); void accept(left.Value value); }".into());
+    ws.open(child, "package inherited\nabstract class Child: Worker { override fun take(value: Int) {}\nfun accept(value: right.Value) {} }\n".into());
+    ws.open(
+        "/selection/left/Value.java",
+        "package left; class Value {}".into(),
+    );
+    ws.open(
+        "/selection/right/Value.java",
+        "package right; class Value {}".into(),
+    );
+    ws.open(java, "package inherited; class Use { void run(Child child) { child.take(1); child.accept(missing); } }".into());
+    ws.open(
+        kotlin,
+        "package inherited\nfun run(child: Child) { child.take(1); child.accept(missing) }\n"
+            .into(),
+    );
+    let own = target(&ws, child, "take", SymbolKind::Function);
+    for file in [java, kotlin] {
+        assert_eq!(goto(&mut ws, file, "child.take(1)"), vec![own.clone()]);
+        assert_eq!(goto(&mut ws, file, "child.accept(missing)").len(), 2);
+    }
+}
+
+#[test]
+fn overridden_member_keeps_boxed_and_primitive_signatures_distinct() {
+    let mut ws = Workspace::new();
+    let base = "/selection/override/Base.java";
+    let child = "/selection/override/Child.java";
+    let java = "/selection/override/Use.java";
+    ws.open(base, "package inherited; class Base { void take(java.lang.Long value) {} void flag(java.lang.Boolean value) {} }".into());
+    ws.open(child, "package inherited; class Child extends Base { void take(long value) {} void flag(boolean value) {} }".into());
+    ws.open(
+        "/selection/java/lang/Long.java",
+        "package java.lang; class Long {}".into(),
+    );
+    ws.open(
+        "/selection/java/lang/Boolean.java",
+        "package java.lang; class Boolean {}".into(),
+    );
+    ws.open(java, "package inherited; class Use { void run(Child child) { child.take(missing); child.flag(missing); } }".into());
+    for call in ["child.take(missing)", "child.flag(missing)"] {
+        assert_eq!(goto(&mut ws, java, call).len(), 2, "{call}");
+    }
+}
+
+#[test]
+fn rename_override_family_keeps_overloads_and_unrelated_calls_unchanged() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/family/Worker.java";
+    let child = "/selection/family/Child.java";
+    let java = "/selection/family/Use.java";
+    let kotlin = "/selection/family/Use.kt";
+    let decoy = "/selection/family/Decoy.java";
+    let worker_source =
+        "package family; public interface Worker { void assist(); void assist(String value); void assist(int value); }";
+    let child_source = "package family; public class Child implements Worker { public void assist() {} public void assist(String value) {} public void assist(int value) {} }";
+    let decoy_source = "package family; public class Decoy { public void assist() {} }";
+    let java_source = "package family; class Use { void run(Child child, Worker worker, Decoy decoy) { child.assist(); worker.assist(); child.assist(\"x\"); worker.assist(\"x\"); decoy.assist(); } }";
+    let kotlin_source = "package family\nfun run(child: Child, worker: Worker, decoy: Decoy) { child.assist(); worker.assist(); child.assist(\"x\"); worker.assist(\"x\"); decoy.assist() }\n";
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (decoy, decoy_source),
+        (java, java_source),
+        (kotlin, kotlin_source),
+    ] {
+        ws.open(file, source.into());
+    }
+    let definition = target(&ws, child, "assist", SymbolKind::Function);
+    let edits = ws.rename(child, definition.start_byte, "support").unwrap();
+    assert_eq!(edits.len(), 6, "{edits:?}");
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (java, java_source),
+        (kotlin, kotlin_source),
+        (decoy, decoy_source),
+    ] {
+        let expected = if file == decoy {
+            source.to_string()
+        } else if file == java || file == kotlin {
+            source
+                .replace("child.assist()", "child.support()")
+                .replace("worker.assist()", "worker.support()")
+        } else {
+            source.replace("assist()", "support()")
+        };
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            expected,
+            "{file}"
+        );
+    }
+    // Unknown overload calls are not unique enough to start a rename.
+    ws.change(
+        java,
+        java_source.replace("child.assist();", "child.assist(missing);"),
+    );
+    assert!(ws
+        .rename(
+            java,
+            ws.doc_text(java).unwrap().find("assist(missing)").unwrap(),
+            "support"
+        )
+        .is_none());
+}
+
+#[test]
+fn rename_override_family_substitutes_generic_parameters_in_both_languages() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/family/Worker.java";
+    let child = "/selection/family/Child.java";
+    let java = "/selection/family/Use.java";
+    let kotlin = "/selection/family/Use.kt";
+    let worker_source = "package family; public interface Worker<T> { void assist(T value); }";
+    let child_source = "package family; public class Child implements Worker<String> { public void assist(String value) {} }";
+    let java_source = "package family; class Use { void run(Child child, Worker<String> worker) { child.assist(\"x\"); worker.assist(\"x\"); } }";
+    let kotlin_source = "package family\nfun run(child: Child, worker: Worker<String>) { child.assist(\"x\"); worker.assist(\"x\") }\n";
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (java, java_source),
+        (kotlin, kotlin_source),
+    ] {
+        ws.open(file, source.into());
+    }
+    let definition = target(&ws, worker, "assist", SymbolKind::Function);
+    let edits = ws.rename(worker, definition.start_byte, "support").unwrap();
+    assert_eq!(edits.len(), 6, "{edits:?}");
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (java, java_source),
+        (kotlin, kotlin_source),
+    ] {
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            source.replace("assist", "support"),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn rename_override_family_is_transitive_across_java_and_kotlin() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/family/Worker.java";
+    let child = "/selection/family/Child.java";
+    let grandchild = "/selection/family/Grandchild.kt";
+    let use_file = "/selection/family/Use.kt";
+    let worker_source = "package family; public interface Worker { void assist(); }";
+    let child_source =
+        "package family; public class Child implements Worker { public void assist() {} }";
+    let grandchild_source =
+        "package family\nclass Grandchild: Child() { override fun assist() {} }\n";
+    let use_source = "package family\nfun run(child: Child, grandchild: Grandchild, worker: Worker) { child.assist(); grandchild.assist(); worker.assist() }\n";
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (grandchild, grandchild_source),
+        (use_file, use_source),
+    ] {
+        ws.open(file, source.into());
+    }
+    let definition = target(&ws, grandchild, "assist", SymbolKind::Function);
+    let edits = ws
+        .rename(grandchild, definition.start_byte, "support")
+        .unwrap();
+    assert_eq!(edits.len(), 6, "{edits:?}");
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (grandchild, grandchild_source),
+        (use_file, use_source),
+    ] {
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            source.replace("assist", "support"),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn rename_override_family_refuses_inherited_common_descendant_contracts() {
+    let mut ws = Workspace::new();
+    let base = "/selection/family/Base.java";
+    let worker = "/selection/family/Worker.java";
+    let child = "/selection/family/Child.java";
+    ws.open(
+        base,
+        "package family; public class Base { public void assist() {} }".into(),
+    );
+    ws.open(
+        worker,
+        "package family; public interface Worker { void assist(); }".into(),
+    );
+    ws.open(
+        child,
+        "package family; public class Child extends Base implements Worker {}".into(),
+    );
+    for file in [base, worker] {
+        let definition = target(&ws, file, "assist", SymbolKind::Function);
+        assert!(
+            ws.prepare_rename(file, definition.start_byte).is_none(),
+            "{file}"
+        );
+        assert!(
+            ws.rename(file, definition.start_byte, "support").is_none(),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn rename_override_family_refuses_unknown_signatures_cycles_and_read_only_ancestors() {
+    for (base_source, child_source, durable) in [
+        (
+            "package family; class Base { public void assist(Missing value) {} }",
+            "package family; class Child extends Base { public void assist(String value) {} }",
+            false,
+        ),
+        (
+            "package family; class Base extends Child { public void assist() {} }",
+            "package family; class Child extends Base { public void assist() {} }",
+            false,
+        ),
+        (
+            "package family; class Base { public void assist() {} }",
+            "package family; class Child extends Base { public void assist() {} }",
+            true,
+        ),
+    ] {
+        let mut ws = Workspace::new();
+        let base = "/selection/family/Base.java";
+        let child = "/selection/family/Child.java";
+        ws.open(base, base_source.into());
+        ws.open(child, child_source.into());
+        if durable {
+            let tree = JavaParser::new().parse(base_source);
+            ws.index.replace_file(
+                base,
+                java::extract_symbols(&tree, base_source),
+                Tier::Durable,
+            );
+        }
+        let definition = target(&ws, child, "assist", SymbolKind::Function);
+        assert!(
+            ws.prepare_rename(child, definition.start_byte).is_none(),
+            "{base_source}"
+        );
+        assert!(
+            ws.rename(child, definition.start_byte, "support").is_none(),
+            "{base_source}"
+        );
+    }
+}
+
+#[test]
+fn rename_override_family_does_not_join_static_or_private_methods() {
+    for modifier in ["public static", "private"] {
+        let mut ws = Workspace::new();
+        let base = "/selection/family/Base.java";
+        let child = "/selection/family/Child.java";
+        let base_source = format!("package family; class Base {{ {modifier} void assist() {{}} }}");
+        let receiver = if modifier == "private" {
+            "this"
+        } else {
+            "Child"
+        };
+        let child_source = format!("package family; class Child extends Base {{ {modifier} void assist() {{}} void run() {{ {receiver}.assist(); }} }}");
+        ws.open(base, base_source.clone());
+        ws.open(child, child_source.clone());
+        let definition = target(&ws, child, "assist", SymbolKind::Function);
+        let edits = ws.rename(child, definition.start_byte, "support").unwrap();
+        assert_eq!(edits.len(), 2, "{modifier}: {edits:?}");
+        assert_eq!(
+            apply_to_text(base, &base_source, &edits).unwrap(),
+            base_source
+        );
+        assert_eq!(
+            apply_to_text(child, &child_source, &edits).unwrap(),
+            child_source.replace("assist", "support")
+        );
+    }
+}
+
+#[test]
+fn rename_override_family_preserves_module_and_package_identity() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/current/Worker.java";
+    let old_worker = "/selection/old/Worker.java";
+    let child = "/selection/current/Child.java";
+    let decoy = "/selection/other/Worker.java";
+    let worker_source = "package family; public interface Worker { void assist(); }";
+    let child_source =
+        "package family; public class Child implements Worker { public void assist() {} }";
+    let decoy_source = "package other; public interface Worker { void assist(); }";
+    for (file, source, module) in [
+        (worker, worker_source, "current"),
+        (child, child_source, "current"),
+        (old_worker, worker_source, "old"),
+        (decoy, decoy_source, "current"),
+    ] {
+        ws.open(file, source.into());
+        ws.index.set_file_origin(file, origin(module, Some(module)));
+    }
+    ws.index.replace_scope_visibilities(
+        ["current", "old"]
+            .into_iter()
+            .map(|module| ScopeVisibility {
+                scope: origin(module, Some(module)).project_scope.unwrap(),
+                ordered_origins: vec![module.into()],
+            })
+            .collect(),
+    );
+    ws.bump_index_revision();
+    let definition = target(&ws, child, "assist", SymbolKind::Function);
+    let edits = ws.rename(child, definition.start_byte, "support").unwrap();
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    for (file, source) in [(worker, worker_source), (child, child_source)] {
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            source.replace("assist", "support"),
+            "{file}"
+        );
+    }
+    assert_eq!(
+        apply_to_text(old_worker, worker_source, &edits).unwrap(),
+        worker_source
+    );
+    assert_eq!(
+        apply_to_text(decoy, decoy_source, &edits).unwrap(),
+        decoy_source
+    );
+}
+
+#[test]
+fn rename_unrelated_object_and_suspend_members_keeps_ordinary_exact_edits() {
+    for declaration in [
+        "object Worker { fun assist() {} }",
+        "class Worker { suspend fun assist() {} }",
+    ] {
+        let mut ws = Workspace::new();
+        let worker = "/selection/family/Worker.kt";
+        let first = "/selection/family/First.kt";
+        let second = "/selection/family/Second.kt";
+        let worker_source = format!("package family\n{declaration}\n");
+        let use_source = if declaration.starts_with("object") {
+            "package family\nfun run() { Worker.assist() }\n"
+        } else {
+            "package family\nsuspend fun run(worker: Worker) { worker.assist() }\n"
+        };
+        ws.open(worker, worker_source.clone());
+        ws.open(first, use_source.into());
+        ws.open(second, use_source.replace("fun run", "fun other"));
+        let definition = target(&ws, worker, "assist", SymbolKind::Function);
+        let edits = ws.rename(worker, definition.start_byte, "support").unwrap();
+        assert_eq!(edits.len(), 3, "{declaration}: {edits:?}");
+        for file in [worker, first, second] {
+            let source = ws.doc_text(file).unwrap();
+            assert_eq!(
+                apply_to_text(file, &source, &edits).unwrap(),
+                source.replace("assist", "support"),
+                "{file}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rename_override_family_refuses_ambiguous_calls_in_either_language() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/family/Worker.java";
+    let child = "/selection/family/Child.java";
+    let java = "/selection/family/Use.java";
+    let kotlin = "/selection/family/Use.kt";
+    let worker_source = "package family; public interface Worker { void assist(String value); void assist(int value); }";
+    let child_source = "package family; public class Child implements Worker { public void assist(String value) {} public void assist(int value) {} }";
+    let java_source = "package family; class Use { void run(Child child, Decoy decoy) { child.assist(missing); decoy.assist(unrelated); } }";
+    let kotlin_source = "package family\nfun run(child: Child, decoy: Decoy) { child.assist(missing); decoy.assist(unrelated) }\n";
+    ws.open(
+        "/selection/family/Decoy.java",
+        "package family; class Decoy { void assist(String value) {} void assist(int value) {} }"
+            .into(),
+    );
+    for (file, source) in [
+        (worker, worker_source),
+        (child, child_source),
+        (java, java_source),
+        (kotlin, kotlin_source),
+    ] {
+        ws.open(file, source.into());
+    }
+    let definition = target(&ws, child, "assist", SymbolKind::Function);
+    assert_eq!(goto(&mut ws, java, "child.assist(missing)").len(), 2);
+    assert_eq!(goto(&mut ws, kotlin, "child.assist(missing)").len(), 2);
+    assert!(ws.rename(child, definition.start_byte, "support").is_none());
+    ws.change(java, java_source.replace("missing", "\"x\""));
+    assert!(ws.rename(child, definition.start_byte, "support").is_none());
+    ws.change(kotlin, kotlin_source.replace("missing", "\"x\""));
+    assert_eq!(goto(&mut ws, java, "decoy.assist(unrelated)").len(), 2);
+    assert_eq!(goto(&mut ws, kotlin, "decoy.assist(unrelated)").len(), 2);
+    let edits = ws.rename(child, definition.start_byte, "support").unwrap();
+    assert_eq!(edits.len(), 4, "{edits:?}");
+    for (file, source) in [(worker, worker_source), (child, child_source)] {
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            source.replace("assist(String", "support(String")
+        );
+    }
+    for file in [java, kotlin] {
+        let source = ws.doc_text(file).unwrap();
+        assert_eq!(
+            apply_to_text(file, &source, &edits).unwrap(),
+            source.replace("child.assist", "child.support")
+        );
+    }
+}
+
+#[test]
+fn rename_override_family_refuses_edits_to_read_only_usage_files() {
+    let mut ws = Workspace::new();
+    let worker = "/selection/family/Worker.java";
+    let child = "/selection/family/Child.java";
+    let library = "/selection/library/Use.java";
+    let library_source = "package family; class Use { void run(Child child) { child.assist(); } }";
+    ws.open(
+        worker,
+        "package family; interface Worker { void assist(); }".into(),
+    );
+    ws.open(
+        child,
+        "package family; class Child implements Worker { public void assist() {} }".into(),
+    );
+    ws.open(library, library_source.into());
+    let tree = JavaParser::new().parse(library_source);
+    ws.index.replace_file(
+        library,
+        java::extract_symbols(&tree, library_source),
+        Tier::Durable,
+    );
+    let definition = target(&ws, child, "assist", SymbolKind::Function);
+    assert_eq!(ws.references(child, definition.start_byte, true).len(), 2);
+    assert!(ws.rename(child, definition.start_byte, "support").is_none());
+}
+
 const API: &str = "/selection/api/Reader.java";
 const OLD_API: &str = "/selection/old/Reader.java";
 const JAVA: &str = "/selection/a/JavaUse.java";

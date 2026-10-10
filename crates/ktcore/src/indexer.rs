@@ -598,7 +598,7 @@ fn user_type_identifiers<'a>(ut: Node, src: &'a str) -> Vec<&'a str> {
 
 /// Build a [`TypeRef`] from a `user_type` / `nullable_type` node: simple name + nullability + raw
 /// type-arguments. `None` if no name identifier is present.
-fn type_ref_from(node: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
+pub(crate) fn type_ref_from(node: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
     match node.kind() {
         "nullable_type" => {
             let mut cursor = node.walk();

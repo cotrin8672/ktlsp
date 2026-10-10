@@ -42,6 +42,14 @@ pub fn call_at<'tree>(
 }
 
 pub fn signatures_for_entries(entries: Vec<Entry>, active_parameter: u32) -> Option<SignatureHelp> {
+    signatures_for_entries_with_extra(entries, Vec::new(), active_parameter)
+}
+
+pub fn signatures_for_entries_with_extra(
+    entries: Vec<Entry>,
+    extra: Vec<Signature>,
+    active_parameter: u32,
+) -> Option<SignatureHelp> {
     let mut signatures = entries
         .into_iter()
         .filter(|entry| {
@@ -57,6 +65,7 @@ pub fn signatures_for_entries(entries: Vec<Entry>, active_parameter: u32) -> Opt
         })
         .map(|entry| signature_for_entry(&entry))
         .collect::<Vec<_>>();
+    signatures.extend(extra);
     signatures.sort_by(|a, b| a.label.cmp(&b.label));
     signatures.dedup_by(|a, b| a.label == b.label);
     if signatures.is_empty() {
@@ -79,13 +88,25 @@ pub fn signature_for_entry(entry: &Entry) -> Signature {
             (entry.sym.params.as_slice(), entry.sym.return_type.as_ref()),
             |(params, result)| (params, Some(result)),
         );
+    signature(&entry.sym.name, declared_params, return_type)
+}
+
+pub fn signature_for_callable(candidate: crate::jvm::CallableCandidate<'_>) -> Signature {
+    signature(
+        candidate.name(),
+        candidate.params(),
+        candidate.return_type(),
+    )
+}
+
+fn signature(name: &str, declared_params: &[TypeRef], return_type: Option<&TypeRef>) -> Signature {
     let params = declared_params
         .iter()
         .enumerate()
         .map(|(idx, ty)| format!("p{}: {}", idx + 1, type_ref_label(ty)))
         .collect::<Vec<_>>();
     let mut label = String::new();
-    label.push_str(&entry.sym.name);
+    label.push_str(name);
     label.push('(');
     label.push_str(&params.join(", "));
     label.push(')');

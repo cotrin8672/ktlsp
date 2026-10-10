@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "project_id": "jvm-projections",
+  "scope": "Disposable source-backed public suspend facade: exact Java/Kotlin completion and goto, plus extra probes for signature, refs, applied independent renames and unsaved annotation edits.",
+  "compiler_baseline": "Kotlin 1.9.23 and javac --release 17 compiled the original source; javap verified the static Object-returning two-argument method. Negative old name, unknown facade, typed return and Kotlin alias controls failed independently.",
+  "probes": [
+    {
+      "id": "java-exported-suspend-alias",
+      "source": "JavaUse.java",
+      "anchor": "return KotlinExtensions.awaitNullable",
+      "token": "awaitNullable",
+      "target_file": "KotlinExtensions.kt",
+      "target_anchor": "Call<T?>.await()",
+      "target_token": "await",
+      "source_sha256": "9009f77c37d7406b628a48435f0bbabcf4203bd0000c6174eb5f15e4ab73acee",
+      "target_sha256": "68be85223bf2daecfef90f4a192371b9686ab9ced14b04cd490cfeae9a621ff6"
+    },
+    {
+      "id": "kotlin-authored-suspend-name",
+      "source": "KotlinUse.kt",
+      "anchor": "return call.await()",
+      "token": "await",
+      "target_file": "KotlinExtensions.kt",
+      "target_anchor": "Call<T?>.await()",
+      "target_token": "await",
+      "source_sha256": "30176c90b717e9b316017284ddd2ff77f9d42738ca9879c7e6878cfed21baf54",
+      "target_sha256": "68be85223bf2daecfef90f4a192371b9686ab9ced14b04cd490cfeae9a621ff6"
+    },
+    {
+      "id": "java-ordinary-member",
+      "source": "JavaUse.java",
+      "anchor": "call.regular()",
+      "token": "regular",
+      "target_file": "KotlinExtensions.kt",
+      "target_anchor": "fun regular()",
+      "target_token": "regular",
+      "source_sha256": "9009f77c37d7406b628a48435f0bbabcf4203bd0000c6174eb5f15e4ab73acee",
+      "target_sha256": "68be85223bf2daecfef90f4a192371b9686ab9ced14b04cd490cfeae9a621ff6"
+    },
+    {
+      "id": "kotlin-ordinary-member",
+      "source": "KotlinUse.kt",
+      "anchor": "call.regular()",
+      "token": "regular",
+      "target_file": "KotlinExtensions.kt",
+      "target_anchor": "fun regular()",
+      "target_token": "regular",
+      "source_sha256": "30176c90b717e9b316017284ddd2ff77f9d42738ca9879c7e6878cfed21baf54",
+      "target_sha256": "68be85223bf2daecfef90f4a192371b9686ab9ced14b04cd490cfeae9a621ff6"
+    }
+  ]
+}

@@ -314,6 +314,7 @@ struct DependencyResult {
     missing_source: bool,
     jdk: bool,
     local_jar: bool,
+    local_origin: Option<String>,
 }
 
 fn dependency_index_threads() -> usize {
@@ -369,6 +370,7 @@ fn spawn_jdk_shard_workers(
                         missing_source: false,
                         jdk: true,
                         local_jar: false,
+                        local_origin: None,
                     },
                     Err(error) => {
                         tracing::warn!(%error, shard, "JDK source indexing failed");
@@ -382,6 +384,7 @@ fn spawn_jdk_shard_workers(
                             missing_source: false,
                             jdk: true,
                             local_jar: false,
+                            local_origin: None,
                         }
                     }
                 };
@@ -412,6 +415,7 @@ fn spawn_jdk_cached_worker(
                 missing_source: false,
                 jdk: true,
                 local_jar: false,
+                local_origin: None,
             });
         });
 }
@@ -445,37 +449,61 @@ fn spawn_local_jar_index_worker(
                     &extract_root,
                     &mut kotlin,
                     &mut java,
-                );
-                let changed =
-                    !jar_path.is_file() || classpath::file_origin_id(&jar_path) != origin_id;
-                (batches, changed)
-            }));
+                )?;
+                let missing_source = batches.is_empty()
+                    && !verified_empty_binaries(&[(jar_path.clone(), origin_id.clone())])?;
+                Ok((batches, missing_source))
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("local artifact index worker panicked")));
             let result = match resolved {
-                Ok((batches, changed)) => DependencyResult {
+                Ok((batches, missing_source)) => DependencyResult {
                     coord: None,
                     label,
-                    failed: changed || batches.is_empty(),
+                    failed: false,
                     batches,
                     discovered: Vec::new(),
                     skipped: false,
-                    missing_source: false,
+                    missing_source,
                     jdk: false,
                     local_jar: true,
+                    local_origin: Some(origin_id),
                 },
-                Err(_) => DependencyResult {
-                    coord: None,
-                    label,
-                    batches: Vec::new(),
-                    discovered: Vec::new(),
-                    failed: true,
-                    skipped: false,
-                    missing_source: false,
-                    jdk: false,
-                    local_jar: true,
-                },
+                Err(error) => {
+                    tracing::warn!("index {label} failed: {error:#}");
+                    DependencyResult {
+                        coord: None,
+                        label,
+                        batches: Vec::new(),
+                        discovered: Vec::new(),
+                        failed: true,
+                        skipped: false,
+                        missing_source: false,
+                        jdk: false,
+                        local_jar: true,
+                        local_origin: None,
+                    }
+                }
             };
             let _ = tx.send(result);
         });
+}
+
+fn verified_empty_binaries(binaries: &[(std::path::PathBuf, String)]) -> anyhow::Result<bool> {
+    let mut empty = !binaries.is_empty();
+    for (binary, expected_origin) in binaries {
+        anyhow::ensure!(
+            binary.is_file() && classpath::file_origin_id(binary) == *expected_origin,
+            "binary artifact changed since project discovery: {}",
+            binary.display()
+        );
+        empty &= !crate::jar::may_contain_definitions(binary)?;
+        anyhow::ensure!(
+            binary.is_file() && classpath::file_origin_id(binary) == *expected_origin,
+            "binary artifact changed while inspecting {}",
+            binary.display()
+        );
+    }
+    Ok(empty)
 }
 
 fn spawn_coordinate_index_worker(
@@ -484,6 +512,7 @@ fn spawn_coordinate_index_worker(
     extract_root: std::path::PathBuf,
     indexed_sources: std::sync::Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>,
     authoritative: bool,
+    selected_binaries: Vec<(std::path::PathBuf, String)>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
@@ -498,7 +527,7 @@ fn spawn_coordinate_index_worker(
             let label = coord.label();
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let source = deps::coordinate_source(&coord, &repos, &extract_root);
-                let missing_source = source.is_none();
+                let source_missing = source.is_none();
                 let skipped = source
                     .as_ref()
                     .map(|source| {
@@ -511,33 +540,54 @@ fn spawn_coordinate_index_worker(
                         !guard.insert(identity)
                     })
                     .unwrap_or(false);
-                let batches = if skipped {
-                    Vec::new()
+                let (batches, mut failed) = if skipped {
+                    (Vec::new(), false)
                 } else if let Some(source) = source {
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
-                    deps::resolve_library_source(&source, &mut kotlin, &mut java)
+                    match deps::resolve_library_source(&source, &mut kotlin, &mut java) {
+                        Ok(batches) => (batches, false),
+                        Err(error) => {
+                            tracing::warn!("index {label} failed: {error:#}");
+                            (Vec::new(), true)
+                        }
+                    }
                 } else {
-                    Vec::new()
+                    (Vec::new(), false)
                 };
+                let empty_input = source_missing || (!skipped && batches.is_empty());
+                let verified_empty_binary = if empty_input && authoritative && !failed {
+                    match verified_empty_binaries(&selected_binaries) {
+                        Ok(empty) => empty,
+                        Err(error) => {
+                            tracing::warn!("inspect {label} binary failed: {error:#}");
+                            failed = true;
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                let missing_source = empty_input && !verified_empty_binary;
                 let discovered = if authoritative {
                     Vec::new()
                 } else {
                     artifacts::dependency_coordinates(&repos, &coord)
                 };
-                (batches, discovered, skipped, missing_source)
+                (batches, failed, discovered, skipped, missing_source)
             }));
             let result = match resolved {
-                Ok((batches, discovered, skipped, missing_source)) => DependencyResult {
+                Ok((batches, failed, discovered, skipped, missing_source)) => DependencyResult {
                     coord: Some(coord),
                     label,
-                    failed: !skipped && !missing_source && batches.is_empty(),
+                    failed,
                     batches,
                     discovered,
                     skipped,
                     missing_source,
                     jdk: false,
                     local_jar: false,
+                    local_origin: None,
                 },
                 Err(_) => DependencyResult {
                     coord: Some(coord),
@@ -549,6 +599,7 @@ fn spawn_coordinate_index_worker(
                     missing_source: false,
                     jdk: false,
                     local_jar: false,
+                    local_origin: None,
                 },
             };
             let _ = tx.send(result);
@@ -743,11 +794,15 @@ fn index_dependencies(
                 let _ = tx.send((completed + active + 1, progress_total, coord.label()));
             }
             spawn_coordinate_index_worker(
-                coord,
+                coord.clone(),
                 repos.clone(),
                 extract_root.clone(),
                 indexed_sources.clone(),
                 authoritative,
+                model
+                    .as_ref()
+                    .and_then(|model| model.coordinate_binaries(&coord))
+                    .unwrap_or_default(),
                 tx.clone(),
             );
             active += 1;
@@ -828,11 +883,6 @@ fn index_dependencies(
             continue;
         }
         let mut files_for_coord = Vec::new();
-        let local_origin = result
-            .batches
-            .first()
-            .and_then(|batch| batch.origin.as_ref())
-            .map(|origin| origin.origin_id.clone());
         for batch in result.batches {
             let mut guard = ws.lock();
             if !guard.is_current_generation(generation) {
@@ -871,7 +921,7 @@ fn index_dependencies(
                 .coord
                 .as_ref()
                 .map(classpath::maven_origin_id)
-                .or(local_origin);
+                .or(result.local_origin);
             let mut guard = ws.lock();
             if guard.is_current_generation(generation) {
                 if let Some(origin) = origin {
@@ -3663,6 +3713,399 @@ fn def_to_range(ws: &Workspace, d: &Def) -> Option<Range> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn source_io_local_metadata_without_sources_stays_incomplete() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_local_metadata_controls_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (case, entry) in [
+            ("jvm", "META-INF/api.kotlin_module"),
+            ("native", "linkdata/package_api/0_api.knm"),
+            ("nested", "META-INF/jarjar/library.jar"),
+        ] {
+            let binary = root.join(format!("{case}.jar"));
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+            archive
+                .start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"unsupported definitions").unwrap();
+            archive.finish().unwrap();
+            for _ in 0..2 {
+                let (tx, rx) = std::sync::mpsc::channel();
+                spawn_local_jar_index_worker(
+                    binary.clone(),
+                    classpath::file_origin_id(&binary),
+                    root.join("extracted"),
+                    tx,
+                );
+                let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    !result.failed,
+                    "{case}: readable input is not an IO failure"
+                );
+                assert!(
+                    result.missing_source,
+                    "{case}: empty stubs do not prove coverage"
+                );
+                assert!(result.batches.is_empty());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_io_unavailable_lazy_archives_do_not_become_empty_extractions() {
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_orphan_lazy_sources_{}", std::process::id()));
+        let repos = crate::artifacts::Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "https://example.invalid".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        for materialize in [false, true] {
+            let coord = crate::coords::Coordinate {
+                group: "fixture".into(),
+                artifact: "lazy".into(),
+                version: materialize.to_string(),
+            };
+            let artifact_dir = repos.m2.join("fixture/lazy").join(&coord.version);
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let binary = artifact_dir.join(format!("lazy-{}.jar", coord.version));
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+            archive
+                .start_file("api/Useful.class", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive
+                .write_all(b"binary definitions remain selected")
+                .unwrap();
+            archive.finish().unwrap();
+            let source = artifact_dir.join(format!("lazy-{}-sources.jar", coord.version));
+            let write_source = || {
+                let mut archive = zip::ZipWriter::new(std::fs::File::create(&source).unwrap());
+                for name in ["Useful", "Other"] {
+                    archive
+                        .start_file(
+                            format!("api/{name}.java"),
+                            zip::write::SimpleFileOptions::default(),
+                        )
+                        .unwrap();
+                    archive
+                        .write_all(format!("package api; public class {name} {{}}").as_bytes())
+                        .unwrap();
+                }
+                archive.finish().unwrap();
+            };
+            let resolve = || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                spawn_coordinate_index_worker(
+                    coord.clone(),
+                    repos.clone(),
+                    root.join("extracted"),
+                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                    true,
+                    vec![(binary.clone(), classpath::file_origin_id(&binary))],
+                    tx,
+                );
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            };
+            write_source();
+            let initial = resolve();
+            assert!(!initial.failed && !initial.missing_source);
+            assert_eq!(initial.batches.len(), 2);
+            if materialize {
+                assert!(crate::deps::materialize_source_file(Path::new(
+                    &initial.batches[0].file
+                )));
+            }
+            std::fs::remove_file(&source).unwrap();
+            for _ in 0..2 {
+                let missing = resolve();
+                assert!(!missing.failed);
+                assert!(
+                    missing.missing_source,
+                    "a marker or materialized subset cannot replace the missing archive"
+                );
+                assert!(missing.batches.is_empty());
+            }
+            write_source();
+            let restored = resolve();
+            assert!(!restored.failed && !restored.missing_source);
+            assert_eq!(restored.batches.len(), 2);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_io_empty_coverage_uses_all_snapshot_selected_binaries() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_selected_empty_coverage_{}",
+            std::process::id()
+        ));
+        let repos = crate::artifacts::Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "https://example.invalid".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let coord = crate::coords::Coordinate::parse("fixture:api:1").unwrap();
+        let artifact_dir = repos.m2.join("fixture/api/1");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let default_binary = artifact_dir.join("api-1.jar");
+        let selected_binary = artifact_dir.join("api-1-all.jar");
+        let another_selected = artifact_dir.join("api-1-test.jar");
+        let empty_jar = |path: &Path| {
+            zip::ZipWriter::new(std::fs::File::create(path).unwrap())
+                .finish()
+                .unwrap();
+        };
+        empty_jar(&default_binary);
+        empty_jar(&another_selected);
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&selected_binary).unwrap());
+        archive
+            .start_file("api/Real.class", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(b"actual selected binary has definitions")
+            .unwrap();
+        archive.finish().unwrap();
+        let snapshot = || {
+            let entries = vec![selected_binary.clone(), another_selected.clone()];
+            classpath::ProjectSnapshot::new(vec![classpath::ModuleClasspath {
+                module: ":".into(),
+                project_dir: root.clone(),
+                build: "fixture".into(),
+                source_sets: vec![classpath::SourceSetClasspath {
+                    name: "main".into(),
+                    entries: entries.clone(),
+                    artifacts: entries
+                        .iter()
+                        .map(|path| classpath::ResolvedArtifact {
+                            path: path.clone(),
+                            component: classpath::ComponentId::Module {
+                                group: coord.group.clone(),
+                                name: coord.artifact.clone(),
+                                version: coord.version.clone(),
+                            },
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                entries,
+                unresolved: Vec::new(),
+            }])
+        };
+        let binaries = snapshot().coordinate_binaries(&coord).unwrap();
+        assert_eq!(binaries.len(), 2);
+        assert!(verified_empty_binaries(&[]).is_ok_and(|empty| !empty));
+        let resolve = |binaries| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            spawn_coordinate_index_worker(
+                coord.clone(),
+                repos.clone(),
+                root.join("extracted"),
+                Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                true,
+                binaries,
+                tx,
+            );
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        };
+        for source_present in [false, true] {
+            if source_present {
+                empty_jar(&artifact_dir.join("api-1-sources.jar"));
+            }
+            let result = resolve(binaries.clone());
+            assert!(!result.failed);
+            assert!(
+                result.missing_source,
+                "an unrelated empty default JAR or empty source JAR cannot prove coverage"
+            );
+            assert!(result.batches.is_empty());
+        }
+        empty_jar(&selected_binary);
+        let stale = resolve(binaries);
+        assert!(stale.failed && stale.missing_source);
+        let fresh = resolve(snapshot().coordinate_binaries(&coord).unwrap());
+        assert!(!fresh.failed && !fresh.missing_source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_source_archives_are_successful_index_inputs() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_empty_source_archives_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coord = crate::coords::Coordinate {
+            group: "fixture".into(),
+            artifact: "empty".into(),
+            version: "1".into(),
+        };
+        let artifact_dir = root.join("m2/fixture/empty/1");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let repos = crate::artifacts::Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "https://example.invalid".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let binary = root.join("empty.jar");
+        zip::ZipWriter::new(std::fs::File::create(&binary).unwrap())
+            .finish()
+            .unwrap();
+        std::fs::copy(&binary, artifact_dir.join("empty-1.jar")).unwrap();
+        for variant in 0..3 {
+            let source = root.join("empty-sources.jar");
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&source).unwrap());
+            if variant > 0 {
+                let (name, body) = if variant == 1 {
+                    ("module-info.java", "module fixture.empty {}")
+                } else {
+                    ("Empty.kt", "// compatibility artifact: no declarations")
+                };
+                archive
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(body.as_bytes()).unwrap();
+            }
+            archive.finish().unwrap();
+            std::fs::copy(&source, artifact_dir.join("empty-1-sources.jar")).unwrap();
+            for _ in 0..2 {
+                let (tx, rx) = std::sync::mpsc::channel();
+                spawn_local_jar_index_worker(
+                    binary.clone(),
+                    classpath::file_origin_id(&binary),
+                    root.join("local-extracted"),
+                    tx,
+                );
+                let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    !result.failed,
+                    "a readable empty archive is not an IO failure"
+                );
+                assert!(result.batches.is_empty());
+                assert!(!result.missing_source);
+                assert_eq!(
+                    result.local_origin,
+                    Some(classpath::file_origin_id(&binary))
+                );
+                let (tx, rx) = std::sync::mpsc::channel();
+                spawn_coordinate_index_worker(
+                    coord.clone(),
+                    repos.clone(),
+                    root.join("maven-extracted"),
+                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                    true,
+                    vec![(
+                        artifact_dir.join("empty-1.jar"),
+                        classpath::file_origin_id(&artifact_dir.join("empty-1.jar")),
+                    )],
+                    tx,
+                );
+                let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    !result.failed,
+                    "an empty coordinate must succeed cold and cached"
+                );
+                assert!(!result.skipped);
+                assert!(!result.missing_source);
+                assert!(result.batches.is_empty());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_sources_require_a_verified_empty_authoritative_binary() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_empty_binary_controls_{}",
+            std::process::id()
+        ));
+        let repos = crate::artifacts::Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "https://example.invalid".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        for case in [
+            "absent",
+            "class",
+            "module-class",
+            "kotlin-metadata",
+            "native-metadata",
+            "nested-archive",
+            "corrupt",
+            "fallback",
+        ] {
+            let coord = crate::coords::Coordinate {
+                group: "fixture".into(),
+                artifact: "empty".into(),
+                version: case.into(),
+            };
+            let artifact_dir = repos.m2.join("fixture/empty").join(case);
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let binary = artifact_dir.join(format!("empty-{case}.jar"));
+            if case == "corrupt" {
+                std::fs::write(&binary, b"unfinished build output").unwrap();
+            } else if case != "absent" {
+                let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+                let entry = match case {
+                    "class" => Some("api/Only.class"),
+                    "module-class" => Some("module-info.class"),
+                    "kotlin-metadata" => Some("META-INF/api.kotlin_module"),
+                    "native-metadata" => Some("linkdata/package_api/0_api.knm"),
+                    "nested-archive" => Some("META-INF/jarjar/library.jar"),
+                    _ => None,
+                };
+                if let Some(entry) = entry {
+                    archive
+                        .start_file(entry, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    archive
+                        .write_all(b"input is conservatively incomplete")
+                        .unwrap();
+                }
+                archive.finish().unwrap();
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            spawn_coordinate_index_worker(
+                coord,
+                repos.clone(),
+                root.join("extracted").join(case),
+                Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                case != "fallback",
+                if case == "absent" {
+                    Vec::new()
+                } else {
+                    vec![(binary.clone(), classpath::file_origin_id(&binary))]
+                },
+                tx,
+            );
+            let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                result.missing_source,
+                "{case} must not prove complete source coverage"
+            );
+            assert_eq!(result.failed, case == "corrupt", "{case}");
+            assert!(!result.skipped);
+            assert!(result.batches.is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn unreadable_jdk_shard_reports_failure_without_partial_batches() {
