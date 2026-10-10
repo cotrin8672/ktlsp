@@ -19,8 +19,11 @@ use crate::imports::{self, ImportStyle};
 use crate::index::{Entry, Index, Tier, Usage};
 use crate::language;
 use crate::parser::{child_of_kind, name_field, node_text};
+use crate::semantic_query::{
+    self, CompletionIncompletenessReason, CompletionQuery, CompletionStatus,
+};
 use crate::symbol::{Def, IndexedSymbol, SymbolKind};
-use crate::types::TypeRef;
+use crate::types::{Type, TypeRef};
 
 /// A reusable Java parser.
 pub struct JavaParser {
@@ -2817,9 +2820,7 @@ pub(crate) fn is_valid_identifier(name: &str) -> bool {
     !JAVA_KEYWORDS.contains(&name)
 }
 
-/// `textDocument/completion` for Java. Intentionally minimal: offers same-file members,
-/// same-package top-level types, explicit/wildcard imports, and implicit `java.lang.*`; it skips
-/// member access, locals, static imports, and keyword-aware context-sensitive filtering.
+/// `textDocument/completion` for callers that only need shaped Java results.
 pub fn completion(
     index: &Index,
     file: &str,
@@ -2828,19 +2829,86 @@ pub fn completion(
     offset: usize,
     snippets_supported: bool,
 ) -> Option<ShapedCompletions> {
-    let ctx = completion_context(tree, src, offset);
-    if ctx != complete::CompletionContext::ScopeName {
-        return None;
-    }
-    let (prefix, _) = prefix_at(tree, src, offset);
-    let candidates = scope_candidates(index, file, src, tree, &prefix);
-    let mut shaped = complete::shape(ctx, &prefix, candidates, snippets_supported);
-    if let Some((sorted_imports, anchor)) =
-        imports::import_layout_with_style(ImportStyle::Java, tree, src)
-    {
-        complete::resolve_auto_import_lines(&mut shaped, &sorted_imports, anchor);
+    let query = completion_query(index, file, src, tree, offset, complete::RESULT_CAP)?;
+    let mut shaped = complete::shape(
+        query.context,
+        &query.prefix,
+        query.candidates,
+        snippets_supported,
+    );
+    if let Some((sorted_imports, anchor)) = query.layout.as_ref() {
+        complete::resolve_auto_import_lines(&mut shaped, sorted_imports, *anchor);
     }
     (!shaped.items.is_empty()).then_some(shaped)
+}
+
+/// Normalize Java syntax and receiver types for the shared completion candidate and shaping flow.
+pub fn completion_query(
+    index: &Index,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+    max_candidates: usize,
+) -> Option<CompletionQuery> {
+    let context = completion_context(tree, src, offset);
+    if context == complete::CompletionContext::AfterDot {
+        let (prefix, mut synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
+        // An unfinished `h.name` statement can parse as a type; a call forces a receiver expression.
+        synthetic.insert_str(syn_offset, "()");
+        let synthetic_tree = JavaParser::new().parse(&synthetic);
+        let ty = completion_receiver_at(&synthetic_tree, syn_offset)
+            .and_then(|receiver| receiver_type(index, file, &synthetic, &synthetic_tree, receiver))
+            .map(|receiver| Type::class(receiver.name, receiver.package))
+            .unwrap_or(Type::Unknown);
+        return semantic_query::member_completion_query_for_type(
+            index,
+            language::SourceLanguage::Java,
+            &synthetic_tree,
+            &synthetic,
+            ty,
+            prefix,
+            max_candidates,
+        );
+    }
+    let (prefix, candidates, status) = if context == complete::CompletionContext::ScopeName {
+        let (prefix, _) = prefix_at(tree, src, offset);
+        let candidates = scope_candidates(index, file, src, tree, &prefix);
+        let status = if candidates.is_empty() {
+            CompletionStatus::DefinitelyAbsent
+        } else {
+            CompletionStatus::Found(())
+        };
+        (prefix, candidates, status)
+    } else {
+        (
+            String::new(),
+            Vec::new(),
+            CompletionStatus::Unknown(vec![CompletionIncompletenessReason::NonCompletablePosition]),
+        )
+    };
+    Some(CompletionQuery {
+        context,
+        prefix,
+        candidates,
+        layout: imports::import_layout_with_style(ImportStyle::Java, tree, src),
+        status,
+    })
+}
+
+fn completion_receiver_at(tree: &Tree, offset: usize) -> Option<Node<'_>> {
+    for probe in [offset, offset.saturating_sub(1)] {
+        let mut current = tree
+            .root_node()
+            .named_descendant_for_byte_range(probe, probe);
+        while let Some(node) = current {
+            if matches!(node.kind(), "field_access" | "method_invocation") {
+                return node.child_by_field_name("object");
+            }
+            current = node.parent();
+        }
+    }
+    None
 }
 
 fn completion_context(tree: &Tree, src: &str, offset: usize) -> complete::CompletionContext {
@@ -2868,7 +2936,7 @@ fn completion_context(tree: &Tree, src: &str, offset: usize) -> complete::Comple
             node = n.parent();
         }
     }
-    // Member access is intentionally skipped for the first slice.
+    // Incomplete Java member access also needs a raw-text check because it may parse as a type.
     let mut i = complete::floor_boundary(src, offset);
     while let Some((start, ch)) = complete::prev_char(src, i) {
         if ch.is_alphanumeric() || ch == '_' {
@@ -2885,7 +2953,7 @@ fn completion_context(tree: &Tree, src: &str, offset: usize) -> complete::Comple
         }
     }
     if matches!(complete::prev_char(src, i), Some((_, '.'))) {
-        return complete::CompletionContext::None;
+        return complete::CompletionContext::AfterDot;
     }
     complete::CompletionContext::ScopeName
 }

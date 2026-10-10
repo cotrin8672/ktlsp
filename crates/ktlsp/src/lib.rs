@@ -20,6 +20,7 @@ pub mod jar;
 pub mod java;
 pub mod language;
 pub mod lsp;
+pub mod paths;
 pub mod refactor;
 pub mod rename;
 pub mod salsa_support;

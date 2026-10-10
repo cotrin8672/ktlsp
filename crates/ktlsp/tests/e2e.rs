@@ -7,6 +7,10 @@ use tower_lsp_server::{LanguageServer, LspService};
 
 use ktlsp::lsp::Backend;
 
+fn test_uri(file: &str) -> Uri {
+    Uri::from_file_path(std::env::temp_dir().join("ktlsp_e2e").join(file)).unwrap()
+}
+
 /// `InitializeParams` advertising snippet support in the client capabilities, so the server emits
 /// `name($0)` snippets. (`InitializeParams::default()` omits it -> plain inserts.)
 fn snippet_capable_params() -> InitializeParams {
@@ -124,7 +128,7 @@ async fn initialize_open_and_goto_definition() {
     backend.initialized(InitializedParams {}).await;
 
     // open a document
-    let uri: Uri = "file:///tmp/ktlsp_e2e/Main.kt".parse().unwrap();
+    let uri = test_uri("Main.kt");
     let text = "/** Helpful hover docs. */\nfun helper() {}\nfun main() { helper() }\n";
     backend
         .did_open(DidOpenTextDocumentParams {
@@ -304,7 +308,7 @@ async fn initialize_open_and_goto_definition() {
     );
 
     // textDocument/codeAction returns a WorkspaceEdit for a provably unused import.
-    let action_uri: Uri = "file:///tmp/ktlsp_e2e/Actions.kt".parse().unwrap();
+    let action_uri = test_uri("Actions.kt");
     let action_text = "import a.b.Unused\nfun main() {}\n";
     backend
         .did_open(DidOpenTextDocumentParams {
@@ -386,7 +390,7 @@ async fn initialize_open_and_goto_definition() {
 
     // textDocument/completion after a dot (Stage B member completion). Open a file with a class and
     // a trailing-dot receiver; the response must include the receiver type's member.
-    let uri2: Uri = "file:///tmp/ktlsp_e2e/Member.kt".parse().unwrap();
+    let uri2 = test_uri("Member.kt");
     let text2 = "class Box {\n    fun open() {}\n}\nfun main() {\n    val b = Box()\n    b.\n}\n";
     backend
         .did_open(DidOpenTextDocumentParams {
@@ -554,7 +558,7 @@ async fn completion_without_snippet_support_is_plain() {
         .unwrap();
     backend.initialized(InitializedParams {}).await;
 
-    let uri: Uri = "file:///tmp/ktlsp_e2e/NoSnippet.kt".parse().unwrap();
+    let uri = test_uri("NoSnippet.kt");
     let text = "class Box {\n    fun open() {}\n}\nfun main() {\n    val b = Box()\n    b.\n}\n";
     backend
         .did_open(DidOpenTextDocumentParams {
@@ -619,7 +623,7 @@ async fn completion_auto_import_edit() {
     backend.initialized(InitializedParams {}).await;
 
     // A library type in another package, opened so it is indexed.
-    let lib_uri: Uri = "file:///tmp/ktlsp_e2e/Helper.kt".parse().unwrap();
+    let lib_uri = test_uri("Helper.kt");
     backend
         .did_open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
@@ -631,7 +635,7 @@ async fn completion_auto_import_edit() {
         })
         .await;
 
-    let uri: Uri = "file:///tmp/ktlsp_e2e/AutoImport.kt".parse().unwrap();
+    let uri = test_uri("AutoImport.kt");
     let text = "package demo\nfun main() { HelperX }\n";
     backend
         .did_open(DidOpenTextDocumentParams {
@@ -689,9 +693,16 @@ async fn expanded_editor_surface_requests_round_trip() {
     let backend = service.inner();
 
     let mut init_params = snippet_capable_params();
-    init_params.initialization_options = Some(serde_json::json!({
-        "formatting": { "command": "/bin/cat", "args": [] }
-    }));
+    let formatter = if cfg!(windows) {
+        serde_json::json!({
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-NonInteractive", "-Command",
+                "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())"]
+        })
+    } else {
+        serde_json::json!({ "command": "/bin/cat", "args": [] })
+    };
+    init_params.initialization_options = Some(serde_json::json!({ "formatting": formatter }));
     let init = backend.initialize(init_params).await.unwrap();
     assert!(
         init.capabilities.document_formatting_provider.is_some(),
@@ -699,7 +710,7 @@ async fn expanded_editor_surface_requests_round_trip() {
     );
     backend.initialized(InitializedParams {}).await;
 
-    let uri: Uri = "file:///tmp/ktlsp_e2e/Expanded.kt".parse().unwrap();
+    let uri = test_uri("Expanded.kt");
     let text = "package app\n\
                 interface Greeter\n\
                 class ConsoleGreeter : Greeter\n\

@@ -169,7 +169,21 @@ dev/ktlsp-harness.sh basic
 ```
 
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
-`library`, `java`, `semantic`, `gradle-live`, or `comprehensive`.
+`library`, `java`, `mixed`, `semantic`, `gradle-live`, or `comprehensive`.
+
+`java` covers incomplete member completion, inherited members, Java receivers of Kotlin types,
+and an unsaved Kotlin declaration edit observed from an unsaved Java buffer on the same client.
+The harness also runs with native Windows Neovim through Git Bash and selects `.exe` binaries.
+
+`mixed` checks Java/Kotlin member completion, generic receivers, exact definitions and references,
+and edits in both unsaved buffers on one client. It applies cross-language renames and checks the
+complete resulting source. Maven and JDK 17+ are required: original, edited, and renamed copies
+must compile, with compiler logs and source snapshots retained in the artifact directory.
+Set `KTLSP_MIXED_MVN` when Maven is outside `PATH`. To run the same assertions through
+`intellij-lsp.nvim`, set `KTLSP_MIXED_SERVER=intellij`, `IJLS_PLUGIN` to its checkout,
+`IJLS_SERVER` to the server executable, and `IJLS_JDK` to the JDK home. Use isolated XDG cache,
+data, and config directories for that temporary plugin; the scenario uses its normal client
+configuration and requires a successful Maven import. These checks do not establish full IDEA parity.
 
 `gradle-live` also verifies classpath discovery against a disposable Gradle project that creates
 `compileClasspath` from a late `afterEvaluate` callback. The probe requires cold and warm

@@ -311,6 +311,10 @@ fn discover_source_files(roots: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
         let mut files = git_source_files(root).unwrap_or_else(|| walk_source_files(root.as_path()));
         out.append(&mut files);
     }
+    let mut out = out
+        .into_iter()
+        .map(|path| PathBuf::from(ktlsp::paths::file_key(&path)))
+        .collect::<Vec<_>>();
     out.sort();
     out.dedup();
     Ok(out)
@@ -767,12 +771,9 @@ fn git_durable_cache_inputs(root: &Path) -> Option<Vec<PathBuf>> {
             "--exclude-standard",
             "--full-name",
             "--",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "build.gradle",
-            "build.gradle.kts",
-            "gradle.properties",
-            "libs.versions.toml",
+            "*.gradle",
+            "*.gradle.kts",
+            "*.properties",
             "*.toml",
         ])
         .output()
@@ -781,6 +782,8 @@ fn git_durable_cache_inputs(root: &Path) -> Option<Vec<PathBuf>> {
         return None;
     }
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_top = top.canonicalize().ok()?;
+    let relative_root = canon_root.strip_prefix(&canonical_top).ok()?;
     let mut out = output
         .stdout
         .split(|byte| *byte == 0)
@@ -791,7 +794,8 @@ fn git_durable_cache_inputs(root: &Path) -> Option<Vec<PathBuf>> {
                 return None;
             }
             let path = top.join(rel.as_ref());
-            (path.starts_with(&canon_root) && is_durable_cache_input(&path)).then_some(path)
+            (Path::new(rel.as_ref()).starts_with(relative_root) && is_durable_cache_input(&path))
+                .then_some(path)
         })
         .collect::<Vec<_>>();
     out.sort();
@@ -1240,6 +1244,8 @@ fn git_source_files(root: &Path) -> Option<Vec<PathBuf>> {
         return None;
     }
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_top = top.canonicalize().ok()?;
+    let relative_root = canon_root.strip_prefix(&canonical_top).ok()?;
     let mut out = Vec::new();
     for rel in output.stdout.split(|byte| *byte == 0) {
         if rel.is_empty() {
@@ -1249,9 +1255,8 @@ fn git_source_files(root: &Path) -> Option<Vec<PathBuf>> {
         if relative_path_has_excluded_dir(&rel) {
             continue;
         }
-        let path = top.join(rel.as_ref());
-        if path.starts_with(&canon_root) {
-            out.push(path);
+        if Path::new(rel.as_ref()).starts_with(relative_root) {
+            out.push(top.join(rel.as_ref()));
         }
     }
     Some(out)
@@ -1373,6 +1378,90 @@ mod tests {
     }
 
     #[test]
+    fn git_discovery_tracks_nested_sources_and_gradle_inputs() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ktcheck-git-discovery-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        for relative in [
+            "Root.kt",
+            "nested/Main.java",
+            "nested/Other.kt",
+            "nested/build.gradle.kts",
+            "settings.gradle.kts",
+            "gradle/libs.versions.toml",
+            "nested/build/Output.kt",
+            "nested/build/build.gradle.kts",
+            "nested/ignored/Ignored.kt",
+        ] {
+            let file = root.join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "").unwrap();
+        }
+        std::fs::write(root.join("nested/.gitignore"), "ignored/\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "add",
+                "--",
+                "Root.kt",
+                "nested/Main.java",
+                "settings.gradle.kts"
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let nested = root.join("nested");
+        for scan_root in [nested.clone(), nested.canonicalize().unwrap()] {
+            let actual =
+                discover_source_files(&[scan_root.clone(), scan_root.join("Main.java")]).unwrap();
+            let actual = actual
+                .into_iter()
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<Vec<_>>();
+            let expected = ["Main.java", "Other.kt", "build.gradle.kts"]
+                .into_iter()
+                .map(|path| nested.join(path).canonicalize().unwrap())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
+            let inputs = durable_cache_inputs(&[scan_root]);
+            assert_eq!(
+                inputs
+                    .into_iter()
+                    .map(|path| path.canonicalize().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![nested.join("build.gradle.kts").canonicalize().unwrap()]
+            );
+        }
+        let inputs = durable_cache_inputs(std::slice::from_ref(&root));
+        let actual = inputs
+            .into_iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect::<BTreeSet<_>>();
+        let expected = [
+            "settings.gradle.kts",
+            "nested/build.gradle.kts",
+            "gradle/libs.versions.toml",
+        ]
+        .into_iter()
+        .map(|path| root.join(path).canonicalize().unwrap())
+        .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn durable_cache_inputs_track_gradle_metadata_only() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1392,29 +1481,21 @@ mod tests {
         let inputs = durable_cache_inputs(std::slice::from_ref(&root));
         let relative = inputs
             .iter()
-            .map(|path| {
-                path.strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
             .collect::<BTreeSet<_>>();
 
-        assert!(relative.contains("settings.gradle.kts"));
-        assert!(relative.contains("service/build.gradle.kts"));
-        assert!(relative.contains("gradle/libs.versions.toml"));
-        assert!(!relative.contains("service/build/build.gradle.kts"));
+        assert!(relative.contains(Path::new("settings.gradle.kts")));
+        assert!(relative.contains(Path::new("service/build.gradle.kts")));
+        assert!(relative.contains(Path::new("gradle/libs.versions.toml")));
+        assert!(!relative.contains(Path::new("service/build/build.gradle.kts")));
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn prune_durable_snapshots_keeps_current_and_one_previous_snapshot() {
-        let root = std::env::temp_dir().join(format!(
-            "ktcheck-durable-prune-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root =
+            std::env::temp_dir().join(format!("ktcheck-durable-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let first = root.join("first.zst");

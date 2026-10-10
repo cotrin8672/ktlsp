@@ -43,7 +43,7 @@ fn goto_java_class_in_same_project() {
     let n = ws.scan(&root);
     assert_eq!(n, 3, "expected three java files indexed");
 
-    let main = app.join("Main.java").to_string_lossy().to_string();
+    let main = ktlsp::paths::file_key(&app.join("Main.java"));
     let main_text = fs::read_to_string(&main).unwrap();
     let constructor_offset = main_text.find("new Helper").unwrap() + 8; // cursor on 'H'
 
@@ -60,7 +60,7 @@ fn goto_java_class_in_same_project() {
         !defs.is_empty(),
         "goto_definition (open) should find Helper, got empty"
     );
-    let helper = app.join("Helper.java").to_string_lossy().to_string();
+    let helper = ktlsp::paths::file_key(&app.join("Helper.java"));
     let class_name_start = helper_text.find("class Helper").unwrap() + "class ".len();
     assert_eq!(
         defs,
@@ -74,7 +74,7 @@ fn goto_java_class_in_same_project() {
 
     let type_offset = main_text.find("Helper helper").unwrap(); // cursor on 'H'
     let defs = ws.goto_definition(&main, type_offset);
-    let helper = app.join("Helper.java").to_string_lossy().to_string();
+    let helper = ktlsp::paths::file_key(&app.join("Helper.java"));
     assert_eq!(
         defs,
         vec![ktlsp::symbol::Def {
@@ -85,12 +85,12 @@ fn goto_java_class_in_same_project() {
         "type references should resolve to the class name only"
     );
 
-    let import_file = app.join("UseImport.java").to_string_lossy().to_string();
+    let import_file = ktlsp::paths::file_key(&app.join("UseImport.java"));
     let import_text = fs::read_to_string(&import_file).unwrap();
     let import_offset = import_text.find("import app.Helper").unwrap() + "import app.".len();
     ws.open(import_file.clone(), import_text.clone());
     let defs = ws.goto_definition(&import_file, import_offset);
-    let helper = app.join("Helper.java").to_string_lossy().to_string();
+    let helper = ktlsp::paths::file_key(&app.join("Helper.java"));
     assert_eq!(
         defs,
         vec![ktlsp::symbol::Def {
@@ -148,9 +148,7 @@ fn goto_java_class_from_local_binary_jar_stub() {
     let defs = ws.goto_definition(&app, offset);
     assert_eq!(defs.len(), 1, "goto on local jar import should resolve");
     assert!(
-        defs[0]
-            .file
-            .ends_with("com/bytedance/tester/model/User.java"),
+        std::path::Path::new(&defs[0].file).ends_with("com/bytedance/tester/model/User.java"),
         "goto should land in the generated User.java stub, got {}",
         defs[0].file
     );

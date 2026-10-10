@@ -2,13 +2,25 @@ use ktlsp::format::{format_document, FormatterConfig};
 
 #[test]
 fn formatter_returns_no_edits_when_output_is_unchanged() {
-    let config = FormatterConfig {
-        command: "/bin/cat".to_string(),
-        args: Vec::new(),
+    let config = if cfg!(windows) {
+        FormatterConfig {
+            command: "powershell.exe".to_string(),
+            args: vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())".into(),
+            ],
+        }
+    } else {
+        FormatterConfig {
+            command: "/bin/cat".to_string(),
+            args: Vec::new(),
+        }
     };
 
     let edits = format_document("mem:///Main.kt", "fun main() {}\n", &config)
-        .expect("/bin/cat should be available in the test environment");
+        .expect("the platform passthrough formatter should be available");
 
     assert!(edits.is_empty());
 }

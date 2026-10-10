@@ -296,14 +296,189 @@ public class Main { }
 }
 
 #[test]
-fn omits_after_dot() {
-    check_none(
+fn completes_this_members_after_dot() {
+    check_contains(
         r#"
 //- Main.java
 package app;
 public class Main {
     public void run() { this./*^*/ }
+    public void assist() {}
 }
 "#,
+        &["run", "assist"],
     );
+}
+
+#[test]
+fn completes_typed_receiver_prefix_without_semicolon() {
+    check_contains(
+        r#"
+//- Helper.java
+package app;
+public class Helper { public void assist() {} }
+//- Main.java
+package app;
+public class Main { void run(Helper h) { h.as/*^*/ } }
+"#,
+        &["assist"],
+    );
+}
+
+#[test]
+fn completes_inherited_receiver_members() {
+    check_contains(
+        r#"
+//- Base.java
+package app;
+public class Base { public void inherited() {} }
+//- Helper.java
+package app;
+public class Helper extends Base { public void assist() {} }
+//- Main.java
+package app;
+public class Main { void run(Helper h) { h.in/*^*/; } }
+"#,
+        &["inherited"],
+    );
+}
+
+#[test]
+fn completes_kotlin_members_without_kotlin_extensions() {
+    let got = labels(
+        r#"
+//- Helper.kt
+package app
+class Helper { fun assist() {} }
+fun Helper.extensionOnly() {}
+//- Main.java
+package app;
+public class Main { void run(Helper h) { h./*^*/ } }
+"#,
+    )
+    .expect("Kotlin receiver members");
+    assert!(got.contains("assist"), "{got:?}");
+    assert!(!got.contains("extensionOnly"), "{got:?}");
+    assert!(!got.contains("Main"), "{got:?}");
+    assert!(!got.contains("run"), "{got:?}");
+}
+
+#[test]
+fn receiver_completion_preserves_package_identity() {
+    let got = labels(
+        r#"
+//- Visible.java
+package lib;
+public class Helper { public void assist() {} }
+//- Unrelated.java
+package other;
+public class Helper { public void unrelated() {} }
+//- Main.java
+package app;
+import lib.Helper;
+public class Main { void run(Helper h) { h./*^*/ } }
+"#,
+    )
+    .expect("imported receiver members");
+    assert!(got.contains("assist"), "{got:?}");
+    assert!(!got.contains("unrelated"), "{got:?}");
+}
+
+#[test]
+fn unknown_receiver_does_not_complete_unrelated_members() {
+    check_none(
+        r#"
+//- Helper.java
+package app;
+public class Helper { public void assist() {} }
+//- Main.java
+package app;
+public class Main { void run() { missing./*^*/ } }
+"#,
+    );
+}
+
+#[test]
+fn receiver_completion_observes_unsaved_java_and_kotlin_changes() {
+    let mut ws = Workspace::new();
+    let kotlin = "package app\nclass Helper {\n    fun assist() {}\n}\nclass Other {\n    fun unrelated() {}\n}\n";
+    let java = "package app; class Main { void run(Helper h) { h.; } }";
+    ws.open("Types.kt", kotlin.to_string());
+    ws.open("Main.java", java.to_string());
+    let labels_at = |ws: &mut Workspace, source: &str| {
+        ws.complete("Main.java", source.find("h.").unwrap() + 2, true)
+            .expect("receiver members")
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<HashSet<_>>()
+    };
+    assert!(labels_at(&mut ws, java).contains("assist"));
+
+    let edited_java = java.replace("Helper h", "Other h");
+    ws.change("Main.java", edited_java.clone());
+    let got = labels_at(&mut ws, &edited_java);
+    assert!(got.contains("unrelated"), "{got:?}");
+    assert!(!got.contains("assist"), "{got:?}");
+
+    ws.change("Types.kt", kotlin.replace("unrelated", "changed"));
+    let got = labels_at(&mut ws, &edited_java);
+    assert!(got.contains("changed"), "{got:?}");
+    assert!(!got.contains("unrelated"), "{got:?}");
+}
+
+#[test]
+fn explains_java_member_completion_and_unknown_receiver() {
+    let mut ws = Workspace::new();
+    let src = "package app; class Helper { public void assist() {} } class Main { void run(Helper h) { h.as; missing.; } }";
+    ws.open("Main.java", src.to_string());
+    let explanation = ws
+        .explain_completion("Main.java", src.find("h.as").unwrap() + 4)
+        .expect("member completion explanation");
+    assert_eq!(explanation.context, "member");
+    assert_eq!(explanation.status, "ok");
+    assert!(explanation.candidates.contains(&"assist".to_string()));
+
+    let unknown = ws
+        .explain_completion("Main.java", src.find("missing.").unwrap() + 8)
+        .expect("unknown receiver explanation");
+    assert_eq!(unknown.context, "member");
+    assert_eq!(unknown.status, "unknown");
+    assert!(unknown
+        .reasons
+        .contains(&"unknown-receiver-type".to_string()));
+}
+
+#[test]
+fn this_recovery_does_not_change_index_or_retain_deleted_members() {
+    let mut ws = Workspace::new();
+    let src = "package app; class Main { void run() { this.; } void assist() {} }";
+    ws.open("Main.java", src.to_string());
+    let indexed_symbols = |ws: &Workspace| {
+        ws.index
+            .entries_for_file("Main.java")
+            .iter()
+            .map(|entry| {
+                (
+                    entry.sym.name.clone(),
+                    entry.sym.start_byte,
+                    entry.sym.end_byte,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = indexed_symbols(&ws);
+    let got = ws
+        .complete("Main.java", src.find("this.").unwrap() + 5, true)
+        .expect("recovered this members");
+    assert!(got.items.iter().any(|item| item.label == "assist"));
+    assert_eq!(indexed_symbols(&ws), before);
+
+    let edited = src.replace("void assist() {}", "void changed() {}");
+    ws.change("Main.java", edited.clone());
+    let got = ws
+        .complete("Main.java", edited.find("this.").unwrap() + 5, true)
+        .expect("updated recovered this members");
+    assert!(got.items.iter().any(|item| item.label == "changed"));
+    assert!(!got.items.iter().any(|item| item.label == "assist"));
 }

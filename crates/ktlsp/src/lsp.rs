@@ -808,7 +808,7 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
 
 /// `file://` URI -> canonical key (the file path string). `None` for non-file URIs.
 fn uri_to_key(uri: &Uri) -> Option<String> {
-    uri.to_file_path().map(|p| p.to_string_lossy().into_owned())
+    uri.to_file_path().map(|path| crate::paths::file_key(&path))
 }
 
 /// Canonical key (path string) -> `file://` URI.
@@ -1033,8 +1033,7 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         *self.progress_supported.lock() = progress;
 
-        *self.diagnostic_scope.lock() =
-            diagnostic_scope_from(&params.initialization_options);
+        *self.diagnostic_scope.lock() = diagnostic_scope_from(&params.initialization_options);
         let formatter = formatter_from(&params.initialization_options);
         *self.formatter.lock() = formatter.clone();
 
@@ -2966,6 +2965,25 @@ fn def_to_range(ws: &Workspace, d: &Def) -> Option<Range> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[cfg(windows)]
+    fn native_file_keys_roundtrip_through_editor_uris() {
+        let expected = "C:/project/space name/Main.kt";
+        for path in [
+            r"c:\project\space name\Main.kt",
+            r"\\?\C:\project\space name\Main.kt",
+        ] {
+            let key = crate::paths::file_key(Path::new(path));
+            let uri = key_to_uri(&key).unwrap();
+            assert!(uri.as_str().starts_with("file://"));
+            assert_eq!(uri_to_key(&uri).as_deref(), Some(expected));
+        }
+        let uri = "file:///c%3A/project/space%20name/Main.kt"
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(uri_to_key(&uri).as_deref(), Some(expected));
+    }
 
     #[test]
     fn diagnostic_scope_defaults_to_open_files_only() {

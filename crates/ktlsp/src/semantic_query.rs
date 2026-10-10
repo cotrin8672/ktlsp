@@ -10,11 +10,11 @@ use tree_sitter::{Node, Tree};
 
 use crate::complete::{self, ScopeCompletion};
 use crate::hierarchy;
-use crate::imports::{self, ImportLayout};
-use crate::index::{Entry, Index};
+use crate::imports::{self, ImportLayout, ImportStyle};
+use crate::index::{Entry, Index, Tier};
 use crate::infer;
 use crate::knowledge::Knowledge;
-use crate::language;
+use crate::language::{self, SourceLanguage};
 use crate::parser::{child_of_kind, identifier_at, node_text, KotlinParser};
 use crate::resolve::{self, CompletenessFacts, ResolutionStatus, UseKind};
 use crate::symbol::{Def, SymbolKind};
@@ -292,33 +292,55 @@ pub fn member_completion_query(
 ) -> Option<CompletionQuery> {
     let ctx = infer::FileCtx::from_tree(tree, src);
     let ty = infer::infer(index, receiver, src, &ctx);
-    member_completion_query_for_type(index, tree, src, ty, prefix, max_candidates)
+    member_completion_query_for_type(
+        index,
+        SourceLanguage::Kotlin,
+        tree,
+        src,
+        ty,
+        prefix,
+        max_candidates,
+    )
 }
 
 pub fn member_completion_query_for_type(
     index: &Index,
+    language: SourceLanguage,
     tree: &Tree,
     src: &str,
     ty: Type,
     prefix: String,
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let style = match language {
+        SourceLanguage::Kotlin => ImportStyle::Kotlin,
+        SourceLanguage::Java => ImportStyle::Java,
+    };
+    let layout = imports::import_layout_with_style(style, tree, src);
     let Some(receiver_type_name) = ty.name().map(str::to_string) else {
         return Some(CompletionQuery {
             context: complete::CompletionContext::AfterDot,
             prefix,
             candidates: Vec::new(),
-            layout: imports::import_layout(tree, src),
+            layout,
             status: CompletionStatus::Unknown(vec![
                 CompletionIncompletenessReason::UnknownReceiverType,
             ]),
         });
     };
     let receiver_type_package = ty.package().map(str::to_string);
-    let vis = Visibility::new(&ctx.package, &ctx.imports);
+    let vis = Visibility::for_file(language, tree, src);
+    // Incomplete selectors can hide later declarations in the live index; use recovered file facts.
+    let mut source_index = Index::new();
+    source_index.replace_file(
+        "<completion>",
+        language::symbol_facts(language, tree, src).symbols,
+        Tier::Volatile,
+    );
     let candidates = member_candidates(
         index,
+        Some(&source_index),
+        language,
         &receiver_type_name,
         receiver_type_package.clone(),
         &prefix,
@@ -334,7 +356,7 @@ pub fn member_completion_query_for_type(
             CompletionStatus::Found(())
         },
         candidates,
-        layout: imports::import_layout(tree, src),
+        layout,
     })
 }
 
@@ -543,6 +565,8 @@ pub fn scope_name_query(
         let receiver_type_package = recv_ty.package().map(str::to_string);
         for candidate in member_candidates(
             index,
+            None,
+            SourceLanguage::Kotlin,
             &receiver_type_name,
             receiver_type_package,
             &prefix,
@@ -611,6 +635,8 @@ pub fn scope_name_query(
 
 fn member_candidates(
     index: &Index,
+    source_index: Option<&Index>,
+    language: SourceLanguage,
     ty: &str,
     ty_pkg: Option<String>,
     prefix: &str,
@@ -625,7 +651,17 @@ fn member_candidates(
         if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
             continue;
         }
-        for e in index.members_of(&cur) {
+        let members_index = source_index
+            .filter(|source| {
+                cur_pkg.as_ref().is_some_and(|pkg| {
+                    source
+                        .lookup_type(&cur)
+                        .iter()
+                        .any(|entry| entry.sym.package == *pkg)
+                })
+            })
+            .unwrap_or(index);
+        for e in members_index.members_of(&cur) {
             if let Some(p) = &cur_pkg {
                 if &e.sym.package != p {
                     continue;
@@ -633,21 +669,22 @@ fn member_candidates(
             }
             push_member_candidate(&mut out, &mut seen, e, prefix, None);
         }
-        for e in index.extensions_for(&cur) {
-            let import_path = if vis.is_visible(&e.sym.package, &e.sym.name) {
-                None
-            } else {
-                Some(fqn(&e.sym.package, &e.sym.name))
-            };
-            push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
+        if language == SourceLanguage::Kotlin {
+            for e in index.extensions_for(&cur) {
+                let import_path = if vis.is_visible(&e.sym.package, &e.sym.name) {
+                    None
+                } else {
+                    Some(fqn(&e.sym.package, &e.sym.name))
+                };
+                push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
+            }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
+        for sup in members_index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
             let sup_pkg = match &cur_pkg {
                 Some(p)
-                    if index
-                        .lookup_by_name(&sup)
-                        .iter()
-                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
+                    if [index, members_index].iter().any(|source| {
+                        source.lookup_type(&sup).iter().any(|e| &e.sym.package == p)
+                    }) =>
                 {
                     Some(p.clone())
                 }

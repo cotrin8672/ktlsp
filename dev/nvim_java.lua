@@ -556,6 +556,59 @@ do
   end
 end
 
+-- Member completion must use incomplete Java text and current shared Kotlin declarations.
+do
+  local function completion_after_edit(anchor, text)
+    local line = assert(find(anchor, anchor), "completion anchor not found: " .. anchor)
+    local original = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)
+    vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, { text })
+    vim.wait(200)
+    local result = request("textDocument/completion", {
+      textDocument = { uri = uri },
+      position = { line = line, character = #text },
+    })
+    local labels = {}
+    for _, item in ipairs(result and (result.items or result) or {}) do
+      labels[item.label] = true
+    end
+    vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, original)
+    vim.wait(200)
+    return labels
+  end
+
+  local labels = completion_after_edit("helper.assist();", "        helper.as")
+  check("unsaved Java helper.as offers assist", labels.assist, vim.inspect(labels))
+  check("Java member completion excludes unrelated Other.assistUnrelated", not labels.assistUnrelated, vim.inspect(labels))
+
+  labels = completion_after_edit("this.runAgain();", "        this.")
+  check("bare Java this. offers runAgain", labels.runAgain, vim.inspect(labels))
+
+  labels = completion_after_edit("helper.inherited();", "        helper.inh")
+  check("Java helper.inh offers inherited member", labels.inherited, vim.inspect(labels))
+
+  labels = completion_after_edit("kotlinHelper.assist();", "        kotlinHelper.as")
+  check("Java kotlinHelper.as offers Kotlin assist", labels.assist, vim.inspect(labels))
+
+  labels = completion_after_edit("helper.assist();", "        unknown.as")
+  check("unknown Java receiver has no unrelated completion", next(labels) == nil, vim.inspect(labels))
+
+  local kotlin_buf = vim.fn.bufadd(project .. "/app/KotlinHelper.kt")
+  vim.fn.bufload(kotlin_buf)
+  vim.bo[kotlin_buf].filetype = "kotlin"
+  assert(vim.lsp.buf_attach_client(kotlin_buf, id), "Kotlin buffer did not attach to shared client")
+  local original = vim.api.nvim_buf_get_lines(kotlin_buf, 0, -1, false)
+  vim.api.nvim_buf_set_lines(kotlin_buf, 0, -1, false, {
+    "package app", "", "class KotlinHelper {", "    fun assistChanged() { }", "}",
+  })
+  vim.wait(200)
+  labels = completion_after_edit("kotlinHelper.assist();", "        kotlinHelper.as")
+  check("unsaved Kotlin member edit appears in Java completion", labels.assistChanged, vim.inspect(labels))
+  check("Java completion removes the old unsaved Kotlin member", not labels.assist, vim.inspect(labels))
+  check("Kotlin declaration remains unsaved", vim.bo[kotlin_buf].modified)
+  vim.api.nvim_buf_set_lines(kotlin_buf, 0, -1, false, original)
+  vim.wait(200)
+end
+
 -- Signature help on a Java method call should include parameter and return types.
 do
   local l, c = find('helper.combine("Ada", 2)', "2")

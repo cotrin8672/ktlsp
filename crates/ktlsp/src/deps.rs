@@ -2224,7 +2224,7 @@ worktree = "com.example:worktree:9.9"
             &mut java,
         );
         assert_eq!(batches.len(), 1);
-        assert!(batches[0].file.ends_with("android/graphics/Bitmap.java"));
+        assert!(Path::new(&batches[0].file).ends_with("android/graphics/Bitmap.java"));
         assert!(batches[0]
             .symbols
             .iter()
@@ -2278,7 +2278,7 @@ worktree = "com.example:worktree:9.9"
         for handle in handles {
             let batches = handle.join().unwrap();
             assert_eq!(batches.len(), 1);
-            assert!(batches[0].file.ends_with("android/graphics/Bitmap.java"));
+            assert!(Path::new(&batches[0].file).ends_with("android/graphics/Bitmap.java"));
         }
         let _ = fs::remove_dir_all(&root);
     }
@@ -2313,6 +2313,7 @@ worktree = "com.example:worktree:9.9"
         fs::create_dir_all(&app).unwrap();
         fs::write(app.join("build.gradle"), "").unwrap();
         fs::write(app.join("gradlew"), "").unwrap();
+        fs::write(app.join("gradlew.bat"), "").unwrap();
         assert_eq!(gradle_root(&root), Some(app));
         let _ = fs::remove_dir_all(&root);
     }
@@ -2328,6 +2329,7 @@ worktree = "com.example:worktree:9.9"
         fs::create_dir_all(&standalone).unwrap();
         fs::write(android.join("settings.gradle"), "").unwrap();
         fs::write(android.join("gradlew"), "").unwrap();
+        fs::write(android.join("gradlew.bat"), "").unwrap();
         fs::write(standalone.join("build.gradle"), "").unwrap();
         assert_eq!(gradle_root(&root), Some(android));
         let _ = fs::remove_dir_all(&root);
@@ -2344,6 +2346,7 @@ worktree = "com.example:worktree:9.9"
         fs::write(a.join("build.gradle"), "").unwrap();
         fs::write(b.join("build.gradle"), "").unwrap();
         fs::write(b.join("gradlew"), "").unwrap();
+        fs::write(b.join("gradlew.bat"), "").unwrap();
         assert_eq!(gradle_root(&root), Some(b));
         let _ = fs::remove_dir_all(&root);
     }

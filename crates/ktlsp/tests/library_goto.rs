@@ -125,7 +125,7 @@ fn assert_goto_into_library(ws: &mut Workspace, key: &str, src: &str, token: &st
     assert!(!defs.is_empty(), "goto on `{token}` returned nothing");
     let d = &defs[0];
     assert!(
-        d.file.ends_with(suffix),
+        std::path::Path::new(&d.file).ends_with(suffix),
         "goto on `{token}` -> {} (expected a file ending in {suffix})",
         d.file
     );
@@ -189,7 +189,7 @@ fn goto_uses_newest_selected_library_version() {
         "older library version should be shadowed: {defs:?}"
     );
     assert!(
-        defs[0].file.contains("/1.11.0/"),
+        std::path::Path::new(&defs[0].file).starts_with(extract_root.join("acme/demo/1.11.0")),
         "goto should land in the newer source tree, got {}",
         defs[0].file
     );
@@ -490,9 +490,7 @@ fn goto_into_android_sdk_sources_from_kotlin_import() {
     let import_offset = src.find("Bitmap").unwrap();
     let import_defs = ws.goto_definition(&key, import_offset);
     assert_eq!(import_defs.len(), 1);
-    assert!(import_defs[0]
-        .file
-        .ends_with("android/graphics/Bitmap.java"));
+    assert!(std::path::Path::new(&import_defs[0].file).ends_with("android/graphics/Bitmap.java"));
     assert_goto_into_library(&mut ws, &key, src, "Bitmap", "android/graphics/Bitmap.java");
 
     let _ = fs::remove_dir_all(&tmp);

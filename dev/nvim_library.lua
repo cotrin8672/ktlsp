@@ -11,9 +11,12 @@
 local project = arg[1]
 assert(project and project ~= "", "usage: nvim -l dev/nvim_library.lua <project-dir>")
 
-local bin = vim.fn.getcwd() .. "/target/release/ktlsp"
-if vim.fn.filereadable(bin) == 0 then
-  bin = vim.fn.getcwd() .. "/target/debug/ktlsp"
+local bin = os.getenv("KTLSP_BIN")
+if not bin or bin == "" then
+  bin = vim.fn.getcwd() .. "/target/release/ktlsp"
+  if vim.fn.filereadable(bin) == 0 then
+    bin = vim.fn.getcwd() .. "/target/debug/ktlsp"
+  end
 end
 assert(vim.fn.filereadable(bin) == 1, "ktlsp binary not found — run `cargo build` first")
 

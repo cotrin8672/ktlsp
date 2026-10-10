@@ -2,7 +2,7 @@
 //! the LSP layer drives. All keys are the caller's canonical identity string (a path or URI
 //! string); we never re-derive identity from the filesystem at query time.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -221,10 +221,15 @@ impl Workspace {
     /// generated source roots and any files currently open (their dirty buffers are authoritative).
     /// Returns the count indexed.
     pub fn scan(&mut self, root: &Path) -> usize {
+        let open_keys = self
+            .open_docs
+            .keys()
+            .map(|key| crate::paths::file_key(Path::new(key)))
+            .collect::<HashSet<_>>();
         let mut paths = Vec::new();
         for path in project_source_files(root) {
-            let key = path.to_string_lossy().to_string();
-            if self.open_docs.contains_key(&key) {
+            let key = crate::paths::file_key(&path);
+            if open_keys.contains(&key) {
                 continue;
             }
             paths.push(path);
@@ -438,7 +443,9 @@ impl Workspace {
         offset: usize,
     ) -> Option<semantic_query::CompletionQuery> {
         if is_java_path(key) {
-            return None;
+            return self
+                .completion_query(key, offset)
+                .filter(|query| query.context == complete::CompletionContext::AfterDot);
         }
         let text = self.doc_text(key)?;
         semantic_query::after_dot_query(
@@ -456,7 +463,18 @@ impl Workspace {
         offset: usize,
     ) -> Option<semantic_query::CompletionQuery> {
         if is_java_path(key) {
-            return None;
+            if let Some(doc) = self.open_docs.get(key) {
+                return java::completion_query(
+                    &self.index,
+                    key,
+                    &doc.text,
+                    &doc.tree,
+                    offset,
+                    MAX_COMPLETIONS,
+                );
+            }
+            let (text, tree) = self.parsed_closed_doc(key)?;
+            return java::completion_query(&self.index, key, &text, &tree, offset, MAX_COMPLETIONS);
         }
         if !self.open_docs.contains_key(key) {
             if let Some(query) = self.closed_completion_query(key, offset) {
@@ -502,6 +520,7 @@ impl Workspace {
         );
         semantic_query::member_completion_query_for_type(
             &self.index,
+            SourceLanguage::Kotlin,
             &synthetic_tree,
             &synthetic,
             receiver_type,
@@ -528,20 +547,6 @@ impl Workspace {
         offset: usize,
         snippets_supported: bool,
     ) -> Option<ShapedCompletions> {
-        if is_java_path(key) {
-            if let Some(doc) = self.open_docs.get(key) {
-                return java::completion(
-                    &self.index,
-                    key,
-                    &doc.text,
-                    &doc.tree,
-                    offset,
-                    snippets_supported,
-                );
-            }
-            let (text, tree) = self.parsed_closed_doc(key)?;
-            return java::completion(&self.index, key, &text, &tree, offset, snippets_supported);
-        }
         let query = self.completion_query(key, offset)?;
         if matches!(
             query.context,
@@ -1339,7 +1344,7 @@ fn parse_project_file(path: &Path, parsers: &mut LanguageParsers) -> Option<Proj
     let tree = parsers.parse(language, &text);
     let facts = language::file_facts(language, &tree, &text);
     Some(ProjectFileIndex {
-        key: path.to_string_lossy().to_string(),
+        key: crate::paths::file_key(path),
         package: facts.package,
         symbols: facts.symbols,
         usages: facts.usages,
@@ -1394,6 +1399,8 @@ fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
         return None;
     }
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_top = top.canonicalize().ok()?;
+    let relative_root = root.strip_prefix(&canonical_top).ok()?;
     let mut out = Vec::new();
     for rel in output.stdout.split(|byte| *byte == 0) {
         if rel.is_empty() {
@@ -1403,9 +1410,8 @@ fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
         if relative_path_has_excluded_dir(&rel) {
             continue;
         }
-        let path = top.join(rel.as_ref());
-        if path.starts_with(&root) {
-            out.push(path);
+        if Path::new(rel.as_ref()).starts_with(relative_root) {
+            out.push(top.join(rel.as_ref()));
         }
     }
     out.sort();
@@ -1532,6 +1538,118 @@ mod tests {
             .iter()
             .map(|candidate| candidate.label.clone())
             .collect()
+    }
+
+    #[test]
+    fn git_source_discovery_handles_nested_and_canonical_roots() {
+        let root = unique_tmp("git-source-discovery");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        for relative in [
+            "Root.kt",
+            "nested/Helper.java",
+            "nested/More.kt",
+            "sibling/Sibling.java",
+            "nested/build/Output.kt",
+            "nested/.hidden/Hidden.kt",
+            "nested/ignored/Ignored.kt",
+            "build/generated/source/ksp/main/kotlin/Generated.kt",
+        ] {
+            let file = root.join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "class Example {}\n").unwrap();
+        }
+        std::fs::write(root.join("nested/.gitignore"), "ignored/\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "--", "Root.kt", "nested/Helper.java"])
+            .status()
+            .unwrap()
+            .success());
+
+        let expected = [
+            "Root.kt",
+            "nested/Helper.java",
+            "nested/More.kt",
+            "sibling/Sibling.java",
+        ]
+        .into_iter()
+        .map(|path| root.join(path).canonicalize().unwrap())
+        .collect::<BTreeSet<_>>();
+        let actual = git_source_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        let mut expected_project = expected;
+        expected_project.insert(
+            root.join("build/generated/source/ksp/main/kotlin/Generated.kt")
+                .canonicalize()
+                .unwrap(),
+        );
+        for scan_root in [root.clone(), root.canonicalize().unwrap()] {
+            let actual = project_source_files(&scan_root)
+                .into_iter()
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected_project);
+        }
+        let nested = root.join("nested");
+        let expected = ["Helper.java", "More.kt"]
+            .into_iter()
+            .map(|path| nested.join(path).canonicalize().unwrap())
+            .collect::<BTreeSet<_>>();
+        for scan_root in [nested.clone(), nested.canonicalize().unwrap()] {
+            let actual = git_source_files(&scan_root)
+                .unwrap()
+                .into_iter()
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_scan_keeps_uri_open_buffers_authoritative() {
+        let root = unique_tmp("git-open-buffer");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        let file = root.join("Main.kt");
+        std::fs::write(&file, "class DiskState\n").unwrap();
+        let generated = root.join("build/generated/source/ksp/main/kotlin/Generated.kt");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "class GeneratedDiskState\n").unwrap();
+        let native_key = file.to_string_lossy().to_string();
+        let uri_key = crate::paths::file_key(&file);
+        for key in [native_key, uri_key] {
+            let mut ws = Workspace::new();
+            ws.open(key.clone(), "class BufferState\n".to_string());
+            ws.open(
+                crate::paths::file_key(&generated),
+                "class GeneratedBufferState\n".to_string(),
+            );
+            assert_eq!(ws.scan(&root), 0);
+            assert_eq!(ws.scan(&root.canonicalize().unwrap()), 0);
+            assert!(ws.index.lookup_by_name("DiskState").is_empty());
+            assert!(ws.index.lookup_by_name("GeneratedDiskState").is_empty());
+            assert_eq!(ws.index.lookup_by_name("BufferState").len(), 1);
+            assert_eq!(ws.index.lookup_by_name("GeneratedBufferState").len(), 1);
+            assert_eq!(ws.doc_text(&key).as_deref(), Some("class BufferState\n"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

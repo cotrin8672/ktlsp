@@ -10,6 +10,7 @@ usage: dev/ktlsp-harness.sh <scenario> [options]
 scenarios:
   basic          generated two-file project; local + cross-file goto
   features       dev/sample feature smoke; refs, completion, auto-import, edits
+  java           generated Java/Kotlin project; Java features and unsaved member completion
   library        generated version-catalog project; goto into kotlin-stdlib sources
   semantic       committed semantic probe; chains, receivers, and KMP narrowing
   project        existing project health check; requires --root and --file; optionally probes implementation
@@ -175,6 +176,10 @@ else
   fi
 fi
 
+if [ -f "$bin_arg.exe" ]; then
+  bin_arg="$bin_arg.exe"
+fi
+
 bench="$repo/target/$profile/bench"
 if [ "$profile" = "debug" ] && [ ! -x "$bench" ]; then
   bench="$repo/target/debug/bench"
@@ -312,7 +317,7 @@ interface Worker {
     void assist();
 }
 
-public class Helper implements Worker {
+public class Helper extends Base implements Worker {
     public Helper() { }
     public void assist() { }
     public String combine(String name, int count) { return name + count; }
@@ -324,7 +329,22 @@ public class Helper implements Worker {
 class Cat { }
 
 class Dog { }
+
+class Base {
+    public void inherited() { }
+}
+
+class Other {
+    public void assistUnrelated() { }
+}
 JAVA
+  cat > "$project/app/KotlinHelper.kt" <<'KOTLIN'
+package app
+
+class KotlinHelper {
+    fun assist() { }
+}
+KOTLIN
   cat > "$project/app/Main.java" <<'JAVA'
 package app;
 
@@ -337,12 +357,18 @@ public class Main {
         Worker worker = helper;
         worker.assist();
         helper.assist();
+        helper.inherited();
+        this.runAgain();
+        KotlinHelper kotlinHelper = new KotlinHelper();
+        kotlinHelper.assist();
         helper.combine("Ada", 2);
         helper.waitFor(1);
         helper.combine("Ada");
         helper.adopt(new Dog());
         missingCall();
     }
+
+    public void runAgain() { }
 }
 JAVA
   printf '%s\n' "$project"
@@ -378,6 +404,10 @@ postprocess() {
   if [ -x "$bench" ] && [ -s "$KTLSP_TRACE" ]; then
     "$bench" trace --file "$KTLSP_TRACE" --out "$artifacts/trace.json" >>"$artifacts/harness.log" 2>&1 || true
   fi
+  local nvim_log="$XDG_STATE_HOME/nvim/lsp.log"
+  if [ -f "$XDG_STATE_HOME/nvim-data/lsp.log" ]; then
+    nvim_log="$XDG_STATE_HOME/nvim-data/lsp.log"
+  fi
   {
     echo "scenario: $scenario"
     echo "status: $run_status"
@@ -385,7 +415,7 @@ postprocess() {
     echo "ktlsp_bin: $bin_arg"
     echo "cache_dir: $KTLSP_CACHE_DIR"
     echo "trace_jsonl: $KTLSP_TRACE"
-    echo "nvim_log: $XDG_STATE_HOME/nvim/lsp.log"
+    echo "nvim_log: $nvim_log"
     if [ -f "$artifacts/trace.json" ]; then
       echo "trace_json: $artifacts/trace.json"
     fi
