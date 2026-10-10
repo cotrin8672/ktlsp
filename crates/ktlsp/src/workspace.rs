@@ -421,21 +421,26 @@ impl Workspace {
         {
             return false;
         }
+        let mut metadata_changed = false;
         if let Some(model) = &self.project_model {
             if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
                 if let Some(origin) = batch.origin {
                     if origin.origin_id.starts_with("jdk:")
                         && self.global_origins.insert(origin.origin_id.clone())
                     {
-                        self.index
-                            .replace_scope_visibilities(model.scope_visibilities(
-                                &self.global_origins.iter().cloned().collect::<Vec<_>>(),
-                            ));
+                        metadata_changed |=
+                            self.index
+                                .replace_scope_visibilities(model.scope_visibilities(
+                                    &self.global_origins.iter().cloned().collect::<Vec<_>>(),
+                                ));
                     }
                     // Late ownership metadata also belongs to authoritative open source buffers.
-                    self.index.set_file_origin(&batch.file, origin);
+                    metadata_changed |= self.index.set_file_origin(&batch.file, origin);
                 }
             }
+        }
+        if metadata_changed {
+            self.analysis_extensions.mark_index_changed();
         }
         self.index_dependency_file(&batch.file, batch.symbols)
     }

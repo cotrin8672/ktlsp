@@ -1513,6 +1513,8 @@ mod tests {
         ));
         let same = index.file_origin("project/Reader.java").cloned().unwrap();
         assert!(!index.set_file_origin("project/Reader.java", same));
+        let same = index.origins.visibilities.values().cloned().collect();
+        assert!(!index.replace_scope_visibilities(same));
         index.replace_file(
             "project/Reader.java",
             vec![IndexedSymbol::new(
@@ -1543,6 +1545,12 @@ mod tests {
             &index.origins.visibilities,
             &snapshot.origins.visibilities
         ));
+        assert!(index.replace_scope_visibilities(vec![visibility("a", &["a"])]));
+        assert!(!Arc::ptr_eq(
+            &index.origins.visibilities,
+            &snapshot.origins.visibilities
+        ));
+        assert_eq!(snapshot.origins.visibilities.len(), 2);
     }
 
     #[test]

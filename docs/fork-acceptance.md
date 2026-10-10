@@ -395,6 +395,44 @@ can change scope visibility without scheduling provider normalization. That fail
 is retained under `ktlsp-extension-host-20261011/late-owner-before-paired.txt` for the
 next repair; ordinary CEM runs do not register that consumer.
 
+### Ninth editor rechecks and late-ownership repair
+
+The ninth source is committed as `2b2325e`. Its unchanged real-CEM manifests now
+pass all four golden completion/exact-definition requests and all six incomplete
+requests (five editing cases), each on its first response after both indexing
+phases. Both runs retain exit 1: dependency completeness reports four failed
+archives and three missing sources. All queried/edited/declaration source bytes,
+helpers and the frozen binary remain unchanged. Evidence is
+`ktlsp-corpus-probes-20261010/cem-working-copy-ktlsp-ninth2-{golden,incomplete}-1/`.
+The archive audit identifies three readable compatibility archives containing
+only `module-info.java`; calling these IO failures is incorrect. Commons Compress
+1.26.0 contains one non-UTF8 Java comment in an otherwise readable archive. Its
+unproven encoding remains an explicit input failure, with no guessed decoding.
+Raw entry/CRC/content hashes are in
+`ktlsp-goal-20261010/source-archives-cem/ninth-cem-and-archives.json`.
+
+The same-client KAPT/KSP rerun restores all previously failing unsaved-member
+completions. Real builds, current API completion, exact generated-source
+navigation/removal and buffer preservation pass. It still fails twelve diagnostic
+expectations for obsolete or removed APIs; no expectations were weakened.
+Evidence is `ktlsp-goal-20261010/processor-refresh-ninth-1/`.
+The broad Java editor recheck also retains five missing-diagnostic failures
+(unresolved reference, arity, argument type and two changed-superclass cases).
+These are coverage gaps from incomplete producer knowledge, despite passing
+ordinary completion/navigation/refactoring controls. Evidence is
+`ktlsp-goal-20261010/ninth2-java-1/`; its legacy forced shutdown does not prove
+graceful termination. None of these correctness runs supplies timing acceptance.
+
+The late-owner repair marks provider inputs dirty only when file-origin or scope
+metadata actually changes. An open buffer still rejects stale symbols; repeated
+unchanged metadata and old generations do not trigger an evaluation. Paired
+Java/Kotlin tests change from two failures to two passes; the related Index, host,
+source-fact, reference, applied-rename and scope suites pass 50 tests. Full fmt and
+Lua syntax checks pass. `ktlsp-extension-host-20261011/late-owner-stable.json`
+records source hashes. The opt-in external Lua corpus hook reuses the existing
+client, checks, source guards and shutdown. Actual external-provider editor
+acceptance and a fresh full workspace run remain pending for this repair.
+
 ### CEM local sources and implicit receivers: eighth checkpoint
 
 The immutable release is

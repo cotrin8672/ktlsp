@@ -394,3 +394,124 @@ fn skipped_late_dependency_batch_preserves_open_source_bindings_and_provider_dia
         assert_eq!(calls.load(Ordering::SeqCst), before);
     }
 }
+
+#[test]
+fn late_open_kotlin_dependency_ownership_refreshes_provider_results() {
+    late_open_dependency_ownership("Target.kt", TARGET);
+}
+
+#[test]
+fn late_open_java_dependency_ownership_refreshes_provider_results() {
+    late_open_dependency_ownership(
+        "Target.java",
+        "package oracle; public class Target { public int twice(int value) { return value * 2; } }",
+    );
+}
+
+fn late_open_dependency_ownership(file: &str, source: &str) {
+    use ktlsp::project_model::{FileOrigin, SourceRepresentation};
+    for change in ["both", "file", "scope", "maven"] {
+        let root = std::env::temp_dir().join("ktlsp-extension-late-ownership");
+        let source_root = root.join("src");
+        let owner_key = ktlsp::paths::file_key(&source_root.join("Owner.java"));
+        let target_key = ktlsp::paths::file_key(&root.join("cache").join(file));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut ws = Workspace::with_analysis_providers(vec![Arc::new(Consumer {
+            calls: calls.clone(),
+        })]);
+        let jar = root.join("api.jar");
+        ws.set_project_model(Arc::new(ktlsp::classpath::ProjectSnapshot::new(
+            ktlsp::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nEND\t:app\n",
+                root.display(), source_root.display(), jar.display(), jar.display()
+            )),
+        )));
+        let stale_generation = ws.analysis_generation();
+        ws.begin_analysis_generation();
+        ws.scan_model_sources();
+        let origin = FileOrigin {
+            origin_id: if change == "maven" {
+                "maven:vendor:api:1"
+            } else {
+                "jdk:fixture"
+            }
+            .into(),
+            representation: SourceRepresentation::Source,
+            project_scope: None,
+        };
+        if change == "file" {
+            assert!(ws.index_dependency_batch(ktlsp::deps::FileSymbols {
+                file: ktlsp::paths::file_key(&root.join("cache/Seed.java")),
+                symbols: Vec::new(),
+                origin: Some(origin.clone()),
+            }));
+            ws.bump_index_revision();
+        } else if change == "scope" {
+            assert!(ws.index.set_file_origin(&target_key, origin.clone()));
+        }
+        let owner = OWNER.replace("abstract int mirror", "Target target; abstract int mirror");
+        ws.open(owner_key.clone(), owner.clone());
+        ws.open(target_key.clone(), source.into());
+        let status = |ws: &mut Workspace| {
+            ws.diagnostics(&owner_key)
+                .into_iter()
+                .filter(|diagnostic| diagnostic.message.starts_with("test-consumer:"))
+                .map(|diagnostic| diagnostic.message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(status(&mut ws), ["test-consumer:unknown"]);
+        assert!(ws
+            .goto_definition(&owner_key, owner.find("Target target").unwrap())
+            .is_empty());
+        let before = calls.load(Ordering::SeqCst);
+        let language = ktlsp::language::SourceLanguage::for_key(file);
+        let stale = source.replace("twice", "oldName");
+        let mut parsers = ktlsp::language::LanguageParsers::new();
+        let tree = parsers.parse(language, &stale);
+        let symbols = ktlsp::language::file_facts(language, &tree, &stale).symbols;
+        let batch = || ktlsp::deps::FileSymbols {
+            file: target_key.clone(),
+            symbols: symbols.clone(),
+            origin: Some(origin.clone()),
+        };
+        let owner_scope = ws
+            .index
+            .file_origin(&owner_key)
+            .unwrap()
+            .project_scope
+            .clone()
+            .unwrap();
+        let visibility = ws.index.scope_visibility(&owner_scope).cloned();
+        let old_origin = ws.index.file_origin(&target_key).cloned();
+        let generation = ws.analysis_generation();
+        assert!(!ws.index_dependency_batch_for_generation(stale_generation, batch()));
+        ws.bump_index_revision();
+        assert_eq!(ws.index.file_origin(&target_key), old_origin.as_ref());
+        assert_eq!(ws.index.scope_visibility(&owner_scope), visibility.as_ref());
+        assert_eq!(status(&mut ws), ["test-consumer:unknown"]);
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        assert!(!ws.index_dependency_batch_for_generation(generation, batch()));
+        ws.bump_index_revision();
+        assert_eq!(ws.doc_text(&target_key).as_deref(), Some(source));
+        assert_eq!(ws.index.file_origin(&target_key), Some(&origin));
+        assert_eq!(
+            ws.goto_definition(&owner_key, owner.find("Target target").unwrap())
+                .len(),
+            1
+        );
+        assert_eq!(status(&mut ws), ["test-consumer:bound"], "{file} {change}");
+        let definition = ws.goto_definition(&owner_key, owner.find("mirror").unwrap());
+        assert_eq!(definition[0].file, target_key);
+        assert_eq!(definition[0].start_byte, source.find("twice").unwrap());
+        assert!(calls.load(Ordering::SeqCst) > before);
+        let before_repeat = calls.load(Ordering::SeqCst);
+        assert!(!ws.index_dependency_batch(batch()));
+        ws.bump_index_revision();
+        assert_eq!(status(&mut ws), ["test-consumer:bound"]);
+        assert_eq!(calls.load(Ordering::SeqCst), before_repeat);
+        assert_eq!(
+            ws.goto_definition(&owner_key, owner.find("mirror").unwrap()),
+            definition
+        );
+    }
+}

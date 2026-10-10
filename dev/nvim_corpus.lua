@@ -293,4 +293,11 @@ for _, prep in ipairs(prepared) do
   end
   if prep.has_edits then deliver_edits(prep, true) end
 end
+if vim.env.KTLSP_CORPUS_EXTRA_PROBES then
+  local ok, err = pcall(function()
+    dofile(vim.env.KTLSP_CORPUS_EXTRA_PROBES)({ repo = vim.fs.dirname(script_dir), client = client,
+      sources = sources, check = check, project = project, artifacts = artifacts })
+  end)
+  check('external corpus probes complete', ok, ok and nil or tostring(err))
+end
 finish()
