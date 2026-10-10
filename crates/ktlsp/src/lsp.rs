@@ -31,6 +31,22 @@ use crate::workspace::Workspace;
 /// Debounce window for diagnostics: the server is FULL-sync (a keystroke is a whole-doc change), so
 /// we coalesce rapid edits before recomputing.
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(300);
+const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+#[derive(Default)]
+struct RefreshState {
+    requested: u64,
+    running: bool,
+    force: bool,
+}
+
+#[derive(Default)]
+struct WatchState {
+    dynamic: bool,
+    relative: bool,
+    registration: Option<String>,
+    sequence: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticScope {
@@ -54,6 +70,8 @@ pub struct Backend {
     progress_supported: Arc<Mutex<bool>>,
     diagnostic_scope: Mutex<DiagnosticScope>,
     formatter: Mutex<Option<FormatterConfig>>,
+    refresh: Arc<Mutex<RefreshState>>,
+    watches: Arc<Mutex<WatchState>>,
 }
 
 impl Backend {
@@ -68,7 +86,61 @@ impl Backend {
             progress_supported: Arc::new(Mutex::new(false)),
             diagnostic_scope: Mutex::new(DiagnosticScope::OpenFilesOnly),
             formatter: Mutex::new(None),
+            refresh: Arc::new(Mutex::new(RefreshState::default())),
+            watches: Arc::new(Mutex::new(WatchState::default())),
         }
+    }
+
+    fn schedule_project_refresh(&self, force: bool, initial_delay: Duration) {
+        let Some(root) = self.root.lock().clone() else {
+            return;
+        };
+        let mut state = self.refresh.lock();
+        state.requested = self.ws.lock().begin_analysis_generation();
+        state.force |= force;
+        if state.running {
+            return;
+        }
+        state.running = true;
+        let state = self.refresh.clone();
+        let ws = self.ws.clone();
+        let client = self.client.clone();
+        let watches = self.watches.clone();
+        let progress = *self.progress_supported.lock();
+        let gradle = *self.gradle_project.lock();
+        tokio::spawn(async move {
+            let mut delay = initial_delay;
+            loop {
+                let requested = state.lock().requested;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                delay = PROJECT_REFRESH_DEBOUNCE;
+                let (generation, force) = {
+                    let mut state = state.lock();
+                    if state.requested != requested {
+                        continue;
+                    }
+                    (state.requested, std::mem::take(&mut state.force))
+                };
+                index_workspace(
+                    client.clone(),
+                    ws.clone(),
+                    root.clone(),
+                    progress,
+                    gradle,
+                    generation,
+                    force,
+                    watches.clone(),
+                )
+                .await;
+                let mut state = state.lock();
+                if state.requested == generation {
+                    state.running = false;
+                    break;
+                }
+            }
+        });
     }
 
     /// Bump `key`'s version and schedule a debounced diagnostics recompute. Off the request path; the
@@ -99,6 +171,10 @@ impl Backend {
         }
         let ws = self.ws.clone();
         let root = self.root.lock().clone();
+        let (generation, model) = {
+            let guard = ws.lock();
+            (guard.analysis_generation(), guard.project_snapshot())
+        };
         let trace_key = key.clone();
         tokio::spawn(async move {
             let start = Instant::now();
@@ -119,8 +195,10 @@ impl Backend {
                 );
                 if let Some(root) = root {
                     if crate::deps::gradle_root(&root).is_some() {
-                        let local_jars = resolve_local_jars_for_file(&root, Path::new(&key));
-                        let model = crate::classpath::snapshot(&root);
+                        let local_jars = model
+                            .as_ref()
+                            .and_then(|model| model.local_jars_for_file(Path::new(&key)))
+                            .unwrap_or_default();
                         if !local_jars.is_empty() {
                             let extract_root = crate::deps::extract_root();
                             for fqn in imports.iter().filter(|fqn| {
@@ -151,8 +229,11 @@ impl Backend {
                 .sum::<usize>();
             if files > 0 {
                 let mut guard = ws.lock();
+                if !guard.is_current_generation(generation) {
+                    return;
+                }
                 for batch in batches {
-                    guard.index_dependency_batch(batch);
+                    guard.index_dependency_batch_for_generation(generation, batch);
                 }
                 guard.bump_index_revision();
             }
@@ -175,6 +256,8 @@ impl Backend {
 struct DepStats {
     coordinates: usize,
     local_jars: usize,
+    reused_coordinates: usize,
+    reused_local_jars: usize,
     files: usize,
     symbols: usize,
     failed: usize,
@@ -186,6 +269,7 @@ struct DepStats {
     local_stub_files: usize,
     local_stub_symbols: usize,
     incomplete_classpath: bool,
+    jdk_reused: bool,
 }
 
 #[derive(Clone)]
@@ -325,21 +409,24 @@ fn spawn_local_jar_index_worker(
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut kotlin = KotlinParser::new();
                 let mut java = JavaParser::new();
-                deps::resolve_local_jar_stubs_for_origin(
+                let batches = deps::resolve_local_jar_stubs_for_origin(
                     &jar_path,
                     &origin_id,
                     &extract_root,
                     &mut kotlin,
                     &mut java,
-                )
+                );
+                let changed =
+                    !jar_path.is_file() || classpath::file_origin_id(&jar_path) != origin_id;
+                (batches, changed)
             }));
             let result = match resolved {
-                Ok(batches) => DependencyResult {
+                Ok((batches, changed)) => DependencyResult {
                     coord: None,
                     label,
                     batches,
                     discovered: Vec::new(),
-                    failed: false,
+                    failed: changed,
                     skipped: false,
                     missing_source: false,
                     jdk: false,
@@ -444,6 +531,9 @@ fn spawn_coordinate_index_worker(
 fn index_dependencies(
     ws: &Arc<Mutex<Workspace>>,
     root: &std::path::Path,
+    model: Option<Arc<classpath::ProjectSnapshot>>,
+    gradle: bool,
+    generation: u64,
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
 ) -> DepStats {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -453,38 +543,26 @@ fn index_dependencies(
     use crate::deps::{self, CoordinateDecision, CoordinateSelector};
 
     let repos = Repos::defaults();
-    let mut coords = deps::coordinates_for_root(root);
-    coords.extend(deps::cached_catalog_coordinates(root, &repos));
-    coords.extend(deps::coordinates_from_build_files(root, &repos));
+    let mut coords = Vec::new();
+    if !gradle {
+        coords = deps::coordinates_for_root(root);
+        coords.extend(deps::cached_catalog_coordinates(root, &repos));
+        coords.extend(deps::coordinates_from_build_files(root, &repos));
+    }
     let mut local_jars = VecDeque::new();
-    let model = if deps::gradle_root(root).is_some() {
-        classpath::resolve_snapshot(root).ok()
-    } else {
-        None
-    };
     let authoritative = model
         .as_ref()
         .is_some_and(|m| m.modules.iter().any(|m| !m.source_sets.is_empty()));
-    if let Some(model) = &model {
-        let mut guard = ws.lock();
-        guard.set_project_model(model.clone());
-        let added = guard.scan_model_sources();
-        tracing::info!(
-            modules = model.modules.len(),
-            additional_sources = added,
-            authoritative,
-            "installed Gradle project model"
-        );
+    if gradle && !authoritative {
+        return DepStats {
+            incomplete_classpath: true,
+            ..Default::default()
+        };
     }
     if authoritative {
-        coords = classpath::coordinates_from_classpath(root);
-        local_jars.extend(classpath::local_jars_from_classpath(root));
-    } else if deps::gradle_root(root).is_some() {
-        // Gradle projects declare dependencies either in a version catalog or directly in
-        // `build.gradle`. The resolved `compileClasspath` jars reveal the actual coordinates of
-        // every dependency (including transitive ones), so use them as the advisory source index.
-        coords.extend(classpath::coordinates_from_classpath(root));
-        local_jars.extend(classpath::local_jars_from_classpath(root));
+        let model = model.as_ref().unwrap();
+        coords = model.coordinates();
+        local_jars.extend(model.local_jars());
     }
     let mut queue: VecDeque<_> = coords.into();
     let mut seen = BTreeSet::new();
@@ -493,7 +571,7 @@ fn index_dependencies(
     let extract_root = deps::extract_root();
     let jdk_src = deps::jdk_src_zip();
     let mut stats = DepStats {
-        incomplete_classpath: deps::gradle_root(root).is_some()
+        incomplete_classpath: gradle
             && (!authoritative
                 || model.as_ref().is_some_and(|m| {
                     m.modules.iter().any(|module| {
@@ -519,7 +597,11 @@ fn index_dependencies(
     let mut jdk_shard_failed = false;
     let mut jdk_parse_plan: Option<deps::JdkParsePlan> = None;
     let mut jdk_batches: Vec<deps::FileSymbols> = Vec::new();
-    if let Some(src_zip) = jdk_src {
+    let jdk_origin = jdk_src.as_deref().map(classpath::jdk_origin_id);
+    stats.jdk_reused = jdk_origin
+        .as_ref()
+        .is_some_and(|origin| ws.lock().dependency_origin_complete(origin));
+    if let Some(src_zip) = jdk_src.filter(|_| !stats.jdk_reused) {
         match deps::plan_jdk_index(&src_zip, &extract_root) {
             Some(deps::JdkIndexPlan::Cached(batches)) => {
                 if let Some(tx) = progress {
@@ -553,6 +635,10 @@ fn index_dependencies(
     }
 
     while active > 0 || !local_jars.is_empty() || !queue.is_empty() {
+        if !ws.lock().is_current_generation(generation) {
+            queue.clear();
+            local_jars.clear();
+        }
         while active < max_workers {
             if let Some(jar_path) = local_jars.pop_front() {
                 stats.local_jars += 1;
@@ -571,6 +657,10 @@ fn index_dependencies(
                     .and_then(|m| m.artifact_origin(&jar_path))
                     .map(str::to_string)
                     .unwrap_or_else(|| classpath::file_origin_id(&jar_path));
+                if ws.lock().dependency_origin_complete(&origin_id) {
+                    stats.reused_local_jars += 1;
+                    continue;
+                }
                 spawn_local_jar_index_worker(jar_path, origin_id, extract_root.clone(), tx.clone());
                 active += 1;
                 continue;
@@ -579,6 +669,14 @@ fn index_dependencies(
                 break;
             };
             if !seen.insert(coord.clone()) {
+                continue;
+            }
+            stats.coordinates = seen.len();
+            if ws
+                .lock()
+                .dependency_origin_complete(&classpath::maven_origin_id(&coord))
+            {
+                stats.reused_coordinates += 1;
                 continue;
             }
             match if authoritative {
@@ -592,6 +690,9 @@ fn index_dependencies(
                     suppressed.insert(previous.clone());
                     if let Some(files) = indexed_files.remove(&previous) {
                         let mut guard = ws.lock();
+                        if !guard.is_current_generation(generation) {
+                            continue;
+                        }
                         for file in files {
                             guard.index.remove_file(&file.path);
                             stats.files = stats.files.saturating_sub(1);
@@ -652,16 +753,22 @@ fn index_dependencies(
                     }
                     for batch in jdk_batches.drain(..) {
                         let mut guard = ws.lock();
+                        if !guard.is_current_generation(generation) {
+                            continue;
+                        }
                         let symbol_count = batch.symbols.len();
                         stats.symbols += symbol_count;
                         stats.jdk_symbols += symbol_count;
                         stats.jdk_files += 1;
-                        guard.index_dependency_batch(batch);
+                        guard.index_dependency_batch_for_generation(generation, batch);
                         stats.files += 1;
                     }
                     // One revision bump for the whole shard drain: readers recompute once after
                     // the JDK lands instead of churning on ~15k intermediate revisions.
-                    ws.lock().bump_index_revision();
+                    let mut guard = ws.lock();
+                    if guard.is_current_generation(generation) {
+                        guard.bump_index_revision();
+                    }
                 }
             }
             continue;
@@ -691,8 +798,16 @@ fn index_dependencies(
             continue;
         }
         let mut files_for_coord = Vec::new();
+        let local_origin = result
+            .batches
+            .first()
+            .and_then(|batch| batch.origin.as_ref())
+            .map(|origin| origin.origin_id.clone());
         for batch in result.batches {
             let mut guard = ws.lock();
+            if !guard.is_current_generation(generation) {
+                continue;
+            }
             let symbol_count = batch.symbols.len();
             stats.symbols += symbol_count;
             if result.jdk {
@@ -707,12 +822,25 @@ fn index_dependencies(
                     symbols: symbol_count,
                 });
             }
-            guard.index_dependency_batch(batch);
+            guard.index_dependency_batch_for_generation(generation, batch);
             guard.bump_index_revision();
             stats.files += 1;
         }
         if let Some(coord) = result.coord.clone() {
             indexed_files.insert(coord, files_for_coord);
+        }
+        if !result.missing_source {
+            let origin = result
+                .coord
+                .as_ref()
+                .map(classpath::maven_origin_id)
+                .or(local_origin);
+            let mut guard = ws.lock();
+            if guard.is_current_generation(generation) {
+                if let Some(origin) = origin {
+                    guard.complete_dependency_origin(origin);
+                }
+            }
         }
         for dep in result.discovered {
             if seen.len() + queue.len() + active >= MAX_DEPENDENCY_COORDINATES {
@@ -723,13 +851,30 @@ fn index_dependencies(
             }
         }
     }
+    if stats.jdk_files > 0 && !jdk_shard_failed {
+        let mut guard = ws.lock();
+        if guard.is_current_generation(generation) {
+            if let Some(origin) = jdk_origin {
+                guard.complete_dependency_origin(origin);
+            }
+        }
+    }
     stats
 }
 
 /// Warm the index off the request path, reporting progress to the client when it supports work-done
 /// progress (rust-analyzer-style status: "scanning project", then "indexing <coordinate> (n/total)").
 /// Falls back to log messages otherwise. Summaries are always logged.
-async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBuf, progress: bool) {
+async fn index_workspace(
+    client: Client,
+    ws: Arc<Mutex<Workspace>>,
+    root: PathBuf,
+    progress: bool,
+    gradle: bool,
+    generation: u64,
+    force: bool,
+    watches: Arc<Mutex<WatchState>>,
+) {
     // 1. Project sources (fast).
     let scan_ws = ws.clone();
     let scan_root = root.clone();
@@ -751,9 +896,97 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
     };
 
     let scan_start = Instant::now();
-    let count = tokio::task::spawn_blocking(move || scan_ws.lock().scan(&scan_root))
+    if gradle {
+        let registered = watches.lock().registration.is_some();
+        if !registered {
+            register_project_watches(&client, &root, None, &watches).await;
+        }
+    }
+    if !ws.lock().is_current_generation(generation) {
+        if let Some(p) = ongoing {
+            p.finish_with_message("superseded by project changes").await;
+        }
+        return;
+    }
+    let model = if gradle {
+        let root = root.clone();
+        match tokio::task::spawn_blocking(move || classpath::load_snapshot(&root, force)).await {
+            Ok(Ok(model)) => Some(model),
+            result => {
+                tracing::warn!(
+                    ?result,
+                    generation,
+                    "Gradle model refresh failed; scope remains incomplete"
+                );
+                Some(Arc::new(classpath::ProjectSnapshot::new(Vec::new())))
+            }
+        }
+    } else {
+        None
+    };
+    let count = if let Some(model) = &model {
+        let known = ws.lock().source_stamps();
+        let prepared_model = model.clone();
+        let update = tokio::task::spawn_blocking(move || {
+            crate::workspace::prepare_model_sources(&prepared_model, &known)
+        })
+        .await;
+        let Ok(update) = update else {
+            if let Some(p) = ongoing {
+                p.finish_with_message("project source refresh failed").await;
+            }
+            return;
+        };
+        let count = {
+            let mut guard = ws.lock();
+            let count = guard.install_project_update(generation, model.clone(), update);
+            if count.is_some() {
+                classpath::publish_snapshot(&root, model.clone());
+            }
+            count
+        };
+        let Some(count) = count else {
+            if let Some(p) = ongoing {
+                p.finish_with_message("superseded by project changes").await;
+            }
+            return;
+        };
+        if model
+            .modules
+            .iter()
+            .any(|module| !module.source_sets.is_empty())
+        {
+            let cache_model = model.clone();
+            let cache_root = root.clone();
+            let cache_ws = ws.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let current = cache_ws.lock().is_current_generation(generation);
+                if current {
+                    classpath::store_snapshot(&cache_root, &cache_model);
+                }
+            })
+            .await;
+        }
+        register_project_watches(&client, &root, Some(model), &watches).await;
+        count
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let mut guard = scan_ws.lock();
+            if guard.is_current_generation(generation) {
+                guard.scan(&scan_root)
+            } else {
+                0
+            }
+        })
         .await
-        .unwrap_or(0);
+        .unwrap_or(0)
+    };
+    if !ws.lock().is_current_generation(generation) {
+        if let Some(p) = ongoing {
+            p.finish_with_message("superseded by project changes").await;
+        }
+        return;
+    }
     crate::trace::span(
         "workspace.project_scan",
         "workspace",
@@ -761,6 +994,8 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         serde_json::json!({
             "root": root.to_string_lossy(),
             "files": count,
+            "generation": generation,
+            "forcedModel": force,
         }),
     );
     client
@@ -783,8 +1018,9 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
     let index_ws = ws.clone();
     let index_root = root.clone();
     let deps_start = Instant::now();
-    let handle =
-        tokio::task::spawn_blocking(move || index_dependencies(&index_ws, &index_root, Some(&tx)));
+    let handle = tokio::task::spawn_blocking(move || {
+        index_dependencies(&index_ws, &index_root, model, gradle, generation, Some(&tx))
+    });
     while let Some((done, total, label)) = rx.recv().await {
         if let Some(p) = &ongoing {
             let pct = if total == 0 {
@@ -797,19 +1033,29 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         }
     }
     let stats = handle.await.unwrap_or_default();
+    if !ws.lock().is_current_generation(generation) {
+        if let Some(p) = ongoing {
+            p.finish_with_message("superseded by project changes").await;
+        }
+        return;
+    }
     crate::trace::span(
         "deps.index_workspace",
         "deps",
         deps_start,
         serde_json::json!({
             "root": root.to_string_lossy(),
+            "generation": generation,
             "coordinates": stats.coordinates,
             "localJars": stats.local_jars,
+            "reusedCoordinates": stats.reused_coordinates,
+            "reusedLocalJars": stats.reused_local_jars,
             "files": stats.files,
             "symbols": stats.symbols,
             "failed": stats.failed,
             "missingSources": stats.missing_sources,
             "jdkFiles": stats.jdk_files,
+            "jdkReused": stats.jdk_reused,
             "jdkSymbols": stats.jdk_symbols,
             "localStubFiles": stats.local_stub_files,
             "localStubSymbols": stats.local_stub_symbols,
@@ -822,6 +1068,8 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
             ", including {} JDK files ({} symbols)",
             stats.jdk_files, stats.jdk_symbols
         )
+    } else if stats.jdk_reused {
+        ", reusing indexed JDK sources".to_string()
     } else {
         String::new()
     };
@@ -834,7 +1082,7 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         String::new()
     };
     let summary = format!(
-        "ktlsp indexed {} library files ({} symbols) from {} dependencies{}{} ({} failed, {} missing sources, {} shadowed, {} duplicate skipped)",
+        "ktlsp indexed {} library files ({} symbols) from {} dependencies{}{} ({} failed, {} missing sources, {} shadowed, {} duplicate skipped, {} dependencies and {} local jars reused)",
         stats.files,
         stats.symbols,
         stats.coordinates,
@@ -843,20 +1091,41 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         stats.failed,
         stats.missing_sources,
         stats.shadowed,
-        stats.skipped
+        stats.skipped,
+        stats.reused_coordinates,
+        stats.reused_local_jars,
     );
-    {
+    let accepted = {
         let mut guard = ws.lock();
-        guard.set_library_index_complete(
+        guard.finish_analysis_generation(
+            generation,
             stats.failed == 0 && stats.missing_sources == 0 && !stats.incomplete_classpath,
-        );
-        guard.set_jdk_index_complete(stats.jdk_files > 0);
+            stats.jdk_files > 0 || stats.jdk_reused,
+        )
+    };
+    if !accepted {
+        if let Some(p) = ongoing {
+            p.finish_with_message("superseded by project changes").await;
+        }
+        return;
     }
     // Open buffers may have received conservative diagnostics before dependency/JDK indexing
     // completed. Republish them now that the library completeness facts and durable symbols are in.
     let open_keys = { ws.lock().open_doc_keys() };
     for key in open_keys {
+        if !ws.lock().is_current_generation(generation) {
+            if let Some(p) = ongoing {
+                p.finish_with_message("superseded by project changes").await;
+            }
+            return;
+        }
         publish_diagnostics(&ws, &client, &key).await;
+    }
+    if !ws.lock().is_current_generation(generation) {
+        if let Some(p) = ongoing {
+            p.finish_with_message("superseded by project changes").await;
+        }
+        return;
     }
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {
@@ -866,6 +1135,189 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         ))
         .await;
     }
+}
+
+fn project_watchers(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    relative: bool,
+) -> Vec<FileSystemWatcher> {
+    use std::collections::BTreeSet;
+    let mut patterns = BTreeSet::from([
+        (
+            crate::paths::file_key(root),
+            "**/*.{gradle,gradle.kts,toml,jar}".to_string(),
+        ),
+        (
+            crate::paths::file_key(root),
+            "**/{gradle.properties,gradle-wrapper.properties}".to_string(),
+        ),
+    ]);
+    if let Some(model) = model {
+        for module in &model.modules {
+            for source in &module.source_sets {
+                for directory in &source.source_roots {
+                    patterns.insert((
+                        crate::paths::file_key(directory),
+                        "**/*.{kt,kts,java}".to_string(),
+                    ));
+                }
+                for directory in &source.output_roots {
+                    patterns.insert((crate::paths::file_key(directory), "**/*".to_string()));
+                }
+            }
+        }
+        for jar in model.local_jars() {
+            if let (Some(parent), Some(name)) =
+                (jar.parent(), jar.file_name().and_then(|name| name.to_str()))
+            {
+                patterns.insert((crate::paths::file_key(parent), name.to_string()));
+            }
+        }
+    }
+    patterns
+        .into_iter()
+        .filter_map(|(directory, pattern)| {
+            let requested = Path::new(&directory);
+            let mut base = requested;
+            while !base.is_dir() {
+                base = base.parent()?;
+                // A not-yet-created model directory must not turn into a drive-wide watch.
+                if base.parent().is_none() {
+                    return None;
+                }
+            }
+            let prefix = crate::paths::file_key(requested.strip_prefix(base).ok()?);
+            let pattern = if prefix.is_empty() {
+                pattern
+            } else {
+                format!("{}/{pattern}", glob_literal(&prefix))
+            };
+            let directory = crate::paths::file_key(base);
+            let glob_pattern = if relative {
+                GlobPattern::Relative(RelativePattern {
+                    base_uri: OneOf::Right(key_to_uri(&directory)?),
+                    pattern,
+                })
+            } else {
+                GlobPattern::String(format!(
+                    "{}/{}",
+                    glob_literal(directory.trim_end_matches('/')),
+                    pattern
+                ))
+            };
+            Some(FileSystemWatcher {
+                glob_pattern,
+                kind: None,
+            })
+        })
+        .collect()
+}
+
+fn glob_literal(text: &str) -> String {
+    let mut literal = String::new();
+    for ch in text.chars() {
+        match ch {
+            '*' | '?' | '[' | ']' | '{' | '}' | '\\' => {
+                literal.push('\\');
+                literal.push(ch);
+            }
+            _ => literal.push(ch),
+        }
+    }
+    literal
+}
+
+async fn register_project_watches(
+    client: &Client,
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    state: &Arc<Mutex<WatchState>>,
+) {
+    let (registration, relative) = {
+        let mut state = state.lock();
+        if !state.dynamic {
+            return;
+        }
+        state.sequence += 1;
+        (
+            format!("ktlsp/project-files/{}", state.sequence),
+            state.relative,
+        )
+    };
+    let options = DidChangeWatchedFilesRegistrationOptions {
+        watchers: project_watchers(root, model, relative),
+    };
+    let result = client
+        .register_capability(vec![Registration {
+            id: registration.clone(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(serde_json::to_value(options).unwrap()),
+        }])
+        .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "client rejected Gradle file watches; explicit watched-file notifications remain supported");
+        return;
+    }
+    let previous = state.lock().registration.replace(registration);
+    if let Some(previous) = previous {
+        let _ = client
+            .unregister_capability(vec![Unregistration {
+                id: previous,
+                method: "workspace/didChangeWatchedFiles".to_string(),
+            }])
+            .await;
+    }
+}
+
+/// `Some(force)` for relevant events; source-only saves reuse the published classpath.
+fn project_change(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    key: &str,
+) -> Option<bool> {
+    let file = Path::new(key);
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.ends_with(".gradle")
+        || name.ends_with(".gradle.kts")
+        || name.ends_with(".toml")
+        || matches!(name, "gradle.properties" | "gradle-wrapper.properties")
+    {
+        return Some(true);
+    }
+    if let Some(model) = model {
+        if model
+            .modules
+            .iter()
+            .flat_map(|module| &module.source_sets)
+            .flat_map(|source| &source.output_roots)
+            .any(|output| path_is_under(key, &crate::paths::file_key(output)))
+        {
+            return Some(true);
+        }
+        if model.artifact_origin(file).is_some() {
+            return Some(true);
+        }
+        if model.file_origin(file).is_some()
+            && crate::language::SourceLanguage::for_project_path(file).is_some()
+        {
+            return Some(false);
+        }
+    }
+    if name.ends_with(".jar") && path_is_under(key, &crate::paths::file_key(root)) {
+        return Some(true);
+    }
+    None
+}
+
+fn path_is_under(key: &str, root: &str) -> bool {
+    key == root
+        || key
+            .strip_prefix(root.trim_end_matches('/'))
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// `file://` URI -> canonical key (the file path string). `None` for non-file URIs.
@@ -1006,43 +1458,6 @@ fn kotlin_import_fqn_for_identifier(text: &str, offset: usize) -> Option<String>
         .map(|import| import.path)
 }
 
-/// Background indexing may resolve an unpublished or changed Gradle model.
-fn resolve_local_jars_for_file(root: &Path, file: &Path) -> Vec<PathBuf> {
-    if let Ok(model) = crate::classpath::resolve_snapshot(root) {
-        if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
-            return model.local_jars_for_file(file).unwrap_or_default();
-        }
-    }
-    let Some(module) = crate::daemon::module_path_for(root, file) else {
-        let build_file_jars = crate::classpath::local_jars_from_build_files(root);
-        return if build_file_jars.is_empty() {
-            crate::classpath::local_jars_from_classpath(root)
-        } else {
-            build_file_jars
-        };
-    };
-    let module_dir = if module.trim_matches(':').is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(module.trim_matches(':').replace(':', "/"))
-    };
-    let build_file_jars = crate::classpath::local_jars_from_build_files(&module_dir);
-    if !build_file_jars.is_empty() {
-        return build_file_jars;
-    }
-    let module_jars = crate::classpath::local_jars_from_module_classpath(root, &module);
-    if module_jars.is_empty() {
-        let build_file_jars = crate::classpath::local_jars_from_build_files(root);
-        if build_file_jars.is_empty() {
-            crate::classpath::local_jars_from_classpath(root)
-        } else {
-            build_file_jars
-        }
-    } else {
-        module_jars
-    }
-}
-
 fn diagnostic_scope_from(opts: &Option<serde_json::Value>) -> DiagnosticScope {
     match opts
         .as_ref()
@@ -1121,6 +1536,27 @@ impl LanguageServer for Backend {
             .and_then(|w| w.work_done_progress)
             .unwrap_or(false);
         *self.progress_supported.lock() = progress;
+        let watches = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref());
+        {
+            let mut state = self.watches.lock();
+            state.dynamic = watches
+                .and_then(|watches| watches.dynamic_registration)
+                .unwrap_or(false);
+            state.relative = watches
+                .and_then(|watches| watches.relative_pattern_support)
+                .unwrap_or(false)
+                // Neovim on Windows compares decoded backslashes with normalized event paths.
+                // shortcut: string watches cover workspace folders; external roots need a client fix.
+                && !(cfg!(windows)
+                    && params
+                        .client_info
+                        .as_ref()
+                        .is_some_and(|client| client.name == "Neovim"));
+        }
 
         *self.diagnostic_scope.lock() = diagnostic_scope_from(&params.initialization_options);
         let formatter = formatter_from(&params.initialization_options);
@@ -1137,6 +1573,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncOptions {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..Default::default()
                     },
                 )),
@@ -1216,15 +1653,7 @@ impl LanguageServer for Backend {
 
         // Index the workspace once, off the request path. Early goto requests fall back to
         // local-scope resolution until the index warms up.
-        let root = self.root.lock().clone();
-        if let Some(root) = root {
-            let ws = self.ws.clone();
-            let client = self.client.clone();
-            let progress = *self.progress_supported.lock();
-            tokio::spawn(async move {
-                index_workspace(client, ws, root, progress).await;
-            });
-        }
+        self.schedule_project_refresh(false, Duration::ZERO);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1256,6 +1685,52 @@ impl LanguageServer for Backend {
             self.ws.lock().close(&key);
             self.doc_versions.lock().remove(&key);
             publish_diagnostics(&self.ws, &self.client, &key).await;
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        if !*self.gradle_project.lock() {
+            return;
+        }
+        let Some(key) = uri_to_key(&params.text_document.uri) else {
+            return;
+        };
+        let Some(root) = self.root.lock().clone() else {
+            return;
+        };
+        let model = self.ws.lock().project_snapshot();
+        if let Some(force) = project_change(&root, model.as_deref(), &key) {
+            self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if !*self.gradle_project.lock() {
+            return;
+        }
+        let Some(root) = self.root.lock().clone() else {
+            return;
+        };
+        let model = self.ws.lock().project_snapshot();
+        let force = params
+            .changes
+            .iter()
+            .filter_map(|change| uri_to_key(&change.uri))
+            .filter_map(|key| project_change(&root, model.as_deref(), &key))
+            .reduce(|left, right| left || right);
+        if let Some(force) = force {
+            self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        let options = Some(params.settings);
+        *self.diagnostic_scope.lock() = diagnostic_scope_from(&options);
+        if let Some(formatter) = formatter_from(&options) {
+            *self.formatter.lock() = Some(formatter);
+        }
+        if *self.gradle_project.lock() {
+            self.schedule_project_refresh(true, PROJECT_REFRESH_DEBOUNCE);
         }
     }
 
@@ -1357,7 +1832,10 @@ impl LanguageServer for Backend {
                 let seed_text = text.clone();
                 let seed_key = key.clone();
                 let gradle_project = *self.gradle_project.lock();
-                let model = classpath::snapshot(&root);
+                let (generation, model) = {
+                    let ws = self.ws.lock();
+                    (ws.analysis_generation(), ws.project_snapshot())
+                };
                 let seed = tokio::task::spawn_blocking(move || {
                     resolve_import_source_batches(
                         &root,
@@ -1387,17 +1865,19 @@ impl LanguageServer for Backend {
                     .unwrap_or_default();
                 if files > 0 {
                     if let Some(mut ws) = self.ws.try_lock() {
-                        for batch in batches {
-                            ws.index_dependency_batch(batch);
+                        if ws.is_current_generation(generation) {
+                            for batch in batches {
+                                ws.index_dependency_batch_for_generation(generation, batch);
+                            }
+                            ws.bump_index_revision();
+                            let defs = ws.goto_definition(&key, offset);
+                            locations = defs
+                                .iter()
+                                .filter_map(|d| def_to_location(&ws, d))
+                                .collect::<Vec<_>>();
                         }
-                        ws.bump_index_revision();
-                        let defs = ws.goto_definition(&key, offset);
-                        locations = defs
-                            .iter()
-                            .filter_map(|d| def_to_location(&ws, d))
-                            .collect::<Vec<_>>();
                     }
-                    if locations.is_empty() {
+                    if locations.is_empty() && self.ws.lock().is_current_generation(generation) {
                         locations = seeded_locations;
                     }
                 }
@@ -1902,7 +2382,10 @@ impl LanguageServer for Backend {
                 let seed_key = key.clone();
                 let seed_text = text.clone();
                 let gradle_project = *self.gradle_project.lock();
-                let model = classpath::snapshot(&root);
+                let (generation, model) = {
+                    let ws = self.ws.lock();
+                    (ws.analysis_generation(), ws.project_snapshot())
+                };
                 let (_, batches) = tokio::task::spawn_blocking(move || {
                     resolve_import_source_batches(
                         &root,
@@ -1917,8 +2400,11 @@ impl LanguageServer for Backend {
                 .unwrap_or_else(|_| (None, Vec::new()));
                 if !batches.is_empty() {
                     let mut ws = self.ws.lock();
+                    if !ws.is_current_generation(generation) {
+                        return Ok(None);
+                    }
                     for batch in batches {
-                        ws.index_dependency_batch(batch);
+                        ws.index_dependency_batch_for_generation(generation, batch);
                     }
                     ws.bump_index_revision();
                     if let Some(query) = ws.resolved_symbol_query(&key, offset) {
@@ -3088,6 +3574,328 @@ mod tests {
             .parse::<Uri>()
             .unwrap();
         assert_eq!(uri_to_key(&uri).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn watched_project_changes_cover_actual_custom_inputs_and_outputs() {
+        let temp = std::env::temp_dir().join(format!("ktlsp_watch_inputs_{}", std::process::id()));
+        let root_key = crate::paths::file_key(&temp.join("workspace"));
+        let external = crate::paths::file_key(&temp.join("external"));
+        for path in [
+            &root_key,
+            &format!("{external}/custom-generated"),
+            &format!("{external}/classes"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let root = Path::new(&root_key);
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{root_key}/modules/editing\nSOURCE\tmain\t{external}/custom-generated\nOUTPUT\tmain\t{external}/classes\nSCP\tmain\t{external}/vendor.jar\nEND\t:app\n")));
+        assert_eq!(
+            project_change(
+                root,
+                Some(&model),
+                &format!("{external}/custom-generated/Generated.java")
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            project_change(root, Some(&model), &format!("{external}/classes/New.class")),
+            Some(true)
+        );
+        assert_eq!(
+            project_change(root, Some(&model), &format!("{external}/vendor.jar")),
+            Some(true)
+        );
+        assert_eq!(
+            project_change(root, Some(&model), &format!("{root_key}/libs/new.jar")),
+            Some(true)
+        );
+        assert_eq!(
+            project_change(
+                root,
+                Some(&model),
+                &format!("{external}/classes-other/Unrelated.class")
+            ),
+            None
+        );
+        assert_eq!(
+            project_change(
+                root,
+                Some(&model),
+                &format!("{root_key}/testData/Decoy.java")
+            ),
+            None
+        );
+        let watches = project_watchers(root, Some(&model), true);
+        assert!(watches
+            .iter()
+            .all(|watch| matches!(watch.glob_pattern, GlobPattern::Relative(_))));
+        for required in [
+            format!("{external}/custom-generated"),
+            format!("{external}/classes"),
+            external,
+        ] {
+            assert!(
+                watches.iter().any(|watch| match &watch.glob_pattern {
+                    GlobPattern::Relative(pattern) => match &pattern.base_uri {
+                        OneOf::Right(uri) => uri_to_key(uri).as_deref() == Some(required.as_str()),
+                        _ => false,
+                    },
+                    _ => false,
+                }),
+                "no automatic watch for {required}"
+            );
+        }
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn automatic_watches_cover_new_roots_from_a_bounded_existing_ancestor() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_watch_new_root_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let generated = root.join("future [exact]/generated");
+        let output = root.join("future [exact]/classes");
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nEND\t:app\n",
+            root.display(),
+            generated.display(),
+            output.display()
+        )));
+        let watches = project_watchers(&root, Some(&model), true);
+        for required in [
+            r"future \[exact\]/generated/**/*.{kt,kts,java}",
+            r"future \[exact\]/classes/**/*",
+        ] {
+            assert!(
+                watches.iter().any(|watch| match &watch.glob_pattern {
+                    GlobPattern::Relative(pattern) =>
+                        pattern.pattern == required
+                            && match &pattern.base_uri {
+                                OneOf::Right(uri) =>
+                                    uri_to_key(uri).as_deref()
+                                        == Some(crate::paths::file_key(&root).as_str()),
+                                _ => false,
+                            },
+                    _ => false,
+                }),
+                "missing bounded watch for {required}"
+            );
+        }
+        // A missing model root directly below the filesystem root must never watch the drive.
+        let drive = root.ancestors().last().unwrap();
+        let absent = drive.join(format!("ktlsp-never-created-{}", std::process::id()));
+        assert!(!absent.exists());
+        assert!(project_watchers(&absent, None, true).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_neovim_registers_absolute_watches_without_changing_other_clients() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_neovim_watch_protocol_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, relative) in [("Neovim", false), ("Visual Studio Code", true)] {
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            backend
+                .initialize(InitializeParams {
+                    client_info: Some(ClientInfo {
+                        name: name.to_string(),
+                        version: None,
+                    }),
+                    capabilities: ClientCapabilities {
+                        workspace: Some(WorkspaceClientCapabilities {
+                            did_change_watched_files: Some(
+                                DidChangeWatchedFilesClientCapabilities {
+                                    dynamic_registration: Some(true),
+                                    relative_pattern_support: Some(true),
+                                },
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Uri::from_file_path(&root).unwrap(),
+                        name: "watch-protocol".to_string(),
+                    }]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let state = backend.watches.lock();
+            assert!(state.dynamic);
+            assert_eq!(state.relative, relative, "{name}");
+            let watchers = project_watchers(&root, None, state.relative);
+            assert!(!watchers.is_empty());
+            assert!(watchers.iter().all(|watcher| {
+                matches!(watcher.glob_pattern, GlobPattern::Relative(_)) == relative
+            }));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_scan_resolves_closed_java_and_kotlin_before_refresh_debounce() {
+        let root = std::env::temp_dir().join(format!("ktlsp_initial_scan_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Helper.java"),
+            "package app;\npublic class Helper {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("KotlinHelper.kt"),
+            "package app\nclass KotlinHelper\n",
+        )
+        .unwrap();
+        let text = "package app;\nclass Main { Helper helper; KotlinHelper kotlin; }";
+        let key = crate::paths::file_key(&root.join("Main.java"));
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Uri::from_file_path(&root).unwrap(),
+                    name: "initial-scan".to_string(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend.ws.lock().open(key.clone(), text.to_string());
+        backend.initialized(InitializedParams {}).await;
+        let result = tokio::time::timeout(PROJECT_REFRESH_DEBOUNCE, async {
+            loop {
+                let resolved = ["Helper", "KotlinHelper"].iter().all(|name| {
+                    backend
+                        .ws
+                        .lock()
+                        .goto_definition(&key, text.find(name).unwrap())
+                        .iter()
+                        .any(|definition| {
+                            Path::new(&definition.file)
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                == Some(*name)
+                        })
+                });
+                if resolved {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let (generation, java_entries, kotlin_entries) = {
+            let ws = backend.ws.lock();
+            (
+                ws.analysis_generation(),
+                ws.index.lookup_type("Helper").len(),
+                ws.index.lookup_type("KotlinHelper").len(),
+            )
+        };
+        assert!(
+            result.is_ok(),
+            "initial source definitions were unavailable before debounce; gradle={}, generation={}, Helper entries={}, KotlinHelper entries={}",
+            *backend.gradle_project.lock(),
+            generation,
+            java_entries,
+            kotlin_entries
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn watched_file_bursts_coalesce_and_active_refreshes_remain_singleflight() {
+        let root = gradle_import_request_fixture("refresh-scheduler");
+        let dump = format!(
+            "PROJECT\t:app\t{}\nCP\t{}\nEND\t:app\n",
+            root.display(),
+            root.join("unbuilt.jar").display()
+        );
+        std::fs::write(root.join("dump.txt"), dump).unwrap();
+        let wrapper = root.join(if cfg!(windows) {
+            "gradlew.bat"
+        } else {
+            "gradlew"
+        });
+        std::fs::write(&wrapper, if cfg!(windows) {
+            "@echo off\r\nif exist \"%~dp0running\" echo overlap> \"%~dp0overlap\"\r\necho active> \"%~dp0running\"\r\necho invoked>> \"%~dp0invocations\"\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 600\" >nul\r\ntype \"%~dp0dump.txt\"\r\ndel \"%~dp0running\"\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n[ ! -e running ] || touch overlap\ntouch running\necho invoked >> invocations\nsleep 0.6\ncat dump.txt\nrm running\n"
+        }).unwrap();
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        // This scheduler test does not inspect outgoing notifications. Close their
+        // receiver so log messages cannot block on an undrained client channel.
+        drop(socket);
+        let backend = service.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Uri::from_file_path(&root).unwrap(),
+                    name: "refresh".to_string(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let event = || DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(
+                Uri::from_file_path(root.join("build.gradle.kts")).unwrap(),
+                FileChangeType::CHANGED,
+            )],
+        };
+        for _ in 0..5 {
+            backend.did_change_watched_files(event()).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while backend.refresh.lock().running && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!backend.refresh.lock().running);
+        assert_eq!(
+            std::fs::read_to_string(root.join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        backend.did_change_watched_files(event()).await;
+        while !root.join("running").exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(root.join("running").exists());
+        let superseded = backend.ws.lock().analysis_generation();
+        backend.did_change_watched_files(event()).await;
+        while backend.refresh.lock().running && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!backend.refresh.lock().running);
+        assert_eq!(
+            std::fs::read_to_string(root.join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert!(!root.join("overlap").exists());
+        let mut ws = backend.ws.lock();
+        assert_eq!(ws.analysis_generation(), superseded + 1);
+        assert!(!ws.finish_analysis_generation(superseded, true, true));
+        assert!(
+            !ws.project_snapshot().unwrap().modules.is_empty(),
+            "latest model was never published"
+        );
+        drop(ws);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

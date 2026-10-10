@@ -21,6 +21,7 @@ use crate::fxhash::FxHashMap;
 use tree_sitter::{Node, Tree};
 
 use crate::index::{Entry, InferenceIndex};
+use crate::members::{self, CallArguments, MemberUse};
 use crate::parser::{
     child_of_kind, first_ident, imports_of, name_field, node_text, package_of, Import,
 };
@@ -137,8 +138,8 @@ fn infer_depth_with<R: ChildInfer>(
         return Type::Unknown;
     }
     match node.kind() {
-        "string_literal" => resolve_type_name(index, "String", ctx, false),
-        "character_literal" => resolve_type_name(index, "Char", ctx, false),
+        "string_literal" => intrinsic_type(index, "String"),
+        "character_literal" => intrinsic_type(index, "Char"),
         "number_literal" => {
             let t = node_text(node, src);
             let name = if t.ends_with('L') || t.ends_with('l') {
@@ -146,7 +147,7 @@ fn infer_depth_with<R: ChildInfer>(
             } else {
                 "Int"
             };
-            resolve_type_name(index, name, ctx, false)
+            intrinsic_type(index, name)
         }
         "float_literal" => {
             let t = node_text(node, src);
@@ -155,10 +156,10 @@ fn infer_depth_with<R: ChildInfer>(
             } else {
                 "Double"
             };
-            resolve_type_name(index, name, ctx, false)
+            intrinsic_type(index, name)
         }
         // Defensive: should the grammar ever expose a boolean_literal kind.
-        "boolean_literal" => resolve_type_name(index, "Boolean", ctx, false),
+        "boolean_literal" => intrinsic_type(index, "Boolean"),
         "identifier" => infer_identifier(index, node, src, ctx, depth, child_infer),
         "this_expression" => {
             if let Some(t) = lambda_receiver_type(index, node, src, ctx, depth, child_infer) {
@@ -1165,7 +1166,7 @@ fn infer_identifier(
 ) -> Type {
     let name = node_text(ident, src);
     if name == "true" || name == "false" {
-        return resolve_type_name(index, "Boolean", ctx, false);
+        return intrinsic_type(index, "Boolean");
     }
     // A lambda parameter (implicit `it` OR a named param) of a scope/collection call takes the
     // receiver's (or element's) type.
@@ -1549,41 +1550,20 @@ fn member_call_entries<'a>(
     name: &str,
     ctx: &FileCtx,
 ) -> Vec<&'a Entry> {
-    let mut members: Vec<&Entry> = Vec::new();
-    let mut extensions: Vec<&Entry> = Vec::new();
-    let _ = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
-        let Some(cur) = receiver_root_key(index, current) else {
-            return ControlFlow::Continue(());
-        };
-        for e in index.members_of(&cur) {
-            if let Some(p) = current.package() {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            if e.sym.name == name && e.sym.kind == SymbolKind::Function {
-                members.push(e);
-            }
-        }
-        for e in index.extensions_for(&cur) {
-            if e.sym.name == name
-                && e.sym.kind == SymbolKind::Function
-                && extension_is_visible(e, ctx)
-            {
-                extensions.push(e);
-            }
-        }
-        for e in generic_receiver_extensions(index, name, ctx) {
-            if e.sym.kind == SymbolKind::Function {
-                extensions.push(e);
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    if !members.is_empty() {
-        members
+    let candidates = members::candidates(index, recv_ty, name, ctx);
+    let own: Vec<_> = candidates
+        .members
+        .into_iter()
+        .filter(|entry| entry.sym.kind == SymbolKind::Function)
+        .collect();
+    if !own.is_empty() {
+        own
     } else {
-        extensions
+        candidates
+            .extensions
+            .into_iter()
+            .filter(|entry| entry.sym.kind == SymbolKind::Function)
+            .collect()
     }
 }
 
@@ -1599,7 +1579,11 @@ fn synth_arg_types(
 ) -> Vec<Type> {
     let mut out = Vec::new();
     let Some(va) = child_of_kind(call, "value_arguments") else {
-        return out;
+        return call
+            .named_child(0)
+            .filter(|child| child.kind() == "call_expression" && has_trailing_lambda(call))
+            .map(|inner| synth_arg_types(index, inner, src, ctx, depth, child_infer))
+            .unwrap_or(out);
     };
     let mut cursor = va.walk();
     for arg in va.named_children(&mut cursor) {
@@ -1616,6 +1600,50 @@ fn synth_arg_types(
         out.push(t);
     }
     out
+}
+
+/// Kotlin syntax adapter for the normalized shared member-use query. Argument expressions are
+/// inferred bottom-up by inference callers; direct resolution can use the same facts here.
+pub fn call_arguments(
+    index: &dyn InferenceIndex,
+    call: Node,
+    src: &str,
+    ctx: &FileCtx,
+) -> CallArguments {
+    let mut child_infer = LocalChildInfer;
+    let types = synth_arg_types(index, call, src, ctx, 0, &mut child_infer);
+    normalized_call_arguments(call, types)
+}
+
+fn normalized_call_arguments(call: Node, types: Vec<Type>) -> CallArguments {
+    let mut arguments = call;
+    while child_of_kind(arguments, "value_arguments").is_none() && has_trailing_lambda(arguments) {
+        let Some(inner) = arguments
+            .named_child(0)
+            .filter(|child| child.kind() == "call_expression")
+        else {
+            break;
+        };
+        arguments = inner;
+    }
+    let named = child_of_kind(arguments, "value_arguments").is_some_and(|args| {
+        let mut cursor = args.walk();
+        let named = args.named_children(&mut cursor).any(|arg| {
+            arg.kind() == "value_argument"
+                && arg.named_child_count() > 1
+                && arg
+                    .named_child(0)
+                    .is_some_and(|first| first.kind() == "identifier")
+        });
+        named
+    });
+    CallArguments {
+        count: (!call.has_error()).then(|| value_arg_count(call)),
+        // Names can reorder parameters. Without a normalized name map, positional filtering is
+        // not evidence that a named call is inapplicable.
+        types: if named { Vec::new() } else { types },
+        trailing_lambda: has_trailing_lambda(call),
+    }
 }
 
 fn select_trailing_lambda_receiver_type(
@@ -1648,31 +1676,10 @@ fn select_trailing_lambda_receiver_type(
     if group.is_empty() {
         return None;
     }
-    let arity_compatible: Vec<(&Entry, TypeRef)> = group
-        .iter()
-        .filter(|(entry, _)| call_accepts_arg_count(index, entry, arg_count, ctx))
-        .cloned()
-        .collect();
-    if !arity_compatible.is_empty() {
-        group = arity_compatible;
-    }
-    let consistent: Vec<(&Entry, TypeRef)> = group
-        .iter()
-        .filter(|(entry, _)| {
-            args_consistent(
-                index,
-                &entry.sym.params,
-                &entry.sym.type_params,
-                &arg_types,
-                ctx,
-                depth,
-            )
-        })
-        .cloned()
-        .collect();
-    if !consistent.is_empty() {
-        group = consistent;
-    }
+    let args = normalized_call_arguments(call, arg_types.clone());
+    group.retain(|(entry, _)| {
+        members::function_accepts(index, recv_ty.unwrap_or(&Type::Unknown), entry, &args, ctx)
+    });
     let mut resolved = Vec::with_capacity(group.len());
     for (entry, receiver_ref) in group {
         resolved.push(resolve_trailing_lambda_receiver_candidate(
@@ -1872,23 +1879,18 @@ fn value_arg_count(call: Node) -> usize {
             .named_children(&mut cursor)
             .filter(|x| x.kind() == "value_argument")
             .count();
+    } else if has_trailing_lambda(call) {
+        if let Some(inner) = call
+            .named_child(0)
+            .filter(|child| child.kind() == "call_expression")
+        {
+            n += value_arg_count(inner);
+        }
     }
     if child_of_kind(call, "annotated_lambda").is_some() {
         n += 1;
     }
     n
-}
-
-fn call_accepts_arg_count(
-    index: &dyn InferenceIndex,
-    entry: &Entry,
-    arg_count: usize,
-    ctx: &FileCtx,
-) -> bool {
-    let min = trailing_lambda_min_arity(index, entry, ctx)
-        .unwrap_or_else(|| entry.sym.min_arity.unwrap_or(0)) as usize;
-    let max = entry.sym.arity.unwrap_or(0) as usize;
-    (min..=max).contains(&arg_count)
 }
 
 /// A standalone `recv.prop` navigation (no call): infer recv, then the type of property `prop`.
@@ -1919,14 +1921,8 @@ fn infer_navigation(
     )
 }
 
-/// The type of member `name` accessed on receiver type `recv_ty`. Resolves overloads as a Kotlin-style
-/// **priority partition**: collect all matching candidates across the supertype closure tagged as
-/// members vs extensions; the **first non-empty group wins** (members before extensions, even over a
-/// more specific extension). For a function call, `arg_count` then prefers exact-arity candidates when
-/// any exist (never emptying the set). Finally, resolve each surviving candidate's type and return it
-/// only if they **all agree** — otherwise [`Type::Unknown`] (ambiguous → silent, never a wrong pick).
-/// `want_function` selects a function's `return_type`, else a property's `value_type`. Members are
-/// package-filtered when the receiver package is known.
+/// Infer the result of the same call/value member selection used by navigation and references.
+/// Every surviving candidate must agree; missing callable signatures retain `Unknown`.
 fn member_type(
     index: &dyn InferenceIndex,
     recv_ty: &Type,
@@ -1943,80 +1939,29 @@ fn member_type(
     let Some(_) = recv_ty.name() else {
         return Type::Unknown;
     };
-    let mut members: Vec<&crate::index::Entry> = Vec::new();
-    let mut extensions: Vec<&crate::index::Entry> = Vec::new();
-    let _ = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
-        let Some(cur) = receiver_root_key(index, current) else {
-            return ControlFlow::Continue(());
-        };
-        let cur_pkg = current.package();
-        for e in index.members_of(&cur) {
-            if let Some(p) = cur_pkg {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            if e.sym.name == name && member_type_ref(e, want_function).is_some() {
-                members.push(e);
-            }
-        }
-        for e in index.extensions_for(&cur) {
-            if e.sym.name == name && member_type_ref(e, want_function).is_some() {
-                extensions.push(e);
-            }
-        }
-        for e in generic_receiver_extensions(index, name, ctx) {
-            if member_type_ref(e, want_function).is_some() {
-                extensions.push(e);
-            }
-        }
-        ControlFlow::Continue(())
-    });
-
-    // Priority partition: members before extensions (first non-empty group wins).
-    let mut group = if !members.is_empty() {
-        members
+    let usage = if want_function {
+        let types = arg_types.unwrap_or_default().to_vec();
+        MemberUse::Call(
+            call.map(|call| normalized_call_arguments(call, types.clone()))
+                .unwrap_or(CallArguments {
+                    count: arg_count,
+                    types,
+                    trailing_lambda: false,
+                }),
+        )
     } else {
-        extensions
+        MemberUse::Value
     };
-    if group.is_empty() {
+    let group = members::candidates(index, recv_ty, name, ctx).select(index, recv_ty, &usage, ctx);
+    if group.applicability == members::Applicability::Rejected || group.entries.is_empty() {
         return Type::Unknown;
-    }
-    // Arity disambiguation (function calls only): prefer exact-arity candidates when any exist; never
-    // empty the set (a vararg/default mismatch falls back to the whole group rather than dropping all).
-    if want_function {
-        if let Some(n) = arg_count {
-            let exact: Vec<&crate::index::Entry> = group
-                .iter()
-                .copied()
-                .filter(|e| e.sym.arity == Some(n as u8))
-                .collect();
-            if !exact.is_empty() {
-                group = exact;
-            }
-        }
-        // Argument-type consistency: keep candidates whose parameter types are each consistent with
-        // the corresponding argument (gradual — an Unknown arg/param or a type-variable param never
-        // eliminates a candidate; a subtype matches). Never empties the set (fall back if it would).
-        if let Some(args) = arg_types {
-            let consistent: Vec<&crate::index::Entry> = group
-                .iter()
-                .copied()
-                .filter(|e| {
-                    args_consistent(index, &e.sym.params, &e.sym.type_params, args, ctx, depth)
-                })
-                .collect();
-            if !consistent.is_empty() {
-                group = consistent;
-            }
-        }
     }
     // Resolve each candidate's type; agree -> that type, disagree -> Unknown (ambiguous, stay silent).
     let mut result: Option<Type> = None;
-    for e in group {
+    for e in group.entries {
         let tr = match member_type_ref(e, want_function) {
             Some(tr) => tr,
-            None => continue,
+            None => return Type::Unknown,
         };
         let t = resolve_member_type_with_subst(
             index,
@@ -2100,49 +2045,6 @@ fn member_type_parameters(index: &dyn InferenceIndex, entry: &Entry) -> HashSet<
     params
 }
 
-fn generic_receiver_extensions<'a>(
-    index: &'a dyn InferenceIndex,
-    name: &str,
-    ctx: &FileCtx,
-) -> Vec<&'a Entry> {
-    index
-        .lookup_by_name(name)
-        .iter()
-        .filter(|e| e.sym.container.is_none())
-        .filter(|e| {
-            e.sym
-                .ext_receiver
-                .as_deref()
-                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
-        })
-        .filter(|e| extension_is_visible(e, ctx))
-        .collect()
-}
-
-fn extension_is_visible(e: &Entry, ctx: &FileCtx) -> bool {
-    if e.sym.package == ctx.package {
-        return true;
-    }
-    if ctx.imports.iter().any(|imp| {
-        !imp.wildcard
-            && imp.alias.is_none()
-            && imp.simple_name() == e.sym.name
-            && imp.package() == e.sym.package
-    }) {
-        return true;
-    }
-    ctx.imports
-        .iter()
-        .filter(|imp| imp.wildcard)
-        .map(|imp| imp.package())
-        .chain(
-            resolve::DEFAULT_IMPORT_PACKAGES
-                .iter()
-                .map(|pkg| (*pkg).to_string()),
-        )
-        .any(|pkg| pkg == e.sym.package)
-}
-
 /// Whether a candidate's parameter types are each consistent with the corresponding argument type.
 /// Gradual: an `Unknown` argument or param, or a param that is one of the candidate's own type
 /// variables, never eliminates the candidate; a known subtype is consistent. Only the positional value
@@ -2180,7 +2082,7 @@ fn args_consistent(
             continue;
         }
         let pt = resolve_type_ref(index, p, ctx, depth + 1);
-        if !consistent(index, a, &pt) {
+        if !types_consistent(index, a, &pt) {
             return false;
         }
     }
@@ -2200,11 +2102,52 @@ pub fn argument_types_consistent(
 /// Gradual consistency of an actual argument type with a formal parameter type: an `Unknown` on either
 /// side is consistent; an exact head match is consistent; an actual that is a subtype of the formal is
 /// consistent; otherwise inconsistent.
-fn consistent(index: &dyn InferenceIndex, actual: &Type, formal: &Type) -> bool {
+pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal: &Type) -> bool {
     let (Some(an), Some(fname)) = (actual.name(), formal.name()) else {
         return true; // Unknown on either side -> compatible (don't eliminate)
     };
-    an == fname || is_subtype(index, an, actual.package(), fname)
+    if primitive_type_name(an) == primitive_type_name(fname) {
+        let builtin = |ty: &Type| {
+            matches!(
+                primitive_type_name(ty.name().unwrap_or_default()),
+                "Int"
+                    | "Long"
+                    | "Short"
+                    | "Byte"
+                    | "Float"
+                    | "Double"
+                    | "Boolean"
+                    | "Char"
+                    | "String"
+            ) && ty.container().is_none()
+                && ty
+                    .package()
+                    .is_none_or(|package| package == "kotlin" || package == "java.lang")
+        };
+        if builtin(actual) && builtin(formal) {
+            return true;
+        }
+        return actual
+            .package()
+            .zip(formal.package())
+            .is_none_or(|(a, f)| a == f)
+            && actual.container() == formal.container();
+    }
+    is_subtype(index, an, actual.package(), fname)
+}
+
+fn primitive_type_name(name: &str) -> &str {
+    match name {
+        "int" => "Int",
+        "long" => "Long",
+        "short" => "Short",
+        "byte" => "Byte",
+        "float" => "Float",
+        "double" => "Double",
+        "boolean" => "Boolean",
+        "char" => "Char",
+        _ => name,
+    }
 }
 
 /// Whether the type named `name` (in package `pkg` when known) is `target` or a subtype of it,
@@ -2512,9 +2455,16 @@ fn named_type_params(
 /// `want_function`) or a property's `value_type`.
 fn member_type_ref(e: &crate::index::Entry, want_function: bool) -> Option<&TypeRef> {
     if want_function {
-        (e.sym.kind == SymbolKind::Function)
-            .then(|| e.sym.return_type.as_ref())
-            .flatten()
+        if e.sym.kind == SymbolKind::Function {
+            e.sym.return_type.as_ref()
+        } else {
+            e.sym
+                .value_type
+                .as_ref()
+                .filter(|ty| !ty.nullable)
+                .and_then(members::function_type_signature)
+                .map(|(_, result)| result)
+        }
     } else {
         (e.sym.kind == SymbolKind::Property)
             .then(|| e.sym.value_type.as_ref())
@@ -2714,6 +2664,9 @@ fn type_ref_identity(
     tr: &TypeRef,
     ctx: &FileCtx,
 ) -> Option<(Option<String>, Option<String>)> {
+    if is_intrinsic_type_ref(index, tr, ctx) {
+        return Some((Some(intrinsic_package(index, &tr.name).to_string()), None));
+    }
     if tr.qualification.is_some() {
         qualified_type_identity(index, tr, ctx)
             .map(|(package, container)| (Some(package), container))
@@ -2729,6 +2682,70 @@ fn type_ref_identity(
         };
         Some((package, resolve_type_ref_container(index, tr, ctx)))
     }
+}
+
+fn intrinsic_type(index: &dyn InferenceIndex, name: &str) -> Type {
+    Type::class(name, Some(intrinsic_package(index, name).to_string()))
+}
+
+fn intrinsic_package(index: &dyn InferenceIndex, name: &str) -> &'static str {
+    // Kotlin's JVM String is java.lang.String. Keep its actual source members usable when only
+    // JDK sources are available, while never binding literals to a user class named String.
+    if name == "String" {
+        let candidates = index.lookup_type(name);
+        let has_top_level = |package: &str| {
+            candidates
+                .iter()
+                .any(|entry| entry.sym.package == package && entry.sym.container.is_none())
+        };
+        if !has_top_level("kotlin") && has_top_level("java.lang") {
+            return "java.lang";
+        }
+    }
+    "kotlin"
+}
+
+/// Default-imported fundamental types do not require an indexed source span. Explicit imports and
+/// visible user declarations still bind their own identities; unrelated global homonyms do not.
+pub(crate) fn is_intrinsic_type_ref(
+    index: &dyn InferenceIndex,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+) -> bool {
+    if !crate::defaults::is_builtin_type(&tr.name) {
+        return false;
+    }
+    if let Some(qualification) = &tr.qualification {
+        return qualification == "kotlin";
+    }
+    if tr.package_candidates.is_empty() {
+        if let Some(import) = ctx
+            .imports
+            .iter()
+            .find(|import| !import.wildcard && import.local_name() == Some(tr.name.as_str()))
+        {
+            return import.path == format!("kotlin.{}", tr.name);
+        }
+    } else if !tr
+        .package_candidates
+        .iter()
+        .any(|package| package == "kotlin")
+    {
+        return false;
+    }
+    !index.lookup_type(&tr.name).iter().any(|entry| {
+        entry.sym.package != "kotlin"
+            && if tr.package_candidates.is_empty() {
+                entry.sym.package == ctx.package
+                    || ctx
+                        .imports
+                        .iter()
+                        .any(|import| import.wildcard && import.package() == entry.sym.package)
+                    || resolve::is_default_import_pkg(&entry.sym.package)
+            } else {
+                tr.package_candidates.contains(&entry.sym.package)
+            }
+    })
 }
 
 fn qualified_type_identity(

@@ -295,6 +295,13 @@ impl Index {
         self.origins.files.get(path)
     }
 
+    pub fn file_origins(&self) -> impl Iterator<Item = (&str, &FileOrigin)> {
+        self.origins
+            .files
+            .iter()
+            .map(|(path, origin)| (path.as_str(), origin))
+    }
+
     pub fn remove_file_origin(&mut self, path: &str) -> bool {
         if !self.origins.files.contains_key(path) {
             return false;

@@ -757,6 +757,12 @@ do
   end
 end
 
+-- Shared call/value roles, callable Kotlin properties and qualified Java nested types.
+do
+  local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:gsub("^@", ""))
+  dofile(script_dir .. "/nvim_member_selection.lua")(project, client, check)
+end
+
 -- Signature help on a Java method call should include parameter and return types.
 do
   local l, c = find('helper.combine("Ada", 2)', "2")

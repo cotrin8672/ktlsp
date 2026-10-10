@@ -19,3 +19,23 @@ pub const DEFAULT_IMPORT_PACKAGES: &[&str] = &[
 pub fn is_default_import_pkg(pkg: &str) -> bool {
     DEFAULT_IMPORT_PACKAGES.contains(&pkg)
 }
+
+/// Fundamental Kotlin types exist even when no library source declaration is indexed.
+pub(crate) fn is_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Any"
+            | "Nothing"
+            | "Unit"
+            | "Number"
+            | "Byte"
+            | "Short"
+            | "Int"
+            | "Long"
+            | "Float"
+            | "Double"
+            | "Boolean"
+            | "Char"
+            | "String"
+    )
+}

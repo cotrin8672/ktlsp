@@ -490,6 +490,69 @@ fun useSuperclasses(child: ImportedChild, kotlin: KotlinImportedChild) {
     kotlin.accept("ok")
 }
 KOTLIN
+  mkdir -p "$project/selection"
+  cat > "$project/selection/Reader.java" <<'JAVA'
+package selection;
+
+public class Reader {
+    public int body;
+    public Payload body() { return new Payload(); }
+    public static class Factory { }
+}
+JAVA
+  cat > "$project/selection/Payload.java" <<'JAVA'
+package selection;
+
+public class Payload {
+    public void useful() { }
+}
+JAVA
+  cat > "$project/selection/Unrelated.java" <<'JAVA'
+package selection;
+
+public class Unrelated {
+    public static class Factory { }
+}
+JAVA
+  cat > "$project/selection/MemberUse.java" <<'JAVA'
+package selection;
+
+public class MemberUse {
+    public void run(Reader reader) {
+        reader.body().useful();
+        int value = reader.body;
+        Reader.Factory factory = new Reader.Factory();
+    }
+}
+JAVA
+  cat > "$project/selection/Callable.kt" <<'KOTLIN'
+package selection
+
+class Product {
+    fun propertyOnly() { }
+}
+
+class OtherResult {
+    fun methodOnly() { }
+}
+
+class Callables {
+    val action: (Int) -> Product = { Product() }
+    fun action(value: String): OtherResult = OtherResult()
+    val maybe: (String?) -> Product? = { null }
+    val optional: ((Int) -> Product)? = null
+}
+
+fun useMembers(reader: Reader, callables: Callables) {
+    reader.body().useful()
+    val value = reader.body
+    val factory: Reader.Factory = Reader.Factory()
+    callables.action(1).propertyOnly()
+    callables.action("x").methodOnly()
+    callables.maybe(null)?.propertyOnly()
+    val optional = callables.optional
+}
+KOTLIN
   printf '%s\n' "$project"
 }
 

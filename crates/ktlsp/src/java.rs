@@ -438,10 +438,10 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
                     args.push(type_ref_from_node(argument, src, scope).unwrap_or_default());
                 }
             }
-            Some(scope.type_ref(node_text(head, src), false, args))
+            Some(scope.type_ref(&type_path(head, src)?, false, args))
         }
         "type_identifier" | "scoped_type_identifier" => {
-            Some(scope.type_ref(text, false, Vec::new()))
+            Some(scope.type_ref(&type_path(node, src)?, false, Vec::new()))
         }
         "wildcard" => None,
         "annotated_type" => {
@@ -453,6 +453,24 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
             ty
         }
         _ => Some(TypeRef::simple(text.replace("...", "[]"))),
+    }
+}
+
+/// A type's qualified identity without generic arguments. Generic outer owners remain in the
+/// path (`Outer<T>.Inner<U>` -> `Outer.Inner`); argument identifiers are never owner segments.
+fn type_path(node: Node<'_>, src: &str) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" => Some(node_text(node, src).to_string()),
+        "generic_type" => type_path(node.named_child(0)?, src),
+        "scoped_type_identifier" => Some(format!(
+            "{}.{}",
+            type_path(node.named_child(0)?, src)?,
+            type_path(
+                node.named_child(node.named_child_count().checked_sub(1)?)?,
+                src
+            )?
+        )),
+        _ => None,
     }
 }
 
@@ -1622,6 +1640,9 @@ fn goto_definition_with_imports(
             end_byte: usage.end_byte(),
         }];
     }
+    if let Some(defs) = qualified_type_defs(index, src, tree, usage) {
+        return defs;
+    }
     if let Some(local) = local_definition(file, src, usage) {
         return vec![local];
     }
@@ -1674,8 +1695,8 @@ fn java_reference_resolves_with_ctx(
     if qualified_member_defs(index, src, tree, usage).is_some_and(|defs| !defs.is_empty()) {
         return true;
     }
-    if qualified_nested_type_resolves(index, src, usage, ctx) {
-        return true;
+    if let Some(defs) = qualified_type_defs(index, src, tree, usage) {
+        return !defs.is_empty();
     }
     let name = node_text(usage, src);
     index.lookup_by_name(name).iter().any(|entry| {
@@ -1686,67 +1707,35 @@ fn java_reference_resolves_with_ctx(
     })
 }
 
-fn qualified_nested_type_resolves(
+fn qualified_type_defs(
     index: &dyn InferenceIndex,
     src: &str,
+    tree: &Tree,
     usage: Node<'_>,
-    ctx: &JavaDiagnosticContext,
-) -> bool {
+) -> Option<Vec<Def>> {
     if usage.kind() != "type_identifier" {
-        return false;
+        return None;
     }
-    let Some(parent) = usage.parent() else {
-        return false;
-    };
-    if parent.kind() != "scoped_type_identifier"
-        || parent.child_by_field_name("name") != Some(usage)
-    {
-        return false;
-    }
-    let Some(scope) = parent.child_by_field_name("scope") else {
-        return false;
-    };
-    let owner_name = simple_java_type_name(node_text(scope, src));
-    if owner_name.is_empty() {
-        return false;
-    }
-    let nested_name = node_text(usage, src);
-    let mut owners = index
-        .lookup_by_name(&owner_name)
-        .iter()
-        .filter(|entry| {
-            entry.sym.kind.is_type_like()
-                && is_visible_with_facts(&ctx.package, &ctx.imports, &ctx.visibility, &entry.sym)
-        })
-        .collect::<Vec<_>>();
-    if owners.is_empty() {
-        let scope_text = node_text(scope, src);
-        if let Some((scope_package, _)) = scope_text.rsplit_once('.') {
-            owners = index
-                .lookup_by_name(&owner_name)
-                .iter()
-                .filter(|entry| entry.sym.kind.is_type_like() && entry.sym.package == scope_package)
-                .collect();
-        } else {
-            owners = index
-                .lookup_by_name(&owner_name)
-                .iter()
-                .filter(|entry| {
-                    entry.sym.kind.is_type_like()
-                        && entry.sym.package == ctx.package
-                        && entry.sym.name == owner_name
-                })
-                .collect();
+    let mut head = usage;
+    let mut qualified = false;
+    while let Some(parent) = head.parent() {
+        match parent.kind() {
+            "generic_type" if parent.named_child(0) == Some(head) => head = parent,
+            "scoped_type_identifier" => {
+                qualified = true;
+                if parent.named_child(parent.named_child_count().saturating_sub(1)) != Some(head) {
+                    break;
+                }
+                head = parent;
+            }
+            _ => break,
         }
     }
-    owners.iter().any(|owner| {
-        index.lookup_by_name(nested_name).iter().any(|entry| {
-            entry.sym.kind.is_type_like()
-                && entry.sym.name == nested_name
-                && entry.sym.container.as_deref() == Some(owner.sym.name.as_str())
-                && entry.sym.package == owner.sym.package
-        })
-    })
+    if !qualified {
+        return None;
+    }
+    let name = type_path(head, src)?;
+    Some(type_defs_for_name(index, "", src, tree, &name))
 }
 
 fn is_type_name_position(node: Node<'_>) -> bool {
@@ -1778,6 +1767,9 @@ pub fn type_definition(
         return Vec::new();
     };
     if usage.kind() == "type_identifier" {
+        if let Some(defs) = qualified_type_defs(index, src, tree, usage) {
+            return defs;
+        }
         return type_defs_for_name(index, file, src, tree, node_text(usage, src));
     }
     if let Some(decl) = if is_declaration_name(usage) {

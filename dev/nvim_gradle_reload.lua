@@ -5,7 +5,10 @@ local fixture = dofile(dev .. '/gradle_reload_project.lua')
 local probe = dofile(dev .. '/nvim_lsp_probe.lua')
 local root, binary, artifacts = assert(arg[1]), assert(arg[2]), assert(arg[3])
 root, artifacts = vim.fs.normalize(root), vim.fs.normalize(artifacts)
+local automatic_watches = vim.env.KTLSP_GRADLE_RELOAD_AUTOWATCH == '1'
 local report = { checks = {}, phases = {}, messages = {}, requests = {}, engine = binary,
+  watches = { mode = automatic_watches and 'automatic Neovim' or 'explicit notification control',
+    registrations = {}, notifications = {} },
   established = { Java = {}, Kotlin = {} },
   fixture = { gradle = '9.6.1', kotlin = '2.4.0', module = ':app', project_dir = 'modules/editing',
     artifact_semantics = 'compiled Java binary and published source JAR; no member claims from class-name stubs',
@@ -101,17 +104,44 @@ local helper = open('src/main/kotlin/app/KotlinHelper.kt', 'kotlin')
 local main = open('src/main/java/app/Main.java', 'java')
 local use = open('src/main/kotlin/app/Use.kt', 'kotlin')
 local exit
+local default_registration = vim.lsp.handlers['client/registerCapability']
+local capabilities = vim.lsp.protocol.make_client_capabilities()
+if not automatic_watches then
+  capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = false
+end
 local id = vim.lsp.start({ name = 'ktlsp', root_dir = root, cmd = { binary },
+  capabilities = capabilities,
   cmd_env = { HOME = root .. '/home', KTLSP_JDK_SRC = root .. '/build/fake-jdk-src.zip' },
-  handlers = { ['window/logMessage'] = function(_, message)
-    report.messages[#report.messages + 1] = message
-  end }, on_exit = function(code, signal) exit = { code = code, signal = signal } end }, { bufnr = java })
+  handlers = {
+    ['window/logMessage'] = function(_, message)
+      report.messages[#report.messages + 1] = message
+    end,
+    ['client/registerCapability'] = function(error, params, context, config)
+      local registration = { params = params, error = error, phase = report.current_phase or 0 }
+      report.watches.registrations[#report.watches.registrations + 1] = registration
+      local result = default_registration(error, params, context, config)
+      registration.handled = true
+      return result
+    end,
+  }, on_exit = function(code, signal) exit = { code = code, signal = signal } end }, { bufnr = java })
 local initialized = vim.wait(10000, function()
   local client = vim.lsp.get_client_by_id(id)
   return client and client.initialized
 end, 50)
 check('one real Neovim LSP connection initialized', initialized)
 local client = assert(vim.lsp.get_client_by_id(id))
+report.watches.capability = vim.tbl_get(client.capabilities, 'workspace', 'didChangeWatchedFiles') or {}
+local explicit_notification = false
+local notify = client.rpc.notify
+client.rpc.notify = function(method, params)
+  local sent = notify(method, params)
+  if method == 'workspace/didChangeWatchedFiles' then
+    report.watches.notifications[#report.watches.notifications + 1] = {
+      phase = report.current_phase or 0, explicit = explicit_notification, sent = sent, params = params,
+    }
+  end
+  return sent
+end
 for _, buffer in ipairs({ kotlin, helper, main, use }) do vim.lsp.buf_attach_client(buffer, id) end
 local function flush() vim.lsp._changetracking.flush(client) end
 local function text(buffer) return vim.api.nvim_buf_get_lines(buffer, 0, -1, false) end
@@ -164,6 +194,14 @@ local ready = wait_for(function()
   return false
 end, 120000)
 check('initial dependency indexing reports completion', ready)
+if automatic_watches then
+  check('Neovim advertises automatic watched-file registration', report.watches.capability.dynamicRegistration)
+  check('Neovim handles actual server watch registration', vim.iter(report.watches.registrations):any(function(item)
+    return item.handled and not item.error and vim.iter(item.params.registrations):any(function(registration)
+      return registration.method == 'workspace/didChangeWatchedFiles'
+    end)
+  end))
+end
 for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
   local useful = has(buffer, 'versioned.oldApi()', 'oldApi')
   check('initial ' .. label .. ' v1 member completion is useful', useful)
@@ -194,8 +232,33 @@ local function watch(phase)
     module .. '/build/ktlsp-custom-java/generated/CustomGenerated.java' }) do
     changes[#changes + 1] = { uri = vim.uri_from_fname(path), type = phase == 3 and 3 or (phase == 1 and 1 or 2) }
   end
-  check('phase ' .. phase .. ' standard watched-file notification sent on same client',
-    client.id == id and client:notify('workspace/didChangeWatchedFiles', { changes = changes }))
+  if automatic_watches then
+    local observed = wait_for(function()
+      return vim.iter(report.watches.notifications):any(function(item)
+        return item.phase == phase and not item.explicit and item.sent == true
+      end)
+    end, 10000)
+    check('phase ' .. phase .. ' automatic standard watched-file notification sent on same client',
+      client.id == id and observed)
+    if phase == 1 then
+      for _, suffix in ipairs({ '/build/generated/sources/fixture/java/main/generated/StandardGenerated.java',
+        '/build/ktlsp-custom-java/generated/CustomGenerated.java' }) do
+        local delivered = wait_for(function()
+          return vim.iter(report.watches.notifications):any(function(item)
+            return not item.explicit and item.sent == true and vim.iter(item.params.changes):any(function(change)
+              return vim.fs.normalize(vim.uri_to_fname(change.uri)):sub(-#suffix) == suffix
+            end)
+          end)
+        end, 10000)
+        check('new generated root automatic notification: ' .. suffix, delivered)
+      end
+    end
+  else
+    explicit_notification = true
+    local sent = client:notify('workspace/didChangeWatchedFiles', { changes = changes })
+    explicit_notification = false
+    check('phase ' .. phase .. ' standard watched-file notification sent on same client', client.id == id and sent)
+  end
   for _, buffer in ipairs({ main, use }) do
     local path = vim.api.nvim_buf_get_name(buffer)
     local content = table.concat(vim.fn.readfile(path), '\n'):gsub('%.assist%(', '.assistUnsaved(')

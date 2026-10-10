@@ -1,5 +1,6 @@
 import java.util.ArrayDeque
 import org.gradle.api.artifacts.component.ComponentIdentifier
+import org.gradle.api.artifacts.component.BuildIdentifier
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.component.ProjectComponentIdentifier
 import org.gradle.api.artifacts.result.ResolvedComponentResult
@@ -16,6 +17,22 @@ class KtlspSourceSet(
     val artifacts: Provider<List<String>>,
     val resolutionRoot: Provider<ResolvedComponentResult>,
 )
+
+object KtlspBuildIdentity {
+    fun path(build: BuildIdentifier?, currentRoot: String, includedRoots: Map<String, String>): String {
+        if (build == null) return "legacy:${currentRoot}"
+        // getBuildPath was added after Gradle 7; use only methods of the running public API.
+        val api = BuildIdentifier::class.java.methods
+        val path = api.firstOrNull { it.name == "getBuildPath" && it.parameterCount == 0 }
+        if (path != null) return path.invoke(build) as String
+        val current = api.firstOrNull { it.name == "isCurrentBuild" && it.parameterCount == 0 }
+        if (current?.invoke(build) == true) return "legacy:${currentRoot}"
+        val name = api.firstOrNull { it.name == "getName" && it.parameterCount == 0 }?.invoke(build) as? String
+        val includedRoot = includedRoots[name]
+        // An unexported nested build stays unmapped, rather than aliasing this build's project.
+        return if (includedRoot != null) "legacy:${includedRoot}" else "unmapped:${currentRoot}|${name}"
+    }
+}
 
 // Dump each module's resolved `compileClasspath` as a machine-readable line protocol, for ktlsp's
 // Kotlin compile-daemon backend to feed the compiler. Run once and cache (the classpath is stable
@@ -53,6 +70,8 @@ class KtlspSourceSet(
 allprojects {
     val projectPath = project.path
     val projectDirPath = project.projectDir.absolutePath
+    val currentBuildRoot = rootProject.projectDir.absolutePath
+    val includedBuildRoots = gradle.includedBuilds.associate { it.name to it.projectDir.absolutePath }
     val sourceSets = mutableListOf<KtlspSourceSet>()
 
     plugins.withId("java-base") {
@@ -82,6 +101,14 @@ allprojects {
                     roots.addAll(sourceSet.output.generatedSourcesDirs.files)
                     val compileJava = tasks.findByName(sourceSet.compileJavaTaskName) as? JavaCompile
                     compileJava?.options?.generatedSourceOutputDirectory?.orNull?.asFile?.let(roots::add)
+                    // KAPT can feed generated Java directly to JavaCompile, outside allJava.
+                    compileJava?.source?.visit {
+                        if (!isDirectory) {
+                            var inputRoot = file
+                            relativePath.segments.forEach { inputRoot = inputRoot.parentFile }
+                            roots.add(inputRoot)
+                        }
+                    }
                     val outputs = sourceSet.output.files.toMutableSet()
                     compileJava?.destinationDirectory?.orNull?.asFile?.let(outputs::add)
                     val provided = linkedSetOf<java.io.File>()
@@ -101,11 +128,12 @@ allprojects {
                         if (actualClasspath.isFailure) listOf("INCOMPLETE\t${sourceSetName}") else emptyList()
                 }
                 sourceSets.add(KtlspSourceSet(
-                    sourceSetName, metadata, view.artifacts.resolvedArtifacts.map { artifacts ->
-                        artifacts.map { artifact ->
+                    sourceSetName, metadata, providers.provider {
+                        // Read declared artifact paths without requiring project JAR tasks to run.
+                        view.artifacts.artifacts.map { artifact ->
                             val identity = when (val id = artifact.id.componentIdentifier) {
                                 is ModuleComponentIdentifier -> "MODULE\t${id.group}\t${id.module}\t${id.version}"
-                                is ProjectComponentIdentifier -> "PROJECT\t${id.build.buildPath}\t${id.projectPath}"
+                                is ProjectComponentIdentifier -> "PROJECT\t${KtlspBuildIdentity.path(id.build, currentBuildRoot, includedBuildRoots)}\t${id.projectPath}"
                                 else -> "FILE"
                             }
                             "ARTIFACT\t${sourceSetName}\t${artifact.file.absolutePath}\t${identity}"
@@ -128,7 +156,7 @@ allprojects {
                 val out = StringBuilder()
                 out.append("PROJECT\t${projectPath}\t${projectDirPath}\n")
                 val projectId = resolutionRoot.get().id as? ProjectComponentIdentifier
-                out.append("BUILD\t${projectId?.build?.buildPath ?: ":"}\n")
+                out.append("BUILD\t${KtlspBuildIdentity.path(projectId?.build, currentBuildRoot, includedBuildRoots)}\n")
                 classpathFiles.files.forEach {
                     out.append("CP\t${it.absolutePath}\n")
                 }

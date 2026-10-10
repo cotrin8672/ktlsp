@@ -192,6 +192,8 @@ Editor-facing changes should also run the smallest relevant harness scenario: `f
 and an unsaved Kotlin declaration edit observed from an unsaved Java buffer on the same client.
 It checks imported superclass identity despite same-name types, exact inherited-member definitions,
 valid and invalid call diagnostics, and first responses after unsaved superclass import changes.
+It also checks same-name Java fields/methods, callable Kotlin properties, nullable function results,
+qualified nested types, signatures, and whole-buffer rename edits through the same LSP connection.
 The harness also runs with native Windows Neovim through Git Bash and selects `.exe` binaries.
 
 `library` compiles a disposable Gradle 9.6.1 / Kotlin plugin 2.4.0 project with stdlib 2.2.20 pinned,

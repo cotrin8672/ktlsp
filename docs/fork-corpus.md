@@ -1,6 +1,6 @@
 # Real-project corpus discovery
 
-Updated: 2026-10-10 (Asia/Tokyo). Discovery is complete; semantic, compiler,
+Updated: 2026-10-11 (Asia/Tokyo). Discovery is complete; semantic, compiler,
 IDEA and performance acceptance are **pending**. See [fork-acceptance.md](fork-acceptance.md).
 
 ## Revisions and source coverage
@@ -672,3 +672,85 @@ project declaration and its own local-JAR stub. Its missing-source count is 138,
 with 13,820 project and 95,272 library files. This later dependency availability
 differs from the incomplete-code run and is not a semantic fix or timing result.
 All owned oracle backends were verified exited after these runs.
+
+### Fifth release scope control and Gradle 7 regression
+
+The immutable fifth release (`c3f4f63b35ec8ff0a4df3cd41aa168cd58f670fe6faff384d5780a705d441076`)
+passes all three exact Gradle-root golden requests. In particular, Kotlin's
+`ProblemReportCreator` navigation returns only its project declaration, rather
+than the project declaration and local-JAR stub returned by the fourth release.
+The independent source-input check still fails (27 missing archives), so the
+complete routed run retains exit 1. The initial `indexed 0 project files` message
+precedes installation of the resolved model and does not count its later source
+scan; that startup message alone is not a final project-coverage measurement.
+
+The same fifth binary regresses Moshi: zero of three golden requests and zero
+of five incomplete-code cases pass. All six incomplete requests use attempt 1;
+the unknown-receiver response excludes the named members but its same-phase
+known control is empty, so it supplies no passing coverage. Eight delivered
+edit/restore controls and all source/Git preservation checks pass. No expectations
+were relaxed. Moshi's independent source-input check also retains its four
+previously classified missing archives.
+
+An independent invocation of the exact embedded init script on Moshi's pinned
+Gradle 7.4.2 fails with native exit 1: `BuildIdentifier.buildPath` is unavailable
+at both project-identity emission sites. No resolved-model cache is published;
+the request trace reports `query-scope-incomplete`. This is a model-extraction
+regression, not evidence that an empty semantic result is correct. Compatibility
+must preserve included-build identities rather than flatten every old build to
+the root. The exact script, failure log and exit record are preserved under
+`ktlsp-goal-20261010/fifth-gradle-compat/`; the first PowerShell collection attempt
+stopped on native stderr and is separate from the recorded native exit.
+
+Runs are `moshi-1.15.2-ktlsp-fifth-golden-1`,
+`gradle-8.14.3-ktlsp-fifth-golden-1` and
+`moshi-1.15.2-ktlsp-fifth-incomplete-1` under the corpus evidence root. Each has
+an unchanged before/after harness SHA-256
+`505cddf47352e94f7bfab7624fac345a3ed0111ced8232c12331074a5fe23f36`.
+All three routed exits remain 1. These correctness runs replace neither the
+earlier six-root comparison nor performance acceptance.
+
+### Sixth immutable release: all six roots
+
+Binary SHA-256 is
+`fa0148d65badc1cb8e95683a5d7bb76a742795a75532afed07e6567be2bfdf90`.
+All twelve golden/incomplete runs completed with matching binary, shared harness,
+manifest, queried-source and target hashes. Every one of the 60 requests received
+a response on attempt 1. All 48 outbound edit/restore barriers pass, and the five
+Git checkouts retain their original status. CEM's disposable copy has no `.git`;
+its actual source hashes supply the preservation control.
+
+| Project | Golden requests | Incomplete requests | Incomplete cases | Missing source archives |
+| --- | --- | --- | --- | --- |
+| CEM, ordinary code | 0/4 | 0/6 | 0/5 | 3 |
+| Moshi | 3/3 | 6/6 | 5/5 | 1 |
+| OkHttp | 3/4 | 6/6 | 5/5 | 0 |
+| Retrofit | 3/6 | 0/6 | 0/5 | 4 |
+| Spring Framework | 1/4 | 0/6 | 0/5 | 16 |
+| Gradle | 3/3 | 6/6 | 5/5 | 27 |
+
+This is 13/24 golden requests (6/13 complete cases) and 18/36 incomplete
+requests (15/30 cases). Negative completion alone earns no case pass: the paired
+known receiver must also return useful members. All six persisted model-v3
+snapshots have complete source sets and zero unresolved classpath entries, and
+both indexing notifications arrive in all twelve runs. Missing source archives
+remain a separate failing input-coverage assertion for five projects; successful
+model extraction does not make those archives available.
+
+Moshi's prior Gradle 7.4.2 regression is repaired, and Gradle's single exact
+project target remains correct. CEM's four golden responses are all empty.
+Retrofit still lacks useful JVM-facade and `@JvmName` completion. Spring's
+reified provider chain is empty, while an overloaded Java provider call resolves
+to a Kotlin extension instead of the Java declaration independently selected by
+IDEA. OkHttp's `newCall` returns two source locations, the interface and concrete
+implementation. Its unchanged one-target assertion fails. Earlier IDEA runs
+return one compiled implementation target and also fail the exact-source-path
+assertion; multiplicity and source navigation are recorded separately from
+proving a wholly unrelated symbol.
+
+The aggregate, guards and gap interpretation are
+`sixth-corpus-observations.json`, `sixth-corpus-guards.json` and
+`sixth-gap-interpretation.json` under the corpus evidence root. Individual runs
+use `<project>-ktlsp-sixth-{golden,incomplete}-1`, with raw results, request traces,
+model snapshots and before/after source snapshots. These runs establish remaining
+correctness gaps and do not supply latency or IDEA-parity acceptance.

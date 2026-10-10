@@ -7,6 +7,7 @@
 pub mod coords;
 pub mod defaults;
 pub mod diagnostics;
+pub mod extensions;
 pub mod fxhash;
 pub mod hierarchy;
 pub mod hints;
@@ -15,6 +16,7 @@ pub mod indexed_diagnostics;
 pub mod indexer;
 pub mod infer;
 pub mod knowledge;
+pub mod members;
 pub mod parser;
 pub mod project_model;
 pub mod ranges;

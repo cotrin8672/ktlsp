@@ -28,7 +28,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 2;
+const MODEL_VERSION: u32 = 3;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +283,53 @@ impl ProjectSnapshot {
                 .collect(),
         )
     }
+
+    pub fn coordinates(&self) -> Vec<Coordinate> {
+        self.modules
+            .iter()
+            .filter(|module| !module.source_sets.is_empty())
+            .flat_map(module_coordinates)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn local_jars(&self) -> Vec<PathBuf> {
+        self.modules
+            .iter()
+            .filter(|module| !module.source_sets.is_empty())
+            .flat_map(module_local_jars)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn live_origins(&self) -> std::collections::BTreeSet<String> {
+        self.visibilities
+            .iter()
+            .flat_map(|visibility| visibility.ordered_origins.iter().cloned())
+            .collect()
+    }
+
+    pub fn artifact_revisions(&self) -> BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut revisions: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+        for source in self.modules.iter().flat_map(|module| &module.source_sets) {
+            for artifact in &source.artifacts {
+                if !self.file_origins.contains_key(&path_key(&artifact.path)) {
+                    continue;
+                }
+                for origin in self.origins_for_entry(&artifact.path, Some(&artifact.component)) {
+                    if let Some(revision) = self.file_origins.get(&path_key(&artifact.path)) {
+                        revisions
+                            .entry(origin)
+                            .or_default()
+                            .insert(revision.clone());
+                    }
+                }
+            }
+        }
+        revisions
+    }
 }
 
 fn project_scope(module: &ModuleClasspath, source: &SourceSetClasspath) -> ProjectScope {
@@ -337,12 +384,17 @@ fn publish(
     let mut model = ProjectSnapshot::new(modules);
     model.mtimes = mtimes;
     let model = Arc::new(model);
+    publish_snapshot(root, model.clone());
+    model
+}
+
+/// Called with the workspace generation accepted; resolving alone never publishes a model.
+pub fn publish_snapshot(root: &Path, model: Arc<ProjectSnapshot>) {
     let mut snapshots = SNAPSHOTS.lock().unwrap_or_else(|p| p.into_inner());
     snapshots.insert(path_key(root), model.clone());
     if let Ok(canonical) = root.canonicalize() {
         snapshots.insert(path_key(&canonical), model.clone());
     }
-    model
 }
 
 /// Parse the init script's line protocol:
@@ -535,36 +587,71 @@ pub fn resolve(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
 }
 
 pub fn resolve_snapshot(root: &Path) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    let previous = snapshot(root);
+    let model = load_snapshot(root, false)?;
+    if previous
+        .as_ref()
+        .is_none_or(|previous| !Arc::ptr_eq(previous, &model))
+    {
+        publish_snapshot(root, model.clone());
+        store_snapshot(root, &model);
+    }
+    Ok(model)
+}
+
+/// Background-only preparation. Build/output events force Gradle even when metadata is unchanged.
+pub fn load_snapshot(root: &Path, force: bool) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    load_snapshot_with(root, force, || {
+        dump_with_fallback(root, "ktlspDumpClasspath")
+    })
+}
+
+fn load_snapshot_with(
+    root: &Path,
+    force: bool,
+    dump: impl FnOnce() -> anyhow::Result<Vec<ModuleClasspath>>,
+) -> anyhow::Result<Arc<ProjectSnapshot>> {
     let _guard = RESOLUTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(model) = snapshot(root) {
+    if let Some(model) = snapshot(root).filter(|_| !force) {
         if model.mtimes == build_file_mtimes(root, &model.modules) {
             return Ok(model);
         }
     }
     let cache = cache_path(root);
-    if let Ok(text) = std::fs::read_to_string(&cache) {
+    if let Some(text) = (!force)
+        .then(|| std::fs::read_to_string(&cache).ok())
+        .flatten()
+    {
         if let Ok(entry) = serde_json::from_str::<CacheEntry>(&text) {
             if entry.model_version == MODEL_VERSION
                 && entry.mtimes == build_file_mtimes(root, &entry.modules)
             {
-                return Ok(publish(root, entry.modules, entry.mtimes));
+                let mut model = ProjectSnapshot::new(entry.modules);
+                model.mtimes = entry.mtimes;
+                return Ok(Arc::new(model));
             }
         }
     }
-    let modules = dump_with_fallback(root, "ktlspDumpClasspath")?;
+    let modules = dump()?;
     let mtimes = build_file_mtimes(root, &modules);
     log_unresolved(&modules);
+    let mut model = ProjectSnapshot::new(modules);
+    model.mtimes = mtimes;
+    Ok(Arc::new(model))
+}
+
+/// Persist an accepted snapshot off the workspace lock.
+pub fn store_snapshot(root: &Path, model: &ProjectSnapshot) {
     write_cache_entry(
-        &cache,
+        &cache_path(root),
         &CacheEntry {
             model_version: MODEL_VERSION,
-            mtimes: mtimes.clone(),
-            modules: modules.clone(),
+            mtimes: model.mtimes.clone(),
+            modules: model.modules.clone(),
         },
     );
-    Ok(publish(root, modules, mtimes))
 }
 
 /// Resolve one module's classpath by gradle path (e.g. `:Web:api`), running only that module's dump
@@ -1230,6 +1317,21 @@ ARTIFACT\tmain\t/repo/modules/library/build/api.jar\tPROJECT\t:included\t:librar
                 project: ":library".to_string(),
             }
         );
+        let mut modules = modules;
+        modules.extend(parse_dump(
+            "PROJECT\t:unsupported\t/repo/unsupported\n\
+CP\t/cache/modules-2/files-2.1/guessed/library/9/hash/library-9.jar\n\
+CP\t/repo/unsupported/library.jar\nEND\t:unsupported\n",
+        ));
+        let model = ProjectSnapshot::new(modules);
+        assert_eq!(
+            model.coordinates(),
+            vec![Coordinate::parse("vendor:api:2").unwrap()]
+        );
+        assert_eq!(
+            model.local_jars(),
+            vec![PathBuf::from("/repo/libs/local.jar")]
+        );
     }
 
     #[test]
@@ -1393,6 +1495,52 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
                 .module,
             ":app"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forced_model_load_bypasses_unchanged_metadata_without_publishing() {
+        let root = std::env::temp_dir().join(format!("ktlsp_forced_model_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("build.gradle"), "plugins { id 'java' }").unwrap();
+        let modules = |version| {
+            parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t{version}\nEND\t:app\n",
+            root.join("modules/editing").display(), root.join("custom-generated").display(),
+            root.join("api.jar").display(), root.join("api.jar").display()))
+        };
+        let original = modules("1");
+        let old = publish(&root, original.clone(), build_file_mtimes(&root, &original));
+        let reused = load_snapshot_with(&root, false, || {
+            panic!("unchanged metadata must reuse the model")
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&old, &reused));
+        let calls = std::cell::Cell::new(0);
+        let prepared = load_snapshot_with(&root, true, || {
+            calls.set(calls.get() + 1);
+            Ok(modules("2"))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(
+            Arc::ptr_eq(&old, &snapshot(&root).unwrap()),
+            "preparation leaked into interactive queries"
+        );
+        assert_eq!(prepared.coordinates()[0].label(), "vendor:api:2");
+        assert_eq!(
+            prepared
+                .owner_for(&root.join("custom-generated/New.kt"))
+                .unwrap()
+                .0
+                .module,
+            ":app"
+        );
+        publish_snapshot(&root, prepared.clone());
+        assert!(Arc::ptr_eq(
+            &prepared,
+            &snapshot(&root.canonicalize().unwrap()).unwrap()
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

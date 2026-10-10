@@ -22,13 +22,14 @@ use tree_sitter::{Node, Tree};
 use crate::index::{Entry, InferenceIndex};
 use crate::infer;
 use crate::knowledge::Knowledge;
+use crate::members::{self, MemberUse};
 use crate::parser::{
     child_of_kind, class_kind, first_ident, identifier_at, imports_of, name_field, node_text,
     package_of, Import,
 };
 use crate::project_model::{self, ProjectPackageScope};
 use crate::symbol::{Def, SymbolKind};
-use crate::types::Type;
+use crate::types::{Type, TypeRef};
 
 /// Coarse index/source completeness facts used only for negative diagnostics. These are deliberately
 /// separate from the symbol index: an empty lookup proves absence only when the caller knows the
@@ -382,6 +383,9 @@ fn simple_name_status_a(
         return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
     }
 
+    if uk == UseKind::Type && infer::is_intrinsic_type_ref(index, &TypeRef::simple(name), ctx) {
+        return ResolutionStatus::Found(());
+    }
     let reasons = visible_package_reasons_with_ctx(file, name, facts, &ctx.package, &ctx.imports);
     if reasons.is_empty() {
         if imported_external_name_with_ctx(name, &ctx.package, &ctx.imports) {
@@ -895,10 +899,24 @@ pub(crate) fn goto_node_with_ctx(
         return vec![def];
     }
     if let Some(def) = resolve_local_a(ident, ancestors, name, uk, src, file) {
+        // Class members are also found by the lexical walk. Select the same overload/property
+        // partition as an explicit receiver instead of committing to the first declaration.
+        if index.entries_for_file(file).iter().any(|entry| {
+            entry.sym.start_byte == def.start_byte
+                && entry.sym.end_byte == def.end_byte
+                && entry.sym.container.is_some()
+                && matches!(entry.sym.kind, SymbolKind::Function | SymbolKind::Property)
+        }) {
+            if let Some(defs) =
+                resolve_implicit_receiver_member_with_ctx_a(index, ident, ancestors, name, src, ctx)
+            {
+                return defs;
+            }
+        }
         return vec![def];
     }
     if let Some(defs) =
-        resolve_implicit_receiver_member_with_ctx_a(index, ancestors, name, src, ctx)
+        resolve_implicit_receiver_member_with_ctx_a(index, ident, ancestors, name, src, ctx)
     {
         if !defs.is_empty() {
             return defs;
@@ -955,14 +973,16 @@ fn resolve_local_a(
 
 fn resolve_implicit_receiver_member_with_ctx_a(
     index: &dyn InferenceIndex,
+    usage: Node,
     ancestors: &[Node],
     name: &str,
     src: &str,
     ctx: &infer::FileCtx,
 ) -> Option<Vec<Def>> {
+    let member_use = member_use(index, usage, src, ctx);
     let receivers = infer::implicit_receiver_types_with_ancestors(index, ancestors, src, &ctx, 0);
     for recv_ty in receivers {
-        let hits = member_defs_for_type(index, &recv_ty, name, &ctx.imports, &ctx.package);
+        let hits = member_defs_for_use(index, &recv_ty, name, &member_use, ctx);
         if !hits.is_empty() {
             return Some(hits);
         }
@@ -1014,7 +1034,7 @@ pub(crate) fn local_decl_a<'t>(
 
 fn resolve_member_with_ctx(
     index: &dyn InferenceIndex,
-    _selector: Node,
+    selector: Node,
     parent: Option<Node>,
     name: &str,
     src: &str,
@@ -1028,9 +1048,14 @@ fn resolve_member_with_ctx(
                 // own members, inherited (supertype walk), and extensions; package-filtered so a
                 // same-named type in another package can't be picked.
                 let ty = infer::infer(index, receiver, src, &ctx);
-                let hits = member_defs_for_type(index, &ty, name, &ctx.imports, &ctx.package);
-                if !hits.is_empty() {
-                    return hits;
+                if ty.name().is_some() {
+                    return member_defs_for_use(
+                        index,
+                        &ty,
+                        name,
+                        &member_use(index, selector, src, ctx),
+                        ctx,
+                    );
                 }
             }
         }
@@ -1067,46 +1092,60 @@ fn member_exists_in(
     index.permits_unique_member_fallback() && index.lookup_by_name(name).len() == 1
 }
 
-/// All definitions of a member named `name` reachable on type `ty`:
-/// own members, members inherited through the supertype closure, and extensions keyed on the type
-/// or a supertype. Package-filtered so a same-named type in a different package can't contribute.
-/// Bounded against deep / cyclic hierarchies.
-pub fn member_defs_for_type(
+/// Normalize whether a Kotlin selector/implicit member is used as a value or as a call's callee.
+/// This is independent of the receiver route (`UseKind::MemberSelector`).
+pub fn member_use(
+    index: &dyn InferenceIndex,
+    usage: Node,
+    src: &str,
+    ctx: &infer::FileCtx,
+) -> MemberUse {
+    let callee = usage
+        .parent()
+        .filter(|parent| {
+            parent.kind() == "navigation_expression" && parent.named_child(1) == Some(usage)
+        })
+        .unwrap_or(usage);
+    let Some(mut call) = callee.parent().filter(|parent| {
+        parent.kind() == "call_expression" && parent.named_child(0) == Some(callee)
+    }) else {
+        // With an unfinished argument list the parser can keep a navigation expression and place
+        // `(` in an ERROR sibling. Preserve the call's possible candidates without inventing args.
+        if src
+            .get(callee.end_byte()..)
+            .is_some_and(|suffix| suffix.trim_start_matches([' ', '\t']).starts_with('('))
+        {
+            return MemberUse::Call(crate::members::CallArguments {
+                count: None,
+                types: Vec::new(),
+                trailing_lambda: false,
+            });
+        }
+        return MemberUse::Value;
+    };
+    while let Some(outer) = call.parent().filter(|parent| {
+        parent.kind() == "call_expression"
+            && parent.named_child(0) == Some(call)
+            && infer::has_trailing_lambda(*parent)
+    }) {
+        call = outer;
+    }
+    MemberUse::Call(infer::call_arguments(index, call, src, ctx))
+}
+
+/// Resolve the shared typed member candidates for a normalized call/value use.
+pub fn member_defs_for_use(
     index: &dyn InferenceIndex,
     ty: &Type,
     name: &str,
-    imports: &[Import],
-    current_pkg: &str,
+    usage: &MemberUse,
+    ctx: &infer::FileCtx,
 ) -> Vec<Def> {
-    if ty.name().is_none() {
-        return Vec::new();
-    }
-    let mut out: Vec<&Entry> = Vec::new();
-    let _ = infer::walk_supertypes(index, ty, 32, |current| {
-        let Some(cur) = infer::receiver_root_key(index, current) else {
-            return ControlFlow::Continue(());
-        };
-        for e in index.members_of(&cur) {
-            if let Some(p) = current.package() {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            if e.sym.name == name {
-                out.push(e);
-            }
-        }
-        for e in index.extensions_for(&cur) {
-            if e.sym.name == name && extension_is_visible(e, imports, current_pkg) {
-                out.push(e);
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    for e in generic_receiver_extensions(index, name, imports, current_pkg) {
-        out.push(e);
-    }
-    entries_to_defs(out)
+    entries_to_defs(
+        members::candidates(index, ty, name, ctx)
+            .select(index, ty, usage, ctx)
+            .entries,
+    )
 }
 
 fn member_entries_exist(
@@ -1116,31 +1155,18 @@ fn member_entries_exist(
     imports: &[Import],
     current_pkg: &str,
 ) -> bool {
-    let walked = infer::walk_supertypes(index, ty, 32, |current| {
-        let Some(cur) = infer::receiver_root_key(index, current) else {
-            return ControlFlow::Continue(());
-        };
-        for e in index.members_of(&cur) {
-            if let Some(p) = current.package() {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            if e.sym.name == name {
-                return ControlFlow::Break(());
-            }
-        }
-        for e in index.extensions_for(&cur) {
-            if e.sym.name == name && extension_is_visible(e, imports, current_pkg) {
-                return ControlFlow::Break(());
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    walked.is_break() || !generic_receiver_extensions(index, name, imports, current_pkg).is_empty()
+    // Existence proves a name, not a call shape. Rejected/unknown arguments must not become an
+    // unresolved-reference error; call diagnostics examine the same candidates separately.
+    let candidates = members::candidates(
+        index,
+        ty,
+        name,
+        &infer::FileCtx::new(current_pkg.to_string(), imports.to_vec()),
+    );
+    !candidates.members.is_empty() || !candidates.extensions.is_empty()
 }
 
-fn generic_receiver_extensions<'a>(
+pub(crate) fn generic_receiver_extensions<'a>(
     index: &'a dyn InferenceIndex,
     name: &str,
     imports: &[Import],
@@ -1160,7 +1186,7 @@ fn generic_receiver_extensions<'a>(
         .collect()
 }
 
-fn extension_is_visible(e: &Entry, imports: &[Import], current_pkg: &str) -> bool {
+pub(crate) fn extension_is_visible(e: &Entry, imports: &[Import], current_pkg: &str) -> bool {
     if e.sym.package == current_pkg {
         return true;
     }

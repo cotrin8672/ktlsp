@@ -601,14 +601,76 @@ fn user_type_identifiers<'a>(ut: Node, src: &'a str) -> Vec<&'a str> {
 fn type_ref_from(node: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
     match node.kind() {
         "nullable_type" => {
-            let ut = find_descendant(node, "user_type")?;
-            let mut tr = type_ref_from_user_type(ut, src, scope)?;
-            tr.nullable = true;
-            Some(tr)
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(mut tr) = type_ref_from(child, src, scope) {
+                    mark_nullable_type(child, &mut tr);
+                    return Some(tr);
+                }
+            }
+            None
         }
         "user_type" => type_ref_from_user_type(node, src, scope),
+        "function_type" => function_type_ref(node, src, scope),
+        "parenthesized_type" => {
+            let mut cursor = node.walk();
+            let ty = node
+                .named_children(&mut cursor)
+                .find_map(|child| type_ref_from(child, src, scope));
+            ty
+        }
         _ => None,
     }
+}
+
+fn mark_nullable_type(node: Node, ty: &mut TypeRef) {
+    // The grammar wraps `() -> R?` around the whole unparenthesized function type.
+    if node.kind() == "function_type" {
+        if let (Some(result), Some(result_type)) = (
+            node.named_child(node.named_child_count() - 1),
+            ty.args.last_mut(),
+        ) {
+            mark_nullable_type(result, result_type);
+            return;
+        }
+    }
+    ty.nullable = true;
+}
+
+fn function_type_ref(node: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
+    let parameters = child_of_kind(node, "function_type_parameters")?;
+    let mut args = Vec::new();
+    let mut cursor = node.walk();
+    // A receiver function type has one additional invoke argument before the ordinary parameters.
+    for child in node.named_children(&mut cursor) {
+        if child == parameters {
+            break;
+        }
+        if let Some(receiver) = type_ref_from(child, src, scope) {
+            args.push(receiver);
+        }
+    }
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        args.push(
+            type_ref_from(parameter, src, scope)
+                .or_else(|| value_type_of_scoped(parameter, src, scope))
+                .unwrap_or_default(),
+        );
+    }
+    let arity = args.len();
+    let mut cursor = node.walk();
+    let result = node
+        .named_children(&mut cursor)
+        .filter(|child| child.start_byte() >= parameters.end_byte())
+        .find_map(|child| type_ref_from(child, src, scope))?;
+    args.push(result);
+    Some(TypeRef {
+        name: format!("Function{arity}"),
+        args,
+        package_candidates: Arc::new(vec!["kotlin".to_string()]),
+        ..TypeRef::default()
+    })
 }
 
 /// Parse a type node at a live use site, where package selection belongs to that file's
@@ -671,7 +733,9 @@ fn return_type_of(decl: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
         }
         if after_params {
             match child.kind() {
-                "user_type" | "nullable_type" => return type_ref_from(child, src, Some(scope)),
+                "user_type" | "nullable_type" | "function_type" => {
+                    return type_ref_from(child, src, Some(scope))
+                }
                 // No explicit annotation: best-effort single-expression-body inference (Stage 6).
                 "function_body" => return expr_body_type(child, src, scope),
                 _ => {}
@@ -712,7 +776,10 @@ pub fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
 fn value_type_of_scoped(var_decl: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
     let mut cursor = var_decl.walk();
     for child in var_decl.named_children(&mut cursor) {
-        if matches!(child.kind(), "user_type" | "nullable_type") {
+        if matches!(
+            child.kind(),
+            "user_type" | "nullable_type" | "function_type" | "parenthesized_type"
+        ) {
             return type_ref_from(child, src, scope);
         }
     }

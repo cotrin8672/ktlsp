@@ -44,7 +44,17 @@ pub fn call_at<'tree>(
 pub fn signatures_for_entries(entries: Vec<Entry>, active_parameter: u32) -> Option<SignatureHelp> {
     let mut signatures = entries
         .into_iter()
-        .filter(|entry| entry.sym.kind == SymbolKind::Function || entry.sym.kind.is_type_like())
+        .filter(|entry| {
+            entry.sym.kind == SymbolKind::Function
+                || entry.sym.kind.is_type_like()
+                || (entry.sym.kind.is_value_like()
+                    && entry
+                        .sym
+                        .value_type
+                        .as_ref()
+                        .and_then(crate::members::function_type_signature)
+                        .is_some())
+        })
         .map(|entry| signature_for_entry(&entry))
         .collect::<Vec<_>>();
     signatures.sort_by(|a, b| a.label.cmp(&b.label));
@@ -59,9 +69,17 @@ pub fn signatures_for_entries(entries: Vec<Entry>, active_parameter: u32) -> Opt
 }
 
 pub fn signature_for_entry(entry: &Entry) -> Signature {
-    let params = entry
+    let (declared_params, return_type) = entry
         .sym
-        .params
+        .value_type
+        .as_ref()
+        .filter(|_| entry.sym.kind.is_value_like())
+        .and_then(crate::members::function_type_signature)
+        .map_or(
+            (entry.sym.params.as_slice(), entry.sym.return_type.as_ref()),
+            |(params, result)| (params, Some(result)),
+        );
+    let params = declared_params
         .iter()
         .enumerate()
         .map(|(idx, ty)| format!("p{}: {}", idx + 1, type_ref_label(ty)))
@@ -71,7 +89,7 @@ pub fn signature_for_entry(entry: &Entry) -> Signature {
     label.push('(');
     label.push_str(&params.join(", "));
     label.push(')');
-    if let Some(ret) = &entry.sym.return_type {
+    if let Some(ret) = return_type {
         if !ret.name.is_empty() {
             label.push_str(": ");
             label.push_str(&type_ref_label(ret));

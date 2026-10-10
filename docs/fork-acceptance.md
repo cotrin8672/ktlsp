@@ -1,6 +1,6 @@
 # Fork acceptance and evidence
 
-Updated: 2026-10-10 (Asia/Tokyo). Goal remains **in progress**.
+Updated: 2026-10-11 (Asia/Tokyo). Goal remains **in progress**.
 
 ## Scope
 
@@ -41,8 +41,8 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. First slice: 711 pass / 3 ignored. Fifth slice: 779 pass / 3 ignored across 31 suites | Current Rust suite verified | Root `rtk cargo test --workspace`, exit 0; original failures retained below |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Fifth immutable release passes basic 9, Java 99, features 80, semantic 18, mixed 36 and library 13, plus native completion UI in both languages | Six current scenarios verified | 255 assertions and two UI samples; library uses an actual compiled Gradle project with unchanged stdlib and thirteen expectations. Real-project acceptance continues |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Seventh immutable slice: 839 pass / 3 ignored across 33 suites | Seventh Rust suite verified | Root `rtk cargo test --workspace`, native exit 0 with an isolated cache; `seventh-fixed/cargo-workspace-isolated.{out,verified.json}`. All 90 Rust/build inputs match before/after tests and release compilation |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Fifth release passes basic 9, Java 99, features 80, semantic 18, mixed 36 and library 13, plus two native UI samples. Seventh passes Java 165/165, including all original 99 expectations and 66 member/unsaved-edit/rename assertions | Java current slice verified; broader rechecks continue | `ktlsp-semantic-gaps-20261010/member-editor-seventh/artifacts/`. Sixth's eight initial Java failures are repaired by immediate initial scanning; no harness sleep was added. Its legacy forced editor shutdown is not graceful-shutdown proof |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Copy resolves 101 materialized classpath entries; offline Kotlin/Java compile succeeds; broad Neovim hover/class-goto smoke passes | Partial | Broad scan also includes extracted Java outside Gradle source roots; class-goto smoke does not independently prove dependency attribution. Exact archive-backed probes, source scope, overrides, diagnostics and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -52,12 +52,112 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Not yet measured | Pending | Extend existing semantic/editor probes |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Baseline omits a Java generic-chain use and renamed snapshot fails compilation. Fixed release and adapted IDEA update all three exact semantic sites, preserve all three complete buffers and compile the renamed snapshot | Mixed fixture verified | Actual corpus, overloads, JVM facades, ambiguous names and extension-provided references remain pending |
-| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Fourth release full indexing exposes wrong nested-type targets and project/dependency version duplicates in Moshi and Retrofit; actual Gradle remapped project ownership also fails. Shared origin/module repair is under validation | Failing; repair in validation | Live baseline has 30/72 checks passing on one connection despite all four actual offline Java/Kotlin builds passing; library addition/update/removal and generated-source refresh still fail |
-| Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | No live classpath-refresh acceptance case verified | Pending | Build disposable versioned dependencies, keep the same LSP session, and verify new members/targets plus removal of obsolete facts; test watched-file/config invalidation without restarting |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Actual mixed Gradle compilation passes with serialization/all-open/no-arg/Kotlin Lombok and javac Lombok; fourth ktlsp fails all 12 generated-method completion requests. IDEA passes 9 literal method-label requests and inserts Kotlin's generated getter property through the native Neovim popup | Failing; reproduced | Compiler-positive/negative controls and exact accepted text are retained below. Plugin config/source refresh, diagnostics, navigation, KAPT and KSP remain unverified |
-| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | No extension mechanism validated | Pending | Prove smallest contract after ordinary semantic slice; test config/source invalidation |
+| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
+| Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Seventh native automatic watching passes 74/76: four actual builds, dependency/generated-source additions, updates, removals, exact targets, preserved dirty buffers and clean shutdown. Three native notification batches and zero explicit notifications. Two stale-member diagnostics remain failing | Partial; automatic refresh verified, diagnostics failing | `ktlsp-gradle-model-20261010/seventh-refresh-automatic/artifacts/`. Unchanged 76 expectations and hashes. Sixth manual 70/72 and automatic 29/76 remain preserved; external Windows Neovim watch roots still need coverage |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Sixth release passes all 144 real KAPT/KSP generated-source editor assertions: 30 first-response completions and six exact source definitions. IDEA passes the same 30 completions and 2/6 exact source targets. Actual v1/v2/restored builds each pass 12 runtime checks; disabled processing removes all three types and both compilers reject their uses. Fourth ktlsp still fails all 12 transformed-API completions | Partial; generated-source slice verified | Portable `processor_project.lua` and `processor-generated.json`; raw evidence below. Same-client processor/config refresh, processor diagnostics and transformed-API analysis remain unverified or failing |
+| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Public semantic-store contract passes 19 API tests, including identities, descriptor/static binding, publication and invalidation. Independent Mixin oracle has 42 cases. No editor host/consumer integration is validated | Pending integration | Prove enabled/disabled completion, diagnostics, navigation and applied rename through a separate consumer; API tests alone do not satisfy the boundary |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
+
+## Actual KAPT/KSP compile and runtime controls
+
+Root independently built real Java JSR-269/KAPT and Kotlin KSP processors using
+Gradle 7.4.2, Kotlin/KAPT 1.8.21, KSP 1.8.21-1.0.11 and JDK 17. They generate
+`KaptJava.java`, `KspJava.java` and `KspKotlin.kt`; the consumer calls all three
+from Java and Kotlin. No generated API was authored in an input stub. Evidence
+is under `C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/processor-oracle/evidence/`.
+The first offline setup attempt failed on unavailable plugin-marker metadata;
+that log is retained separately. The subsequent actual online build succeeds,
+including KSP, KAPT, Kotlin and Java compilation.
+
+Changing only the real generation option from v1 to v2 replaces `versionOne`
+with `versionTwo` in all three emitted APIs. Both builds exit 0 and each runtime
+control passes 12 assertions: six calls through the Java/Kotlin consumers, three
+present versioned methods and three absent obsolete methods. Sources and hashes
+are retained in `generated-api-v{1,2}` and their corresponding source JSON files.
+`processor-api-v{1,2}-build.{log,json}` and `runtime-api-v{1,2}.json` retain the
+compiler/runtime results. This is actual processor execution, not a model-only
+simulation.
+
+After `:app:clean :app:classes -PprocessingDisabled`, the expected Kotlin build
+failure names all three missing types. Gradle does not reach Java compilation,
+so a separate actual javac invocation checks the Java consumer and also rejects
+all three missing types. All three generated source files are absent.
+`processor-off-controls.json` records both exits and the six rejection/source
+controls. Re-enabling v1 processing rebuilds successfully, passes all 12 runtime
+assertions and reproduces all three original generated source hashes exactly;
+see `processor-restored-v1-build.{log,json}`, `runtime-restored-v1.json` and
+`generated-restored-v1-checks.json`.
+
+The earlier post-build model owns both KSP roots but omits KAPT's generated Java
+root (`processor-model-root-checks.json`, 2 pass / 1 fail). Reading public
+`JavaCompile.source` inputs repairs that omission. The actual updated Gradle 7
+dump owns all three generated files, while a modern Gradle 8.10.2 strict
+configuration-cache cold/warm control retains custom Java/Kotlin and processor
+roots, excludes a resource-file source decoy and avoids broadening to the whole
+project. Those 16 model checks pass in
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-gradle-model-20261010/model-input-proof.json`,
+with init-script SHA-256
+`df30f6b97bef288a0549e849189c103c4a556929555e68dd153c1dc002323130`.
+Root ownership derived from a filtered or exact-file JavaCompile FileTree can
+still be less precise than the compiler's file membership; that limitation
+remains explicit. Model version 3 invalidates older persisted model entries.
+
+The portable producer is `dev/processor_project.lua`, with the existing corpus
+route and `dev/corpus/processor-generated.json`. Root generated a fresh external
+`processor-portable-1` project, compiled all 11 real tasks successfully offline
+and passed its source-file Java runtime control (12/12). All 102 pinned source,
+generated-target and edit-anchor preflight assertions pass in
+`processor-portable-evidence-1/manifest-preflight.json` under the external goal
+directory. Its 24 editor cases require 30 useful/paired completion responses
+and six exact generated-source definitions.
+
+The immutable sixth release, SHA-256
+`fa0148d65badc1cb8e95683a5d7bb76a742795a75532afed07e6567be2bfdf90`,
+passes all 144 editor assertions against that fresh portable project. All 30
+completion requests and six exact generated-source definitions match on attempt
+1. All 36 edit/restore delivery controls pass, both authored consumer files are
+unchanged, the three shared harness hashes are stable, and the client stops.
+The index reports 7 project files and 14,308 library files, with zero failed
+dependencies or missing sources. Raw results and all 36 requests are under
+`processor-editor-ktlsp-sixth-1/artifacts/`; `wrapper-result.json` records exit 0.
+This verifies post-build generated-source editing. Normal same-client processor
+configuration/build refresh was still unmeasured at that post-build checkpoint.
+
+The subsequent `KTLSP_PROCESSOR_RELOAD=1` probe keeps one real client through
+v1, v2, disabled processing and restored v1. The three enabled actual builds
+exit 0 and each passes 12 runtime checks. Disabled compilation exits 1 with all
+three generated types unresolved; a separate javac control rejects all three,
+and their emitted source files are absent. All three native watched-file
+notification batches arrive, the current completion API and 24 exact source
+targets/proved removals pass, and restored source hashes equal the original
+three hashes. Authored disk files remain unchanged and the client exits cleanly.
+
+The whole run retains exit 1 and 97/114 passing assertions. Seventeen assertions
+fail: eight unsaved `Source.editorUnsaved` completions (already empty in phase 0,
+so not established as a refresh regression), six stale-member diagnostics and
+three Kotlin removed-type diagnostics. Refresh readiness uses 102 separate
+polling requests; its 60 acceptance requests must not be advertised as first
+responses after a build or as performance samples. Evidence is
+`processor-refresh-seventh-1/artifacts/processor-reload.json` and its wrapper
+record under the external goal directory. All four script hashes and the binary
+hash are unchanged. This is real processor execution and native watch delivery, but
+the remaining failures prevent complete processor editing acceptance.
+
+The official IntelliJ LSP plugin against that same portable project passes all
+30 completion requests on their first responses after successful Gradle import,
+including every incomplete and paired unknown case. Exact generated-source
+navigation passes 2/6: Kotlin to KSP Kotlin/Java sources. Kotlin to KAPT Java,
+and Java to all three APIs, instead return their compiled `.class` files. The
+original source-definition expectations are unchanged, so the run retains
+140 passing assertions and four failures, wrapper exit 1. Both queried source
+files are unchanged, all three harness scripts have matching before/after
+hashes, and the client reports stopped. Evidence is `processor-editor-intellij-1/`:
+`observations.json`, `wrapper-result.json`, and the complete corpus results and
+36 raw requests under `artifacts/`. This records the plugin's source-navigation
+limit rather than accepting a different target as the exact source. The wrapper
+finished in 39.8 seconds; an inherited child output pipe remains open in the
+command runner, so that observation is not a process-lifetime or latency claim.
 
 ## Compiler-plugin expectations and first independent control
 

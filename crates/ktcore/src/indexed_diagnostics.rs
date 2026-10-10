@@ -4,7 +4,6 @@
 //! index, so every diagnostic here is gated by explicit completeness facts.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
 
 use tree_sitter::{Node, Tree};
 
@@ -237,7 +236,8 @@ fn member_call_shape_query(
         index,
         &recv_ty,
         &symbol,
-        &Visibility::new(&ctx.package, &ctx.imports),
+        &infer::call_arguments(index, call, src, ctx),
+        ctx,
     );
     // Bind the receiver's type arguments into the candidates' parameter types, so a member
     // declared against a class-level type variable is checked against the actual receiver
@@ -389,43 +389,36 @@ fn member_call_entries(
     index: &dyn InferenceIndex,
     recv_ty: &Type,
     name: &str,
-    vis: &Visibility,
+    args: &crate::members::CallArguments,
+    ctx: &infer::FileCtx,
 ) -> Vec<Entry> {
-    let mut members: Vec<Entry> = Vec::new();
-    let mut extensions: Vec<Entry> = Vec::new();
-    let _ = infer::walk_supertypes(index, recv_ty, 32, |current| {
-        let Some(cur) = infer::receiver_root_key(index, current) else {
-            return ControlFlow::Continue(());
-        };
-        for e in index.members_of(&cur) {
-            if let Some(p) = current.package() {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            if e.sym.name == name && e.sym.kind == SymbolKind::Function {
-                members.push(e.clone());
-            }
-        }
-        for e in index.extensions_for(&cur) {
-            if e.sym.name == name
-                && e.sym.kind == SymbolKind::Function
-                && vis.is_visible(&e.sym.package, &e.sym.name)
-            {
-                extensions.push(e.clone());
-            }
-        }
-        for e in generic_receiver_extensions(index, name, vis) {
-            if e.sym.kind == SymbolKind::Function {
-                extensions.push(e.clone());
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    if !members.is_empty() {
-        members
+    let candidates = crate::members::candidates(index, recv_ty, name, ctx);
+    let selected = candidates.select(
+        index,
+        recv_ty,
+        &crate::members::MemberUse::Call(args.clone()),
+        ctx,
+    );
+    if !selected.entries.is_empty() {
+        return selected.entries.into_iter().cloned().collect();
+    }
+    // A rejected call still needs its declared signatures to explain a shape mismatch. A name's
+    // existence alone does not make any one of those signatures a navigation/inference result.
+    let own: Vec<_> = candidates
+        .members
+        .into_iter()
+        .filter(|entry| entry.sym.kind == SymbolKind::Function)
+        .cloned()
+        .collect();
+    if !own.is_empty() {
+        own
     } else {
-        extensions
+        candidates
+            .extensions
+            .into_iter()
+            .filter(|entry| entry.sym.kind == SymbolKind::Function)
+            .cloned()
+            .collect()
     }
 }
 
@@ -498,25 +491,6 @@ fn visible_durable_top_level_function(
     candidates.iter().any(|entry| {
         entry.tier == crate::index::Tier::Durable && star_pkgs.contains(&entry.sym.package)
     })
-}
-
-fn generic_receiver_extensions<'a>(
-    index: &'a dyn InferenceIndex,
-    name: &str,
-    vis: &Visibility,
-) -> Vec<&'a Entry> {
-    index
-        .lookup_by_name(name)
-        .iter()
-        .filter(|e| e.sym.kind == SymbolKind::Function && e.sym.container.is_none())
-        .filter(|e| {
-            e.sym
-                .ext_receiver
-                .as_deref()
-                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
-        })
-        .filter(|e| vis.is_visible(&e.sym.package, &e.sym.name))
-        .collect()
 }
 
 fn argument_type_mismatch_query(
@@ -845,37 +819,6 @@ fn uses_named_arguments(call: Node) -> bool {
     call.named_child(0)
         .filter(|child| child.kind() == "call_expression")
         .is_some_and(uses_named_arguments)
-}
-
-struct Visibility {
-    pkg: String,
-    star_pkgs: Vec<String>,
-    explicit_names: HashSet<String>,
-}
-
-impl Visibility {
-    fn new(pkg: &str, imports: &[crate::parser::Import]) -> Self {
-        Visibility {
-            pkg: pkg.to_string(),
-            star_pkgs: imports
-                .iter()
-                .filter(|i| i.wildcard)
-                .map(|i| i.package())
-                .collect(),
-            explicit_names: imports
-                .iter()
-                .filter(|i| !i.wildcard)
-                .filter_map(|i| i.local_name().map(str::to_string))
-                .collect(),
-        }
-    }
-
-    fn is_visible(&self, package: &str, name: &str) -> bool {
-        self.explicit_names.contains(name)
-            || package == self.pkg
-            || self.star_pkgs.iter().any(|p| p == package)
-            || resolve::is_default_import_pkg(package)
-    }
 }
 
 #[cfg(test)]

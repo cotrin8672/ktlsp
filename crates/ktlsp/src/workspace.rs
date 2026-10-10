@@ -41,6 +41,19 @@ struct ProjectFileIndex {
     symbols: Vec<IndexedSymbol>,
     usages: Vec<Usage>,
     clean: bool,
+    stamp: Option<SourceStamp>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
+    modified: std::time::SystemTime,
+    size: u64,
+}
+
+pub(crate) struct ModelSourceUpdate {
+    current: HashSet<String>,
+    batches: Vec<ProjectFileIndex>,
+    complete: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +79,11 @@ pub struct Workspace {
     project_scan_initialized: bool,
     project_model: Option<Arc<crate::classpath::ProjectSnapshot>>,
     global_origins: BTreeSet<String>,
+    source_stamps: HashMap<String, SourceStamp>,
+    completed_dependency_origins: BTreeSet<String>,
+    analysis_generation: u64,
+    live_dependency_origins: BTreeSet<String>,
+    project_refresh_pending: bool,
 }
 
 impl Default for Workspace {
@@ -87,6 +105,11 @@ impl Workspace {
             project_scan_initialized: false,
             project_model: None,
             global_origins: BTreeSet::new(),
+            source_stamps: HashMap::new(),
+            completed_dependency_origins: BTreeSet::new(),
+            analysis_generation: 0,
+            live_dependency_origins: BTreeSet::new(),
+            project_refresh_pending: false,
         }
     }
 
@@ -122,6 +145,53 @@ impl Workspace {
         self.open_docs.keys().cloned().collect()
     }
 
+    pub fn analysis_generation(&self) -> u64 {
+        self.analysis_generation
+    }
+
+    pub fn begin_analysis_generation(&mut self) -> u64 {
+        self.analysis_generation = self.analysis_generation.wrapping_add(1);
+        self.completeness.project_scan_complete = false;
+        self.completeness.library_index_complete = false;
+        self.project_refresh_pending = true;
+        self.bump_index_revision();
+        self.analysis_generation
+    }
+
+    pub fn is_current_generation(&self, generation: u64) -> bool {
+        self.analysis_generation == generation
+    }
+
+    pub fn project_snapshot(&self) -> Option<Arc<crate::classpath::ProjectSnapshot>> {
+        self.project_model.clone()
+    }
+
+    pub(crate) fn finish_analysis_generation(
+        &mut self,
+        generation: u64,
+        libraries: bool,
+        jdk: bool,
+    ) -> bool {
+        if !self.is_current_generation(generation) {
+            return false;
+        }
+        self.set_library_index_complete(libraries);
+        self.set_jdk_index_complete(jdk);
+        true
+    }
+
+    pub(crate) fn source_stamps(&self) -> HashMap<String, SourceStamp> {
+        self.source_stamps.clone()
+    }
+
+    pub(crate) fn dependency_origin_complete(&self, origin: &str) -> bool {
+        self.completed_dependency_origins.contains(origin)
+    }
+
+    pub(crate) fn complete_dependency_origin(&mut self, origin: String) {
+        self.completed_dependency_origins.insert(origin);
+    }
+
     pub fn set_project_model(&mut self, model: Arc<crate::classpath::ProjectSnapshot>) {
         self.index.replace_scope_visibilities(
             model.scope_visibilities(&self.global_origins.iter().cloned().collect::<Vec<_>>()),
@@ -142,6 +212,43 @@ impl Workspace {
                 .file_origin(Path::new(key))
                 .and_then(|origin| origin.project_scope);
         }
+        let active = model.live_origins();
+        let previous_revisions = self
+            .project_model
+            .as_ref()
+            .map(|model| model.artifact_revisions())
+            .unwrap_or_default();
+        let revisions = model.artifact_revisions();
+        let changed_origins: BTreeSet<_> = previous_revisions
+            .iter()
+            .filter(|(origin, revision)| {
+                active.contains(*origin) && revisions.get(*origin) != Some(*revision)
+            })
+            .map(|(origin, _)| origin.clone())
+            .collect();
+        self.live_dependency_origins = active.clone();
+        let removed: Vec<_> = self
+            .index
+            .file_origins()
+            .filter(|(key, origin)| {
+                is_dependency_origin(&origin.origin_id)
+                    && !origin.origin_id.starts_with("jdk:")
+                    && (!active.contains(&origin.origin_id)
+                        || changed_origins.contains(&origin.origin_id))
+                    && !self.open_docs.contains_key(*key)
+            })
+            .map(|(key, _)| key.to_string())
+            .collect();
+        for key in removed {
+            self.index.remove_file(&key);
+            self.salsa.forget(&key);
+            self.project_file_meta.remove(&key);
+        }
+        self.completed_dependency_origins.retain(|origin| {
+            self.global_origins.contains(origin)
+                || (active.contains(origin)
+                    && previous_revisions.get(origin) == revisions.get(origin))
+        });
         self.project_model = Some(model);
         self.bump_index_revision();
         self.recompute_project_completeness();
@@ -152,25 +259,24 @@ impl Workspace {
         let Some(model) = &self.project_model else {
             return 0;
         };
-        if !model.modules.iter().any(|m| !m.source_sets.is_empty()) {
-            if self.index.prune_origin_history() {
-                self.bump_index_revision();
+        let update = prepare_model_sources(model, &self.source_stamps);
+        self.apply_model_sources(update)
+    }
+
+    pub(crate) fn apply_model_sources(&mut self, update: ModelSourceUpdate) -> usize {
+        self.project_refresh_pending = false;
+        self.remove_obsolete_project_files(&update.current);
+        self.source_stamps
+            .retain(|key, _| update.current.contains(key));
+        let mut count = 0;
+        for batch in update.batches {
+            if let Some(stamp) = batch.stamp {
+                self.source_stamps.insert(batch.key.clone(), stamp);
             }
-            return 0;
-        }
-        let mut paths = registered_source_files(model);
-        let current: HashSet<_> = paths
-            .iter()
-            .map(|path| crate::paths::file_key(path))
-            .collect();
-        self.remove_obsolete_project_files(&current);
-        paths.retain(|path| {
-            let key = crate::paths::file_key(path);
-            !self.project_file_meta.contains_key(&key) && !self.open_docs.contains_key(&key)
-        });
-        let batches = parse_project_files(paths);
-        let count = batches.len();
-        for batch in batches {
+            if self.open_docs.contains_key(&batch.key) {
+                continue;
+            }
+            count += 1;
             if let Some(origin) = self
                 .project_model
                 .as_ref()
@@ -189,6 +295,7 @@ impl Workspace {
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
+            self.salsa.forget(&batch.key);
         }
         if count > 0 {
             self.bump_index_revision();
@@ -214,10 +321,26 @@ impl Workspace {
             }
         }
         self.recompute_project_completeness();
+        if !update.complete {
+            self.completeness.project_scan_complete = false;
+        }
         if self.index.prune_origin_history() {
             self.bump_index_revision();
         }
         count
+    }
+
+    pub(crate) fn install_project_update(
+        &mut self,
+        generation: u64,
+        model: Arc<crate::classpath::ProjectSnapshot>,
+        update: ModelSourceUpdate,
+    ) -> Option<usize> {
+        if !self.is_current_generation(generation) {
+            return None;
+        }
+        self.set_project_model(model);
+        Some(self.apply_model_sources(update))
     }
 
     fn remove_obsolete_project_files(&mut self, current: &HashSet<String>) {
@@ -238,6 +361,7 @@ impl Workspace {
                 self.salsa.forget(key);
             }
             self.project_file_meta.remove(key);
+            self.source_stamps.remove(key);
         }
         if !obsolete.is_empty() {
             self.bump_index_revision();
@@ -260,6 +384,15 @@ impl Workspace {
     }
 
     pub fn index_dependency_batch(&mut self, batch: crate::deps::FileSymbols) -> bool {
+        if self.project_model.is_some()
+            && batch.origin.as_ref().is_some_and(|origin| {
+                is_dependency_origin(&origin.origin_id)
+                    && !origin.origin_id.starts_with("jdk:")
+                    && !self.live_dependency_origins.contains(&origin.origin_id)
+            })
+        {
+            return false;
+        }
         if let Some(model) = &self.project_model {
             if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
                 if let Some(origin) = batch.origin {
@@ -277,6 +410,14 @@ impl Workspace {
             }
         }
         self.index_dependency_file(&batch.file, batch.symbols)
+    }
+
+    pub fn index_dependency_batch_for_generation(
+        &mut self,
+        generation: u64,
+        batch: crate::deps::FileSymbols,
+    ) -> bool {
+        self.is_current_generation(generation) && self.index_dependency_batch(batch)
     }
 
     /// Insert closed dependency facts under a normalized key, preserving authoritative open text.
@@ -375,10 +516,17 @@ impl Workspace {
     /// `textDocument/didClose`: drop the dirty buffer; re-sync the index from disk (or drop it).
     pub fn close(&mut self, key: &str) {
         self.open_docs.remove(key);
+        let inactive_dependency = self.index.file_origin(key).is_some_and(|origin| {
+            is_dependency_origin(&origin.origin_id)
+                && !origin.origin_id.starts_with("jdk:")
+                && self.project_model.is_some()
+                && !self.live_dependency_origins.contains(&origin.origin_id)
+        });
         if self.project_model.as_ref().is_some_and(|model| {
             model.modules.iter().any(|m| !m.source_sets.is_empty())
                 && model.file_origin(Path::new(key)).is_none()
         }) && self.index.file_origin(key).is_none()
+            || inactive_dependency
         {
             self.index.remove_file(key);
             self.salsa.forget(key);
@@ -411,6 +559,7 @@ impl Workspace {
     /// generated source roots and any files currently open (their dirty buffers are authoritative).
     /// Returns the count indexed.
     pub fn scan(&mut self, root: &Path) -> usize {
+        self.project_refresh_pending = false;
         let open_keys = self
             .open_docs
             .keys()
@@ -435,6 +584,9 @@ impl Workspace {
         self.project_scan_initialized = true;
         self.project_file_meta.clear();
         for batch in batches {
+            if let Some(stamp) = batch.stamp {
+                self.source_stamps.insert(batch.key.clone(), stamp);
+            }
             self.project_file_meta.insert(
                 batch.key.clone(),
                 ProjectFileMeta {
@@ -561,14 +713,15 @@ impl Workspace {
             self.index_revision,
             ExprKey::from_node(receiver),
         );
-        let hits = resolve::member_defs_for_type(
+        let member_use = resolve::member_use(&self.index.scoped_for_file(key), ident, text, &ctx);
+        let hits = resolve::member_defs_for_use(
             &self.index.scoped_for_file(key),
             &receiver_type,
             name,
-            &ctx.imports,
-            &ctx.package,
+            &member_use,
+            &ctx,
         );
-        if !hits.is_empty() {
+        if receiver_type.name().is_some() || !hits.is_empty() {
             return Some(hits);
         }
         let index = self.index.scoped_for_file(key);
@@ -1193,13 +1346,15 @@ impl Workspace {
         if !self.project_scan_initialized {
             return;
         }
-        self.completeness.project_scan_complete =
-            self.project_model
+        self.completeness.project_scan_complete = !self.project_refresh_pending
+            && self
+                .project_model
                 .as_ref()
                 .is_none_or(|model| model.modules.iter().any(|m| !m.source_sets.is_empty()))
-                && self.project_file_meta.values().all(|meta| {
-                    meta.clean && (self.project_model.is_none() || meta.scope.is_some())
-                });
+            && self
+                .project_file_meta
+                .values()
+                .all(|meta| meta.clean && (self.project_model.is_none() || meta.scope.is_some()));
         let mut clean_packages = BTreeSet::new();
         let mut dirty_packages = BTreeSet::new();
         let mut clean_scoped_packages = BTreeSet::new();
@@ -1626,17 +1781,59 @@ fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> 
 }
 
 fn parse_project_file(path: &Path, parsers: &mut LanguageParsers) -> Option<ProjectFileIndex> {
+    let stamp = source_stamp(path)?;
     let text = std::fs::read_to_string(path).ok()?;
     let language = SourceLanguage::for_project_path(path)?;
     let tree = parsers.parse(language, &text);
     let facts = language::file_facts(language, &tree, &text);
+    if source_stamp(path) != Some(stamp) {
+        return None;
+    }
     Some(ProjectFileIndex {
         key: crate::paths::file_key(path),
         package: facts.package,
         symbols: facts.symbols,
         usages: facts.usages,
         clean: facts.clean,
+        stamp: Some(stamp),
     })
+}
+
+fn source_stamp(path: &Path) -> Option<SourceStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(SourceStamp {
+        modified: metadata.modified().ok()?,
+        size: metadata.len(),
+    })
+}
+
+pub(crate) fn prepare_model_sources(
+    model: &crate::classpath::ProjectSnapshot,
+    known: &HashMap<String, SourceStamp>,
+) -> ModelSourceUpdate {
+    let paths = registered_source_files(model);
+    let current = paths
+        .iter()
+        .map(|path| crate::paths::file_key(path))
+        .collect();
+    let changed: Vec<_> = paths
+        .into_iter()
+        .filter(|path| {
+            let key = crate::paths::file_key(path);
+            source_stamp(path).is_none_or(|stamp| known.get(&key) != Some(&stamp))
+        })
+        .collect();
+    let expected = changed.len();
+    let batches = parse_project_files(changed);
+    ModelSourceUpdate {
+        current,
+        complete: batches.len() == expected,
+        batches,
+    }
+}
+
+fn is_dependency_origin(origin: &str) -> bool {
+    origin.starts_with("maven:") || origin.starts_with("file:") || origin.starts_with("jdk:")
 }
 
 fn project_index_threads() -> usize {
@@ -2004,6 +2201,174 @@ mod tests {
             assert_eq!(ws.index.lookup_by_name("GeneratedBufferState").len(), 1);
             assert_eq!(ws.doc_text(&key).as_deref(), Some("class BufferState\n"));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_refresh_updates_changed_closed_sources_and_preserves_dirty_buffers() {
+        let root = unique_tmp("model-refresh-sources");
+        let source = root.join("custom-generated");
+        std::fs::create_dir_all(&source).unwrap();
+        let java = source.join("Generated.java");
+        let kotlin = source.join("Generated.kt");
+        std::fs::write(&java, "class BeforeGenerated { Before reference; }").unwrap();
+        std::fs::write(&kotlin, "class KotlinDisk\n").unwrap();
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(
+            crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nEND\t:app\n",
+                root.display(),
+                source.display()
+            )),
+        ));
+        let mut ws = Workspace::new();
+        ws.set_project_model(model.clone());
+        assert_eq!(ws.scan_model_sources(), 2);
+        assert_eq!(
+            ws.scan_model_sources(),
+            0,
+            "unchanged files must not be reparsed"
+        );
+        let java_key = crate::paths::file_key(&java);
+        let kotlin_key = crate::paths::file_key(&kotlin);
+        assert!(ws
+            .index
+            .lookup_refs("Before")
+            .iter()
+            .any(|entry| entry.path.as_ref() == java_key));
+        std::fs::write(&java, "class AfterGeneratedUpdate { After reference; }").unwrap();
+        std::fs::write(&kotlin, "class KotlinDiskChanged\n").unwrap();
+        let update = prepare_model_sources(&model, &ws.source_stamps());
+        assert_eq!(update.batches.len(), 2);
+        // Opening a file after staging must still win over the background disk facts.
+        ws.open(kotlin_key.clone(), "class KotlinDirty\n".to_string());
+        let generation = ws.begin_analysis_generation();
+        assert_eq!(
+            ws.install_project_update(generation, model, update),
+            Some(1)
+        );
+        assert!(ws.index.lookup_type("BeforeGenerated").is_empty());
+        assert_eq!(ws.index.lookup_type("AfterGeneratedUpdate").len(), 1);
+        assert!(!ws
+            .index
+            .lookup_refs("Before")
+            .iter()
+            .any(|entry| entry.path.as_ref() == java_key));
+        assert_eq!(ws.index.lookup_type("KotlinDirty").len(), 1);
+        assert!(ws.index.lookup_type("KotlinDiskChanged").is_empty());
+        assert_eq!(ws.scan_model_sources(), 0);
+        std::fs::remove_file(&java).unwrap();
+        assert_eq!(ws.scan_model_sources(), 0);
+        assert!(ws.index.lookup_type("AfterGeneratedUpdate").is_empty());
+        assert!(!ws
+            .index
+            .lookup_refs("After")
+            .iter()
+            .any(|entry| entry.path.as_ref() == java_key));
+        ws.close(&kotlin_key);
+        assert!(ws.index.lookup_type("KotlinDirty").is_empty());
+        assert_eq!(ws.index.lookup_type("KotlinDiskChanged").len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_refresh_removes_inactive_libraries_and_rejects_stale_batches_and_readiness() {
+        use crate::project_model::{FileOrigin, SourceRepresentation};
+        let root = unique_tmp("model-refresh-library");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("api.jar"), b"first binary").unwrap();
+        let model = |version| {
+            Arc::new(crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t{version}\nEND\t:app\n",
+            root.display(), root.join("src").display(), root.join("api.jar").display(), root.join("api.jar").display()))))
+        };
+        let mut ws = Workspace::new();
+        ws.set_project_model(model("1"));
+        let old = ws.begin_analysis_generation();
+        let mut parsers = LanguageParsers::new();
+        let batch = |parsers: &mut LanguageParsers, key: &str, text: &str| {
+            let tree = parsers.parse_for_key(key, text);
+            crate::deps::FileSymbols {
+                file: key.to_string(),
+                symbols: language::file_facts(SourceLanguage::for_key(key), &tree, text).symbols,
+                origin: Some(FileOrigin {
+                    origin_id: "maven:vendor:api:1".to_string(),
+                    representation: SourceRepresentation::Source,
+                    project_scope: None,
+                }),
+            }
+        };
+        let closed = crate::paths::file_key(&root.join("cache/Closed.kt"));
+        let opened = crate::paths::file_key(&root.join("cache/Open.kt"));
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        std::fs::write(&opened, "package api\nclass OpenDisk\n").unwrap();
+        assert!(ws.index_dependency_batch_for_generation(
+            old,
+            batch(&mut parsers, &closed, "package api\nclass ClosedOld\n")
+        ));
+        assert!(ws.index_dependency_batch_for_generation(
+            old,
+            batch(&mut parsers, &opened, "package api\nclass OpenDisk\n")
+        ));
+        ws.open(opened.clone(), "package api\nclass OpenDirty\n".to_string());
+        ws.complete_dependency_origin("maven:vendor:api:1".to_string());
+        std::fs::write(
+            root.join("api.jar"),
+            b"updated binary with the same coordinate",
+        )
+        .unwrap();
+        ws.set_project_model(model("1"));
+        assert!(
+            ws.index.lookup_type("ClosedOld").is_empty(),
+            "changed binary kept its old source projection"
+        );
+        assert!(!ws.dependency_origin_complete("maven:vendor:api:1"));
+        assert_eq!(ws.index.lookup_type("OpenDirty").len(), 1);
+        assert!(ws.index_dependency_batch_for_generation(
+            old,
+            batch(&mut parsers, &closed, "package api\nclass ClosedOld\n")
+        ));
+        ws.complete_dependency_origin("maven:vendor:api:1".to_string());
+        let next = model("2");
+        let staged = prepare_model_sources(&next, &ws.source_stamps());
+        let generation = ws.begin_analysis_generation();
+        assert!(ws
+            .install_project_update(old, next.clone(), staged)
+            .is_none());
+        assert!(!ws.finish_analysis_generation(old, true, true));
+        assert!(!ws.completeness.library_index_complete);
+        assert!(
+            ws.index.lookup_type("ClosedOld").len() == 1,
+            "a rejected model changed the index"
+        );
+        let staged = prepare_model_sources(&next, &ws.source_stamps());
+        assert_eq!(ws.install_project_update(generation, next, staged), Some(0));
+        assert!(ws.index.lookup_type("ClosedOld").is_empty());
+        assert!(ws.index.file_origin(&closed).is_none());
+        assert_eq!(
+            ws.doc_text(&opened).as_deref(),
+            Some("package api\nclass OpenDirty\n")
+        );
+        assert_eq!(ws.index.lookup_type("OpenDirty").len(), 1);
+        assert!(!ws.dependency_origin_complete("maven:vendor:api:1"));
+        assert!(!ws.index_dependency_batch_for_generation(
+            old,
+            batch(&mut parsers, &closed, "package api\nclass ClosedOld\n")
+        ));
+        assert!(
+            !ws.index_dependency_batch_for_generation(
+                generation,
+                batch(&mut parsers, &closed, "package api\nclass ClosedOld\n")
+            ),
+            "a same-generation lazy result used an inactive snapshot"
+        );
+        ws.close(&opened);
+        assert!(ws.index.lookup_type("OpenDirty").is_empty());
+        assert!(
+            ws.index.lookup_type("OpenDisk").is_empty(),
+            "closing an inactive library resurrected old disk facts"
+        );
+        assert!(ws.finish_analysis_generation(generation, true, false));
+        assert!(ws.completeness.library_index_complete);
         std::fs::remove_dir_all(root).unwrap();
     }
 

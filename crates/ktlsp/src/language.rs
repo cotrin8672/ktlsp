@@ -259,7 +259,12 @@ pub fn signature_entries(
     match language {
         SourceLanguage::Kotlin => {
             let (callee, name, active_parameter) = crate::signature::call_at(tree, text, offset)?;
-            let entries = resolve::goto(index, file, text, tree, callee.start_byte())
+            let selector = if callee.kind() == "navigation_expression" {
+                callee.named_child(1).unwrap_or(callee)
+            } else {
+                callee
+            };
+            let entries = resolve::goto(index, file, text, tree, selector.start_byte())
                 .into_iter()
                 .filter_map(|def| {
                     hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
