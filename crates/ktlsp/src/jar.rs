@@ -26,13 +26,50 @@ fn open_archive(jar: &Path) -> anyhow::Result<zip::ZipArchive<io::Cursor<Vec<u8>
 
 /// Empty compatibility artifacts need no source definitions. Metadata and nested archives do not
 /// prove emptiness, and unreadable archives stay errors.
+/// Proof work is bounded to 50,000 entries and one 16 MiB descriptor; the compressed archive is
+/// still loaded in full by the shared archive reader.
 pub fn may_contain_definitions(jar: &Path) -> anyhow::Result<bool> {
     let mut archive = open_archive(jar)?;
+    if archive.len() > MAX_SOURCE_FILES {
+        return Ok(true);
+    }
+    let mut module = false;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
+        let mut entry = archive.by_index(index)?;
         let name = entry.name();
+        if name.ends_with(".class") {
+            if module
+                || !module_descriptor_path(name)
+                || entry.size() > ktcore::classfile::MAX_CLASS_FILE_BYTES as u64
+            {
+                return Ok(true);
+            }
+            let mut bytes = Vec::with_capacity(entry.size().min(8192) as usize);
+            entry
+                .by_ref()
+                .take(ktcore::classfile::MAX_CLASS_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .with_context(|| {
+                    format!(
+                        "read module descriptor {} from {}",
+                        entry.name(),
+                        jar.display()
+                    )
+                })?;
+            if bytes.len() > ktcore::classfile::MAX_CLASS_FILE_BYTES {
+                return Ok(true);
+            }
+            anyhow::ensure!(
+                bytes.len() as u64 == entry.size(),
+                "module descriptor size mismatch"
+            );
+            if !matches!(ktcore::classfile::is_requires_only_module(&bytes), Ok(true)) {
+                return Ok(true);
+            }
+            module = true;
+            continue;
+        }
         if [
-            ".class",
             ".kotlin_metadata",
             ".kotlin_module",
             ".kotlin_builtins",
@@ -48,6 +85,19 @@ pub fn may_contain_definitions(jar: &Path) -> anyhow::Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn module_descriptor_path(name: &str) -> bool {
+    if name == "module-info.class" {
+        return true;
+    }
+    name.strip_prefix("META-INF/versions/")
+        .and_then(|name| name.strip_suffix("/module-info.class"))
+        .is_some_and(|version| {
+            !version.starts_with('0')
+                && version.bytes().all(|ch| ch.is_ascii_digit())
+                && version.parse::<u16>().is_ok_and(|version| version >= 9)
+        })
 }
 
 /// Open an archive over bytes shared across shard workers — one allocation feeds every shard's
@@ -321,14 +371,197 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     fn write_jar(path: &Path, entries: &[(&str, &str)]) {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|(name, body)| (*name, body.as_bytes()))
+            .collect();
+        write_binary_jar(path, &entries);
+    }
+
+    fn write_binary_jar(path: &Path, entries: &[(&str, &[u8])]) {
         let file = fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts = SimpleFileOptions::default();
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (name, body) in entries {
             zip.start_file(*name, opts).unwrap();
-            zip.write_all(body.as_bytes()).unwrap();
+            zip.write_all(body).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn requires_only_selected_binaries_have_no_ordinary_definition_surface() {
+        let fixtures: &[(&str, &[u8])] = &[
+            (
+                "kotlin-stdlib-jdk7-1.8.21",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk7-1.8.21.jar"),
+            ),
+            (
+                "kotlin-stdlib-jdk8-1.8.21",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk8-1.8.21.jar"),
+            ),
+            (
+                "kotlin-stdlib-jdk7-2.4.0",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk7-2.4.0.jar"),
+            ),
+            (
+                "kotlin-stdlib-jdk8-2.4.0",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk8-2.4.0.jar"),
+            ),
+            (
+                "kotlinx-coroutines-jdk8-1.11.0",
+                include_bytes!("../tests/fixtures/module-only/kotlinx-coroutines-jdk8-1.11.0.jar"),
+            ),
+        ];
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_module_only_selected_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut possible = Vec::new();
+        for (name, bytes) in fixtures {
+            let path = root.join(format!("{name}.jar"));
+            fs::write(&path, bytes).unwrap();
+            if may_contain_definitions(&path).unwrap() {
+                possible.push(*name);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            possible.is_empty(),
+            "requires-only selected artifacts still treated as ordinary API: {possible:?}"
+        );
+    }
+
+    #[test]
+    fn module_only_classification_preserves_possible_definition_inputs() {
+        let module = include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/module-only/javac-empty-module.class"
+        )
+        .as_slice();
+        let plain = include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/module-only/ordinary-as-module-info.class"
+        )
+        .as_slice();
+        let root = std::env::temp_dir().join(format!("ktlsp_module_shapes_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.jar");
+        for name in ["module-info.class", "META-INF/versions/9/module-info.class"] {
+            write_binary_jar(&path, &[(name, module)]);
+            assert!(!may_contain_definitions(&path).unwrap(), "{name}");
+        }
+        for name in [
+            "demo/module-info.class",
+            "META-INF/versions/8/module-info.class",
+            "META-INF/versions/09/module-info.class",
+            "META-INF/versions/9/extra/module-info.class",
+        ] {
+            write_binary_jar(&path, &[(name, module)]);
+            assert!(may_contain_definitions(&path).unwrap(), "{name}");
+        }
+        for (name, bytes) in [
+            ("Plain.class", plain),
+            ("module-info.class", plain),
+            ("module-info.class", b"not a descriptor".as_slice()),
+        ] {
+            write_binary_jar(&path, &[(name, bytes)]);
+            assert!(may_contain_definitions(&path).unwrap(), "{name}");
+        }
+        for name in [
+            "Plain.class",
+            "META-INF/versions/9/module-info.class",
+            "native.knm",
+            "native.klib",
+            "code.kotlin_metadata",
+            "code.kotlin_module",
+            "code.kotlin_builtins",
+            "nested.jar",
+            "nested.zip",
+        ] {
+            write_binary_jar(&path, &[("module-info.class", module), (name, plain)]);
+            assert!(may_contain_definitions(&path).unwrap(), "{name}");
+        }
+        write_binary_jar(
+            &path,
+            &[
+                ("module-info.class", module),
+                ("META-INF/versions/9/module-info.class", module),
+            ],
+        );
+        assert!(
+            may_contain_definitions(&path).unwrap(),
+            "multiple descriptors stay unsupported"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn module_descriptor_io_errors_and_size_limits_are_conservative() {
+        let module = include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/module-only/javac-empty-module.class"
+        )
+        .as_slice();
+        let root = std::env::temp_dir().join(format!("ktlsp_module_io_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.jar");
+        write_binary_jar(&path, &[("module-info.class", module)]);
+        let valid = fs::read(&path).unwrap();
+        let start = valid
+            .windows(module.len())
+            .position(|bytes| bytes == module)
+            .unwrap();
+        let mut bad_crc = valid.clone();
+        bad_crc[start + module.len() - 1] ^= 1;
+        fs::write(&path, bad_crc).unwrap();
+        let error = may_contain_definitions(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").to_lowercase().contains("checksum"),
+            "{error:#}"
+        );
+        fs::write(&path, &valid[..valid.len() - 20]).unwrap();
+        assert!(may_contain_definitions(&path).is_err());
+        let central = valid
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        let mut forged_size = valid;
+        forged_size[central + 24..central + 28]
+            .copy_from_slice(&(ktcore::classfile::MAX_CLASS_FILE_BYTES as u32 + 1).to_le_bytes());
+        fs::write(&path, forged_size).unwrap();
+        assert!(may_contain_definitions(&path).unwrap());
+        write_binary_jar(
+            &path,
+            &[(
+                "module-info.class",
+                &vec![0; ktcore::classfile::MAX_CLASS_FILE_BYTES + 1],
+            )],
+        );
+        assert!(may_contain_definitions(&path).unwrap());
+        let mut false_hint = fs::read(&path).unwrap();
+        let central = false_hint
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        false_hint[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&path, false_hint).unwrap();
+        assert!(
+            may_contain_definitions(&path).unwrap(),
+            "observed size is bounded even when the declared size is small"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excessive_archive_entries_cannot_prove_emptiness() {
+        let root = std::env::temp_dir().join(format!("ktlsp_module_work_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.jar");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        for index in 0..=MAX_SOURCE_FILES {
+            zip.start_file(format!("res/{index}"), SimpleFileOptions::default())
+                .unwrap();
+        }
+        zip.finish().unwrap();
+        assert!(may_contain_definitions(&path).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

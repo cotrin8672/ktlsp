@@ -77,6 +77,37 @@ class Main {
 }
 
 #[test]
+fn java_signature_help_keeps_receiver_overloads_while_arguments_are_being_edited() {
+    for call in ["greet(\"Ada\", 2)", "this.greet(\"Ada\", 2)"] {
+        let mut ws = Workspace::new();
+        let key = "mem:///Main.java";
+        let src = format!(
+            "package app; class Main {{ String greet(String name) {{ return name; }} String greet(String name, int count) {{ return name; }} int greet(boolean flag) {{ return 0; }} void run() {{ {call}; }} }}"
+        );
+        ws.open(key, src.clone());
+        ws.open(
+            "mem:///Decoy.java",
+            "package app; class Decoy { boolean greet(String name, int first, int second) { return false; } }".into(),
+        );
+        let help = ws
+            .signature_help(key, src.find("2);").unwrap())
+            .expect("receiver overload signatures");
+        let labels: Vec<_> = help
+            .signatures
+            .iter()
+            .map(|sig| sig.label.as_str())
+            .collect();
+        assert_eq!(labels.len(), 2, "{call}: {help:?}");
+        assert!(labels.contains(&"greet(p1: String): String"), "{help:?}");
+        assert!(
+            labels.contains(&"greet(p1: String, p2: int): String"),
+            "{help:?}"
+        );
+        assert_eq!(help.active_parameter, Some(1));
+    }
+}
+
+#[test]
 fn java_signature_help_returns_constructor_signature() {
     let mut ws = Workspace::new();
     let key = "mem:///Main.java".to_string();

@@ -837,8 +837,43 @@ do
   end
 end
 
--- A method rename must preserve its interface contract, both language callers and overloads.
-do
+-- Applied method renames must preserve interface contracts and hidden static dispatch.
+for _, case in ipairs({
+  {
+    directory = "renamecase", target = "Provider.java", anchor = "void assist()", renamed_anchor = "void support()",
+    files = { "Contract.java", "Provider.java", "Unrelated.java", "JavaUse.java", "KotlinUse.kt" },
+    replacements = {
+      ["Contract.java"] = { { "assist%(%)", "support()" } },
+      ["Provider.java"] = { { "void assist%(%)", "void support()" } },
+      ["JavaUse.java"] = { { "provider%.assist%(%)", "provider.support()" }, { "contract%.assist%(%)", "contract.support()" } },
+      ["KotlinUse.kt"] = { { "provider%.assist%(%)", "provider.support()" }, { "contract%.assist%(%)", "contract.support()" } },
+    },
+    sites = {
+      { "Contract.java", "void assist()" }, { "Provider.java", "void assist()" },
+      { "JavaUse.java", "provider.assist()" }, { "JavaUse.java", "contract.assist()" },
+      { "KotlinUse.kt", "provider.assist()" }, { "KotlinUse.kt", "contract.assist()" },
+    },
+    count = 6, label = "override rename", kotlin_call = "provider.support()",
+    sites_label = "override rename includes both declarations and four Java/Kotlin calls",
+    goto_label = "renamed Kotlin call navigates to current implementation", snapshot = "override-rename-snapshots.json",
+  },
+  {
+    directory = "barecase", target = "Child.java", anchor = "int assist()", renamed_anchor = "int support()",
+    files = { "Base.java", "Child.java", "Decoy.java", "JavaUse.java", "KotlinUse.kt" },
+    replacements = {
+      ["Child.java"] = { { "int assist%(%)", "int support()" }, { "return assist%(%)", "return support()" } },
+      ["JavaUse.java"] = { { "Child%.assist%(%)", "Child.support()" } },
+      ["KotlinUse.kt"] = { { "Child%.assist%(%)", "Child.support()" } },
+    },
+    sites = {
+      { "Child.java", "int assist()" }, { "Child.java", "return assist()" },
+      { "JavaUse.java", "Child.assist()" }, { "KotlinUse.kt", "Child.assist()" },
+    },
+    count = 4, label = "static bare rename", bare_call = "return assist()", kotlin_call = "Child.support()",
+    sites_label = "static bare rename includes declaration, bare call and Java/Kotlin calls",
+    goto_label = "renamed Kotlin static call navigates to current implementation", snapshot = "static-bare-rename-snapshots.json",
+  },
+}) do
   local probe = dofile(vim.fn.getcwd() .. "/dev/nvim_lsp_probe.lua")
   if arg[3] then probe.outside_project(project, arg[3]) end
   local files, by_path, delivered = {}, {}, {}
@@ -851,8 +886,8 @@ do
     end
     return original_notify(method, params)
   end
-  for _, name in ipairs({ "Contract.java", "Provider.java", "Unrelated.java", "JavaUse.java", "KotlinUse.kt" }) do
-    local path = project .. "/renamecase/" .. name
+  for _, name in ipairs(case.files) do
+    local path = project .. "/" .. case.directory .. "/" .. name
     local buffer = vim.fn.bufadd(path)
     vim.fn.bufload(buffer)
     vim.bo[buffer].filetype = name:match("%.kt$") and "kotlin" or "java"
@@ -862,33 +897,32 @@ do
     file.disk = vim.fn.readfile(path)
     file.expected = vim.deepcopy(file.before)
     for line, text in ipairs(file.expected) do
-      if name == "Contract.java" then
-        text = text:gsub("assist%(%)", "support()")
-      elseif name == "Provider.java" then
-        text = text:gsub("void assist%(%)", "void support()")
-      elseif name == "JavaUse.java" or name == "KotlinUse.kt" then
-        text = text:gsub("provider%.assist%(%)", "provider.support()")
-          :gsub("contract%.assist%(%)", "contract.support()")
+      for _, replacement in ipairs(case.replacements[name] or {}) do
+        text = text:gsub(replacement[1], replacement[2])
       end
       file.expected[line] = text
     end
     files[#files + 1] = file
     by_path[probe.path_key(path)] = file
   end
-  local provider = by_path[probe.path_key(project .. "/renamecase/Provider.java")]
-  local position = probe.find(provider.before, "void assist()", "assist")
+  local provider = by_path[probe.path_key(project .. "/" .. case.directory .. "/" .. case.target)]
+  local position, target_range = probe.find(provider.before, case.anchor, "assist")
+  if case.bare_call then
+    local bare_position = probe.find(provider.before, case.bare_call, "assist")
+    local target = client:request_sync("textDocument/definition", {
+      textDocument = { uri = provider.uri }, position = bare_position,
+    }, 5000, provider.buffer)
+    check("bare Java call resolves to hidden static declaration",
+      probe.exact_definition(target and target.result, provider.path, { target_range }), vim.inspect(target))
+  end
   local result = client:request_sync("textDocument/rename", {
     textDocument = { uri = provider.uri }, position = position, newName = "support",
   }, 5000, provider.buffer)
   local edit = result and result.result
   local safe, count, sites = type(edit) == "table", 0, {}
   local expected_sites = {}
-  for _, site in ipairs({
-    { "Contract.java", "void assist()" }, { "Provider.java", "void assist()" },
-    { "JavaUse.java", "provider.assist()" }, { "JavaUse.java", "contract.assist()" },
-    { "KotlinUse.kt", "provider.assist()" }, { "KotlinUse.kt", "contract.assist()" },
-  }) do
-    local file = by_path[probe.path_key(project .. "/renamecase/" .. site[1])]
+  for _, site in ipairs(case.sites) do
+    local file = by_path[probe.path_key(project .. "/" .. case.directory .. "/" .. site[1])]
     local _, range = probe.find(file.before, site[2], "assist")
     expected_sites[probe.location_key(file.uri, range)] = true
   end
@@ -917,18 +951,18 @@ do
       if canonical then normalized.documentChanges[index].textDocument.uri = canonical end
     else safe = false end
   end
-  safe = safe and count == 6
-  check("override rename includes both declarations and four Java/Kotlin calls", safe, vim.inspect(result))
+  safe = safe and count == case.count
+  check(case.sites_label, safe, vim.inspect(result))
   local applied, message = false, "unsafe or incomplete edits"
   if safe then
     applied, message = pcall(vim.lsp.util.apply_workspace_edit, normalized, client.offset_encoding)
     applied = applied and message ~= false
   end
-  check("override rename applies in Neovim", applied, tostring(message))
+  check(case.label .. " applies in Neovim", applied, tostring(message))
   local snapshots = { request = result, files = {}, applied = applied }
   for _, file in ipairs(files) do
     local actual = vim.api.nvim_buf_get_lines(file.buffer, 0, -1, false)
-    check("override rename preserves exact " .. file.name, vim.deep_equal(actual, file.expected), vim.inspect(actual))
+    check(case.label .. " preserves exact " .. file.name, vim.deep_equal(actual, file.expected), vim.inspect(actual))
     snapshots.files[file.name] = { before = file.before, expected = file.expected, actual = actual }
   end
   require("vim.lsp._changetracking").flush(client)
@@ -937,31 +971,31 @@ do
     if not vim.deep_equal(file.before, file.expected) then
       local sent = delivered[probe.path_key(file.path)]
       local text = table.concat(file.expected, "\n") .. (vim.bo[file.buffer].eol and "\n" or "")
-      check("override rename changes delivered for " .. file.name, sent ~= nil and #sent.changes == 1
+      check(case.label .. " changes delivered for " .. file.name, sent ~= nil and #sent.changes == 1
         and sent.changes[1].range == nil and sent.changes[1].text == text, vim.inspect(sent))
     end
   end
   if applied then
-    local use = by_path[probe.path_key(project .. "/renamecase/KotlinUse.kt")]
+    local use = by_path[probe.path_key(project .. "/" .. case.directory .. "/KotlinUse.kt")]
     local current = vim.api.nvim_buf_get_lines(use.buffer, 0, -1, false)
-    local cursor = probe.find(current, "provider.support()", "support")
+    local cursor = probe.find(current, case.kotlin_call, "support")
     local target = client:request_sync("textDocument/definition", {
       textDocument = { uri = use.uri }, position = cursor,
     }, 5000, use.buffer)
-    local _, range = probe.find(provider.expected, "void support()", "support")
-    check("renamed Kotlin call navigates to current implementation",
+    local _, range = probe.find(provider.expected, case.renamed_anchor, "support")
+    check(case.goto_label,
       probe.exact_definition(target and target.result, provider.path, { range }), vim.inspect(target))
   else
-    check("renamed Kotlin call navigates to current implementation", false, "rename was not safely applied")
+    check(case.goto_label, false, "rename was not safely applied")
   end
   for _, file in ipairs(files) do
     vim.api.nvim_buf_set_lines(file.buffer, 0, -1, false, file.before)
-    check("override rename leaves disk unchanged for " .. file.name, vim.deep_equal(vim.fn.readfile(file.path), file.disk))
+    check(case.label .. " leaves disk unchanged for " .. file.name, vim.deep_equal(vim.fn.readfile(file.path), file.disk))
   end
   require("vim.lsp._changetracking").flush(client)
   client.rpc.notify = original_notify
   if arg[3] then
-    vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/override-rename-snapshots.json")
+    vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/" .. case.snapshot)
   end
 end
 

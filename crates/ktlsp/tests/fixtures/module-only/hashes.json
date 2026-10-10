@@ -1,0 +1,27 @@
+[
+  {
+    "file": "kotlin-stdlib-jdk7-1.8.21.jar",
+    "bytes": 963,
+    "sha256": "33d148db0e11debd0d90677d28242bced907f9c77730000fd597867089039d86"
+  },
+  {
+    "file": "kotlin-stdlib-jdk7-2.4.0.jar",
+    "bytes": 946,
+    "sha256": "5072265564b6b0296f9c7b21fee65edee760c5697436f5ae7427033fa58fc034"
+  },
+  {
+    "file": "kotlin-stdlib-jdk8-1.8.21.jar",
+    "bytes": 968,
+    "sha256": "3db752a30074f06ee6c57984aa6f27da44f4d2bbc7f5442651f6988f1cb2b7d7"
+  },
+  {
+    "file": "kotlin-stdlib-jdk8-2.4.0.jar",
+    "bytes": 952,
+    "sha256": "d96b4e297136b8a4b2b88c1adcdc64d92e90d52a417e4315cdcf964adede8aa2"
+  },
+  {
+    "file": "kotlinx-coroutines-jdk8-1.11.0.jar",
+    "bytes": 1018,
+    "sha256": "1238f179da55360725ec49b887225317f31ae89bd29b652cbe139ff59f5d45cb"
+  }
+]

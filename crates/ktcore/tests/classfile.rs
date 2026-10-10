@@ -1,4 +1,6 @@
-use ktcore::classfile::{decode, ClassFileFacts, MemberFacts, MAX_CLASS_FILE_BYTES};
+use ktcore::classfile::{
+    decode, is_requires_only_module, ClassFileFacts, MemberFacts, MAX_CLASS_FILE_BYTES,
+};
 use ktcore::jvm::InputIdentity;
 
 const PERSON: &[u8] = include_bytes!("fixtures/classfile/pluginfixture/Person.class");
@@ -359,4 +361,227 @@ fn corruptions_of_compiler_metadata_return_without_panicking() {
             }
         }
     }
+}
+
+#[test]
+fn requires_only_module_matches_independent_jdk17_oracle() {
+    macro_rules! case {
+        ($file:literal, $expected:expr) => {
+            (
+                $file,
+                include_bytes!(concat!("fixtures/classfile/module-only/", $file)).as_slice(),
+                $expected,
+            )
+        };
+    }
+    for (name, bytes, expected) in [
+        case!("kotlin-stdlib-jdk7-1.8.21.class", true),
+        case!("kotlin-stdlib-jdk8-1.8.21.class", true),
+        case!("kotlin-stdlib-jdk7-2.4.0.class", true),
+        case!("kotlin-stdlib-jdk8-2.4.0.class", true),
+        case!("kotlinx-coroutines-jdk8-1.11.0.class", true),
+        case!("javac-empty-module.class", true),
+        case!("zero-requires-version.class", true),
+        case!("ordinary-as-module-info.class", false),
+        case!("zero-member-interface.class", false),
+        case!("wrong-class-flags.class", false),
+        case!("extra-class-flags.class", false),
+        case!("old-class-version.class", false),
+        case!("invalid-module-name-index.class", false),
+        case!("wrong-module-name-tag.class", false),
+        case!("forged-module-class-name.class", false),
+        case!("invalid-empty-module-payload.class", false),
+        case!("invalid-module-payload-trailing.class", false),
+        case!("duplicate-module-attribute.class", false),
+        case!("truncated-module.class", false),
+    ] {
+        let result = is_requires_only_module(bytes);
+        assert_eq!(matches!(result, Ok(true)), expected, "{name}: {result:?}");
+    }
+    let bytes = include_bytes!("fixtures/classfile/module-only/javac-empty-module.class");
+    assert_eq!(bytes.len(), 160);
+    for end in 0..bytes.len() {
+        assert!(
+            !matches!(is_requires_only_module(&bytes[..end]), Ok(true)),
+            "prefix={end}"
+        );
+    }
+}
+
+// Flat trust-boundary inputs supplement the compiler/JDK fixtures; they are not an oracle.
+fn module_class(payload: &[u16], attributes: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 61, 0, 17];
+    for (index, text) in [
+        "module-info",
+        "",
+        "Module",
+        "oracle.empty",
+        "",
+        "java.base",
+        "",
+        "SourceFile",
+        "module-info.java",
+        "RuntimeVisibleAnnotations",
+        "Lfixture/Marker;",
+        "RuntimeInvisibleAnnotations",
+        "FutureAttribute",
+        "other.module",
+        "",
+        "",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match index + 1 {
+            2 => bytes.extend_from_slice(&[7, 0, 1]),
+            5 => bytes.extend_from_slice(&[19, 0, 4]),
+            7 | 16 => bytes.extend_from_slice(&[19, 0, 6]),
+            15 => bytes.extend_from_slice(&[19, 0, 14]),
+            _ => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(text.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(text.as_bytes());
+            }
+        }
+    }
+    bytes.extend_from_slice(&[0x80, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&(1 + attributes.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(&[0, 3]);
+    bytes.extend_from_slice(&(payload.len() as u32 * 2).to_be_bytes());
+    for word in payload {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    for (name, payload) in attributes {
+        bytes.extend_from_slice(&name.to_be_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+    }
+    bytes
+}
+
+const REQUIRES_BASE: &[u16] = &[5, 0, 0, 1, 7, 0x8000, 0, 0, 0, 0, 0];
+
+#[test]
+fn module_tables_indexes_versions_and_flags_must_be_proven() {
+    assert!(is_requires_only_module(&module_class(REQUIRES_BASE, &[])).unwrap());
+    for (word, value) in [
+        (0, 0),
+        (0, 2),
+        (1, 1),
+        (2, 2),
+        (3, u16::MAX),
+        (4, 0),
+        (4, 2),
+        (4, 5),
+        (4, 15),
+        (5, 0),
+        (5, 0x0020),
+        (6, 2),
+        (7, 1),
+        (8, 1),
+        (9, 1),
+        (10, 1),
+    ] {
+        let mut words = REQUIRES_BASE.to_vec();
+        words[word] = value;
+        let result = is_requires_only_module(&module_class(&words, &[]));
+        assert!(
+            !matches!(result, Ok(true)),
+            "word {word}={value}: {result:?}"
+        );
+    }
+    for words in [
+        vec![5, 0, 0, 0, 0, 0, 0, 0], // missing java.base
+        vec![5, 0, 0, 2, 7, 0x8000, 0, 16, 0x8000, 0, 0, 0, 0, 0], // aliases, same name
+        vec![5, 0, 0, 2, 7, 0x8000, 0, 15, 0x0040, 0, 0, 0, 0, 0], // unsupported flags
+    ] {
+        assert!(!matches!(
+            is_requires_only_module(&module_class(&words, &[])),
+            Ok(true)
+        ));
+    }
+    let versions = [5, 0, 9, 2, 7, 0x8000, 9, 15, 0x0020, 0, 0, 0, 0, 0];
+    assert!(is_requires_only_module(&module_class(&versions, &[])).unwrap());
+    let bytes = module_class(REQUIRES_BASE, &[]);
+    for (offset, value) in [(4, 255), (7, 62)] {
+        // preview/future versions
+        let mut changed = bytes.clone();
+        changed[offset] = value;
+        assert!(!matches!(is_requires_only_module(&changed), Ok(true)));
+    }
+}
+
+#[test]
+fn module_known_attributes_require_exact_typed_marker_payloads() {
+    assert!(is_requires_only_module(&module_class(
+        REQUIRES_BASE,
+        &[
+            (8, &[0, 9]),
+            (10, &[0, 1, 0, 11, 0, 0]),
+            (12, &[0, 1, 0, 11, 0, 0]),
+        ]
+    ))
+    .unwrap());
+    for (name, payload) in [
+        (8, &[0][..]),
+        (8, &[0, 0]),
+        (8, &[0, 2]),
+        (8, &[0, 9, 0]),
+        (10, &[255, 255]),
+        (10, &[0, 1, 0, 11, 0]),
+        (10, &[0, 1, 0, 11, 0, 0, 0]),
+        (10, &[0, 1, 0, 11, 0, 1]),
+        (10, &[0, 1, 0, 0, 0, 0]),
+        (10, &[0, 1, 0, 2, 0, 0]),
+        (10, &[0, 1, 0, 9, 0, 0]),
+        (13, &[]),
+    ] {
+        let result = is_requires_only_module(&module_class(REQUIRES_BASE, &[(name, payload)]));
+        assert!(
+            !matches!(result, Ok(true)),
+            "attribute {name} {payload:?}: {result:?}"
+        );
+    }
+    assert!(!matches!(
+        is_requires_only_module(&module_class(REQUIRES_BASE, &[(8, &[0, 9]), (8, &[0, 9])])),
+        Ok(true)
+    ));
+}
+
+#[test]
+fn module_unused_pool_references_and_input_bounds_cannot_prove_emptiness() {
+    let bytes = module_class(REQUIRES_BASE, &[]);
+    let unused = bytes.windows(3).rposition(|b| b == [19, 0, 6]).unwrap();
+    for (offset, value) in [(unused, 20), (unused + 2, 255)] {
+        let mut changed = bytes.clone();
+        changed[offset] = value;
+        assert!(!matches!(is_requires_only_module(&changed), Ok(true)));
+    }
+    let mut changed = bytes.clone();
+    let utf8 = changed
+        .windows(b"Lfixture/Marker;".len())
+        .position(|b| b == b"Lfixture/Marker;")
+        .unwrap();
+    changed[utf8..utf8 + 3].copy_from_slice(&[0xed, 0xa0, 0x80]);
+    assert!(is_requires_only_module(&changed).is_err());
+    let mut forged = bytes[..10].to_vec();
+    forged[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+    assert!(is_requires_only_module(&forged).is_err());
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(is_requires_only_module(&trailing).is_err());
+    assert!(is_requires_only_module(&vec![0; MAX_CLASS_FILE_BYTES + 1]).is_err());
+
+    let mut repeated = module_class(REQUIRES_BASE, &[]);
+    let at = repeated
+        .windows(b"oracle.empty".len())
+        .position(|b| b == b"oracle.empty")
+        .unwrap();
+    repeated[at - 2..at].copy_from_slice(&60_000u16.to_be_bytes());
+    repeated.splice(at..at + b"oracle.empty".len(), vec![b'x'; 60_000]);
+    let pool_end = repeated.windows(3).rposition(|b| b == [19, 0, 6]).unwrap() + 3;
+    repeated.splice(pool_end..pool_end, (0..512).flat_map(|_| [19, 0, 4]));
+    repeated[8..10].copy_from_slice(&529u16.to_be_bytes());
+    let error = is_requires_only_module(&repeated).unwrap_err().to_string();
+    assert!(error.contains("metadata text budget"), "{error}");
 }

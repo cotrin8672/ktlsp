@@ -52,23 +52,7 @@ pub struct MemberFacts {
 /// Text processing is limited to sixteen times the input length, including repeated pool uses.
 pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
     ensure!(!origin_id.is_empty(), "classfile origin is empty");
-    ensure!(
-        bytes.len() <= MAX_CLASS_FILE_BYTES,
-        "classfile exceeds metadata size limit"
-    );
-    ensure!(bytes.len() >= 10, "truncated classfile header");
-    // Even the shortest constant-pool entry consumes three bytes. Check before Noak allocates its
-    // u16-sized pool, so a ten-byte forged header cannot request a full constant-pool allocation.
-    let pool_count = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
-    ensure!(
-        pool_count.saturating_sub(1) <= (bytes.len() - 10) / 3,
-        "truncated constant pool"
-    );
-    let class = Class::new(bytes).context("classfile structure")?;
-    ensure!(
-        class.buffer_size() == bytes.len(),
-        "trailing classfile bytes"
-    );
+    let class = read_class(bytes)?;
     let mut strings = Strings {
         pool: class.pool(),
         values: HashMap::new(),
@@ -167,6 +151,163 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
     })
 }
 
+/// Prove only a narrow, requires-only module descriptor has no ordinary declarations.
+///
+/// `false` or an error is inconclusive. This is not a module graph reader or compiler-producer
+/// closure proof. Unsupported attributes, tables, versions, and constant-pool tags stay unknown.
+pub fn is_requires_only_module(bytes: &[u8]) -> Result<bool> {
+    let class = read_class(bytes)?;
+    if class.access_flags().bits() != 0x8000
+        || !(53..=61).contains(&class.version().major)
+        || class.version().minor != 0
+        || class.super_class().is_some()
+        || class.interfaces().into_iter().next().is_some()
+        || class.fields().into_iter().next().is_some()
+        || class.methods().into_iter().next().is_some()
+    {
+        return Ok(false);
+    }
+    let mut strings = Strings {
+        pool: class.pool(),
+        values: HashMap::new(),
+        remaining_text_work: bytes.len() * 16,
+    };
+    if strings.class_name(class.this_class())?.as_ref() != "module-info" {
+        return Ok(false);
+    }
+    // Validate even unused references; accepting the header alone is not an emptiness proof.
+    for (index, item) in class.pool().iter_indices() {
+        match item {
+            cpool::Item::Utf8(_) => {
+                let text = strings.get(cpool::Index::new(index.as_u16())?)?;
+                strings.charge(text.len())?;
+            }
+            cpool::Item::Class(_) => {
+                strings.class_name(cpool::Index::new(index.as_u16())?)?;
+            }
+            cpool::Item::Module(_) => {
+                strings.module_name(index.as_u16())?;
+            }
+            _ => return Ok(false),
+        }
+    }
+    let mut names = HashSet::new();
+    let mut module = false;
+    for attribute in class.attributes() {
+        let attribute = attribute?;
+        let name = strings.get(attribute.name())?;
+        strings.charge(name.len())?;
+        if !names.insert(name.clone()) {
+            return Ok(false);
+        }
+        match name.as_ref() {
+            "Module" => {
+                if !requires_only(&mut strings, attribute.content())? {
+                    return Ok(false);
+                }
+                module = true;
+            }
+            "SourceFile" => {
+                let hint = strings.attribute_string(attribute.content())?;
+                strings.charge(hint.len())?;
+            }
+            "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations" => {
+                if !marker_annotations(&mut strings, attribute.content())? {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(module)
+}
+
+fn read_class(bytes: &[u8]) -> Result<Class<'_>> {
+    ensure!(
+        bytes.len() <= MAX_CLASS_FILE_BYTES,
+        "classfile exceeds metadata size limit"
+    );
+    ensure!(bytes.len() >= 10, "truncated classfile header");
+    // Check before Noak allocates its u16-sized pool from an untrusted header.
+    let pool_count = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+    ensure!(
+        pool_count.saturating_sub(1) <= (bytes.len() - 10) / 3,
+        "truncated constant pool"
+    );
+    let class = Class::new(bytes).context("classfile structure")?;
+    ensure!(
+        class.buffer_size() == bytes.len(),
+        "trailing classfile bytes"
+    );
+    Ok(class)
+}
+
+fn take_u16(input: &mut &[u8]) -> Result<u16> {
+    let (word, rest) = input
+        .split_first_chunk::<2>()
+        .context("truncated module metadata")?;
+    *input = rest;
+    Ok(u16::from_be_bytes(*word))
+}
+
+fn requires_only(strings: &mut Strings<'_, '_>, mut input: &[u8]) -> Result<bool> {
+    let length = input.len();
+    let name = strings.module_name(take_u16(&mut input)?)?;
+    if name.as_ref() == "java.base" || take_u16(&mut input)? != 0 {
+        return Ok(false);
+    }
+    strings.optional_utf8(take_u16(&mut input)?)?;
+    let count = take_u16(&mut input)? as usize;
+    ensure!(
+        length == 16 + 6 * count,
+        "invalid requires-only Module length"
+    );
+    let mut required = HashSet::new();
+    let mut base = false;
+    for _ in 0..count {
+        let dependency = strings.module_name(take_u16(&mut input)?)?;
+        let flags = take_u16(&mut input)?;
+        strings.optional_utf8(take_u16(&mut input)?)?;
+        if dependency == name || !required.insert(dependency.clone()) {
+            return Ok(false);
+        }
+        if dependency.as_ref() == "java.base" {
+            if flags != 0x8000 {
+                return Ok(false);
+            }
+            base = true;
+        } else if !matches!(flags, 0 | 0x0020) {
+            return Ok(false);
+        }
+    }
+    // Noak's typed Require rejects legal version index 0 and does not enforce exact consumption.
+    for _ in 0..4 {
+        if take_u16(&mut input)? != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(base && input.is_empty())
+}
+
+fn marker_annotations(strings: &mut Strings<'_, '_>, mut input: &[u8]) -> Result<bool> {
+    let count = take_u16(&mut input)? as usize;
+    ensure!(input.len() == count * 4, "invalid marker annotation length");
+    for _ in 0..count {
+        let index = cpool::Index::new(take_u16(&mut input)?)?;
+        let descriptor = strings.get(index)?;
+        strings.charge(descriptor.len())?;
+        let ty = TypeDescriptor::parse(strings.pool.retrieve(index)?)?;
+        validate_type_name(&ty)?;
+        if ty.dimensions != 0
+            || !matches!(ty.base, BaseType::Object(_))
+            || take_u16(&mut input)? != 0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(input.is_empty())
+}
+
 // Intern by constant-pool index: repeated references to a large UTF8 item must not multiply its
 // allocation by the number of members/attributes in an otherwise small classfile.
 struct Strings<'pool, 'input> {
@@ -197,6 +338,34 @@ impl<'input> Strings<'_, 'input> {
         self.charge(name.len())?;
         ensure!(internal_name(&name), "invalid JVM internal class name");
         Ok(name)
+    }
+
+    fn module_name(&mut self, index: u16) -> Result<Arc<str>> {
+        let module = self
+            .pool
+            .get(cpool::Index::<cpool::Module<'input>>::new(index)?)?;
+        let name = self.get(module.name)?;
+        self.charge(name.len())?;
+        // shortcut: escaped/non-ASCII module names need a full module-name reader before admission.
+        ensure!(
+            name.split('.').all(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphabetic())
+                    && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+            }),
+            "unsupported module name"
+        );
+        Ok(name)
+    }
+
+    fn optional_utf8(&mut self, index: u16) -> Result<()> {
+        if index != 0 {
+            let value = self.get(cpool::Index::new(index)?)?;
+            self.charge(value.len())?;
+        }
+        Ok(())
     }
 
     fn charge(&mut self, bytes: usize) -> Result<()> {

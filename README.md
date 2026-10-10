@@ -198,6 +198,9 @@ Its override rename probe applies all related interface/implementation and Java/
 compares five complete buffers, preserves unrelated methods and overloads, and checks fresh goto.
 `artifacts/override-rename-snapshots.json` retains original, expected and actually applied source;
 the declaration-only rename regression is a failure even if its edit list is nonempty.
+The same probe checks a hidden static method and its bare Java call, applies all four declaration/
+Java/Kotlin edits, and preserves the parent and an unrelated same-name method. Its complete
+buffers and delivered changes are retained in `artifacts/static-bare-rename-snapshots.json`.
 The harness also runs with native Windows Neovim through Git Bash and selects `.exe` binaries.
 
 `library` compiles a disposable Gradle 9.6.1 / Kotlin plugin 2.4.0 project with stdlib 2.2.20 pinned,

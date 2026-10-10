@@ -51,3 +51,60 @@ NUL and a supplementary character. The decoder does not interpret the constant's
 The decoder is a metadata reader, not a JVM verifier, compiler-producer closure proof, or an editor
 integration. SourceFile attributes are filename hints, never fabricated source ranges. Freshness,
 module visibility, language-specific callability, and source mappings require separate evidence.
+
+## Requires-only module controls
+
+`module-only/` contains 19 small classfiles (3,431 bytes total). Five are exact
+`META-INF/versions/9/module-info.class` entries extracted from the published binary JARs:
+
+| Artifact | Versions |
+| --- | --- |
+| `org.jetbrains.kotlin:kotlin-stdlib-jdk7` | 1.8.21, 2.4.0 |
+| `org.jetbrains.kotlin:kotlin-stdlib-jdk8` | 1.8.21, 2.4.0 |
+| `org.jetbrains.kotlinx:kotlinx-coroutines-jdk8` | 1.11.0 |
+
+The matching source-JAR declarations are preserved in `sources/module-only/<artifact-version>/`.
+The upstream projects are [Kotlin](https://github.com/JetBrains/kotlin) and
+[kotlinx.coroutines](https://github.com/Kotlin/kotlinx.coroutines), copyright JetBrains and their
+contributors, licensed under Apache 2.0. `module-only/LICENSE-APACHE-2.0.txt` preserves that license.
+`module-only/provenance.json` records the exact binary/source Maven URLs and SHA256 values, each
+classfile's SHA256, and the independent JDK 17 `ModuleDescriptor.read` result. To recover the five
+exact published classfiles, download those hash-pinned JARs and extract the named entry without
+recompiling or modifying it. Whole binary JAR controls are separately preserved under
+`crates/ktlsp/tests/fixtures/module-only/`.
+
+The other inputs start from these repository-authored sources, compiled separately with javac 17:
+
+```sh
+javac --release 17 -d /new/temp/module sources/module-only/javac/module-info.java
+javac --release 17 -d /new/temp/ordinary sources/module-only/javac/Plain.java sources/module-only/javac/Empty.java
+```
+
+`javac-empty-module.class` is the emitted module descriptor; `ordinary-as-module-info.class` and
+`zero-member-interface.class` are the unmodified `Plain.class` and `Empty.class`, with fixture
+filenames chosen to defeat filename/header-only classification. The remaining mutations of the
+module descriptor are listed below. Offsets refer to the parsed class header or Module payload,
+not fixed byte positions. Update outer attribute lengths/counts when changing payloads.
+
+| Fixture | Mutation |
+| --- | --- |
+| `wrong-class-flags` | Replace class flags with zero. |
+| `extra-class-flags` | Replace class flags with `0x8001`. |
+| `old-class-version` | Set major version to 52. |
+| `invalid-module-name-index` | Set Module's name index to zero. |
+| `wrong-module-name-tag` | Set Module's name index to the header's Class index. |
+| `zero-requires-version` | Set the first requires-version index to zero (valid). |
+| `forged-module-class-name` | Replace the UTF8 `module-info` with `module-infX`. |
+| `invalid-empty-module-payload` | Remove the complete Module payload. |
+| `invalid-module-payload-trailing` | Append a zero byte inside the Module payload. |
+| `duplicate-module-attribute` | Append a second copy of the Module attribute. |
+| `truncated-module` | Remove the classfile's last byte. |
+
+The independent JDK oracle accepted seven inputs and rejected twelve; all 160 strict prefixes of
+the javac module descriptor were also rejected. The requires-only helper deliberately supports a
+smaller subset than the JVM: versions 53–61, requires flags observed in these artifacts, zero
+exports/opens/uses/provides, SourceFile, and generic zero-pair marker annotations. Other shapes stay
+inconclusive. In particular, legal zero version indexes must work, while trailing payload bytes
+must not become an emptiness proof. Tests need no installed JVM. This classification establishes
+ordinary declaration absence for a verified selected artifact; it supplies no module graph or
+compiler-plugin closure proof.

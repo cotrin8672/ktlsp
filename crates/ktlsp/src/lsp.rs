@@ -1242,27 +1242,36 @@ fn project_watchers(
     relative: bool,
 ) -> Vec<FileSystemWatcher> {
     use std::collections::BTreeSet;
+    let root_key = crate::paths::file_key(root);
     let mut patterns = BTreeSet::from([
         (
-            crate::paths::file_key(root),
+            root_key.clone(),
             "**/*.{gradle,gradle.kts,toml,jar}".to_string(),
         ),
         (
-            crate::paths::file_key(root),
+            root_key.clone(),
             "**/{gradle.properties,gradle-wrapper.properties}".to_string(),
         ),
     ]);
     if let Some(model) = model {
+        let mut workspace_files = false;
         for module in &model.modules {
             for source in &module.source_sets {
                 for directory in &source.source_roots {
-                    patterns.insert((
-                        crate::paths::file_key(directory),
-                        "**/*.{kt,kts,java}".to_string(),
-                    ));
+                    let directory = crate::paths::file_key(directory);
+                    if path_is_under(&directory, &root_key) {
+                        workspace_files = true;
+                    } else {
+                        patterns.insert((directory, "**/*.{kt,kts,java}".to_string()));
+                    }
                 }
                 for directory in &source.output_roots {
-                    patterns.insert((crate::paths::file_key(directory), "**/*".to_string()));
+                    let directory = crate::paths::file_key(directory);
+                    if path_is_under(&directory, &root_key) {
+                        workspace_files = true;
+                    } else {
+                        patterns.insert((directory, "**/*".to_string()));
+                    }
                 }
             }
         }
@@ -1270,6 +1279,9 @@ fn project_watchers(
             for artifact in
                 std::iter::once(jar.clone()).chain(classpath::adjacent_sources_jar(&jar))
             {
+                if path_is_under(&crate::paths::file_key(&artifact), &root_key) {
+                    continue;
+                }
                 if let (Some(parent), Some(name)) = (
                     artifact.parent(),
                     artifact.file_name().and_then(|name| name.to_str()),
@@ -1277,6 +1289,11 @@ fn project_watchers(
                     patterns.insert((crate::paths::file_key(parent), glob_literal(name)));
                 }
             }
+        }
+        if workspace_files {
+            // Thousands of same-base globs exhaust some clients; project_change filters events.
+            patterns.retain(|(directory, _)| directory != &root_key);
+            patterns.insert((root_key, "**/*".to_string()));
         }
     }
     patterns
@@ -4028,6 +4045,112 @@ mod tests {
     }
 
     #[test]
+    fn requires_only_selected_binaries_succeed_without_ordinary_sources_cold_and_warm() {
+        use std::io::Write;
+        let fixtures: &[(&str, &[u8])] = &[
+            (
+                "kotlin-stdlib-jdk7-1.8.21",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk7-1.8.21.jar"),
+            ),
+            (
+                "kotlin-stdlib-jdk8-1.8.21",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk8-1.8.21.jar"),
+            ),
+            (
+                "kotlin-stdlib-jdk7-2.4.0",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk7-2.4.0.jar"),
+            ),
+            (
+                "kotlin-stdlib-jdk8-2.4.0",
+                include_bytes!("../tests/fixtures/module-only/kotlin-stdlib-jdk8-2.4.0.jar"),
+            ),
+            (
+                "kotlinx-coroutines-jdk8-1.11.0",
+                include_bytes!("../tests/fixtures/module-only/kotlinx-coroutines-jdk8-1.11.0.jar"),
+            ),
+        ];
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_requires_only_workers_{}",
+            std::process::id()
+        ));
+        let repos = crate::artifacts::Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "https://example.invalid".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, bytes) in fixtures {
+            let coord = crate::coords::Coordinate {
+                group: "fixture".into(),
+                artifact: "empty".into(),
+                version: (*name).into(),
+            };
+            let artifact_dir = repos.m2.join("fixture/empty").join(name);
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let binary = root.join(format!("{name}.jar"));
+            std::fs::write(&binary, bytes).unwrap();
+            for with_sources in [false, true] {
+                if with_sources {
+                    let sources = root.join(format!("{name}-sources.jar"));
+                    let mut archive = zip::ZipWriter::new(std::fs::File::create(&sources).unwrap());
+                    archive
+                        .start_file("module-info.java", zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    archive.write_all(b"module fixture.empty {}").unwrap();
+                    archive.finish().unwrap();
+                    std::fs::copy(
+                        &sources,
+                        artifact_dir.join(format!("empty-{name}-sources.jar")),
+                    )
+                    .unwrap();
+                }
+                for _ in 0..2 {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    spawn_coordinate_index_worker(
+                        coord.clone(),
+                        repos.clone(),
+                        root.join("maven-extracted"),
+                        Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                        true,
+                        vec![(binary.clone(), classpath::file_origin_id(&binary))],
+                        tx,
+                    );
+                    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        !result.failed
+                            && !result.skipped
+                            && !result.missing_source
+                            && result.batches.is_empty(),
+                        "{name}, sources={with_sources}"
+                    );
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    spawn_local_jar_index_worker(
+                        binary.clone(),
+                        classpath::file_origin_id(&binary),
+                        root.join("local-extracted"),
+                        tx,
+                    );
+                    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        !result.failed
+                            && !result.skipped
+                            && !result.missing_source
+                            && result.batches.is_empty(),
+                        "{name}, sources={with_sources}"
+                    );
+                    assert_eq!(
+                        result.local_origin,
+                        Some(classpath::file_origin_id(&binary))
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn missing_sources_require_a_verified_empty_authoritative_binary() {
         use std::io::Write;
         let root = std::env::temp_dir().join(format!(
@@ -4218,6 +4341,126 @@ mod tests {
     }
 
     #[test]
+    fn workspace_watch_registration_is_bounded_for_large_source_models() {
+        let temp =
+            std::env::temp_dir().join(format!("ktlsp_watch_large_model_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let root = crate::paths::file_key(&temp);
+        let mut dump = format!("PROJECT\t:app\t{root}\n");
+        // Cardinalities from the real Gradle corpus registration that exhausted Neovim memory.
+        for n in 0..4869 {
+            dump.push_str(&format!("SOURCE\tmain\t{root}/sources/module-{n}/src\n"));
+        }
+        for n in 0..3925 {
+            dump.push_str(&format!(
+                "OUTPUT\tmain\t{root}/outputs/module-{n}/classes\n"
+            ));
+        }
+        dump.push_str("END\t:app\n");
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&dump));
+        assert_eq!(model.modules[0].source_sets[0].source_roots.len(), 4869);
+        assert_eq!(model.modules[0].source_sets[0].output_roots.len(), 3925);
+        for (path, expected) in [
+            ("sources/module-0/src/Example.java", Some(false)),
+            ("sources/module-4868/src/Generated.kt", Some(false)),
+            ("outputs/module-0/classes/New.class", Some(true)),
+            (
+                "outputs/module-3924/classes/META-INF/plugin.inventory",
+                Some(true),
+            ),
+            ("build.gradle.kts", Some(true)),
+            ("nested/libs/version.jar", Some(true)),
+            ("nested/libs/version-sources.jar", Some(true)),
+            ("gradle/wrapper/gradle-wrapper.properties", Some(true)),
+            ("gradle/libs.versions.toml", Some(true)),
+            ("sources/module-0/src-other/Decoy.java", None),
+            ("outputs/module-0/classes-other/Decoy.class", None),
+            ("src/test/resources/Fake.kt", None),
+            ("docs/readme.txt", None),
+        ] {
+            assert_eq!(
+                project_change(&temp, Some(&model), &format!("{root}/{path}")),
+                expected,
+                "{path}"
+            );
+        }
+        for relative in [false, true] {
+            let watches = project_watchers(&temp, Some(&model), relative);
+            assert_eq!(watches.len(), 1, "relative={relative}");
+            assert!(
+                watches[0].kind.is_none(),
+                "create/change/delete all remain watched"
+            );
+            match &watches[0].glob_pattern {
+                GlobPattern::String(pattern) => {
+                    assert!(!relative);
+                    assert_eq!(pattern, &format!("{}/**/*", glob_literal(&root)));
+                }
+                GlobPattern::Relative(pattern) => {
+                    assert!(relative);
+                    assert_eq!(pattern.pattern, "**/*");
+                    assert!(matches!(
+                        &pattern.base_uri,
+                        OneOf::Right(uri) if uri_to_key(uri).as_deref() == Some(root.as_str())
+                    ));
+                }
+            }
+            assert!(serde_json::to_vec(&watches).unwrap().len() < 1024);
+        }
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn workspace_watch_without_internal_sources_keeps_its_boundary() {
+        let temp =
+            std::env::temp_dir().join(format!("ktlsp_watch_model_boundary_{}", std::process::id()));
+        let root = temp.join("workspace");
+        let sibling = temp.join("workspace-sibling");
+        for path in [&root, &sibling.join("sources"), &sibling.join("classes")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let root_key = crate::paths::file_key(&root);
+        let sibling_key = crate::paths::file_key(&sibling);
+        let empty = classpath::ProjectSnapshot::new(Vec::new());
+        for model in [None, Some(&empty)] {
+            let watches = project_watchers(&root, model, true);
+            assert_eq!(watches.len(), 2);
+            assert!(watches.iter().all(|watch| matches!(
+                &watch.glob_pattern,
+                GlobPattern::Relative(pattern) if pattern.pattern != "**/*"
+            )));
+        }
+        let internal = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{root_key}\nSOURCE\tmain\t{root_key}/future-source\nSCP\tmain\t{root_key}/libs/vendor.jar\nEND\t:app\n"
+        )));
+        assert_eq!(internal.local_jars().len(), 1);
+        assert_eq!(project_watchers(&root, Some(&internal), true).len(), 1);
+        let external = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{root_key}\nSOURCE\tmain\t{sibling_key}/sources\nOUTPUT\tmain\t{sibling_key}/classes\nSCP\tmain\t{sibling_key}/vendor.jar\nEND\t:app\n"
+        )));
+        let watches = project_watchers(&root, Some(&external), true);
+        assert_eq!(watches.len(), 6);
+        for (base, pattern) in [
+            (format!("{sibling_key}/sources"), "**/*.{kt,kts,java}"),
+            (format!("{sibling_key}/classes"), "**/*"),
+            (sibling_key.clone(), "vendor.jar"),
+            (sibling_key.clone(), "vendor-sources.jar"),
+        ] {
+            assert!(
+                watches.iter().any(|watch| matches!(
+                    &watch.glob_pattern,
+                    GlobPattern::Relative(watch) if watch.pattern == pattern && matches!(
+                        &watch.base_uri,
+                        OneOf::Right(uri) if uri_to_key(uri).as_deref() == Some(base.as_str())
+                    )
+                )),
+                "{base}/{pattern}"
+            );
+        }
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn watched_project_changes_cover_actual_custom_inputs_and_outputs() {
         let temp = std::env::temp_dir().join(format!("ktlsp_watch_inputs_{}", std::process::id()));
         let root_key = crate::paths::file_key(&temp.join("workspace"));
@@ -4308,21 +4551,44 @@ mod tests {
 
     #[test]
     fn automatic_watches_cover_new_roots_from_a_bounded_existing_ancestor() {
-        let root =
+        let temp =
             std::env::temp_dir().join(format!("ktlsp_watch_new_root_{}", std::process::id()));
+        let root = temp.join("workspace");
         std::fs::create_dir_all(&root).unwrap();
         let generated = root.join("future [exact]/generated");
         let output = root.join("future [exact]/classes");
+        let external = temp.join("external/future [exact]");
         let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nEND\t:app\n",
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nEND\t:app\n",
             root.display(),
             generated.display(),
-            output.display()
+            output.display(),
+            external.join("generated").display(),
+            external.join("classes").display()
         )));
         let watches = project_watchers(&root, Some(&model), true);
+        assert_eq!(watches.len(), 3);
+        assert!(watches.iter().any(|watch| matches!(
+            &watch.glob_pattern,
+            GlobPattern::Relative(pattern) if pattern.pattern == "**/*" && matches!(
+                &pattern.base_uri,
+                OneOf::Right(uri) if uri_to_key(uri).as_deref() == Some(crate::paths::file_key(&root).as_str())
+            )
+        )));
+        for (file, force) in [
+            (generated.join("New.java"), false),
+            (output.join("plugin.inventory"), true),
+            (external.join("generated/New.kt"), false),
+            (external.join("classes/New.class"), true),
+        ] {
+            assert_eq!(
+                project_change(&root, Some(&model), &crate::paths::file_key(&file)),
+                Some(force)
+            );
+        }
         for required in [
-            r"future \[exact\]/generated/**/*.{kt,kts,java}",
-            r"future \[exact\]/classes/**/*",
+            r"external/future \[exact\]/generated/**/*.{kt,kts,java}",
+            r"external/future \[exact\]/classes/**/*",
         ] {
             assert!(
                 watches.iter().any(|watch| match &watch.glob_pattern {
@@ -4331,7 +4597,7 @@ mod tests {
                             && match &pattern.base_uri {
                                 OneOf::Right(uri) =>
                                     uri_to_key(uri).as_deref()
-                                        == Some(crate::paths::file_key(&root).as_str()),
+                                        == Some(crate::paths::file_key(&temp).as_str()),
                                 _ => false,
                             },
                     _ => false,
@@ -4344,7 +4610,7 @@ mod tests {
         let absent = drive.join(format!("ktlsp-never-created-{}", std::process::id()));
         assert!(!absent.exists());
         assert!(project_watchers(&absent, None, true).is_empty());
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[cfg(windows)]

@@ -377,7 +377,30 @@ run_classpath_config_cache_probe() {
 
 write_java_project() {
   local project="$projects/java"
-  mkdir -p "$project/app" "$project/support" "$project/renamecase"
+  mkdir -p "$project/app" "$project/support" "$project/renamecase" "$project/barecase"
+  cat > "$project/barecase/Base.java" <<'JAVA'
+package barecase;
+public class Base { public static int assist() { return 1; } }
+JAVA
+  cat > "$project/barecase/Child.java" <<'JAVA'
+package barecase;
+public class Child extends Base {
+    public static int assist() { return 2; }
+    public static int run() { return assist(); }
+}
+JAVA
+  cat > "$project/barecase/Decoy.java" <<'JAVA'
+package barecase;
+public class Decoy { public static int assist() { return 3; } }
+JAVA
+  cat > "$project/barecase/JavaUse.java" <<'JAVA'
+package barecase;
+public class JavaUse { public static int run() { return Child.assist(); } }
+JAVA
+  cat > "$project/barecase/KotlinUse.kt" <<'KOTLIN'
+package barecase
+fun runKt(): Int = Child.assist()
+KOTLIN
   cat > "$project/renamecase/Contract.java" <<'JAVA'
 package renamecase;
 public interface Contract { void assist(); }

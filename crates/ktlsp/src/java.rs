@@ -1134,17 +1134,14 @@ fn java_call_entries_with_imports(
 ) -> Vec<Entry> {
     let explicit_call =
         call.kind() == "method_invocation" && call.child_by_field_name("object").is_some();
-    let defs = if explicit_call {
-        let Some(receiver) = receiver_type(
-            index,
-            file,
-            src,
-            tree,
-            call.child_by_field_name("object").unwrap(),
-        ) else {
-            return Vec::new();
-        };
-        jvm_call_candidates(index, file, src, tree, call, &receiver, symbol)
+    let mut arguments = java_call_arguments(index, file, src, tree, call);
+    // Keep alternative arities for signature help and shape diagnostics while typing arguments.
+    arguments.count = None;
+    let member_call =
+        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments);
+    let resolved_member_call = member_call.is_some();
+    let defs = if let Some(selection) = member_call {
+        selection
             .candidates
             .into_iter()
             .filter_map(|candidate| match candidate {
@@ -1152,25 +1149,17 @@ fn java_call_entries_with_imports(
                 _ => None,
             })
             .collect()
+    } else if explicit_call {
+        return Vec::new();
     } else {
         goto_definition_with_imports(index, file, src, tree, name.start_byte(), package, imports)
     };
-    let mut seeds = defs
+    let seeds = defs
         .into_iter()
         .filter_map(|def| {
             hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
         })
         .collect::<Vec<_>>();
-    if call.kind() == "method_invocation" && call.child_by_field_name("object").is_none() {
-        if let Some(container) = enclosing_type_name(name, src) {
-            seeds.extend(java_member_entries(
-                index,
-                &Type::class(container, Some(package.to_string())),
-                symbol,
-                SymbolKind::Function,
-            ));
-        }
-    }
     let mut entries = if call.kind() == "object_creation_expression" {
         constructor_entries_for_call(index, symbol, seeds)
     } else {
@@ -1179,7 +1168,7 @@ fn java_call_entries_with_imports(
             .filter(|entry| entry.sym.kind == SymbolKind::Function)
             .collect::<Vec<_>>()
     };
-    if !explicit_call {
+    if !resolved_member_call {
         expand_java_overloads(index, symbol, &mut entries);
     }
     entries.sort_by(|a, b| {
@@ -2378,40 +2367,29 @@ fn receiver_member_defs(
     let start = std::time::Instant::now();
     let parent = usage.parent()?;
     let kind = parent.kind();
+    if kind == "method_invocation" && parent.child_by_field_name("name") == Some(usage) {
+        if let Some(selection) = java_member_call_candidates(index, file, src, tree, parent) {
+            return Some(
+                selection
+                    .navigation_candidates()
+                    .iter()
+                    .filter_map(|candidate| candidate.definition())
+                    .collect(),
+            );
+        }
+        return parent.child_by_field_name("object").map(|_| Vec::new());
+    }
     let object = match kind {
         "field_access" if parent.child_by_field_name("field") == Some(usage) => {
-            parent.child_by_field_name("object")
-        }
-        "method_invocation" if parent.child_by_field_name("name") == Some(usage) => {
             parent.child_by_field_name("object")
         }
         _ => None,
     }?;
     let name = node_text(usage, src);
-    let expected_kind = match kind {
-        "field_access" => Some(SymbolKind::Property),
-        "method_invocation" => Some(SymbolKind::Function),
-        _ => None,
-    }?;
     let Some(recv) = receiver_type(index, file, src, tree, object) else {
         return Some(Vec::new());
     };
-    if kind == "method_invocation" {
-        let candidates = jvm_call_candidates(index, file, src, tree, parent, &recv, name);
-        return Some(
-            candidates
-                .navigation_candidates()
-                .iter()
-                .filter_map(|candidate| candidate.definition())
-                .collect(),
-        );
-    }
-    let members = java_member_entries(index, &recv, name, expected_kind);
-    let members = if kind == "method_invocation" {
-        narrow_java_entries_by_call_arity(src, parent, members)
-    } else {
-        members
-    };
+    let members = java_member_entries(index, &recv, name, SymbolKind::Property);
     let mut defs = members
         .iter()
         .map(|entry| Def {
@@ -2623,23 +2601,50 @@ fn receiver_type_from_type_identifier(
     )
 }
 
-fn jvm_call_candidates<'a>(
+fn java_member_call_candidates<'a>(
     index: &'a dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
     call: Node<'_>,
-    receiver: &Type,
-    name: &str,
-) -> ktcore::jvm::CallSelection<'a> {
-    ktcore::jvm::select_call(
+) -> Option<ktcore::jvm::CallSelection<'a>> {
+    java_member_call_candidates_with_arguments(
         index,
-        receiver,
-        ktcore::jvm::member_candidates(index, receiver, name),
-        name,
+        file,
+        src,
+        tree,
+        call,
         &java_call_arguments(index, file, src, tree, call),
-        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
     )
+}
+
+fn java_member_call_candidates_with_arguments<'a>(
+    index: &'a dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+    arguments: &ktcore::members::CallArguments,
+) -> Option<ktcore::jvm::CallSelection<'a>> {
+    if call.kind() != "method_invocation" {
+        return None;
+    }
+    let name = node_text(call.child_by_field_name("name")?, src);
+    let object = call.child_by_field_name("object");
+    let receiver = match object {
+        Some(object) => receiver_type(index, file, src, tree, object)?,
+        None => Type::class(enclosing_type_name(call, src)?, Some(package_of(tree, src))),
+    };
+    let selection = ktcore::jvm::select_call(
+        index,
+        &receiver,
+        ktcore::jvm::member_candidates(index, &receiver, name),
+        name,
+        arguments,
+        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+    );
+    // An absent implicit member leaves the existing import/name lookup available.
+    (object.is_some() || !selection.candidates.is_empty()).then_some(selection)
 }
 
 fn java_call_arguments(
@@ -2708,16 +2713,7 @@ pub fn jvm_member_at(
     if call.kind() != "method_invocation" || call.child_by_field_name("name") != Some(usage) {
         return None;
     }
-    let receiver = receiver_type(index, file, src, tree, call.child_by_field_name("object")?)?;
-    let candidates = jvm_call_candidates(
-        index,
-        file,
-        src,
-        tree,
-        call,
-        &receiver,
-        node_text(usage, src),
-    );
+    let candidates = java_member_call_candidates(index, file, src, tree, call)?;
     let [candidate] = candidates.navigation_candidates() else {
         return None;
     };
@@ -2731,29 +2727,19 @@ pub fn jvm_call_signatures(
     tree: &Tree,
     call: Node<'_>,
 ) -> Vec<crate::signature::Signature> {
-    let Some(object) = call.child_by_field_name("object") else {
+    let mut arguments = java_call_arguments(index, file, src, tree, call);
+    arguments.count = None;
+    let Some(selection) =
+        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments)
+    else {
         return Vec::new();
     };
-    let Some(receiver) = receiver_type(index, file, src, tree, object) else {
-        return Vec::new();
-    };
-    let Some(name) = call.child_by_field_name("name") else {
-        return Vec::new();
-    };
-    jvm_call_candidates(
-        index,
-        file,
-        src,
-        tree,
-        call,
-        &receiver,
-        node_text(name, src),
-    )
-    .candidates
-    .into_iter()
-    .filter(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
-    .map(crate::signature::signature_for_callable)
-    .collect()
+    selection
+        .candidates
+        .into_iter()
+        .filter(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
+        .map(crate::signature::signature_for_callable)
+        .collect()
 }
 
 fn java_method_invocation_return_type(
@@ -2768,25 +2754,22 @@ fn java_method_invocation_return_type(
     if symbol.is_empty() {
         return None;
     }
-    if let Some(object) = call.child_by_field_name("object") {
-        if let Some(receiver) = receiver_type(index, file, src, tree, object) {
-            let candidates = jvm_call_candidates(index, file, src, tree, call, &receiver, symbol);
-            if candidates.applicability == ktcore::members::Applicability::Rejected {
+    if let Some(candidates) = java_member_call_candidates(index, file, src, tree, call) {
+        if candidates.applicability == ktcore::members::Applicability::Rejected {
+            return None;
+        }
+        if candidates
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
+        {
+            let [candidate] = candidates.candidates.as_slice() else {
+                return None;
+            };
+            if !candidate.accepts_count(java_argument_nodes(src, call).map(|args| args.len())) {
                 return None;
             }
-            if candidates
-                .candidates
-                .iter()
-                .any(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
-            {
-                let [candidate] = candidates.candidates.as_slice() else {
-                    return None;
-                };
-                if !candidate.accepts_count(java_argument_nodes(src, call).map(|args| args.len())) {
-                    return None;
-                }
-                return ktcore::jvm::projected_return_type(*candidate);
-            }
+            return ktcore::jvm::projected_return_type(*candidate);
         }
     }
     let package = package_of(tree, src);

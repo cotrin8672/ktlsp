@@ -712,6 +712,106 @@ fn rename_override_family_refuses_unknown_signatures_cycles_and_read_only_ancest
 }
 
 #[test]
+fn java_bare_member_call_resolves_before_same_package_decoys() {
+    let mut ws = Workspace::new();
+    let base = "/selection/bare/Base.java";
+    let child = "/selection/bare/Child.java";
+    let decoy = "/selection/bare/Decoy.java";
+    let child_source = "package bare; public class Child extends Base { public static int assist() { return 2; } public static int run() { return assist(); } }";
+    ws.open(
+        base,
+        "package bare; public class Base { public static int assist() { return 1; } }".into(),
+    );
+    ws.open(child, child_source.into());
+    ws.open(
+        decoy,
+        "package bare; public class Decoy { public static int assist() { return 3; } }".into(),
+    );
+    let definition = target(&ws, child, "assist", SymbolKind::Function);
+    let offset = child_source.find("return assist()").unwrap() + "return ".len();
+    assert_eq!(ws.goto_definition(child, offset), vec![definition.clone()]);
+    assert_eq!(
+        ws.references(child, definition.start_byte, true),
+        vec![
+            definition,
+            Def {
+                file: child.into(),
+                start_byte: offset,
+                end_byte: offset + "assist".len(),
+            }
+        ]
+    );
+}
+
+#[test]
+fn rename_bare_java_static_call_preserves_hidden_parent_and_decoy() {
+    let mut ws = Workspace::new();
+    let base = "/selection/bare/Base.java";
+    let child = "/selection/bare/Child.java";
+    let decoy = "/selection/bare/Decoy.java";
+    let java = "/selection/bare/JavaUse.java";
+    let kotlin = "/selection/bare/KotlinUse.kt";
+    let sources = [
+        (base, "package bare; public class Base { public static int assist() { return 1; } }"),
+        (child, "package bare; public class Child extends Base { public static int assist() { return 2; } public static int run() { return assist(); } }"),
+        (decoy, "package bare; public class Decoy { public static int assist() { return 3; } }"),
+        (java, "package bare; public class JavaUse { public static int run() { return Child.assist(); } }"),
+        (kotlin, "package bare\nfun run(): Int = Child.assist()\n"),
+    ];
+    for (file, source) in sources {
+        ws.open(file, source.into());
+    }
+    let definition = target(&ws, child, "assist", SymbolKind::Function);
+    let edits = ws.rename(child, definition.start_byte, "support").unwrap();
+    assert_eq!(edits.len(), 4, "{edits:?}");
+    for (file, source) in sources {
+        let expected = if file == base || file == decoy {
+            source.into()
+        } else {
+            source.replace("assist", "support")
+        };
+        assert_eq!(
+            apply_to_text(file, source, &edits).unwrap(),
+            expected,
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn java_bare_calls_share_typed_selection_for_navigation_signature_and_result() {
+    let (mut ws, file) = overload_workspace(true);
+    let source = "package typed; public class Target { public NumberResult twice(int value) { return null; } public TextResult twice(String value) { return null; } void run() { twice(1).numberOnly(); twice(\"x\").textOnly(); twice(missing); } }";
+    ws.change(file, source.into());
+    for (call, parameter, result) in [
+        ("twice(1)", "int", "numberOnly"),
+        ("twice(\"x\")", "String", "textOnly"),
+    ] {
+        let definition = overload_target(&ws, file, parameter);
+        let offset = source.find(call).unwrap();
+        assert_eq!(ws.goto_definition(file, offset), vec![definition]);
+        let help = ws.signature_help(file, offset + "twice(".len()).unwrap();
+        assert_eq!(help.signatures.len(), 1, "{help:?}");
+        assert!(help.signatures[0].label.contains(parameter), "{help:?}");
+        let completion = labels(&mut ws, file, &format!("{call}."));
+        assert!(completion.contains(result), "{completion:?}");
+        assert!(!completion.contains(if result == "numberOnly" {
+            "textOnly"
+        } else {
+            "numberOnly"
+        }));
+    }
+    let mut actual = ws.goto_definition(file, source.find("twice(missing)").unwrap());
+    actual.sort();
+    let mut expected = vec![
+        overload_target(&ws, file, "int"),
+        overload_target(&ws, file, "String"),
+    ];
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn rename_override_family_does_not_join_static_or_private_methods() {
     for modifier in ["public static", "private"] {
         let mut ws = Workspace::new();

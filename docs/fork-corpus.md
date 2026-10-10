@@ -894,7 +894,7 @@ NeoForge stubs; Retrofit retains 26,405 library files. Source encoding, missing
 binary-only/nested inputs and configured-producer versus output freshness limits
 remain unchanged.
 
-The separate Java harness now passes 177/182 checks: the incoming-call regression
+The separate Java harness now passes 174/179 checks: the incoming-call regression
 is fixed and all seventeen complete override rename controls pass. Five previous
 diagnostic failures remain. Actual applied Java/Kotlin rename snapshots compile
 and preserve the expected bytecode targets; they are distinct from a nonempty
@@ -903,10 +903,154 @@ passes 81/81 plus nine compiler/runtime controls. See
 [fork-acceptance.md](fork-acceptance.md) for exact evidence and remaining rename
 limits. These concurrent runs still provide no latency acceptance or IDEA parity.
 
-The remaining four real-root replays are pending. An initial external controller
-stalled after its Moshi editor process completed; that raw attempt is preserved
-as incomplete controller evidence, and fresh guarded runs use new directories.
-No semantic expectation or shared harness was changed to address the wrapper.
+An initial external controller stalled after its Moshi editor process completed;
+that raw attempt is preserved as incomplete controller evidence. The subsequent
+fresh four-root audit is recorded below. No semantic expectation or shared harness
+was changed to address the wrapper.
 The final precommit `tenth-fixed-3` receipt repeats the full Rust/release checks
 after removing only the fixture generator's trailing blank line. Its generated
 four-file fixture and both release binaries are byte-identical to fixed-2.
+
+### Tenth-fixed-2: remaining root audit and Gradle allocation failure
+
+The six completed Moshi, OkHttp and Spring replays pass **29/29** semantic requests
+on attempt 1, with no retries or expectation changes. Both indexing phases,
+buffer-only edits, exact outbound versions, restoration and source guards pass.
+Together with CEM and Retrofit, this is **51/51 measured requests across five real
+roots**; it does not cover the sixth root or establish complete analysis coverage.
+
+| Project | Golden requests | Incomplete requests | Whole run checks | Failed / missing sources | Routed exits |
+| --- | --- | --- | --- | --- | --- |
+| Moshi 1.15.2 | 3/3 | 6/6 | 8/9 and 35/36 | 0 / 2 | 1 / 1 |
+| OkHttp 4.12.0 | 4/4 | 6/6 | 9/10 and 35/36 | 0 / 4 | 1 / 1 |
+| Spring Framework 6.2.0 | 4/4 | 6/6 | 9/10 and 35/36 | 4 / 14 | 1 / 1 |
+| Gradle 8.14.3 | NOT_MEASURED | NOT_MEASURED | Golden 5/7; incomplete absent | Library readiness failed / incomplete unknown | 1 / unknown |
+
+The original v2 external controller incorrectly required every request's phase
+to equal the run's indexing phase. Its three incomplete-run phase guards remain
+false in the original evidence. A separate audit derives the expected phase from
+each unchanged manifest's `buffer_edits`: one disk control follows indexing and
+five requests follow unsaved buffer delivery. It verifies attempt 1 and exact
+outbound versions, without requerying the server or changing expectations.
+
+The Gradle golden log contains `memory allocation of 1290240 bytes failed` after
+a file-watch rejection reporting insufficient memory. It announces 11,325 project
+files but no library completion and executes zero required semantic requests.
+The incomplete run has no result or request artifact after controller interruption;
+its server exit and readiness outcome cannot be inferred. Neither run supplies a
+semantic pass. Allocation-time server peak and system commit were not captured in
+that original run; late free-memory observations do not identify its cause. The
+isolated monitored follow-up is recorded below, with no performance claim.
+
+Evidence is `fourroots-tenth2-v2-verified-report.json`, its concise
+`fourroots-tenth2-v2-summary.json`, and the referenced raw artifacts under the
+corpus evidence root. All 26 input hashes match in the captured after-guard at
+`2026-10-10T22:20:00.931933Z`, before the shared harness was released for the
+separate bare-call fixture. The original missing controller-final receipt remains
+missing. Source coverage, compiler-output freshness and current IDEA/performance
+acceptance remain open.
+
+### Isolated Gradle follow-up: excessive client memory during watch registration
+
+The unchanged `tenth-fixed-2` binary was replayed alone through the existing real
+Neovim corpus route, with process and system memory sampling. The measured client
+is Neovim 0.12.5 x64 running **ktlsp**, not IDEA LSP. The root agent forcibly
+stopped its verified owned process tree to release host memory; this run is
+**HOST-RESOURCE-PRESSURE-ABORT**, not a natural allocation failure or an acceptance
+pass. All eleven input hashes match before and after the run.
+
+| Measurement | Observed value |
+| --- | --- |
+| Neovim process lifetime peak commit | 63,475,847,168 bytes |
+| Neovim maximum sampled private bytes | 62,120,669,184 bytes |
+| Neovim process lifetime peak working set | 53,535,596,544 bytes |
+| ktlsp process lifetime peak commit | 5,982,179,328 bytes |
+| ktlsp process lifetime peak working set | 3,630,755,840 bytes |
+| Maximum sampled system commit / limit | 95,120,838,656 / 96,102,813,696 bytes |
+| Minimum sampled system commit headroom | 90,001,408 bytes |
+| Project / library files / library symbols | 11,325 / 60,759 / 1,245,495 |
+| Watch registration | 8,796 patterns; acknowledgement about 88 seconds later |
+
+The earlier observations of approximately 40 GB for Neovim and 1.1 GB for ktlsp
+were intermediate samples, not lifetime peaks. Forty-seven samples were collected
+approximately five seconds apart. Commit, physical working set and system totals
+are different measurements; the boot-wide system commit peak is not used as a run
+peak.
+
+All 8,796 patterns describe paths inside this workspace: 4,869 source directories,
+3,925 output directories and two configuration patterns. Neovim groups these
+absolute string globs under the same workspace base and folds their LPEG patterns
+into one union before starting the native recursive watcher. Pattern count does
+not establish the number of kernel watch handles. The code path and registration
+delay are verified; individual allocation call stacks were not captured.
+
+After the delay, indexing completed and three golden requests matched on their
+first response. These are separate observations from the preceding zero-query
+failure; they do not change its result. The monitored run still has three failed
+and thirty missing dependency sources, no final `corpus-results.json`, and forced
+termination. Its printed shutdown assertion does not prove clean process exit.
+
+Evidence under the corpus root is
+`gradle-tenth2-oom-monitored-1-terminal-summary.json`, the referenced memory
+JSON/JSONL, and
+`gradle-8.14.3-ktlsp-tenth2-oom-monitored-1/{artifacts,xdg-state/nvim-data/lsp.log}`.
+The watch/model audit is under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-watch-registration-20261011/`.
+
+### Bounded watch repair: same large Gradle workload
+
+The immutable `eleventh-fixed-2` release, SHA-256
+`08fea5789ef522d00b0f4b012febeb555de249c92f8e883df1d268c464d9eab7`, was replayed
+through the same existing corpus route. All twelve guarded inputs match. It indexes
+the same 11,325 project files, 60,759 library files and 1,245,495 library symbols.
+The model registration contains one pattern; both initial and model registrations
+are acknowledged in the same log second. One-second log resolution does not imply
+exact zero latency.
+
+| Measurement | Before repair | After repair |
+| --- | --- | --- |
+| Model watch patterns | 8,796 | 1 |
+| Neovim lifetime peak commit | 63,475,847,168 bytes | 9,261,056 bytes |
+| Neovim lifetime peak working set | 53,535,596,544 bytes | 20,205,568 bytes |
+| ktlsp lifetime peak commit | 5,982,179,328 bytes | 5,969,633,280 bytes |
+| ktlsp lifetime peak working set | 3,630,755,840 bytes | 4,217,020,416 bytes |
+| Maximum sampled system commit | 95,120,838,656 bytes | 38,921,887,744 bytes |
+| Minimum sampled commit headroom | 90,001,408 bytes | 34,317,193,216 bytes |
+| Minimum sampled physical memory available | 1,409,024 bytes | 46,680,809,472 bytes |
+| Failed / missing dependency inputs | 3 / 30 | 3 / 25 |
+
+The new run collects 98 samples at 0.5-second intervals, with a 750-second duration
+bound and resource ceilings of 1 GiB Neovim private bytes, 8 GiB server private
+bytes, at least 8 GiB system commit headroom and 4 GiB physical memory available.
+No ceiling fires. These ceilings protect the test host; they are not accepted UX
+budgets. The old run uses a different sampling interval and product revision, so
+this is a diagnostic comparison rather than a controlled statistical benchmark.
+Neither run measures a defined post-index steady-state window.
+
+All three golden requests match exactly on their first response. Both stdout and
+`corpus-results.json` report **9 PASS, 1 FAIL**; the sole failed check is dependency
+source completeness. The module-only classification repair accounts for five fewer
+missing sources. Server memory remains a separate optimization task.
+
+The raw monitor status is `controller-ended-with-live-owned-abort`: it observes the
+controller ending while the retained server handle is still live. Independent
+handle auditing finds **zero TerminateProcess calls**, no resource-cap reason, all
+owned processes exited 125 ms later, and every retained handle closed. Preserve
+that raw status separately from the actual exit evidence. Controller, Neovim and
+server native exit codes are one. The first shutdown receives a successful null
+response, but the client treats `is_stopped()` (also true while stopping) as process
+exit and reaches VimLeavePre too soon. That handler sends a second shutdown and
+exit; the second shutdown receives `-32600 Invalid request`. Four tiny independent
+protocol controls confirm normal shutdown exits zero and duplicate shutdown is
+rejected. The corpus assertion is not clean-server-exit proof. The
+preexisting Gradle daemon remains alive with the same creation identity and is
+protected throughout.
+
+Evidence under the same corpus root is
+`gradle-watch-cap-eleventh2-1-terminal-summary.json`, SHA-256
+`1fb5c3199adead18450ebb9e14ba9f3ed4098f236c4b65e085de07f5dd0a12b1`,
+its referenced raw memory JSON/JSONL and logs, and
+`gradle-8.14.3-ktlsp-watch-cap-eleventh2-1/{artifacts,xdg-state/nvim-data/lsp.log}`.
+Source/output/configuration/external-path boundaries also have six focused tests;
+notification-classification cost, server allocation peaks, shutdown and remaining
+dependency coverage require further work.

@@ -42,11 +42,11 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
 | Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Frozen late-owner repair `64565d0`: 932 pass / 3 ignored. Tenth hierarchy/source-refresh repair: 1,019 pass / 3 ignored across 40 suites, native exit 0; 270 inputs match before/after tests and release build | Rust verified for final tenth-fixed-3; release bytes equal tenth-fixed-2 used by editor replays | `ktlsp-goal-20261010/tenth-fixed-3/result.json`; isolated caches, fmt and release also pass. Seven independently compiled class fixtures are included in the input guard |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Tenth-fixed-2 Java passes 177/182, including repaired incoming calls and all 17 new applied override rename controls. Five missing diagnostics remain. Library source lifecycle passes 13/13 | Partial; current ordinary editor slice verified, diagnostic coverage still failing | `ktlsp-goal-20261010/tenth2-{java,library}-1/`. Preserve unknown competitors and inherited overloads. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Eleventh-fixed-2 Java passes 191/196, including all 17 bare-call and earlier override controls. Five missing diagnostics remain. Tenth-fixed-2 library source lifecycle passes 13/13 | Partial; current ordinary editor slice verified, diagnostic coverage still failing | `ktlsp-goal-20261010/eleventh2-java-1/` and `tenth2-library-1/`. Preserve unknown competitors and inherited overloads. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Tenth reads 5,865 NeoForge source files with 103,029 symbols; all 4/4 golden and 6/6 incomplete requests pass. One failed archive and five missing sources retain both routed exits at 1 | Partial; ordinary queried semantics verified, input coverage failing | Guarded `cem-working-copy-ktlsp-tenth-{golden,incomplete}-1/` under the corpus evidence root. Configured main/test compiler task metadata is complete; full CEM diagnostics, overrides and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Sixth six-root controls pass 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 and 29/36. Tenth CEM and Retrofit each pass all 6/6 first-response incomplete requests and 5/5 cases | Partial; two real roots verified for tenth-fixed-1 | [fork-corpus.md](fork-corpus.md) records exact results and independent coverage failures. Four other roots require current rechecks; a paired useful known receiver is required for negative cases |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Sixth six-root controls pass 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 and 29/36. Tenth-fixed-2 CEM, Retrofit, Moshi, OkHttp and Spring each pass all 6/6 first-response incomplete requests | Partial; five real roots have focused current results, Gradle unmeasured | [fork-corpus.md](fork-corpus.md) records independent coverage failures. Gradle golden fails readiness after allocation failure; incomplete run was interrupted. A paired useful known receiver is required for negative cases |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Tenth Retrofit passes all six golden and six incomplete requests, including Java facade names for Kotlin suspend extensions. Spring's main reduction improves, but explicit-this and dangling-dot chains remain gaps | Partial | Guarded `retrofit-tenth-verified-report.json`; `spring-provider-reduction` retains compiler and failing editor evidence. Recovered facts must participate before receiver inference |
@@ -55,7 +55,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Seventh native automatic watching passes 74/76: four actual builds, dependency/generated-source additions, updates, removals, exact targets, preserved dirty buffers and clean shutdown. Three native notification batches and zero explicit notifications. Two stale-member diagnostics remain failing | Partial; automatic refresh verified, diagnostics failing | `ktlsp-gradle-model-20261010/seventh-refresh-automatic/artifacts/`. Unchanged 76 expectations and hashes. Sixth manual 70/72 and automatic 29/76 remain preserved; external Windows Neovim watch roots still need coverage |
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Ninth same-client KAPT/KSP refresh passes 102/114, repairing unsaved completion; twelve obsolete/removed-API diagnostics fail. Transformed-API completion still fails 12/12 | Partial; generated-source editing works, diagnostic and transformed-API coverage failing | Actual v1/v2/restored builds and disabled compiler rejections establish expected APIs. Raw classfile decoder tests do not supply generated-API editing acceptance |
-| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Tenth-fixed-2 external Mixin consumer passes 139/140 actual LSP checks. All completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass; two missing module-only sources retain the coverage failure | Focused host lifecycle verified; full extension/input coverage pending | `ktlsp-shadow-tenth-fixed-2-20261011/provider-evidence.json`. Same expectations as the earlier runs; nineteen delivery barriers, four applied renames and graceful shutdown pass |
+| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Eleventh-fixed-2 external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-eleventh-fixed-1-20261011/provider-evidence.json` identifies the actual eleventh-fixed-2 snapshot. Same strict expectations, nineteen delivery barriers and four applied renames. Process shutdown is audited separately from the legacy client assertion |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
 
@@ -272,6 +272,37 @@ This validates the optional UI route without relabeling the original assertions.
 Evidence paths in this section are below
 `C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/`.
 
+### Successful compiler output and dependency readsets
+
+The current immutable fixed-2 plugin replay retains **38 PASS / 12 FAIL** checks.
+All twelve failures are transformed-API completion: Java/Kotlin getter and
+serializer, each in golden, partial-member and dangling-dot states. All sixteen
+delivery/restoration controls pass, with no readiness failure. Evidence is
+`ktlsp-compiled-freshness-plan-20261011/baseline-evidence.json`; no compiled-API
+host adapter has shipped.
+
+A separate controlled experiment runs thirteen same-module compiler scenarios:
+63 native commands, 59 successful and four expected failures. Nine successful
+direct compiler receipts and four rejected incomplete-module receipts preserve
+exact source, output, plugin, processor, toolchain and ancestor-config inventories.
+Valid consumer changes preserve the target classes. Failed javac can still emit
+`Person.class` and leave successful Kotlin outputs; those partial outputs do not
+certify a successful whole-module build. Changing `Model.label` from String to Int
+leaves `Model$Companion.class` byte-identical while changing Model and its serializer.
+Adding an ancestor `lombok.config` changes `getName()` to `name()` without changing
+Person's source. Class content alone therefore does not establish producer freshness.
+
+The next host slice must reuse the existing provider/read-session contract and
+track actual owner source plus successful output, selected origin, plugin/config
+and negative ancestor reads. Generated members retain binary identity without
+invented source definitions. Unknown producers retain whole-input validation;
+a narrower positive projection requires an explicit verified producer contract.
+The experiment uses a four-source reduction with pinned serialization/Lombok
+plugins, not the original complete six-plugin Gradle configuration or a production
+Gradle task-completion receipt. It supplies no editor improvement or general
+processor-isolation proof. Evidence is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-plugin-readset-proof-20261011/{readset-report.txt,results.json,commands.json}`.
+
 ## Measurement policy and initial UX targets
 
 Compilation is an independent semantic oracle, not editing acceptance. The user
@@ -298,6 +329,20 @@ they are **unverified targets**, not measured results or a claim of IDEA parity:
 - Warm restart readiness: <= 5 s, at least five process restarts.
 - Report steady-state working set/RSS and peak memory separately; set a concrete
   memory budget after baseline project sizes and host capacity are recorded.
+
+An isolated Gradle follow-up exposed a client-memory scaling failure: 8,796 watch
+patterns took about 88 seconds to register, with Neovim lifetime peak commit
+63,475,847,168 bytes and ktlsp peak commit 5,982,179,328 bytes. This was the ktlsp
+client, not IDEA LSP. The owned process tree was forcibly stopped for host resource
+pressure; the run supplies no performance acceptance. See the separate measurements
+and provenance in [fork-corpus.md](fork-corpus.md).
+
+The next isolated replay uses provisional abort guards: Neovim private bytes above
+1 GiB, ktlsp private bytes above 8 GiB, system commit headroom below 8 GiB or physical
+available memory below 4 GiB. These protect the host while investigating scaling;
+they are not UX memory budgets or evidence that the server's current footprint is
+acceptable. Registration cardinality, event classification cost, index storage and
+request algorithms must be assessed alongside semantic correctness.
 
 Record baseline-derived budget decisions before accepting performance changes.
 Report failures and missing semantic results separately; fast empty responses cannot
@@ -624,7 +669,7 @@ byte-identical. The final `tenth-fixed-3` full test/release run again passes
 1,019 tests with all 270 inputs unchanged; both release binaries are byte-identical
 to fixed-2, so its editor evidence applies without rerunning unchanged requests.
 
-The new Java editor replay passes **177/182** checks, with exactly the five
+The new Java editor replay passes **174/179** checks, with exactly the five
 previous diagnostic failures remaining. Incoming calls now pass, as do all
 seventeen new override rename controls. Neovim applies both declarations and
 four Java/Kotlin calls, preserves all five complete buffers and delivers the
@@ -638,6 +683,12 @@ evidence. The known Java bare static call reference omission is retained in
 `override-family-safety-first.txt`; its replacement explicit-receiver control
 does not count as coverage of that omission. A common-descendant inherited
 implementation/interface family safely refuses rename pending a shared identity.
+
+A recount of the unchanged `tenth2-java-1/artifacts/java.out` corrects the previous
+177/182 transcription to 174 PASS and 5 FAIL. The expanded bare-call RED run
+retains all 179 original check names and adds 17 controls: 181 PASS and 15 FAIL
+out of 196, including the same five diagnostic failures. No checks were removed;
+the ten additional failures expose the unapplied bare-call rename.
 
 The same release passes **13/13** library source lifecycle checks after an actual
 successful Gradle build, and **81/81** JVM facade editor checks. The facade's
@@ -653,10 +704,144 @@ consumer, fixtures, probes and binary remain unchanged across build and editor.
 
 CEM and Retrofit retain all **22/22** golden/incomplete first responses across
 four guarded runs. Their independent coverage failures remain 1 failed and 5
-missing sources each. Current four-root replays remain pending; reproduce any
-remaining recovery gap against this release before implementing its older plan.
-Retain strict coverage and producer-freshness failures while completing their
-inputs, and commit each verified slice without claiming whole-goal parity.
+missing sources each. The subsequent audited Moshi, OkHttp and Spring replays
+pass **29/29** semantic requests on attempt 1, giving 51 measured requests across
+five real roots. All six additional routed runs still fail independent source
+coverage. Gradle golden reaches project indexing but fails library readiness
+after an allocation error; it executes zero semantic requests. Gradle incomplete
+was interrupted before a result artifact and also remains NOT_MEASURED.
+[fork-corpus.md](fork-corpus.md) records the unchanged expectations, corrected
+external phase audit and evidence guards. These results establish neither complete
+six-root coverage, performance nor current IDEA parity.
+
+### Current slice: Java calls with an implicit receiver
+
+Against `e200d14`, two new focused regressions fail: a bare `assist()` in
+`Child extends Base` resolves to Base, Child and an unrelated same-package Decoy;
+rename returns three of the four required edits and omits the bare call. This
+can silently change dispatch to Base after a compilable partial rename. Raw
+evidence is `ktlsp-bare-call-20261011/red-1/` (native cargo exit 101).
+
+The current Java adapter sends implicit member calls through the same JVM
+candidate/applicability query as explicit receiver calls. Navigation, references,
+rename, signature help and result completion share that selection; signature
+assembly no longer re-adds hidden parent methods or unrelated same-name members.
+All **61/61** member-selection tests pass, including three new regressions for
+exact bare-call references/applied edits and typed overload selection with an
+unknown-argument control. Evidence is `green-2/` and `members-green-1/` under that
+root. The subsequent release, editor and independent compiler/runtime results are
+recorded below. These focused results do not establish broader Java name-lookup
+parity.
+
+The unchanged tenth-fixed-2 release also reproduces the omission through the
+expanded real Neovim `java` probe in `bare-java-editor-red-1/`: the exact four-site
+check rejects its three-site edit, so unsafe edits are not applied. The original
+override-rename expectations are preserved. The independent compiler experiment
+`ktlsp-bare-call-20261011/compiler-red-1/` captures all twenty expected command
+outcomes. Original, independently expected and unchanged actual snapshots compile
+and run; the three-site partial-rename counterexample also compiles in Java/Kotlin
+but its runtime assertion fails with `1:2:2:1:3` instead of `2:2:2:1:3`. Therefore
+compiler validity alone cannot establish safe rename. This RED experiment reports
+`passed=false` because Neovim did not apply the required edit; it is not a current
+successful editor/rename result.
+
+The first full eleventh checkpoint caught a signature-help regression: only the
+two-argument `greet` remained when the existing test also requires the one-argument
+overload. That guarded run reports 1,032 PASS, one FAIL and three ignored, native
+101; its failed result is preserved in `eleventh-fixed-1/`. Two focused signature
+regressions then fail before repair, including explicit/implicit receiver and
+unrelated same-name controls. Signature assembly now retains alternative arities
+while sharing receiver ownership and argument-type selection; navigation and
+rename still use complete-call applicability. The same unchanged expectations
+pass **67/67** member/signature tests in `signature-green-1/`, with input guards.
+
+The accepted `eleventh-fixed-2` checkpoint passes **1,034** Rust tests across forty
+suites, with zero failures and three ignored. Formatting and both release builds
+pass; all 306 product inputs, including 26 classfiles and five module-fixture JARs,
+match before tests, after tests and after release compilation. Its immutable ktlsp
+SHA-256 is `08fea5789ef522d00b0f4b012febeb555de249c92f8e883df1d268c464d9eab7`.
+The real Neovim Java replay passes **191/196** checks: all seventeen new bare-call
+controls pass, all five buffers match their independently expected text after the
+four-site rename, and delivery/current Kotlin navigation/disk guards pass. The
+same five diagnostic failures remain; native harness exit is one. Evidence is
+`eleventh2-java-1/{java-verified.json,artifacts/}`. The independent
+`ktlsp-bare-call-20261011/compiler-green-1/compiler-results.json` verifies all twenty
+expected native command outcomes. It derives the four edits and expected five
+buffers independently, compiles the actual applied Java/Kotlin text and observes
+`2:2:2:1:3` at runtime. The three-edit counterexample still compiles but fails the
+runtime assertion with `1:2:2:1:3`; all input guards match. This is a passing applied
+rename slice, not an all-green Java acceptance result.
+
+### Current slice: bounded watch registration and algorithm review
+
+`project_watchers` now coalesces internal source/output directories under one
+workspace pattern. External source/output directories and exact local binary and
+source JAR paths retain their existing boundaries. Models without internal
+source/output roots keep the two configuration/archive patterns. Event relevance
+still follows the published model, including arbitrary output extensions and
+unrelated-source exclusions.
+
+The regression uses the observed 4,869 source and 3,925 output directories. Before
+repair it returns 8,796 patterns instead of one; afterward both absolute and
+relative registrations have one pattern and serialize below 1 KiB. Six relevant
+tests pass, including create/change/delete, external future-directory escaping,
+empty/external-only models and existing refresh coalescing. Evidence is
+`ktlsp-watch-registration-20261011/final-proof.json`. The guarded full/release
+checkpoint above includes this repair. The same large Gradle workload through
+real Neovim now registers one model pattern, acknowledged in the same log second.
+Neovim lifetime peak commit drops from 63,475,847,168 to 9,261,056 bytes; server peak
+commit remains 5,969,633,280 bytes. All three golden requests match on their first
+response. The module-only repair reduces missing sources from thirty to twenty-five;
+three failed inputs remain. This is one diagnostic comparison, not statistical
+performance acceptance or a steady-state measurement. See [fork-corpus.md](fork-corpus.md)
+for process/system measurements and unchanged-work evidence. The controller and
+server both exit one: dependency coverage fails, and the raw shutdown exchange has
+a duplicate request and an Invalid request response. No resource cap fired and no
+process termination API was called. Complete editor lifecycle verification remains
+open.
+
+The broader review found three concrete scaling paths that require measurement
+and follow-up: notification classification scans model roots per event and
+rebuilds local-JAR sets; inference snapshot refresh clones search maps after an
+index revision; ordinary completion queries candidates twice before returning the
+response. Shared symbol payloads already use `Arc`, so this is not evidence of a
+complete deep copy of every symbol. These findings do not establish the cause of
+the server's measured peak or supply accepted performance results. Optimize the
+shared paths with unchanged semantic expectations, then compare useful editor
+responses and separate client/server memory on the same real roots.
+
+### Current slice: requires-only compatibility artifacts
+
+Selected Kotlin compatibility and coroutines JARs can contain a module descriptor
+and no ordinary declarations. Requiring nonexistent source definitions for those
+artifacts left otherwise useful indexing incomplete. The shared classfile reader
+now proves a narrow requires-only module shape, and archive classification checks
+the actual selected binary before treating it as having no ordinary API. Unknown
+versions, attributes, pool tags, additional definitions or malformed input remain
+inconclusive. Read/CRC failures remain errors; work is bounded to 50,000 entries
+and one 16 MiB descriptor. The existing archive reader still loads the compressed
+archive in full.
+
+The portable fixture set contains 26 classfiles and five original small Maven
+JARs, with exact byte/SHA manifests, source/compiler provenance and licensing.
+Five actual selected artifacts fail before repair; thirty-six distinct focused
+checks pass afterward, including authority, corrupt/missing archives and worker
+coverage controls. The accepted eleventh full/release checkpoint includes this
+slice. Evidence is `ktlsp-module-only-20261011/implementation/final-proof.json`.
+The separate external Rust consumer now builds with `--release --locked --offline`
+and passes **140/140** unchanged checks through the real Neovim corpus route,
+native editor exit zero. Its five features, 29 first-response requests, nineteen
+delivery barriers and four applied/inspected renames pass with zero failed/missing
+inputs. The earlier 139/140 failure remains preserved. All 306 product, four
+consumer, 27 fixture files and strict probes match before/after. Evidence is
+`ktlsp-shadow-eleventh-fixed-1-20261011/provider-evidence.json`; the directory name
+is retained, but its guarded product snapshot is eleventh-fixed-2. The distinct
+consumer binary SHA-256 is
+`34a4a0720fd7f6b3cc8c0f15e1e23fdec97e0c8d6aa555ceaeca1c81e934c187`.
+Its legacy client shutdown assertion is not used as independent process-exit proof.
+The large Gradle replay separately reduces missing inputs from thirty to twenty-five.
+This is no general binary-source replacement or compiler-producer closure proof;
+remaining real-root coverage and generated APIs still need work.
 
 ### CEM local sources and implicit receivers: eighth checkpoint
 

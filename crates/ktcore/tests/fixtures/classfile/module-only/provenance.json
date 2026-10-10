@@ -1,0 +1,242 @@
+{
+  "oracle": "JDK 17 ModuleDescriptor.read; 7 accepted, 12 rejected, 160 strict prefixes rejected",
+  "cases": [
+    {
+      "file": "duplicate-module-attribute.class",
+      "bytes": 188,
+      "sha256": "357575a4b10d5dd9cce89b93eda4340d5331a6b99805aa59201118795148a11b",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: More than one Module attribute",
+      "provenance": "two Module attributes"
+    },
+    {
+      "file": "extra-class-flags.class",
+      "bytes": 160,
+      "sha256": "d2522e1861109ed245f814cb2a8163f11ed893f452beb605d9fe12332c1e9b61",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: access_flags should be ACC_MODULE",
+      "provenance": "ACC_MODULE with prohibited ACC_PUBLIC"
+    },
+    {
+      "file": "forged-module-class-name.class",
+      "bytes": 160,
+      "sha256": "be4a7531b3564ecbfa78d075e315133db66e9e1f1d9fb326de25c169d5fde8ae",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: this_class should be module-info",
+      "provenance": "ACC_MODULE class has wrong internal name"
+    },
+    {
+      "file": "invalid-empty-module-payload.class",
+      "bytes": 138,
+      "sha256": "ce0e387af26919bdd96e15b1345c970e0b7648727594289e03bcd0264c141b08",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: Truncated module-info.class",
+      "provenance": "valid class/attribute wrapper, missing Module payload"
+    },
+    {
+      "file": "invalid-module-name-index.class",
+      "bytes": 160,
+      "sha256": "427b49e162bbb692ba0dfe826663a2a86edac7b90f60e2462d8d3154dcb0ac10",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: Index into constant pool out of range",
+      "provenance": "Module payload CP index zero; valid outer attribute length"
+    },
+    {
+      "file": "invalid-module-payload-trailing.class",
+      "bytes": 161,
+      "sha256": "32b469d919da2ed5f97d6103fcc709dde2453bb3fc723f0a84ac44e73868ce50",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: Attribute Module does not match its expected length",
+      "provenance": "Module payload has unconsumed extra byte"
+    },
+    {
+      "file": "javac-empty-module.class",
+      "bytes": 160,
+      "sha256": "163b9ba8fada7ec44b9b294f6d43bc633f53c10a0f2c691684d29ea6e12ba01c",
+      "jdk17_valid": true,
+      "jdk17_result": "oracle.empty\trequires=1\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "independent javac17 module declaration"
+    },
+    {
+      "file": "kotlin-stdlib-jdk7-1.8.21.class",
+      "bytes": 257,
+      "sha256": "5aacdda790cea4158419f55c2c18e385b022ce0c274b795309ead4987f4645c6",
+      "jdk17_valid": true,
+      "jdk17_result": "kotlin.stdlib.jdk7\trequires=2\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "audited exact-selected binary; whole archive has no ordinary classes"
+    },
+    {
+      "file": "kotlin-stdlib-jdk7-2.4.0.class",
+      "bytes": 247,
+      "sha256": "0420f974d4126933509b63fd04b47728f21b4817f2b2d9aa27429a2c84c070ad",
+      "jdk17_valid": true,
+      "jdk17_result": "kotlin.stdlib.jdk7\trequires=2\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "audited exact-selected binary; whole archive has no ordinary classes"
+    },
+    {
+      "file": "kotlin-stdlib-jdk8-1.8.21.class",
+      "bytes": 287,
+      "sha256": "27214264e5c4f8cdec84fc46efa4d318f3350f28a8a4b5717fed3bfff93dbc92",
+      "jdk17_valid": true,
+      "jdk17_result": "kotlin.stdlib.jdk8\trequires=3\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "audited exact-selected binary; whole archive has no ordinary classes"
+    },
+    {
+      "file": "kotlin-stdlib-jdk8-2.4.0.class",
+      "bytes": 277,
+      "sha256": "3af42ed2867e9e2071e000d260e7986b3a124719b32b48feb115cc427fb6ff3f",
+      "jdk17_valid": true,
+      "jdk17_result": "kotlin.stdlib.jdk8\trequires=3\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "audited exact-selected binary; whole archive has no ordinary classes"
+    },
+    {
+      "file": "kotlinx-coroutines-jdk8-1.11.0.class",
+      "bytes": 162,
+      "sha256": "9ae78066fd3e947a267b952ebc19a25354a6c1a57a47f53359bce09d119971b3",
+      "jdk17_valid": true,
+      "jdk17_result": "kotlinx.coroutines.jdk8\trequires=1\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "audited exact-selected binary; whole archive has no ordinary classes"
+    },
+    {
+      "file": "old-class-version.class",
+      "bytes": 160,
+      "sha256": "1d85f1995cf55953c63328658331c5f3b75f424035042c8e3771d8d794a75a26",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: Unsupported major.minor version 52.0",
+      "provenance": "ACC_MODULE requires class version at least53"
+    },
+    {
+      "file": "ordinary-as-module-info.class",
+      "bytes": 184,
+      "sha256": "69ea56a4d420873ce457ae1ef681c5786f25f7c2541e6a790589602336058223",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: access_flags should be ACC_MODULE",
+      "provenance": "ordinary class; filename cannot establish module identity"
+    },
+    {
+      "file": "truncated-module.class",
+      "bytes": 159,
+      "sha256": "19f9d191c4e4daa8883a0b30d1caaea34a67b8d2d91cca993ebf3e1e6b704145",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: Truncated module-info.class",
+      "provenance": "truncated attribute input"
+    },
+    {
+      "file": "wrong-class-flags.class",
+      "bytes": 160,
+      "sha256": "46109b723135374d2bcc6ea3730481da60b6e1dbc7d0e0aacdea803cb86f241c",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: access_flags should be ACC_MODULE",
+      "provenance": "ACC_MODULE omitted"
+    },
+    {
+      "file": "wrong-module-name-tag.class",
+      "bytes": 160,
+      "sha256": "e32430755d1b10de00c5ac3078b9898f48db1656e11e14e8ba07ee29005111c4",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: CONSTANT_Module expected at entry: 1",
+      "provenance": "Module payload points to CONSTANT_Class rather than CONSTANT_Module"
+    },
+    {
+      "file": "zero-member-interface.class",
+      "bytes": 91,
+      "sha256": "a50a77c88a1a9971151bea49d888c478f2131dd58edb6837800b849787a94858",
+      "jdk17_valid": false,
+      "jdk17_result": "InvalidModuleDescriptorException: access_flags should be ACC_MODULE",
+      "provenance": "ordinary empty interface has no fields or methods"
+    },
+    {
+      "file": "zero-requires-version.class",
+      "bytes": 160,
+      "sha256": "4075b787804d271e30822842a35f302e849a2500435d6ab9333d3e2d8f4b191c",
+      "jdk17_valid": true,
+      "jdk17_result": "oracle.empty\trequires=1\texports=0\topens=0\tuses=0\tprovides=0",
+      "provenance": "JVMS permits requires_version_index zero; Noak typed Require uses nonoptional index"
+    }
+  ],
+  "artifacts": [
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.21",
+      "file": "kotlin-stdlib-jdk7-1.8.21-sources.jar",
+      "sha256": "ea10d3e5e6e695d8a5283cbf116321acae6ba42d0bdd3eda50f7c34a26fa25cb",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk7/1.8.21/kotlin-stdlib-jdk7-1.8.21-sources.jar",
+      "source_files": [
+        "module-info.java"
+      ]
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.21",
+      "file": "kotlin-stdlib-jdk7-1.8.21.jar",
+      "sha256": "33d148db0e11debd0d90677d28242bced907f9c77730000fd597867089039d86",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk7/1.8.21/kotlin-stdlib-jdk7-1.8.21.jar"
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.21",
+      "file": "kotlin-stdlib-jdk8-1.8.21-sources.jar",
+      "sha256": "40e9a80f6b953d12389623760d438e69914098d0c4d7053f70f90533ec041259",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/1.8.21/kotlin-stdlib-jdk8-1.8.21-sources.jar",
+      "source_files": [
+        "module-info.java"
+      ]
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.21",
+      "file": "kotlin-stdlib-jdk8-1.8.21.jar",
+      "sha256": "3db752a30074f06ee6c57984aa6f27da44f4d2bbc7f5442651f6988f1cb2b7d7",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/1.8.21/kotlin-stdlib-jdk8-1.8.21.jar"
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk7:2.4.0",
+      "file": "kotlin-stdlib-jdk7-2.4.0.jar",
+      "sha256": "5072265564b6b0296f9c7b21fee65edee760c5697436f5ae7427033fa58fc034",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk7/2.4.0/kotlin-stdlib-jdk7-2.4.0.jar"
+    },
+    {
+      "coordinate": "org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.11.0",
+      "file": "kotlinx-coroutines-jdk8-1.11.0.jar",
+      "sha256": "1238f179da55360725ec49b887225317f31ae89bd29b652cbe139ff59f5d45cb",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-jdk8/1.11.0/kotlinx-coroutines-jdk8-1.11.0.jar"
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk8:2.4.0",
+      "file": "kotlin-stdlib-jdk8-2.4.0.jar",
+      "sha256": "d96b4e297136b8a4b2b88c1adcdc64d92e90d52a417e4315cdcf964adede8aa2",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/2.4.0/kotlin-stdlib-jdk8-2.4.0.jar"
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk7:2.4.0",
+      "file": "kotlin-stdlib-jdk7-2.4.0-sources.jar",
+      "sha256": "2534c8908432e06de73177509903d405b55f423dd4c2f747e16b92a2162611e6",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk7/2.4.0/kotlin-stdlib-jdk7-2.4.0-sources.jar",
+      "source_files": [
+        "module-info.java"
+      ]
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk8:2.4.0",
+      "file": "kotlin-stdlib-jdk8-2.4.0-sources.jar",
+      "sha256": "3cb6895054a0985bba591c165503fe4dd63a215af53263b67a071ccdc242bf6e",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/2.4.0/kotlin-stdlib-jdk8-2.4.0-sources.jar",
+      "source_files": [
+        "module-info.java"
+      ]
+    },
+    {
+      "coordinate": "org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.11.0",
+      "file": "kotlinx-coroutines-jdk8-1.11.0-sources.jar",
+      "sha256": "8a42fb2a78b17b2f6a21785f237e263e8ce6ca12a5155dcb6bca3f0f3ae27fd4",
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-jdk8/1.11.0/kotlinx-coroutines-jdk8-1.11.0-sources.jar",
+      "source_files": [
+        "module-info.java"
+      ]
+    }
+  ],
+  "license": {
+    "url": "https://raw.githubusercontent.com/JetBrains/kotlin/master/license/LICENSE.txt",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "projects": [
+      "https://github.com/JetBrains/kotlin",
+      "https://github.com/Kotlin/kotlinx.coroutines"
+    ]
+  }
+}
