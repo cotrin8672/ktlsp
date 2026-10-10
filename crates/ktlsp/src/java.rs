@@ -17,7 +17,7 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::complete::{self, ScopeCompletion, ShapedCompletions};
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
 use crate::imports::{self, ImportStyle};
-use crate::index::{Entry, Index, Tier, Usage};
+use crate::index::{Entry, InferenceIndex, Tier, Usage};
 use crate::indexer::TypeScope;
 use crate::infer::{self, FileCtx};
 use crate::language;
@@ -652,7 +652,7 @@ pub fn add_import_action(
 }
 
 pub fn diagnostics(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -662,7 +662,7 @@ pub fn diagnostics(
 }
 
 pub fn diagnostics_with_options(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -680,13 +680,13 @@ pub fn diagnostics_with_options(
             ));
         }
     }
-    if facts.project_scan_complete && durable_indexes_complete(facts) {
+    if facts.project_scan_complete && durable_indexes_complete(facts) && index.scope_is_complete() {
         collect_unresolved_imports(index, tree, src, &mut out);
     }
-    if facts.project_scan_complete {
+    if facts.project_scan_complete && index.scope_is_complete() {
         collect_unresolved_references(index, file, src, tree, tree.root_node(), &ctx, &mut out);
     }
-    if facts.project_scan_complete && include_call_shape {
+    if facts.project_scan_complete && include_call_shape && index.scope_is_complete() {
         collect_call_shape_mismatches(
             index,
             file,
@@ -702,7 +702,7 @@ pub fn diagnostics_with_options(
 }
 
 fn collect_unresolved_imports(
-    index: &Index,
+    index: &dyn InferenceIndex,
     tree: &Tree,
     src: &str,
     out: &mut Vec<crate::diagnostics::Diagnostic>,
@@ -741,7 +741,7 @@ fn collect_unresolved_imports(
     }
 }
 
-fn import_resolves_to_type(index: &Index, package: &str, name: &str) -> bool {
+fn import_resolves_to_type(index: &dyn InferenceIndex, package: &str, name: &str) -> bool {
     if index.lookup_by_name(name).iter().any(|entry| {
         entry.sym.name == name && entry.sym.package == package && entry.sym.kind.is_type_like()
     }) {
@@ -763,7 +763,7 @@ fn import_resolves_to_type(index: &Index, package: &str, name: &str) -> bool {
 }
 
 fn collect_unresolved_references(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -887,7 +887,7 @@ fn enclosing_type_has_explicit_supertype(node: Node<'_>) -> bool {
 }
 
 fn collect_call_shape_mismatches(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -959,7 +959,7 @@ impl JavaCallShapeQuery {
 }
 
 fn java_call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1006,7 +1006,7 @@ fn simple_type_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub(crate) fn java_call_entries(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1022,7 +1022,7 @@ pub(crate) fn java_call_entries(
 }
 
 fn java_call_entries_with_imports(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1081,7 +1081,11 @@ fn java_call_entries_with_imports(
     entries
 }
 
-fn constructor_entries_for_call(index: &Index, symbol: &str, seeds: Vec<Entry>) -> Vec<Entry> {
+fn constructor_entries_for_call(
+    index: &dyn InferenceIndex,
+    symbol: &str,
+    seeds: Vec<Entry>,
+) -> Vec<Entry> {
     let mut entries = Vec::new();
     for seed in seeds {
         if seed.sym.kind == SymbolKind::Function {
@@ -1101,7 +1105,7 @@ fn constructor_entries_for_call(index: &Index, symbol: &str, seeds: Vec<Entry>) 
     entries
 }
 
-fn expand_java_overloads(index: &Index, symbol: &str, entries: &mut Vec<Entry>) {
+fn expand_java_overloads(index: &dyn InferenceIndex, symbol: &str, entries: &mut Vec<Entry>) {
     let seeds = entries.clone();
     for seed in seeds {
         for entry in index.lookup_by_name(symbol) {
@@ -1117,7 +1121,7 @@ fn expand_java_overloads(index: &Index, symbol: &str, entries: &mut Vec<Entry>) 
 }
 
 fn call_shape_from_java_entries(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1166,7 +1170,7 @@ fn call_shape_from_java_entries(
 }
 
 fn java_argument_type_mismatch_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1218,7 +1222,7 @@ struct JavaExprType {
 }
 
 fn java_expression_type(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1285,7 +1289,11 @@ fn java_floating_literal_type(text: &str) -> &'static str {
     }
 }
 
-fn java_params_accept_args(index: &Index, params: &[TypeRef], args: &[JavaExprType]) -> bool {
+fn java_params_accept_args(
+    index: &dyn InferenceIndex,
+    params: &[TypeRef],
+    args: &[JavaExprType],
+) -> bool {
     if params.len() != args.len() {
         return false;
     }
@@ -1295,7 +1303,7 @@ fn java_params_accept_args(index: &Index, params: &[TypeRef], args: &[JavaExprTy
         .all(|(param, arg)| java_type_accepts(index, param, arg))
 }
 
-fn java_type_accepts(index: &Index, param: &TypeRef, arg: &JavaExprType) -> bool {
+fn java_type_accepts(index: &dyn InferenceIndex, param: &TypeRef, arg: &JavaExprType) -> bool {
     let formal = simple_java_type_name(&param.name);
     let actual = simple_java_type_name(&arg.name);
     if formal == actual {
@@ -1322,7 +1330,12 @@ fn java_type_accepts(index: &Index, param: &TypeRef, arg: &JavaExprType) -> bool
     java_is_subtype(index, &actual, arg.package.as_deref(), &formal)
 }
 
-fn java_is_subtype(index: &Index, actual: &str, package: Option<&str>, formal: &str) -> bool {
+fn java_is_subtype(
+    index: &dyn InferenceIndex,
+    actual: &str,
+    package: Option<&str>,
+    formal: &str,
+) -> bool {
     let mut visited = std::collections::HashSet::new();
     let mut frontier = vec![(actual.to_string(), package.map(str::to_string))];
     while let Some((current, current_package)) = frontier.pop() {
@@ -1578,7 +1591,7 @@ pub fn explicit_import_fqn_at(tree: &Tree, src: &str, offset: usize) -> Option<S
 /// local variables/parameters, `this.*`, and cross-file/same-package resolution work; broader
 /// member access and static imports are still best-effort or not yet implemented.
 pub fn goto_definition(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1590,7 +1603,7 @@ pub fn goto_definition(
 }
 
 fn goto_definition_with_imports(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1642,7 +1655,7 @@ fn goto_definition_with_imports(
 }
 
 fn java_reference_resolves_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -1674,7 +1687,7 @@ fn java_reference_resolves_with_ctx(
 }
 
 fn qualified_nested_type_resolves(
-    index: &Index,
+    index: &dyn InferenceIndex,
     src: &str,
     usage: Node<'_>,
     ctx: &JavaDiagnosticContext,
@@ -1755,7 +1768,7 @@ fn is_type_name_position(node: Node<'_>) -> bool {
 }
 
 pub fn type_definition(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -1779,7 +1792,7 @@ pub fn type_definition(
     Vec::new()
 }
 
-fn type_defs_for_receiver(index: &Index, ty: &Type) -> Vec<Def> {
+fn type_defs_for_receiver(index: &dyn InferenceIndex, ty: &Type) -> Vec<Def> {
     let Some(name) = ty.name() else {
         return Vec::new();
     };
@@ -1801,7 +1814,13 @@ fn type_defs_for_receiver(index: &Index, ty: &Type) -> Vec<Def> {
     defs
 }
 
-fn type_defs_for_name(index: &Index, file: &str, src: &str, tree: &Tree, name: &str) -> Vec<Def> {
+fn type_defs_for_name(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    name: &str,
+) -> Vec<Def> {
     let _ = file;
     let ty =
         type_scope(tree, src).type_ref(name.split('<').next().unwrap_or(name), false, Vec::new());
@@ -1880,7 +1899,7 @@ fn active_parameter(text: &str, callee_end: usize, offset: usize) -> u32 {
 }
 
 pub fn enclosing_callable_item(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     text: &str,
@@ -1917,7 +1936,7 @@ pub fn enclosing_callable_item(
 }
 
 pub fn incoming_calls<F>(
-    index: &Index,
+    index: &dyn InferenceIndex,
     target: &HierarchyItem,
     refs: Vec<Def>,
     mut parse_file: F,
@@ -1957,7 +1976,7 @@ where
 }
 
 pub fn outgoing_calls(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     text: &str,
@@ -2241,7 +2260,7 @@ fn declaration_in_for_init<'a>(src: &str, node: Node<'a>, name: &str) -> Option<
 }
 
 fn receiver_member_defs(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2304,7 +2323,7 @@ fn receiver_member_defs(
 const JAVA_SUPERTYPE_WALK_CAP: usize = 16;
 
 fn java_member_entries(
-    index: &Index,
+    index: &dyn InferenceIndex,
     recv: &Type,
     name: &str,
     expected_kind: SymbolKind,
@@ -2387,7 +2406,11 @@ fn java_member_kind_matches(actual: SymbolKind, expected: SymbolKind) -> bool {
     actual == expected || expected == SymbolKind::Property && actual == SymbolKind::EnumEntry
 }
 
-fn java_same_pkg_supertype(index: &Index, sup: &str, cur_pkg: Option<&str>) -> Option<String> {
+fn java_same_pkg_supertype(
+    index: &dyn InferenceIndex,
+    sup: &str,
+    cur_pkg: Option<&str>,
+) -> Option<String> {
     match cur_pkg {
         Some(pkg)
             if index
@@ -2402,7 +2425,7 @@ fn java_same_pkg_supertype(index: &Index, sup: &str, cur_pkg: Option<&str>) -> O
 }
 
 fn receiver_type(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2432,7 +2455,7 @@ fn receiver_type(
 }
 
 fn receiver_type_from_type_identifier(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2448,7 +2471,7 @@ fn receiver_type_from_type_identifier(
 }
 
 fn java_method_invocation_return_type(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2574,7 +2597,7 @@ fn same_file_field_declaration<'a>(src: &str, usage: Node<'a>) -> Option<Node<'a
 }
 
 fn type_of_value_declaration(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2591,7 +2614,7 @@ fn type_of_value_declaration(
 }
 
 fn receiver_type_from_type_node(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2606,14 +2629,23 @@ fn receiver_type_from_type_node(
     ))
 }
 
-fn same_file_type_package(index: &Index, file: &str, type_name: &str) -> Option<String> {
+fn same_file_type_package(
+    index: &dyn InferenceIndex,
+    file: &str,
+    type_name: &str,
+) -> Option<String> {
     index.entries_for_file(file).into_iter().find_map(|entry| {
         (entry.sym.name == type_name && entry.sym.kind.is_type_like())
             .then(|| entry.sym.package.clone())
     })
 }
 
-fn visible_type_package(index: &Index, src: &str, tree: &Tree, type_name: &str) -> Option<String> {
+fn visible_type_package(
+    index: &dyn InferenceIndex,
+    src: &str,
+    tree: &Tree,
+    type_name: &str,
+) -> Option<String> {
     let package = package_of(tree, src);
     let imports = imports_of(tree, src);
     index
@@ -2642,7 +2674,7 @@ fn enclosing_type_name(node: Node<'_>, src: &str) -> Option<String> {
 }
 
 fn qualified_member_defs(
-    index: &Index,
+    index: &dyn InferenceIndex,
     src: &str,
     tree: &Tree,
     usage: Node<'_>,
@@ -2863,7 +2895,7 @@ pub(crate) fn is_valid_identifier(name: &str) -> bool {
 
 /// `textDocument/completion` for callers that only need shaped Java results.
 pub fn completion(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -2885,7 +2917,7 @@ pub fn completion(
 
 /// Normalize Java syntax and receiver types for the shared completion candidate and shaping flow.
 pub fn completion_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -3008,7 +3040,7 @@ fn prefix_at<'a>(tree: &'a Tree, src: &str, offset: usize) -> (String, Option<No
 }
 
 fn scope_candidates(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -3111,6 +3143,7 @@ fn parse_import(node: Node, src: &str) -> Option<Import> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::Index;
 
     fn index(src: &str) -> Vec<IndexedSymbol> {
         let tree = JavaParser::new().parse(src);

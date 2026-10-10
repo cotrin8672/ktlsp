@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use tree_sitter::{Node, Tree};
 
-use crate::index::{Entry, Index, Tier};
+use crate::index::{Entry, InferenceIndex, Tier};
 use crate::parser::{child_of_kind, class_kind, first_ident, identifier_at, name_field, node_text};
 use crate::resolve::{use_kind, UseKind};
 use crate::symbol::SymbolKind;
@@ -307,7 +307,7 @@ pub struct IndexScopeCandidateConfig {
 /// visibility rules; this owns the common policy of project/library tiering, arity/detail facts,
 /// and whether a candidate needs an auto-import edit.
 pub fn index_scope_candidates<F>(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     prefix: &str,
     config: IndexScopeCandidateConfig,
@@ -642,7 +642,11 @@ pub fn navigation_receiver_at(tree: &Tree, offset: usize) -> Option<Node<'_>> {
 /// applicable extensions (receiver == ty or any supertype). Dedup by `(label, kind)`. Returns at
 /// most `MAX_MEMBER_COMPLETIONS`. Empty when the type contributes nothing visible (silent omission
 /// is the caller's concern — an empty vec here just means no members matched).
-pub fn assemble_members(index: &Index, ty: &str, prefix: &str) -> Vec<ScopeCompletion> {
+pub fn assemble_members(
+    index: &dyn InferenceIndex,
+    ty: &str,
+    prefix: &str,
+) -> Vec<ScopeCompletion> {
     let mut out: Vec<ScopeCompletion> = Vec::new();
     let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
 

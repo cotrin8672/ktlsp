@@ -35,6 +35,7 @@ use crate::jar;
 use crate::java::JavaParser;
 use crate::language::{self, SourceLanguage};
 use crate::parser::KotlinParser;
+use crate::project_model::{FileOrigin, SourceRepresentation};
 use crate::symbol::IndexedSymbol;
 
 /// One file's worth of indexed symbols, keyed by its stable on-disk path (the goto target is
@@ -43,6 +44,9 @@ use crate::symbol::IndexedSymbol;
 pub struct FileSymbols {
     pub file: String,
     pub symbols: Vec<IndexedSymbol>,
+    /// Runtime project ownership is reapplied after loading the shared symbol cache.
+    #[serde(skip)]
+    pub origin: Option<FileOrigin>,
 }
 
 /// A resolved source location for a dependency coordinate. The `identity` is stable for the actual
@@ -53,6 +57,7 @@ pub struct LibrarySource {
     dest: PathBuf,
     jar: Option<PathBuf>,
     fingerprint: Option<String>,
+    origin_id: String,
 }
 
 impl LibrarySource {
@@ -840,6 +845,7 @@ fn parse_source_file(
     (!facts.symbols.is_empty()).then(|| FileSymbols {
         file: crate::paths::file_key(path),
         symbols: facts.symbols,
+        origin: None,
     })
 }
 
@@ -870,6 +876,7 @@ pub fn coordinate_source(
             dest,
             jar: None,
             fingerprint: None,
+            origin_id: crate::classpath::maven_origin_id(coord),
         });
     };
 
@@ -878,12 +885,37 @@ pub fn coordinate_source(
         dest,
         jar: Some(jar),
         fingerprint,
+        origin_id: crate::classpath::maven_origin_id(coord),
     })
 }
 
 /// Index an already-resolved library source: ensure it's extracted, then load parsed symbols from
 /// the symcache (skipping parse) or parse + cache them.
 pub fn resolve_library_source(
+    source: &LibrarySource,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
+    let mut batches = resolve_library_source_unowned(source, kotlin, java);
+    tag_batches(
+        &mut batches,
+        &source.origin_id,
+        SourceRepresentation::Source,
+    );
+    batches
+}
+
+fn tag_batches(batches: &mut [FileSymbols], origin_id: &str, representation: SourceRepresentation) {
+    for batch in batches {
+        batch.origin = Some(FileOrigin {
+            origin_id: origin_id.to_string(),
+            representation,
+            project_scope: None,
+        });
+    }
+}
+
+fn resolve_library_source_unowned(
     source: &LibrarySource,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
@@ -938,6 +970,41 @@ pub fn resolve_local_jar_stubs(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> Vec<FileSymbols> {
+    resolve_local_jar_stubs_for_origin(
+        jar_path,
+        &crate::classpath::file_origin_id(jar_path),
+        extract_root,
+        kotlin,
+        java,
+    )
+}
+
+pub fn resolve_local_jar_stubs_for_origin(
+    jar_path: &Path,
+    origin_id: &str,
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
+    if crate::classpath::file_origin_id(jar_path) != origin_id {
+        tracing::warn!(path = %jar_path.display(), "local artifact changed since project discovery");
+        return Vec::new();
+    }
+    let mut batches = resolve_local_jar_stubs_unowned(jar_path, extract_root, kotlin, java);
+    if crate::classpath::file_origin_id(jar_path) != origin_id {
+        tracing::warn!(path = %jar_path.display(), "local artifact changed while indexing");
+        return Vec::new();
+    }
+    tag_batches(&mut batches, origin_id, SourceRepresentation::Stub);
+    batches
+}
+
+fn resolve_local_jar_stubs_unowned(
+    jar_path: &Path,
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
     if !jar_path.is_file() {
         return Vec::new();
     }
@@ -970,6 +1037,7 @@ pub fn resolve_local_jar_stubs(
 pub fn resolve_import_fqn_from_local_jars(
     import_fqn: &str,
     jars: Vec<PathBuf>,
+    model: Option<&crate::classpath::ProjectSnapshot>,
     extract_root: &Path,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
@@ -978,7 +1046,12 @@ pub fn resolve_import_fqn_from_local_jars(
         return Vec::new();
     };
     for jar_path in jars {
-        let batches = resolve_local_jar_stubs(&jar_path, extract_root, kotlin, java);
+        let origin_id = model
+            .and_then(|model| model.artifact_origin(&jar_path))
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::classpath::file_origin_id(&jar_path));
+        let batches =
+            resolve_local_jar_stubs_for_origin(&jar_path, &origin_id, extract_root, kotlin, java);
         let matches = batches
             .into_iter()
             .filter(|batch| {
@@ -1525,6 +1598,12 @@ pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPla
     }
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
+        let mut cached = cached;
+        tag_batches(
+            &mut cached,
+            &crate::classpath::jdk_origin_id(src_zip),
+            SourceRepresentation::Source,
+        );
         return Some(JdkIndexPlan::Cached(cached));
     }
 
@@ -1561,6 +1640,11 @@ pub fn parse_jdk_shard(
     ) {
         tracing::warn!("parse {} failed: {error}", plan.src_zip.display());
     }
+    tag_batches(
+        &mut out,
+        &crate::classpath::jdk_origin_id(&plan.src_zip),
+        SourceRepresentation::Source,
+    );
     out
 }
 
@@ -1642,10 +1726,16 @@ fn resolve_jdk_imports_from_zip(
     }
     paths.sort();
     paths.dedup();
-    paths
+    let mut batches: Vec<_> = paths
         .into_iter()
         .filter_map(|path| parse_java_source_file(&path, java))
-        .collect()
+        .collect();
+    tag_batches(
+        &mut batches,
+        &crate::classpath::jdk_origin_id(src_zip),
+        SourceRepresentation::Source,
+    );
+    batches
 }
 
 fn find_extracted_source(dest: &Path, suffix: &str) -> Option<PathBuf> {
@@ -1745,6 +1835,7 @@ fn parse_java_source_file(path: &Path, java: &mut JavaParser) -> Option<FileSymb
     (!facts.symbols.is_empty()).then(|| FileSymbols {
         file: crate::paths::file_key(path),
         symbols: facts.symbols,
+        origin: None,
     })
 }
 
@@ -2010,6 +2101,95 @@ public interface ExecutorService {
         assert_eq!(batches.len(), 1);
         assert_dependency_buffer_lifecycle(batches.remove(0), &source, original);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn library_origin_is_attached_after_cold_parse_and_warm_cache_load() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_library_origin_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        write_sources_jar(
+            &jar,
+            &[(
+                "api/Reader.java",
+                "package api; public class Reader { public void useful() {} }",
+            )],
+        );
+        let mut source = LibrarySource {
+            dest: tmp.join("extract"),
+            jar: Some(jar.clone()),
+            fingerprint: jar_fingerprint(&jar),
+            origin_id: "maven:vendor:api:1".to_string(),
+        };
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let cold = resolve_library_source(&source, &mut kotlin, &mut java);
+        assert_eq!(cold.len(), 1);
+        assert!(cold[0].symbols.iter().any(|symbol| symbol.name == "useful"));
+        assert_eq!(
+            cold[0].origin.as_ref().unwrap().origin_id,
+            "maven:vendor:api:1"
+        );
+        assert_eq!(
+            cold[0].origin.as_ref().unwrap().representation,
+            SourceRepresentation::Source
+        );
+        let serialized = bincode::serialize(&cold).unwrap();
+        let unowned: Vec<FileSymbols> = bincode::deserialize(&serialized).unwrap();
+        assert!(
+            unowned[0].origin.is_none(),
+            "runtime ownership must not be persisted in symbol caches"
+        );
+        source.origin_id = "maven:vendor:alias:1".to_string();
+        let warm = resolve_library_source(&source, &mut kotlin, &mut java);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].origin.as_ref().unwrap().origin_id, source.origin_id);
+        assert_eq!(warm[0].file, cold[0].file);
+        assert_eq!(warm[0].symbols.len(), cold[0].symbols.len());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn local_stub_origin_rejects_binary_changes_after_discovery() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_local_stub_origin_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("local.jar");
+        // The existing shallow fallback reads class names; it does not claim bytecode members.
+        write_sources_jar(&jar, &[("api/Only.class", "")]);
+        let captured = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for _ in 0..2 {
+            let batches = resolve_local_jar_stubs_for_origin(
+                &jar,
+                &captured,
+                &tmp.join("extract"),
+                &mut kotlin,
+                &mut java,
+            );
+            assert_eq!(batches.len(), 1);
+            assert!(batches[0]
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "Only"));
+            assert_eq!(batches[0].origin.as_ref().unwrap().origin_id, captured);
+            assert_eq!(
+                batches[0].origin.as_ref().unwrap().representation,
+                SourceRepresentation::Stub
+            );
+        }
+        write_sources_jar(&jar, &[("api/ChangedAfterSnapshot.class", "")]);
+        assert_ne!(crate::classpath::file_origin_id(&jar), captured);
+        assert!(resolve_local_jar_stubs_for_origin(
+            &jar,
+            &captured,
+            &tmp.join("extract"),
+            &mut kotlin,
+            &mut java
+        )
+        .is_empty());
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

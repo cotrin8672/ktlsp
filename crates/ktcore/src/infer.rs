@@ -2594,7 +2594,7 @@ mod tests {
 
     #[test]
     fn inference_stops_a_generic_cycle_before_expanding_the_same_declaration() {
-        use crate::index::{Entry, InferenceIndex};
+        use crate::index::{InferenceIndex, LookupEntries};
         use crate::parser::KotlinParser;
         use std::cell::Cell;
 
@@ -2603,18 +2603,18 @@ mod tests {
             cyclic_member_queries: Cell<usize>,
         }
         impl InferenceIndex for CountIndex {
-            fn lookup_by_name(&self, name: &str) -> &[Entry] {
-                self.index.lookup_by_name(name)
+            fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+                LookupEntries::All(self.index.lookup_by_name(name))
             }
-            fn members_of(&self, name: &str) -> &[Entry] {
+            fn members_of(&self, name: &str) -> LookupEntries<'_> {
                 if name == "A" || name == "B" {
                     self.cyclic_member_queries
                         .set(self.cyclic_member_queries.get() + 1);
                 }
-                self.index.members_of(name)
+                LookupEntries::All(self.index.members_of(name))
             }
-            fn extensions_for(&self, name: &str) -> &[Entry] {
-                self.index.extensions_for(name)
+            fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+                LookupEntries::All(self.index.extensions_for(name))
             }
         }
 

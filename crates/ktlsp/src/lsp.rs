@@ -42,6 +42,7 @@ pub struct Backend {
     client: Client,
     ws: Arc<Mutex<Workspace>>,
     root: Mutex<Option<PathBuf>>,
+    gradle_project: Mutex<bool>,
     /// Whether the client advertised snippet support in `initialize`. Set once; gates whether
     /// completion items insert `name($0)` snippets or plain bare names.
     snippets_supported: Mutex<bool>,
@@ -61,6 +62,7 @@ impl Backend {
             client,
             ws: Arc::new(Mutex::new(Workspace::new())),
             root: Mutex::new(None),
+            gradle_project: Mutex::new(false),
             snippets_supported: Mutex::new(false),
             doc_versions: Arc::new(Mutex::new(HashMap::new())),
             progress_supported: Arc::new(Mutex::new(false)),
@@ -117,7 +119,8 @@ impl Backend {
                 );
                 if let Some(root) = root {
                     if crate::deps::gradle_root(&root).is_some() {
-                        let local_jars = local_jars_for_file(&root, Path::new(&key));
+                        let local_jars = resolve_local_jars_for_file(&root, Path::new(&key));
+                        let model = crate::classpath::snapshot(&root);
                         if !local_jars.is_empty() {
                             let extract_root = crate::deps::extract_root();
                             for fqn in imports.iter().filter(|fqn| {
@@ -126,6 +129,7 @@ impl Backend {
                                 batches.extend(crate::deps::resolve_import_fqn_from_local_jars(
                                     fqn,
                                     local_jars.clone(),
+                                    model.as_deref(),
                                     &extract_root,
                                     &mut kotlin,
                                     &mut java,
@@ -148,7 +152,7 @@ impl Backend {
             if files > 0 {
                 let mut guard = ws.lock();
                 for batch in batches {
-                    guard.index_dependency_file(&batch.file, batch.symbols);
+                    guard.index_dependency_batch(batch);
                 }
                 guard.bump_index_revision();
             }
@@ -181,6 +185,7 @@ struct DepStats {
     jdk_symbols: usize,
     local_stub_files: usize,
     local_stub_symbols: usize,
+    incomplete_classpath: bool,
 }
 
 #[derive(Clone)]
@@ -299,6 +304,7 @@ fn spawn_jdk_cached_worker(
 
 fn spawn_local_jar_index_worker(
     jar_path: std::path::PathBuf,
+    origin_id: String,
     extract_root: std::path::PathBuf,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
@@ -319,7 +325,13 @@ fn spawn_local_jar_index_worker(
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut kotlin = KotlinParser::new();
                 let mut java = JavaParser::new();
-                deps::resolve_local_jar_stubs(&jar_path, &extract_root, &mut kotlin, &mut java)
+                deps::resolve_local_jar_stubs_for_origin(
+                    &jar_path,
+                    &origin_id,
+                    &extract_root,
+                    &mut kotlin,
+                    &mut java,
+                )
             }));
             let result = match resolved {
                 Ok(batches) => DependencyResult {
@@ -354,6 +366,7 @@ fn spawn_coordinate_index_worker(
     repos: crate::artifacts::Repos,
     extract_root: std::path::PathBuf,
     indexed_sources: std::sync::Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>,
+    authoritative: bool,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
@@ -373,7 +386,12 @@ fn spawn_coordinate_index_worker(
                     .as_ref()
                     .map(|source| {
                         let mut guard = indexed_sources.lock();
-                        !guard.insert(source.identity())
+                        let identity = if authoritative {
+                            format!("{}|{}", source.identity(), coord.label())
+                        } else {
+                            source.identity()
+                        };
+                        !guard.insert(identity)
                     })
                     .unwrap_or(false);
                 let batches = if skipped {
@@ -385,7 +403,11 @@ fn spawn_coordinate_index_worker(
                 } else {
                     Vec::new()
                 };
-                let discovered = artifacts::dependency_coordinates(&repos, &coord);
+                let discovered = if authoritative {
+                    Vec::new()
+                } else {
+                    artifacts::dependency_coordinates(&repos, &coord)
+                };
                 (batches, discovered, skipped, missing_source)
             }));
             let result = match resolved {
@@ -435,7 +457,29 @@ fn index_dependencies(
     coords.extend(deps::cached_catalog_coordinates(root, &repos));
     coords.extend(deps::coordinates_from_build_files(root, &repos));
     let mut local_jars = VecDeque::new();
-    if deps::gradle_root(root).is_some() {
+    let model = if deps::gradle_root(root).is_some() {
+        classpath::resolve_snapshot(root).ok()
+    } else {
+        None
+    };
+    let authoritative = model
+        .as_ref()
+        .is_some_and(|m| m.modules.iter().any(|m| !m.source_sets.is_empty()));
+    if let Some(model) = &model {
+        let mut guard = ws.lock();
+        guard.set_project_model(model.clone());
+        let added = guard.scan_model_sources();
+        tracing::info!(
+            modules = model.modules.len(),
+            additional_sources = added,
+            authoritative,
+            "installed Gradle project model"
+        );
+    }
+    if authoritative {
+        coords = classpath::coordinates_from_classpath(root);
+        local_jars.extend(classpath::local_jars_from_classpath(root));
+    } else if deps::gradle_root(root).is_some() {
         // Gradle projects declare dependencies either in a version catalog or directly in
         // `build.gradle`. The resolved `compileClasspath` jars reveal the actual coordinates of
         // every dependency (including transitive ones), so use them as the advisory source index.
@@ -448,7 +492,19 @@ fn index_dependencies(
     let mut indexed_files: BTreeMap<Coordinate, Vec<IndexedDependencyFile>> = BTreeMap::new();
     let extract_root = deps::extract_root();
     let jdk_src = deps::jdk_src_zip();
-    let mut stats = DepStats::default();
+    let mut stats = DepStats {
+        incomplete_classpath: deps::gradle_root(root).is_some()
+            && (!authoritative
+                || model.as_ref().is_some_and(|m| {
+                    m.modules.iter().any(|module| {
+                        !module.unresolved.is_empty()
+                            || module.source_sets.iter().any(|source| {
+                                source.classpath_incomplete || !source.unresolved.is_empty()
+                            })
+                    })
+                })),
+        ..Default::default()
+    };
     const MAX_DEPENDENCY_COORDINATES: usize = 1024;
     let max_workers = dependency_index_threads();
     let indexed_sources = std::sync::Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
@@ -510,7 +566,12 @@ fn index_dependencies(
                         .to_string();
                     let _ = tx.send((completed + active + 1, progress_total, label));
                 }
-                spawn_local_jar_index_worker(jar_path, extract_root.clone(), tx.clone());
+                let origin_id = model
+                    .as_ref()
+                    .and_then(|m| m.artifact_origin(&jar_path))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| classpath::file_origin_id(&jar_path));
+                spawn_local_jar_index_worker(jar_path, origin_id, extract_root.clone(), tx.clone());
                 active += 1;
                 continue;
             }
@@ -520,7 +581,11 @@ fn index_dependencies(
             if !seen.insert(coord.clone()) {
                 continue;
             }
-            match selected.consider(coord.clone()) {
+            match if authoritative {
+                CoordinateDecision::Selected
+            } else {
+                selected.consider(coord.clone())
+            } {
                 CoordinateDecision::Selected => {}
                 CoordinateDecision::Replaces(previous) => {
                     stats.shadowed += 1;
@@ -551,6 +616,7 @@ fn index_dependencies(
                 repos.clone(),
                 extract_root.clone(),
                 indexed_sources.clone(),
+                authoritative,
                 tx.clone(),
             );
             active += 1;
@@ -590,7 +656,7 @@ fn index_dependencies(
                         stats.symbols += symbol_count;
                         stats.jdk_symbols += symbol_count;
                         stats.jdk_files += 1;
-                        guard.index_dependency_file(&batch.file, batch.symbols);
+                        guard.index_dependency_batch(batch);
                         stats.files += 1;
                     }
                     // One revision bump for the whole shard drain: readers recompute once after
@@ -641,7 +707,7 @@ fn index_dependencies(
                     symbols: symbol_count,
                 });
             }
-            guard.index_dependency_file(&batch.file, batch.symbols);
+            guard.index_dependency_batch(batch);
             guard.bump_index_revision();
             stats.files += 1;
         }
@@ -747,6 +813,7 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
             "jdkSymbols": stats.jdk_symbols,
             "localStubFiles": stats.local_stub_files,
             "localStubSymbols": stats.local_stub_symbols,
+            "classpathComplete": !stats.incomplete_classpath,
         }),
     );
 
@@ -780,7 +847,9 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
     );
     {
         let mut guard = ws.lock();
-        guard.set_library_index_complete(stats.failed == 0 && stats.missing_sources == 0);
+        guard.set_library_index_complete(
+            stats.failed == 0 && stats.missing_sources == 0 && !stats.incomplete_classpath,
+        );
         guard.set_jdk_index_complete(stats.jdk_files > 0);
     }
     // Open buffers may have received conservative diagnostics before dependency/JDK indexing
@@ -814,6 +883,8 @@ fn resolve_import_source_batches(
     file: &Path,
     text: &str,
     offset: usize,
+    gradle_project: bool,
+    model: Option<&classpath::ProjectSnapshot>,
 ) -> (Option<String>, Vec<crate::deps::FileSymbols>) {
     let mut java = crate::java::JavaParser::new();
     let import_fqn = if file.extension().and_then(|ext| ext.to_str()) == Some("java") {
@@ -824,6 +895,15 @@ fn resolve_import_source_batches(
     let Some(import_fqn) = import_fqn else {
         return (None, Vec::new());
     };
+    // Editor requests use the published model; Gradle resolution belongs to background indexing.
+    if gradle_project
+        && model
+            .and_then(|model| model.owner_for(file))
+            .and_then(|(_, source)| source)
+            .is_none()
+    {
+        return (Some(import_fqn), Vec::new());
+    }
     let extract_root = crate::deps::extract_root();
     if import_fqn.starts_with("android.") {
         let batches = crate::deps::resolve_android_imports(
@@ -846,12 +926,20 @@ fn resolve_import_source_batches(
     }
 
     let repos = crate::artifacts::Repos::defaults();
-    let mut coords = crate::deps::coordinates_for_root(root);
-    coords.extend(crate::deps::cached_catalog_coordinates(root, &repos));
-    coords.extend(crate::deps::coordinates_from_build_files(root, &repos));
-    let gradle_project = crate::deps::gradle_root(root).is_some();
+    let coords = if gradle_project {
+        model
+            .and_then(|m| m.coordinates_for_file(file))
+            .unwrap_or_default()
+    } else {
+        let mut coords = crate::deps::coordinates_for_root(root);
+        coords.extend(crate::deps::cached_catalog_coordinates(root, &repos));
+        coords.extend(crate::deps::coordinates_from_build_files(root, &repos));
+        coords
+    };
     let local_jars = if gradle_project {
-        local_jars_for_file(root, file)
+        model
+            .and_then(|m| m.local_jars_for_file(file))
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -860,20 +948,13 @@ fn resolve_import_source_batches(
         let batches = crate::deps::resolve_import_fqn_from_local_jars(
             &import_fqn,
             local_jars.clone(),
+            model,
             &extract_root,
             &mut kotlin,
             &mut java,
         );
         if !batches.is_empty() {
             return (Some(import_fqn), batches);
-        }
-    }
-    if gradle_project {
-        coords.extend(crate::classpath::coordinates_from_classpath(root));
-        if let Some(module) = crate::daemon::module_path_for(root, file) {
-            coords.extend(crate::classpath::coordinates_from_module_classpath(
-                root, &module,
-            ));
         }
     }
     let mut batches = if coords.is_empty() {
@@ -892,6 +973,7 @@ fn resolve_import_source_batches(
         batches = crate::deps::resolve_import_fqn_from_local_jars(
             &import_fqn,
             local_jars,
+            model,
             &extract_root,
             &mut kotlin,
             &mut java,
@@ -924,7 +1006,13 @@ fn kotlin_import_fqn_for_identifier(text: &str, offset: usize) -> Option<String>
         .map(|import| import.path)
 }
 
-fn local_jars_for_file(root: &Path, file: &Path) -> Vec<PathBuf> {
+/// Background indexing may resolve an unpublished or changed Gradle model.
+fn resolve_local_jars_for_file(root: &Path, file: &Path) -> Vec<PathBuf> {
+    if let Ok(model) = crate::classpath::resolve_snapshot(root) {
+        if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
+            return model.local_jars_for_file(file).unwrap_or_default();
+        }
+    }
     let Some(module) = crate::daemon::module_path_for(root, file) else {
         let build_file_jars = crate::classpath::local_jars_from_build_files(root);
         return if build_file_jars.is_empty() {
@@ -1001,8 +1089,16 @@ impl LanguageServer for Backend {
                     .and_then(|folder| uri_to_key(&folder.uri))
             })
             .map(PathBuf::from);
-        if root.is_some() {
-            *self.root.lock() = root;
+        if let Some(root) = root {
+            let gradle_project = crate::deps::gradle_root(&root).is_some();
+            *self.gradle_project.lock() = gradle_project;
+            if gradle_project {
+                // Pending or failed Gradle resolution cannot expose an unscoped checkout.
+                self.ws
+                    .lock()
+                    .set_project_model(Arc::new(classpath::ProjectSnapshot::new(Vec::new())));
+            }
+            *self.root.lock() = Some(root);
         }
 
         // Whether the client supports snippet insertion (`name($0)`). Option chain; default false.
@@ -1260,8 +1356,17 @@ impl LanguageServer for Backend {
                 let seed_start = Instant::now();
                 let seed_text = text.clone();
                 let seed_key = key.clone();
+                let gradle_project = *self.gradle_project.lock();
+                let model = classpath::snapshot(&root);
                 let seed = tokio::task::spawn_blocking(move || {
-                    resolve_import_source_batches(&root, Path::new(&seed_key), &seed_text, offset)
+                    resolve_import_source_batches(
+                        &root,
+                        Path::new(&seed_key),
+                        &seed_text,
+                        offset,
+                        gradle_project,
+                        model.as_deref(),
+                    )
                 })
                 .await
                 .unwrap_or_else(|_| (None, Vec::new()));
@@ -1283,7 +1388,7 @@ impl LanguageServer for Backend {
                 if files > 0 {
                     if let Some(mut ws) = self.ws.try_lock() {
                         for batch in batches {
-                            ws.index_dependency_file(&batch.file, batch.symbols);
+                            ws.index_dependency_batch(batch);
                         }
                         ws.bump_index_revision();
                         let defs = ws.goto_definition(&key, offset);
@@ -1708,7 +1813,7 @@ impl LanguageServer for Backend {
                     let text = match ws.doc_text(&key) {
                         Some(t) => t,
                         None => {
-                            return Ok(Some(serde_json::json!({ "status": "missing-document" })))
+                            return Ok(Some(serde_json::json!({ "status": "missing-document" })));
                         }
                     };
                     let offset =
@@ -1796,15 +1901,24 @@ impl LanguageServer for Backend {
             if let Some(root) = root {
                 let seed_key = key.clone();
                 let seed_text = text.clone();
+                let gradle_project = *self.gradle_project.lock();
+                let model = classpath::snapshot(&root);
                 let (_, batches) = tokio::task::spawn_blocking(move || {
-                    resolve_import_source_batches(&root, Path::new(&seed_key), &seed_text, offset)
+                    resolve_import_source_batches(
+                        &root,
+                        Path::new(&seed_key),
+                        &seed_text,
+                        offset,
+                        gradle_project,
+                        model.as_deref(),
+                    )
                 })
                 .await
                 .unwrap_or_else(|_| (None, Vec::new()));
                 if !batches.is_empty() {
                     let mut ws = self.ws.lock();
                     for batch in batches {
-                        ws.index_dependency_file(&batch.file, batch.symbols);
+                        ws.index_dependency_batch(batch);
                     }
                     ws.bump_index_revision();
                     if let Some(query) = ws.resolved_symbol_query(&key, offset) {
@@ -3017,6 +3131,223 @@ mod tests {
         assert_eq!(
             java_import_fqn_for_identifier(text, usage_offset, &mut java).as_deref(),
             Some("android.graphics.Bitmap")
+        );
+    }
+
+    fn gradle_import_request_fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_import_request_{name}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
+        let wrapper = root.join(if cfg!(windows) {
+            "gradlew.bat"
+        } else {
+            "gradlew"
+        });
+        std::fs::write(
+            &wrapper,
+            if cfg!(windows) {
+                "@echo off\r\necho invoked> \"%~dp0gradle-invoked\"\r\nexit /b 1\r\n"
+            } else {
+                "#!/bin/sh\n: > \"$(dirname \"$0\")/gradle-invoked\"\nexit 1\n"
+            },
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        root
+    }
+
+    #[tokio::test]
+    async fn initialize_keeps_gradle_unknown_until_a_source_model_is_available() {
+        for gradle in [true, false] {
+            let root = std::env::temp_dir().join(format!(
+                "ktlsp_initialize_scope_{gradle}_{}",
+                std::process::id()
+            ));
+            let decoy = root.join("src/test/resources/vendor/Helper.java");
+            std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+            std::fs::write(
+                &decoy,
+                "package vendor; public class Helper { public void forbidden() {} }",
+            )
+            .unwrap();
+            if gradle {
+                std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
+            }
+            let (service, _socket) = tower_lsp_server::LspService::new(Backend::new);
+            let backend = service.inner();
+            backend
+                .initialize(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Uri::from_file_path(&root).unwrap(),
+                        name: "pending-model".to_string(),
+                    }]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let mut ws = backend.ws.lock();
+            assert_eq!(ws.scan(&root), usize::from(!gradle));
+            for (name, text) in [
+                (
+                    "Use.java",
+                    "package app; import vendor.Helper; class Use { void known() {} void run(Helper helper) { known(); helper.forbidden(); } }",
+                ),
+                (
+                    "Use.kt",
+                    "package app\nimport vendor.Helper\nfun known() {}\nfun run(helper: Helper) { known(); helper.forbidden() }\n",
+                ),
+            ] {
+                let key = crate::paths::file_key(&root.join("src/main").join(name));
+                ws.open(key.clone(), text.to_string());
+                let forbidden = text.find("helper.forbidden").unwrap() + "helper.".len();
+                assert_eq!(
+                    ws.goto_definition(&key, forbidden).len(),
+                    usize::from(!gradle),
+                    "{name}: a closed resource is visible while the Gradle model is unknown"
+                );
+                assert_eq!(
+                    ws.complete(&key, forbidden + 3, true)
+                        .is_some_and(|completion| completion
+                            .items
+                            .iter()
+                            .any(|item| item.label.starts_with("forbidden"))),
+                    !gradle,
+                    "{name}: resource member completion must respect pending Gradle scope"
+                );
+                let known = text.find("known();").unwrap();
+                let targets = ws.goto_definition(&key, known);
+                assert_eq!(targets.len(), 1, "{name}: same-file goto remains useful");
+                assert_eq!(targets[0].file, key);
+                assert!(
+                    ws.complete(&key, known + 2, true)
+                        .expect("same-file completion")
+                        .items
+                        .iter()
+                        .any(|item| item.label.starts_with("known")),
+                    "{name}: same-file completion remains useful"
+                );
+            }
+            drop(ws);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn gradle_import_request_does_not_resolve_unpublished_model() {
+        let root = gradle_import_request_fixture("unpublished");
+        let text = "import vendor.Only; class Use { Only value; }";
+        let (import, batches) = resolve_import_source_batches(
+            &root,
+            &root.join("src/main/java/Use.java"),
+            text,
+            text.rfind("Only").unwrap(),
+            true,
+            None,
+        );
+        let launched = root.join("gradle-invoked").exists();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(import.as_deref(), Some("vendor.Only"));
+        assert!(batches.is_empty());
+        assert!(
+            !launched,
+            "an editor request launched Gradle without a published model"
+        );
+    }
+
+    #[test]
+    fn gradle_import_request_keeps_published_source_set_after_build_file_change() {
+        use std::io::Write;
+
+        let root = gradle_import_request_fixture("published");
+        let selected_jar = root.join("selected.jar");
+        let other_jar = root.join("other.jar");
+        for jar in [&selected_jar, &other_jar] {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(jar).unwrap());
+            zip.start_file(
+                "vendor/Only.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"").unwrap();
+            zip.finish().unwrap();
+        }
+        let source_root = root.join("modules/editing/custom-java");
+        let test_root = root.join("modules/editing/custom-test");
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nSOURCE\ttest\t{}\nSCP\ttest\t{}\nEND\t:app\n",
+            root.join("modules/editing").display(),
+            source_root.display(),
+            selected_jar.display(),
+            test_root.display(),
+            other_jar.display(),
+        )));
+        std::fs::write(
+            root.join("build.gradle.kts"),
+            "plugins { java }; dependencies { implementation(files(\"other.jar\")) }",
+        )
+        .unwrap();
+        for (file, text, expected_jar) in [
+            (
+                source_root.join("Use.java"),
+                "import vendor.Only; class Use { Only value; }",
+                &selected_jar,
+            ),
+            (
+                test_root.join("Use.kt"),
+                "import vendor.Only\nfun use(value: Only) = value\n",
+                &other_jar,
+            ),
+        ] {
+            let (import, batches) = resolve_import_source_batches(
+                &root,
+                &file,
+                text,
+                text.rfind("Only").unwrap(),
+                true,
+                Some(&model),
+            );
+            assert_eq!(import.as_deref(), Some("vendor.Only"));
+            assert_eq!(batches.len(), 1);
+            assert!(batches[0].symbols.iter().any(|symbol| {
+                symbol.name == "Only" && symbol.package == "vendor" && symbol.kind.is_type_like()
+            }));
+            assert_eq!(
+                batches[0].origin.as_ref().unwrap().origin_id,
+                model.artifact_origin(expected_jar).unwrap()
+            );
+        }
+        let text = "import vendor.Only; class Use { Only value; }";
+        let unsupported = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nEND\t:app\n",
+            root.display()
+        )));
+        for (file, model) in [
+            (root.join("testData/Use.java"), &model),
+            (source_root.join("Use.java"), &unsupported),
+        ] {
+            let (import, batches) = resolve_import_source_batches(
+                &root,
+                &file,
+                text,
+                text.rfind("Only").unwrap(),
+                true,
+                Some(model),
+            );
+            assert_eq!(import.as_deref(), Some("vendor.Only"));
+            assert!(batches.is_empty());
+        }
+        let launched = root.join("gradle-invoked").exists();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            !launched,
+            "an editor request re-resolved changed Gradle metadata"
         );
     }
 }

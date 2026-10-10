@@ -12,7 +12,7 @@ use tree_sitter::{Node, Tree};
 use crate::complete::{self, ScopeCompletion};
 use crate::hierarchy;
 use crate::imports::{self, ImportLayout, ImportStyle};
-use crate::index::{Entry, Index, InferenceIndex, Tier};
+use crate::index::{Entry, Index, InferenceIndex, LookupEntries, OriginFacts, Tier};
 use crate::infer;
 use crate::knowledge::Knowledge;
 use crate::language::{self, SourceLanguage};
@@ -92,6 +92,7 @@ pub enum CompletionIncompletenessReason {
     ImportContext,
     NonCompletablePosition,
     UnknownReceiverType,
+    QueryScopeIncomplete,
 }
 
 impl CompletionIncompletenessReason {
@@ -100,6 +101,7 @@ impl CompletionIncompletenessReason {
             CompletionIncompletenessReason::ImportContext => "import-context",
             CompletionIncompletenessReason::NonCompletablePosition => "non-completable-position",
             CompletionIncompletenessReason::UnknownReceiverType => "unknown-receiver-type",
+            CompletionIncompletenessReason::QueryScopeIncomplete => "query-scope-incomplete",
         }
     }
 }
@@ -183,7 +185,7 @@ fn completion_reason_labels(status: &CompletionStatus) -> Vec<String> {
 }
 
 pub fn reference_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -204,7 +206,7 @@ pub fn reference_query(
 }
 
 pub fn resolved_symbol_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -235,7 +237,7 @@ pub fn resolved_symbol_query(
 }
 
 pub fn completion_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     parser: &mut KotlinParser,
     file: &str,
     src: &str,
@@ -271,7 +273,7 @@ pub fn completion_query(
 }
 
 pub fn after_dot_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     parser: &mut KotlinParser,
     src: &str,
     offset: usize,
@@ -284,7 +286,7 @@ pub fn after_dot_query(
 }
 
 pub fn member_completion_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     tree: &Tree,
     src: &str,
     receiver: Node,
@@ -305,7 +307,7 @@ pub fn member_completion_query(
 }
 
 pub fn member_completion_query_for_type(
-    index: &Index,
+    index: &dyn InferenceIndex,
     language: SourceLanguage,
     tree: &Tree,
     src: &str,
@@ -349,7 +351,9 @@ pub fn member_completion_query_for_type(
     Some(CompletionQuery {
         context: complete::CompletionContext::AfterDot,
         prefix,
-        status: if candidates.is_empty() {
+        status: if candidates.is_empty() && !index.scope_is_complete() {
+            CompletionStatus::Unknown(vec![CompletionIncompletenessReason::QueryScopeIncomplete])
+        } else if candidates.is_empty() {
             CompletionStatus::DefinitelyAbsent
         } else {
             CompletionStatus::Found(())
@@ -360,14 +364,14 @@ pub fn member_completion_query_for_type(
 }
 
 pub fn call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
     call: Node,
     facts: &CompletenessFacts,
 ) -> Option<CallShapeQuery> {
-    if call.kind() != "call_expression" {
+    if call.kind() != "call_expression" || !index.scope_is_complete() {
         return None;
     }
     let normalized = outer_trailing_lambda_call(call);
@@ -390,7 +394,7 @@ pub fn call_shape_query(
 }
 
 fn top_level_call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -462,7 +466,7 @@ fn top_level_call_shape_query(
 }
 
 fn member_call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -539,7 +543,7 @@ fn member_call_shape_query(
 }
 
 pub fn scope_name_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -617,7 +621,9 @@ pub fn scope_name_query(
     Some(CompletionQuery {
         context: complete::CompletionContext::ScopeName,
         prefix,
-        status: if items.is_empty() {
+        status: if items.is_empty() && !index.scope_is_complete() {
+            CompletionStatus::Unknown(vec![CompletionIncompletenessReason::QueryScopeIncomplete])
+        } else if items.is_empty() {
             CompletionStatus::DefinitelyAbsent
         } else {
             CompletionStatus::Found(())
@@ -629,19 +635,28 @@ pub fn scope_name_query(
 
 // Recovery replaces only matching declaration identities; other packages' homonyms remain visible.
 struct RecoveredTypeIndex<'a> {
-    index: &'a Index,
+    index: &'a dyn InferenceIndex,
     source: &'a Index,
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
-    fn lookup_by_name(&self, name: &str) -> &[Entry] {
+    fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
         self.index.lookup_by_name(name)
     }
-    fn members_of(&self, name: &str) -> &[Entry] {
+    fn members_of(&self, name: &str) -> LookupEntries<'_> {
         self.index.members_of(name)
     }
-    fn extensions_for(&self, name: &str) -> &[Entry] {
+    fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
         self.index.extensions_for(name)
+    }
+    fn origin_facts(&self) -> Option<&OriginFacts> {
+        self.index.origin_facts()
+    }
+    fn scope_is_complete(&self) -> bool {
+        self.index.scope_is_complete()
+    }
+    fn permits_unique_member_fallback(&self) -> bool {
+        self.index.permits_unique_member_fallback()
     }
     fn lookup_type(&self, name: &str) -> Vec<&Entry> {
         let recovered = self.source.lookup_type(name);
@@ -658,7 +673,7 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
 }
 
 fn member_candidates(
-    index: &Index,
+    index: &dyn InferenceIndex,
     source_index: Option<&Index>,
     language: SourceLanguage,
     ty: &Type,
@@ -690,6 +705,7 @@ fn member_candidates(
                     })
                 })
             })
+            .map(|source| source as &dyn InferenceIndex)
             .unwrap_or(index);
         for e in members_index.members_of(&cur) {
             if let Some(p) = cur_pkg {
@@ -716,7 +732,7 @@ fn member_candidates(
 }
 
 fn member_call_entries<'a>(
-    index: &'a Index,
+    index: &'a dyn InferenceIndex,
     recv_ty: &Type,
     name: &str,
     vis: &Visibility,
@@ -760,7 +776,7 @@ fn member_call_entries<'a>(
 }
 
 fn generic_receiver_extensions<'a>(
-    index: &'a Index,
+    index: &'a dyn InferenceIndex,
     name: &str,
     vis: &Visibility,
 ) -> Vec<&'a Entry> {
@@ -779,7 +795,7 @@ fn generic_receiver_extensions<'a>(
 }
 
 fn argument_type_mismatch_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     tree: &Tree,
     src: &str,
     call: Node,
@@ -816,7 +832,7 @@ fn argument_type_mismatch_query(
 }
 
 fn expand_same_file_function_overloads(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     symbol: &str,
     entries: Vec<Entry>,
@@ -856,7 +872,12 @@ fn expand_same_file_function_overloads(
     }
 }
 
-fn synth_arg_types(index: &Index, call: Node, src: &str, ctx: &infer::FileCtx) -> Vec<Type> {
+fn synth_arg_types(
+    index: &dyn InferenceIndex,
+    call: Node,
+    src: &str,
+    ctx: &infer::FileCtx,
+) -> Vec<Type> {
     let mut out = Vec::new();
     let va = if let Some(va) = call.child_by_field_name("valueArguments") {
         Some(va)
@@ -974,7 +995,7 @@ fn has_trailing_lambda(call: Node) -> bool {
 }
 
 fn call_accepts_arg_count(
-    index: &Index,
+    index: &dyn InferenceIndex,
     entry: &Entry,
     arg_count: usize,
     uses_trailing_lambda: bool,

@@ -19,7 +19,7 @@ use std::ops::ControlFlow;
 
 use tree_sitter::{Node, Tree};
 
-use crate::index::{Entry, Index};
+use crate::index::{Entry, InferenceIndex};
 use crate::infer;
 use crate::knowledge::Knowledge;
 use crate::parser::{
@@ -71,6 +71,7 @@ pub enum IncompletenessReason {
     UnknownReceiverType,
     AmbiguousReceiverTypePackage(String),
     ReceiverTypeNotIndexed(String),
+    QueryScopeIncomplete,
 }
 
 pub type ResolutionStatus<T> = Knowledge<T, IncompletenessReason>;
@@ -101,6 +102,7 @@ impl IncompletenessReason {
             IncompletenessReason::ReceiverTypeNotIndexed(name) => {
                 format!("receiver-type-not-indexed:{name}")
             }
+            IncompletenessReason::QueryScopeIncomplete => "query-scope-incomplete".to_string(),
         }
     }
 }
@@ -149,7 +151,7 @@ pub(crate) fn use_kind_in(usage: Node, parent: Option<Node>) -> UseKind {
 }
 
 pub fn reference_status(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -161,7 +163,7 @@ pub fn reference_status(
 }
 
 pub fn reference_status_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -178,7 +180,7 @@ pub fn reference_status_with_ctx(
 /// the caller. Batch traversals that already visit every node pass the chain down so
 /// classification never redescends the tree.
 pub(crate) fn reference_status_node(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     usage: Node,
@@ -200,6 +202,9 @@ pub(crate) fn reference_status_node(
     }
     if !goto_node_with_ctx(index, file, src, usage, ancestors, ctx).is_empty() {
         return ResolutionStatus::Found(());
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
     }
     if node_text(usage, src) == "it" {
         if has_ancestor_kind_a(ancestors, &["lambda_literal"]) {
@@ -245,7 +250,7 @@ pub(crate) fn reference_status_node(
 /// Callers should use this for diagnostics, not navigation. Navigation can return "no result" when
 /// unsure; diagnostics need a proof boundary for the negative case.
 pub fn simple_type_name_status(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -265,7 +270,7 @@ pub fn simple_type_name_status(
 }
 
 fn simple_type_name_status_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     usage: Node,
@@ -357,7 +362,7 @@ fn has_ancestor_kind_a(ancestors: &[Node<'_>], kinds: &[&str]) -> bool {
 }
 
 fn simple_name_status_a(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     usage: Node,
@@ -372,6 +377,9 @@ fn simple_name_status_a(
     }
     if has_visible_cross_file(index, name, uk, &ctx.imports, &ctx.package) {
         return ResolutionStatus::Found(());
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
     }
 
     let reasons = visible_package_reasons_with_ctx(file, name, facts, &ctx.package, &ctx.imports);
@@ -389,7 +397,7 @@ fn simple_name_status_a(
 }
 
 fn member_name_status_a(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     usage: Node,
@@ -400,6 +408,9 @@ fn member_name_status_a(
     let name = node_text(usage, src);
     if member_exists_in(index, usage, parent, name, src, ctx) {
         return ResolutionStatus::Found(());
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
     }
 
     let Some(nav) = parent else {
@@ -443,7 +454,11 @@ fn member_name_status_a(
     }
 }
 
-fn receiver_world_is_library_or_jdk(index: &Index, root: &str, root_pkg: &str) -> bool {
+fn receiver_world_is_library_or_jdk(
+    index: &dyn InferenceIndex,
+    root: &str,
+    root_pkg: &str,
+) -> bool {
     if matches!(root_pkg, "java.lang")
         || root_pkg.starts_with("java.")
         || root_pkg.starts_with("javax.")
@@ -464,7 +479,7 @@ fn receiver_world_is_library_or_jdk(index: &Index, root: &str, root_pkg: &str) -
             .all(|entry| entry.tier == crate::index::Tier::Durable)
 }
 
-fn package_has_member_named(index: &Index, package: &str, name: &str) -> bool {
+fn package_has_member_named(index: &dyn InferenceIndex, package: &str, name: &str) -> bool {
     index.lookup_by_name(name).iter().any(|entry| {
         entry.sym.package == package
             && entry.sym.container.is_some()
@@ -472,7 +487,7 @@ fn package_has_member_named(index: &Index, package: &str, name: &str) -> bool {
     })
 }
 
-fn receiver_is_enum_like(index: &Index, root: &str, root_pkg: &str) -> bool {
+fn receiver_is_enum_like(index: &dyn InferenceIndex, root: &str, root_pkg: &str) -> bool {
     index
         .lookup_type(root)
         .into_iter()
@@ -480,7 +495,7 @@ fn receiver_is_enum_like(index: &Index, root: &str, root_pkg: &str) -> bool {
 }
 
 fn visible_durable_candidate_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     name: &str,
     uk: UseKind,
     current_pkg: &str,
@@ -527,7 +542,7 @@ fn imported_external_name_with_ctx(name: &str, current_pkg: &str, imports: &[Imp
 }
 
 fn hierarchy_package_reasons(
-    index: &Index,
+    index: &dyn InferenceIndex,
     receiver: &Type,
     facts: &CompletenessFacts,
 ) -> Vec<IncompletenessReason> {
@@ -634,7 +649,7 @@ pub fn top_level_call_completeness_reasons_with_ctx(
 }
 
 pub fn member_call_completeness_reasons(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     src: &str,
@@ -666,7 +681,7 @@ pub fn member_call_completeness_reasons(
 }
 
 pub fn member_call_completeness_reasons_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     usage: Node,
@@ -687,7 +702,7 @@ pub fn member_call_completeness_reasons_with_ctx(
 /// [`member_call_completeness_reasons_with_ctx`] with the member name and its
 /// navigation-expression parent supplied by the caller.
 pub(crate) fn member_call_completeness_reasons_in(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     name: &str,
@@ -814,13 +829,19 @@ fn kind_ok(uk: UseKind, kind: SymbolKind) -> bool {
 
 /// Resolve goto-definition for the identifier at `offset` in `file` (whose parsed `tree`/`src` are
 /// given). `file` is the canonical key used for results in the current file.
-pub fn goto(index: &Index, file: &str, src: &str, tree: &Tree, offset: usize) -> Vec<Def> {
+pub fn goto(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Vec<Def> {
     let ctx = infer::FileCtx::from_tree(tree, src);
     goto_with_ctx(index, file, src, tree, offset, &ctx)
 }
 
 pub fn goto_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -838,7 +859,7 @@ pub fn goto_with_ctx(
 /// [`goto_with_ctx`] with the identifier node and its ancestor chain (root-first) supplied by
 /// the caller, skipping both the `identifier_at` root descent and per-helper parent lookups.
 pub(crate) fn goto_node_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     ident: Node,
@@ -933,7 +954,7 @@ fn resolve_local_a(
 }
 
 fn resolve_implicit_receiver_member_with_ctx_a(
-    index: &Index,
+    index: &dyn InferenceIndex,
     ancestors: &[Node],
     name: &str,
     src: &str,
@@ -992,7 +1013,7 @@ pub(crate) fn local_decl_a<'t>(
 // ---------------------------------------------------------------------------------------------
 
 fn resolve_member_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     _selector: Node,
     parent: Option<Node>,
     name: &str,
@@ -1016,7 +1037,7 @@ fn resolve_member_with_ctx(
     }
     // Fallback: commit only if the member name is globally unique (best-effort, no type info).
     let candidates = index.lookup_by_name(name);
-    if candidates.len() == 1 {
+    if index.permits_unique_member_fallback() && candidates.len() == 1 {
         vec![to_def(&candidates[0])]
     } else {
         Vec::new()
@@ -1024,7 +1045,7 @@ fn resolve_member_with_ctx(
 }
 
 fn member_exists_in(
-    index: &Index,
+    index: &dyn InferenceIndex,
     _selector: Node,
     parent: Option<Node>,
     name: &str,
@@ -1043,7 +1064,7 @@ fn member_exists_in(
             }
         }
     }
-    index.lookup_by_name(name).len() == 1
+    index.permits_unique_member_fallback() && index.lookup_by_name(name).len() == 1
 }
 
 /// All definitions of a member named `name` reachable on type `ty`:
@@ -1051,7 +1072,7 @@ fn member_exists_in(
 /// or a supertype. Package-filtered so a same-named type in a different package can't contribute.
 /// Bounded against deep / cyclic hierarchies.
 pub fn member_defs_for_type(
-    index: &Index,
+    index: &dyn InferenceIndex,
     ty: &Type,
     name: &str,
     imports: &[Import],
@@ -1089,7 +1110,7 @@ pub fn member_defs_for_type(
 }
 
 fn member_entries_exist(
-    index: &Index,
+    index: &dyn InferenceIndex,
     ty: &Type,
     name: &str,
     imports: &[Import],
@@ -1120,7 +1141,7 @@ fn member_entries_exist(
 }
 
 fn generic_receiver_extensions<'a>(
-    index: &'a Index,
+    index: &'a dyn InferenceIndex,
     name: &str,
     imports: &[Import],
     current_pkg: &str,
@@ -1468,7 +1489,7 @@ fn is_specific_main_source_set(source_set: &str) -> bool {
 }
 
 fn resolve_import_target_a(
-    index: &Index,
+    index: &dyn InferenceIndex,
     usage: Node,
     ancestors: &[Node],
     src: &str,
@@ -1490,7 +1511,7 @@ fn resolve_import_target_a(
 }
 
 fn resolve_qualified_a(
-    index: &Index,
+    index: &dyn InferenceIndex,
     usage: Node,
     ancestors: &[Node],
     name: &str,
@@ -1507,7 +1528,7 @@ fn resolve_qualified_a(
 }
 
 fn resolve_nested_type_in(
-    index: &Index,
+    index: &dyn InferenceIndex,
     src: &str,
     usage: Node,
     parent: Option<Node>,
@@ -1628,7 +1649,7 @@ fn navigation_parts<'t>(node: Node<'t>, src: &str) -> Option<Vec<(Node<'t>, Stri
 }
 
 fn resolve_absolute_path(
-    index: &Index,
+    index: &dyn InferenceIndex,
     parts: &[String],
     kind_ok: impl Fn(SymbolKind) -> bool,
 ) -> Vec<Def> {
@@ -1675,7 +1696,7 @@ fn absolute_path_matches(entry: &Entry, prefix: &[String]) -> bool {
 }
 
 fn visible_outer_types(
-    index: &Index,
+    index: &dyn InferenceIndex,
     local_name: &str,
     ctx: &infer::FileCtx,
 ) -> Vec<(String, String)> {
@@ -1707,7 +1728,12 @@ fn visible_outer_types(
     out
 }
 
-fn push_visible_outer(index: &Index, out: &mut Vec<(String, String)>, name: &str, package: &str) {
+fn push_visible_outer(
+    index: &dyn InferenceIndex,
+    out: &mut Vec<(String, String)>,
+    name: &str,
+    package: &str,
+) {
     if index
         .lookup_by_name(name)
         .iter()
@@ -1721,7 +1747,7 @@ fn push_visible_outer(index: &Index, out: &mut Vec<(String, String)>, name: &str
 }
 
 fn has_visible_cross_file(
-    index: &Index,
+    index: &dyn InferenceIndex,
     name: &str,
     uk: UseKind,
     imports: &[Import],
@@ -1772,7 +1798,12 @@ fn has_visible_cross_file(
         .any(|e| star_pkgs.contains(&e.sym.package))
 }
 
-fn resolve_cross_file(index: &Index, name: &str, uk: UseKind, ctx: &infer::FileCtx) -> Vec<Def> {
+fn resolve_cross_file(
+    index: &dyn InferenceIndex,
+    name: &str,
+    uk: UseKind,
+    ctx: &infer::FileCtx,
+) -> Vec<Def> {
     // `as`-alias: the usage name is an import alias; resolve the *real* name in that package.
     for imp in &ctx.imports {
         if imp.alias.as_deref() == Some(name) {

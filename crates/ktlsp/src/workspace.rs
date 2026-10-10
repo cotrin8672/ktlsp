@@ -14,7 +14,7 @@ use walkdir::{DirEntry, WalkDir};
 use crate::actions::{self, Action};
 use crate::complete::{self, ShapedCompletions};
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
-use crate::index::{Index, RefEntry, Tier, Usage};
+use crate::index::{Index, InferenceIndex, RefEntry, Tier, Usage};
 use crate::infer;
 use crate::java;
 use crate::language::{self, LanguageParsers, SourceLanguage};
@@ -64,6 +64,8 @@ pub struct Workspace {
     completeness: resolve::CompletenessFacts,
     project_file_meta: HashMap<String, ProjectFileMeta>,
     project_scan_initialized: bool,
+    project_model: Option<Arc<crate::classpath::ProjectSnapshot>>,
+    global_origins: BTreeSet<String>,
 }
 
 impl Default for Workspace {
@@ -83,6 +85,8 @@ impl Workspace {
             completeness: resolve::CompletenessFacts::default(),
             project_file_meta: HashMap::new(),
             project_scan_initialized: false,
+            project_model: None,
+            global_origins: BTreeSet::new(),
         }
     }
 
@@ -116,6 +120,163 @@ impl Workspace {
 
     pub fn open_doc_keys(&self) -> Vec<String> {
         self.open_docs.keys().cloned().collect()
+    }
+
+    pub fn set_project_model(&mut self, model: Arc<crate::classpath::ProjectSnapshot>) {
+        self.index.replace_scope_visibilities(
+            model.scope_visibilities(&self.global_origins.iter().cloned().collect::<Vec<_>>()),
+        );
+        for key in self.project_file_meta.keys().chain(self.open_docs.keys()) {
+            if let Some(origin) = model.file_origin(Path::new(key)) {
+                self.index.set_file_origin(key, origin);
+            } else if self
+                .index
+                .file_origin(key)
+                .is_some_and(|origin| origin.project_scope.is_some())
+            {
+                self.index.remove_file_origin(key);
+            }
+        }
+        for (key, meta) in &mut self.project_file_meta {
+            meta.scope = model
+                .file_origin(Path::new(key))
+                .and_then(|origin| origin.project_scope);
+        }
+        self.project_model = Some(model);
+        self.bump_index_revision();
+        self.recompute_project_completeness();
+    }
+
+    /// Reconcile source ownership without reparsing unchanged sources from the initial scan.
+    pub fn scan_model_sources(&mut self) -> usize {
+        let Some(model) = &self.project_model else {
+            return 0;
+        };
+        if !model.modules.iter().any(|m| !m.source_sets.is_empty()) {
+            if self.index.prune_origin_history() {
+                self.bump_index_revision();
+            }
+            return 0;
+        }
+        let mut paths = registered_source_files(model);
+        let current: HashSet<_> = paths
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
+        self.remove_obsolete_project_files(&current);
+        paths.retain(|path| {
+            let key = crate::paths::file_key(path);
+            !self.project_file_meta.contains_key(&key) && !self.open_docs.contains_key(&key)
+        });
+        let batches = parse_project_files(paths);
+        let count = batches.len();
+        for batch in batches {
+            if let Some(origin) = self
+                .project_model
+                .as_ref()
+                .and_then(|m| m.file_origin(Path::new(&batch.key)))
+            {
+                self.index.set_file_origin(&batch.key, origin);
+            }
+            self.project_file_meta.insert(
+                batch.key.clone(),
+                ProjectFileMeta {
+                    package: batch.package,
+                    clean: batch.clean,
+                    scope: self.project_scope_for_file(&batch.key),
+                },
+            );
+            self.index
+                .replace_file(&batch.key, batch.symbols, Tier::Volatile);
+            self.index.replace_file_refs(&batch.key, batch.usages);
+        }
+        if count > 0 {
+            self.bump_index_revision();
+        }
+        self.project_scan_initialized = true;
+        for (key, doc) in &self.open_docs {
+            if self
+                .project_model
+                .as_ref()
+                .and_then(|m| m.file_origin(Path::new(key)))
+                .is_some()
+            {
+                let facts =
+                    language::file_facts(SourceLanguage::for_key(key), &doc.tree, &doc.text);
+                self.project_file_meta.insert(
+                    key.clone(),
+                    ProjectFileMeta {
+                        package: facts.package,
+                        clean: facts.clean,
+                        scope: self.project_scope_for_file(key),
+                    },
+                );
+            }
+        }
+        self.recompute_project_completeness();
+        if self.index.prune_origin_history() {
+            self.bump_index_revision();
+        }
+        count
+    }
+
+    fn remove_obsolete_project_files(&mut self, current: &HashSet<String>) {
+        let obsolete: Vec<_> = self
+            .project_file_meta
+            .keys()
+            .filter(|key| !current.contains(*key) && !self.open_docs.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in &obsolete {
+            // Initial checkout facts have no origin; dependency facts belong to another owner.
+            if self
+                .index
+                .file_origin(key)
+                .is_none_or(|origin| origin.project_scope.is_some())
+            {
+                self.index.remove_file(key);
+                self.salsa.forget(key);
+            }
+            self.project_file_meta.remove(key);
+        }
+        if !obsolete.is_empty() {
+            self.bump_index_revision();
+        }
+        if let Some(model) = &self.project_model {
+            if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
+                self.project_file_meta
+                    .retain(|key, _| model.file_origin(Path::new(key)).is_some());
+            }
+        }
+    }
+
+    pub fn project_scope_for_file(&self, key: &str) -> Option<ProjectScope> {
+        match &self.project_model {
+            Some(model) => model
+                .file_origin(Path::new(key))
+                .and_then(|origin| origin.project_scope),
+            None => project_model::project_scope_for_path(key),
+        }
+    }
+
+    pub fn index_dependency_batch(&mut self, batch: crate::deps::FileSymbols) -> bool {
+        if let Some(model) = &self.project_model {
+            if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
+                if let Some(origin) = batch.origin {
+                    if origin.origin_id.starts_with("jdk:")
+                        && self.global_origins.insert(origin.origin_id.clone())
+                    {
+                        self.index
+                            .replace_scope_visibilities(model.scope_visibilities(
+                                &self.global_origins.iter().cloned().collect::<Vec<_>>(),
+                            ));
+                    }
+                    // Late ownership metadata also belongs to authoritative open source buffers.
+                    self.index.set_file_origin(&batch.file, origin);
+                }
+            }
+        }
+        self.index_dependency_file(&batch.file, batch.symbols)
     }
 
     /// Insert closed dependency facts under a normalized key, preserving authoritative open text.
@@ -165,6 +326,13 @@ impl Workspace {
     }
 
     fn apply_file_facts(&mut self, key: &str, facts: language::FileFacts) {
+        if let Some(origin) = self
+            .project_model
+            .as_ref()
+            .and_then(|m| m.file_origin(Path::new(key)))
+        {
+            self.index.set_file_origin(key, origin);
+        }
         self.index.replace_file(key, facts.symbols, Tier::Volatile);
         self.index.replace_file_refs(key, facts.usages);
         self.bump_index_revision();
@@ -207,6 +375,18 @@ impl Workspace {
     /// `textDocument/didClose`: drop the dirty buffer; re-sync the index from disk (or drop it).
     pub fn close(&mut self, key: &str) {
         self.open_docs.remove(key);
+        if self.project_model.as_ref().is_some_and(|model| {
+            model.modules.iter().any(|m| !m.source_sets.is_empty())
+                && model.file_origin(Path::new(key)).is_none()
+        }) && self.index.file_origin(key).is_none()
+        {
+            self.index.remove_file(key);
+            self.salsa.forget(key);
+            self.project_file_meta.remove(key);
+            self.bump_index_revision();
+            self.recompute_project_completeness();
+            return;
+        }
         match std::fs::read_to_string(key) {
             Ok(text) => self.reindex(key, &text),
             Err(_) => {
@@ -236,8 +416,14 @@ impl Workspace {
             .keys()
             .map(|key| crate::paths::file_key(Path::new(key)))
             .collect::<HashSet<_>>();
+        let source_paths = project_source_files_with_model(root, self.project_model.as_deref());
+        let current: HashSet<_> = source_paths
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
+        self.remove_obsolete_project_files(&current);
         let mut paths = Vec::new();
-        for path in project_source_files(root) {
+        for path in source_paths {
             let key = crate::paths::file_key(&path);
             if open_keys.contains(&key) {
                 continue;
@@ -254,22 +440,35 @@ impl Workspace {
                 ProjectFileMeta {
                     package: batch.package.clone(),
                     clean: batch.clean,
-                    scope: project_model::project_scope_for_path(&batch.key),
+                    scope: self.project_scope_for_file(&batch.key),
                 },
             );
+            if let Some(origin) = self
+                .project_model
+                .as_ref()
+                .and_then(|m| m.file_origin(Path::new(&batch.key)))
+            {
+                self.index.set_file_origin(&batch.key, origin);
+            }
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
         }
         self.bump_index_revision();
         for (key, doc) in &self.open_docs {
+            if self.project_model.as_ref().is_some_and(|model| {
+                model.modules.iter().any(|m| !m.source_sets.is_empty())
+                    && model.file_origin(Path::new(key)).is_none()
+            }) {
+                continue;
+            }
             let facts = language::file_facts(SourceLanguage::for_key(key), &doc.tree, &doc.text);
             self.project_file_meta.insert(
                 key.clone(),
                 ProjectFileMeta {
                     package: facts.package,
                     clean: facts.clean,
-                    scope: project_model::project_scope_for_path(key),
+                    scope: self.project_scope_for_file(key),
                 },
             );
         }
@@ -283,7 +482,7 @@ impl Workspace {
     pub fn goto_definition(&mut self, key: &str, offset: usize) -> Vec<Def> {
         if let Some(doc) = self.open_docs.get(key) {
             let defs = language::goto_definition(
-                &self.index,
+                &self.index.scoped_for_file(key),
                 SourceLanguage::for_key(key),
                 key,
                 &doc.text,
@@ -304,7 +503,14 @@ impl Workspace {
                 return defs;
             }
         }
-        let defs = language::goto_definition(&self.index, language, key, &text, &tree, offset);
+        let defs = language::goto_definition(
+            &self.index.scoped_for_file(key),
+            language,
+            key,
+            &text,
+            &tree,
+            offset,
+        );
         materialize_definition_files(&defs);
         defs
     }
@@ -317,7 +523,7 @@ impl Workspace {
         offset: usize,
     ) -> Vec<Def> {
         language::goto_definition(
-            &self.index,
+            &self.index.scoped_for_file(key),
             SourceLanguage::for_key(key),
             key,
             text,
@@ -356,7 +562,7 @@ impl Workspace {
             ExprKey::from_node(receiver),
         );
         let hits = resolve::member_defs_for_type(
-            &self.index,
+            &self.index.scoped_for_file(key),
             &receiver_type,
             name,
             &ctx.imports,
@@ -365,8 +571,9 @@ impl Workspace {
         if !hits.is_empty() {
             return Some(hits);
         }
-        let candidates = self.index.lookup_by_name(name);
-        if candidates.len() == 1 {
+        let index = self.index.scoped_for_file(key);
+        let candidates = index.lookup_by_name(name);
+        if index.permits_unique_member_fallback() && candidates.len() == 1 {
             let entry = &candidates[0];
             return Some(vec![Def {
                 file: entry.path.to_string(),
@@ -428,7 +635,7 @@ impl Workspace {
     ) -> Option<semantic_query::ResolvedSymbolQuery> {
         if let Some(doc) = self.open_docs.get(key) {
             return semantic_query::resolved_symbol_query(
-                &self.index,
+                &self.index.scoped_for_file(key),
                 key,
                 &doc.tree,
                 &doc.text,
@@ -438,7 +645,7 @@ impl Workspace {
         }
         let (text, tree) = self.parsed_closed_doc(key)?;
         semantic_query::resolved_symbol_query(
-            &self.index,
+            &self.index.scoped_for_file(key),
             key,
             &tree,
             &text,
@@ -459,7 +666,7 @@ impl Workspace {
         }
         let text = self.doc_text(key)?;
         semantic_query::after_dot_query(
-            &self.index,
+            &self.index.scoped_for_file(key),
             self.parsers.kotlin_mut(),
             &text,
             offset,
@@ -475,7 +682,7 @@ impl Workspace {
         if is_java_path(key) {
             if let Some(doc) = self.open_docs.get(key) {
                 return java::completion_query(
-                    &self.index,
+                    &self.index.scoped_for_file(key),
                     key,
                     &doc.text,
                     &doc.tree,
@@ -484,7 +691,14 @@ impl Workspace {
                 );
             }
             let (text, tree) = self.parsed_closed_doc(key)?;
-            return java::completion_query(&self.index, key, &text, &tree, offset, MAX_COMPLETIONS);
+            return java::completion_query(
+                &self.index.scoped_for_file(key),
+                key,
+                &text,
+                &tree,
+                offset,
+                MAX_COMPLETIONS,
+            );
         }
         if !self.open_docs.contains_key(key) {
             if let Some(query) = self.closed_completion_query(key, offset) {
@@ -493,7 +707,7 @@ impl Workspace {
         }
         let text = self.doc_text(key)?;
         semantic_query::completion_query(
-            &self.index,
+            &self.index.scoped_for_file(key),
             self.parsers.kotlin_mut(),
             key,
             &text,
@@ -520,8 +734,9 @@ impl Workspace {
             .salsa
             .parsed_tree(&synthetic_key, &synthetic, Durability::LOW);
         let receiver = complete::navigation_receiver_at(&synthetic_tree, syn_offset)?;
-        let receiver_type = self.salsa.expr_type(
+        let receiver_type = self.salsa.expr_type_in_file(
             &synthetic_key,
+            key,
             &synthetic,
             Durability::LOW,
             &self.index,
@@ -529,7 +744,7 @@ impl Workspace {
             ExprKey::from_node(receiver),
         );
         semantic_query::member_completion_query_for_type(
-            &self.index,
+            &self.index.scoped_for_file(key),
             SourceLanguage::Kotlin,
             &synthetic_tree,
             &synthetic,
@@ -684,7 +899,7 @@ impl Workspace {
         if let Some(doc) = self.open_docs.get(key) {
             return language::inlay_hints(
                 SourceLanguage::for_key(key),
-                &self.index,
+                &self.index.scoped_for_file(key),
                 &doc.tree,
                 &doc.text,
                 start_byte,
@@ -697,7 +912,7 @@ impl Workspace {
         };
         language::inlay_hints(
             SourceLanguage::for_key(key),
-            &self.index,
+            &self.index.scoped_for_file(key),
             &tree,
             &text,
             start_byte,
@@ -795,7 +1010,7 @@ impl Workspace {
         if let Some(doc) = self.open_docs.get(key) {
             return language::type_definition(
                 SourceLanguage::for_key(key),
-                &self.index,
+                &self.index.scoped_for_file(key),
                 key,
                 &doc.tree,
                 &doc.text,
@@ -808,7 +1023,7 @@ impl Workspace {
         };
         language::type_definition(
             SourceLanguage::for_key(key),
-            &self.index,
+            &self.index.scoped_for_file(key),
             key,
             &tree,
             &text,
@@ -828,7 +1043,7 @@ impl Workspace {
     }
 
     pub fn type_supertypes(&self, item: &HierarchyItem) -> Vec<HierarchyItem> {
-        hierarchy::supertypes(&self.index, item)
+        hierarchy::supertypes(&self.index.scoped_for_file(&item.file), item)
     }
 
     pub fn type_subtypes(&self, item: &HierarchyItem) -> Vec<HierarchyItem> {
@@ -855,7 +1070,7 @@ impl Workspace {
         if let Some(doc) = self.open_docs.get(&item.file) {
             return language::outgoing_calls(
                 SourceLanguage::for_key(&item.file),
-                &self.index,
+                &self.index.scoped_for_file(&item.file),
                 &item.file,
                 &doc.tree,
                 &doc.text,
@@ -868,7 +1083,7 @@ impl Workspace {
         };
         language::outgoing_calls(
             SourceLanguage::for_key(&item.file),
-            &self.index,
+            &self.index.scoped_for_file(&item.file),
             &item.file,
             &tree,
             &text,
@@ -893,13 +1108,24 @@ impl Workspace {
             name,
             active_parameter,
             mut entries,
-        } = language::signature_entries(&self.index, language, key, doc_text, tree, offset)?;
-        if entries.is_empty() {
+            unqualified,
+        } = language::signature_entries(
+            &self.index.scoped_for_file(key),
+            language,
+            key,
+            doc_text,
+            tree,
+            offset,
+        )?;
+        if entries.is_empty() && unqualified {
             entries = self
                 .index
+                .scoped_for_file(key)
                 .lookup_by_name(&name)
                 .iter()
-                .filter(|entry| entry.sym.kind == SymbolKind::Function)
+                .filter(|entry| {
+                    entry.sym.kind == SymbolKind::Function && entry.sym.container.is_none()
+                })
                 .cloned()
                 .collect();
         }
@@ -927,7 +1153,7 @@ impl Workspace {
         tree: &Tree,
     ) -> Vec<crate::diagnostics::Diagnostic> {
         language::diagnostics(
-            &self.index,
+            &self.index.scoped_for_file(key),
             SourceLanguage::for_key(key),
             key,
             text,
@@ -944,12 +1170,20 @@ impl Workspace {
         if !self.project_scan_initialized {
             return;
         }
+        if self.project_model.as_ref().is_some_and(|model| {
+            model.modules.iter().any(|m| !m.source_sets.is_empty())
+                && model.file_origin(Path::new(key)).is_none()
+        }) {
+            self.project_file_meta.remove(key);
+            self.recompute_project_completeness();
+            return;
+        }
         self.project_file_meta.insert(
             key.to_string(),
             ProjectFileMeta {
                 package,
                 clean,
-                scope: project_model::project_scope_for_path(key),
+                scope: self.project_scope_for_file(key),
             },
         );
         self.recompute_project_completeness();
@@ -960,7 +1194,12 @@ impl Workspace {
             return;
         }
         self.completeness.project_scan_complete =
-            self.project_file_meta.values().all(|meta| meta.clean);
+            self.project_model
+                .as_ref()
+                .is_none_or(|model| model.modules.iter().any(|m| !m.source_sets.is_empty()))
+                && self.project_file_meta.values().all(|meta| {
+                    meta.clean && (self.project_model.is_none() || meta.scope.is_some())
+                });
         let mut clean_packages = BTreeSet::new();
         let mut dirty_packages = BTreeSet::new();
         let mut clean_scoped_packages = BTreeSet::new();
@@ -1048,8 +1287,13 @@ impl Workspace {
             return Vec::new();
         }
         if is_java_path(key) {
-            let diagnostics =
-                java::diagnostics(&self.index, key, tree, text, &self.effective_completeness());
+            let diagnostics = java::diagnostics(
+                &self.index.scoped_for_file(key),
+                key,
+                tree,
+                text,
+                &self.effective_completeness(),
+            );
             let mut out =
                 java::unused_import_actions(key, text, tree, &diagnostics, range_start, range_end);
             if let Some(action) = java::organize_imports_action(key, text, tree) {
@@ -1101,9 +1345,9 @@ impl Workspace {
         let ident = language::identifier_at(language, tree, offset)?;
         let name = language::importable_reference_name(language, ident, text)?;
         let visibility = language::NameVisibility::for_file(language, tree, text);
-        let mut candidates = self
-            .index
-            .all_entries()
+        let index = self.index.scoped_for_file(key);
+        let mut candidates = index
+            .lookup_by_name(name)
             .into_iter()
             .filter(|entry| {
                 entry.sym.name == name
@@ -1294,12 +1538,45 @@ fn relative_path_has_excluded_dir(path: &str) -> bool {
     path.split('/').any(is_excluded_dir_name)
 }
 
+#[cfg(test)]
 fn project_source_files(root: &Path) -> Vec<std::path::PathBuf> {
+    project_source_files_with_model(root, None)
+}
+
+fn project_source_files_with_model(
+    root: &Path,
+    model: Option<&crate::classpath::ProjectSnapshot>,
+) -> Vec<std::path::PathBuf> {
+    if let Some(model) = model {
+        return registered_source_files(model);
+    }
     let mut out = git_source_files(root).unwrap_or_else(|| walk_source_files(root));
     out.extend(generated_source_files(root));
     out.sort();
     out.dedup();
     out
+}
+
+fn registered_source_files(model: &crate::classpath::ProjectSnapshot) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for root in model
+        .modules
+        .iter()
+        .flat_map(|m| &m.source_sets)
+        .flat_map(|s| &s.source_roots)
+    {
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if entry.file_type().is_file()
+                && SourceLanguage::for_project_path(entry.path()).is_some()
+                && model.file_origin(entry.path()).is_some()
+            {
+                files.push(entry.into_path());
+            }
+        }
+    }
+    files.sort_by_key(|path| crate::paths::file_key(path));
+    files.dedup_by_key(|path| crate::paths::file_key(path));
+    files
 }
 
 fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> {
@@ -1727,6 +2004,202 @@ mod tests {
             assert_eq!(ws.index.lookup_by_name("GeneratedBufferState").len(), 1);
             assert_eq!(ws.doc_text(&key).as_deref(), Some("class BufferState\n"));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authoritative_model_adopts_only_registered_sources_and_preserves_open_and_library_facts() {
+        use crate::project_model::{FileOrigin, SourceRepresentation};
+        let root = unique_tmp("model-source-ownership");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        for (relative, text) in [
+            (
+                "modules/editing/src/main/java/app/Main.java",
+                "package app; class DiskMain { Helper helper; }",
+            ),
+            (
+                "modules/editing/src/main/java/app/Helper.java",
+                "package app; class Helper {}",
+            ),
+            (
+                "build/custom-java/app/Generated.java",
+                "package app; class Generated { Helper helper; }",
+            ),
+            (
+                "testData/private/Private.java",
+                "package app; class PrivateFixture {}",
+            ),
+            (
+                "testData/private/Closed.java",
+                "package app; class ClosedFixture { Helper helper; }",
+            ),
+            (
+                "testData/extracted/Library.java",
+                "package library; class Library {}",
+            ),
+        ] {
+            let file = root.join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "--", "modules", "testData"])
+            .status()
+            .unwrap()
+            .success());
+        let main =
+            crate::paths::file_key(&root.join("modules/editing/src/main/java/app/Main.java"));
+        let private = crate::paths::file_key(&root.join("testData/private/Private.java"));
+        let library = crate::paths::file_key(&root.join("testData/extracted/Library.java"));
+        let generated = root.join("build/custom-java/app/Generated.java");
+        let generated_key = crate::paths::file_key(&generated);
+        let mut ws = Workspace::new();
+        ws.scan(&root);
+        assert_eq!(ws.index.lookup_type("PrivateFixture").len(), 1);
+        assert_eq!(ws.index.lookup_type("ClosedFixture").len(), 1);
+        ws.open(
+            main.clone(),
+            "package app; class BufferMain { Helper helper; }".to_string(),
+        );
+        ws.open(
+            private.clone(),
+            "package app; class PrivateBuffer { Helper helper; }".to_string(),
+        );
+        ws.index.set_file_origin(
+            &library,
+            FileOrigin {
+                origin_id: "maven:vendor:api:1".to_string(),
+                representation: SourceRepresentation::Source,
+                project_scope: None,
+            },
+        );
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(
+            crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nEND\t:app\n",
+                root.join("modules/editing").display(),
+                root.join("modules/editing/src/main/java").display(),
+                root.join("build/custom-java").display(),
+                root.join("api.jar").display(),
+                root.join("api.jar").display(),
+            )),
+        ));
+        ws.set_project_model(model);
+        assert_eq!(ws.scan_model_sources(), 1);
+        assert!(ws.completeness.project_scan_complete);
+        assert!(ws.index.lookup_type("DiskMain").is_empty());
+        assert_eq!(ws.index.lookup_type("BufferMain").len(), 1);
+        assert_eq!(ws.index.lookup_type("PrivateBuffer").len(), 1);
+        assert_eq!(ws.index.lookup_type("Generated").len(), 1);
+        assert_eq!(ws.index.lookup_type("Library").len(), 1);
+        assert!(ws.index.lookup_type("ClosedFixture").is_empty());
+        assert!(ws.index.file_origin(&private).is_none());
+        assert!(!ws.project_file_meta.contains_key(&private));
+        assert!(!ws.project_file_meta.contains_key(&library));
+        let private_text = ws.doc_text(&private).unwrap();
+        assert!(ws
+            .goto_definition(&private, private_text.find("Helper").unwrap())
+            .is_empty());
+        assert!(ws
+            .index
+            .lookup_refs("Helper")
+            .iter()
+            .any(|entry| entry.path.as_ref() == generated_key));
+        std::fs::remove_file(&generated).unwrap();
+        assert_eq!(ws.scan_model_sources(), 0);
+        assert!(ws.index.lookup_type("Generated").is_empty());
+        assert!(!ws
+            .index
+            .lookup_refs("Helper")
+            .iter()
+            .any(|entry| entry.path.as_ref() == generated_key));
+        assert!(ws.index.file_origin(&generated_key).is_none());
+        assert!(ws.completeness.project_scan_complete);
+        ws.close(&private);
+        assert!(ws.index.lookup_type("PrivateBuffer").is_empty());
+        assert!(ws.index.lookup_type("PrivateFixture").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removed_source_root_keeps_dirty_buffer_but_drops_its_scope() {
+        let root = unique_tmp("model-removed-root");
+        let source_root = root.join("custom");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let file = source_root.join("Generated.java");
+        std::fs::write(&file, "class DiskGenerated {}").unwrap();
+        let key = crate::paths::file_key(&file);
+        let model = |source: &Path| {
+            Arc::new(crate::classpath::ProjectSnapshot::new(
+                crate::classpath::parse_dump(&format!(
+                    "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nEND\t:app\n",
+                    root.display(),
+                    source.display(),
+                )),
+            ))
+        };
+        let mut ws = Workspace::new();
+        ws.set_project_model(model(&source_root));
+        assert_eq!(ws.scan_model_sources(), 1);
+        ws.open(key.clone(), "class DirtyGenerated {}".to_string());
+        assert!(ws.index.file_origin(&key).is_some());
+        ws.set_project_model(model(&root.join("src/main/java")));
+        ws.scan_model_sources();
+        assert!(ws.index.file_origin(&key).is_none());
+        assert_eq!(
+            ws.doc_text(&key).as_deref(),
+            Some("class DirtyGenerated {}")
+        );
+        assert_eq!(ws.index.lookup_type("DirtyGenerated").len(), 1);
+        assert!(!ws.project_file_meta.contains_key(&key));
+        assert!(ws.completeness.project_scan_complete);
+        ws.close(&key);
+        assert!(ws.index.lookup_type("DirtyGenerated").is_empty());
+        assert!(ws.index.lookup_type("DiskGenerated").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_gradle_source_model_stays_unknown_instead_of_using_global_facts() {
+        let root = unique_tmp("model-unsupported-sources");
+        std::fs::create_dir_all(&root).unwrap();
+        let main = root.join("Main.java");
+        let text = "package app;\nimport api.Helper;\nclass Main { Helper helper; }\n";
+        std::fs::write(&main, text).unwrap();
+        std::fs::write(
+            root.join("Helper.java"),
+            "package api;\npublic class Helper {}\n",
+        )
+        .unwrap();
+        let key = crate::paths::file_key(&main);
+        let mut ws = Workspace::new();
+        ws.scan(&root);
+        assert_eq!(
+            ws.goto_definition(&key, text.find("Helper").unwrap()).len(),
+            1
+        );
+        ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(
+            crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nEND\t:app\n",
+                root.display(),
+            )),
+        )));
+        assert!(ws
+            .goto_definition(&key, text.find("Helper").unwrap())
+            .is_empty());
+        assert!(!ws.completeness.project_scan_complete);
+        assert_eq!(ws.scan_model_sources(), 0);
+        assert!(!ws.completeness.project_scan_complete);
+        assert_eq!(ws.scan(&root), 0);
+        assert!(ws.index.lookup_type("Helper").is_empty());
+        assert!(!ws.completeness.project_scan_complete);
         std::fs::remove_dir_all(root).unwrap();
     }
 

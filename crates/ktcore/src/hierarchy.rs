@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use tree_sitter::{Node, Tree};
 
-use crate::index::{Entry, Index};
+use crate::index::{Entry, Index, InferenceIndex};
 use crate::infer;
 use crate::parser::{name_field, node_text};
 use crate::resolve;
 use crate::symbol::{Def, SymbolKind};
-use crate::types::TypeRef;
+use crate::types::{Type, TypeRef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HierarchyItem {
@@ -48,18 +48,8 @@ pub fn type_implementations(index: &Index, target: &HierarchyItem) -> Vec<Def> {
     if !target.kind.is_type_like() {
         return Vec::new();
     }
-    let mut out: Vec<Def> = index
-        .all_entries()
+    let mut out: Vec<Def> = direct_subtype_entries(index, target)
         .into_iter()
-        .filter(|entry| entry.sym.kind.is_type_like())
-        .filter(|entry| {
-            entry.sym.name != target.name
-                && entry
-                    .sym
-                    .supertypes
-                    .iter()
-                    .any(|supertype| supertype == &target.name)
-        })
         .map(|entry| Def {
             file: entry.path.to_string(),
             start_byte: entry.sym.start_byte,
@@ -93,16 +83,19 @@ pub fn implementations(index: &Index, target: &Entry) -> Vec<Def> {
         .filter(|entry| entry.sym.kind.is_type_like())
         .filter(|entry| entry.sym.package == target.sym.package)
         .filter(|entry| type_container_path(entry) == owner_path)
+        .filter(|entry| entry.path == target.path)
         .collect();
 
     let mut out = Vec::new();
     for owner in owners {
-        for subtype in direct_subtype_entries(index, &owner) {
+        for subtype in direct_subtype_entries(index, &item_from_entry(&owner)) {
             let subtype_path = type_container_path(&subtype);
+            let scoped = index.scoped_for_file(&subtype.path);
             out.extend(
-                index
+                scoped
                     .members_of(&subtype_path)
                     .iter()
+                    .filter(|member| member.path == subtype.path)
                     .filter(|member| member.sym.package == subtype.sym.package)
                     .filter(|member| member.sym.container.as_deref() == Some(&subtype_path))
                     .filter(|member| member.sym.name == target.sym.name)
@@ -121,20 +114,77 @@ pub fn implementations(index: &Index, target: &Entry) -> Vec<Def> {
     out
 }
 
-fn direct_subtype_entries(index: &Index, target: &Entry) -> Vec<Entry> {
+/// Reverse queries scan candidates globally, then resolve each candidate in its
+/// own source-set scope. The target module need not depend on its consumers.
+fn direct_subtype_entries(index: &Index, target: &HierarchyItem) -> Vec<Entry> {
     index
         .all_entries()
         .into_iter()
         .filter(|entry| entry.sym.kind.is_type_like())
         .filter(|entry| {
-            entry.sym.name != target.sym.name || entry.sym.package != target.sym.package
-        })
-        .filter(|entry| {
             entry
                 .sym
-                .supertypes
+                .supertype_refs
                 .iter()
-                .any(|supertype| supertype == &target.sym.name)
+                .any(|supertype| supertype.name.rsplit('.').next() == Some(target.name.as_str()))
+                || entry
+                    .sym
+                    .supertypes
+                    .iter()
+                    .any(|supertype| supertype.rsplit('.').next() == Some(target.name.as_str()))
+        })
+        .filter(|entry| {
+            entry.path.as_ref() != target.file
+                || entry.sym.start_byte != target.start_byte
+                || entry.sym.end_byte != target.end_byte
+        })
+        .filter(|entry| {
+            let scoped = index.scoped_for_file(&entry.path);
+            if !scoped.lookup_type(&entry.sym.name).iter().any(|visible| {
+                visible.path == entry.path
+                    && visible.sym.start_byte == entry.sym.start_byte
+                    && visible.sym.end_byte == entry.sym.end_byte
+            }) {
+                return false;
+            }
+            direct_supertype_entries(&scoped, entry)
+                .iter()
+                .any(|parent| {
+                    parent.path.as_ref() == target.file
+                        && parent.sym.start_byte == target.start_byte
+                        && parent.sym.end_byte == target.end_byte
+                })
+        })
+        .collect()
+}
+
+fn direct_supertype_entries<'a>(index: &'a dyn InferenceIndex, entry: &Entry) -> Vec<&'a Entry> {
+    let ty = Type::Class {
+        name: entry.sym.name.clone(),
+        package: Some(entry.sym.package.clone()),
+        container: entry.sym.container.clone(),
+        nullable: false,
+        args: entry
+            .sym
+            .type_params
+            .iter()
+            .map(|_| Type::Unknown)
+            .collect(),
+    };
+    infer::direct_supertypes(index, &ty)
+        .into_iter()
+        .flat_map(|supertype| {
+            supertype
+                .name()
+                .map(|name| index.lookup_type(name))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(move |parent| {
+                    supertype
+                        .package()
+                        .is_none_or(|package| parent.sym.package == package)
+                        && parent.sym.container.as_deref() == supertype.container()
+                })
         })
         .collect()
 }
@@ -174,7 +224,12 @@ fn type_ref_shapes_match(target: &TypeRef, candidate: &TypeRef) -> bool {
             .all(|(target, candidate)| type_ref_shapes_match(target, candidate))
 }
 
-pub fn type_definition(index: &Index, tree: &Tree, text: &str, offset: usize) -> Vec<Def> {
+pub fn type_definition(
+    index: &dyn InferenceIndex,
+    tree: &Tree,
+    text: &str,
+    offset: usize,
+) -> Vec<Def> {
     let Some(node) = tree
         .root_node()
         .named_descendant_for_byte_range(offset, offset)
@@ -198,34 +253,26 @@ pub fn type_definition(index: &Index, tree: &Tree, text: &str, offset: usize) ->
         .collect()
 }
 
-pub fn supertypes(index: &Index, item: &HierarchyItem) -> Vec<HierarchyItem> {
-    index
-        .supertypes_of_in(&item.name, Some(&item.package))
+pub fn supertypes(index: &dyn InferenceIndex, item: &HierarchyItem) -> Vec<HierarchyItem> {
+    let Some(entry) = entry_for_name_range(index, &item.file, item.start_byte, item.end_byte)
+    else {
+        return Vec::new();
+    };
+    direct_supertype_entries(index, &entry)
         .into_iter()
-        .flat_map(|name| index.lookup_type(&name))
-        .filter(|entry| item.package.is_empty() || entry.sym.package == item.package)
         .map(item_from_entry)
         .collect()
 }
 
 pub fn subtypes(index: &Index, item: &HierarchyItem) -> Vec<HierarchyItem> {
-    index
-        .all_entries()
+    direct_subtype_entries(index, item)
         .into_iter()
-        .filter(|entry| entry.sym.kind.is_type_like())
-        .filter(|entry| {
-            entry
-                .sym
-                .supertypes
-                .iter()
-                .any(|supertype| supertype == &item.name)
-        })
         .map(|entry| item_from_entry(&entry))
         .collect()
 }
 
 pub fn enclosing_callable_item(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     text: &str,
@@ -272,7 +319,7 @@ pub fn enclosing_callable_item(
 }
 
 pub fn incoming_calls<F>(
-    index: &Index,
+    index: &dyn InferenceIndex,
     target: &HierarchyItem,
     refs: Vec<Def>,
     mut parse_file: F,
@@ -308,7 +355,7 @@ where
 }
 
 pub fn outgoing_calls(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     text: &str,
@@ -359,7 +406,12 @@ pub fn outgoing_calls(
         .collect()
 }
 
-pub fn entry_for_name_range(index: &Index, file: &str, start: usize, end: usize) -> Option<Entry> {
+pub fn entry_for_name_range(
+    index: &dyn InferenceIndex,
+    file: &str,
+    start: usize,
+    end: usize,
+) -> Option<Entry> {
     index
         .entries_for_file(file)
         .into_iter()

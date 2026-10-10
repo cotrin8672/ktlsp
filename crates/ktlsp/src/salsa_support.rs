@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use salsa::{Durability, Setter};
 use tree_sitter::{Node, Tree};
 
-use crate::index::{Index, InferenceIndex, InferenceIndexSnapshot};
+use crate::index::{Index, InferenceIndex, InferenceIndexSnapshot, ScopedIndex};
 use crate::infer;
 use crate::language::{self, FileFacts, SourceLanguage};
 use crate::parser;
@@ -58,6 +58,8 @@ impl KtlspDb for KtlspDatabase {
 pub struct SourceFile {
     #[returns(ref)]
     key: String,
+    #[returns(ref)]
+    scope_key: String,
     #[returns(copy)]
     language: SourceLanguage,
     #[returns(ref)]
@@ -146,12 +148,13 @@ fn expr_type_at_depth(
     };
     let facts = file_ctx_facts(db, file);
     let ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone());
+    let scoped_index = ScopedIndex::new(db.index(), file.scope_key(db));
     if !supports_compositional_expr(node) {
-        return infer::infer(db.index(), node, file.text(db), &ctx);
+        return infer::infer(&scoped_index, node, file.text(db), &ctx);
     }
     let mut child_infer = SalsaChildInfer { db, file, index };
     infer::infer_with_child_infer(
-        db.index(),
+        &scoped_index,
         node,
         file.text(db),
         &ctx,
@@ -285,8 +288,27 @@ impl SalsaState {
         index_revision: u64,
         expr: ExprKey,
     ) -> Type {
+        self.expr_type_in_file(key, key, text, durability, index, index_revision, expr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn expr_type_in_file(
+        &mut self,
+        key: &str,
+        scope_key: &str,
+        text: &str,
+        durability: Durability,
+        index: &Index,
+        index_revision: u64,
+        expr: ExprKey,
+    ) -> Type {
         self.sync_index(index, index_revision);
         let file = self.upsert_file(key, text, durability);
+        if file.scope_key(&self.db) != scope_key {
+            file.set_scope_key(&mut self.db)
+                .with_durability(durability)
+                .to(scope_key.to_string());
+        }
         expr_type(&self.db, file, self.index, expr)
     }
 
@@ -313,6 +335,7 @@ impl SalsaState {
         }
 
         let file = SourceFile::builder(
+            key.to_string(),
             key.to_string(),
             SourceLanguage::for_key(key),
             text.to_string(),

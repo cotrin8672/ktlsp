@@ -2,7 +2,7 @@
 
 use tree_sitter::{Node, Tree};
 
-use crate::index::Index;
+use crate::index::InferenceIndex;
 use crate::infer::{self, FileCtx};
 use crate::parser::{child_of_kind, first_ident, name_field, node_text};
 use crate::types::{Type, TypeRef};
@@ -20,7 +20,7 @@ pub struct InlayHint {
 }
 
 pub fn inlay_hints(
-    index: &Index,
+    index: &dyn InferenceIndex,
     tree: &Tree,
     text: &str,
     start_byte: usize,
@@ -46,7 +46,7 @@ pub fn inlay_hints(
 }
 
 pub fn java_inlay_hints(
-    index: &Index,
+    index: &dyn InferenceIndex,
     tree: &Tree,
     text: &str,
     start_byte: usize,
@@ -70,7 +70,7 @@ pub fn java_inlay_hints(
 }
 
 fn collect(
-    index: &Index,
+    index: &dyn InferenceIndex,
     node: Node<'_>,
     text: &str,
     ctx: &FileCtx,
@@ -95,7 +95,7 @@ fn collect(
 }
 
 fn collect_java(
-    index: &Index,
+    index: &dyn InferenceIndex,
     node: Node<'_>,
     text: &str,
     start_byte: usize,
@@ -113,7 +113,7 @@ fn collect_java(
 }
 
 fn collect_java_var_hints(
-    index: &Index,
+    index: &dyn InferenceIndex,
     decl: Node<'_>,
     text: &str,
     start_byte: usize,
@@ -154,7 +154,11 @@ fn collect_java_var_hints(
     }
 }
 
-fn infer_java_initializer(index: &Index, node: Node<'_>, text: &str) -> Option<TypeRef> {
+fn infer_java_initializer(
+    index: &dyn InferenceIndex,
+    node: Node<'_>,
+    text: &str,
+) -> Option<TypeRef> {
     match node.kind() {
         "string_literal" => Some(TypeRef::simple("String")),
         "character_literal" => Some(TypeRef::simple("char")),
@@ -189,7 +193,7 @@ fn simple_java_type_ref(node: Node<'_>, text: &str) -> Option<TypeRef> {
         .map(TypeRef::simple)
 }
 
-fn unique_java_return_type(index: &Index, name: &str) -> Option<TypeRef> {
+fn unique_java_return_type(index: &dyn InferenceIndex, name: &str) -> Option<TypeRef> {
     let mut candidates = index
         .lookup_by_name(name)
         .iter()
@@ -232,7 +236,7 @@ fn type_ref_name(ty: &TypeRef) -> String {
 }
 
 fn collect_property_hint(
-    index: &Index,
+    index: &dyn InferenceIndex,
     property: Node<'_>,
     text: &str,
     ctx: &FileCtx,
@@ -270,7 +274,7 @@ fn collect_property_hint(
 }
 
 fn collect_function_return_hint(
-    index: &Index,
+    index: &dyn InferenceIndex,
     function: Node<'_>,
     text: &str,
     ctx: &FileCtx,

@@ -10,7 +10,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::diagnostics::{Diagnostic, DiagnosticCode, Severity};
 use crate::hierarchy;
-use crate::index::{Entry, Index};
+use crate::index::{Entry, InferenceIndex};
 use crate::infer;
 use crate::parser::{child_of_kind, node_text, Import};
 use crate::resolve::{self, CompletenessFacts};
@@ -18,7 +18,7 @@ use crate::symbol::SymbolKind;
 use crate::types::{Type, TypeRef};
 
 pub fn compute(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
@@ -29,14 +29,14 @@ pub fn compute(
 }
 
 pub fn compute_with_ctx(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> Vec<Diagnostic> {
-    if tree.root_node().has_error() {
+    if tree.root_node().has_error() || !index.scope_is_complete() {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -72,7 +72,7 @@ pub fn compute_with_ctx(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_diagnostics<'t>(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     node: Node<'t>,
@@ -133,7 +133,7 @@ fn collect_diagnostics<'t>(
 }
 
 fn call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     call: Node,
@@ -170,7 +170,7 @@ fn call_shape_query(
 }
 
 fn top_level_call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     call: Node,
@@ -201,7 +201,7 @@ fn top_level_call_shape_query(
 }
 
 fn member_call_shape_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     call: Node,
@@ -282,14 +282,14 @@ impl CallShapeQuery {
 }
 
 fn call_shape_from_entries(
-    index: &Index,
+    index: &dyn InferenceIndex,
     src: &str,
     call: Node,
     symbol: String,
     entries: Vec<Entry>,
     ctx: &infer::FileCtx,
 ) -> Option<CallShapeQuery> {
-    if entries.is_empty() {
+    if entries.is_empty() || !index.scope_is_complete() {
         return None;
     }
     if entries.iter().any(|entry| {
@@ -385,7 +385,12 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
     }
 }
 
-fn member_call_entries(index: &Index, recv_ty: &Type, name: &str, vis: &Visibility) -> Vec<Entry> {
+fn member_call_entries(
+    index: &dyn InferenceIndex,
+    recv_ty: &Type,
+    name: &str,
+    vis: &Visibility,
+) -> Vec<Entry> {
     let mut members: Vec<Entry> = Vec::new();
     let mut extensions: Vec<Entry> = Vec::new();
     let _ = infer::walk_supertypes(index, recv_ty, 32, |current| {
@@ -424,7 +429,7 @@ fn member_call_entries(index: &Index, recv_ty: &Type, name: &str, vis: &Visibili
     }
 }
 
-fn receiver_world_is_library_or_jdk(index: &Index, recv_ty: &Type) -> bool {
+fn receiver_world_is_library_or_jdk(index: &dyn InferenceIndex, recv_ty: &Type) -> bool {
     let Some(root) = recv_ty.name() else {
         return false;
     };
@@ -451,7 +456,11 @@ fn receiver_world_is_library_or_jdk(index: &Index, recv_ty: &Type) -> bool {
             .all(|entry| entry.tier == crate::index::Tier::Durable)
 }
 
-fn visible_durable_top_level_function(index: &Index, name: &str, ctx: &infer::FileCtx) -> bool {
+fn visible_durable_top_level_function(
+    index: &dyn InferenceIndex,
+    name: &str,
+    ctx: &infer::FileCtx,
+) -> bool {
     let candidates = index
         .lookup_by_name(name)
         .iter()
@@ -492,7 +501,7 @@ fn visible_durable_top_level_function(index: &Index, name: &str, ctx: &infer::Fi
 }
 
 fn generic_receiver_extensions<'a>(
-    index: &'a Index,
+    index: &'a dyn InferenceIndex,
     name: &str,
     vis: &Visibility,
 ) -> Vec<&'a Entry> {
@@ -511,7 +520,7 @@ fn generic_receiver_extensions<'a>(
 }
 
 fn argument_type_mismatch_query(
-    index: &Index,
+    index: &dyn InferenceIndex,
     src: &str,
     call: Node,
     symbol: String,
@@ -546,7 +555,7 @@ fn argument_type_mismatch_query(
 }
 
 fn expand_visible_function_overloads(
-    index: &Index,
+    index: &dyn InferenceIndex,
     _src: &str,
     file: &str,
     symbol: &str,
@@ -593,7 +602,7 @@ fn expand_visible_function_overloads(
 }
 
 fn visible_function_packages(
-    index: &Index,
+    index: &dyn InferenceIndex,
     symbol: &str,
     seed_entries: &[Entry],
     ctx: &infer::FileCtx,
@@ -634,7 +643,7 @@ fn visible_function_packages(
 }
 
 fn insert_import_target_packages(
-    index: &Index,
+    index: &dyn InferenceIndex,
     out: &mut HashSet<String>,
     import: &Import,
     local_name: &str,
@@ -654,7 +663,12 @@ fn insert_import_target_packages(
     }
 }
 
-fn insert_visible_package(index: &Index, out: &mut HashSet<String>, symbol: &str, package: &str) {
+fn insert_visible_package(
+    index: &dyn InferenceIndex,
+    out: &mut HashSet<String>,
+    symbol: &str,
+    package: &str,
+) {
     if index.lookup_by_name(symbol).iter().any(|entry| {
         entry.sym.kind == SymbolKind::Function
             && entry.sym.container.is_none()
@@ -707,7 +721,12 @@ fn entry_identity_eq(a: &mut Entry, b: &mut Entry) -> bool {
         && a.sym.end_byte == b.sym.end_byte
 }
 
-fn synth_arg_types(index: &Index, call: Node, src: &str, ctx: &infer::FileCtx) -> Vec<Type> {
+fn synth_arg_types(
+    index: &dyn InferenceIndex,
+    call: Node,
+    src: &str,
+    ctx: &infer::FileCtx,
+) -> Vec<Type> {
     let mut out = Vec::new();
     let va = if let Some(va) = call.child_by_field_name("valueArguments") {
         Some(va)
@@ -789,7 +808,7 @@ fn value_arg_count(call: Node) -> usize {
 }
 
 fn call_accepts_arg_count(
-    index: &Index,
+    index: &dyn InferenceIndex,
     entry: &Entry,
     arg_count: usize,
     uses_trailing_lambda: bool,

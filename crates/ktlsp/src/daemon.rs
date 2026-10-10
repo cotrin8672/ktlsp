@@ -15,6 +15,7 @@ use crate::sidecar::{self, CompileRequest, SidecarClient};
 pub struct DaemonCompiler {
     client: Option<SidecarClient>,
     last_module: Option<String>,
+    last_source_set: Option<String>,
 }
 
 impl Default for DaemonCompiler {
@@ -22,6 +23,7 @@ impl Default for DaemonCompiler {
         DaemonCompiler {
             client: None,
             last_module: None,
+            last_source_set: None,
         }
     }
 }
@@ -40,10 +42,18 @@ impl DaemonCompiler {
     ) -> anyhow::Result<CompileOutcome> {
         let module = match changed {
             Some(c) => {
+                let model = crate::classpath::resolve_snapshot(root)?;
                 let m = module_path_for(root, c).ok_or_else(|| {
                     anyhow::anyhow!("can't derive gradle module for {}", c.display())
                 })?;
                 self.last_module = Some(m.clone());
+                self.last_source_set = Some(
+                    model
+                        .owner_for(c)
+                        .and_then(|(_, source)| source)
+                        .map_or("main", |s| s.name.as_str())
+                        .to_string(),
+                );
                 m
             }
             None => self
@@ -53,18 +63,31 @@ impl DaemonCompiler {
         };
 
         let mc = crate::classpath::resolve_module(root, &module)?;
+        let source_set = self.last_source_set.as_deref().unwrap_or("main");
+        let source = mc.source_sets.iter().find(|s| s.name == source_set);
+        let cache_key = format!("{}|{}#{}", mc.build, mc.module, source_set);
         let req = CompileRequest::new(
-            mc.module.clone(),
-            vec![mc
-                .project_dir
-                .join("src/main/kotlin")
-                .to_string_lossy()
-                .into_owned()],
-            mc.entries
+            cache_key.clone(),
+            source
+                .map(|s| {
+                    s.source_roots
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![mc
+                        .project_dir
+                        .join("src/main/kotlin")
+                        .to_string_lossy()
+                        .into_owned()]
+                }),
+            source
+                .map_or(&mc.entries, |source| &source.entries)
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
-            daemon_cache_dir(&mc.module).to_string_lossy().into_owned(),
+            daemon_cache_dir(&cache_key).to_string_lossy().into_owned(),
         );
 
         let result = self.compile_with_retry(&req)?;
@@ -104,11 +127,14 @@ impl DaemonCompiler {
     }
 }
 
-/// Derive a Gradle project path from a source file path, by Gradle's default dir convention: the
-/// directory segments between `root` and the `src/` source-set marker, joined with `:`. e.g.
-/// `<root>/Web/api/src/main/kotlin/X.kt` -> `:Web:api`. (Assumes the default projectDir convention;
-/// a module with a remapped projectDir would need the settings graph.)
+/// Use the shared Gradle model when available. Non-Gradle callers retain default-layout inference.
+/// This function never starts Gradle; discovery is performed by the background caller.
 pub fn module_path_for(root: &Path, file: &Path) -> Option<String> {
+    if let Some(model) = crate::classpath::snapshot(root) {
+        return model
+            .owner_for(file)
+            .map(|(module, _)| module.module.clone());
+    }
     let rel = file.strip_prefix(root).ok()?;
     let mut segs = Vec::new();
     for comp in rel.components() {

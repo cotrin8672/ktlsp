@@ -10,12 +10,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::coords::Coordinate;
+use crate::project_model::{FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation};
 
 /// The init script, single-sourced with the committed copy so a manual run and the embedded run
 /// can't drift.
@@ -25,6 +26,42 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 /// importantly, a cache miss is expensive enough that concurrent LSP requests must share it
 /// instead of each launching Gradle before the first result reaches the disk cache.
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+const MODEL_VERSION: u32 = 2;
+
+/// Gradle's resolved identity, independent of where an artifact happens to be cached.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComponentId {
+    Module {
+        group: String,
+        name: String,
+        version: String,
+    },
+    Project {
+        build: String,
+        project: String,
+    },
+    File,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedArtifact {
+    pub path: PathBuf,
+    pub component: ComponentId,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSetClasspath {
+    pub name: String,
+    pub source_roots: Vec<PathBuf>,
+    pub output_roots: Vec<PathBuf>,
+    pub provided_artifacts: Vec<PathBuf>,
+    pub entries: Vec<PathBuf>,
+    pub artifacts: Vec<ResolvedArtifact>,
+    pub unresolved: Vec<String>,
+    pub classpath_incomplete: bool,
+}
 
 /// One module's resolved compile classpath.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,12 +70,279 @@ pub struct ModuleClasspath {
     pub module: String,
     /// Absolute module directory.
     pub project_dir: PathBuf,
+    #[serde(default)]
+    pub build: String,
+    #[serde(default)]
+    pub source_sets: Vec<SourceSetClasspath>,
     /// Classpath entries (jars and class dirs), in declared order.
     pub entries: Vec<PathBuf>,
     /// Dependencies the lenient dump could not resolve (`selector: problem`). Empty on a fully
     /// resolved run; reported so silent under-indexing is observable.
     #[serde(default)]
     pub unresolved: Vec<String>,
+}
+
+/// A shared immutable Gradle model. Ownership queries do no filesystem or Gradle work.
+#[derive(Debug)]
+pub struct ProjectSnapshot {
+    pub modules: Vec<ModuleClasspath>,
+    owners: Vec<(String, usize, Option<usize>)>,
+    output_owners: BTreeMap<String, Vec<(usize, usize)>>,
+    file_origins: BTreeMap<String, String>,
+    mtimes: BTreeMap<String, u128>,
+    visibilities: Vec<ScopeVisibility>,
+}
+
+impl ProjectSnapshot {
+    pub fn new(modules: Vec<ModuleClasspath>) -> Self {
+        let mut owners = Vec::new();
+        let mut output_owners: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+        for (module_idx, module) in modules.iter().enumerate() {
+            owners.push((path_key(&module.project_dir), module_idx, None));
+            for (source_idx, source) in module.source_sets.iter().enumerate() {
+                for path in source.output_roots.iter().chain(&source.provided_artifacts) {
+                    output_owners
+                        .entry(path_key(path))
+                        .or_default()
+                        .push((module_idx, source_idx));
+                }
+                for root in &source.source_roots {
+                    owners.push((path_key(root), module_idx, Some(source_idx)));
+                    if let Ok(canonical) = root.canonicalize() {
+                        owners.push((path_key(&canonical), module_idx, Some(source_idx)));
+                    }
+                }
+            }
+        }
+        owners.sort_by(|a, b| {
+            b.0.len()
+                .cmp(&a.0.len())
+                .then(b.2.is_some().cmp(&a.2.is_some()))
+        });
+        owners.dedup();
+        let mut model = Self {
+            modules,
+            owners,
+            output_owners,
+            file_origins: BTreeMap::new(),
+            mtimes: BTreeMap::new(),
+            visibilities: Vec::new(),
+        };
+        for entry in model
+            .modules
+            .iter()
+            .flat_map(|m| &m.source_sets)
+            .flat_map(|s| &s.entries)
+        {
+            model
+                .file_origins
+                .entry(path_key(entry))
+                .or_insert_with(|| file_origin_id(entry));
+        }
+        model.visibilities = model
+            .modules
+            .iter()
+            .flat_map(|module| {
+                module.source_sets.iter().map(|source| {
+                    let scope = project_scope(module, source);
+                    let mut ordered_origins = vec![project_origin_id(&scope)];
+                    let mut seen = std::collections::BTreeSet::from([ordered_origins[0].clone()]);
+                    let artifacts: BTreeMap<_, _> = source
+                        .artifacts
+                        .iter()
+                        .map(|a| (path_key(&a.path), &a.component))
+                        .collect();
+                    for entry in &source.entries {
+                        for origin in
+                            model.origins_for_entry(entry, artifacts.get(&path_key(entry)).copied())
+                        {
+                            if seen.insert(origin.clone()) {
+                                ordered_origins.push(origin);
+                            }
+                        }
+                    }
+                    ScopeVisibility {
+                        scope,
+                        ordered_origins,
+                    }
+                })
+            })
+            .collect();
+        model
+    }
+
+    pub fn owner_for(
+        &self,
+        file: &Path,
+    ) -> Option<(&ModuleClasspath, Option<&SourceSetClasspath>)> {
+        let key = path_key(file);
+        let (_, module, source) = self.owners.iter().find(|(root, _, _)| {
+            key == *root
+                || key
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })?;
+        let module = &self.modules[*module];
+        Some((module, source.map(|idx| &module.source_sets[idx])))
+    }
+
+    pub fn file_origin(&self, file: &Path) -> Option<FileOrigin> {
+        let (module, source) = self.owner_for(file)?;
+        let scope = project_scope(module, source?);
+        Some(FileOrigin {
+            origin_id: project_origin_id(&scope),
+            representation: SourceRepresentation::Source,
+            project_scope: Some(scope),
+        })
+    }
+
+    pub fn scope_visibilities(&self, global_origins: &[String]) -> Vec<ScopeVisibility> {
+        let mut visibilities = self.visibilities.clone();
+        for visibility in &mut visibilities {
+            for origin in global_origins {
+                if !visibility.ordered_origins.contains(origin) {
+                    visibility.ordered_origins.push(origin.clone());
+                }
+            }
+        }
+        visibilities
+    }
+
+    fn origins_for_entry(&self, entry: &Path, component: Option<&ComponentId>) -> Vec<String> {
+        if let Some(ComponentId::Module {
+            group,
+            name,
+            version,
+        }) = component
+        {
+            return vec![format!("maven:{group}:{name}:{version}")];
+        }
+        let key = path_key(entry);
+        let mut origins = Vec::new();
+        for &(module_idx, source_idx) in self.output_owners.get(&key).into_iter().flatten() {
+            let module = &self.modules[module_idx];
+            if let Some(ComponentId::Project { build, project }) = component {
+                if module.build != *build || module.module != *project {
+                    continue;
+                }
+            }
+            origins.push(project_origin_id(&project_scope(
+                module,
+                &module.source_sets[source_idx],
+            )));
+        }
+        if origins.is_empty() {
+            // An unmapped project output stays unavailable instead of borrowing another module.
+            origins.push(self.file_origins[&key].clone());
+        }
+        origins
+    }
+
+    pub fn artifact_origin(&self, path: &Path) -> Option<&str> {
+        self.file_origins.get(&path_key(path)).map(String::as_str)
+    }
+
+    pub fn coordinates_for_file(&self, file: &Path) -> Option<Vec<Coordinate>> {
+        let (_, source) = self.owner_for(file)?;
+        Some(
+            source?
+                .artifacts
+                .iter()
+                .filter_map(|artifact| {
+                    if let ComponentId::Module {
+                        group,
+                        name,
+                        version,
+                    } = &artifact.component
+                    {
+                        Coordinate::parse(&format!("{group}:{name}:{version}"))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn local_jars_for_file(&self, file: &Path) -> Option<Vec<PathBuf>> {
+        let (_, source) = self.owner_for(file)?;
+        let source = source?;
+        let known: std::collections::BTreeSet<_> = source
+            .artifacts
+            .iter()
+            .filter(|a| !matches!(a.component, ComponentId::File))
+            .map(|a| path_key(&a.path))
+            .collect();
+        Some(
+            source
+                .entries
+                .iter()
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jar"))
+                .filter(|p| !known.contains(&path_key(p)))
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+fn project_scope(module: &ModuleClasspath, source: &SourceSetClasspath) -> ProjectScope {
+    ProjectScope {
+        module: format!("gradle:{}|{}", module.build, module.module),
+        source_set: source.name.clone(),
+    }
+}
+
+fn project_origin_id(scope: &ProjectScope) -> String {
+    format!("project:{}#{}", scope.module, scope.source_set)
+}
+
+pub fn maven_origin_id(coordinate: &Coordinate) -> String {
+    format!("maven:{}", coordinate.label())
+}
+
+pub fn file_origin_id(path: &Path) -> String {
+    let metadata = std::fs::metadata(path).ok();
+    let size = metadata.as_ref().map_or(0, |m| m.len());
+    let mtime = metadata
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    format!("file:{}#{mtime}:{size}", path_key(path))
+}
+
+pub fn jdk_origin_id(path: &Path) -> String {
+    format!("jdk:{}", path_key(path))
+}
+
+fn path_key(path: &Path) -> String {
+    crate::paths::file_key(path)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Only returns an already-published model; safe on an interactive request path.
+pub fn snapshot(root: &Path) -> Option<Arc<ProjectSnapshot>> {
+    SNAPSHOTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&path_key(root))
+        .cloned()
+}
+
+fn publish(
+    root: &Path,
+    modules: Vec<ModuleClasspath>,
+    mtimes: BTreeMap<String, u128>,
+) -> Arc<ProjectSnapshot> {
+    let mut model = ProjectSnapshot::new(modules);
+    model.mtimes = mtimes;
+    let model = Arc::new(model);
+    let mut snapshots = SNAPSHOTS.lock().unwrap_or_else(|p| p.into_inner());
+    snapshots.insert(path_key(root), model.clone());
+    if let Ok(canonical) = root.canonicalize() {
+        snapshots.insert(path_key(&canonical), model.clone());
+    }
+    model
 }
 
 /// Parse the init script's line protocol:
@@ -67,9 +371,84 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
                     current = Some(ModuleClasspath {
                         module,
                         project_dir: PathBuf::from(dir),
+                        build: ":".to_string(),
+                        source_sets: Vec::new(),
                         entries: Vec::new(),
                         unresolved: Vec::new(),
                     });
+                }
+            }
+            Some("BUILD") => {
+                if let (Some(cur), Some(build)) = (current.as_mut(), parts.next()) {
+                    cur.build = build.to_string();
+                }
+            }
+            Some(
+                record @ ("SOURCESET" | "SOURCE" | "OUTPUT" | "PROVIDES" | "SCP" | "ARTIFACT"
+                | "SUNRESOLVED" | "INCOMPLETE"),
+            ) => {
+                if let (Some(cur), Some(name)) = (current.as_mut(), parts.next()) {
+                    let idx = cur
+                        .source_sets
+                        .iter()
+                        .position(|s| s.name == name)
+                        .unwrap_or_else(|| {
+                            cur.source_sets.push(SourceSetClasspath {
+                                name: name.to_string(),
+                                ..Default::default()
+                            });
+                            cur.source_sets.len() - 1
+                        });
+                    let source = &mut cur.source_sets[idx];
+                    if record == "INCOMPLETE" {
+                        source.classpath_incomplete = true;
+                    }
+                    if let Some(path) = parts.next().filter(|p| !p.is_empty()) {
+                        if record == "SUNRESOLVED" {
+                            source
+                                .unresolved
+                                .push(format!("{path}: {}", parts.next().unwrap_or("")));
+                            continue;
+                        }
+                        let path = PathBuf::from(path);
+                        match record {
+                            "SOURCE" => source.source_roots.push(path),
+                            "OUTPUT" => source.output_roots.push(path),
+                            "PROVIDES" => source.provided_artifacts.push(path),
+                            "SCP" => source.entries.push(path),
+                            "ARTIFACT" => {
+                                let component = match parts.next() {
+                                    Some("MODULE") => {
+                                        match (parts.next(), parts.next(), parts.next()) {
+                                            (Some(group), Some(name), Some(version)) => {
+                                                Some(ComponentId::Module {
+                                                    group: group.to_string(),
+                                                    name: name.to_string(),
+                                                    version: version.to_string(),
+                                                })
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    Some("PROJECT") => match (parts.next(), parts.next()) {
+                                        (Some(build), Some(project)) => {
+                                            Some(ComponentId::Project {
+                                                build: build.to_string(),
+                                                project: project.to_string(),
+                                            })
+                                        }
+                                        _ => None,
+                                    },
+                                    Some("FILE") => Some(ComponentId::File),
+                                    _ => None,
+                                };
+                                if let Some(component) = component {
+                                    source.artifacts.push(ResolvedArtifact { path, component });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Some("CP") => {
@@ -100,7 +479,7 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
 }
 
 /// Build files whose mtimes invalidate the cache.
-fn build_file_mtimes(root: &Path) -> BTreeMap<String, u128> {
+fn build_file_mtimes(root: &Path, modules: &[ModuleClasspath]) -> BTreeMap<String, u128> {
     const NAMES: &[&str] = &[
         "settings.gradle.kts",
         "settings.gradle",
@@ -111,14 +490,17 @@ fn build_file_mtimes(root: &Path) -> BTreeMap<String, u128> {
     ];
     let gradle = crate::deps::gradle_root(root).unwrap_or_else(|| root.to_path_buf());
     let mut map = BTreeMap::new();
-    for name in NAMES {
-        let p = gradle.join(name);
-        if let Ok(meta) = std::fs::metadata(&p) {
-            if let Ok(mtime) = meta.modified() {
-                if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                    map.insert((*name).to_string(), d.as_millis());
-                }
-            }
+    for dir in
+        std::iter::once(gradle.as_path()).chain(modules.iter().map(|m| m.project_dir.as_path()))
+    {
+        for name in NAMES {
+            let p = dir.join(name);
+            let mtime = std::fs::metadata(&p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            map.insert(path_key(&p), mtime);
         }
     }
     map
@@ -126,6 +508,8 @@ fn build_file_mtimes(root: &Path) -> BTreeMap<String, u128> {
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
+    #[serde(default)]
+    model_version: u32,
     mtimes: BTreeMap<String, u128>,
     modules: Vec<ModuleClasspath>,
 }
@@ -147,28 +531,40 @@ fn cache_path(root: &Path) -> PathBuf {
 /// Note: on a build with configuration-on-demand this may only return the configured subset; prefer
 /// `resolve_module` when the target module is known.
 pub fn resolve(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
+    Ok(resolve_snapshot(root)?.modules.clone())
+}
+
+pub fn resolve_snapshot(root: &Path) -> anyhow::Result<Arc<ProjectSnapshot>> {
     let _guard = RESOLUTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mtimes = build_file_mtimes(root);
+    if let Some(model) = snapshot(root) {
+        if model.mtimes == build_file_mtimes(root, &model.modules) {
+            return Ok(model);
+        }
+    }
     let cache = cache_path(root);
     if let Ok(text) = std::fs::read_to_string(&cache) {
         if let Ok(entry) = serde_json::from_str::<CacheEntry>(&text) {
-            if entry.mtimes == mtimes {
-                return Ok(entry.modules);
+            if entry.model_version == MODEL_VERSION
+                && entry.mtimes == build_file_mtimes(root, &entry.modules)
+            {
+                return Ok(publish(root, entry.modules, entry.mtimes));
             }
         }
     }
     let modules = dump_with_fallback(root, "ktlspDumpClasspath")?;
+    let mtimes = build_file_mtimes(root, &modules);
     log_unresolved(&modules);
     write_cache_entry(
         &cache,
         &CacheEntry {
-            mtimes,
+            model_version: MODEL_VERSION,
+            mtimes: mtimes.clone(),
             modules: modules.clone(),
         },
     );
-    Ok(modules)
+    Ok(publish(root, modules, mtimes))
 }
 
 /// Resolve one module's classpath by gradle path (e.g. `:Web:api`), running only that module's dump
@@ -178,13 +574,22 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
     let _guard = RESOLUTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mtimes = build_file_mtimes(root);
+    if let Some(model) = snapshot(root) {
+        if model.mtimes == build_file_mtimes(root, &model.modules) {
+            if let Some(module) = model.modules.iter().find(|m| m.module == module) {
+                return Ok(module.clone());
+            }
+        }
+    }
     let cache = module_cache_path(root, module);
     if let Ok(text) = std::fs::read_to_string(&cache) {
         if let Ok(entry) = serde_json::from_str::<CacheEntry>(&text) {
-            if entry.mtimes == mtimes {
-                if let Some(m) = entry.modules.into_iter().find(|m| m.module == module) {
-                    return Ok(m);
+            if entry.model_version == MODEL_VERSION
+                && entry.mtimes == build_file_mtimes(root, &entry.modules)
+            {
+                if let Some(found) = entry.modules.iter().find(|m| m.module == module).cloned() {
+                    publish_modules(root, entry.modules);
+                    return Ok(found);
                 }
             }
         }
@@ -197,8 +602,29 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
         .find(|m| m.module == module)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("module {module} not found in dump"))?;
-    write_cache_entry(&cache, &CacheEntry { mtimes, modules });
+    let mtimes = build_file_mtimes(root, &modules);
+    write_cache_entry(
+        &cache,
+        &CacheEntry {
+            model_version: MODEL_VERSION,
+            mtimes,
+            modules: modules.clone(),
+        },
+    );
+    publish_modules(root, modules);
     Ok(found)
+}
+
+fn publish_modules(root: &Path, modules: Vec<ModuleClasspath>) {
+    let mut all = snapshot(root)
+        .map(|m| m.modules.clone())
+        .unwrap_or_default();
+    for module in modules {
+        all.retain(|m| m.module != module.module || m.build != module.build);
+        all.push(module);
+    }
+    let mtimes = build_file_mtimes(root, &all);
+    publish(root, all, mtimes);
 }
 
 fn write_cache_entry(path: &Path, entry: &CacheEntry) {
@@ -253,7 +679,12 @@ fn log_unresolved(modules: &[ModuleClasspath]) {
     }
     let sample: Vec<String> = modules
         .iter()
-        .flat_map(|m| m.unresolved.iter().take(2).map(move |u| format!("{}: {u}", m.module)))
+        .flat_map(|m| {
+            m.unresolved
+                .iter()
+                .take(2)
+                .map(move |u| format!("{}: {u}", m.module))
+        })
         .take(6)
         .collect();
     tracing::warn!(
@@ -327,19 +758,17 @@ impl Drop for TempFile<'_> {
 /// reveals its coordinate, and ktlsp can then locate/download the matching `-sources.jar`.
 pub fn coordinates_from_classpath(root: &Path) -> Vec<Coordinate> {
     let mut out = std::collections::BTreeSet::new();
-    for module in resolve(root).unwrap_or_default() {
-        out.extend(coordinates_from_entries(module.entries));
+    if let Ok(model) = resolve_snapshot(root) {
+        for module in &model.modules {
+            out.extend(module_coordinates(module));
+        }
     }
     out.into_iter().collect()
 }
 
 pub fn coordinates_from_module_classpath(root: &Path, module: &str) -> Vec<Coordinate> {
     resolve_module(root, module)
-        .map(|classpath| {
-            coordinates_from_entries(classpath.entries)
-                .into_iter()
-                .collect()
-        })
+        .map(|classpath| module_coordinates(&classpath).into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -348,23 +777,33 @@ pub fn coordinates_from_module_classpath(root: &Path, module: &str) -> Vec<Coord
 /// so dependency navigation falls back to class stubs.
 pub fn local_jars_from_classpath(root: &Path) -> Vec<PathBuf> {
     let mut out = std::collections::BTreeSet::new();
-    for module in resolve(root).unwrap_or_default() {
-        out.extend(local_jars_from_entries(module.entries));
+    let mut authoritative = false;
+    if let Ok(model) = resolve_snapshot(root) {
+        authoritative = model.modules.iter().any(|m| !m.source_sets.is_empty());
+        for module in &model.modules {
+            out.extend(module_local_jars(module));
+        }
     }
-    out.extend(local_jars_from_build_files(root));
+    if !authoritative {
+        out.extend(local_jars_from_build_files(root));
+    }
     out.into_iter().collect()
 }
 
 pub fn local_jars_from_module_classpath(root: &Path, module: &str) -> Vec<PathBuf> {
-    let mut out: std::collections::BTreeSet<PathBuf> = resolve_module(root, module)
-        .map(|classpath| {
-            local_jars_from_entries(classpath.entries)
-                .into_iter()
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(module_dir) = module_dir_for_default_layout(root, module) {
-        out.extend(local_jars_from_build_files(&module_dir));
+    let mut out = std::collections::BTreeSet::new();
+    match resolve_module(root, module) {
+        Ok(classpath) => {
+            out.extend(module_local_jars(&classpath));
+            if classpath.source_sets.is_empty() {
+                out.extend(local_jars_from_build_files(&classpath.project_dir));
+            }
+        }
+        Err(_) => {
+            if let Some(module_dir) = module_dir_for_default_layout(root, module) {
+                out.extend(local_jars_from_build_files(&module_dir));
+            }
+        }
     }
     out.into_iter().collect()
 }
@@ -442,6 +881,50 @@ fn coordinates_from_entries(entries: Vec<PathBuf>) -> std::collections::BTreeSet
     entries
         .into_iter()
         .filter_map(|entry| coordinate_from_gradle_cache_path(&entry))
+        .collect()
+}
+
+fn module_coordinates(module: &ModuleClasspath) -> std::collections::BTreeSet<Coordinate> {
+    if module.source_sets.is_empty() {
+        return coordinates_from_entries(module.entries.clone());
+    }
+    module
+        .source_sets
+        .iter()
+        .flat_map(|source| &source.artifacts)
+        .filter_map(|artifact| {
+            if let ComponentId::Module {
+                group,
+                name,
+                version,
+            } = &artifact.component
+            {
+                Coordinate::parse(&format!("{group}:{name}:{version}"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn module_local_jars(module: &ModuleClasspath) -> std::collections::BTreeSet<PathBuf> {
+    if module.source_sets.is_empty() {
+        return local_jars_from_entries(module.entries.clone());
+    }
+    let known: std::collections::BTreeSet<_> = module
+        .source_sets
+        .iter()
+        .flat_map(|source| &source.artifacts)
+        .filter(|artifact| !matches!(artifact.component, ComponentId::File))
+        .map(|artifact| path_key(&artifact.path))
+        .collect();
+    module
+        .source_sets
+        .iter()
+        .flat_map(|source| &source.entries)
+        .filter(|entry| entry.extension().and_then(|ext| ext.to_str()) == Some("jar"))
+        .filter(|entry| !known.contains(&path_key(entry)))
+        .cloned()
         .collect()
 }
 
@@ -583,11 +1066,12 @@ END\t:lib\n";
 
     #[test]
     fn cache_entry_without_unresolved_field_deserializes() {
-        // Cache entries written before the unresolved report existed must keep loading.
+        // Legacy records remain readable for tooling but cannot satisfy the new model cache.
         let json = r#"{"mtimes":{},"modules":[{"module":":lib","project_dir":"/abs/lib","entries":["/jars/a.jar"]}]}"#;
         let entry: CacheEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.modules[0].module, ":lib");
         assert!(entry.modules[0].unresolved.is_empty());
+        assert_ne!(entry.model_version, MODEL_VERSION);
     }
 
     #[test]
@@ -689,10 +1173,13 @@ dependencies {
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("classpath.json");
         let entry = CacheEntry {
+            model_version: MODEL_VERSION,
             mtimes: BTreeMap::from([("build.gradle.kts".to_string(), 42)]),
             modules: vec![ModuleClasspath {
                 module: ":app".to_string(),
                 project_dir: PathBuf::from("/project/app"),
+                build: ":".to_string(),
+                source_sets: Vec::new(),
                 entries: vec![PathBuf::from("/jars/app.jar")],
                 unresolved: Vec::new(),
             }],
@@ -708,5 +1195,204 @@ dependencies {
             .flatten()
             .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actual_components_distinguish_maven_project_and_local_jars() {
+        let dump = "PROJECT\t:app\t/repo/modules/editing\nBUILD\t:\nSOURCESET\tmain\n\
+SOURCE\tmain\t/repo/generated/custom\nOUTPUT\tmain\t/repo/classes\n\
+SCP\tmain\t/repo/home/.m2/repository/vendor/api/2/api-2.jar\n\
+SCP\tmain\t/repo/libs/local.jar\nSCP\tmain\t/repo/modules/library/build/api.jar\n\
+ARTIFACT\tmain\t/repo/home/.m2/repository/vendor/api/2/api-2.jar\tMODULE\tvendor\tapi\t2\n\
+ARTIFACT\tmain\t/repo/modules/library/build/api.jar\tPROJECT\t:included\t:library\nEND\t:app\n";
+        let modules = parse_dump(dump);
+        let module = &modules[0];
+        assert_eq!(
+            module.source_sets[0].source_roots,
+            vec![PathBuf::from("/repo/generated/custom")]
+        );
+        assert_eq!(
+            module.source_sets[0].output_roots,
+            vec![PathBuf::from("/repo/classes")]
+        );
+        assert_eq!(
+            module_coordinates(module).into_iter().collect::<Vec<_>>(),
+            vec![Coordinate::parse("vendor:api:2").unwrap()]
+        );
+        assert_eq!(
+            module_local_jars(module).into_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("/repo/libs/local.jar")]
+        );
+        assert_eq!(
+            module.source_sets[0].artifacts[1].component,
+            ComponentId::Project {
+                build: ":included".to_string(),
+                project: ":library".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_uses_actual_project_dirs_and_longest_registered_source_root() {
+        let model = ProjectSnapshot::new(parse_dump(
+            "\
+PROJECT\t:\t/repo\nEND\t:\n\
+PROJECT\t:app\t/repo/modules/editing\nSOURCESET\tmain\n\
+SOURCE\tmain\t/repo/modules/editing/src/main/java\n\
+SOURCE\tmain\t/repo/build/custom-generated\nEND\t:app\n\
+PROJECT\t:tests\t/repo/modules/editing/tests\nSOURCESET\tintegration\n\
+SOURCE\tintegration\t/repo/modules/editing/tests/custom\nEND\t:tests\n",
+        ));
+        for file in [
+            "/repo/modules/editing/src/main/java/Main.java",
+            "/repo/build/custom-generated/New.java",
+        ] {
+            let (module, source) = model.owner_for(Path::new(file)).unwrap();
+            assert_eq!(module.module, ":app");
+            assert_eq!(source.unwrap().name, "main");
+        }
+        assert_eq!(
+            model
+                .owner_for(Path::new("/repo/modules/editing/tests/custom/T.kt"))
+                .unwrap()
+                .0
+                .module,
+            ":tests"
+        );
+        assert!(model.owner_for(Path::new("/repository/Other.kt")).is_none());
+    }
+
+    #[test]
+    fn source_set_visibility_preserves_order_and_actual_project_artifact_aliases() {
+        let model = ProjectSnapshot::new(parse_dump(
+            "PROJECT\t:app\t/repo/modules/editing\n\
+SOURCE\tmain\t/repo/modules/editing/src/main/java\n\
+OUTPUT\tmain\t/repo/app-classes\n\
+SCP\tmain\t/repo/m2/api-2.jar\n\
+ARTIFACT\tmain\t/repo/m2/api-2.jar\tMODULE\tvendor\tapi\t2\n\
+SCP\tmain\t/repo/lib-custom.jar\n\
+ARTIFACT\tmain\t/repo/lib-custom.jar\tPROJECT\t:\t:lib\n\
+SCP\tmain\t/repo/libs/local.jar\n\
+SOURCE\ttest\t/repo/modules/editing/src/test/java\n\
+SCP\ttest\t/repo/app-classes\n\
+SCP\ttest\t/repo/m2/api-1.jar\n\
+ARTIFACT\ttest\t/repo/m2/api-1.jar\tMODULE\tvendor\tapi\t1\n\
+INCOMPLETE\ttest\nSUNRESOLVED\ttest\tvendor:missing:1\tabsent\nEND\t:app\n\
+PROJECT\t:lib\t/repo/modules/library\n\
+SOURCE\tmain\t/repo/modules/library/src/main/java\n\
+PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
+        ));
+        let visibilities = model.scope_visibilities(&["jdk:chosen".to_string()]);
+        assert_eq!(
+            visibilities[0].ordered_origins,
+            vec![
+                "project:gradle::|:app#main",
+                "maven:vendor:api:2",
+                "project:gradle::|:lib#main",
+                model
+                    .artifact_origin(Path::new("/repo/libs/local.jar"))
+                    .unwrap(),
+                "jdk:chosen",
+            ]
+        );
+        assert_eq!(
+            visibilities[1].ordered_origins,
+            vec![
+                "project:gradle::|:app#test",
+                "project:gradle::|:app#main",
+                "maven:vendor:api:1",
+                "jdk:chosen",
+            ]
+        );
+        assert_eq!(
+            model
+                .coordinates_for_file(Path::new("/repo/modules/editing/src/test/java/Use.java"))
+                .unwrap(),
+            vec![Coordinate::parse("vendor:api:1").unwrap()]
+        );
+        assert_eq!(
+            model
+                .local_jars_for_file(Path::new("/repo/modules/editing/src/main/java/Use.java"))
+                .unwrap(),
+            vec![PathBuf::from("/repo/libs/local.jar")]
+        );
+        assert!(model.modules[0].source_sets[1].classpath_incomplete);
+        assert_eq!(
+            model.modules[0].source_sets[1].unresolved,
+            vec!["vendor:missing:1: absent"]
+        );
+        assert!(model
+            .file_origin(Path::new("/repo/modules/editing/testData/Private.java"))
+            .is_none());
+    }
+
+    #[test]
+    fn artifact_identity_is_frozen_with_the_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_snapshot_artifact_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let jar = root.join("local.jar");
+        std::fs::write(&jar, b"first").unwrap();
+        let model = ProjectSnapshot::new(parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{}\nEND\t:app\n",
+            root.display(),
+            jar.display()
+        )));
+        let captured = model.artifact_origin(&jar).unwrap().to_string();
+        std::fs::write(&jar, b"changed binary").unwrap();
+        assert_ne!(captured, file_origin_id(&jar));
+        assert_eq!(model.artifact_origin(&jar), Some(captured.as_str()));
+        assert_eq!(
+            model.scope_visibilities(&[])[0].ordered_origins[1],
+            captured
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_model_reuses_actual_module_without_another_gradle_invocation() {
+        let root = std::env::temp_dir().join(format!("ktlsp_shared_model_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("modules/editing")).unwrap();
+        std::fs::write(root.join("settings.gradle.kts"), "include(\":app\")").unwrap();
+        std::fs::write(
+            root.join("modules/editing/build.gradle.kts"),
+            "plugins { java }",
+        )
+        .unwrap();
+        let modules = parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nEND\t:app\n",
+            root.join("modules/editing").display(),
+            root.join("build/custom-generated").display()
+        ));
+        let mtimes = build_file_mtimes(&root, &modules);
+        let model = publish(&root, modules, mtimes.clone());
+        for _ in 0..100 {
+            assert!(Arc::ptr_eq(&model, &resolve_snapshot(&root).unwrap()));
+            assert_eq!(
+                resolve_module(&root, ":app").unwrap().project_dir,
+                root.join("modules/editing")
+            );
+            assert_eq!(
+                crate::daemon::module_path_for(&root, &root.join("build/custom-generated/New.kt")),
+                Some(":app".to_string())
+            );
+        }
+        std::fs::write(
+            root.join("modules/editing/gradle.properties"),
+            "changed=true",
+        )
+        .unwrap();
+        assert_ne!(mtimes, build_file_mtimes(&root, &model.modules));
+        let canonical = root.canonicalize().unwrap();
+        assert!(Arc::ptr_eq(&model, &snapshot(&canonical).unwrap()));
+        assert_eq!(
+            model
+                .owner_for(&canonical.join("modules/editing/src/main/kotlin/Unsaved.kt"))
+                .unwrap()
+                .0
+                .module,
+            ":app"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

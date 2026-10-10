@@ -12,7 +12,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
 use crate::hints::{self, InlayHint};
-use crate::index::{Entry, Index, Usage};
+use crate::index::{Entry, InferenceIndex, Usage};
 use crate::indexer;
 use crate::java::{self, JavaParser};
 use crate::parser::{self, node_text, KotlinParser};
@@ -221,7 +221,7 @@ impl VisibilityFacts {
 }
 
 pub fn goto_definition(
-    index: &Index,
+    index: &dyn InferenceIndex,
     language: SourceLanguage,
     file: &str,
     text: &str,
@@ -245,10 +245,11 @@ pub struct SignatureEntries {
     pub name: String,
     pub active_parameter: u32,
     pub entries: Vec<Entry>,
+    pub unqualified: bool,
 }
 
 pub fn signature_entries(
-    index: &Index,
+    index: &dyn InferenceIndex,
     language: SourceLanguage,
     file: &str,
     text: &str,
@@ -268,6 +269,7 @@ pub fn signature_entries(
                 name,
                 active_parameter,
                 entries,
+                unqualified: callee.kind() == "identifier",
             })
         }
         SourceLanguage::Java => {
@@ -277,13 +279,15 @@ pub fn signature_entries(
                 name,
                 active_parameter,
                 entries,
+                unqualified: call.kind() == "method_invocation"
+                    && call.child_by_field_name("object").is_none(),
             })
         }
     }
 }
 
 pub fn diagnostics(
-    index: &Index,
+    index: &dyn InferenceIndex,
     language: SourceLanguage,
     file: &str,
     text: &str,
@@ -399,7 +403,7 @@ pub fn semantic_tokens(language: SourceLanguage, tree: &Tree, text: &str) -> Vec
 
 pub fn inlay_hints(
     language: SourceLanguage,
-    index: &Index,
+    index: &dyn InferenceIndex,
     tree: &Tree,
     text: &str,
     start_byte: usize,
@@ -413,7 +417,7 @@ pub fn inlay_hints(
 
 pub fn type_definition(
     language: SourceLanguage,
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     text: &str,
@@ -427,7 +431,7 @@ pub fn type_definition(
 
 pub fn incoming_calls<F>(
     language: SourceLanguage,
-    index: &Index,
+    index: &dyn InferenceIndex,
     item: &HierarchyItem,
     refs: Vec<Def>,
     parse_file: F,
@@ -443,7 +447,7 @@ where
 
 pub fn outgoing_calls(
     language: SourceLanguage,
-    index: &Index,
+    index: &dyn InferenceIndex,
     file: &str,
     tree: &Tree,
     text: &str,

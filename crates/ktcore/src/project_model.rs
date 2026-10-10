@@ -6,6 +6,30 @@ pub struct ProjectScope {
     pub source_set: String,
 }
 
+/// How a file represents its origin. A stub is a shallow class-name fallback, not
+/// evidence that compiler-generated callable members are absent from source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRepresentation {
+    Source,
+    Stub,
+}
+
+/// Runtime ownership supplied by the project adapter. Origin IDs are opaque to
+/// the semantic core: the adapter identifies project outputs and resolved artifacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileOrigin {
+    pub origin_id: String,
+    pub representation: SourceRepresentation,
+    pub project_scope: Option<ProjectScope>,
+}
+
+/// Resolved classpath order for one source set, including its own source origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeVisibility {
+    pub scope: ProjectScope,
+    pub ordered_origins: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProjectPackageScope {
     pub module: String,
