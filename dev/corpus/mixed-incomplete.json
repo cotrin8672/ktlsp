@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "project_id": "mixed-incomplete",
+  "build_tool": "maven",
+  "scope": "Compiled mixed_project.lua golden, unsaved edits only; ten edit cases and paired known/unknown receiver queries. This is a fixture control, not real-root acceptance.",
+  "probes": [
+    {
+      "id": "java-partial-member",
+      "source": "src/main/java/mixed/JavaApi.java",
+      "anchor": "return api.kotlinGre",
+      "token": "kotlinGre",
+      "definition": false,
+      "completion_token": "kotlinGreeting",
+      "completion_excludes": [
+        "javaGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "return api.kotlinGreeting();",
+          "replacement": "return api.kotlinGre",
+          "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+        }
+      ],
+      "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+    },
+    {
+      "id": "kotlin-partial-member",
+      "source": "src/main/kotlin/mixed/KotlinApi.kt",
+      "anchor": "= peer.javaGre",
+      "token": "javaGre",
+      "definition": false,
+      "completion_token": "javaGreeting",
+      "completion_excludes": [
+        "kotlinGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "fun kotlinGreeting(): String = peer.javaGreeting()",
+          "replacement": "fun kotlinGreeting(): String = peer.javaGre",
+          "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+        }
+      ],
+      "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+    },
+    {
+      "id": "java-dangling-dot",
+      "source": "src/main/java/mixed/JavaApi.java",
+      "anchor": "return api.",
+      "token": ".",
+      "definition": false,
+      "completion_token": "kotlinGreeting",
+      "completion_excludes": [
+        "javaGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "return api.kotlinGreeting();",
+          "replacement": "return api.",
+          "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+        }
+      ],
+      "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+    },
+    {
+      "id": "kotlin-dangling-dot",
+      "source": "src/main/kotlin/mixed/KotlinApi.kt",
+      "anchor": "= peer.",
+      "token": ".",
+      "definition": false,
+      "completion_token": "javaGreeting",
+      "completion_excludes": [
+        "kotlinGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "fun kotlinGreeting(): String = peer.javaGreeting()",
+          "replacement": "fun kotlinGreeting(): String = peer.",
+          "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+        }
+      ],
+      "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+    },
+    {
+      "id": "java-with-broken-kotlin-peer",
+      "source": "src/main/java/mixed/JavaApi.java",
+      "anchor": "return api.kotlinGreeting();",
+      "token": "kotlinGreeting",
+      "definition": false,
+      "completion_token": "kotlinGreeting",
+      "completion_excludes": [
+        "javaGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "    fun useBox(",
+          "replacement": "    fun unrelatedBroken() { val broken = }\n\n    fun useBox(",
+          "source": "src/main/kotlin/mixed/KotlinApi.kt",
+          "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+        }
+      ],
+      "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+    },
+    {
+      "id": "kotlin-with-broken-java-peer",
+      "source": "src/main/kotlin/mixed/KotlinApi.kt",
+      "anchor": "fun kotlinGreeting(): String = peer.javaGreeting()",
+      "token": "javaGreeting",
+      "definition": false,
+      "completion_token": "javaGreeting",
+      "completion_excludes": [
+        "kotlinGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "    public String useBox(",
+          "replacement": "    public void unrelatedBroken() { int broken = ; }\n\n    public String useBox(",
+          "source": "src/main/java/mixed/JavaApi.java",
+          "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+        }
+      ],
+      "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+    },
+    {
+      "id": "java-known-receiver-with-unknown-name",
+      "source": "src/main/java/mixed/JavaApi.java",
+      "anchor": "+ api.kotlinGreeting()",
+      "token": "kotlinGreeting",
+      "definition": false,
+      "completion_token": "kotlinGreeting",
+      "completion_excludes": [
+        "javaGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "return api.kotlinGreeting();",
+          "replacement": "return missingReceiver.kotlinGre() + api.kotlinGreeting();",
+          "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+        }
+      ],
+      "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+    },
+    {
+      "id": "kotlin-known-receiver-with-unknown-name",
+      "source": "src/main/kotlin/mixed/KotlinApi.kt",
+      "anchor": "+ peer.javaGreeting()",
+      "token": "javaGreeting",
+      "definition": false,
+      "completion_token": "javaGreeting",
+      "completion_excludes": [
+        "kotlinGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "fun kotlinGreeting(): String = peer.javaGreeting()",
+          "replacement": "fun kotlinGreeting(): String = missingReceiver.javaGre() + peer.javaGreeting()",
+          "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+        }
+      ],
+      "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+    },
+    {
+      "id": "java-unknown-receiver",
+      "source": "src/main/java/mixed/JavaApi.java",
+      "anchor": "return missingReceiver.kotlinGre()",
+      "token": "kotlinGre",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "kotlinGreeting",
+        "javaGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "return api.kotlinGreeting();",
+          "replacement": "return missingReceiver.kotlinGre() + api.kotlinGreeting();",
+          "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+        }
+      ],
+      "known_control": {
+        "anchor": "+ api.kotlinGreeting()",
+        "token": "kotlinGreeting",
+        "completion_token": "kotlinGreeting",
+        "completion_excludes": [
+          "javaGreeting"
+        ]
+      },
+      "source_sha256": "b5e891bd32ab45b9d13e3765cb88d625f1698627b90eb2efba6d9f4912a7e06f"
+    },
+    {
+      "id": "kotlin-unknown-receiver",
+      "source": "src/main/kotlin/mixed/KotlinApi.kt",
+      "anchor": "= missingReceiver.javaGre()",
+      "token": "javaGre",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "javaGreeting",
+        "kotlinGreeting"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "fun kotlinGreeting(): String = peer.javaGreeting()",
+          "replacement": "fun kotlinGreeting(): String = missingReceiver.javaGre() + peer.javaGreeting()",
+          "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+        }
+      ],
+      "known_control": {
+        "anchor": "+ peer.javaGreeting()",
+        "token": "javaGreeting",
+        "completion_token": "javaGreeting",
+        "completion_excludes": [
+          "kotlinGreeting"
+        ]
+      },
+      "source_sha256": "6eebc8f7dbb3d375fa1e64dad6c570474112cdb0b773d8d18bad9f5dfa0a17d7"
+    }
+  ],
+  "compiler_baseline": "Unmodified mixed_project.lua golden compiled offline with Maven 3.10.0, Kotlin 2.0.21 and JDK 21 on 2026-10-10, in an external copy. Incomplete buffers are never saved."
+}

@@ -212,17 +212,28 @@ document-version translation and Neovim's stale-edit checks.
 The scenario records normal peer-buffer debounce separately, then flushes Neovim's pending
 changes for both buffers and checks the first completion/definition responses without retries.
 That explicit test delivery barrier does not establish freshness before the editor sends changes.
+After the compiler and RPC checks, `mixed` runs native insert-mode completion in both languages.
+It types a dot, checks the actual popup's LSP member and wrong-receiver exclusions, accepts it
+through the keyboard, and inspects the exact inserted source. `artifacts/completion-ui.json`
+separates protocol time, input-to-popup handoff, and selection-to-text verification; this is not
+physical-screen timing. Set `KTLSP_UI_SAMPLES` for cycles per language (default 1). Cycle 1 is
+the first after readiness; later cycles are repetitions. These small controls do not establish
+real-project latency budgets. The same UI probe supports the temporary IntelliJ client.
 
 `corpus --root <project> --file <manifest.json>` runs read-only completion and exact declaration
 probes on a real project. The manifest supplies relative source files, unique anchors, tokens,
 and expected declaration files/anchors. `KTLSP_PROBE_SERVER=intellij` uses the same official
-plugin configuration as `mixed`, with successful Gradle import required. Source hashes, working-tree
+plugin configuration as `mixed`, with successful build-tool import required. Source hashes, working-tree
 status, first/last responses and bounded indexing retries are recorded; retries are not timing samples.
 Set `KTLSP_CORPUS_WAIT_INDEX=1` to require both project and dependency indexing notifications and
 check the first response without retries. Missing dependency sources remain a failed coverage check;
 the selected semantic probes still run after completed indexing and explicitly record incomplete inputs.
 Definition requests use the identifier start; completion requests use its end, or the manifest's
 `completion_prefix`, so an unfiltered first page does not obscure the requested member.
+Optional `buffer_edits` test partial identifiers, dangling dots, syntax errors in a peer file,
+and unknown receivers without saving source. Changes and restoration require outbound versions;
+each query uses one response after Neovim's flush. Negative unknown cases also require a useful
+known receiver in the same edited state. [dev/corpus](dev/corpus/README.md) includes these controls.
 See [the corpus record](docs/fork-corpus.md) for pinned projects, candidate probes and remaining coverage.
 
 `gradle-live` also verifies classpath discovery against a disposable Gradle project that creates

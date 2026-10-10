@@ -43,9 +43,11 @@ mixed/corpus environment:
   KTLSP_MIXED_MVN          Maven executable (otherwise mvn/mvn.cmd on PATH)
   KTLSP_MIXED_MAVEN_REPO   Maven cache (default: artifacts/m2)
   KTLSP_MIXED_SERVER       ktlsp (default) or intellij
+  KTLSP_UI_SAMPLES         mixed builtin completion cycles per language (default: 1)
   KTLSP_PROBE_SERVER       corpus backend: ktlsp (default) or intellij
   IJLS_PLUGIN/IJLS_SERVER  intellij-lsp.nvim plugin and server paths for intellij
   IJLS_JDK/JAVA_HOME       JDK for the IntelliJ server
+
 USAGE
 }
 
@@ -517,6 +519,22 @@ case "$scenario" in
   mixed)
     project="${root_arg:-$(write_mixed_project)}"
     run_and_capture mixed nvim -l "$repo/dev/nvim_mixed.lua" "$project" "$bin_arg" "$artifacts" || run_status=$?
+    if [ "$run_status" -eq 0 ]; then
+      ui_project="$project"
+      ui_artifacts="$artifacts"
+      ui_script="$repo/dev/nvim_completion_ui.lua"
+      ui_bin="$bin_arg"
+      if command -v cygpath >/dev/null 2>&1; then
+        ui_project="$(cygpath -m "$ui_project")"
+        ui_artifacts="$(cygpath -m "$ui_artifacts")"
+        ui_script="$(cygpath -m "$ui_script")"
+        ui_bin="$(cygpath -m "$ui_bin")"
+      fi
+      KTLSP_UI_PROJECT="$ui_project" KTLSP_UI_ARTIFACTS="$ui_artifacts" \
+        KTLSP_UI_SCRIPT="$ui_script" KTLSP_BIN="$ui_bin" \
+        run_and_capture completion-ui nvim --headless -u NONE -i NONE -n \
+          -c 'lua dofile(vim.env.KTLSP_UI_SCRIPT)' || run_status=$?
+    fi
     ;;
   corpus)
     if [ -z "$root_arg" ] || [ -z "$file_arg" ]; then

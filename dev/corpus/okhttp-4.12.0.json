@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "project_id": "okhttp-4.12.0",
+  "revision": "4984568367caaf359b82c452bd28b5e192824d1c",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "enqueue",
+      "target": "okhttp/src/main/kotlin/okhttp3/Call.kt",
+      "target_anchor": "fun enqueue(responseCallback: Callback)",
+      "target_token": "enqueue",
+      "expected": "Java chained Call.enqueue resolves the Kotlin interface member; completion includes enqueue through the returned Call.",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "target_sha256": "1207c71dd6de35a2afcbbdc3d4b2de6a72aeae88345a9cf256c8a6ade82c07af",
+      "compiler_status": "guide Java+Kotlin and required core compilation passed",
+      "module": ":samples:guide",
+      "id": "okhttp-java-kotlin-call",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "anchor": "client.newCall(request).enqueue("
+    },
+    {
+      "token": "newCall",
+      "target": "okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt",
+      "target_anchor": "override fun newCall(request: Request): Call",
+      "target_token": "newCall",
+      "expected": "Java receiver OkHttpClient resolves concrete Kotlin newCall override, returning shared Call type.",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "target_sha256": "7dd4feb07f40501aff1d95fba9b93a9ca91122515c011ae7bebde0611566ad6c",
+      "compiler_status": "guide Java+Kotlin and required core compilation passed",
+      "module": ":samples:guide",
+      "id": "okhttp-java-kotlin-newcall",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "anchor": "client.newCall(request).enqueue("
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "project_id": "moshi-1.15.2",
+  "revision": "7f957b18ea123b7bb2ffc9d3c079e680eecf15e1",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "Factory",
+      "target": "moshi/src/main/java/com/squareup/moshi/JsonAdapter.java",
+      "target_anchor": "public interface Factory {",
+      "target_token": "Factory",
+      "expected": "Kotlin implementation navigates to nested Java JsonAdapter.Factory; Java contract includes nullable create return.",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "compiler_status": "focused main compilation passed",
+      "target_sha256": "e3f3a2102be11404995cbbc4e80c71c05b71c3f239a9966f0ff52e704acdaf1f",
+      "completion": false,
+      "module": ":moshi-kotlin",
+      "id": "moshi-factory-interface",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "anchor": ": JsonAdapter.Factory"
+    },
+    {
+      "token": "beginObject",
+      "target": "moshi/src/main/java/com/squareup/moshi/JsonReader.java",
+      "target_anchor": "public abstract void beginObject()",
+      "target_token": "beginObject",
+      "expected": "Completion contains beginObject; definition is Java JsonReader.beginObject, not a Javadoc occurrence or unrelated overload.",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "target_sha256": "70bc4047e5e02b95cad573864828793ab98f03d1bfde405a6557ac1283f0179a",
+      "compiler_status": "focused main compilation passed",
+      "module": ":moshi-kotlin",
+      "id": "moshi-jsonreader-member",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "anchor": "reader.beginObject()"
+    }
+  ]
+}

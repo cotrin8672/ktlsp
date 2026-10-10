@@ -263,10 +263,13 @@ indexing retries, source hashes, revision/status and graceful shutdown. These
 read-only probes do not prove unsaved editing, references, rename or latency on
 the real roots.
 
-Generated per-root manifests are outside the checkout at
+Portable per-root manifests are in [dev/corpus](../dev/corpus/README.md), with
+source-snapshot hashes and CEM archive-extraction instructions. The original runs
+use equivalent external manifests at
 `C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/probes/<directory>.json`.
-The 13 source/declaration anchor pairs were validated for uniqueness and UTF-16
-positions against the pinned sources. A portable minimal manifest is:
+All six portable manifests were checked against the actual roots: 13 unique
+source/declaration anchor pairs, matching text hashes and 24 semantic checks.
+A minimal manifest is:
 
 ```json
 {
@@ -319,7 +322,7 @@ archive versions before using the manifest on another machine.
 Example command after selecting an immutable release binary:
 
 ```powershell
-rtk proxy C:/Users/gummy/scoop/apps/git/current/bin/bash.exe dev/ktlsp-harness.sh corpus --root C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/moshi-1.15.2 --file C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/probes/moshi-1.15.2.json --bin <release>/ktlsp.exe --no-build
+rtk proxy C:/Users/gummy/scoop/apps/git/current/bin/bash.exe dev/ktlsp-harness.sh corpus --root C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-20261010/moshi-1.15.2 --file dev/corpus/moshi-1.15.2.json --bin <release>/ktlsp.exe --no-build
 ```
 
 For IntelliJ, set `KTLSP_PROBE_SERVER=intellij`, `IJLS_PLUGIN`, `IJLS_SERVER`
@@ -381,10 +384,71 @@ counts of Moshi 4, OkHttp 13, Retrofit 30, Spring 27, Gradle 145 and CEM 6. Its 
 five roots stopped at the coverage check before a policy refinement; they do not
 contain indexed semantic measurements. CEM's indexed run continues and passes the
 exact inherited `getBreakSpeed` definition, while both completion checks and the
-`HolderGetter.getOrThrow` definition fail. A uniform series with filtered
-completion positions is the next comparison. The initial Retrofit `body` probe
+`HolderGetter.getOrThrow` definition fail. The next series below applies filtered
+completion positions uniformly. The initial Retrofit `body` probe
 accidentally selected the local variable of the same name; the manifest anchor
 was corrected to `= response.body()` before the independent IntelliJ pass.
+
+### Uniform post-index first responses
+
+The second series uses the same complete roots and 13 anchor pairs, with
+completion at the full identifier's end in both engines. ktlsp uses the immutable
+third release, SHA-256
+`72a900ebe45b4a04daa027d656cd5d7af14c0d9096f5ccaa600a574d344ea7f0`.
+All six roots finish both index phases, then each semantic request consumes one
+response. Zero dependency workers fail, but missing sources fail the separate
+coverage check in every root. The 9/24 matching selected semantic checks do not
+pass root acceptance.
+
+| Root | Project / library files reported | Missing sources | ktlsp selected checks | Actual remaining result |
+| --- | --- | --- | --- | --- |
+| Moshi | 150 / 25,123 | 4 | 1/3 match | `Factory` returns seven unrelated nested declarations; `beginObject` returns both project and dependency Moshi 1.12.0 declarations |
+| OkHttp | 404 / 59,235 | 13 | 3/4 match | `newCall` returns both `Call.Factory` and concrete `OkHttpClient` declarations; both completions and `enqueue` definition match |
+| Retrofit | 313 / 56,641 | 30 | 1/6 match | Facade navigation also returns dependency 2.9.0; `awaitNullable` is empty; `body` returns field/parameter and method declarations from both versions. Only `body` completion matches |
+| Spring | 9,080 / 76,698 | 25 | 1/4 match | Generic-chain `getObject` completion/navigation is empty; `getBeanProvider(ResolvableType)` navigates to the Kotlin no-argument extension instead of the Java overload |
+| Gradle | 13,820 / 94,203 | 146 | 2/3 match | Java-to-Kotlin constructor completion/navigation matches; Java interface navigation returns both project source and a local-JAR stub |
+| CEM | 122 / 37,825 | 6 | 1/4 match | Inherited `getBreakSpeed` definition matches; its completion and generic `HolderGetter` completion/navigation do not |
+
+Evidence: `ktlsp-corpus-probes-20261010/<root>-ktlsp-indexed-2/artifacts/`
+contains `corpus-results.json` and raw `corpus-requests.jsonl`. These file counts
+are the server's actual entire-root index reports, not claims that every indexed
+file belongs to the correct compilation source set. Spring's missing-source count
+changes from 27 to 25 and Gradle's from 145 to 146 between series, reflecting
+external input availability; retain each run's counts rather than attributing
+that change to the unchanged binary.
+
+The independent filtered IntelliJ series uses official plugin revision
+`9cfad18005470e4187090013e08f92ec9e437219` and ILS-263.6379.0. Successful Gradle
+import precedes every measured root. It matches 17/21 measured checks; Gradle's
+three checks remain unmeasured after import failure.
+
+| Root | Selected checks matching the same assertions | Limitation |
+| --- | --- | --- |
+| Moshi | 3/3 | Exact project-owned Java declarations selected |
+| Retrofit | 6/6 | Confirms facade, JVM-name nullable overload and method rather than local/field `body` |
+| Spring | 4/4 | Confirms generic chain and Java `ResolvableType` overload |
+| OkHttp | 1/4 | Filtered `newCall` completion now matches. `enqueue` completion is an empty complete list and definition is empty; `newCall` navigates to one compiled `OkHttpClient.class` declaration rather than the configured source target. This requires importer/source-attachment investigation |
+| CEM | 3/4 | Both exact dependency definitions and `getOrThrow` completion match. Getter completion has synthetic property `breakSpeed`, with `isIncomplete: true`; the configured method-name assertion fails. This does not establish that later completion pages lack that method |
+| Gradle | Unmeasured | The importer still runs JDK 22 although the temporary launch sets JDK 17 in `JAVA_HOME`, `PATH`, `defaultSdk`, and a task-local `GRADLE_USER_HOME/gradle.properties` with `org.gradle.java.home`. The build's JDK-17 guard fails; no source/build guard was changed or ignored |
+
+Evidence: `<root>-intellij-filtered-2/artifacts/` in the same external directory.
+All source hashes and tracked status controls pass in both series. The earlier
+identifier-start results remain separate. IDEA's getter-property representation
+and compiled-class navigation need explicit compiler-backed controls; the exact
+matcher has not been relaxed to turn them into source matches. Raw editor logs
+are private; inspection copies redact application credential values and retain
+source/copy hashes and replacement counts. The harness removes credential-named
+variables from its own process before invoking the official plugin, preserving
+the required toolchain environment.
+
+A focused fourth-release Moshi rerun, SHA-256
+`8b9166c05d7769e8a3cecbfe18dcfad89acc7a0bf9fb96d51b925b08981a8c0c`,
+changes `Factory` to the correct project and dependency declarations instead of
+the seven unrelated targets. Both definition checks still fail because each
+returns the extra Moshi 1.12.0 target; completion matches, with four missing source
+inputs retained as a coverage failure. Evidence:
+`moshi-1.15.2-ktlsp-indexed-fourth-1/artifacts/`. Module/version visibility and
+project-versus-binary identity remain required shared-layer work.
 
 ### Compiler-plugin inventory and pending editing cases
 
@@ -409,11 +473,39 @@ particular, completion must not advertise `new Foo()` merely because no-arg is
 enabled. Separate disposable fixtures are required for transformations absent
 from the selected real roots.
 
-The proposed incomplete-code slice preserves a compiled disk golden, applies
-buffer-only edits, then checks useful expected members and excluded unrelated
-members for Java and Kotlin: a partial member, a dangling dot, a syntax error in
-an unrelated peer and an unknown receiver alongside a known typed receiver.
-Outgoing `didChange` versions and first responses after a delivery barrier must
-be recorded, then buffers restored and source hashes checked. These cases are
-pending; their RPC correctness phase must remain separate from later actual
-Neovim popup-display measurements.
+### Unsaved incomplete-code fixture control
+
+[mixed-incomplete.json](../dev/corpus/mixed-incomplete.json) uses the existing
+`mixed_project.lua` golden and the same `corpus` route. Ten buffer-edit cases cover
+Java and Kotlin partial members, dangling dots, an unrelated broken peer, and
+known/unknown receivers. Each negative unknown receiver also queries a useful
+known receiver in the same edited state and excludes wrong typed members. This
+makes twelve completion requests, with no acceptance retries. An LSP null negative
+response is valid; a timeout or protocol error is not.
+
+The golden compiles in an external copy with Maven 3.10.0, Kotlin 2.0.21 and JDK 21
+using cached dependencies. Evidence is
+`ktlsp-corpus-probes-20261010/incomplete-compiler-original/maven-cached.log`.
+An initial offline attempt selected the wrong isolated Maven repository and
+failed to resolve the compiler plugin; `maven.log` retains that setup failure.
+Neither compiler invocation saves editor buffers or modifies the golden project.
+
+The fourth ktlsp release and ILS-263.6379.0 each pass 72/72 checks, comprising ten
+edit/restore cycles, twelve first-response completion requests and the associated
+delivery, exclusion and disk controls. Both runs record twenty outbound `didChange`
+versions and twenty matching barriers. Evidence is
+`incomplete-ktlsp-2/artifacts/` and `incomplete-intellij-2/artifacts/` under the same
+external directory as the real-root probes. The IntelliJ control requires actual
+Maven import success. The initial ktlsp run's four negative assertions incorrectly
+treated valid LSP null responses as unavailable; its raw `incomplete-ktlsp-1`
+artifact is retained and is not a fabricated-member product failure.
+
+The transport barrier is Neovim's existing all-buffer change flush, followed by
+outbound version checks and one response per query. Buffers are restored after
+each case, with unchanged disk hashes and clean-buffer assertions. The ktlsp
+fixture reports one background-indexed Kotlin file; the two Java/Kotlin query
+buffers are attached explicitly. This does not prove complete Maven source-root
+discovery. These small fixture results do not establish incomplete-code acceptance
+on the six real roots, normal debounce freshness, or popup-display latency.
+The same optional manifest fields will next exercise actual Moshi Kotlin, OkHttp
+Java and the other full roots without saving their source files.

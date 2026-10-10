@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "project_id": "cem-working-copy",
+  "revision": "09073e3d71c9f62a48009f3c3698bb6e159a0636 (source snapshot includes existing user edits)",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "getBreakSpeed",
+      "target_file": "../source-oracles/com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.java",
+      "target_anchor": "protected float getBreakSpeed()",
+      "target_token": "getBreakSpeed",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "target_uri_suffix": "com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.java",
+      "target_sha256": "9079393254407c0be252419437db145de78cab19b53548f80be4b12d56ceabb3",
+      "compiler_status": "CEM source snapshot classes --offline passed JDK21/Kotlin2.4",
+      "expected": "Kotlin super.getBreakSpeed resolves inherited protected Java method through DrillBlockEntity, with useful completion.",
+      "module": ":",
+      "id": "cem-java-super-member",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "anchor": "return super.getBreakSpeed()"
+    },
+    {
+      "token": "getOrThrow",
+      "target_file": "../source-oracles/net/minecraft/core/HolderGetter.java",
+      "target_anchor": "default Holder.Reference<T> getOrThrow(ResourceKey<T> resourceKey)",
+      "target_token": "getOrThrow",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "target_uri_suffix": "net/minecraft/core/HolderGetter.java",
+      "target_sha256": "6c31e824922037ae29b845a7ca64ad3c297f10bd24de307032128be245b60920",
+      "compiler_status": "CEM source snapshot classes --offline passed JDK21/Kotlin2.4",
+      "expected": "Generic holderLookup extension chain resolves ResourceKey overload returning Holder.Reference<Enchantment>, not TagKey overload; no Mixin-dependent statement is queried.",
+      "module": ":",
+      "id": "cem-java-generic-holder",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "anchor": "holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)"
+    }
+  ]
+}

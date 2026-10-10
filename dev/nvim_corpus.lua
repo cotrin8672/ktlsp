@@ -28,9 +28,8 @@ local function full_path(path)
   if not path:match('^[/\\]') and not path:match('^%a:[/\\]') then path = project .. '/' .. path end
   return vim.fs.abspath(path)
 end
--- A target is read as oracle data, not opened/indexed merely to make a result available.
-for _, case in ipairs(manifest.probes) do
-  local path = full_path(assert(case.source, 'probe needs source'))
+local function source_file(path)
+  path = full_path(path)
   if not sources[path] then
     local disk = vim.fn.readfile(path)
     local buf = vim.fn.bufadd(path)
@@ -38,23 +37,57 @@ for _, case in ipairs(manifest.probes) do
     vim.bo[buf].filetype = path:match('%.java$') and 'java' or 'kotlin'
     sources[path] = { buf = buf, disk = disk, sha256 = vim.fn.sha256(table.concat(disk, '\n')) }
   end
-  local source = sources[path]
+  return path, sources[path]
+end
+local function replace_once(lines, anchor, replacement)
+  local text = table.concat(lines, '\n')
+  local first, last = text:find(anchor, 1, true)
+  assert(first and not text:find(anchor, first + 1, true), 'edit anchor must be unique: ' .. anchor)
+  return vim.split(text:sub(1, first - 1) .. replacement .. text:sub(last + 1), '\n', { plain = true })
+end
+local function positions(lines, case)
+  local position = probe.find(lines, assert(case.anchor), assert(case.token))
+  local prefix = case.completion_prefix or case.token
+  assert(case.token:sub(1, #prefix) == prefix, 'completion prefix must match token: ' .. case.id)
+  return position, { line = position.line, character = position.character + vim.str_utfindex(prefix, 'utf-16') }
+end
+-- A target is read as oracle data, not opened/indexed merely to make a result available.
+for _, case in ipairs(manifest.probes) do
+  assert(case.completion_token ~= false or case.known_control,
+    'negative-only completion needs a same-phase known receiver: ' .. case.id)
+  local path, source = source_file(assert(case.source, 'probe needs source'))
+  local edits = {}
+  for _, edit in ipairs(case.buffer_edits or {}) do
+    local edit_path, original = source_file(edit.source or case.source)
+    assert(not edit.source_sha256 or edit.source_sha256 == original.sha256,
+      'edited peer changed since oracle: ' .. case.id)
+    edits[edit_path] = replace_once(edits[edit_path] or original.disk,
+      assert(edit.anchor), assert(edit.replacement))
+  end
   assert(not case.source_sha256 or case.source_sha256 == source.sha256, 'source changed since oracle: ' .. case.id)
-  local position = probe.find(source.disk, assert(case.anchor), assert(case.token))
-  local completion_prefix = case.completion_prefix or case.token
-  assert(case.token:sub(1, #completion_prefix) == completion_prefix, 'completion prefix must match token: ' .. case.id)
-  local completion_position = { line = position.line,
-    character = position.character + vim.str_utfindex(completion_prefix, 'utf-16') }
-  local target = full_path(assert(case.target_file or case.target, 'probe needs target'))
-  local target_lines = vim.fn.readfile(target)
-  assert(not case.target_sha256 or case.target_sha256 == vim.fn.sha256(table.concat(target_lines, '\n')),
-    'target changed since oracle: ' .. case.id)
-  local _, expected_range = probe.find(target_lines, assert(case.target_anchor),
-    case.target_token or case.token)
-  local expected = probe.location_key(vim.uri_from_fname(target), expected_range)
-  prepared[#prepared + 1] = { case = case, buf = source.buf, position = position,
-    completion_position = completion_position,
+  local position, completion_position = positions(edits[path] or source.disk, case)
+  local target, expected_range, expected
+  if case.definition ~= false then
+    target = full_path(assert(case.target_file or case.target, 'probe needs target'))
+    local target_lines = vim.fn.readfile(target)
+    assert(not case.target_sha256 or case.target_sha256 == vim.fn.sha256(table.concat(target_lines, '\n')),
+      'target changed since oracle: ' .. case.id)
+    local _, selection = probe.find(target_lines, assert(case.target_anchor), case.target_token or case.token)
+    expected_range = selection
+    expected = probe.location_key(vim.uri_from_fname(target), expected_range)
+  end
+  local prep = { case = case, buf = source.buf, position = position,
+    completion_position = completion_position, edits = edits, has_edits = next(edits) ~= nil,
     expected = expected, range = expected_range, target = target }
+  if case.known_control then
+    assert(case.known_control.completion_token ~= false and case.known_control.completion ~= false,
+      'known receiver control must require a useful completion: ' .. case.id)
+    local control = vim.tbl_extend('force', case.known_control, { id = case.id .. ':known-control' })
+    local control_position, control_completion = positions(edits[path] or source.disk, control)
+    prep.known_control = { case = control, buf = source.buf, position = control_position,
+      completion_position = control_completion, has_edits = prep.has_edits }
+  end
+  prepared[#prepared + 1] = prep
 end
 
 local function git_snapshot()
@@ -88,6 +121,8 @@ end
 vim.api.nvim_set_current_buf(prepared[1].buf)
 local id = vim.lsp.start(config, { bufnr = prepared[1].buf })
 local client, import_state
+local sent_versions, outbound_changes, delivery_records = {}, {}, {}
+local active_case
 local function finish()
   if client then
     client:stop()
@@ -112,6 +147,7 @@ local function finish()
     jdk = vim.env.IJLS_JDK or vim.env.JAVA_HOME, gradle_user_home = vim.env.GRADLE_USER_HOME,
     import_state = import_state, git_before = before_git, git_after = after_git, neovim = vim.version(),
     index_state = index_state, wait_index = wait_index, semantic_phase = semantic_phase,
+    delivery = delivery_records, outbound_changes = outbound_changes,
     query_positions = 'definition at identifier start; completion after completion_prefix or full identifier',
     performance = 'separate startup observation and post-index first response; not timing acceptance' })
   print(#failures == 0 and '\nALL CORPUS CHECKS PASSED' or ('\nFAILED: ' .. table.concat(failures, ', ')))
@@ -147,27 +183,70 @@ if wait_index and mode == 'ktlsp' and (index_state.failed ~= 0 or index_state.mi
   semantic_phase = 'first-response-after-indexing-with-incomplete-inputs'
 end
 
+local rpc_notify = client.rpc.notify
+client.rpc.notify = function(method, params)
+  local sent = rpc_notify(method, params)
+  if sent and method == 'textDocument/didChange' then
+    local document = params.textDocument
+    sent_versions[document.uri] = document.version
+    outbound_changes[#outbound_changes + 1] = { case = active_case, uri = document.uri, version = document.version }
+  end
+  return sent
+end
+local function deliver_edits(prep, restore)
+  local expected = {}
+  active_case = prep.case.id .. (restore and ':restore' or ':edit')
+  for path, lines in pairs(prep.edits) do
+    local source = sources[path]
+    vim.api.nvim_buf_set_lines(source.buf, 0, -1, false, restore and source.disk or lines)
+    expected[vim.uri_from_bufnr(source.buf)] = vim.lsp.util.buf_versions[source.buf]
+    if restore then vim.bo[source.buf].modified = false end
+  end
+  -- Test-side transport barrier; no sleep, index warm-up, or acceptance retry.
+  require('vim.lsp._changetracking').flush(client)
+  local delivered, unchanged = true, true
+  for uri, version in pairs(expected) do delivered = delivered and sent_versions[uri] == version end
+  for path in pairs(prep.edits) do
+    local source = sources[path]
+    unchanged = unchanged and vim.deep_equal(vim.fn.readfile(path), source.disk)
+      and (restore and not vim.bo[source.buf].modified or not restore and vim.bo[source.buf].modified)
+  end
+  delivery_records[#delivery_records + 1] = { case = prep.case.id, restore = restore,
+    expected = expected, outbound = vim.deepcopy(sent_versions), delivered = delivered,
+    barrier = 'vim.lsp._changetracking.flush(client)' }
+  check(prep.case.id .. (restore and ': restored buffers delivered' or ': unsaved edits delivered'), delivered)
+  check(prep.case.id .. (restore and ': disk golden and clean buffers restored' or ': edits remain buffer-only'), unchanged)
+end
+
 local function request(prep, method, accepts)
   local position = method == 'textDocument/completion' and prep.completion_position or prep.position
   local params = { textDocument = { uri = vim.uri_from_bufnr(prep.buf) }, position = position }
   if method == 'textDocument/completion' then params.context = { triggerKind = 1 } end
   local deadline = vim.uv.hrtime() + (tonumber(vim.env.KTLSP_CORPUS_REQUEST_TIMEOUT_MS) or 15000) * 1000000
-  local attempts, result, error, matched, first = 0, nil, nil, false, nil
+  local attempts, result, error, matched, first, response_received = 0, nil, nil, false, nil, false
+  local once = strict_first or prep.has_edits
+  local phase = prep.has_edits and 'first-response-after-unsaved-buffer-delivery' or semantic_phase
+  local sent_before = vim.deepcopy(sent_versions)
   repeat
     attempts = attempts + 1
     local response, err = client:request_sync(method, params, 5000, prep.buf)
     result, error = response and response.result, response and response.err or err
-    matched = result ~= nil and accepts(result)
-    if not first then first = { result = result, error = error, matched = matched } end
-    if not matched and not strict_first then vim.wait(200) end
-  until matched or strict_first or vim.uv.hrtime() >= deadline
+    response_received = response ~= nil and error == nil
+    -- LSP null is a valid negative unknown-receiver response. A timeout/error is not.
+    local negative = method == 'textDocument/completion' and prep.case.completion_token == false
+    matched = response_received and (result ~= nil or negative) and accepts(result)
+    if not first then first = { result = result, error = error, matched = matched,
+      response_received = response_received } end
+    if not matched and not once then vim.wait(200) end
+  until matched or once or vim.uv.hrtime() >= deadline
   vim.fn.writefile({ vim.json.encode({ case = prep.case.id, method = method, params = params,
     attempts = attempts, matched = matched, result = result, error = error, first = first,
-    phase = semantic_phase }) },
+    response_received = response_received,
+    phase = phase, sent_before = sent_before, sent_after = vim.deepcopy(sent_versions) }) },
     artifacts .. '/corpus-requests.jsonl', 'a')
   print(('REQUEST %s %s attempts=%d first_matched=%s matched=%s'):format(
     prep.case.id, method, attempts, tostring(first.matched), tostring(matched)))
-  return matched, result
+  return matched, result, response_received
 end
 
 local function exact_definition(prep, result)
@@ -184,17 +263,39 @@ local function exact_definition(prep, result)
   end
   return probe.location_key(uri, range) == prep.expected
 end
-for _, prep in ipairs(prepared) do
-  if prep.case.completion ~= false then
-    local token = prep.case.completion_token or prep.case.token
-    local matched = request(prep, 'textDocument/completion', function(result)
-      return probe.completion_has(result, token)
-    end)
-    check(prep.case.id .. ': completion offers ' .. token, matched)
-  end
-  local matched, result = request(prep, 'textDocument/definition', function(value)
-    return exact_definition(prep, value)
+local function completion(prep)
+  local token = prep.case.completion_token or prep.case.token
+  local positive = prep.case.completion_token ~= false
+  local matched, result, response_received = request(prep, 'textDocument/completion', function(value)
+    if positive and not probe.completion_has(value, token) then return false end
+    for _, excluded in ipairs(prep.case.completion_excludes or {}) do
+      if probe.completion_has(value, excluded) then return false end
+    end
+    return true
   end)
-  check(prep.case.id .. ': goto exact declaration', matched, matched and nil or vim.inspect(result))
+  if positive then check(prep.case.id .. ': completion offers ' .. token,
+    result ~= nil and probe.completion_has(result, token)) end
+  for _, excluded in ipairs(prep.case.completion_excludes or {}) do
+    check(prep.case.id .. ': completion excludes ' .. excluded,
+      response_received and not probe.completion_has(result, excluded))
+  end
+  if not positive and #(prep.case.completion_excludes or {}) == 0 then
+    check(prep.case.id .. ': completion response available', matched)
+  end
+  return matched
+end
+for _, prep in ipairs(prepared) do
+  if prep.has_edits then deliver_edits(prep, false) end
+  if prep.known_control then
+    check(prep.case.id .. ': same-phase known receiver is useful', completion(prep.known_control))
+  end
+  if prep.case.completion ~= false then completion(prep) end
+  if prep.case.definition ~= false then
+    local matched, result = request(prep, 'textDocument/definition', function(value)
+      return exact_definition(prep, value)
+    end)
+    check(prep.case.id .. ': goto exact declaration', matched, matched and nil or vim.inspect(result))
+  end
+  if prep.has_edits then deliver_edits(prep, true) end
 end
 finish()

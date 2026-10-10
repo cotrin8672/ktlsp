@@ -150,17 +150,38 @@ compiler. See `compile-generated-directsuper.ps1` and
 `compiler-generated-directsuper/{original,switched-valid,switched-invalid}`.
 Mixed original, edited and applied-rename compiler snapshots all exit 0.
 
-An external native-Neovim UI control uses builtin autocompletion and actual
-insert-mode `.` input in both languages. `popupmenu_show` contains the intended
-LSP member and excludes the other receiver's member; keyboard selection expands
-the method snippet to the exact expected buffer line. Source files remain
-unchanged and shutdown succeeds. Evidence is
-`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/completion-ui/probe.json`.
-There is one sample per language in a disposable three-file project, with other
-investigations running; these observations are **not performance acceptance**.
-The popup event measures the editor's menu handoff, not physical screen pixels.
-Next integrate this control into the existing harness and collect repeated real
-project samples, keeping protocol and editor timings separate.
+The `mixed` harness now also runs `dev/nvim_completion_ui.lua` in Neovim's input
+loop. Builtin autocompletion receives actual insert-mode `.` input in both
+languages. `popupmenu_show` must contain the intended LSP member and exclude the
+other receiver's member; keyboard selection must produce the exact expected
+buffer line. Protocol time, input-to-menu handoff and selection-to-text
+verification are recorded separately. Source files remain unchanged, and clean
+shutdown requires acknowledgement, an exit notification and process exit 0.
+
+The full fourth-release mixed run passes its original 36 checks and three
+compiler snapshots, then both languages' UI controls. The independent IntelliJ
+run passes the corresponding 38 RPC controls and three compiler snapshots; its
+final UI-only run also passes both languages. Each final UI control uses two
+cycles per language, four useful first responses and four exact accepted lines.
+Evidence under `C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/` is
+`mixed-ui-integrated/artifacts/`, `mixed-ui-final-control/completion-ui.json`,
+`mixed-ui-intellij/artifacts/` and
+`mixed-ui-intellij-ui4/completion-ui.json`.
+
+Earlier UI setup failures are retained separately: enabling autotrigger after
+an existing disabled handle did not replace Neovim's original options; typing a
+Java semicolon before asynchronous `completionItem/resolve` completed invalidated
+Neovim's pending edit by changedtick. The probe now reenables the handle with the
+requested options and waits for resolve/server-command completion before
+inspecting text. The IntelliJ Kotlin item actually inserts through a server
+command and `workspace/applyEdit`; this path is exercised without changing its
+handler or weakening stale-edit checks.
+
+These are small three-file controls with other investigations running, **not
+performance acceptance**. Cycle 1 is first-after-readiness, cycle 2 is one warm
+repetition per language; neither is a latency distribution. The popup event
+measures the editor's menu handoff, not physical screen pixels. Repeated real-root
+samples and normal editor debounce remain required.
 
 ### Generic and dependency-buffer slice: Rust checkpoint
 

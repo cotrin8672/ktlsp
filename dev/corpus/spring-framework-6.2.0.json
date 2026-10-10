@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "project_id": "spring-framework-6.2.0",
+  "revision": "5024bb72279188f1d0dcfe19e8abdd4bdb9887c8",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "getObject",
+      "target": "spring-beans/src/main/java/org/springframework/beans/factory/ObjectProvider.java",
+      "target_anchor": "default T getObject()",
+      "target_token": "getObject",
+      "expected": "Completion/getObject definition select Java zero-argument ObjectProvider<T>.getObject, with reified extension's T preserved.",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "target_sha256": "730971e9b689acf5753a97250c861e3f9588481d443fb6dc401c05e9b0312174",
+      "compiler_status": "focused spring-beans main compilation passed",
+      "module": ":spring-beans",
+      "id": "spring-reified-provider-chain",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "anchor": "getBeanProvider<T>().getObject()"
+    },
+    {
+      "token": "getBeanProvider",
+      "target": "spring-beans/src/main/java/org/springframework/beans/factory/BeanFactory.java",
+      "target_anchor": "<T> ObjectProvider<T> getBeanProvider(ResolvableType requiredType)",
+      "target_token": "getBeanProvider",
+      "expected": "Overload navigation selects ResolvableType Java overload, not Class<T> overload and not recursive no-arg Kotlin extension.",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "target_sha256": "c0ea789d165c13db71b5eee14b012c712dc763d8acf3e20840c744653d27f486",
+      "compiler_status": "focused spring-beans main compilation passed",
+      "module": ":spring-beans",
+      "id": "spring-provider-overload",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "anchor": "getBeanProvider(ResolvableType.forType("
+    }
+  ]
+}
