@@ -87,12 +87,18 @@ fn collect_diagnostics<'t>(
             .is_definitely_absent()
         {
             let name = node_text(node, src);
+            let message = ancestors
+                .iter()
+                .find(|ancestor| ancestor.kind() == "import")
+                .and_then(|import| child_of_kind(*import, "qualified_identifier"))
+                .map(|path| format!("Unresolved import: {}", node_text(path, src)))
+                .unwrap_or_else(|| format!("Unresolved reference: {name}"));
             missing.push(Diagnostic {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 severity: Severity::Error,
                 code: Some(DiagnosticCode::UnresolvedReference),
-                message: format!("Unresolved reference: {name}"),
+                message,
             });
         }
     }
@@ -140,7 +146,7 @@ fn call_shape_query(
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> Option<CallShapeQuery> {
-    if call.kind() != "call_expression" {
+    if call.kind() != "call_expression" || !facts.compiler_surface_status(None).is_found() {
         return None;
     }
     let (normalized, normalized_ancestors) =
@@ -196,6 +202,12 @@ fn top_level_call_shape_query(
         })
         .collect::<Vec<_>>();
     entries = expand_visible_function_overloads(index, src, file, &symbol, entries, ctx);
+    if entries
+        .iter()
+        .any(|entry| !resolve::declaration_surface_status(index, entry, facts).is_found())
+    {
+        return None;
+    }
     call_shape_from_entries(index, src, call, symbol, entries, ctx)
 }
 

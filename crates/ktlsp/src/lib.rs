@@ -5,6 +5,7 @@
 //! in milliseconds — and a thin LSP layer (`lsp`) that is the only place aware of `tower-lsp`.
 
 pub mod actions;
+pub mod analysis_extensions;
 pub mod artifacts;
 pub mod catalog;
 pub mod classpath;

@@ -171,7 +171,7 @@ fn infer_depth_with<R: ChildInfer>(
                 }
             }
         }
-        "super_expression" => super_receiver_type(index, node, src, ctx),
+        "super_expression" => super_receiver_type(index, node, src, ctx, None),
         "parenthesized_expression" => match node.named_child(0) {
             Some(inner) => child_infer.infer_child(index, inner, src, ctx, depth + 1),
             None => Type::Unknown,
@@ -860,9 +860,16 @@ fn cached_class_receiver_contribution(
 }
 
 /// `super` starts at the enclosing declaration's direct supertypes, never its own overrides.
-/// A written qualifier/outer label must identify an actual direct supertype; unresolved or
-/// multiple unqualified receivers remain unknown rather than choosing an arbitrary declaration.
-fn super_receiver_type(index: &dyn InferenceIndex, node: Node, src: &str, ctx: &FileCtx) -> Type {
+/// A written qualifier/outer label must identify an actual direct supertype. With several direct
+/// supertypes, a selector must identify a unique member provider. Completion passes the real prefix
+/// separately so recovery placeholders never become part of semantic lookup.
+pub fn super_receiver_type(
+    index: &dyn InferenceIndex,
+    node: Node,
+    src: &str,
+    ctx: &FileCtx,
+    member_prefix: Option<&str>,
+) -> Type {
     let label = child_of_kind(node, "identifier").map(|label| node_text(label, src));
     let mut enclosing = node.parent();
     let declaration = loop {
@@ -897,9 +904,27 @@ fn super_receiver_type(index: &dyn InferenceIndex, node: Node, src: &str, ctx: &
     }
     supers.dedup();
     if supers.len() == 1 {
-        supers.pop().unwrap()
+        let receiver = supers.pop().unwrap();
+        if type_head_is_known(index, &receiver) {
+            receiver
+        } else {
+            Type::Unknown
+        }
     } else {
-        Type::Unknown
+        let name = if let Some(prefix) = member_prefix {
+            members::MemberName::Prefix(prefix)
+        } else if let Some(selector) = node
+            .parent()
+            .filter(|parent| parent.kind() == "navigation_expression")
+            .and_then(|navigation| navigation.named_child(1))
+        {
+            members::MemberName::Exact(node_text(selector, src))
+        } else {
+            return Type::Unknown;
+        };
+        // shortcut: abstract/default implementations are not distinguished; keep multiple
+        // providers Unknown until normalized declaration facts carry implementation availability.
+        members::unique_super_receiver(index, supers, name, ctx)
     }
 }
 
@@ -2073,22 +2098,33 @@ fn selected_member_type(
     // Resolve each candidate's type; agree -> that type, disagree -> Unknown (ambiguous, stay silent).
     let mut result: Option<Type> = None;
     for e in group.entries {
+        let definition = crate::symbol::Def {
+            file: e.path.to_string(),
+            start_byte: e.sym.start_byte,
+            end_byte: e.sym.end_byte,
+        };
+        let semantic_entry = index.semantic_entry(&definition);
+        let e = semantic_entry.unwrap_or(e);
         let tr = match member_type_ref(e, want_function) {
             Some(tr) => tr,
             None => return Type::Unknown,
         };
-        let t = resolve_member_type_with_subst(
-            index,
-            recv_ty,
-            e,
-            name,
-            tr,
-            call,
-            src,
-            ctx,
-            depth + 1,
-            child_infer,
-        );
+        let t = if semantic_entry.is_some() {
+            declared_type(index, tr, &FileCtx::new(e.sym.package.clone(), Vec::new()))
+        } else {
+            resolve_member_type_with_subst(
+                index,
+                recv_ty,
+                e,
+                name,
+                tr,
+                call,
+                src,
+                ctx,
+                depth + 1,
+                child_infer,
+            )
+        };
         match &result {
             None => result = Some(t),
             Some(prev) if *prev == t => {}

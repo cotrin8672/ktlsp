@@ -59,6 +59,46 @@ pub fn extract(
     text: &str,
     scope: &TypeScope,
 ) -> Vec<SourceDeclaration> {
+    extract_declarations(index, file, tree, text, scope, true)
+}
+
+/// Declaration annotations may introduce members even with no framework provider registered.
+/// This uses the same accepted identities and annotation parser without normalizing signatures.
+pub fn annotated_type_owners(
+    index: &dyn InferenceIndex,
+    file: &str,
+    tree: &Tree,
+    text: &str,
+    scope: &TypeScope,
+) -> Vec<Def> {
+    let entries = index.entries_for_file(file);
+    let mut owners: Vec<_> = extract_declarations(index, file, tree, text, scope, false)
+        .into_iter()
+        .filter(|declaration| !declaration.annotations.is_empty())
+        .filter_map(|declaration| {
+            if entries.iter().any(|entry| {
+                definition(file, &entry.sym) == declaration.definition
+                    && entry.sym.kind.is_type_like()
+            }) {
+                Some(declaration.definition)
+            } else {
+                declaration.owner
+            }
+        })
+        .collect();
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
+fn extract_declarations(
+    index: &dyn InferenceIndex,
+    file: &str,
+    tree: &Tree,
+    text: &str,
+    scope: &TypeScope,
+    include_members: bool,
+) -> Vec<SourceDeclaration> {
     let java = match tree.root_node().kind() {
         "program" => true,
         "source_file" => false,
@@ -80,8 +120,9 @@ pub fn extract(
             })
             .map(|entry| definition(file, &entry.sym));
         let annotations = annotations(node, text, scope, java);
-        let member = matches!(symbol.kind, SymbolKind::Function | SymbolKind::Property)
-            .then(|| member_facts(index, file, text, symbol, node, scope, java, &annotations));
+        let member = (include_members
+            && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Property))
+        .then(|| member_facts(index, file, text, symbol, node, scope, java, &annotations));
         result.push(SourceDeclaration {
             definition: definition(file, symbol),
             owner,

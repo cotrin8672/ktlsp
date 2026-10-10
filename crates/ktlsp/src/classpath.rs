@@ -28,7 +28,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 3;
+const MODEL_VERSION: u32 = 4;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +51,28 @@ pub struct ResolvedArtifact {
     pub component: ComponentId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompilerLanguage {
+    Java,
+    Kotlin,
+}
+
+/// Configured compiler inputs, not proof that a build produced current class files.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompilerTask {
+    pub task: String,
+    pub language: CompilerLanguage,
+    pub task_type: String,
+    pub arguments: Vec<String>,
+    pub annotation_processor_path: Vec<PathBuf>,
+    pub java_home: Option<PathBuf>,
+    pub options: BTreeMap<String, serde_json::Value>,
+    pub output_roots: Vec<PathBuf>,
+    pub complete: bool,
+    pub problem: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSetClasspath {
     pub name: String,
@@ -61,6 +83,10 @@ pub struct SourceSetClasspath {
     pub artifacts: Vec<ResolvedArtifact>,
     pub unresolved: Vec<String>,
     pub classpath_incomplete: bool,
+    #[serde(default)]
+    pub compiler_tasks: Vec<CompilerTask>,
+    #[serde(default)]
+    pub compiler_metadata_incomplete: bool,
 }
 
 /// One module's resolved compile classpath.
@@ -456,7 +482,7 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
             }
             Some(
                 record @ ("SOURCESET" | "SOURCE" | "OUTPUT" | "PROVIDES" | "SCP" | "ARTIFACT"
-                | "SUNRESOLVED" | "INCOMPLETE"),
+                | "SUNRESOLVED" | "INCOMPLETE" | "COMPILER"),
             ) => {
                 if let (Some(cur), Some(name)) = (current.as_mut(), parts.next()) {
                     let idx = cur
@@ -471,6 +497,28 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
                             cur.source_sets.len() - 1
                         });
                     let source = &mut cur.source_sets[idx];
+                    if record == "COMPILER" {
+                        let compiler = parts
+                            .next()
+                            .and_then(|json| serde_json::from_str::<CompilerTask>(json).ok());
+                        match compiler {
+                            Some(compiler)
+                                if !compiler.task.is_empty() && !compiler.task_type.is_empty() =>
+                            {
+                                source.compiler_metadata_incomplete |= !compiler.complete;
+                                source.compiler_tasks.push(compiler);
+                            }
+                            _ => {
+                                source.compiler_metadata_incomplete = true;
+                                tracing::warn!(
+                                    "invalid compiler configuration for {}:{}",
+                                    cur.module,
+                                    name
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     if record == "INCOMPLETE" {
                         source.classpath_incomplete = true;
                     }
@@ -1119,6 +1167,45 @@ fn coordinate_from_gradle_cache_path(path: &Path) -> Option<Coordinate> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiler_configuration_preserves_task_identity_and_opaque_options() {
+        let compiler = serde_json::json!({
+            "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
+            "arguments": ["-Xplugin=C:\\plugins\\serializer.jar", "-P", "annotation=one\ttwo\n三"],
+            "annotation_processor_path": [], "java_home": null,
+            "options": {"jvmTarget": "17"}, "output_roots": ["/app/classes/kotlin"],
+            "complete": true, "problem": null
+        });
+        let dump = format!(
+            "PROJECT\t:app\t/app\nSOURCESET\tmain\nCOMPILER\tmain\t{compiler}\nEND\t:app\n"
+        );
+        let modules = parse_dump(&dump);
+        let value = serde_json::to_value(&modules[0]).unwrap();
+        assert_eq!(value["source_sets"][0]["compiler_tasks"][0], compiler);
+    }
+
+    #[test]
+    fn compiler_metadata_failure_cannot_erase_source_ownership_or_claim_completeness() {
+        let compiler = serde_json::json!({
+            "task": ":compileKotlin", "language": "kotlin", "task_type": "UnsupportedKotlinCompile",
+            "arguments": [], "annotation_processor_path": [], "java_home": null,
+            "options": {}, "output_roots": [], "complete": false,
+            "problem": "Serialized compiler arguments are unavailable"
+        });
+        let modules = parse_dump(&format!(
+            "PROJECT\t:\t/repo\nSOURCE\tmain\t/repo/src\nCOMPILER\tmain\t{compiler}\n\
+             COMPILER\tmain\t{{malformed\nSCP\tmain\t/repo/api.jar\nEND\t:\n"
+        ));
+        let source = &modules[0].source_sets[0];
+        assert_eq!(source.source_roots, [PathBuf::from("/repo/src")]);
+        assert_eq!(source.entries, [PathBuf::from("/repo/api.jar")]);
+        assert!(source.compiler_metadata_incomplete);
+        assert_eq!(source.compiler_tasks.len(), 1);
+        assert!(!source.compiler_tasks[0].complete);
+        let model = ProjectSnapshot::new(modules);
+        assert!(model.file_origin(Path::new("/repo/src/Use.kt")).is_some());
+    }
+
     use super::*;
     #[test]
     fn parse_single_module() {

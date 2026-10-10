@@ -20,7 +20,8 @@ const MAX_ENTRY_SIZE_HINT: u64 = 64 << 20;
 /// cold-index flamegraphs).
 fn open_archive(jar: &Path) -> anyhow::Result<zip::ZipArchive<io::Cursor<Vec<u8>>>> {
     let bytes = fs::read(jar).with_context(|| format!("open jar {}", jar.display()))?;
-    zip::ZipArchive::new(io::Cursor::new(bytes)).with_context(|| format!("read jar {}", jar.display()))
+    zip::ZipArchive::new(io::Cursor::new(bytes))
+        .with_context(|| format!("read jar {}", jar.display()))
 }
 
 /// Open an archive over bytes shared across shard workers — one allocation feeds every shard's
@@ -29,7 +30,8 @@ pub fn archive_shared(
     bytes: std::sync::Arc<[u8]>,
     jar: &Path,
 ) -> anyhow::Result<zip::ZipArchive<io::Cursor<std::sync::Arc<[u8]>>>> {
-    zip::ZipArchive::new(io::Cursor::new(bytes)).with_context(|| format!("read jar {}", jar.display()))
+    zip::ZipArchive::new(io::Cursor::new(bytes))
+        .with_context(|| format!("read jar {}", jar.display()))
 }
 
 /// Extract every `.kt`/`.java` entry from `jar` into `out_dir`, preserving the in-jar directory
@@ -111,9 +113,9 @@ pub fn visit_sources(
             continue;
         }
         let mut text = String::with_capacity(entry.size().min(MAX_ENTRY_SIZE_HINT) as usize);
-        if entry.read_to_string(&mut text).is_err() {
-            continue;
-        }
+        entry
+            .read_to_string(&mut text)
+            .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
         visit(&path, &text);
         visited += 1;
     }
@@ -158,9 +160,9 @@ pub fn visit_sources_shard(
             continue;
         }
         let mut text = String::with_capacity(entry.size().min(MAX_ENTRY_SIZE_HINT) as usize);
-        if entry.read_to_string(&mut text).is_err() {
-            continue;
-        }
+        entry
+            .read_to_string(&mut text)
+            .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
         visit(&path, &text);
         visited += 1;
     }
@@ -351,7 +353,12 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
 
         let entries: Vec<(String, String)> = (0..7)
-            .map(|i| (format!("demo/F{i}.kt"), format!("package demo\nfun f{i}() {{}}\n")))
+            .map(|i| {
+                (
+                    format!("demo/F{i}.kt"),
+                    format!("package demo\nfun f{i}() {{}}\n"),
+                )
+            })
             .collect();
         let refs: Vec<(&str, &str)> = entries
             .iter()
@@ -372,7 +379,10 @@ mod tests {
         }
         seen.sort();
         let expected: Vec<String> = (0..7).map(|i| format!("F{i}.kt")).collect();
-        assert_eq!(seen, expected, "shards partition the entry set without overlap");
+        assert_eq!(
+            seen, expected,
+            "shards partition the entry set without overlap"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

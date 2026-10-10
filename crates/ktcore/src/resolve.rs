@@ -43,9 +43,14 @@ pub struct CompletenessFacts {
     pub project_package_modules: BTreeMap<String, BTreeSet<String>>,
     pub library_index_complete: bool,
     pub jdk_index_complete: bool,
+    /// No unknown compiler producer may add types or members to this source world.
+    pub compiler_producers_complete: bool,
+    /// Accepted annotations may augment their owner even when authored source is clean.
+    pub member_surfaces_unknown: BTreeSet<Def>,
 }
 
 impl CompletenessFacts {
+    /// Explicit closed-source fixtures/callers also certify compiler-producer coverage.
     pub fn complete() -> Self {
         Self {
             project_scan_complete: true,
@@ -55,6 +60,23 @@ impl CompletenessFacts {
             project_package_modules: BTreeMap::new(),
             library_index_complete: true,
             jdk_index_complete: true,
+            compiler_producers_complete: true,
+            member_surfaces_unknown: BTreeSet::new(),
+        }
+    }
+
+    pub fn compiler_surface_status(&self, owner: Option<&Def>) -> ResolutionStatus<()> {
+        let mut reasons = Vec::new();
+        if !self.compiler_producers_complete {
+            reasons.push(IncompletenessReason::CompilerProducerIncomplete);
+        }
+        if let Some(owner) = owner.filter(|owner| self.member_surfaces_unknown.contains(*owner)) {
+            reasons.push(IncompletenessReason::MemberSurfaceIncomplete(owner.clone()));
+        }
+        if reasons.is_empty() {
+            ResolutionStatus::Found(())
+        } else {
+            ResolutionStatus::Unknown(reasons)
         }
     }
 }
@@ -73,6 +95,8 @@ pub enum IncompletenessReason {
     AmbiguousReceiverTypePackage(String),
     ReceiverTypeNotIndexed(String),
     QueryScopeIncomplete,
+    CompilerProducerIncomplete,
+    MemberSurfaceIncomplete(Def),
 }
 
 pub type ResolutionStatus<T> = Knowledge<T, IncompletenessReason>;
@@ -104,6 +128,13 @@ impl IncompletenessReason {
                 format!("receiver-type-not-indexed:{name}")
             }
             IncompletenessReason::QueryScopeIncomplete => "query-scope-incomplete".to_string(),
+            IncompletenessReason::CompilerProducerIncomplete => {
+                "compiler-producer-incomplete".to_string()
+            }
+            IncompletenessReason::MemberSurfaceIncomplete(definition) => format!(
+                "member-surface-incomplete:{}:{}:{}",
+                definition.file, definition.start_byte, definition.end_byte
+            ),
         }
     }
 }
@@ -196,8 +227,21 @@ pub(crate) fn reference_status_node(
     if is_non_reference_identifier_in(usage, parent, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
     }
+    if let Some(import) = ancestor_of_kind_a(ancestors, "import") {
+        let Some(path) = child_of_kind(import, "qualified_identifier") else {
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
+        };
+        if direct_identifier_parts(path, src).last().map(|part| part.0) != Some(usage) {
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
+        }
+        let path = node_text(path, src);
+        let Some(import) = ctx.imports.iter().find(|import| import.path == path) else {
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
+        };
+        return import_target_status(index, file, import, facts, ctx);
+    }
     if is_declaration_identifier_in(usage, parent)
-        || has_ancestor_kind_a(ancestors, &["import", "package_header"])
+        || has_ancestor_kind_a(ancestors, &["package_header"])
     {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
     }
@@ -386,10 +430,38 @@ fn simple_name_status_a(
     if uk == UseKind::Type && infer::is_intrinsic_type_ref(index, &TypeRef::simple(name), ctx) {
         return ResolutionStatus::Found(());
     }
-    let reasons = visible_package_reasons_with_ctx(file, name, facts, &ctx.package, &ctx.imports);
+    let owner = ancestors.iter().rev().find_map(|ancestor| {
+        if !matches!(ancestor.kind(), "class_declaration" | "object_declaration") {
+            return None;
+        }
+        let name = name_field(*ancestor)?;
+        Some(Def {
+            file: file.into(),
+            start_byte: name.start_byte(),
+            end_byte: name.end_byte(),
+        })
+    });
+    let mut reasons =
+        visible_package_reasons_with_ctx(file, name, facts, &ctx.package, &ctx.imports);
+    if let ResolutionStatus::Unknown(unknown) = facts.compiler_surface_status(owner.as_ref()) {
+        reasons.extend(unknown);
+    }
+    dedup_reasons(&mut reasons);
     if reasons.is_empty() {
-        if imported_external_name_with_ctx(name, &ctx.package, &ctx.imports) {
-            return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+        for import in ctx
+            .imports
+            .iter()
+            .filter(|import| !import.wildcard && import.local_name() == Some(name))
+        {
+            match import_target_status(index, file, import, facts, ctx) {
+                ResolutionStatus::DefinitelyAbsent => {}
+                ResolutionStatus::Unknown(reasons) => return ResolutionStatus::Unknown(reasons),
+                ResolutionStatus::Found(()) => {
+                    return ResolutionStatus::Unknown(vec![
+                        IncompletenessReason::UnknownReceiverType,
+                    ]);
+                }
+            }
         }
         if visible_durable_candidate_with_ctx(index, name, uk, &ctx.package, &ctx.imports) {
             return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
@@ -410,13 +482,6 @@ fn member_name_status_a(
     ctx: &infer::FileCtx,
 ) -> ResolutionStatus<()> {
     let name = node_text(usage, src);
-    if member_exists_in(index, usage, parent, name, src, ctx) {
-        return ResolutionStatus::Found(());
-    }
-    if !index.scope_is_complete() {
-        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
-    }
-
     let Some(nav) = parent else {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
     };
@@ -424,6 +489,26 @@ fn member_name_status_a(
         return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
     };
     let recv_ty = infer::infer(index, recv, src, ctx);
+    member_name_status_for_receiver(index, file, &recv_ty, name, facts, ctx)
+}
+
+/// Shared negative member proof after a language adapter has inferred the receiver. A known
+/// declaration is useful even when the rest of the producer/hierarchy surface remains unknown.
+pub fn member_name_status_for_receiver(
+    index: &dyn InferenceIndex,
+    file: &str,
+    recv_ty: &Type,
+    name: &str,
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> ResolutionStatus<()> {
+    let candidates = members::candidates(index, recv_ty, name, ctx);
+    if !candidates.members.is_empty() || !candidates.extensions.is_empty() {
+        return ResolutionStatus::Found(());
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
+    }
     let Some(root) = recv_ty.name() else {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
     };
@@ -433,7 +518,7 @@ fn member_name_status_a(
         ]);
     };
 
-    let mut reasons = hierarchy_package_reasons(index, &recv_ty, facts);
+    let mut reasons = hierarchy_package_reasons(index, recv_ty, facts);
     reasons.extend(visible_package_reasons_with_ctx(
         file,
         name,
@@ -446,11 +531,26 @@ fn member_name_status_a(
         if receiver_world_is_library_or_jdk(index, root, root_pkg) {
             return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
         }
+        if [("Object", "java.lang"), ("Any", "kotlin")]
+            .iter()
+            .any(|(owner, package)| {
+                index
+                    .members_of(owner)
+                    .iter()
+                    .any(|entry| entry.sym.package == *package && entry.sym.name == name)
+            })
+        {
+            // Implicit JVM roots are not yet part of the typed supertype walk.
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+        }
         if receiver_is_enum_like(index, root, root_pkg) && matches!(name, "name" | "ordinal") {
             return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
         }
         if recv_ty.container().is_none() && package_has_member_named(index, root_pkg, name) {
             return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+        }
+        if !index.scope_is_complete() {
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
         }
         ResolutionStatus::DefinitelyAbsent
     } else {
@@ -539,10 +639,58 @@ fn visible_durable_candidate_with_ctx(
     })
 }
 
-fn imported_external_name_with_ctx(name: &str, current_pkg: &str, imports: &[Import]) -> bool {
-    imports
-        .iter()
-        .any(|imp| !imp.wildcard && imp.local_name() == Some(name) && imp.package() != current_pkg)
+/// Resolve an explicit import's full target before certifying its absence. Import aliases do not
+/// change that target, and imported members require an owner surface we may not have indexed.
+pub fn import_target_status(
+    index: &dyn InferenceIndex,
+    file: &str,
+    import: &Import,
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> ResolutionStatus<()> {
+    if import.wildcard || import.path.is_empty() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
+    }
+    let parts: Vec<String> = import.path.split('.').map(str::to_string).collect();
+    if !resolve_absolute_path(index, &parts, |_| true).is_empty() {
+        return ResolutionStatus::Found(());
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
+    }
+    let package = import.package();
+    let mut reasons = Vec::new();
+    if !facts.project_scan_complete {
+        reasons.push(IncompletenessReason::ProjectPackageIncomplete(
+            package.clone(),
+        ));
+    }
+    if let ResolutionStatus::Unknown(unknown) = facts.compiler_surface_status(None) {
+        reasons.extend(unknown);
+    }
+    package_world_reasons(&package, None, file, &ctx.package, facts, &mut reasons);
+    if !facts.library_index_complete {
+        reasons.push(IncompletenessReason::LibraryPackageIncomplete(package));
+    }
+    if !facts.jdk_index_complete {
+        reasons.push(IncompletenessReason::JdkPackageIncomplete(
+            "java.lang".into(),
+        ));
+    }
+    dedup_reasons(&mut reasons);
+    if !reasons.is_empty() {
+        return ResolutionStatus::Unknown(reasons);
+    }
+    for end in (1..parts.len()).rev() {
+        if !resolve_absolute_path(index, &parts[..end], |_| true).is_empty() {
+            // Source declarations alone do not close compiler-generated nested/member surfaces.
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+        }
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
+    }
+    ResolutionStatus::DefinitelyAbsent
 }
 
 fn hierarchy_package_reasons(
@@ -551,6 +699,9 @@ fn hierarchy_package_reasons(
     facts: &CompletenessFacts,
 ) -> Vec<IncompletenessReason> {
     let mut reasons = Vec::new();
+    if let ResolutionStatus::Unknown(unknown) = facts.compiler_surface_status(None) {
+        reasons.extend(unknown);
+    }
     let root_pkg = receiver.package().unwrap_or_default();
     let _ = infer::walk_supertypes(index, receiver, 32, |current| {
         let Some(name) = current.name() else {
@@ -576,6 +727,15 @@ fn hierarchy_package_reasons(
             return ControlFlow::Continue(());
         }
         for entry in &entries {
+            if entry.tier == crate::index::Tier::Durable {
+                // Source-only dependency ancestors do not close compiler-generated members.
+                reasons.push(IncompletenessReason::MemberSurfaceIncomplete(to_def(entry)));
+            }
+            if let ResolutionStatus::Unknown(unknown) =
+                facts.compiler_surface_status(Some(&to_def(entry)))
+            {
+                reasons.extend(unknown);
+            }
             package_world_reasons(
                 pkg,
                 Some(*entry),
@@ -589,6 +749,49 @@ fn hierarchy_package_reasons(
     });
     dedup_reasons(&mut reasons);
     reasons
+}
+
+/// A callable's absence of further overloads also depends on its selected declaration owner.
+pub fn declaration_surface_status(
+    index: &dyn InferenceIndex,
+    entry: &Entry,
+    facts: &CompletenessFacts,
+) -> ResolutionStatus<()> {
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
+    }
+    if entry.sym.kind.is_type_like() {
+        return facts.compiler_surface_status(Some(&to_def(entry)));
+    }
+    let Some(container) = entry.sym.container.as_deref() else {
+        return facts.compiler_surface_status(None);
+    };
+    let (parent, name) = container
+        .rsplit_once('.')
+        .map_or((None, container), |(parent, name)| (Some(parent), name));
+    let owners: Vec<_> = index
+        .lookup_type(name)
+        .into_iter()
+        .filter(|owner| {
+            owner.sym.package == entry.sym.package && owner.sym.container.as_deref() == parent
+        })
+        .collect();
+    if owners.is_empty() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::ReceiverTypeNotIndexed(
+            container.into(),
+        )]);
+    }
+    for owner in owners {
+        if let ResolutionStatus::Unknown(reasons) =
+            facts.compiler_surface_status(Some(&to_def(owner)))
+        {
+            return ResolutionStatus::Unknown(reasons);
+        }
+    }
+    if !index.scope_is_complete() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
+    }
+    ResolutionStatus::Found(())
 }
 
 fn visible_package_reasons(
@@ -611,6 +814,9 @@ fn visible_package_reasons_with_ctx(
     imports: &[Import],
 ) -> Vec<IncompletenessReason> {
     let mut reasons = Vec::new();
+    if let ResolutionStatus::Unknown(unknown) = facts.compiler_surface_status(None) {
+        reasons.extend(unknown);
+    }
     let mut visible_pkgs = Vec::new();
     push_visible_package(&mut visible_pkgs, current_pkg.to_string());
     for imp in imports {
@@ -852,6 +1058,9 @@ pub fn goto_with_ctx(
     offset: usize,
     ctx: &infer::FileCtx,
 ) -> Vec<Def> {
+    if let Some(binding) = index.semantic_binding_at(file, offset) {
+        return vec![index.semantic_definition(binding.target.definition())];
+    }
     let ident = match identifier_at(tree, offset) {
         Some(n) => n,
         None => return Vec::new(),
@@ -863,6 +1072,41 @@ pub fn goto_with_ctx(
 /// [`goto_with_ctx`] with the identifier node and its ancestor chain (root-first) supplied by
 /// the caller, skipping both the `identifier_at` root descent and per-helper parent lookups.
 pub(crate) fn goto_node_with_ctx(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    ident: Node,
+    ancestors: &[Node],
+    ctx: &infer::FileCtx,
+) -> Vec<Def> {
+    goto_authored_node_with_ctx(index, file, src, ident, ancestors, ctx)
+        .into_iter()
+        .map(|definition| index.semantic_definition(&definition))
+        .collect()
+}
+
+pub fn goto_authored(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Vec<Def> {
+    let Some(ident) = identifier_at(tree, offset) else {
+        return Vec::new();
+    };
+    let ctx = infer::FileCtx::from_tree(tree, src);
+    goto_authored_node_with_ctx(
+        index,
+        file,
+        src,
+        ident,
+        &crate::parser::ancestors_of(ident),
+        &ctx,
+    )
+}
+
+fn goto_authored_node_with_ctx(
     index: &dyn InferenceIndex,
     file: &str,
     src: &str,
@@ -1064,29 +1308,6 @@ fn resolve_member_with_ctx(
     }
 }
 
-fn member_exists_in(
-    index: &dyn InferenceIndex,
-    _selector: Node,
-    parent: Option<Node>,
-    name: &str,
-    src: &str,
-    ctx: &infer::FileCtx,
-) -> bool {
-    if let Some(nav) = parent {
-        if nav.kind() == "navigation_expression" {
-            if let Some(receiver) = nav.named_child(0) {
-                let ty = infer::infer(index, receiver, src, ctx);
-                if ty.name().is_some() {
-                    if member_entries_exist(index, &ty, name, &ctx.imports, &ctx.package) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    index.permits_unique_member_fallback() && index.lookup_by_name(name).len() == 1
-}
-
 /// Normalize whether a Kotlin selector/implicit member is used as a value or as a call's callee.
 /// This is independent of the receiver route (`UseKind::MemberSelector`).
 pub fn member_use(
@@ -1141,24 +1362,6 @@ pub fn member_defs_for_use(
             .select(index, ty, usage, ctx)
             .entries,
     )
-}
-
-fn member_entries_exist(
-    index: &dyn InferenceIndex,
-    ty: &Type,
-    name: &str,
-    imports: &[Import],
-    current_pkg: &str,
-) -> bool {
-    // Existence proves a name, not a call shape. Rejected/unknown arguments must not become an
-    // unresolved-reference error; call diagnostics examine the same candidates separately.
-    let candidates = members::candidates(
-        index,
-        ty,
-        name,
-        &infer::FileCtx::new(current_pkg.to_string(), imports.to_vec()),
-    );
-    !candidates.members.is_empty() || !candidates.extensions.is_empty()
 }
 
 pub(crate) fn generic_receiver_extensions<'a>(

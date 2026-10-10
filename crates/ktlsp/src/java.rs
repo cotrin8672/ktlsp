@@ -689,6 +689,7 @@ pub fn diagnostics_with_options(
 ) -> Vec<crate::diagnostics::Diagnostic> {
     let mut out = Vec::new();
     let ctx = JavaDiagnosticContext::new(tree, src);
+    let inference_ctx = FileCtx::new(ctx.package.clone(), inference_imports(tree, src));
     for import in &ctx.diagnostic_imports {
         if !ctx.name_used_outside_imports(&import.name) {
             out.push(crate::diagnostics::unused_import_diagnostic(
@@ -699,12 +700,26 @@ pub fn diagnostics_with_options(
         }
     }
     if facts.project_scan_complete && durable_indexes_complete(facts) && index.scope_is_complete() {
-        collect_unresolved_imports(index, tree, src, &mut out);
+        collect_unresolved_imports(index, file, tree, src, facts, &inference_ctx, &mut out);
     }
     if facts.project_scan_complete && index.scope_is_complete() {
-        collect_unresolved_references(index, file, src, tree, tree.root_node(), &ctx, &mut out);
+        collect_unresolved_references(
+            index,
+            file,
+            src,
+            tree,
+            tree.root_node(),
+            &ctx,
+            &inference_ctx,
+            facts,
+            &mut out,
+        );
     }
-    if facts.project_scan_complete && include_call_shape && index.scope_is_complete() {
+    if facts.project_scan_complete
+        && include_call_shape
+        && index.scope_is_complete()
+        && facts.compiler_surface_status(None).is_found()
+    {
         collect_call_shape_mismatches(
             index,
             file,
@@ -713,6 +728,7 @@ pub fn diagnostics_with_options(
             tree.root_node(),
             &ctx.package,
             &ctx.imports,
+            facts,
             &mut out,
         );
     }
@@ -721,8 +737,11 @@ pub fn diagnostics_with_options(
 
 fn collect_unresolved_imports(
     index: &dyn InferenceIndex,
+    file: &str,
     tree: &Tree,
     src: &str,
+    facts: &crate::resolve::CompletenessFacts,
+    inference_ctx: &FileCtx,
     out: &mut Vec<crate::diagnostics::Diagnostic>,
 ) {
     let root = tree.root_node();
@@ -747,6 +766,20 @@ fn collect_unresolved_imports(
             continue;
         };
         if import_resolves_to_type(index, &import.package, name) {
+            continue;
+        }
+        let target = crate::parser::Import {
+            path: if import.package.is_empty() {
+                name.into()
+            } else {
+                format!("{}.{name}", import.package)
+            },
+            alias: None,
+            wildcard: false,
+        };
+        if !crate::resolve::import_target_status(index, file, &target, facts, inference_ctx)
+            .is_definitely_absent()
+        {
             continue;
         }
         out.push(crate::diagnostics::Diagnostic {
@@ -780,6 +813,7 @@ fn import_resolves_to_type(index: &dyn InferenceIndex, package: &str, name: &str
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_unresolved_references(
     index: &dyn InferenceIndex,
     file: &str,
@@ -787,19 +821,47 @@ fn collect_unresolved_references(
     tree: &Tree,
     node: Node<'_>,
     ctx: &JavaDiagnosticContext,
+    inference_ctx: &FileCtx,
+    facts: &crate::resolve::CompletenessFacts,
     out: &mut Vec<crate::diagnostics::Diagnostic>,
 ) {
     if node.kind() == "method_invocation" {
         if let Some(name_node) = node.child_by_field_name("name") {
             let name = node_text(name_node, src);
-            if !name.is_empty()
-                && node.child_by_field_name("object").is_none()
-                && !is_java_builtin_type(name)
-                && !ctx.static_imports.may_resolve(name)
-                && !java_synthetic_member_resolves(name, name_node, src)
-                && missing_java_reference_is_project_local_proof(name_node, &ctx.static_imports)
-                && !java_reference_resolves_with_ctx(index, file, src, tree, name_node, ctx)
-            {
+            let absent = if let Some(object) = node.child_by_field_name("object") {
+                !java_synthetic_member_resolves(name, name_node, src)
+                    && receiver_type(index, file, src, tree, object).is_some_and(|receiver| {
+                        crate::resolve::member_name_status_for_receiver(
+                            index,
+                            file,
+                            &receiver,
+                            name,
+                            facts,
+                            inference_ctx,
+                        )
+                        .is_definitely_absent()
+                    })
+            } else {
+                !is_java_builtin_type(name)
+                    && facts.compiler_surface_status(None).is_found()
+                    && !ctx.static_imports.may_resolve(name)
+                    && !java_synthetic_member_resolves(name, name_node, src)
+                    && missing_java_reference_is_project_local_proof(name_node, &ctx.static_imports)
+                    && !java_reference_resolves_with_ctx(index, file, src, tree, name_node, ctx)
+                    && enclosing_type_name(name_node, src).is_some_and(|owner| {
+                        let entries: Vec<_> = index
+                            .lookup_type(&owner)
+                            .into_iter()
+                            .filter(|entry| entry.path.as_ref() == file)
+                            .collect();
+                        !entries.is_empty()
+                            && entries.iter().all(|entry| {
+                                crate::resolve::declaration_surface_status(index, entry, facts)
+                                    .is_found()
+                            })
+                    })
+            };
+            if !name.is_empty() && absent {
                 out.push(crate::diagnostics::Diagnostic {
                     start_byte: name_node.start_byte(),
                     end_byte: name_node.end_byte(),
@@ -812,7 +874,17 @@ fn collect_unresolved_references(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_unresolved_references(index, file, src, tree, child, ctx, out);
+        collect_unresolved_references(
+            index,
+            file,
+            src,
+            tree,
+            child,
+            ctx,
+            inference_ctx,
+            facts,
+            out,
+        );
     }
 }
 
@@ -912,13 +984,16 @@ fn collect_call_shape_mismatches(
     node: Node<'_>,
     package: &str,
     imports: &[Import],
+    facts: &crate::resolve::CompletenessFacts,
     out: &mut Vec<crate::diagnostics::Diagnostic>,
 ) {
     if matches!(
         node.kind(),
         "method_invocation" | "object_creation_expression"
     ) {
-        if let Some(query) = java_call_shape_query(index, file, src, tree, node, package, imports) {
+        if let Some(query) =
+            java_call_shape_query(index, file, src, tree, node, package, imports, facts)
+        {
             out.push(crate::diagnostics::Diagnostic {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
@@ -931,7 +1006,7 @@ fn collect_call_shape_mismatches(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_call_shape_mismatches(index, file, src, tree, child, package, imports, out);
+        collect_call_shape_mismatches(index, file, src, tree, child, package, imports, facts, out);
     }
 }
 
@@ -984,6 +1059,7 @@ fn java_call_shape_query(
     call: Node<'_>,
     package: &str,
     imports: &[Import],
+    facts: &crate::resolve::CompletenessFacts,
 ) -> Option<JavaCallShapeQuery> {
     let name = java_call_name(call)?;
     let symbol = node_text(name, src).to_string();
@@ -993,6 +1069,12 @@ fn java_call_shape_query(
     let entries = java_call_entries_with_imports(
         index, file, src, tree, call, name, &symbol, package, imports,
     );
+    if entries
+        .iter()
+        .any(|entry| !crate::resolve::declaration_surface_status(index, entry, facts).is_found())
+    {
+        return None;
+    }
     call_shape_from_java_entries(index, file, src, tree, call, symbol, entries)
 }
 
@@ -1609,6 +1691,22 @@ pub fn explicit_import_fqn_at(tree: &Tree, src: &str, offset: usize) -> Option<S
 /// local variables/parameters, `this.*`, and cross-file/same-package resolution work; broader
 /// member access and static imports are still best-effort or not yet implemented.
 pub fn goto_definition(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Vec<Def> {
+    if let Some(binding) = index.semantic_binding_at(file, offset) {
+        return vec![index.semantic_definition(binding.target.definition())];
+    }
+    authored_goto_definition(index, file, src, tree, offset)
+        .into_iter()
+        .map(|definition| index.semantic_definition(&definition))
+        .collect()
+}
+
+pub fn authored_goto_definition(
     index: &dyn InferenceIndex,
     file: &str,
     src: &str,
@@ -3351,6 +3449,8 @@ class App {
         );
         let facts = crate::resolve::CompletenessFacts {
             project_scan_complete: true,
+            // This authored-only fixture certifies producers; durable coverage stays unknown.
+            compiler_producers_complete: true,
             ..Default::default()
         };
 

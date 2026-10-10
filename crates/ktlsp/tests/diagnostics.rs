@@ -635,7 +635,10 @@ fn java_plain_missing_call_is_flagged_after_project_index() {
     let mut ws = Workspace::new();
     let src = "package app;\npublic class Main {\n    public void run() { missingCall(); }\n}\n";
     ws.open("Main.java".to_string(), src.to_string());
-    ws.set_project_scan_complete(true);
+    // This authored-only fixture proves its producer surface even while durable indexes load.
+    ws.assume_index_complete_for_tests();
+    ws.set_library_index_complete(false);
+    ws.set_jdk_index_complete(false);
 
     let d = ws.diagnostics("Main.java");
     assert_eq!(

@@ -1,4 +1,8 @@
 import java.util.ArrayDeque
+import groovy.json.JsonOutput
+import org.gradle.api.Task
+import org.gradle.api.Action
+import org.gradle.api.file.FileCollection
 import org.gradle.api.artifacts.component.ComponentIdentifier
 import org.gradle.api.artifacts.component.BuildIdentifier
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
@@ -10,6 +14,7 @@ import org.gradle.api.file.SourceDirectorySet
 import org.gradle.api.provider.Provider
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.process.CommandLineArgumentProvider
 
 class KtlspSourceSet(
     val name: String,
@@ -17,6 +22,86 @@ class KtlspSourceSet(
     val artifacts: Provider<List<String>>,
     val resolutionRoot: Provider<ResolvedComponentResult>,
 )
+
+object KtlspCompilerConfiguration {
+    private fun read(bean: Any, getter: String): Any? {
+        val method = bean.javaClass.methods.firstOrNull { it.name == getter && it.parameterCount == 0 }
+            ?: error("Compiler task does not expose $getter")
+        val value = method.invoke(bean)
+        return if (value is Provider<*>) value.orNull else value
+    }
+
+    fun dump(task: Task, language: String): String {
+        val record = linkedMapOf<String, Any?>(
+            "task" to task.path, "language" to language, "task_type" to task.javaClass.name,
+            "arguments" to emptyList<String>(), "annotation_processor_path" to emptyList<String>(),
+            "java_home" to null, "options" to emptyMap<String, Any?>(),
+            "output_roots" to emptyList<String>(), "complete" to false, "problem" to null,
+        )
+        try {
+            if (task is JavaCompile) {
+                val options = task.options
+                record["arguments"] = options.allCompilerArgs.toList()
+                record["annotation_processor_path"] = options.annotationProcessorPath?.files
+                    ?.map { it.absolutePath } ?: emptyList<String>()
+                record["java_home"] = task.javaCompiler.orNull?.metadata?.installationPath?.asFile?.absolutePath
+                record["options"] = linkedMapOf(
+                    "sourceCompatibility" to task.sourceCompatibility,
+                    "targetCompatibility" to task.targetCompatibility,
+                    "release" to options.release.orNull,
+                    "encoding" to options.encoding,
+                    "fork" to options.isFork,
+                    "forkJavaHome" to options.forkOptions.javaHome?.absolutePath,
+                    "forkExecutable" to options.forkOptions.executable,
+                    "forkJvmArgs" to options.forkOptions.jvmArgs?.toList(),
+                )
+                record["output_roots"] = listOfNotNull(task.destinationDirectory.orNull?.asFile?.absolutePath)
+            } else if (task.javaClass.methods.any { it.name == "getSerializedCompilerArguments" && it.parameterCount == 0 }) {
+                // The public KGP getter keeps plugin options intact; unsupported versions stay unknown.
+                val getter = task.javaClass.methods.firstOrNull {
+                    it.name == "getSerializedCompilerArguments" && it.parameterCount == 0
+                } ?: error("Kotlin task does not expose serialized compiler arguments")
+                val arguments = getter.invoke(task) as? List<*>
+                    ?: error("Kotlin compiler arguments are unavailable")
+                check(arguments.all { it is String }) { "Unsupported Kotlin compiler argument value" }
+                record["arguments"] = arguments.toList()
+                val strings = arguments.filterIsInstance<String>()
+                record["output_roots"] = strings.windowed(2).filter { it[0] == "-d" }.map { it[1] }
+                record["java_home"] = strings.windowed(2).firstOrNull { it[0] == "-jdk-home" }?.get(1)
+            } else {
+                val processors = read(task, "getKaptClasspath") as? FileCollection
+                    ?: error("Annotation processor classpath is unavailable")
+                record["annotation_processor_path"] = processors.files.map { it.absolutePath }
+                val plugins = read(task, "getKaptPluginOptions") as? List<*>
+                    ?: error("KAPT plugin configuration is unavailable")
+                val pluginOptions = plugins.map { plugin ->
+                    read(checkNotNull(plugin), "getAsTaskInputArgs") as? Map<*, *>
+                        ?: error("KAPT plugin options are unavailable")
+                }
+                val optionProviders = read(task, "getAnnotationProcessorOptionProviders") as? List<*>
+                    ?: error("KAPT option providers are unavailable")
+                val providerArguments = optionProviders.flatMap { provider ->
+                    (provider as? CommandLineArgumentProvider)?.asArguments()?.toList()
+                        ?: error("Unsupported KAPT option provider")
+                }
+                record["options"] = linkedMapOf(
+                    "pluginOptions" to pluginOptions,
+                    "javacOptions" to read(task, "getJavacOptions"),
+                    "processors" to read(task, "getAnnotationProcessorFqNames"),
+                    "includeCompileClasspath" to read(task, "getIncludeCompileClasspath"),
+                    "classpath" to (read(task, "getClasspath") as FileCollection).files.map { it.absolutePath },
+                    "providerArguments" to providerArguments,
+                )
+                record["output_roots"] = listOf("getClassesDir", "getDestinationDir", "getKotlinSourcesDestinationDir")
+                    .mapNotNull { (read(task, it) as? org.gradle.api.file.Directory)?.asFile?.absolutePath }
+            }
+            record["complete"] = true
+        } catch (failure: Exception) {
+            record["problem"] = (failure.cause ?: failure).toString()
+        }
+        return JsonOutput.toJson(record)
+    }
+}
 
 object KtlspBuildIdentity {
     fun path(build: BuildIdentifier?, currentRoot: String, includedRoots: Map<String, String>): String {
@@ -34,6 +119,81 @@ object KtlspBuildIdentity {
     }
 }
 
+class KtlspDumpClasspathAction(
+    private val projectPath: String,
+    private val projectDirPath: String,
+    private val currentBuildRoot: String,
+    private val includedBuildRoots: Map<String, String>,
+    private val classpathFiles: FileCollection,
+    private val resolutionRoot: Provider<ResolvedComponentResult>,
+    private val sourceSets: List<KtlspSourceSet>,
+) : Action<Task> {
+    override fun execute(task: Task) {
+        val out = StringBuilder()
+        out.append("PROJECT\t${projectPath}\t${projectDirPath}\n")
+        val projectId = resolutionRoot.get().id as? ProjectComponentIdentifier
+        out.append("BUILD\t${KtlspBuildIdentity.path(projectId?.build, currentBuildRoot, includedBuildRoots)}\n")
+        classpathFiles.files.forEach {
+            out.append("CP\t${it.absolutePath}\n")
+        }
+        sourceSets.forEach { sourceSet ->
+            out.append("SOURCESET\t${sourceSet.name}\n")
+            sourceSet.metadata.get().forEach { out.append(it).append('\n') }
+            sourceSet.artifacts.get().forEach { out.append(it).append('\n') }
+        }
+
+        val pending = ArrayDeque<ResolvedComponentResult>()
+        val visited = mutableSetOf<ComponentIdentifier>()
+        val unresolved = linkedSetOf<String>()
+        pending.add(resolutionRoot.get())
+        while (pending.isNotEmpty()) {
+            val component = pending.removeFirst()
+            if (!visited.add(component.id)) {
+                continue
+            }
+            component.dependencies.forEach { dependency ->
+                when (dependency) {
+                    is ResolvedDependencyResult -> pending.add(dependency.selected)
+                    is UnresolvedDependencyResult -> {
+                        val problem = dependency.failure.message
+                            ?.replace('\n', ' ')
+                            ?.replace('\t', ' ')
+                        unresolved.add(
+                            "UNRESOLVED\t${dependency.attempted}\t${problem}"
+                        )
+                    }
+                }
+            }
+        }
+
+        unresolved.forEach {
+            out.append(it).append('\n')
+        }
+        sourceSets.forEach { sourceSet ->
+            val queue = ArrayDeque<ResolvedComponentResult>()
+            val seen = mutableSetOf<ComponentIdentifier>()
+            val failures = linkedSetOf<String>()
+            queue.add(sourceSet.resolutionRoot.get())
+            while (queue.isNotEmpty()) {
+                val component = queue.removeFirst()
+                if (!seen.add(component.id)) continue
+                component.dependencies.forEach { dependency ->
+                    when (dependency) {
+                        is ResolvedDependencyResult -> queue.add(dependency.selected)
+                        is UnresolvedDependencyResult -> {
+                            val problem = dependency.failure.message?.replace('\n', ' ')?.replace('\t', ' ')
+                            failures.add("SUNRESOLVED\t${sourceSet.name}\t${dependency.attempted}\t${problem}")
+                        }
+                    }
+                }
+            }
+            failures.forEach { out.append(it).append('\n') }
+        }
+        out.append("END\t${projectPath}")
+        System.out.println(out.toString())
+    }
+}
+
 // Dump each module's resolved `compileClasspath` as a machine-readable line protocol, for ktlsp's
 // Kotlin compile-daemon backend to feed the compiler. Run once and cache (the classpath is stable
 // across .kt edits); re-run only when build files change.
@@ -47,6 +207,7 @@ object KtlspBuildIdentity {
 //   SOURCESET\t<name>
 //   SOURCE\t<source set>\t<absolute source root>
 //   OUTPUT\t<source set>\t<absolute output root>
+//   COMPILER\t<source set>\t<JSON task configuration, escaped opaque arguments>
 //   SCP\t<source set>\t<absolute classpath entry> (in compilation order)
 //   ARTIFACT\t<source set>\t<absolute file>\tMODULE\t<group>\t<name>\t<version>
 //   ARTIFACT\t<source set>\t<absolute file>\tPROJECT\t<build path>\t<project path>
@@ -100,6 +261,16 @@ allprojects {
                     kotlinDirectories?.srcDirs?.let(roots::addAll)
                     roots.addAll(sourceSet.output.generatedSourcesDirs.files)
                     val compileJava = tasks.findByName(sourceSet.compileJavaTaskName) as? JavaCompile
+                    // shortcut: these are JVM source-set task names; other compilation models need explicit adapters.
+                    val kotlinTasks = listOf(
+                        sourceSet.getCompileTaskName("kotlin"),
+                        sourceSet.getTaskName("kapt", "Kotlin"),
+                        sourceSet.getTaskName("kaptGenerateStubs", "Kotlin"),
+                        sourceSet.getTaskName("ksp", "Kotlin"),
+                    ).mapNotNull { taskName -> tasks.findByName(taskName) }.distinctBy { it.path }
+                    val compilers = listOfNotNull(
+                        compileJava?.let { KtlspCompilerConfiguration.dump(it, "java") },
+                    ) + kotlinTasks.map { KtlspCompilerConfiguration.dump(it, "kotlin") }
                     compileJava?.options?.generatedSourceOutputDirectory?.orNull?.asFile?.let(roots::add)
                     // KAPT can feed generated Java directly to JavaCompile, outside allJava.
                     compileJava?.source?.visit {
@@ -124,6 +295,7 @@ allprojects {
                     roots.map { "SOURCE\t${sourceSetName}\t${it.absolutePath}" } +
                         outputs.map { "OUTPUT\t${sourceSetName}\t${it.absolutePath}" } +
                         provided.map { "PROVIDES\t${sourceSetName}\t${it.absolutePath}" } +
+                        compilers.map { "COMPILER\t${sourceSetName}\t${it}" } +
                         entries.map { "SCP\t${sourceSetName}\t${it.absolutePath}" } +
                         if (actualClasspath.isFailure) listOf("INCOMPLETE\t${sourceSetName}") else emptyList()
                 }
@@ -152,70 +324,11 @@ allprojects {
         val resolutionRoot = incoming.resolutionResult.rootComponent
 
         tasks.register("ktlspDumpClasspath") {
-            doLast {
-                val out = StringBuilder()
-                out.append("PROJECT\t${projectPath}\t${projectDirPath}\n")
-                val projectId = resolutionRoot.get().id as? ProjectComponentIdentifier
-                out.append("BUILD\t${KtlspBuildIdentity.path(projectId?.build, currentBuildRoot, includedBuildRoots)}\n")
-                classpathFiles.files.forEach {
-                    out.append("CP\t${it.absolutePath}\n")
-                }
-                sourceSets.forEach { sourceSet ->
-                    out.append("SOURCESET\t${sourceSet.name}\n")
-                    sourceSet.metadata.get().forEach { out.append(it).append('\n') }
-                    sourceSet.artifacts.get().forEach { out.append(it).append('\n') }
-                }
-
-                val pending = ArrayDeque<ResolvedComponentResult>()
-                val visited = mutableSetOf<ComponentIdentifier>()
-                val unresolved = linkedSetOf<String>()
-                pending.add(resolutionRoot.get())
-                while (pending.isNotEmpty()) {
-                    val component = pending.removeFirst()
-                    if (!visited.add(component.id)) {
-                        continue
-                    }
-                    component.dependencies.forEach { dependency ->
-                        when (dependency) {
-                            is ResolvedDependencyResult -> pending.add(dependency.selected)
-                            is UnresolvedDependencyResult -> {
-                                val problem = dependency.failure.message
-                                    ?.replace('\n', ' ')
-                                    ?.replace('\t', ' ')
-                                unresolved.add(
-                                    "UNRESOLVED\t${dependency.attempted}\t${problem}"
-                                )
-                            }
-                        }
-                    }
-                }
-
-                unresolved.forEach {
-                    out.append(it).append('\n')
-                }
-                sourceSets.forEach { sourceSet ->
-                    val queue = ArrayDeque<ResolvedComponentResult>()
-                    val seen = mutableSetOf<ComponentIdentifier>()
-                    val failures = linkedSetOf<String>()
-                    queue.add(sourceSet.resolutionRoot.get())
-                    while (queue.isNotEmpty()) {
-                        val component = queue.removeFirst()
-                        if (!seen.add(component.id)) continue
-                        component.dependencies.forEach { dependency ->
-                            when (dependency) {
-                                is ResolvedDependencyResult -> queue.add(dependency.selected)
-                                is UnresolvedDependencyResult -> {
-                                    val problem = dependency.failure.message?.replace('\n', ' ')?.replace('\t', ' ')
-                                    failures.add("SUNRESOLVED\t${sourceSet.name}\t${dependency.attempted}\t${problem}")
-                                }
-                            }
-                        }
-                    }
-                    failures.forEach { out.append(it).append('\n') }
-                }
-                out.append("END\t${projectPath}")
-                println(out.toString())
-            }
+            // Gradle 7 serializes enclosing Kotlin DSL closures, including their Project receiver.
+            doLast(KtlspDumpClasspathAction(
+                projectPath, projectDirPath, currentBuildRoot, includedBuildRoots,
+                classpathFiles, resolutionRoot, sourceSets,
+            ))
         }
     }
 }

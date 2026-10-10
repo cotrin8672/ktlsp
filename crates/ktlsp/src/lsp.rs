@@ -76,9 +76,16 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(client: Client) -> Self {
+        Self::with_analysis_providers(client, Vec::new())
+    }
+
+    pub fn with_analysis_providers(
+        client: Client,
+        providers: Vec<Arc<dyn crate::analysis_extensions::AnalysisProvider>>,
+    ) -> Self {
         Backend {
             client,
-            ws: Arc::new(Mutex::new(Workspace::new())),
+            ws: Arc::new(Mutex::new(Workspace::with_analysis_providers(providers))),
             root: Mutex::new(None),
             gradle_project: Mutex::new(false),
             snippets_supported: Mutex::new(false),
@@ -96,7 +103,14 @@ impl Backend {
             return;
         };
         let mut state = self.refresh.lock();
-        state.requested = self.ws.lock().begin_analysis_generation();
+        let changed = {
+            let mut ws = self.ws.lock();
+            state.requested = ws.begin_analysis_generation();
+            ws.take_extension_diagnostic_changes()
+        };
+        for key in changed {
+            self.schedule_one_diagnostic(key);
+        }
         state.force |= force;
         if state.running {
             return;
@@ -146,6 +160,16 @@ impl Backend {
     /// Bump `key`'s version and schedule a debounced diagnostics recompute. Off the request path; the
     /// task discards itself if a newer edit lands during the debounce window.
     fn schedule_diagnostics(&self, key: String) {
+        let mut keys = self.ws.lock().take_extension_diagnostic_changes();
+        keys.push(key);
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            self.schedule_one_diagnostic(key);
+        }
+    }
+
+    fn schedule_one_diagnostic(&self, key: String) {
         let version = {
             let mut versions = self.doc_versions.lock();
             let n = versions.entry(key.clone()).or_insert(0);
@@ -332,7 +356,8 @@ fn spawn_jdk_shard_workers(
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
                     deps::parse_jdk_shard(&plan, shard, shards, &mut kotlin, &mut java)
-                }));
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("JDK index worker panicked")));
                 let result = match resolved {
                     Ok(batches) => DependencyResult {
                         coord: None,
@@ -345,17 +370,20 @@ fn spawn_jdk_shard_workers(
                         jdk: true,
                         local_jar: false,
                     },
-                    Err(_) => DependencyResult {
-                        coord: None,
-                        label: format!("JDK sources (shard {shard}/{shards})"),
-                        batches: Vec::new(),
-                        discovered: Vec::new(),
-                        failed: true,
-                        skipped: false,
-                        missing_source: false,
-                        jdk: true,
-                        local_jar: false,
-                    },
+                    Err(error) => {
+                        tracing::warn!(%error, shard, "JDK source indexing failed");
+                        DependencyResult {
+                            coord: None,
+                            label: format!("JDK sources (shard {shard}/{shards})"),
+                            batches: Vec::new(),
+                            discovered: Vec::new(),
+                            failed: true,
+                            skipped: false,
+                            missing_source: false,
+                            jdk: true,
+                            local_jar: false,
+                        }
+                    }
                 };
                 let _ = tx.send(result);
             })
@@ -503,9 +531,9 @@ fn spawn_coordinate_index_worker(
                 Ok((batches, discovered, skipped, missing_source)) => DependencyResult {
                     coord: Some(coord),
                     label,
+                    failed: !skipped && !missing_source && batches.is_empty(),
                     batches,
                     discovered,
-                    failed: false,
                     skipped,
                     missing_source,
                     jdk: false,
@@ -696,7 +724,7 @@ fn index_dependencies(
                             continue;
                         }
                         for file in files {
-                            guard.index.remove_file(&file.path);
+                            guard.remove_dependency_file(&file.path);
                             stats.files = stats.files.saturating_sub(1);
                             stats.symbols = stats.symbols.saturating_sub(file.symbols);
                         }
@@ -742,7 +770,7 @@ fn index_dependencies(
             // single-thread flow, which only returned at the very end.
             jdk_shards_pending = jdk_shards_pending.saturating_sub(1);
             if result.failed {
-                tracing::warn!("indexing panicked for {}; skipping", result.label);
+                tracing::warn!("indexing failed for {}; skipping", result.label);
                 stats.failed += 1;
                 jdk_shard_failed = true;
             } else {
@@ -778,9 +806,9 @@ fn index_dependencies(
 
         if result.failed {
             if result.jdk {
-                tracing::warn!("indexing JDK sources panicked; skipping");
+                tracing::warn!("indexing JDK sources failed; skipping");
             } else {
-                tracing::warn!("indexing panicked for {}; skipping", result.label);
+                tracing::warn!("indexing failed for {}; skipping", result.label);
             }
             stats.failed += 1;
             continue;
@@ -1125,7 +1153,14 @@ async fn index_workspace(
     }
     // Open buffers may have received conservative diagnostics before dependency/JDK indexing
     // completed. Republish them now that the library completeness facts and durable symbols are in.
-    let open_keys = { ws.lock().open_doc_keys() };
+    let open_keys = {
+        let mut guard = ws.lock();
+        let mut keys = guard.open_doc_keys();
+        keys.extend(guard.take_extension_diagnostic_changes());
+        keys.sort();
+        keys.dedup();
+        keys
+    };
     for key in open_keys {
         if !ws.lock().is_current_generation(generation) {
             if let Some(p) = ongoing {
@@ -1483,6 +1518,30 @@ fn kotlin_import_fqn_for_identifier(text: &str, offset: usize) -> Option<String>
         .map(|import| import.path)
 }
 
+fn configure_analysis_providers(ws: &mut Workspace, options: &Option<serde_json::Value>) {
+    let Some(providers) = options
+        .as_ref()
+        .and_then(|options| options.get("analysisProviders"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    for (id, settings) in providers {
+        let Some(settings) = settings.as_object() else {
+            continue;
+        };
+        let enabled = settings
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let configuration = settings
+            .get("configuration")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        ws.configure_analysis_provider(id, enabled, Arc::from(configuration.to_string()));
+    }
+}
+
 fn diagnostic_scope_from(opts: &Option<serde_json::Value>) -> DiagnosticScope {
     match opts
         .as_ref()
@@ -1584,6 +1643,7 @@ impl LanguageServer for Backend {
         }
 
         *self.diagnostic_scope.lock() = diagnostic_scope_from(&params.initialization_options);
+        configure_analysis_providers(&mut self.ws.lock(), &params.initialization_options);
         let formatter = formatter_from(&params.initialization_options);
         *self.formatter.lock() = formatter.clone();
 
@@ -1709,6 +1769,7 @@ impl LanguageServer for Backend {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             self.ws.lock().close(&key);
             self.doc_versions.lock().remove(&key);
+            self.schedule_diagnostics(key.clone());
             publish_diagnostics(&self.ws, &self.client, &key).await;
         }
     }
@@ -1750,11 +1811,22 @@ impl LanguageServer for Backend {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         let options = Some(params.settings);
+        configure_analysis_providers(&mut self.ws.lock(), &options);
+        let changed = self.ws.lock().take_extension_diagnostic_changes();
+        for key in changed {
+            self.schedule_one_diagnostic(key);
+        }
         *self.diagnostic_scope.lock() = diagnostic_scope_from(&options);
         if let Some(formatter) = formatter_from(&options) {
             *self.formatter.lock() = Some(formatter);
         }
-        if *self.gradle_project.lock() {
+        let provider_only = options
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|settings| {
+                settings.len() == 1 && settings.contains_key("analysisProviders")
+            });
+        if *self.gradle_project.lock() && !provider_only {
             self.schedule_project_refresh(true, PROJECT_REFRESH_DEBOUNCE);
         }
     }
@@ -1838,7 +1910,8 @@ impl LanguageServer for Backend {
                 Some(t) => t,
                 None => return Ok(None),
             };
-            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let line_index = LineIndex::new(&text);
+            let offset = line_index.offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
             let defs = ws.goto_definition(&key, offset);
             let locs = defs
@@ -2768,7 +2841,8 @@ impl LanguageServer for Backend {
                 Some(t) => t,
                 None => return Ok(None),
             };
-            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let line_index = LineIndex::new(&text);
+            let offset = line_index.offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
             let semantic = ws.completion_query(&key, offset).map(|query| {
                 (
@@ -2783,7 +2857,7 @@ impl LanguageServer for Backend {
                     let items = shaped
                         .items
                         .into_iter()
-                        .map(to_completion_item)
+                        .map(|item| to_completion_item(item, &line_index, &text))
                         .collect::<Vec<_>>();
                     (items, incomplete, symbol, semantic)
                 }
@@ -3392,7 +3466,7 @@ fn to_lsp_inlay_hint(
 /// through the shaped `sortText`/`filterText`/`insertText`/`insertTextFormat`/`detail` and the
 /// auto-import `additionalTextEdits` (a zero-width insert of one `import` line at column 0). This is
 /// the only `ls-types`-aware completion code.
-fn to_completion_item(it: ShapedItem) -> CompletionItem {
+fn to_completion_item(it: ShapedItem, line_index: &LineIndex, text: &str) -> CompletionItem {
     let kind = if it.is_keyword {
         CompletionItemKind::KEYWORD
     } else {
@@ -3411,6 +3485,14 @@ fn to_completion_item(it: ShapedItem) -> CompletionItem {
         }
     };
     CompletionItem {
+        text_edit: it.replace_range.map(|range| {
+            let (sl, sc) = line_index.position(text, range.start);
+            let (el, ec) = line_index.position(text, range.end);
+            CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
+                new_text: it.insert_text.clone(),
+            })
+        }),
         label: it.label,
         kind: Some(kind),
         sort_text: Some(it.sort_text),
@@ -3583,6 +3665,40 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn unreadable_jdk_shard_reports_failure_without_partial_batches() {
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_bad_jdk_sources_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let jar = root.join("src.zip");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        for (name, body) in [
+            (
+                "java/lang/Good.java",
+                b"package java.lang; public class Good {}".as_slice(),
+            ),
+            ("java/lang/Bad.java", b"\xff".as_slice()),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(body).unwrap();
+        }
+        archive.finish().unwrap();
+        let Some(crate::deps::JdkIndexPlan::Parse(plan)) =
+            crate::deps::plan_jdk_index(&jar, &root.join("extracted"))
+        else {
+            panic!("new JDK archive must be parsed");
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert_eq!(spawn_jdk_shard_workers(plan, 1, tx), 1);
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(result.failed);
+        assert!(result.batches.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unreadable_local_sources_do_not_report_complete_library_indexing() {
         use std::io::Write;
         let root =
@@ -3596,9 +3712,25 @@ mod tests {
             .unwrap();
         archive.write_all(b"").unwrap();
         archive.finish().unwrap();
-        for present in [true, false] {
-            if present {
+        for variant in 0..3 {
+            let present = variant < 2;
+            if variant == 0 {
                 std::fs::write(&sources, b"incomplete build output").unwrap();
+            } else if variant == 1 {
+                let mut archive = zip::ZipWriter::new(std::fs::File::create(&sources).unwrap());
+                for (name, body) in [
+                    (
+                        "api/Only.java",
+                        b"package api; public class Only {}".as_slice(),
+                    ),
+                    ("api/Unreadable.java", b"\xff".as_slice()),
+                ] {
+                    archive
+                        .start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    archive.write_all(body).unwrap();
+                }
+                archive.finish().unwrap();
             } else {
                 std::fs::remove_file(&sources).unwrap();
             }

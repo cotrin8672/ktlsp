@@ -294,7 +294,11 @@ pub fn member_completion_query(
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
     let ctx = infer::FileCtx::from_tree(tree, src);
-    let ty = infer::infer(index, receiver, src, &ctx);
+    let ty = if receiver.kind() == "super_expression" {
+        infer::super_receiver_type(index, receiver, src, &ctx, Some(&prefix))
+    } else {
+        infer::infer(index, receiver, src, &ctx)
+    };
     member_completion_query_for_type(
         index,
         SourceLanguage::Kotlin,
@@ -640,6 +644,10 @@ struct RecoveredTypeIndex<'a> {
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn contributions_for_file(&self, file: &str) -> &[ktcore::extensions::ContributionSet] {
+        self.index.contributions_for_file(file)
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
         self.index.lookup_by_name(name)
     }

@@ -41,7 +41,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Eighth immutable slice: 875 pass / 3 ignored across 35 suites | Eighth Rust suite verified | Root `rtk proxy cargo test --workspace`, native exit 0 with an isolated cache; `eighth-fixed/cargo-workspace-isolated.{out,verified.json}`. All 93 Rust/build inputs match before/after tests and release compilation |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Ninth immutable slice: 930 pass / 3 ignored across 38 suites | Ninth Rust suite verified; editor rechecks pending | Root `rtk proxy cargo test --workspace --locked --no-fail-fast`, native exit 0 with an isolated cache; `ninth-fixed-2/cargo-workspace-isolated.{out,verified.json}`. All 97 Rust/build inputs match before/after tests and release compilation |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Fifth release passes basic 9, Java 99, features 80, semantic 18, mixed 36 and library 13, plus two native UI samples. Seventh passes Java 165/165, including all original 99 expectations and 66 member/unsaved-edit/rename assertions | Java current slice verified; broader rechecks continue | `ktlsp-semantic-gaps-20261010/member-editor-seventh/artifacts/`. Sixth's eight initial Java failures are repaired by immediate initial scanning; no harness sleep was added. Its legacy forced editor shutdown is not graceful-shutdown proof |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Eighth release reads 5,865 NeoForge source files with 103,029 symbols; generic-holder completion and exact navigation pass. All six incomplete requests pass; superclass completion/navigation and three missing source archives still fail | Partial; real editing repair verified | `eighth-cem-observations.json` and guarded golden/incomplete runs under the corpus evidence root. Full CEM diagnostics, overrides and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -305,6 +305,95 @@ lower the accepted latency distribution. Sampling/profiling runs are separate fr
 timing runs. Initialization timing never substitutes for editor completion timing.
 
 ## Work log
+
+### Parser termination and compiler inputs: ninth Rust checkpoint
+
+The scanner failure has an existing upstream report, [issue #10](https://github.com/tree-sitter-grammars/tree-sitter-kotlin/issues/10),
+and an unmerged fix, [PR #11](https://github.com/tree-sitter-grammars/tree-sitter-kotlin/pull/11).
+The current upstream default and the independent fwcd main revision were also tested;
+neither repairs the exact Source/KSP reductions. The newer fwcd parser also has a
+different AST contract, so its consumer-contract failures are not all grammar bugs.
+Using PR #11's old base directly repairs the inline bodies but regresses the existing
+primary-constructor-newline and context-parameter controls. Keeping our previous
+`10f5277602bc3af132bfe21997b775d0ac0a58bf` base and cherry-picking the original fix
+preserves both. The dependency now pins
+[`42f93dc3e3d73ef07a657fa5fd557e39c65704ee`](https://github.com/cotrin8672/tree-sitter-kotlin/commit/42f93dc3e3d73ef07a657fa5fd557e39c65704ee),
+with the original author and commit attribution retained; no Cargo checkout was patched.
+
+The independent engine-0.24.7 causal comparison passes 13/13, including the original
+issue's adjacent-class example. The grammar's existing 27 corpus cases pass before
+and after; its added regression fails before and passes after, giving 28/28 on the
+published shipping source. Tree-sitter CLI 0.27.0 corpus checks are recorded separately
+from the actual Rust engine checks. Product tests repair five previously failing
+Source/KSP cases and now pass all six, covering Java/Kotlin completion, exact navigation
+and unsaved replacement/removal. Another 86 inference/member/generic checks pass.
+The external 92-test run has unchanged hashes for all 96 then-current product inputs.
+Evidence is under `ktlsp-semantic-gaps-20261010/{grammar-comparisons,grammar-corpus-pr11,grammar-integration-pr11}/`.
+Root's direct locked-dependency six-test result is
+`ktlsp-goal-20261010/compiler-metadata/parser-shipping-2.{out,json}`.
+Bodyless annotation declarations remain a separate parser gap. The library symbol
+cache and ktcheck durable cache versions were bumped to discard old parsed facts.
+
+Unreadable UTF-8 entries previously allowed a source archive containing one good and
+one bad file to publish and cache a partial success. Source-archive and JDK-shard reads
+now return an error atomically; failed worker batches do not publish partial facts or
+write a success cache. The three focused cold/warm/repair and worker checks pass after
+their baseline failures, under `ktlsp-goal-20261010/local-source-pair/partial-source-*`.
+This is read-error coverage; parser recovery, source-count limits and directory-read
+completeness have not been proved by those checks.
+
+Gradle model v4 captures configured Java/Kotlin compiler task identities, serialized
+arguments, annotation-processor paths, available toolchain information, options and
+output directories. Arguments use JSON escaping, including tabs, newlines and Unicode.
+Unsupported task adapters remain explicitly incomplete and retain known source ownership.
+This is compiler configuration, not evidence that producers are closed or class files
+match the current source. JVM task-name discovery is a bounded adapter; other compilation
+models and processor paths encoded inside opaque options remain unknown.
+The classpath unit suite passes 21 tests. Actual Gradle 7.4.2/Kotlin 1.8.21 KAPT/KSP
+exports 16 task records, and Gradle 8.10.2/Kotlin 1.9.23 compiler plugins export four.
+Both pass strict configuration-cache checks and reuse; 38 and 21 source/build/class
+inputs respectively remain unchanged. Moving the dump action out of its enclosing
+Project closure also repairs a reproduced pre-existing Gradle 7 configuration-cache
+failure. Evidence is `ktlsp-goal-20261010/compiler-metadata/{old-head-control-1,old-6,modern-2}/`.
+Generated binary APIs and automatic watching of all compiler-only inputs remain pending.
+
+The first complete ninth workspace attempt is deliberately retained as failed:
+631 pass, five fail, two ignored before Cargo stops, native exit 101, with 97 unchanged
+inputs. Its `explain_resolution` failures expose missing accumulated incompleteness
+reasons and fixtures that had not supplied the new compiler-producer proof. Shared
+reason accumulation now preserves compiler, project, library and annotation-owner
+reasons together; known declarations still resolve first. Closed-world test fixtures
+supply the compiler proof before scanning, without erasing the package/source-set facts.
+The focused rerun passes 396 ktlsp tests and 110 core tests with one ignored, including
+all seven original explanation cases and three added controls. A new immutable full
+run is required before a ninth release is accepted. Evidence is
+`ktlsp-goal-20261010/ninth-explain-reasons/`. The earlier
+direct parser attempt failed before tests because a referenced Rust 1.99 toolchain's
+standard library was unavailable; retrying with the installed baseline Rust 1.98.1
+passes. Verification scripts now select that toolchain explicitly.
+
+The second complete run passes 930 tests with three ignored across 38 suites,
+native exit 0 in 30.906 seconds. Release compilation exits 0 in 40.086 seconds;
+all 97 Rust/build inputs match across both runs. The immutable server is
+`ktlsp-goal-20261010/ninth-fixed-2/bin/ktlsp.exe`, SHA-256
+`e4b726b8920be45ec06941c71c1fc5955bc327c393487ad9d3098b738e7e8ad1`.
+The sibling `rust-release-inputs.verified.json` confirms source and binary hashes.
+These are test/build durations, not editing-performance measurements. The next
+checks use the unchanged real-CEM corpus and `KTLSP_PROCESSOR_RELOAD=1` Neovim route;
+their ninth results have not yet been claimed here.
+
+Registered Rust analysis providers now receive normalized accepted source facts
+and publish validated bindings into the shared index. Completion, inferred member
+metadata, navigation, references and applied rename use those relations. Configuration,
+model/source edits, failure, disable and removal invalidate publications; providers
+are registered through the public host constructor, with framework policy outside
+ktlsp. Focused provider/producer/reference/rename checks pass 24 cases, and the full
+suite above includes the host tests. A separate actual-Mixin consumer compiles, but
+its five-feature Neovim lifecycle proof is pending. Paired external Java/Kotlin probes
+also expose a remaining late-ownership bug: a skipped open-buffer dependency batch
+can change scope visibility without scheduling provider normalization. That failure
+is retained under `ktlsp-extension-host-20261011/late-owner-before-paired.txt` for the
+next repair; ordinary CEM runs do not register that consumer.
 
 ### CEM local sources and implicit receivers: eighth checkpoint
 

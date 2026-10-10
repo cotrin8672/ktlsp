@@ -76,7 +76,7 @@ fn infer_expression(ws: &Workspace, file: &str, expression: &str) -> Type {
     let start = source.find(expression).unwrap();
     let node = tree
         .root_node()
-        .descendant_for_byte_range(start, start + expression.len())
+        .named_descendant_for_byte_range(start, start + expression.len())
         .unwrap();
     assert_eq!(&source[node.byte_range()], expression);
     infer::infer(
@@ -330,6 +330,110 @@ fn unsaved_superclass_edit_replaces_receiver_binding() {
                 "getBreakSpeed"
             ),
             vec![expected]
+        );
+    }
+}
+
+fn add_super_interfaces(ws: &mut Workspace) {
+    ws.open("SuperInterfaces.kt", "package probe\ninterface Marker {\n    fun marker(): Float\n}\ninterface ParentMarker : Marker {}\nclass MarkerImpl : Marker {\n    override fun marker(): Float = 3f\n}\n".to_string());
+}
+
+#[test]
+fn kotlin_super_selects_unique_member_provider_with_distinct_interfaces() {
+    let mut ws = workspace();
+    add_super_interfaces(&mut ws);
+    let expected = target(&ws, "Base.java", "getBreakSpeed");
+    for inheritance in [
+        "Base(), Marker",
+        "Base(), ParentMarker",
+        "Base(), Marker by MarkerImpl()",
+    ] {
+        let source = format!("package probe\nclass Multiple : {inheritance} {{\n    override fun marker(): Float = 3f\n    override fun getBreakSpeed(): Float = super.getBreakSpeed()\n}}\n");
+        ws.open("Multiple.kt", source.clone());
+        assert!(
+            labels(&mut ws, "Multiple.kt", "super.getB").contains("getBreakSpeed"),
+            "{inheritance}"
+        );
+        assert_eq!(
+            goto(
+                &mut ws,
+                "Multiple.kt",
+                "super.getBreakSpeed()",
+                "getBreakSpeed"
+            ),
+            vec![expected.clone()],
+            "{inheritance}"
+        );
+        assert_eq!(
+            infer_expression(&ws, "Multiple.kt", "super").name(),
+            Some("Base"),
+            "{inheritance}"
+        );
+        ws.change(
+            "Multiple.kt",
+            source.replace("super.getBreakSpeed()", "super.getB"),
+        );
+        assert!(
+            labels(&mut ws, "Multiple.kt", "super.getB").contains("getBreakSpeed"),
+            "incomplete {inheritance}"
+        );
+    }
+}
+
+#[test]
+fn kotlin_super_with_distinct_interface_preserves_generic_arguments() {
+    let mut ws = workspace();
+    add_super_interfaces(&mut ws);
+    add_payload_members(&mut ws);
+    ws.open(
+        "GenericBase.java",
+        "package probe; public class GenericBase<T> { public T inherited() { return null; } }"
+            .to_string(),
+    );
+    ws.open("Multiple.kt", "package probe\nclass Multiple : GenericBase<Payload>(), Marker by MarkerImpl() {\n    fun run(): Payload = super.inherited().payloadOnly()\n}\n".to_string());
+    assert_eq!(
+        infer_expression(&ws, "Multiple.kt", "super.inherited()"),
+        Type::class("Payload", Some("probe".to_string()))
+    );
+    assert!(labels(&mut ws, "Multiple.kt", "super.inherited().pay").contains("payloadOnly"));
+    let expected = target(&ws, "GenericBase.java", "inherited");
+    assert_eq!(
+        goto(&mut ws, "Multiple.kt", "super.inherited()", "inherited"),
+        vec![expected]
+    );
+}
+
+#[test]
+fn kotlin_super_provider_changes_invalidate_positive_and_ambiguous_queries() {
+    let mut ws = workspace();
+    let source = "package probe\nclass Multiple : Base(), Marker {\n    override fun getBreakSpeed(): Float = super.getBreakSpeed()\n}\n";
+    ws.open("Multiple.kt", source.to_string());
+    for marker in [
+        "package probe\ninterface Marker {}\n",
+        "package probe\ninterface Marker {\n    fun getBreakSpeed(): Float = 3f\n}\n",
+        "package probe\ninterface Marker : Missing {}\n",
+        "package probe\ninterface Marker {}\n",
+    ] {
+        ws.open("SuperInterfaces.kt", marker.to_string());
+        let expected = if marker.contains("getBreakSpeed") || marker.contains("Missing") {
+            Vec::new()
+        } else {
+            vec![target(&ws, "Base.java", "getBreakSpeed")]
+        };
+        assert_eq!(
+            goto(
+                &mut ws,
+                "Multiple.kt",
+                "super.getBreakSpeed()",
+                "getBreakSpeed"
+            ),
+            expected,
+            "{marker}"
+        );
+        assert_eq!(
+            labels(&mut ws, "Multiple.kt", "super.getB").contains("getBreakSpeed"),
+            !expected.is_empty(),
+            "{marker}"
         );
     }
 }

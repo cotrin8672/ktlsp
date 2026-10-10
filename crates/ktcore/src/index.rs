@@ -80,6 +80,7 @@ pub struct Index {
     /// Derived reverse lookup: simple name -> usage sites.
     refs_by_name: FxHashMap<Arc<str>, Vec<RefEntry>>,
     origins: OriginFacts,
+    contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
 }
 
 #[derive(Clone, Default)]
@@ -88,6 +89,7 @@ pub struct InferenceIndexSnapshot {
     members_by_container: FxHashMap<String, Vec<Entry>>,
     ext_by_receiver: FxHashMap<String, Vec<Entry>>,
     origins: OriginFacts,
+    contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
 }
 
 /// Project ownership is separate from serialized symbols and per-symbol entries.
@@ -206,6 +208,119 @@ pub trait InferenceIndex {
     fn members_of(&self, type_name: &str) -> LookupEntries<'_>;
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_>;
 
+    fn contributions_for_file(&self, _file: &str) -> &[crate::extensions::ContributionSet] {
+        &[]
+    }
+
+    fn semantic_binding_at(
+        &self,
+        file: &str,
+        byte: usize,
+    ) -> Option<&crate::extensions::MemberBinding> {
+        let mut selected = None;
+        for set in self.contributions_for_file(file) {
+            if let Some(binding) = set.binding_at(byte) {
+                let candidate = set
+                    .requirements()
+                    .iter()
+                    .flat_map(|resolution| &resolution.candidates)
+                    .find(|candidate| candidate.id == binding.target)?;
+                if !self.scope_is_complete()
+                    || !self.lookup_by_name(&candidate.name).iter().any(|entry| {
+                        entry.path.as_ref() == binding.target.definition().file
+                            && entry.sym.start_byte == binding.target.definition().start_byte
+                            && entry.sym.end_byte == binding.target.definition().end_byte
+                    })
+                {
+                    return None;
+                }
+                if selected.is_some_and(|old| old != binding) {
+                    return None;
+                }
+                selected = Some(binding);
+            }
+        }
+        selected
+    }
+
+    /// A relation preserves authored identity and is usable only while its real target remains
+    /// visible in this scoped view. Conflicting providers cannot silently choose a target.
+    fn semantic_binding(
+        &self,
+        declaration: &crate::symbol::Def,
+    ) -> Option<&crate::extensions::MemberBinding> {
+        let mut selected = None;
+        for set in self.contributions_for_file(&declaration.file) {
+            for resolution in set.requirements() {
+                let crate::knowledge::Knowledge::Found(binding) = &resolution.binding else {
+                    continue;
+                };
+                if binding
+                    .authored
+                    .as_ref()
+                    .is_none_or(|authored| authored.definition() != declaration)
+                {
+                    continue;
+                }
+                let candidate = resolution
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.id == binding.target)?;
+                if !self.lookup_by_name(&candidate.name).iter().any(|entry| {
+                    entry.path.as_ref() == binding.target.definition().file
+                        && entry.sym.start_byte == binding.target.definition().start_byte
+                        && entry.sym.end_byte == binding.target.definition().end_byte
+                }) || !self.scope_is_complete()
+                {
+                    return None;
+                }
+                if selected.is_some_and(|old| old != binding) {
+                    return None;
+                }
+                selected = Some(binding);
+            }
+        }
+        selected
+    }
+
+    fn semantic_entry(&self, declaration: &crate::symbol::Def) -> Option<&Entry> {
+        let binding = self.semantic_binding(declaration)?;
+        for set in self.contributions_for_file(&declaration.file) {
+            for resolution in set.requirements() {
+                if let Some(candidate) = resolution
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.id == binding.target)
+                {
+                    return self
+                        .lookup_by_name(&candidate.name)
+                        .into_iter()
+                        .find(|entry| {
+                            entry.path.as_ref() == binding.target.definition().file
+                                && entry.sym.start_byte == binding.target.definition().start_byte
+                                && entry.sym.end_byte == binding.target.definition().end_byte
+                        });
+                }
+            }
+        }
+        None
+    }
+
+    fn semantic_definition(&self, declaration: &crate::symbol::Def) -> crate::symbol::Def {
+        let mut current = declaration.clone();
+        let mut seen = BTreeSet::new();
+        for _ in 0..16 {
+            if !seen.insert(current.clone()) {
+                return declaration.clone();
+            }
+            let Some(binding) = self.semantic_binding(&current) else {
+                return current;
+            };
+            current = binding.target.definition().clone();
+        }
+        declaration.clone()
+    }
+
     fn origin_facts(&self) -> Option<&OriginFacts> {
         None
     }
@@ -280,7 +395,15 @@ impl Index {
             members_by_container: self.members_by_container.clone(),
             ext_by_receiver: self.ext_by_receiver.clone(),
             origins: self.origins.clone(),
+            contributions: self.contributions.clone(),
         }
+    }
+
+    pub fn replace_contributions(
+        &mut self,
+        contributions: BTreeMap<String, Vec<crate::extensions::ContributionSet>>,
+    ) {
+        self.contributions = Arc::new(contributions);
     }
 
     pub fn set_file_origin(&mut self, path: &str, origin: FileOrigin) -> bool {
@@ -670,6 +793,13 @@ impl Index {
 }
 
 impl InferenceIndex for Index {
+    fn contributions_for_file(&self, file: &str) -> &[crate::extensions::ContributionSet] {
+        self.contributions
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
         LookupEntries::All(Index::lookup_by_name(self, name))
     }
@@ -704,6 +834,13 @@ impl InferenceIndex for Index {
 }
 
 impl InferenceIndex for InferenceIndexSnapshot {
+    fn contributions_for_file(&self, file: &str) -> &[crate::extensions::ContributionSet] {
+        self.contributions
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
         LookupEntries::All(self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[]))
     }
@@ -1002,6 +1139,10 @@ impl<'a> ScopedIndex<'a> {
 }
 
 impl InferenceIndex for ScopedIndex<'_> {
+    fn contributions_for_file(&self, file: &str) -> &[crate::extensions::ContributionSet] {
+        self.index.contributions_for_file(file)
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
         self.select(self.index.lookup_by_name(name))
     }

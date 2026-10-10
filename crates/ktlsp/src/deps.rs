@@ -667,7 +667,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v16-member-function-types";
+const SYMCACHE_VERSION: &[u8] = b"v18-kotlin-inline-member-termination";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -818,16 +818,14 @@ fn parse_source_jar(
     dest: &Path,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> anyhow::Result<Vec<FileSymbols>> {
     let mut out = Vec::new();
-    if let Err(error) = jar::visit_sources(jar_path, dest, |path, text| {
+    jar::visit_sources(jar_path, dest, |path, text| {
         if let Some(file) = parse_source_file(path, text, kotlin, java) {
             out.push(file);
         }
-    }) {
-        tracing::warn!("parse {} failed: {error}", jar_path.display());
-    }
-    out
+    })?;
+    Ok(out)
 }
 
 fn parse_source_file(
@@ -937,12 +935,18 @@ fn resolve_library_source_unowned(
         if let Some(cached) = symcache_load(&fingerprint, &source.dest) {
             return cached;
         }
-        let symbols = parse_source_jar(jar, &source.dest, kotlin, java);
-        symcache_store(fingerprint, &symbols);
-        return symbols;
     }
-
-    parse_dir(&source.dest, kotlin, java)
+    let symbols = match parse_source_jar(jar, &source.dest, kotlin, java) {
+        Ok(symbols) => symbols,
+        Err(error) => {
+            tracing::warn!("parse {} failed: {error}", jar.display());
+            return Vec::new();
+        }
+    };
+    if let Some(fingerprint) = &source.fingerprint {
+        symcache_store(fingerprint, &symbols);
+    }
+    symbols
 }
 
 /// Resolve one coordinate to indexed symbols: locate/download its sources jar, ensure it's
@@ -1641,9 +1645,9 @@ pub fn parse_jdk_shard(
     shards: usize,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> anyhow::Result<Vec<FileSymbols>> {
     let mut out = Vec::new();
-    if let Err(error) = jar::visit_sources_shard(
+    jar::visit_sources_shard(
         plan.bytes.clone(),
         &plan.src_zip,
         &plan.dest,
@@ -1654,15 +1658,13 @@ pub fn parse_jdk_shard(
                 out.push(file);
             }
         },
-    ) {
-        tracing::warn!("parse {} failed: {error}", plan.src_zip.display());
-    }
+    )?;
     tag_batches(
         &mut out,
         &crate::classpath::jdk_origin_id(&plan.src_zip),
         SourceRepresentation::Source,
     );
-    out
+    Ok(out)
 }
 
 /// Persist the merged shard results. Call only when every shard succeeded, so a partial parse
@@ -1680,11 +1682,16 @@ pub fn resolve_jdk_sources(
 ) -> Vec<FileSymbols> {
     match plan_jdk_index(src_zip, extract_root) {
         Some(JdkIndexPlan::Cached(batches)) => batches,
-        Some(JdkIndexPlan::Parse(plan)) => {
-            let batches = parse_jdk_shard(&plan, 0, 1, kotlin, java);
-            store_jdk_symcache(&plan, &batches);
-            batches
-        }
+        Some(JdkIndexPlan::Parse(plan)) => match parse_jdk_shard(&plan, 0, 1, kotlin, java) {
+            Ok(batches) => {
+                store_jdk_symcache(&plan, &batches);
+                batches
+            }
+            Err(error) => {
+                tracing::warn!("parse {} failed: {error}", src_zip.display());
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     }
 }
@@ -2206,6 +2213,65 @@ public interface ExecutorService {
             &mut java
         )
         .is_empty());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn unreadable_source_entries_do_not_publish_or_cache_partial_libraries() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "ktlsp_partial_source_archive_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+        for (name, body) in [
+            (
+                "api/Good.java",
+                b"package api; public class Good {}".as_slice(),
+            ),
+            ("api/Bad.java", b"\xff".as_slice()),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(body).unwrap();
+        }
+        archive.finish().unwrap();
+        let source = LibrarySource {
+            dest: tmp.join("extract/library"),
+            jar: Some(jar.clone()),
+            fingerprint: Some(format!("partial-source-test-{}", std::process::id())),
+            origin_id: "test-library".into(),
+        };
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for _ in 0..2 {
+            assert!(
+                resolve_library_source(&source, &mut kotlin, &mut java).is_empty(),
+                "an unreadable entry cannot leave a partial library or a partial cache hit"
+            );
+            assert!(
+                resolve_jdk_sources(&jar, &tmp.join("extract/jdk"), &mut kotlin, &mut java)
+                    .is_empty(),
+                "the single-threaded JDK path must also reject partial source archives"
+            );
+        }
+        write_sources_jar(
+            &jar,
+            &[
+                ("api/Good.java", "package api; public class Good {}"),
+                ("api/Bad.java", "package api; public class Bad {}"),
+            ],
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_library_source(&source, &mut kotlin, &mut java).len(),
+                2,
+                "a failed parse must not cache an empty result that hides repaired sources"
+            );
+        }
         fs::remove_dir_all(tmp).unwrap();
     }
 

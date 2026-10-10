@@ -16,7 +16,8 @@ tree-sitter-java = "0.23"
 # Fork fixes automatic semicolon insertion before a bare primary constructor on the next line,
 # parses generic calls with value arguments as calls (not comparison chains), and supports
 # context parameters (KEEP-0259).
-tree-sitter-kotlin-ng = { git = "https://github.com/pepegar/tree-sitter-kotlin", rev = "10f5277602bc3af132bfe21997b775d0ac0a58bf" }
+# Preserve the existing syntax fixes while including upstream scanner PR #11.
+tree-sitter-kotlin-ng = { git = "https://github.com/cotrin8672/tree-sitter-kotlin", rev = "42f93dc3e3d73ef07a657fa5fd557e39c65704ee" }
 ureq = { version = "3", features = ["rustls"] }
 walkdir = "2"
 zip = { version = "2.3", default-features = false, features = ["deflate"] }

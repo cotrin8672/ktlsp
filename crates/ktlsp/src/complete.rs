@@ -114,6 +114,8 @@ pub struct ShapedItem {
     pub is_snippet: bool,
     pub detail: Option<String>,
     pub auto_import: Option<ImportEdit>,
+    /// An exact name subrange when source delimiters/prefixes must remain untouched.
+    pub replace_range: Option<std::ops::Range<usize>>,
 }
 
 /// A zero-width insertion of one import line at column 0 of `line` (0-based). The text is the bare
@@ -277,6 +279,7 @@ pub fn shape(
             })
         };
         items.push(ShapedItem {
+            replace_range: None,
             filter_text: c.label.clone(),
             label: c.label,
             sort_text: sort,

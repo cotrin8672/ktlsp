@@ -153,6 +153,103 @@ fn requirement(
 }
 
 #[test]
+fn normalized_source_rejects_foreign_owners_and_invalid_nested_ranges_atomically() {
+    use ktcore::extensions::source::{
+        AnnotationArgument, AnnotationValue, SourceAnnotation, SourceDeclaration,
+    };
+    let (index, mut store) = fixture();
+    let entries = index.entries_for_file(MIXIN_FILE);
+    let method = entries
+        .iter()
+        .find(|entry| entry.sym.name.contains("shadow$twice"))
+        .unwrap();
+    let owner = entries
+        .iter()
+        .find(|entry| entry.sym.name == "CaseMixin")
+        .unwrap();
+    let quoted = occurrence(MIXIN, "\"shadow$\"", 0);
+    let annotation = occurrence(MIXIN, "@Shadow(prefix = \"shadow$\")", 0);
+    let valid = SourceDeclaration {
+        definition: def(MIXIN_FILE, &method.sym),
+        owner: Some(def(MIXIN_FILE, &owner.sym)),
+        member: None,
+        annotations: vec![SourceAnnotation {
+            ty: ktcore::types::TypeRef::simple("Shadow"),
+            use_site_target: None,
+            range: annotation,
+            arguments: vec![AnnotationArgument {
+                name: Some("prefix".into()),
+                range: quoted.clone(),
+                value: Knowledge::Found(AnnotationValue::String {
+                    value: "shadow$".into(),
+                    content_range: quoted.start + 1..quoted.end - 1,
+                }),
+            }],
+        }],
+    };
+    store
+        .replace_source_declarations(
+            &index,
+            MIXIN_FILE,
+            Arc::from(MIXIN),
+            Knowledge::Found(()),
+            vec![valid.clone()],
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    assert_eq!(read.declarations(), &[valid.clone()]);
+    let request = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(method_signature()),
+        Dispatch::Instance,
+    );
+    read.require(request).unwrap();
+    let pending = read.finish();
+    let mut invalid = Vec::new();
+    let mut foreign = valid.clone();
+    foreign.owner = Some(Def {
+        file: TARGET_FILE.into(),
+        start_byte: 0,
+        end_byte: 1,
+    });
+    invalid.push(foreign);
+    let mut outside = valid.clone();
+    outside.annotations[0].range = 0..MIXIN.len() + 1;
+    invalid.push(outside);
+    let mut escaped = valid.clone();
+    escaped.annotations[0].arguments[0].range = 0..1;
+    invalid.push(escaped);
+    let mut wrong_text = valid.clone();
+    if let Knowledge::Found(AnnotationValue::String { value, .. }) =
+        &mut wrong_text.annotations[0].arguments[0].value
+    {
+        *value = "wrong".into();
+    }
+    invalid.push(wrong_text);
+    for invalid in invalid {
+        assert!(store
+            .replace_source_declarations(
+                &index,
+                MIXIN_FILE,
+                Arc::from(MIXIN),
+                Knowledge::Found(()),
+                vec![invalid]
+            )
+            .is_err());
+        assert_eq!(
+            store.source_declarations(MIXIN_FILE).unwrap(),
+            &[valid.clone()]
+        );
+    }
+    store.commit(pending).unwrap();
+}
+
+fn method_signature() -> MemberSignature {
+    method(&[JvmType::Int], &JvmType::Int)
+}
+
+#[test]
 fn exact_signature_static_and_owner_are_required_for_a_binding() {
     let (index, mut store) = fixture();
     let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();

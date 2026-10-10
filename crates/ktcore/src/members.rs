@@ -36,6 +36,46 @@ pub struct Selection<'a> {
 pub struct Candidates<'a> {
     pub members: Vec<&'a Entry>,
     pub extensions: Vec<&'a Entry>,
+    hierarchy_complete: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MemberName<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+}
+
+impl MemberName<'_> {
+    fn matches(self, name: &str) -> bool {
+        match self {
+            Self::Exact(written) => name == written,
+            Self::Prefix(written) => name.starts_with(written),
+        }
+    }
+}
+
+/// A competing supertype can be excluded only when its known hierarchy supplies no matching
+/// declaration. Extensions are not super implementations; multiple providers stay ambiguous.
+pub(crate) fn unique_super_receiver(
+    index: &dyn InferenceIndex,
+    receivers: Vec<Type>,
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+) -> Type {
+    let mut result = None;
+    for receiver in receivers {
+        let candidates = matching_candidates(index, &receiver, name, ctx);
+        if candidates.members.is_empty() {
+            if !candidates.hierarchy_complete {
+                return Type::Unknown;
+            }
+        } else if result.is_some() {
+            return Type::Unknown;
+        } else {
+            result = Some(receiver);
+        }
+    }
+    result.unwrap_or(Type::Unknown)
 }
 
 /// Select a bare member/extension call through the same innermost-first receiver stack used by
@@ -73,27 +113,41 @@ pub fn candidates<'a>(
     name: &str,
     ctx: &FileCtx,
 ) -> Candidates<'a> {
+    matching_candidates(index, receiver, MemberName::Exact(name), ctx)
+}
+
+fn matching_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+) -> Candidates<'a> {
     let mut members = Vec::new();
     let mut extensions = Vec::new();
+    let mut hierarchy_complete = true;
     let _ = infer::walk_supertypes(index, receiver, 32, |current| {
         let Some(root) = infer::receiver_root_key(index, current) else {
+            hierarchy_complete = false;
             return ControlFlow::Continue(());
         };
         members.extend(index.members_of(&root).into_iter().filter(|entry| {
-            entry.sym.name == name && current.package().is_none_or(|pkg| entry.sym.package == pkg)
+            name.matches(&entry.sym.name)
+                && current.package().is_none_or(|pkg| entry.sym.package == pkg)
         }));
         extensions.extend(index.extensions_for(&root).into_iter().filter(|entry| {
-            entry.sym.name == name
+            name.matches(&entry.sym.name)
                 && resolve::extension_is_visible(entry, &ctx.imports, &ctx.package)
         }));
         ControlFlow::Continue(())
     });
-    extensions.extend(resolve::generic_receiver_extensions(
-        index,
-        name,
-        &ctx.imports,
-        &ctx.package,
-    ));
+    if let MemberName::Exact(name) = name {
+        extensions.extend(resolve::generic_receiver_extensions(
+            index,
+            name,
+            &ctx.imports,
+            &ctx.package,
+        ));
+    }
     // A diamond or a generic extension reached through several supertypes is still one declaration.
     for entries in [&mut members, &mut extensions] {
         entries.sort_by_key(|entry| {
@@ -112,6 +166,7 @@ pub fn candidates<'a>(
     Candidates {
         members,
         extensions,
+        hierarchy_complete,
     }
 }
 

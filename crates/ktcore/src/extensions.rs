@@ -5,7 +5,7 @@
 //! target identities, supply revision stamps, or publish feature-specific answers. Host adapters
 //! must update file/model inputs together with the corresponding index changes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,6 +16,12 @@ use crate::knowledge::Knowledge;
 use crate::symbol::{Def, SymbolKind};
 
 pub mod source;
+
+/// Compile-time registration is intentionally independent of framework discovery and LSP.
+pub trait AnalysisProvider: Send + Sync {
+    fn id(&self) -> &str;
+    fn analyze(&self, session: &mut ReadSession<'_>) -> Result<(), ContractError>;
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -324,6 +330,16 @@ pub struct ContributionSet {
 }
 
 impl ContributionSet {
+    pub fn sites_at(
+        &self,
+        byte: usize,
+    ) -> impl Iterator<Item = (&BoundSite, &ResolvedRequirement)> {
+        self.sites
+            .iter()
+            .filter(move |site| site.full_range.start <= byte && byte <= site.full_range.end)
+            .map(|site| (site, &self.requirements[site.requirement]))
+    }
+
     pub fn requirements(&self) -> &[ResolvedRequirement] {
         &self.requirements
     }
@@ -440,6 +456,7 @@ struct SourceFacts {
     coverage: Fact<()>,
     members: BTreeMap<(usize, usize), DeclaredMemberFacts>,
     types: Vec<String>,
+    declarations: Vec<source::SourceDeclaration>,
 }
 
 #[derive(Clone)]
@@ -479,6 +496,7 @@ pub struct ExtensionStore {
     providers: BTreeMap<String, ProviderState>,
     evaluations: BTreeMap<(String, String), u64>,
     sets: BTreeMap<(String, String), PendingContributions>,
+    dirty: BTreeSet<(String, String)>,
 }
 
 impl Default for ExtensionStore {
@@ -494,6 +512,7 @@ impl Default for ExtensionStore {
             providers: BTreeMap::new(),
             evaluations: BTreeMap::new(),
             sets: BTreeMap::new(),
+            dirty: BTreeSet::new(),
         }
     }
 }
@@ -501,6 +520,99 @@ impl Default for ExtensionStore {
 impl ExtensionStore {
     pub fn publication_revision(&self) -> u64 {
         self.publication_revision
+    }
+
+    pub fn namespace_revision(&self) -> u64 {
+        self.namespace_generation
+    }
+
+    pub fn source_declarations(&self, file: &str) -> Option<&[source::SourceDeclaration]> {
+        self.sources
+            .get(file)
+            .map(|source| source.declarations.as_slice())
+    }
+
+    pub fn contribution_sets(&self) -> impl Iterator<Item = (&str, &str, &ContributionSet)> {
+        self.sets
+            .iter()
+            .map(|((provider, owner), pending)| (provider.as_str(), owner.as_str(), &pending.set))
+    }
+
+    /// Invalidated evaluations include negative reads; removed owners and disabled providers
+    /// cannot be evaluated again until the host supplies their inputs.
+    pub fn take_dirty(&mut self) -> Vec<(String, String)> {
+        let dirty = std::mem::take(&mut self.dirty);
+        dirty
+            .into_iter()
+            .filter(|(provider, owner)| {
+                self.sources.contains_key(owner)
+                    && self
+                        .providers
+                        .get(provider)
+                        .is_some_and(|provider| provider.enabled)
+            })
+            .collect()
+    }
+
+    pub fn replace_source_declarations(
+        &mut self,
+        index: &dyn InferenceIndex,
+        file: &str,
+        text: Arc<str>,
+        coverage: Fact<()>,
+        declarations: Vec<source::SourceDeclaration>,
+    ) -> Result<(), ContractError> {
+        let entries = index.entries_for_file(file);
+        let mut seen = BTreeSet::new();
+        for declaration in &declarations {
+            if declaration.definition.file != file {
+                return Err(ContractError::ForeignFile);
+            }
+            let entry = entries
+                .iter()
+                .find(|entry| definition(entry) == declaration.definition)
+                .ok_or(ContractError::NotIndexedDeclaration)?;
+            validate_entry(&text, entry)?;
+            if !seen.insert((
+                declaration.definition.start_byte,
+                declaration.definition.end_byte,
+            )) {
+                return Err(ContractError::NotIndexedDeclaration);
+            }
+            if let Some(owner) = &declaration.owner {
+                let owner_entry = entries
+                    .iter()
+                    .find(|entry| definition(entry) == *owner && entry.sym.kind.is_type_like())
+                    .ok_or(ContractError::NotIndexedDeclaration)?;
+                let owner_name = owner_entry.sym.container.as_ref().map_or_else(
+                    || unquote(&owner_entry.sym.name).to_string(),
+                    |parent| format!("{parent}.{}", unquote(&owner_entry.sym.name)),
+                );
+                if entry.sym.container.as_deref() != Some(owner_name.as_str()) {
+                    return Err(ContractError::NotIndexedDeclaration);
+                }
+            }
+            if declaration
+                .member
+                .as_ref()
+                .is_some_and(|member| member.definition != declaration.definition)
+            {
+                return Err(ContractError::NotIndexedDeclaration);
+            }
+            for annotation in &declaration.annotations {
+                validate_range(&text, &annotation.range)?;
+                for argument in &annotation.arguments {
+                    validate_argument(&text, argument, &annotation.range)?;
+                }
+            }
+        }
+        let members = declarations
+            .iter()
+            .filter_map(|declaration| declaration.member.clone())
+            .collect();
+        self.replace_source(index, file, text, coverage, members)?;
+        self.sources.get_mut(file).unwrap().declarations = declarations;
+        Ok(())
     }
 
     /// Call with the accepted index and source together. Coverage certifies completeness of the
@@ -561,12 +673,18 @@ impl ExtensionStore {
                 coverage,
                 members: normalized,
                 types,
+                declarations: Vec::new(),
             },
         );
         if namespace_changed {
             self.namespace_generation += 1;
         }
         self.remove_stale_sets();
+        for (provider, state) in &self.providers {
+            if state.enabled {
+                self.dirty.insert((provider.clone(), file.into()));
+            }
+        }
         Ok(())
     }
 
@@ -584,6 +702,13 @@ impl ExtensionStore {
         self.model_generation += 1;
         self.namespace_coverage = unknown(IncompleteReason::IncompleteScope);
         self.remove_stale_sets();
+        for (provider, state) in &self.providers {
+            if state.enabled {
+                for owner in self.sources.keys() {
+                    self.dirty.insert((provider.clone(), owner.clone()));
+                }
+            }
+        }
     }
 
     /// Certifies whether a missing scoped type is really absent from the accepted project model.
@@ -614,6 +739,11 @@ impl ExtensionStore {
             },
         );
         self.remove_stale_sets();
+        if enabled {
+            for owner in self.sources.keys() {
+                self.dirty.insert((provider.into(), owner.clone()));
+            }
+        }
     }
 
     /// A current failed evaluation removes only its own previous set. A delayed failure cannot
@@ -725,6 +855,7 @@ impl ExtensionStore {
         if !stale.is_empty() {
             for key in stale {
                 self.sets.remove(&key);
+                self.dirty.insert(key);
             }
             self.publication_revision += 1;
         }
@@ -744,6 +875,10 @@ pub struct ReadSession<'a> {
 }
 
 impl ReadSession<'_> {
+    pub fn declarations(&self) -> &[source::SourceDeclaration] {
+        &self.store.sources[self.owner].declarations
+    }
+
     pub fn source(&self) -> &str {
         &self.store.sources[self.owner].text
     }
@@ -808,6 +943,39 @@ impl ReadSession<'_> {
             container,
             model_generation: self.store.model_generation,
         })
+    }
+
+    pub fn resolve_type_ref(&mut self, ty: &crate::types::TypeRef) -> Fact<TypeId> {
+        self.reads.namespace = Some(self.store.namespace_generation);
+        let package = self
+            .index
+            .entries_for_file(self.owner)
+            .first()
+            .map(|entry| entry.sym.package.clone())
+            .unwrap_or_default();
+        let context = crate::infer::FileCtx::new(package, Vec::new());
+        match crate::infer::declared_type(&self.index, ty, &context) {
+            crate::types::Type::Class {
+                name,
+                package,
+                container,
+                ..
+            } => {
+                let qualified = [
+                    package.unwrap_or_default(),
+                    container.unwrap_or_default(),
+                    name,
+                ]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(".");
+                self.resolve_type(&qualified)
+            }
+            crate::types::Type::Unknown => {
+                unknown(IncompleteReason::UnsupportedType(ty.name.clone()))
+            }
+        }
     }
 
     pub fn declared_members(
@@ -1265,6 +1433,38 @@ fn validate_range(text: &str, range: &Range<usize>) -> Result<(), ContractError>
     } else {
         Ok(())
     }
+}
+
+fn validate_argument(
+    text: &str,
+    argument: &source::AnnotationArgument,
+    parent: &Range<usize>,
+) -> Result<(), ContractError> {
+    validate_range(text, &argument.range)?;
+    if argument.range.start < parent.start || argument.range.end > parent.end {
+        return Err(ContractError::InvalidRange);
+    }
+    match &argument.value {
+        Knowledge::Found(source::AnnotationValue::String {
+            value,
+            content_range,
+        }) => {
+            validate_range(text, content_range)?;
+            if content_range.start < argument.range.start
+                || content_range.end > argument.range.end
+                || text.get(content_range.clone()) != Some(value.as_str())
+            {
+                return Err(ContractError::InvalidRange);
+            }
+        }
+        Knowledge::Found(source::AnnotationValue::Array(values)) => {
+            for value in values {
+                validate_argument(text, value, &argument.range)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_entry(text: &str, entry: &Entry) -> Result<(), ContractError> {

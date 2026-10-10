@@ -27,6 +27,8 @@ use crate::semantic;
 use crate::semantic_query;
 use crate::symbol::{Def, IndexedSymbol, SymbolKind};
 use crate::symbols::SymbolSummary;
+use ktcore::extensions::{NameLink, RenameTarget};
+use ktcore::knowledge::Knowledge;
 
 /// An open buffer: its current text plus the parsed tree, kept in sync so goto-definition reads an
 /// already-current tree instead of re-parsing on every request.
@@ -42,6 +44,7 @@ struct ProjectFileIndex {
     usages: Vec<Usage>,
     clean: bool,
     stamp: Option<SourceStamp>,
+    source: (Arc<str>, Tree),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,6 +87,8 @@ pub struct Workspace {
     analysis_generation: u64,
     live_dependency_origins: BTreeSet<String>,
     project_refresh_pending: bool,
+    analysis_extensions: crate::analysis_extensions::AnalysisExtensions,
+    annotated_type_owners: HashMap<String, BTreeSet<Def>>,
 }
 
 impl Default for Workspace {
@@ -94,6 +99,12 @@ impl Default for Workspace {
 
 impl Workspace {
     pub fn new() -> Self {
+        Self::with_analysis_providers(Vec::new())
+    }
+
+    pub fn with_analysis_providers(
+        providers: Vec<Arc<dyn crate::analysis_extensions::AnalysisProvider>>,
+    ) -> Self {
         Workspace {
             index: Index::new(),
             open_docs: HashMap::new(),
@@ -110,6 +121,8 @@ impl Workspace {
             analysis_generation: 0,
             live_dependency_origins: BTreeSet::new(),
             project_refresh_pending: false,
+            analysis_extensions: crate::analysis_extensions::AnalysisExtensions::new(providers),
+            annotated_type_owners: HashMap::new(),
         }
     }
 
@@ -154,6 +167,7 @@ impl Workspace {
         self.completeness.project_scan_complete = false;
         self.completeness.library_index_complete = false;
         self.project_refresh_pending = true;
+        self.analysis_extensions.suspend();
         self.bump_index_revision();
         self.analysis_generation
     }
@@ -241,6 +255,8 @@ impl Workspace {
             .collect();
         for key in removed {
             self.index.remove_file(&key);
+            self.analysis_extensions.remove_source(&self.index, &key);
+            self.annotated_type_owners.remove(&key);
             self.salsa.forget(&key);
             self.project_file_meta.remove(&key);
         }
@@ -250,6 +266,7 @@ impl Workspace {
                     && previous_revisions.get(origin) == revisions.get(origin))
         });
         self.project_model = Some(model);
+        self.analysis_extensions.model_changed(&self.index);
         self.bump_index_revision();
         self.recompute_project_completeness();
     }
@@ -269,6 +286,7 @@ impl Workspace {
         self.source_stamps
             .retain(|key, _| update.current.contains(key));
         let mut count = 0;
+        let mut extension_sources = Vec::new();
         for batch in update.batches {
             if let Some(stamp) = batch.stamp {
                 self.source_stamps.insert(batch.key.clone(), stamp);
@@ -296,8 +314,16 @@ impl Workspace {
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
             self.salsa.forget(&batch.key);
+            self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
+            if !self.analysis_extensions.is_empty() {
+                extension_sources.push((batch.key, batch.source.0, batch.source.1));
+            }
         }
-        if count > 0 {
+        let extension_revision = self.analysis_extensions.revision();
+        self.analysis_extensions
+            .replace_sources(&self.index, extension_sources);
+        self.analysis_extensions.resume(&self.index);
+        if count > 0 || self.analysis_extensions.revision() != extension_revision {
             self.bump_index_revision();
         }
         self.project_scan_initialized = true;
@@ -358,6 +384,8 @@ impl Workspace {
                 .is_none_or(|origin| origin.project_scope.is_some())
             {
                 self.index.remove_file(key);
+                self.analysis_extensions.remove_source(&self.index, key);
+                self.annotated_type_owners.remove(key);
                 self.salsa.forget(key);
             }
             self.project_file_meta.remove(key);
@@ -426,8 +454,20 @@ impl Workspace {
         if self.open_docs.contains_key(key) {
             return false;
         }
+        self.analysis_extensions.mark_index_changed();
         self.index.replace_file(key, symbols, Tier::Durable);
         true
+    }
+
+    pub(crate) fn remove_dependency_file(&mut self, key: &str) {
+        if self.open_docs.contains_key(key) {
+            return;
+        }
+        self.index.remove_file(key);
+        self.analysis_extensions.remove_source(&self.index, key);
+        self.analysis_extensions.mark_index_changed();
+        self.annotated_type_owners.remove(key);
+        self.salsa.forget(key);
     }
 
     pub fn project_doc_keys(&self) -> Vec<String> {
@@ -444,7 +484,49 @@ impl Workspace {
     }
 
     pub fn bump_index_revision(&mut self) {
+        self.analysis_extensions.flush_index_changed(&self.index);
+        self.analysis_extensions.publish(&mut self.index);
         self.index_revision = self.index_revision.wrapping_add(1).max(1);
+    }
+
+    pub fn configure_analysis_provider(
+        &mut self,
+        provider: &str,
+        enabled: bool,
+        configuration: Arc<str>,
+    ) -> bool {
+        let revision = self.analysis_extensions.revision();
+        let registered =
+            self.analysis_extensions
+                .configure(&self.index, provider, enabled, configuration);
+        if self.analysis_extensions.revision() != revision {
+            self.bump_index_revision();
+        }
+        registered
+    }
+
+    pub fn take_extension_diagnostic_changes(&mut self) -> Vec<String> {
+        self.analysis_extensions.take_changed()
+    }
+
+    fn replace_extension_source(&mut self, key: &str, text: Arc<str>, tree: Tree) {
+        self.record_annotated_owners(key, &text, &tree);
+        if !self.analysis_extensions.is_empty() {
+            self.analysis_extensions
+                .replace_sources(&self.index, vec![(key.into(), text, tree)]);
+            if self.analysis_extensions.publish(&mut self.index) {
+                self.index_revision = self.index_revision.wrapping_add(1).max(1);
+            }
+        }
+    }
+
+    fn record_annotated_owners(&mut self, key: &str, text: &str, tree: &Tree) {
+        self.annotated_type_owners.insert(
+            key.into(),
+            language::annotated_type_owners(&self.index, key, tree, text)
+                .into_iter()
+                .collect(),
+        );
     }
 
     /// Current text for a key: the open buffer if present, else the file on disk.
@@ -464,6 +546,7 @@ impl Workspace {
     fn index_from_tree(&mut self, key: &str, text: &str, tree: &Tree) {
         let facts = language::file_facts(SourceLanguage::for_key(key), tree, text);
         self.apply_file_facts(key, facts);
+        self.replace_extension_source(key, Arc::from(text), tree.clone());
     }
 
     fn apply_file_facts(&mut self, key: &str, facts: language::FileFacts) {
@@ -485,6 +568,8 @@ impl Workspace {
     pub fn reindex(&mut self, key: &str, text: &str) {
         let facts = self.salsa.file_facts(key, text, Durability::LOW);
         self.apply_file_facts(key, facts);
+        let tree = self.salsa.parsed_tree(key, text, Durability::LOW);
+        self.replace_extension_source(key, Arc::from(text), tree);
     }
 
     /// `textDocument/didOpen`.
@@ -493,6 +578,7 @@ impl Workspace {
         let tree = self.salsa.parsed_tree(&key, &text, Durability::LOW);
         let facts = self.salsa.file_facts(&key, &text, Durability::LOW);
         self.apply_file_facts(&key, facts);
+        self.replace_extension_source(&key, Arc::from(text.as_str()), tree.clone());
         self.open_docs.insert(key, DocState { text, tree });
     }
 
@@ -529,6 +615,8 @@ impl Workspace {
             || inactive_dependency
         {
             self.index.remove_file(key);
+            self.analysis_extensions.remove_source(&self.index, key);
+            self.annotated_type_owners.remove(key);
             self.salsa.forget(key);
             self.project_file_meta.remove(key);
             self.bump_index_revision();
@@ -539,6 +627,8 @@ impl Workspace {
             Ok(text) => self.reindex(key, &text),
             Err(_) => {
                 self.index.remove_file(key);
+                self.analysis_extensions.remove_source(&self.index, key);
+                self.annotated_type_owners.remove(key);
                 self.bump_index_revision();
                 self.salsa.forget(key);
                 if self.project_scan_initialized {
@@ -583,6 +673,7 @@ impl Workspace {
         let n = batches.len();
         self.project_scan_initialized = true;
         self.project_file_meta.clear();
+        let mut extension_sources = Vec::new();
         for batch in batches {
             if let Some(stamp) = batch.stamp {
                 self.source_stamps.insert(batch.key.clone(), stamp);
@@ -605,7 +696,14 @@ impl Workspace {
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
+            self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
+            if !self.analysis_extensions.is_empty() {
+                extension_sources.push((batch.key, batch.source.0, batch.source.1));
+            }
         }
+        self.analysis_extensions
+            .replace_sources(&self.index, extension_sources);
+        self.analysis_extensions.resume(&self.index);
         self.bump_index_revision();
         for (key, doc) in &self.open_docs {
             if self.project_model.as_ref().is_some_and(|model| {
@@ -925,6 +1023,9 @@ impl Workspace {
         offset: usize,
         snippets_supported: bool,
     ) -> Option<ShapedCompletions> {
+        if let Some(completions) = self.contributed_completion(key, offset) {
+            return Some(completions);
+        }
         let query = self.completion_query(key, offset)?;
         if matches!(
             query.context,
@@ -947,6 +1048,64 @@ impl Workspace {
         }
         // Silent omission: an empty result is never a "success".
         (!shaped.items.is_empty()).then_some(shaped)
+    }
+
+    fn contributed_completion(&self, key: &str, offset: usize) -> Option<ShapedCompletions> {
+        let index = self.index.scoped_for_file(key);
+        let mut items = Vec::new();
+        let mut site_present = false;
+        for set in index.contributions_for_file(key) {
+            for (site, resolution) in set.sites_at(offset) {
+                if !(site.editable_name.start <= offset && offset <= site.editable_name.end) {
+                    continue;
+                }
+                site_present = true;
+                if !resolution.requirement.target.is_found() {
+                    continue;
+                }
+                for candidate in &resolution.candidates {
+                    if !candidate.mismatches.is_empty()
+                        || !candidate.signature.is_found()
+                        || !candidate.dispatch.is_found()
+                    {
+                        continue;
+                    }
+                    if !index.lookup_by_name(&candidate.name).iter().any(|entry| {
+                        entry.path.as_ref() == candidate.id.definition().file
+                            && entry.sym.start_byte == candidate.id.definition().start_byte
+                            && entry.sym.end_byte == candidate.id.definition().end_byte
+                    }) {
+                        continue;
+                    }
+                    let label = site.projection.apply(&candidate.name);
+                    items.push(complete::ShapedItem {
+                        label: label.clone(),
+                        sort_text: label.clone(),
+                        filter_text: label,
+                        kind: match candidate.kind {
+                            ktcore::extensions::MemberKind::Method => SymbolKind::Function,
+                            ktcore::extensions::MemberKind::Field => SymbolKind::Property,
+                        },
+                        is_keyword: false,
+                        insert_text: candidate.name.clone(),
+                        is_snippet: false,
+                        detail: Some(format!(
+                            "{} {}",
+                            candidate.id.owner().qualified_name(),
+                            candidate.id.signature().unwrap().descriptor()
+                        )),
+                        auto_import: None,
+                        replace_range: Some(site.editable_name.clone()),
+                    });
+                }
+            }
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items.dedup_by(|a, b| a.label == b.label && a.replace_range == b.replace_range);
+        site_present.then_some(ShapedCompletions {
+            items,
+            is_incomplete: true,
+        })
     }
 
     /// Declarations for `textDocument/documentSymbol` and future passive symbol features. Results
@@ -1079,6 +1238,18 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<crate::rename::PreparedRename> {
+        if let Some(subject) = self.extension_rename_subject(key, offset) {
+            let range = self.extension_rename_range_at(key, offset, &subject)?;
+            let text = self.doc_text(key)?;
+            return Some(crate::rename::PreparedRename {
+                placeholder: text.get(range.clone())?.to_string(),
+                range: Def {
+                    file: key.into(),
+                    start_byte: range.start,
+                    end_byte: range.end,
+                },
+            });
+        }
         let target = self.rename_target(key, offset)?;
         let text = self.doc_text(&target.file)?;
         let placeholder = text.get(target.start_byte..target.end_byte)?.to_string();
@@ -1098,6 +1269,9 @@ impl Workspace {
         if !language::is_valid_identifier(SourceLanguage::for_key(key), new_name) {
             return None;
         }
+        if let Some(subject) = self.extension_rename_subject(key, offset) {
+            return self.rename_contribution(key, offset, subject, new_name);
+        }
         let target = self.rename_target(key, offset)?;
         let name = self.name_at(key, offset)?;
         if self.index.lookup_refs(&name).len() > RENAME_REF_CAP {
@@ -1109,6 +1283,275 @@ impl Workspace {
         }
         let edits = crate::rename::edits_for_refs(refs, new_name);
         crate::edit::validate_non_overlapping(&edits).ok()?;
+        Some(edits)
+    }
+
+    fn authored_goto(&mut self, key: &str, offset: usize) -> Vec<Def> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return language::authored_goto_definition(
+                &self.index.scoped_for_file(key),
+                SourceLanguage::for_key(key),
+                key,
+                &doc.text,
+                &doc.tree,
+                offset,
+            );
+        }
+        let Some((text, tree)) = self.parsed_closed_doc(key) else {
+            return Vec::new();
+        };
+        language::authored_goto_definition(
+            &self.index.scoped_for_file(key),
+            SourceLanguage::for_key(key),
+            key,
+            &text,
+            &tree,
+            offset,
+        )
+    }
+
+    fn extension_rename_subject(&mut self, key: &str, offset: usize) -> Option<RenameTarget> {
+        let scoped = self.index.scoped_for_file(key);
+        if scoped.semantic_binding_at(key, offset).is_some() {
+            let mut selected = None;
+            for set in scoped.contributions_for_file(key) {
+                if let Some(subject) = set.rename_subject_at(offset) {
+                    if selected.as_ref().is_some_and(|old| old != &subject) {
+                        return None;
+                    }
+                    selected = Some(subject);
+                }
+            }
+            if selected.is_some() {
+                return selected;
+            }
+        }
+        let authored = self.authored_goto(key, offset);
+        let [authored] = authored.as_slice() else {
+            return None;
+        };
+        if let Some(binding) = self.index.scoped_for_file(key).semantic_binding(authored) {
+            return match binding.name_link {
+                NameLink::IndependentAlias => {
+                    binding.authored.clone().map(RenameTarget::Declaration)
+                }
+                _ => Some(RenameTarget::Member(binding.target.clone())),
+            };
+        }
+        let mut selected = None;
+        for (owner, set) in self.analysis_extensions.sets() {
+            for resolution in set.requirements() {
+                let Knowledge::Found(binding) = &resolution.binding else {
+                    continue;
+                };
+                if binding.target.definition() != authored {
+                    continue;
+                }
+                if let Some(source) = &binding.authored {
+                    if self
+                        .index
+                        .scoped_for_file(owner)
+                        .semantic_binding(source.definition())
+                        != Some(binding)
+                    {
+                        continue;
+                    }
+                }
+                let subject = RenameTarget::Member(binding.target.clone());
+                if selected.as_ref().is_some_and(|old| old != &subject) {
+                    return None;
+                }
+                selected = Some(subject);
+            }
+        }
+        selected
+    }
+
+    fn extension_rename_range_at(
+        &mut self,
+        key: &str,
+        offset: usize,
+        subject: &RenameTarget,
+    ) -> Option<std::ops::Range<usize>> {
+        for set in self.index.contributions_for_file(key) {
+            if set.rename_subject_at(offset).as_ref() == Some(subject) {
+                return set
+                    .sites_at(offset)
+                    .next()
+                    .map(|(site, _)| site.editable_name.clone());
+            }
+        }
+        let parsed;
+        let tree = if let Some(doc) = self.open_docs.get(key) {
+            &doc.tree
+        } else {
+            parsed = self.parsed_closed_doc(key)?;
+            &parsed.1
+        };
+        let ident = self.identifier_at_key(key, tree, offset)?;
+        let site = Def {
+            file: key.into(),
+            start_byte: ident.start_byte(),
+            end_byte: ident.end_byte(),
+        };
+        self.extension_usage_range(&site, subject)
+    }
+
+    fn extension_usage_range(
+        &mut self,
+        site: &Def,
+        subject: &RenameTarget,
+    ) -> Option<std::ops::Range<usize>> {
+        let defs = self.authored_goto(&site.file, site.start_byte);
+        let [definition] = defs.as_slice() else {
+            return None;
+        };
+        let prefix = match subject {
+            RenameTarget::Declaration(authored) if authored.definition() == definition => {
+                String::new()
+            }
+            RenameTarget::Member(target) if target.definition() == definition => String::new(),
+            RenameTarget::Member(target) => {
+                let scoped = self.index.scoped_for_file(&site.file);
+                let binding = scoped.semantic_binding(definition)?;
+                if &binding.target != target {
+                    return None;
+                }
+                match &binding.name_link {
+                    NameLink::Direct => String::new(),
+                    NameLink::Prefixed(prefix) => prefix.clone(),
+                    NameLink::IndependentAlias => return None,
+                }
+            }
+            _ => return None,
+        };
+        let text = self.doc_text(&site.file)?;
+        let spelling = text.get(site.start_byte..site.end_byte)?;
+        let escaped = spelling.starts_with('`') && spelling.ends_with('`');
+        let start = site.start_byte + usize::from(escaped);
+        let end = site.end_byte - usize::from(escaped);
+        text.get(start..end)?.strip_prefix(&prefix)?;
+        Some(start + prefix.len()..end)
+    }
+
+    fn rename_contribution(
+        &mut self,
+        key: &str,
+        offset: usize,
+        subject: RenameTarget,
+        new_name: &str,
+    ) -> Option<Vec<crate::edit::TextEdit>> {
+        let definition = match &subject {
+            RenameTarget::Member(id) => id.definition(),
+            RenameTarget::Declaration(id) => id.definition(),
+        }
+        .clone();
+        if self.is_library_def(&definition) {
+            return None;
+        }
+        let names = self.reference_names(&definition);
+        if names
+            .iter()
+            .map(|name| self.index.lookup_refs(name).len())
+            .sum::<usize>()
+            > RENAME_REF_CAP
+        {
+            return None;
+        }
+        let mut edits = Vec::new();
+        let mut explicit = Vec::new();
+        for (owner, set) in self.analysis_extensions.sets() {
+            for site in set.sites() {
+                explicit.push((owner.to_string(), site.full_range.clone()));
+            }
+            for replacement in set.rename_edits(&subject, new_name).ok()? {
+                let site = set
+                    .sites()
+                    .iter()
+                    .find(|site| site.editable_name == replacement.range)?;
+                if self
+                    .index
+                    .scoped_for_file(owner)
+                    .semantic_binding_at(owner, site.full_range.start)
+                    .is_some()
+                {
+                    edits.push(crate::edit::TextEdit::new(
+                        owner,
+                        replacement.range.start,
+                        replacement.range.end,
+                        replacement.text,
+                    ));
+                }
+            }
+        }
+        let mut refs = match &subject {
+            RenameTarget::Member(_) => self.references(key, offset, true),
+            RenameTarget::Declaration(_) => {
+                let mut out = Vec::new();
+                for name in &names {
+                    let candidates = self.index.lookup_refs(name).to_vec();
+                    let mut by_path: HashMap<Arc<str>, Vec<RefEntry>> = HashMap::new();
+                    for candidate in candidates {
+                        by_path
+                            .entry(candidate.path.clone())
+                            .or_default()
+                            .push(candidate);
+                    }
+                    for (path, candidates) in by_path {
+                        self.collect_refs_in_file(
+                            &path,
+                            &candidates,
+                            &definition,
+                            true,
+                            true,
+                            &mut out,
+                        );
+                    }
+                }
+                out
+            }
+        };
+        refs.push(definition);
+        refs.sort();
+        refs.dedup();
+        for site in refs {
+            if explicit.iter().any(|(file, range)| {
+                file == &site.file && range.start < site.end_byte && site.start_byte < range.end
+            }) {
+                continue;
+            }
+            if let Some(range) = self.extension_usage_range(&site, &subject) {
+                edits.push(crate::edit::TextEdit::new(
+                    site.file,
+                    range.start,
+                    range.end,
+                    new_name,
+                ));
+            }
+        }
+        edits.sort_by(|a, b| {
+            (&a.file, a.start_byte, a.end_byte, &a.new_text).cmp(&(
+                &b.file,
+                b.start_byte,
+                b.end_byte,
+                &b.new_text,
+            ))
+        });
+        edits.dedup();
+        if edits.is_empty() {
+            return None;
+        }
+        crate::edit::validate_non_overlapping(&edits).ok()?;
+        let files = edits
+            .iter()
+            .map(|edit| edit.file.clone())
+            .collect::<BTreeSet<_>>();
+        for file in files {
+            if !language::is_valid_identifier(SourceLanguage::for_key(&file), new_name) {
+                return None;
+            }
+            crate::edit::apply_to_text(&file, &self.doc_text(&file)?, &edits).ok()?;
+        }
         Some(edits)
     }
 
@@ -1289,14 +1732,22 @@ impl Workspace {
     /// over the cached tree for an open buffer (or a one-off parse from disk). Byte-range based; the
     /// LSP layer converts to positions and severities.
     pub fn diagnostics(&mut self, key: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        let mut extra = self
+            .analysis_extensions
+            .sets()
+            .filter(|(owner, _)| *owner == key)
+            .flat_map(|(_, set)| set.diagnostics().iter().cloned())
+            .collect::<Vec<_>>();
         if let Some(doc) = self.open_docs.get(key) {
-            return self.diagnostics_for_tree(key, &doc.text, &doc.tree);
+            extra.extend(self.diagnostics_for_tree(key, &doc.text, &doc.tree));
+            return extra;
         }
         let (text, tree) = match self.parsed_closed_doc(key) {
             Some(parsed) => parsed,
             None => return Vec::new(),
         };
-        self.diagnostics_for_tree(key, &text, &tree)
+        extra.extend(self.diagnostics_for_tree(key, &text, &tree));
+        extra
     }
 
     fn diagnostics_for_tree(
@@ -1316,7 +1767,15 @@ impl Workspace {
     }
 
     fn effective_completeness(&self) -> resolve::CompletenessFacts {
-        self.completeness.clone()
+        let mut facts = self.completeness.clone();
+        // shortcut: Gradle metadata does not certify generated API closure; lift after producer/binary inventory proof.
+        if self.project_model.is_some() || self.project_refresh_pending {
+            facts.compiler_producers_complete = false;
+        }
+        facts
+            .member_surfaces_unknown
+            .extend(self.annotated_type_owners.values().flatten().cloned());
+        facts
     }
 
     fn record_project_file_meta(&mut self, key: &str, package: String, clean: bool) {
@@ -1529,16 +1988,21 @@ impl Workspace {
             Some(d) => d,
             None => return Vec::new(),
         };
-        let name = match self.name_at(key, offset) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-        let mut candidates: Vec<RefEntry> = self.index.lookup_refs(&name).to_vec();
+        let mut names = self.reference_names(&target);
+        if names.is_empty() {
+            if let Some(name) = self.name_at(key, offset) {
+                names.insert(name);
+            }
+        }
+        let mut candidates: Vec<RefEntry> = names
+            .iter()
+            .flat_map(|name| self.index.lookup_refs(name).iter().cloned())
+            .collect();
         // Backstop against a pathologically common name in a very large project.
         const MAX_CANDIDATES: usize = 5000;
         if candidates.len() > MAX_CANDIDATES {
             tracing::warn!(
-                "references({name}): {} candidates, capping at {MAX_CANDIDATES}",
+                "references({names:?}): {} candidates, capping at {MAX_CANDIDATES}",
                 candidates.len()
             );
             candidates.truncate(MAX_CANDIDATES);
@@ -1552,7 +2016,34 @@ impl Workspace {
         let file_count = by_path.len();
         let mut out: Vec<Def> = Vec::new();
         for (path, refs) in by_path {
-            self.collect_refs_in_file(&path, &refs, &target, include_declaration, &mut out);
+            self.collect_refs_in_file(&path, &refs, &target, include_declaration, false, &mut out);
+        }
+        if include_declaration {
+            out.push(target.clone());
+        }
+        for (owner, set) in self.analysis_extensions.sets() {
+            for site in set.sites() {
+                let scoped = self.index.scoped_for_file(owner);
+                let Some(binding) = scoped.semantic_binding_at(owner, site.full_range.start) else {
+                    continue;
+                };
+                if binding.target.definition() != &target {
+                    continue;
+                }
+                let location = Def {
+                    file: owner.into(),
+                    start_byte: site.full_range.start,
+                    end_byte: site.full_range.end,
+                };
+                if include_declaration
+                    || binding
+                        .authored
+                        .as_ref()
+                        .is_none_or(|authored| authored.definition() != &location)
+                {
+                    out.push(location);
+                }
+            }
         }
         out.sort();
         out.dedup();
@@ -1562,13 +2053,56 @@ impl Workspace {
             start,
             serde_json::json!({
                 "file": key,
-                "symbol": name,
+                "symbols": names,
                 "candidateRefs": candidate_count,
                 "candidateFiles": file_count,
                 "count": out.len(),
             }),
         );
         out
+    }
+
+    fn reference_names(&self, target: &Def) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        if let Some(entry) = hierarchy::entry_for_name_range(
+            &self.index,
+            &target.file,
+            target.start_byte,
+            target.end_byte,
+        ) {
+            names.insert(entry.sym.name.clone());
+        }
+        for (owner, set) in self.analysis_extensions.sets() {
+            for resolution in set.requirements() {
+                let Knowledge::Found(binding) = &resolution.binding else {
+                    continue;
+                };
+                if binding.target.definition() != target {
+                    continue;
+                }
+                let Some(authored) = &binding.authored else {
+                    continue;
+                };
+                if self
+                    .index
+                    .scoped_for_file(owner)
+                    .semantic_binding(authored.definition())
+                    != Some(binding)
+                {
+                    continue;
+                }
+                let definition = authored.definition();
+                if let Some(entry) = hierarchy::entry_for_name_range(
+                    &self.index,
+                    &definition.file,
+                    definition.start_byte,
+                    definition.end_byte,
+                ) {
+                    names.insert(entry.sym.name.clone());
+                }
+            }
+        }
+        names
     }
 
     /// Resolve all candidate usages in one file against `target`, parsing the file at most once
@@ -1579,13 +2113,20 @@ impl Workspace {
         refs: &[RefEntry],
         target: &Def,
         include_declaration: bool,
+        authored: bool,
         out: &mut Vec<Def>,
     ) {
         if let Some(doc) = self.open_docs.get(path) {
             for r in refs {
-                if let Some(s) =
-                    self.resolve_usage(path, &doc.text, &doc.tree, r, target, include_declaration)
-                {
+                if let Some(s) = self.resolve_usage(
+                    path,
+                    &doc.text,
+                    &doc.tree,
+                    r,
+                    target,
+                    include_declaration,
+                    authored,
+                ) {
                     out.push(s);
                 }
             }
@@ -1596,7 +2137,7 @@ impl Workspace {
             };
             for r in refs {
                 if let Some(s) =
-                    self.resolve_usage(path, &text, &tree, r, target, include_declaration)
+                    self.resolve_usage(path, &text, &tree, r, target, include_declaration, authored)
                 {
                     out.push(s);
                 }
@@ -1613,6 +2154,7 @@ impl Workspace {
         r: &RefEntry,
         target: &Def,
         include_declaration: bool,
+        authored: bool,
     ) -> Option<Def> {
         let site = Def {
             file: path.to_string(),
@@ -1623,8 +2165,28 @@ impl Workspace {
             // The declaration's own name identifier.
             return include_declaration.then_some(site);
         }
-        let defs = self.goto_definition_for_tree(path, text, tree, r.start_byte);
-        defs.iter().any(|d| d == target).then_some(site)
+        if !authored
+            && self
+                .index
+                .scoped_for_file(path)
+                .semantic_binding(&site)
+                .is_some_and(|binding| binding.target.definition() == target)
+        {
+            return include_declaration.then_some(site);
+        }
+        let defs = if authored {
+            language::authored_goto_definition(
+                &self.index.scoped_for_file(path),
+                SourceLanguage::for_key(path),
+                path,
+                text,
+                tree,
+                r.start_byte,
+            )
+        } else {
+            self.goto_definition_for_tree(path, text, tree, r.start_byte)
+        };
+        matches!(defs.as_slice(), [definition] if definition == target).then_some(site)
     }
 
     /// The identifier text at `offset` in `key`, using the cached tree for open buffers.
@@ -1796,6 +2358,7 @@ fn parse_project_file(path: &Path, parsers: &mut LanguageParsers) -> Option<Proj
         usages: facts.usages,
         clean: facts.clean,
         stamp: Some(stamp),
+        source: (Arc::from(text), tree),
     })
 }
 
@@ -1999,6 +2562,94 @@ fn is_generated_source_file(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotation_owner_metadata_survives_close_and_cleans_up_deleted_and_reopened_sources() {
+        for (file, annotated, plain) in [
+            (
+                "Person.java",
+                "package oracle; @Marker class Person { @Marker int value; }",
+                "package oracle; class Person { int value; }",
+            ),
+            (
+                "Person.kt",
+                "package oracle\n@Marker class Person { @Marker val value: Int = 1 }",
+                "package oracle\nclass Person { val value: Int = 1 }",
+            ),
+        ] {
+            let root = unique_tmp("annotation-lifecycle");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join(file);
+            std::fs::write(&path, annotated).unwrap();
+            let key = crate::paths::file_key(&path);
+            let mut ws = Workspace::new();
+            ws.scan(&root);
+            ws.assume_index_complete_for_tests();
+            let initial = ws.effective_completeness();
+            assert!(initial.compiler_producers_complete);
+            assert_eq!(initial.member_surfaces_unknown.len(), 1);
+            ws.open(&key, plain.into());
+            assert!(ws
+                .effective_completeness()
+                .member_surfaces_unknown
+                .is_empty());
+            ws.close(&key);
+            assert_eq!(ws.effective_completeness().member_surfaces_unknown.len(), 1);
+            std::fs::remove_file(&path).unwrap();
+            ws.close(&key);
+            assert!(ws
+                .effective_completeness()
+                .member_surfaces_unknown
+                .is_empty());
+            assert!(!ws.annotated_type_owners.contains_key(&key));
+            std::fs::write(&path, annotated).unwrap();
+            ws.scan(&root);
+            assert_eq!(ws.effective_completeness().member_surfaces_unknown.len(), 1);
+            std::fs::remove_file(&path).unwrap();
+            ws.scan(&root);
+            assert!(ws
+                .effective_completeness()
+                .member_surfaces_unknown
+                .is_empty());
+            assert!(!ws.annotated_type_owners.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn model_source_refresh_with_no_reparsed_files_republishes_provider_results() {
+        struct Provider;
+        impl crate::analysis_extensions::AnalysisProvider for Provider {
+            fn id(&self) -> &str {
+                "refresh-test"
+            }
+            fn analyze(
+                &self,
+                read: &mut ktcore::extensions::ReadSession<'_>,
+            ) -> Result<(), ktcore::extensions::ContractError> {
+                read.diagnostic(crate::diagnostics::Diagnostic {
+                    start_byte: 0,
+                    end_byte: 1,
+                    severity: crate::diagnostics::Severity::Hint,
+                    code: None,
+                    message: "accepted".into(),
+                })
+            }
+        }
+        let mut ws = Workspace::with_analysis_providers(vec![Arc::new(Provider)]);
+        ws.open("Current.kt", "class Current".into());
+        assert_eq!(ws.index.contributions_for_file("Current.kt").len(), 1);
+        ws.begin_analysis_generation();
+        assert!(ws.index.contributions_for_file("Current.kt").is_empty());
+        assert_eq!(
+            ws.apply_model_sources(ModelSourceUpdate {
+                current: HashSet::from(["Current.kt".into()]),
+                batches: Vec::new(),
+                complete: true,
+            }),
+            0
+        );
+        assert_eq!(ws.index.contributions_for_file("Current.kt").len(), 1);
+    }
 
     fn unique_tmp(prefix: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()

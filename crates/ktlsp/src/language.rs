@@ -120,6 +120,21 @@ pub fn extension_source_facts(
     tree: &Tree,
     text: &str,
 ) -> Vec<ktcore::extensions::source::SourceDeclaration> {
+    let scope = source_type_scope(key, tree, text);
+    ktcore::extensions::source::extract(index, key, tree, text, &scope)
+}
+
+pub fn annotated_type_owners(
+    index: &dyn InferenceIndex,
+    key: &str,
+    tree: &Tree,
+    text: &str,
+) -> Vec<Def> {
+    let scope = source_type_scope(key, tree, text);
+    ktcore::extensions::source::annotated_type_owners(index, key, tree, text, &scope)
+}
+
+fn source_type_scope(key: &str, tree: &Tree, text: &str) -> ktcore::indexer::TypeScope {
     let scope = match SourceLanguage::for_key(key) {
         SourceLanguage::Java => java::type_scope(tree, text),
         SourceLanguage::Kotlin => indexer::TypeScope::with_default_imports(
@@ -128,7 +143,7 @@ pub fn extension_source_facts(
             ktcore::defaults::DEFAULT_IMPORT_PACKAGES,
         ),
     };
-    ktcore::extensions::source::extract(index, key, tree, text, &scope)
+    scope
 }
 
 /// The current file's name-visibility context, mirroring the rules cross-file resolution uses: a
@@ -248,6 +263,20 @@ pub fn goto_definition(
     match language {
         SourceLanguage::Kotlin => resolve::goto(index, file, text, tree, offset),
         SourceLanguage::Java => java::goto_definition(index, file, text, tree, offset),
+    }
+}
+
+pub fn authored_goto_definition(
+    index: &dyn InferenceIndex,
+    language: SourceLanguage,
+    file: &str,
+    text: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Vec<Def> {
+    match language {
+        SourceLanguage::Kotlin => resolve::goto_authored(index, file, text, tree, offset),
+        SourceLanguage::Java => java::authored_goto_definition(index, file, text, tree, offset),
     }
 }
 

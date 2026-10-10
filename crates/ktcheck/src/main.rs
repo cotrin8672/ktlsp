@@ -64,11 +64,10 @@ fn run(cli: CliArgs) -> anyhow::Result<i32> {
         DurableLoad::default()
     };
     let (index, completeness) = if run_indexed_diagnostics {
-        let completeness = completeness_from_scans(&scans, &durable, cli.closed_world);
-        (
-            Some(Arc::new(build_index(&mut scans, durable))),
-            Some(Arc::new(completeness)),
-        )
+        let mut completeness = completeness_from_scans(&scans, &durable, cli.closed_world);
+        let index = build_index(&mut scans, durable);
+        record_annotation_surfaces(&scans, &index, &mut completeness);
+        (Some(Arc::new(index)), Some(Arc::new(completeness)))
     } else {
         (None, None)
     };
@@ -575,12 +574,27 @@ fn completeness_from_scans(
         project_package_modules: package_modules.into_iter().collect(),
         library_index_complete: closed_world || durable.library_index_complete,
         jdk_index_complete: closed_world || durable.jdk_index_complete,
+        compiler_producers_complete: closed_world,
+        member_surfaces_unknown: BTreeSet::new(),
+    }
+}
+
+fn record_annotation_surfaces(scans: &[ScannedFile], index: &Index, facts: &mut CompletenessFacts) {
+    for scan in scans {
+        facts
+            .member_surfaces_unknown
+            .extend(language::annotated_type_owners(
+                index,
+                &scan.path.to_string_lossy(),
+                &scan.tree,
+                &scan.text,
+            ));
     }
 }
 
 // Java symbol extraction now includes record accessors and richer inheritance facts, so caches
 // produced before those facts existed cannot safely drive overload diagnostics.
-const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v7-member-function-types";
+const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v8-kotlin-inline-member-termination";
 const MAX_DURABLE_SNAPSHOTS_PER_ROOT: usize = 2;
 
 fn load_durable_library_symbols_cached(roots: &[PathBuf], scans: &[ScannedFile]) -> DurableLoad {
@@ -1583,11 +1597,108 @@ mod tests {
             .map(|diag| diag.message.as_str())
             .collect();
         assert!(
+            messages.is_empty(),
+            "durable indexes do not certify compiler-producer coverage: {messages:?}"
+        );
+
+        let mut scans = scan_files(vec![file.clone()]);
+        let durable = DurableLoad::default();
+        let completeness = completeness_from_scans(&scans, &durable, true);
+        let index = build_index(&mut scans, durable);
+        let analyses = analyze_scans(
+            scans,
+            Some(Arc::new(index)),
+            Some(Arc::new(completeness)),
+            false,
+        );
+        let messages: Vec<_> = analyses[0]
+            .diagnostics
+            .iter()
+            .map(|diag| diag.message.as_str())
+            .collect();
+        assert!(
             messages.contains(&"Unresolved import: missing.Type"),
-            "complete durable indexes should report missing Java imports: {messages:?}"
+            "an explicitly closed source world should report missing Java imports: {messages:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn closed_source_world_keeps_lombok_and_serialization_surfaces_unknown() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ktcheck-annotation-surface-{}-{unique}",
+            std::process::id()
+        ));
+        let dir = root.join("src/main/java");
+        std::fs::create_dir_all(&dir).unwrap();
+        let person = "package pluginfixture;\nimport lombok.AllArgsConstructor;\nimport lombok.Getter;\n@Getter\n@AllArgsConstructor\npublic final class Person {\n    private String name;\n}\n";
+        let model = "package pluginfixture\nimport kotlinx.serialization.Serializable\n@Serializable\ndata class Model(val label: String)\n";
+        let java_use = "package app; import pluginfixture.Person; class Use { String use(Person value) { return value.getName(); } Person create() { return new Person(\"Ada\"); } }";
+        let kotlin_use =
+            "package app\nimport pluginfixture.Model\nfun use() { Model.serializer() }\n";
+        for annotations_enabled in [true, false] {
+            let person_source = if annotations_enabled {
+                person.into()
+            } else {
+                person
+                    .replace("@Getter\n", "")
+                    .replace("@AllArgsConstructor\n", "")
+            };
+            let model_source = if annotations_enabled {
+                model.into()
+            } else {
+                model.replace("@Serializable\n", "")
+            };
+            let paths = [
+                ("Person.java", person_source.as_str()),
+                ("Model.kt", model_source.as_str()),
+                ("Use.java", java_use),
+                ("Use.kt", kotlin_use),
+            ]
+            .into_iter()
+            .map(|(name, text)| {
+                let path = dir.join(name);
+                std::fs::write(&path, text).unwrap();
+                path
+            })
+            .collect();
+            let mut scans = scan_files(paths);
+            let durable = DurableLoad::default();
+            let mut facts = completeness_from_scans(&scans, &durable, true);
+            let index = build_index(&mut scans, durable);
+            record_annotation_surfaces(&scans, &index, &mut facts);
+            let analyses =
+                analyze_scans(scans, Some(Arc::new(index)), Some(Arc::new(facts)), false);
+            for (name, member) in [("Use.java", "getName"), ("Use.kt", "serializer")] {
+                let analysis = analyses
+                    .iter()
+                    .find(|analysis| analysis.path.file_name().unwrap() == name)
+                    .unwrap();
+                let missing = analysis.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == Some(diagnostics::DiagnosticCode::UnresolvedReference)
+                        && diagnostic.message.ends_with(member)
+                });
+                assert_eq!(
+                    missing, !annotations_enabled,
+                    "{name}, annotation={annotations_enabled}: {:?}",
+                    analysis.diagnostics
+                );
+                if annotations_enabled {
+                    assert!(
+                        analysis.diagnostics.iter().all(|diagnostic| diagnostic.code
+                            != Some(diagnostics::DiagnosticCode::CallShapeMismatch)),
+                        "{:?}",
+                        analysis.diagnostics
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
