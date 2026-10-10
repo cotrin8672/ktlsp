@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project_id": "cem-working-copy-incomplete",
+  "revision": "09073e3d71c9f62a48009f3c3698bb6e159a0636 (source snapshot includes existing user edits)",
+  "build_tool": "gradle",
+  "scope": "Full root; one compiled production receiver, then unsaved partial member/dangling dot/broken peer/paired known-unknown controls. This does not establish complete-root editing coverage.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "oracle_status": "Original non-Mixin production call compiled in the disposable source snapshot. IDEA ILS-263.6379.0 imported the full root and matched all six first-response queries after preserving the original initializer; see docs/fork-corpus.md.",
+  "probes": [
+    {
+      "id": "cem-working-copy-disk-control",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": "holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+      "token": "getOrThrow",
+      "definition": false,
+      "completion_token": "getOrThrow",
+      "completion_excludes": [
+        "getBreakSpeed"
+      ],
+      "category": "disk-control",
+      "buffer_edits": []
+    },
+    {
+      "id": "cem-working-copy-partial-member",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": "holderLookup(Registries.ENCHANTMENT).getOrTh(Enchantments.EFFICIENCY)",
+      "token": "getOrTh",
+      "definition": false,
+      "completion_token": "getOrThrow",
+      "completion_excludes": [
+        "getBreakSpeed"
+      ],
+      "category": "partial-member",
+      "buffer_edits": [
+        {
+          "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+          "anchor": "holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+          "replacement": "holderLookup(Registries.ENCHANTMENT).getOrTh(Enchantments.EFFICIENCY)",
+          "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289"
+        }
+      ]
+    },
+    {
+      "id": "cem-working-copy-dangling-dot",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": ".(",
+      "token": ".",
+      "definition": false,
+      "completion_token": "getOrThrow",
+      "completion_excludes": [
+        "getBreakSpeed"
+      ],
+      "category": "dangling-dot",
+      "buffer_edits": [
+        {
+          "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+          "anchor": "holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+          "replacement": "holderLookup(Registries.ENCHANTMENT).(Enchantments.EFFICIENCY)",
+          "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289"
+        }
+      ]
+    },
+    {
+      "id": "cem-working-copy-broken-peer",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": "holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+      "token": "getOrThrow",
+      "definition": false,
+      "completion_token": "getOrThrow",
+      "completion_excludes": [
+        "getBreakSpeed"
+      ],
+      "category": "broken-peer",
+      "buffer_edits": [
+        {
+          "source": "src/main/kotlin/io/github/cotrin8672/cem/util/BlockEntityExtension.kt",
+          "anchor": "fun <T> BlockEntity.holderLookup(registryKey: ResourceKey<out Registry<out T>>): HolderLookup<T> =",
+          "replacement": "fun ktlspBrokenPeer() { val broken = }\n\nfun <T> BlockEntity.holderLookup(registryKey: ResourceKey<out Registry<out T>>): HolderLookup<T> =",
+          "source_sha256": "42070ea06c04e9cd445223d1623357bc4ceb341af1f97d95d55c5b641e6513a9"
+        }
+      ]
+    },
+    {
+      "id": "cem-working-copy-unknown-receiver",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": "ktlspUnknownReceiver.getOrTh()",
+      "token": "getOrTh",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "getOrThrow",
+        "getBreakSpeed"
+      ],
+      "category": "unknown-receiver",
+      "buffer_edits": [
+        {
+          "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+          "anchor": "val efficiency = holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+          "replacement": "ktlspUnknownReceiver.getOrTh();\n        val efficiency = holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+          "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289"
+        }
+      ],
+      "known_control": {
+        "anchor": "holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)",
+        "token": "getOrThrow",
+        "completion_token": "getOrThrow",
+        "completion_excludes": [
+          "getBreakSpeed"
+        ]
+      }
+    }
+  ]
+}

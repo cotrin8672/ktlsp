@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project_id": "retrofit-2.11.0-incomplete",
+  "revision": "cc76c22a68e090f3dd898cbcb0bac30414f59c31",
+  "build_tool": "gradle",
+  "scope": "Full root; one compiled production receiver, then unsaved partial member/dangling dot/broken peer/paired known-unknown controls. This does not establish complete-root editing coverage.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "oracle_status": "Original production call compiled. IDEA ILS-263.6379.0 imported the full root and matched all six first-response queries after the unknown edit preserved the original return statement; see docs/fork-corpus.md.",
+  "probes": [
+    {
+      "id": "retrofit-2.11.0-disk-control",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "anchor": "KotlinExtensions.awaitResponse(call, continuation)",
+      "token": "awaitResponse",
+      "definition": false,
+      "completion_token": "awaitResponse",
+      "completion_excludes": [
+        "body"
+      ],
+      "category": "disk-control",
+      "buffer_edits": []
+    },
+    {
+      "id": "retrofit-2.11.0-partial-member",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "anchor": "KotlinExtensions.awaitRespo(call, continuation)",
+      "token": "awaitRespo",
+      "definition": false,
+      "completion_token": "awaitResponse",
+      "completion_excludes": [
+        "body"
+      ],
+      "category": "partial-member",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+          "anchor": "KotlinExtensions.awaitResponse(call, continuation)",
+          "replacement": "KotlinExtensions.awaitRespo(call, continuation)",
+          "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-2.11.0-dangling-dot",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "anchor": ".(",
+      "token": ".",
+      "definition": false,
+      "completion_token": "awaitResponse",
+      "completion_excludes": [
+        "body"
+      ],
+      "category": "dangling-dot",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+          "anchor": "KotlinExtensions.awaitResponse(call, continuation)",
+          "replacement": "KotlinExtensions.(call, continuation)",
+          "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-2.11.0-broken-peer",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "anchor": "KotlinExtensions.awaitResponse(call, continuation)",
+      "token": "awaitResponse",
+      "definition": false,
+      "completion_token": "awaitResponse",
+      "completion_excludes": [
+        "body"
+      ],
+      "category": "broken-peer",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "anchor": "suspend fun <T> Call<T>.awaitResponse(): Response<T> {",
+          "replacement": "fun ktlspBrokenPeer() { val broken = }\n\nsuspend fun <T> Call<T>.awaitResponse(): Response<T> {",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-2.11.0-unknown-receiver",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "anchor": "ktlspUnknownReceiver.awaitRespo()",
+      "token": "awaitRespo",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "awaitResponse",
+        "body"
+      ],
+      "category": "unknown-receiver",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+          "anchor": "return KotlinExtensions.awaitResponse(call, continuation)",
+          "replacement": "ktlspUnknownReceiver.awaitRespo();\n        return KotlinExtensions.awaitResponse(call, continuation)",
+          "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8"
+        }
+      ],
+      "known_control": {
+        "anchor": "KotlinExtensions.awaitResponse(call, continuation)",
+        "token": "awaitResponse",
+        "completion_token": "awaitResponse",
+        "completion_excludes": [
+          "body"
+        ]
+      }
+    }
+  ]
+}

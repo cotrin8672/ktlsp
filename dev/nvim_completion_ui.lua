@@ -12,6 +12,22 @@ local report = { samples = {}, cycles = cycles, neovim = vim.version(),
   performance_acceptance = false }
 local files = { java = 'src/main/java/mixed/JavaApi.java',
   kotlin = 'src/main/kotlin/mixed/KotlinApi.kt', box = 'src/main/java/mixed/JavaBox.java' }
+local cases = {
+  { name = 'java', anchor = 'return api.kotlinGreeting();', before = '        return api',
+    member = 'kotlinGreeting', excluded = 'javaGreeting', after = '        return api.kotlinGreeting();',
+    post_input = ';' },
+  { name = 'kotlin', anchor = 'fun kotlinGreeting(): String = peer.javaGreeting()',
+    before = '    fun kotlinGreeting(): String = peer', member = 'javaGreeting', excluded = 'kotlinGreeting',
+    after = '    fun kotlinGreeting(): String = peer.javaGreeting()' },
+}
+local build_tool = 'maven'
+local custom
+if vim.env.KTLSP_UI_CASES then
+  custom = vim.json.decode(table.concat(vim.fn.readfile(vim.env.KTLSP_UI_CASES), '\n'))
+  files, cases, build_tool = assert(custom.files), assert(custom.cases), assert(custom.build_tool)
+  assert(#cases > 0, 'custom UI manifest needs at least one case')
+  report.manifest = vim.env.KTLSP_UI_CASES
+end
 local buffers, original = {}, {}
 local client, sample, done
 vim.o.hidden = true
@@ -23,6 +39,10 @@ for name, file in pairs(files) do
   vim.fn.bufload(buf)
   vim.bo[buf].filetype = name == 'kotlin' and 'kotlin' or 'java'
   buffers[name], original[name] = buf, vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  if custom then
+    assert(vim.fn.sha256(table.concat(original[name], '\n')) == assert(custom.source_sha256[name]),
+      'custom UI source changed: ' .. file)
+  end
 end
 -- The mixed probe already created an isolated Maven launcher for the official plugin.
 local shim = artifacts .. '/maven-bin'
@@ -60,13 +80,6 @@ local function guarded(fn)
     if not ok then vim.schedule(function() finish(tostring(err)) end) end
   end
 end
-local cases = {
-  { name = 'java', anchor = 'return api.kotlinGreeting();', before = '        return api',
-    member = 'kotlinGreeting', excluded = 'javaGreeting', after = '        return api.kotlinGreeting();' },
-  { name = 'kotlin', anchor = 'fun kotlinGreeting(): String = peer.javaGreeting()',
-    before = '    fun kotlinGreeting(): String = peer', member = 'javaGreeting', excluded = 'kotlinGreeting',
-    after = '    fun kotlinGreeting(): String = peer.javaGreeting()' },
-}
 local next_case
 local function matches(label, token)
   return label == token or label:match('^' .. token .. '%f[^%w_]')
@@ -85,7 +98,7 @@ vim.ui_attach(ns, { ext_popupmenu = true }, guarded(function(event, items)
   sample.enqueue_to_menu_ms = (sample.menu_ns - sample.enqueue_ns) / 1e6
   local selected
   for i, item in ipairs(items) do
-    assert(not matches(item[1], sample.case.excluded), 'wrong receiver member in popup')
+    assert(not sample.case.excluded or not matches(item[1], sample.case.excluded), 'wrong receiver member in popup')
     if matches(item[1], sample.case.member) then selected = i end
   end
   assert(selected, 'expected LSP member missing from popup')
@@ -110,7 +123,7 @@ vim.ui_attach(ns, { ext_popupmenu = true }, guarded(function(event, items)
       end
       assert(sample.complete_done_reason == 'accept', 'completion was not accepted')
       assert(not sample.resolve_error and not sample.command_error, 'completion acceptance failed')
-      if sample.case.name == 'java' then vim.api.nvim_input(';') end
+      if sample.case.post_input then vim.api.nvim_input(sample.case.post_input) end
       vim.defer_fn(guarded(function()
         sample.result_line = vim.api.nvim_get_current_line()
         assert(sample.result_line == sample.case.after, 'accepted completion produced wrong text')
@@ -123,7 +136,7 @@ vim.ui_attach(ns, { ext_popupmenu = true }, guarded(function(event, items)
     vim.defer_fn(guarded(accepted), 20)
   end))
 end))
-local config, mode = probe.config(project, assert(vim.env.KTLSP_BIN), artifacts, 'maven')
+local config, mode = probe.config(project, assert(vim.env.KTLSP_BIN), artifacts, build_tool)
 report.mode, report.binary = mode, vim.env.KTLSP_BIN
 report.removed_environment_names = probe.removed_environment
 local index_state = { project = false, libraries = false }
@@ -156,8 +169,9 @@ config.on_exit = function(code, signal, client_id)
   report.server_exit_code, report.server_exit_signal = code, signal
   if previous_exit then previous_exit(code, signal, client_id) end
 end
-vim.api.nvim_set_current_buf(buffers.java)
-local id = assert(vim.lsp.start(config, { bufnr = buffers.java }))
+local initial_buf = assert(buffers[cases[1].name], 'missing initial UI buffer')
+vim.api.nvim_set_current_buf(initial_buf)
+local id = assert(vim.lsp.start(config, { bufnr = initial_buf }))
 local number = 0
 next_case = function()
   if sample then
@@ -169,7 +183,7 @@ next_case = function()
   local case = cases[(number - 1) % #cases + 1]
   local buf = buffers[case.name]
   vim.api.nvim_set_current_buf(buf)
-  local pos = probe.find(original[case.name], case.anchor, case.member)
+  local pos = probe.find(original[case.name], case.anchor, case.source_token or case.member)
   vim.api.nvim_buf_set_lines(buf, pos.line, pos.line + 1, false, { case.before })
   require('vim.lsp._changetracking').flush(client)
   vim.api.nvim_win_set_cursor(0, { pos.line + 1, #case.before })

@@ -1,6 +1,6 @@
 # Exact real-project probes
 
-These six manifests contain 13 source/declaration pairs and 24 selected semantic
+The six baseline manifests contain 13 source/declaration pairs and 24 selected semantic
 checks. Use the full pinned roots in [fork-corpus.md](../../docs/fork-corpus.md),
 including the focused compiler prerequisites recorded there. They do not establish
 whole-project coverage or IDEA parity. The harness derives unique UTF-16 positions
@@ -17,6 +17,19 @@ Use an explicit isolated harness run/cache directory when collecting comparable
 evidence. For the independent oracle, select `KTLSP_PROBE_SERVER=intellij` and
 provide `IJLS_PLUGIN`, `IJLS_SERVER`, and `IJLS_JDK` as documented in
 [fork-corpus.md](../../docs/fork-corpus.md). Successful import is required.
+
+`target_ranges` adds explicitly reviewed exact declaration ranges to the default
+identifier range. Only Gradle's primary-constructor probe currently uses it:
+IDEA returns its parameter-list range for a Java constructor call. The target
+text hash is mandatory, and every alternative must be nonempty and within the
+source's UTF-16 bounds. The result must still name exactly one expected file and
+match one exact range. An enclosing range or an extra location fails.
+
+Run the pure boundary checks with:
+
+```powershell
+rtk proxy nvim --headless -l dev/corpus_matcher_test.lua
+```
 
 ## CEM source snapshot and declaration oracles
 
@@ -82,5 +95,58 @@ An LSP null negative response is distinct from a timeout or protocol error.
 The scenario flushes pending Neovim notifications and checks outbound versions
 before one response per query, restores each buffer, then verifies the unchanged
 disk golden and clean editor buffers. That test transport barrier does not prove
-normal editor debounce or popup-display latency. Real-root incomplete cases remain
-separate acceptance work.
+normal editor debounce, server recomputation completion or popup-display latency.
+
+## Real-root incomplete controls
+
+Each `<project>-incomplete.json` uses the same corpus route against its full pinned
+root. Five cases make six first-response completion requests: a compiled disk
+control, a partial member, a dangling dot, a broken peer, and an unknown receiver
+paired with a useful known receiver in the same edited state. Across the six
+roots this is 30 cases and 36 requests per engine. A negative result does not pass
+its case if the known receiver is unusable. Expectations and recorded IDEA setup
+or semantic limitations remain explicit in each manifest and
+[fork-corpus.md](../../docs/fork-corpus.md).
+
+```powershell
+$env:KTLSP_CORPUS_WAIT_INDEX = '1'
+rtk proxy C:/Users/gummy/scoop/apps/git/current/bin/bash.exe dev/ktlsp-harness.sh corpus --root <corpus>/moshi-1.15.2 --file dev/corpus/moshi-1.15.2-incomplete.json --bin <immutable-release>/ktlsp.exe --no-build
+```
+
+Query and edited peer hashes are checked before startup. Source edits remain in
+buffers, are delivered once before each query, and are restored before the next
+case. Peers are attached because they are edited; this differs from merely reading
+a definition target as oracle text. Background index counts therefore need to be
+read alongside the attached buffers. These selected RPC controls do not establish
+whole-root editing coverage, normal debounce behavior or popup latency.
+
+## Compiler-plugin and processor controls
+
+Generate a new disposable Gradle project with the same sources and build settings
+as the independently compiled plugin control:
+
+```powershell
+rtk proxy nvim --headless -l dev/compiler_plugin_project.lua <new-external-directory>
+```
+
+It pins Kotlin JVM, serialization, all-open, no-arg and Kotlin Lombok to 1.9.23,
+javac Lombok processing to 1.18.32, serialization core to 1.6.3 and JDK 17.
+Compile the generated project with its actual Gradle wrapper before running
+`corpus --root <directory> --file dev/corpus/compiler-plugins.json`. Its twelve
+completion requests cover generated serialization/getter APIs from Java and
+Kotlin in complete, partial and dangling-dot buffers. No generated API is
+handwritten into a stub. Enable `KTLSP_CORPUS_WAIT_INDEX=1` for ktlsp's first
+response after indexing; retain missing-input coverage failures separately.
+
+Set `KTLSP_UI_CASES` to the absolute path of `compiler-plugins-ui.json` to run
+the existing native completion UI probe after the corpus requests. The UI case
+checks Kotlin's generated getter property: type a dot, select `name` from the
+actual LSP popup and inspect the exact inserted `.name` expression. IDEA offers
+this property projection rather than the manifest's literal `getName` method
+label; the original method-label failures are retained. The accepted expression
+has a compiler-positive processor-on and compiler-negative processor-off control.
+Use the same isolated temporary IntelliJ setup as the other corpus scenarios.
+
+The current ktlsp baseline fails all twelve generated-method completion checks.
+These fixtures expose that gap; they do not establish plugin configuration
+refresh, generated-symbol navigation, diagnostics, KAPT or KSP acceptance.

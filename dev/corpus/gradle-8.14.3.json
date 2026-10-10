@@ -11,7 +11,13 @@
       "target": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
       "target_anchor": "class DefaultProblemsReportCreator(",
       "target_token": "DefaultProblemsReportCreator",
-      "expected": "Java constructor resolves Kotlin class in same physical source tree; Gradle module is :problems, not :platforms:ide:problems.",
+      "target_ranges": [
+        {
+          "start": { "line": 48, "character": 34 },
+          "end": { "line": 55, "character": 1 }
+        }
+      ],
+      "expected": "Java constructor resolves this Kotlin class identifier or its exact primary-constructor parameter range, independently observed with IDEA ILS-263.6379.0. Gradle module is :problems, not :platforms:ide:problems.",
       "source_sha256": "84e9734bf314f0d3a9024b43f4bfac02dfb808a03c6d479cb0cfd218e3954ac9",
       "target_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
       "compiler_status": "focused problems Java+Kotlin compilation passed (root 28m46s)",

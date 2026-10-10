@@ -467,11 +467,14 @@ being present or a compiler task succeeding does not establish LSP support.
 [KSP generates new code and cannot modify existing source](https://kotlinlang.org/docs/ksp-overview.html).
 [SAM-with-receiver changes how the first Java SAM parameter is exposed to a Kotlin lambda](https://kotlinlang.org/docs/sam-with-receiver-plugin.html).
 [All-open changes class and member openness, including meta-annotations and annotated superclasses](https://kotlinlang.org/docs/all-open-plugin.html).
-[No-arg generates a synthetic constructor callable through reflection, not direct Java/Kotlin calls](https://kotlinlang.org/docs/no-arg-plugin.html).
-These transformations require distinct positive and negative expectations. In
-particular, completion must not advertise `new Foo()` merely because no-arg is
-enabled. Separate disposable fixtures are required for transformations absent
-from the selected real roots.
+[No-arg adds a zero-argument constructor](https://kotlinlang.org/docs/no-arg-plugin.html).
+Its documented reflection-only access requires a pinned compiler check: root's
+1.9.23 output has a public, non-synthetic constructor callable by a separate
+Java 17 compiler client. Java/Kotlin and source/binary expectations must be
+checked separately; see [the compiler controls](fork-acceptance.md).
+These transformations require distinct positive and negative expectations.
+Separate disposable fixtures are required for transformations absent from the
+selected real roots.
 
 ### Unsaved incomplete-code fixture control
 
@@ -507,5 +510,165 @@ fixture reports one background-indexed Kotlin file; the two Java/Kotlin query
 buffers are attached explicitly. This does not prove complete Maven source-root
 discovery. These small fixture results do not establish incomplete-code acceptance
 on the six real roots, normal debounce freshness, or popup-display latency.
-The same optional manifest fields will next exercise actual Moshi Kotlin, OkHttp
-Java and the other full roots without saving their source files.
+The real-root observations below use the same fields and retain failing controls.
+
+### Real-root unsaved incomplete-code comparison
+
+The six `dev/corpus/*-incomplete.json` manifests each contain five cases: compiled
+disk golden, partial member, dangling dot, broken peer and paired known/unknown
+receivers. Each root makes six completion requests because the unknown case also
+queries its known control. This is **30 cases and 36 requests per engine**. A
+negative unknown response is accepted only when the same-state known receiver is
+useful; an empty response alone cannot pass that case.
+
+The ktlsp binary is the immutable fourth release, SHA-256
+`8b9166c05d7769e8a3cecbfe18dcfad89acc7a0bf9fb96d51b925b08981a8c0c`.
+The independent oracle is ILS-263.6379.0 through the pinned official plugin.
+Every measured request uses its first response, with `attempts: 1`; no retry is
+used to accept a case. Counts below distinguish whole cases from requests whose
+predicate and required known control both pass.
+
+| Root | ktlsp cases / 5 | IDEA cases / 5 | ktlsp qualified requests / 6 | IDEA qualified requests / 6 |
+| --- | ---: | ---: | ---: | ---: |
+| Moshi | 5 | 5 | 6 | 6 |
+| OkHttp | 5 | 0 | 6 | 0 |
+| Retrofit | 0 | 5 | 0 | 6 |
+| Spring | 0 | 4 | 0 | 5 |
+| Gradle | 5 | 5 | 6 | 6 |
+| CEM non-Mixin call | 0 | 5 | 0 | 6 |
+
+These are 15/30 cases and 18/36 qualified requests for ktlsp, and 24/30 cases and
+29/36 qualified requests for IDEA. Retrofit's Kotlin facade, Spring's generic
+provider chain and CEM's `holderLookup().getOrThrow` are already unavailable in
+ktlsp's disk-golden controls. Their later failures do not isolate an incomplete
+parser regression. IDEA's OkHttp `Call.enqueue` candidate is absent in the disk
+golden as well; full-root import succeeds, so the limitation of that imported
+model remains explicit instead of weakening the expected compiled API.
+
+Spring's IDEA dangling-dot request passed in `incomplete-1` and failed in
+`inc-ctx2`, where `getObject` was absent and `getBeanProvider` incorrectly appeared.
+Both responses are retained. The latter run's paired unknown control passes after
+preserving the extension receiver scope. This is a variable first-response
+observation; outbound notification order does not establish completion of server
+recomputation. Neither a stable recovery result nor a specific cause is claimed.
+The original unknown edit had incorrectly placed the known call outside an
+expression-bodied extension; that manifest error and the later long-cache-path
+RocksDB initialization failure are preserved separately from product failures.
+Retrofit and CEM's final unknown edits also preserve their original return or
+initializer statements.
+
+Each engine records 48 delivered edit/restore versions and barriers, with every
+delivery, restored buffer and disk-hash control passing. The five Git clones also
+retain their tracked status. CEM's disposable snapshot has no `.git`, so that
+status control is unavailable; its queried and edited peer texts are hash-checked.
+No test saves an editor buffer or modifies the original CEM project.
+
+ktlsp still fails the independent source-input coverage check for every root:
+
+| Root | Background project files | Library files | Missing-source count |
+| --- | ---: | ---: | ---: |
+| Moshi | 149 | 25,123 | 4 |
+| OkHttp | 403 | 59,235 | 13 |
+| Retrofit | 313 | 56,644 | 29 |
+| Spring | 9,079 | 76,698 | 25 |
+| Gradle | 13,820 | 95,859 | 147 |
+| CEM | 121 | 37,825 | 6 |
+
+Both indexing phases finish with zero failed dependencies. Query and edited peer
+buffers are attached before indexing; the peer is attached because it is edited,
+rather than to expose an oracle declaration. Background counts therefore differ
+from the earlier read-only probes. Shared dependency availability also changed
+during independent imports: Retrofit's prior count was 30. These input changes
+are recorded and are not attributed to a binary fix.
+
+Moshi's four warnings have been individually classified from cached artifacts:
+Kotlin BOM 1.8.21 and 1.9.22 and coroutines BOM 1.8.0 have POM packaging and no JAR;
+`listenablefuture:9999.0-empty-to-avoid-conflict-with-guava` has a JAR with zero
+class entries. The current coverage check still fails; sound classification of
+source-less artifacts and coverage of actual semantic inputs remain follow-up
+work. This classification does not turn unrelated missing source archives into
+passing coverage.
+
+Evidence is under `ktlsp-corpus-probes-20261010/`, with an aggregate
+`real-incomplete-matrix.json`. The final per-root series are:
+
+- ktlsp: Moshi/OkHttp/Gradle `incomplete-fourth-1`, Spring
+  `incomplete-spring-context-2`, Retrofit/CEM `inc-ctx2`.
+- IDEA: Moshi/OkHttp `incomplete-1`, Spring/Retrofit/CEM `inc-ctx2`, Gradle `inc-1`.
+
+Each run contains `artifacts/corpus-results.json` and
+`artifacts/corpus-requests.jsonl`. Gradle's IDEA run reuses only the completed,
+isolated oracle cache after verifying its old backend exited; preceding backend
+logs were snapshotted. It is a warm correctness control. These selected RPC
+results do not establish whole-root editing coverage, normal debounce freshness,
+popup-display latency or a performance budget.
+
+### Gradle IDEA import JVM and primary-constructor ranges
+
+Full Gradle-root import now succeeds with JDK 17. The earlier failed imports
+remain recorded. `JAVA_HOME`, `defaultSdk`, task-local `org.gradle.java.home` and
+the disposable clone's ignored `.idea/gradle.xml` alone had left the backend
+selecting JDK 22. Inspection of the installed
+`com.jetbrains.ls.imports.gradle.GradleToolingApiHelper` shows that
+`findTheMostCompatibleJdk` first reads this JVM system property:
+
+```powershell
+$env:IJ_JAVA_OPTIONS = '"-Dcom.jetbrains.ls.imports.gradle.java.home=C:/Program Files/Java/jdk-17"'
+```
+
+Apply this option only to the pinned Gradle-root oracle. It is an internal
+implementation detail of ILS-263.6379.0, not a promised public configuration ABI.
+The pinned official plugin preserves it when adding the isolated server home.
+Without the property, the inspected method sorts compatible installed JDKs by
+version before its `JAVA_HOME` fallback. No tracked settings, daemon criteria or
+JDK-version guard were changed, and the guard's bypass property was not enabled.
+
+The installed executable SHA-256 is
+`9a732f33aa4ae59a2112249734a710ea6a93c7df284a4561a0bc5e5920ab96dc`;
+`plugins/kotlin.lsp/lib/modules/language-server.workspace-import.jar` is
+`b4fc5f0e11f798fe0cbe73481b19512ccc7b65f8e1a126db221629ca1366410b`.
+Evidence includes `GradleToolingApiHelper.javap.txt` and
+`gradle-jvm-property-evidence.json`. A task-local observational init script then
+records actual settings evaluation for the root and all three included builds:
+all four use PID 50276, JDK 17.0.7 and
+`ignore_build_java_version_check: false`. The callback only records these facts;
+it changes neither JVM selection nor the guard. Records are in
+`gradle-jvm-observations/*.json` under the same external evidence directory.
+The task-local Gradle home keeps cache/wrapper junctions; the real home remains
+unchanged.
+
+IDEA's Java `new DefaultProblemsReportCreator(...)` definition names the correct
+source file but selects its exact primary-constructor parameter list:
+zero-based UTF-16 range `48:34` to `55:1`. The identifier is `48:6` to `48:34`.
+Both are valid navigation extents for the compiled six-argument constructor,
+whose JVM signature is independently retained in
+`gradle-primary-constructor.javap.txt`. The portable Gradle manifest alone adds
+the reviewed constructor range through optional `target_ranges`; it retains the
+identifier alternative and requires the pinned target text hash and in-file
+bounds. Wrong files, other ranges, enclosing ranges and extra locations fail.
+`dev/corpus_matcher_test.lua` passes 18 pure checks, including these rejection
+controls and UTF-16 bounds. Other manifests' definition expectations are unchanged.
+
+The original `gradle-jvm-property-4` run retains its identifier-range assertion
+failure. With the explicit alternative, `gradle-8.14.3-intellij-range-1` passes
+all three first-response semantic requests and all ten Lua checks, including
+import success, graceful shutdown and unchanged source/Git controls. Its Bash
+wrapper subsequently fails with `project: unbound variable` at line 608; the
+harness script was edited while Bash awaited Neovim. The current script has no
+such access at that line, consistent with the known hazard of changing a running
+Bash script's unread tail. The queried source files remain unchanged. The routed
+run's exit remains 1; semantic checks passing does not relabel its whole-harness
+result as passing. Separate stable-wrapper controls now pass the basic scenario
+with exit 0 and complete the portable compiler-plugin corpus/native-UI route
+without an undefined variable. That latter route retains exit 1 for its three
+literal getter-label failures while its native UI stage passes; its harness hash
+is unchanged before/after. Evidence is `fifth-fixed/basic/artifacts` under the
+goal evidence root and `pp-idea-2/artifacts` under this corpus evidence root.
+Neither control relabels the original Gradle wrapper failure.
+
+The same reviewed manifest on the fourth ktlsp binary passes constructor completion
+and identifier navigation, while interface navigation still returns both the
+project declaration and its own local-JAR stub. Its missing-source count is 138,
+with 13,820 project and 95,272 library files. This later dependency availability
+differs from the incomplete-code run and is not a semantic fix or timing result.
+All owned oracle backends were verified exited after these runs.

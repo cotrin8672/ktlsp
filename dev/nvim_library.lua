@@ -1,10 +1,9 @@
 ---@diagnostic disable: undefined-global
 -- Headless Neovim test for *library* goto-definition.
 --
--- Drives the real ktlsp server against a project (arg[1]) whose `gradle/libs.versions.toml`
--- declares kotlin-stdlib, and asserts that goto on `listOf(...)` jumps into the JVM-specific
--- stdlib source set while `java.sql.Connection` jumps into indexed JDK source. Run via
--- dev/smoke_library.sh (which sets up the temp project).
+-- Drives the real ktlsp server against a compiled Gradle Kotlin project (arg[1]), and asserts
+-- that goto on `listOf(...)` jumps into stdlib source while `java.sql.Connection` jumps into
+-- indexed JDK source. Run via dev/ktlsp-harness.sh library or dev/smoke_library.sh.
 --
 --     nvim -l dev/nvim_library.lua <project-dir>
 
@@ -20,7 +19,9 @@ if not bin or bin == "" then
 end
 assert(vim.fn.filereadable(bin) == 1, "ktlsp binary not found — run `cargo build` first")
 
-vim.cmd("edit " .. vim.fn.fnameescape(project .. "/Main.kt"))
+local main = project .. "/src/main/kotlin/Main.kt"
+if vim.fn.filereadable(main) == 0 then main = project .. "/Main.kt" end
+vim.cmd("edit " .. vim.fn.fnameescape(main))
 local bufnr = vim.api.nvim_get_current_buf()
 vim.bo[bufnr].filetype = "kotlin"
 

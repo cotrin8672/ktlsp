@@ -13,7 +13,7 @@ scenarios:
   java           generated Java/Kotlin project; Java features and unsaved member completion
   mixed          generated Maven project; compiled mixed-language edits, goto, refs, and rename
   corpus         existing project comparison; requires --root and --file JSON probe manifest
-  library        generated version-catalog project; goto into kotlin-stdlib sources
+  library        compiled Gradle project; stdlib/JDK sources and unsaved dependency edits
   semantic       committed semantic probe; chains, receivers, and KMP narrowing
   project        existing project health check; requires --root and --file; optionally probes implementation
   java-project   existing Java project goto/references probe; requires --root, --file, and --token
@@ -44,10 +44,14 @@ mixed/corpus environment:
   KTLSP_MIXED_MAVEN_REPO   Maven cache (default: artifacts/m2)
   KTLSP_MIXED_SERVER       ktlsp (default) or intellij
   KTLSP_UI_SAMPLES         mixed builtin completion cycles per language (default: 1)
+  KTLSP_UI_CASES           optional corpus popup/accepted-text manifest; uses the same UI probe
   KTLSP_PROBE_SERVER       corpus backend: ktlsp (default) or intellij
   IJLS_PLUGIN/IJLS_SERVER  intellij-lsp.nvim plugin and server paths for intellij
   IJLS_JDK/JAVA_HOME       JDK for the IntelliJ server
 
+gradle-live environment:
+  KTLSP_GRADLE_RELOAD=1    disposable offline dependency/generated-source reload probe
+  GRADLE_USER_HOME        existing Gradle wrapper/plugin cache for that probe
 USAGE
 }
 
@@ -239,12 +243,53 @@ write_mixed_project() {
 
 write_library_project() {
   local project="$projects/library"
-  mkdir -p "$project/gradle"
+  mkdir -p "$project/gradle/wrapper" "$project/src/main/kotlin"
+  for file in gradlew gradlew.bat gradle/wrapper/gradle-wrapper.jar; do
+    cp "$repo/dev/gradle-wrapper-template/$file" "$project/$file"
+  done
+  chmod +x "$project/gradlew"
+  cat > "$project/gradle/wrapper/gradle-wrapper.properties" <<'PROPERTIES'
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-9.6.1-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+PROPERTIES
+  cat > "$project/settings.gradle" <<'GRADLE'
+pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }
+rootProject.name = 'ktlsp-library-fixture'
+GRADLE
+  cat > "$project/gradle.properties" <<'PROPERTIES'
+org.gradle.parallel=false
+org.gradle.workers.max=2
+kotlin.compiler.execution.strategy=in-process
+kotlin.stdlib.default.dependency=false
+PROPERTIES
   cat > "$project/gradle/libs.versions.toml" <<'TOML'
 [libraries]
 stdlib = "org.jetbrains.kotlin:kotlin-stdlib:2.2.20"
 TOML
-  cat > "$project/Main.kt" <<'KOTLIN'
+  cat > "$project/build.gradle" <<'GRADLE'
+plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0' }
+repositories { mavenCentral() }
+java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+kotlin { compilerOptions { jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17 } }
+configurations {
+    librarySources { canBeConsumed = false; canBeResolved = true; transitive = false }
+}
+dependencies {
+    implementation libs.stdlib
+    librarySources 'org.jetbrains.kotlin:kotlin-stdlib:2.2.20:sources'
+}
+def librarySourceFiles = configurations.librarySources.incoming.files
+tasks.register('prepareLibrarySources') {
+    inputs.files(librarySourceFiles)
+    doLast { inputs.files.files.each { println('LIBRARY_SOURCES\t' + it.absolutePath) } }
+}
+GRADLE
+  cat > "$project/src/main/kotlin/Main.kt" <<'KOTLIN'
 package app
 
 import java.sql.Connection
@@ -259,6 +304,10 @@ fun useConnection(connection: Connection) {
 }
 KOTLIN
   printf '%s\n' "$project"
+}
+
+run_library_compile() {
+  (cd "$1" && ./gradlew classes prepareLibrarySources --console=plain --no-daemon)
 }
 
 write_classpath_config_cache_project() {
@@ -470,6 +519,21 @@ run_and_capture() {
   return "$status"
 }
 
+run_completion_ui() {
+  local ui_project="$1" ui_artifacts="$artifacts"
+  local ui_script="$repo/dev/nvim_completion_ui.lua" ui_bin="$bin_arg"
+  if command -v cygpath >/dev/null 2>&1; then
+    ui_project="$(cygpath -m "$ui_project")"
+    ui_artifacts="$(cygpath -m "$ui_artifacts")"
+    ui_script="$(cygpath -m "$ui_script")"
+    ui_bin="$(cygpath -m "$ui_bin")"
+  fi
+  KTLSP_UI_PROJECT="$ui_project" KTLSP_UI_ARTIFACTS="$ui_artifacts" \
+    KTLSP_UI_SCRIPT="$ui_script" KTLSP_BIN="$ui_bin" \
+    run_and_capture completion-ui nvim --headless -u NONE -i NONE -n \
+      -c 'lua dofile(vim.env.KTLSP_UI_SCRIPT)'
+}
+
 postprocess() {
   if [ -x "$bench" ] && [ -s "$KTLSP_TRACE" ]; then
     "$bench" trace --file "$KTLSP_TRACE" --out "$artifacts/trace.json" >>"$artifacts/harness.log" 2>&1 || true
@@ -510,7 +574,12 @@ case "$scenario" in
     ;;
   library)
     project="${root_arg:-$(write_library_project)}"
-    run_and_capture library nvim -l "$repo/dev/nvim_library.lua" "$project" || run_status=$?
+    if [ -z "$root_arg" ]; then
+      run_and_capture library-compile run_library_compile "$project" || run_status=$?
+    fi
+    if [ "$run_status" -eq 0 ]; then
+      run_and_capture library nvim -l "$repo/dev/nvim_library.lua" "$project" || run_status=$?
+    fi
     ;;
   java)
     project="${root_arg:-$(write_java_project)}"
@@ -520,20 +589,7 @@ case "$scenario" in
     project="${root_arg:-$(write_mixed_project)}"
     run_and_capture mixed nvim -l "$repo/dev/nvim_mixed.lua" "$project" "$bin_arg" "$artifacts" || run_status=$?
     if [ "$run_status" -eq 0 ]; then
-      ui_project="$project"
-      ui_artifacts="$artifacts"
-      ui_script="$repo/dev/nvim_completion_ui.lua"
-      ui_bin="$bin_arg"
-      if command -v cygpath >/dev/null 2>&1; then
-        ui_project="$(cygpath -m "$ui_project")"
-        ui_artifacts="$(cygpath -m "$ui_artifacts")"
-        ui_script="$(cygpath -m "$ui_script")"
-        ui_bin="$(cygpath -m "$ui_bin")"
-      fi
-      KTLSP_UI_PROJECT="$ui_project" KTLSP_UI_ARTIFACTS="$ui_artifacts" \
-        KTLSP_UI_SCRIPT="$ui_script" KTLSP_BIN="$ui_bin" \
-        run_and_capture completion-ui nvim --headless -u NONE -i NONE -n \
-          -c 'lua dofile(vim.env.KTLSP_UI_SCRIPT)' || run_status=$?
+      run_completion_ui "$project" || run_status=$?
     fi
     ;;
   corpus)
@@ -542,6 +598,9 @@ case "$scenario" in
       run_status=2
     else
       run_and_capture corpus nvim -l "$repo/dev/nvim_corpus.lua" "$root_arg" "$file_arg" "$bin_arg" "$artifacts" || run_status=$?
+      if [ -n "${KTLSP_UI_CASES:-}" ]; then
+        run_completion_ui "$root_arg" || run_status=$?
+      fi
     fi
     ;;
   semantic)
@@ -574,20 +633,22 @@ case "$scenario" in
         "$root_arg" "$file_arg" "$bin_arg" "${needle_arg:-KotlinLogging}" "${burst_arg:-6}" || run_status=$?
     fi
     ;;
-  gradle-live)
-    project="${root_arg:-$repo/dev/gradle-sample}"
-    classpath_project="$(write_classpath_config_cache_project)"
-    run_classpath_config_cache_probe "$classpath_project" || run_status=$?
-    if [ "$run_status" -eq 0 ]; then
-      run_and_capture gradle-live nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
-    fi
-    ;;
-  gradle-compile)
-    project="${root_arg:-$repo/dev/gradle-sample}"
-    classpath_project="$(write_classpath_config_cache_project)"
-    run_classpath_config_cache_probe "$classpath_project" || run_status=$?
-    if [ "$run_status" -eq 0 ]; then
-      run_and_capture gradle-compile nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
+  gradle-live|gradle-compile)
+    if [ "${KTLSP_GRADLE_RELOAD:-0}" = "1" ]; then
+      if [ -n "$root_arg" ]; then
+        echo "Gradle reload probe requires its generated disposable project; omit --root" >&2
+        run_status=2
+      else
+        run_and_capture "$scenario" nvim -l "$repo/dev/nvim_gradle_reload.lua" \
+          "$projects/gradle-reload" "$bin_arg" "$artifacts" || run_status=$?
+      fi
+    else
+      project="${root_arg:-$repo/dev/gradle-sample}"
+      classpath_project="$(write_classpath_config_cache_project)"
+      run_classpath_config_cache_probe "$classpath_project" || run_status=$?
+      if [ "$run_status" -eq 0 ]; then
+        run_and_capture "$scenario" nvim -l "$repo/dev/nvim_gradle_live.lua" "$project" "$bin_arg" || run_status=$?
+      fi
     fi
     ;;
   comprehensive)

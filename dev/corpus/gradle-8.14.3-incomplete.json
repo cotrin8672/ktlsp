@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project_id": "gradle-8.14.3-incomplete",
+  "revision": "e5ee1df3d88b8ca3a8074787a94f373e3090e1db",
+  "build_tool": "gradle",
+  "scope": "Full root; one compiled production receiver, then unsaved partial member/dangling dot/broken peer/paired known-unknown controls. This does not establish complete-root editing coverage.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "oracle_status": "Original production call compiled. IDEA ILS-263.6379.0 imported the full root using task-local JDK 17 selection and matched all six first-response queries in a warm correctness run; see docs/fork-corpus.md. This is not a latency result.",
+  "probes": [
+    {
+      "id": "gradle-8.14.3-disk-control",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "anchor": "problemCount.incrementAndGet()",
+      "token": "incrementAndGet",
+      "definition": false,
+      "completion_token": "incrementAndGet",
+      "completion_excludes": [
+        "onProblem"
+      ],
+      "category": "disk-control",
+      "buffer_edits": []
+    },
+    {
+      "id": "gradle-8.14.3-partial-member",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "anchor": "problemCount.incrementAnd()",
+      "token": "incrementAnd",
+      "definition": false,
+      "completion_token": "incrementAndGet",
+      "completion_excludes": [
+        "onProblem"
+      ],
+      "category": "partial-member",
+      "buffer_edits": [
+        {
+          "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+          "anchor": "problemCount.incrementAndGet()",
+          "replacement": "problemCount.incrementAnd()",
+          "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+        }
+      ]
+    },
+    {
+      "id": "gradle-8.14.3-dangling-dot",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "anchor": ".(",
+      "token": ".",
+      "definition": false,
+      "completion_token": "incrementAndGet",
+      "completion_excludes": [
+        "onProblem"
+      ],
+      "category": "dangling-dot",
+      "buffer_edits": [
+        {
+          "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+          "anchor": "problemCount.incrementAndGet()",
+          "replacement": "problemCount.()",
+          "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+        }
+      ]
+    },
+    {
+      "id": "gradle-8.14.3-broken-peer",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "anchor": "problemCount.incrementAndGet()",
+      "token": "incrementAndGet",
+      "definition": false,
+      "completion_token": "incrementAndGet",
+      "completion_excludes": [
+        "onProblem"
+      ],
+      "category": "broken-peer",
+      "buffer_edits": [
+        {
+          "source": "platforms/ide/problems-api/src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java",
+          "anchor": "    void addProblem(InternalProblem problem);",
+          "replacement": "    void addProblem(InternalProblem problem);\n\n    default void ktlspBrokenPeer() { int broken = ; }",
+          "source_sha256": "dbb47bcb3ba697c291663e41df6cbbbb9f24ab97faec4edeb6c90547234db361"
+        }
+      ]
+    },
+    {
+      "id": "gradle-8.14.3-unknown-receiver",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "anchor": "ktlspUnknownReceiver.incrementAnd()",
+      "token": "incrementAnd",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "incrementAndGet",
+        "onProblem"
+      ],
+      "category": "unknown-receiver",
+      "buffer_edits": [
+        {
+          "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+          "anchor": "problemCount.incrementAndGet()",
+          "replacement": "ktlspUnknownReceiver.incrementAnd();\nproblemCount.incrementAndGet()",
+          "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+        }
+      ],
+      "known_control": {
+        "anchor": "problemCount.incrementAndGet()",
+        "token": "incrementAndGet",
+        "completion_token": "incrementAndGet",
+        "completion_excludes": [
+          "onProblem"
+        ]
+      }
+    }
+  ]
+}

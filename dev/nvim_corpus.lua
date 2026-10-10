@@ -66,19 +66,25 @@ for _, case in ipairs(manifest.probes) do
   end
   assert(not case.source_sha256 or case.source_sha256 == source.sha256, 'source changed since oracle: ' .. case.id)
   local position, completion_position = positions(edits[path] or source.disk, case)
-  local target, expected_range, expected
+  local target, expected_ranges
   if case.definition ~= false then
     target = full_path(assert(case.target_file or case.target, 'probe needs target'))
     local target_lines = vim.fn.readfile(target)
     assert(not case.target_sha256 or case.target_sha256 == vim.fn.sha256(table.concat(target_lines, '\n')),
       'target changed since oracle: ' .. case.id)
     local _, selection = probe.find(target_lines, assert(case.target_anchor), case.target_token or case.token)
-    expected_range = selection
-    expected = probe.location_key(vim.uri_from_fname(target), expected_range)
+    expected_ranges = { selection }
+    if case.target_ranges then
+      assert(case.target_sha256, 'explicit target ranges require a pinned target hash: ' .. case.id)
+      for _, range in ipairs(case.target_ranges) do
+        assert(probe.range_in_source(range, target_lines), 'target range outside source: ' .. case.id)
+        expected_ranges[#expected_ranges + 1] = range
+      end
+    end
   end
   local prep = { case = case, buf = source.buf, position = position,
     completion_position = completion_position, edits = edits, has_edits = next(edits) ~= nil,
-    expected = expected, range = expected_range, target = target }
+    ranges = expected_ranges, target = target }
   if case.known_control then
     assert(case.known_control.completion_token ~= false and case.known_control.completion ~= false,
       'known receiver control must require a useful completion: ' .. case.id)
@@ -250,18 +256,7 @@ local function request(prep, method, accepts)
 end
 
 local function exact_definition(prep, result)
-  local found = probe.locations(result)
-  if #found ~= 1 then return false end
-  local loc = found[1]
-  local uri, range = loc.uri or loc.targetUri, loc.targetSelectionRange or loc.range
-  if prep.case.target_uri_suffix then
-    -- A dependency may be exposed as a jar URI or an extracted file in either engine.
-    -- Its qualified source path AND exact declaration range must match the verified archive source.
-    local decoded = uri and uri:gsub('%%(%x%x)', function(hex) return string.char(tonumber(hex, 16)) end)
-    local suffix = '/' .. prep.case.target_uri_suffix:gsub('\\', '/')
-    return decoded and decoded:gsub('\\', '/'):sub(-#suffix) == suffix and vim.deep_equal(range, prep.range)
-  end
-  return probe.location_key(uri, range) == prep.expected
+  return probe.exact_definition(result, prep.target, prep.ranges, prep.case.target_uri_suffix)
 end
 local function completion(prep)
   local token = prep.case.completion_token or prep.case.token

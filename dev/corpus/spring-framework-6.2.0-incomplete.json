@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project_id": "spring-framework-6.2.0-incomplete",
+  "revision": "5024bb72279188f1d0dcfe19e8abdd4bdb9887c8",
+  "build_tool": "gradle",
+  "scope": "Full root; one compiled production receiver, then unsaved partial member/dangling dot/broken peer/paired known-unknown controls. This does not establish complete-root editing coverage.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "oracle_status": "Original production call compiled. IDEA ILS-263.6379.0 matched disk, partial, broken-peer and paired-unknown controls; dangling-dot first responses differ across runs and the latest fails. The unknown edit preserves the extension receiver scope. See docs/fork-corpus.md.",
+  "probes": [
+    {
+      "id": "spring-framework-6.2.0-disk-control",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "anchor": "getBeanProvider<T>().getObject()",
+      "token": "getObject",
+      "definition": false,
+      "completion_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "category": "disk-control",
+      "buffer_edits": []
+    },
+    {
+      "id": "spring-framework-6.2.0-partial-member",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "anchor": "getBeanProvider<T>().getObj()",
+      "token": "getObj",
+      "definition": false,
+      "completion_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "category": "partial-member",
+      "buffer_edits": [
+        {
+          "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+          "anchor": "getBeanProvider<T>().getObject()",
+          "replacement": "getBeanProvider<T>().getObj()",
+          "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2"
+        }
+      ]
+    },
+    {
+      "id": "spring-framework-6.2.0-dangling-dot",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "anchor": ".(",
+      "token": ".",
+      "definition": false,
+      "completion_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "category": "dangling-dot",
+      "buffer_edits": [
+        {
+          "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+          "anchor": "getBeanProvider<T>().getObject()",
+          "replacement": "getBeanProvider<T>().()",
+          "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2"
+        }
+      ]
+    },
+    {
+      "id": "spring-framework-6.2.0-broken-peer",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "anchor": "getBeanProvider<T>().getObject()",
+      "token": "getObject",
+      "definition": false,
+      "completion_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "category": "broken-peer",
+      "buffer_edits": [
+        {
+          "source": "spring-beans/src/main/java/org/springframework/beans/factory/ObjectProvider.java",
+          "anchor": "\tdefault T getObject() throws BeansException {",
+          "replacement": "\tdefault void ktlspBrokenPeer() { int broken = ; }\n\n\tdefault T getObject() throws BeansException {",
+          "source_sha256": "730971e9b689acf5753a97250c861e3f9588481d443fb6dc401c05e9b0312174"
+        }
+      ]
+    },
+    {
+      "id": "spring-framework-6.2.0-unknown-receiver",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "anchor": "ktlspUnknownReceiver.getObj()",
+      "token": "getObj",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "getObject",
+        "getBeanProvider"
+      ],
+      "category": "unknown-receiver",
+      "buffer_edits": [
+        {
+          "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+          "anchor": "inline fun <reified T : Any> BeanFactory.getBean(): T =\n\t\tgetBeanProvider<T>().getObject()",
+          "replacement": "inline fun <reified T : Any> BeanFactory.getBean(): T {\n\t\tktlspUnknownReceiver.getObj();\n\t\treturn getBeanProvider<T>().getObject()\n}",
+          "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2"
+        }
+      ],
+      "known_control": {
+        "anchor": "getBeanProvider<T>().getObject()",
+        "token": "getObject",
+        "completion_token": "getObject",
+        "completion_excludes": [
+          "getBeanProvider"
+        ]
+      }
+    }
+  ]
+}

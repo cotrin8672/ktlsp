@@ -36,6 +36,43 @@ function M.locations(result)
   return (result.uri or result.targetUri) and { result } or result
 end
 
+function M.range_in_source(range, lines)
+  local function inside(position)
+    if type(position) ~= 'table' then return false end
+    for _, key in ipairs({ 'line', 'character' }) do
+      local value = position[key]
+      if type(value) ~= 'number' or value < 0 or value ~= math.floor(value) then return false end
+    end
+    local line = lines[position.line + 1]
+    return line ~= nil and position.character <= vim.str_utfindex(line, 'utf-16')
+  end
+  if type(range) ~= 'table' or not inside(range.start) or not inside(range['end']) then return false end
+  return range.start.line < range['end'].line
+    or (range.start.line == range['end'].line and range.start.character < range['end'].character)
+end
+
+function M.exact_definition(result, target, ranges, uri_suffix)
+  local found = M.locations(result)
+  if #found ~= 1 or type(found[1]) ~= 'table' then return false end
+  local location = found[1]
+  local uri = location.uri or location.targetUri
+  local range = location.targetSelectionRange or location.range
+  if type(uri) ~= 'string' or type(range) ~= 'table' then return false end
+  if uri_suffix then
+    -- Archive and extracted URIs must name the same qualified source file.
+    local decoded = uri:gsub('%%(%x%x)', function(hex) return string.char(tonumber(hex, 16)) end)
+    local suffix = '/' .. uri_suffix:gsub('\\', '/')
+    if decoded:gsub('\\', '/'):sub(-#suffix) ~= suffix then return false end
+  else
+    local ok, path = pcall(vim.uri_to_fname, uri)
+    if not ok or M.path_key(path) ~= M.path_key(target) then return false end
+  end
+  for _, expected in ipairs(ranges) do
+    if vim.deep_equal(range, expected) then return true end
+  end
+  return false
+end
+
 function M.completion_has(result, token)
   if type(result) ~= 'table' then return false end
   for _, item in ipairs(result.items or result) do

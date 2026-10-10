@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project_id": "okhttp-4.12.0-incomplete",
+  "revision": "4984568367caaf359b82c452bd28b5e192824d1c",
+  "build_tool": "gradle",
+  "scope": "Full root; one compiled production receiver, then unsaved partial member/dangling dot/broken peer/paired known-unknown controls. This does not establish complete-root editing coverage.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "oracle_status": "Original production call compiled. IDEA ILS-263.6379.0 imported the full root but Call.enqueue completion is missing even for the disk golden; its same-state negative control is not accepted without a useful positive. See docs/fork-corpus.md.",
+  "probes": [
+    {
+      "id": "okhttp-4.12.0-disk-control",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "anchor": "client.newCall(request).enqueue(",
+      "token": "enqueue",
+      "definition": false,
+      "completion_token": "enqueue",
+      "completion_excludes": [
+        "newCall"
+      ],
+      "category": "disk-control",
+      "buffer_edits": []
+    },
+    {
+      "id": "okhttp-4.12.0-partial-member",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "anchor": "client.newCall(request).enqu(",
+      "token": "enqu",
+      "definition": false,
+      "completion_token": "enqueue",
+      "completion_excludes": [
+        "newCall"
+      ],
+      "category": "partial-member",
+      "buffer_edits": [
+        {
+          "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+          "anchor": "client.newCall(request).enqueue(",
+          "replacement": "client.newCall(request).enqu(",
+          "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2"
+        }
+      ]
+    },
+    {
+      "id": "okhttp-4.12.0-dangling-dot",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "anchor": ".(",
+      "token": ".",
+      "definition": false,
+      "completion_token": "enqueue",
+      "completion_excludes": [
+        "newCall"
+      ],
+      "category": "dangling-dot",
+      "buffer_edits": [
+        {
+          "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+          "anchor": "client.newCall(request).enqueue(",
+          "replacement": "client.newCall(request).(",
+          "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2"
+        }
+      ]
+    },
+    {
+      "id": "okhttp-4.12.0-broken-peer",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "anchor": "client.newCall(request).enqueue(",
+      "token": "enqueue",
+      "definition": false,
+      "completion_token": "enqueue",
+      "completion_excludes": [
+        "newCall"
+      ],
+      "category": "broken-peer",
+      "buffer_edits": [
+        {
+          "source": "okhttp/src/main/kotlin/okhttp3/Call.kt",
+          "anchor": "  fun enqueue(responseCallback: Callback)",
+          "replacement": "  fun enqueue(responseCallback: Callback)\n\n  fun ktlspBrokenPeer() { val broken = }",
+          "source_sha256": "1207c71dd6de35a2afcbbdc3d4b2de6a72aeae88345a9cf256c8a6ade82c07af"
+        }
+      ]
+    },
+    {
+      "id": "okhttp-4.12.0-unknown-receiver",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "anchor": "ktlspUnknownReceiver.enqu()",
+      "token": "enqu",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "enqueue",
+        "newCall"
+      ],
+      "category": "unknown-receiver",
+      "buffer_edits": [
+        {
+          "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+          "anchor": "client.newCall(request).enqueue(",
+          "replacement": "ktlspUnknownReceiver.enqu();\nclient.newCall(request).enqueue(",
+          "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2"
+        }
+      ],
+      "known_control": {
+        "anchor": "client.newCall(request).enqueue(",
+        "token": "enqueue",
+        "completion_token": "enqueue",
+        "completion_excludes": [
+          "newCall"
+        ]
+      }
+    }
+  ]
+}

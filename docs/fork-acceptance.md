@@ -41,20 +41,20 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. First slice: 711 pass / 3 ignored. Fourth slice: 746 pass / 3 ignored across 30 suites | Current Rust suite verified | Root `rtk cargo test --workspace --no-fail-fast`, exit 0; original failures retained below |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Original basic passes 9; extended Java fails 5 useful member cases; features fails 3 then stalls. Third release passes 221 assertions. Fourth release: expanded Java 99, mixed 36 and semantic 18 pass | Current focused editor suite verified | Fourth release 153 assertions across three affected scenarios; unchanged third-release basic/features/library evidence retained separately; real-project acceptance continues |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. First slice: 711 pass / 3 ignored. Fifth slice: 779 pass / 3 ignored across 31 suites | Current Rust suite verified | Root `rtk cargo test --workspace`, exit 0; original failures retained below |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Fifth immutable release passes basic 9, Java 99, features 80, semantic 18, mixed 36 and library 13, plus native completion UI in both languages | Six current scenarios verified | 255 assertions and two UI samples; library uses an actual compiled Gradle project with unchanged stdlib and thirteen expectations. Real-project acceptance continues |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Copy resolves 101 materialized classpath entries; offline Kotlin/Java compile succeeds; broad Neovim hover/class-goto smoke passes | Partial | Broad scan also includes extracted Java outside Gradle source roots; class-goto smoke does not independently prove dependency attribution. Exact archive-backed probes, source scope, overrides, diagnostics and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Focused Java incomplete member recovery passes; complete-source corpus probes alone do not cover this requirement | Partial | Exercise unsaved incomplete buffers on real projects; require intended candidates and exclude unrelated ones, with first responses after change delivery recorded |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real six-root controls: fourth ktlsp passes 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 cases and 29/36 qualified requests. All requests use attempt 1; each engine passes 48 edit/restore delivery controls | Failing; reproduced | [fork-corpus.md](fork-corpus.md) records exact per-root results, source hashes, first-response instability and missing-input coverage. Small mixed incomplete fixture passes both engines; it does not replace these failures |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Not yet measured | Pending | Include invalid and ambiguous cases with independent expected results |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Not yet measured | Pending | Extend existing semantic/editor probes |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Baseline omits a Java generic-chain use and renamed snapshot fails compilation. Fixed release and adapted IDEA update all three exact semantic sites, preserve all three complete buffers and compile the renamed snapshot | Mixed fixture verified | Actual corpus, overloads, JVM facades, ambiguous names and extension-provided references remain pending |
-| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Full indexing exposes wrong nested-type targets and project/dependency version duplicates in Moshi and Retrofit; actual Gradle remapped project ownership also fails | Failing; reproduced | Preserve module-specific classpaths and source ownership rather than adding all dependency symbols to one unscoped lookup; generated-source refresh still pending |
+| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Fourth release full indexing exposes wrong nested-type targets and project/dependency version duplicates in Moshi and Retrofit; actual Gradle remapped project ownership also fails. Shared origin/module repair is under validation | Failing; repair in validation | Live baseline has 30/72 checks passing on one connection despite all four actual offline Java/Kotlin builds passing; library addition/update/removal and generated-source refresh still fail |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | No live classpath-refresh acceptance case verified | Pending | Build disposable versioned dependencies, keep the same LSP session, and verify new members/targets plus removal of obsolete facts; test watched-file/config invalidation without restarting |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | No Kotlin/Java compiler-plugin acceptance case verified | Pending | Independently verify compiler and IDEA expectations for Kotlin serialization/all-open/no-arg, KAPT/KSP outputs and Java Lombok or processor-generated APIs; distinguish generated source from source-less semantic transformations |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Actual mixed Gradle compilation passes with serialization/all-open/no-arg/Kotlin Lombok and javac Lombok; fourth ktlsp fails all 12 generated-method completion requests. IDEA passes 9 literal method-label requests and inserts Kotlin's generated getter property through the native Neovim popup | Failing; reproduced | Compiler-positive/negative controls and exact accepted text are retained below. Plugin config/source refresh, diagnostics, navigation, KAPT and KSP remain unverified |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | No extension mechanism validated | Pending | Prove smallest contract after ordinary semantic slice; test config/source invalidation |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
@@ -68,8 +68,11 @@ the input program; Lombok's javac processor transforms compiler trees. See the
 [Lombok execution path](https://projectlombok.org/contributing/lombok-execution-path).
 The [all-open plugin](https://kotlinlang.org/docs/all-open-plugin.html) changes
 class/member openness, while the [no-arg plugin](https://kotlinlang.org/docs/no-arg-plugin.html)
-creates a synthetic constructor that direct Java/Kotlin calls cannot use. Do not
-invent a callable zero-argument constructor just because that plugin is enabled.
+adds a zero-argument constructor. Its documented reflection-only visibility must
+not replace pinned compiler evidence: root's actual 1.9.23 bytecode has a public,
+non-synthetic constructor, and a separate Java 17 caller compiles against it.
+Check Java and Kotlin callability separately, including source and binary views;
+do not infer either language's callable API merely from the plugin's name.
 Pin each fixture's actual plugin/compiler versions; current documentation does
 not substitute for that fixture's compiler and IDEA observations.
 
@@ -84,6 +87,90 @@ method returns `KSerializer<Model>`. `compile-oracle.ps1`, source files, compile
 logs and generated class files retain the evidence. No serializer method was
 written into a source stub. This proves the expected API independently; LSP
 completion, diagnostics, navigation and unsaved invalidation are still unverified.
+
+Root's additional pinned all-open/no-arg 1.9.23 and Lombok 1.18.32 controls
+pass 30 compiler, bytecode and runtime assertions with JDK 17. Evidence is
+`plugin-oracle/compiler-controls.py`, `compiler-controls.json`,
+`compiler-artifacts.json`, the three source directories and individual logs
+under the same external goal directory. With all-open disabled, both Java and
+Kotlin reject inheritance/override; enabled output removes the relevant final
+flags and both clients compile. Lombok disabled emits no getter or argument
+constructor, and both language clients fail; enabled javac processing emits both
+APIs, both clients compile and a Kotlin/Java runtime control reads the expected
+values. These members were not written into generated source stubs.
+
+The no-arg pin requires different Java and Kotlin expectations. Disabled output
+has no zero-argument constructor and reflection fails. Enabled output exposes
+public `()V` without `ACC_SYNTHETIC`; reflection succeeds with `isSynthetic=false`,
+and a separate Java client compiles `new NeedsLabel()`. Kotlin still rejects
+`NeedsLabel()` with its missing `label` argument in both modes. This matches the
+[1.9.23 backend source](https://github.com/JetBrains/kotlin/blob/v1.9.23/plugins/noarg/noarg.backend/src/org/jetbrains/kotlin/noarg/NoArgIrGenerationExtension.kt),
+which sets synthetic source offsets while constructing the IR constructor;
+synthetic offsets do not prove a JVM synthetic access flag. The original
+documentation-derived synthetic assertion fails and is preserved in
+`noarg-doc-hypothesis-failed.json`, `noarg-reflect-runtime-doc-hypothesis-failed.log`
+and `noarg/ReflectCheck-doc-hypothesis.java.txt`. Separate source/light-model IDEA
+behavior and LSP editing are still unmeasured; neither is inferred from these
+compiled-client controls.
+
+### Actual plugin project and Neovim editing
+
+The real mixed Gradle control uses wrapper 8.10.2, JDK 17, Kotlin 1.9.23
+JVM/serialization/all-open/no-arg/Lombok plugins, javac Lombok 1.18.32 and
+serialization core 1.6.3. `compileKotlin` runs before `compileJava`; both
+language clients compile against actual plugin output. Sources contain annotated
+declarations only, with no handwritten generated getter or serializer method.
+The reusable `dev/compiler_plugin_project.lua` reproduces these six sources,
+build settings and wrapper; 69 external preflight assertions check identity,
+manifest hashes, edit anchors and query positions against the compiled control.
+The generated portable project also passes its own offline `classes` build
+(both compiler tasks execute, exit 0, 17 seconds); evidence is
+`portable-plugin-classes.log`. Its first generator draft omitted the explicit
+plugin-management repositories and failed identity preflight. That draft was
+retained separately and the corrected fixture was generated into a new directory.
+
+`dev/corpus/compiler-plugins.json` makes twelve first-response requests: Java
+and Kotlin serialization/getter calls in complete, partial and dangling-dot
+buffers. In `plugin-oracle/editor-ktlsp-fourth-1`, all twelve literal generated
+method-label checks fail after completed indexing. Its one missing source remains
+an independent coverage failure. Every unsaved edit and restoration is delivered
+and source files stay unchanged. `editor-intellij-1` imports successfully and
+passes all six serializer and three Java getter requests. Its three Kotlin
+getter requests return the useful property label `name`; they retain their
+literal `getName` assertion failures rather than being reported as empty results.
+
+The same native Neovim UI probe, using `compiler-plugins-ui.json`, types a dot,
+selects the actual LSP item `name` with detail `(from getName())`, accepts it
+through the keyboard and verifies exactly
+`fun lombokMethodFromKotlin() = Person("method").name`. No URI adapter is used
+for this completion. `editor-intellij-ui-property-1/artifacts/completion-ui.json`
+records one useful popup, unchanged disk source and real backend exit 0 after
+shutdown. Input-to-popup handoff is 1,536 ms and RPC time 1,510 ms in this loaded
+run; one sample supplies no latency acceptance. The default mixed UI cases also
+pass both languages after the optional-manifest change, in
+`ui-default-manifest-control/completion-ui.json`.
+
+`plugin-oracle/ui-accepted-control/checks.json` independently compiles the actual
+accepted `.name` expression against the Gradle-processed `Person` successfully.
+The same expression fails against `Person` compiled with processing disabled;
+its private source field alone cannot establish a usable Kotlin property.
+All three processor/accepted-expression compiler controls pass. These observations
+do not verify source/configuration refresh, generated-symbol navigation or
+diagnostics. All-open/no-arg editing and KAPT/KSP remain separate work.
+
+The portable regenerated project is also exercised through the complete corpus
+plus native UI route with a fresh isolated official IDEA import. In
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-probes-20261010/pp-idea-2/artifacts`,
+all twelve requests use attempt 1 and retain the same nine literal successes and
+three Kotlin property-label failures. Despite corpus exit 1, the configured UI
+stage runs, accepts the exact `.name` line and exits its backend cleanly with code
+0. The Bash footer finishes normally; overall status 1 preserves the three
+strict query failures. Harness SHA-256 is unchanged before/after, all six source
+files remain unchanged, and owned IDEA/task-local Gradle processes are stopped.
+This validates the optional UI route without relabeling the original assertions.
+
+Evidence paths in this section are below
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/`.
 
 ## Measurement policy and initial UX targets
 
@@ -118,6 +205,82 @@ lower the accepted latency distribution. Sampling/profiling runs are separate fr
 timing runs. Initialization timing never substitutes for editor completion timing.
 
 ## Work log
+
+### Gradle ownership and scoped semantic facts: fifth checkpoint
+
+The new immutable release is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/fifth-fixed/bin/ktlsp.exe`,
+SHA-256 `c3f4f63b35ec8ff0a4df3cd41aa168cd58f670fe6faff384d5780a705d441076`.
+Root's complete Rust suite passes 779 tests with three ignored across 31 suites;
+release compilation succeeds. Logs are `fifth-slice/cargo-workspace-boundary.log`
+and `fifth-slice/release-build-boundary.log` under the same external goal root.
+
+Gradle snapshots now retain actual project directories, registered Java/Kotlin
+source-set roots, generated/processor output roots, resolved artifact identities
+and ordered per-source-set classpaths. Java and Kotlin query the same borrowed
+scoped index. Type ownership is chosen before nested/member lookup; source and
+shallow class-name stubs for one selected origin no longer create unrelated
+version fallbacks. Reverse references and rename resolve each candidate in its
+own source scope. Arc-backed origin facts avoid cloning the whole index for each
+query, and model/source changes bump the shared revision.
+
+Interactive goto/hover import seeding reads only the published snapshot. The old
+request path launched a deliberately failing Gradle wrapper; the focused
+regression reproduces that failure and then passes with the request fix. Source
+downloads/extraction can still involve I/O; removing Gradle from this path alone
+does not establish a latency budget.
+
+An additional actual-LSP review exposed a startup/error boundary: when Gradle
+resolution failed, initial broad source facts remained globally visible. Both
+languages navigated/completed a closed resources-directory decoy while resolution
+was pending and after failure. The immutable pre-boundary binary records eight
+semantic failures, while eight same-file positive controls pass. Evidence is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-semantic-gaps-20261010/pending-model-before2/`.
+Known Gradle projects now start with an explicit empty scoped model; only
+registered roots are scanned even when a model has no supported source sets.
+Unknown ownership cannot enable a global fallback. Non-Gradle legacy behavior is
+covered separately. The same external LSP reproduction passes all 23 checks
+against the frozen fifth release, including all eight leak regressions and all
+eight useful same-file controls. Request-path wrapper counts do not increase,
+both source hashes remain unchanged and the server shuts down with exit 0.
+Evidence is the sibling `pending-model-after/artifacts/results.json`.
+
+Root's five completed Neovim scenarios are under `fifth-fixed/<scenario>/artifacts`:
+basic, Java, features, semantic and mixed all exit 0. Mixed independently compiles
+the original, unsaved and applied-rename snapshots, preserves exact source after
+both renames, and passes both native popup/accepted-text cases with clean backend
+exit. The older smoke scenarios terminate Neovim directly and log a terminated
+server job; their assertion success is not a graceful-shutdown check. Each wrapper
+run hashes the harness before and after execution. The catalog-only library
+fixture fails both attempted navigation assertions; its eleven JDK lifecycle
+checks are consequently unrun. Raw artifacts remain in `fifth-fixed/library`.
+The replacement fixture compiles Gradle 9.6.1 / Kotlin plugin 2.4.0 with the
+unchanged stdlib 2.2.20 pin and passes all thirteen original library assertions
+on the same frozen binary. `dev/smoke_library.sh` delegates to this shared fixture.
+The actual source-set root, selected stdlib version, zero unresolved inputs,
+emitted `MainKt.class`, identical pinned stdlib source archive and stable harness
+hash are checked in `library-fixture-proof.json`. Evidence is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-gradle-model-20261010/fifth-library-actual-gradle/artifacts/`.
+This adds the sixth scenario, for 255 assertions plus two native UI samples.
+The scoped policy and all thirteen library expectations are unchanged.
+
+Actual custom-root evidence is `source-root-{cold,warm}.log`: JDK 17, Gradle
+8.10.2 and Kotlin 1.9.23 compile ordinary and late custom Java/Kotlin roots,
+include the configured processor-output root, and exclude resource directories
+containing deliberately invalid Java/Kotlin decoys. Both strict configuration-cache
+runs exit 0 and the warm run reuses the cache. The 194-module Gradle dump's older
+configuration-cache reuse evidence predates this resource-root refinement and
+is not substituted for the newer custom-root control.
+
+The live reload acceptance remains failing. The strengthened existing
+`KTLSP_GRADLE_RELOAD=1 ... gradle-live` probe has 30 passing and 42 failing checks
+out of 72 in
+`C:/Users/gummy/AppData/Local/Temp/kr-reload-baseline-4/artifacts/`.
+All four real offline builds compile; initial classpath checks and unsaved
+cross-language controls pass. New/updated/removed libraries and standard/custom
+generated sources remain stale on the same connection. A negative removal check
+requires its prior useful positive result. Refresh implementation follows this
+ownership checkpoint; no restart-based run counts as live refresh acceptance.
 
 ### Imported superclass identity: fourth checkpoint
 

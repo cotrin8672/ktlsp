@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "project_id": "compiler-plugin-gradle-mixed",
+  "build_tool": "gradle",
+  "scope": "Compiler-verified generated APIs; 12 completion requests with plugin ON. Synthetic navigation and plugin OFF/config-refresh remain separate acceptance.",
+  "probes": [
+    {
+      "id": "serialization-java-golden",
+      "source": "src/main/java/pluginfixture/JavaUse.java",
+      "anchor": "Model.Companion.serializer()",
+      "token": "serializer",
+      "completion_token": "serializer",
+      "definition": false,
+      "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e"
+    },
+    {
+      "id": "serialization-java-partial",
+      "source": "src/main/java/pluginfixture/JavaUse.java",
+      "anchor": "Model.Companion.seri",
+      "token": "seri",
+      "completion_token": "serializer",
+      "definition": false,
+      "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e",
+      "buffer_edits": [
+        {
+          "anchor": "Model.Companion.serializer()",
+          "replacement": "Model.Companion.seri",
+          "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e"
+        }
+      ]
+    },
+    {
+      "id": "serialization-java-dangling-dot",
+      "source": "src/main/java/pluginfixture/JavaUse.java",
+      "anchor": "Model.Companion.",
+      "token": "Companion.",
+      "completion_token": "serializer",
+      "definition": false,
+      "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e",
+      "buffer_edits": [
+        {
+          "anchor": "Model.Companion.serializer()",
+          "replacement": "Model.Companion.",
+          "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e"
+        }
+      ]
+    },
+    {
+      "id": "serialization-kotlin-golden",
+      "source": "src/main/kotlin/pluginfixture/KotlinUse.kt",
+      "anchor": "Model.serializer()",
+      "token": "serializer",
+      "completion_token": "serializer",
+      "definition": false,
+      "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+    },
+    {
+      "id": "serialization-kotlin-partial",
+      "source": "src/main/kotlin/pluginfixture/KotlinUse.kt",
+      "anchor": "Model.seri",
+      "token": "seri",
+      "completion_token": "serializer",
+      "definition": false,
+      "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f",
+      "buffer_edits": [
+        {
+          "anchor": "Model.serializer()",
+          "replacement": "Model.seri",
+          "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+        }
+      ]
+    },
+    {
+      "id": "serialization-kotlin-dangling-dot",
+      "source": "src/main/kotlin/pluginfixture/KotlinUse.kt",
+      "anchor": "Model.",
+      "token": ".",
+      "completion_token": "serializer",
+      "definition": false,
+      "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f",
+      "buffer_edits": [
+        {
+          "anchor": "Model.serializer()",
+          "replacement": "Model.",
+          "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+        }
+      ]
+    },
+    {
+      "id": "lombok-java-golden",
+      "source": "src/main/java/pluginfixture/JavaUse.java",
+      "anchor": "new Person(\"Java\").getName()",
+      "token": "getName",
+      "completion_token": "getName",
+      "definition": false,
+      "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e"
+    },
+    {
+      "id": "lombok-java-partial",
+      "source": "src/main/java/pluginfixture/JavaUse.java",
+      "anchor": "new Person(\"Java\").getN",
+      "token": "getN",
+      "completion_token": "getName",
+      "definition": false,
+      "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e",
+      "buffer_edits": [
+        {
+          "anchor": "new Person(\"Java\").getName()",
+          "replacement": "new Person(\"Java\").getN",
+          "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e"
+        }
+      ]
+    },
+    {
+      "id": "lombok-java-dangling-dot",
+      "source": "src/main/java/pluginfixture/JavaUse.java",
+      "anchor": "new Person(\"Java\").",
+      "token": ".",
+      "completion_token": "getName",
+      "definition": false,
+      "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e",
+      "buffer_edits": [
+        {
+          "anchor": "new Person(\"Java\").getName()",
+          "replacement": "new Person(\"Java\").",
+          "source_sha256": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e"
+        }
+      ]
+    },
+    {
+      "id": "lombok-kotlin-golden",
+      "source": "src/main/kotlin/pluginfixture/KotlinUse.kt",
+      "anchor": "Person(\"method\").getName()",
+      "token": "getName",
+      "completion_token": "getName",
+      "definition": false,
+      "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+    },
+    {
+      "id": "lombok-kotlin-partial",
+      "source": "src/main/kotlin/pluginfixture/KotlinUse.kt",
+      "anchor": "Person(\"method\").getN",
+      "token": "getN",
+      "completion_token": "getName",
+      "definition": false,
+      "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f",
+      "buffer_edits": [
+        {
+          "anchor": "Person(\"method\").getName()",
+          "replacement": "Person(\"method\").getN",
+          "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+        }
+      ]
+    },
+    {
+      "id": "lombok-kotlin-dangling-dot",
+      "source": "src/main/kotlin/pluginfixture/KotlinUse.kt",
+      "anchor": "Person(\"method\").",
+      "token": ".",
+      "completion_token": "getName",
+      "definition": false,
+      "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f",
+      "buffer_edits": [
+        {
+          "anchor": "Person(\"method\").getName()",
+          "replacement": "Person(\"method\").",
+          "source_sha256": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+        }
+      ]
+    }
+  ]
+}

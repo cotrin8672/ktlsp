@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project_id": "moshi-1.15.2-incomplete",
+  "revision": "7f957b18ea123b7bb2ffc9d3c079e680eecf15e1",
+  "build_tool": "gradle",
+  "scope": "Full root; one compiled production receiver, then unsaved partial member/dangling dot/broken peer/paired known-unknown controls. This does not establish complete-root editing coverage.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "oracle_status": "Original production call compiled. IDEA ILS-263.6379.0 imported the full root and matched all six first-response queries; see docs/fork-corpus.md for evidence and scope.",
+  "probes": [
+    {
+      "id": "moshi-1.15.2-disk-control",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "anchor": "reader.beginObject()",
+      "token": "beginObject",
+      "definition": false,
+      "completion_token": "beginObject",
+      "completion_excludes": [
+        "toJson"
+      ],
+      "category": "disk-control",
+      "buffer_edits": []
+    },
+    {
+      "id": "moshi-1.15.2-partial-member",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "anchor": "reader.beginObj()",
+      "token": "beginObj",
+      "definition": false,
+      "completion_token": "beginObject",
+      "completion_excludes": [
+        "toJson"
+      ],
+      "category": "partial-member",
+      "buffer_edits": [
+        {
+          "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+          "anchor": "reader.beginObject()",
+          "replacement": "reader.beginObj()",
+          "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef"
+        }
+      ]
+    },
+    {
+      "id": "moshi-1.15.2-dangling-dot",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "anchor": ".(",
+      "token": ".",
+      "definition": false,
+      "completion_token": "beginObject",
+      "completion_excludes": [
+        "toJson"
+      ],
+      "category": "dangling-dot",
+      "buffer_edits": [
+        {
+          "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+          "anchor": "reader.beginObject()",
+          "replacement": "reader.()",
+          "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef"
+        }
+      ]
+    },
+    {
+      "id": "moshi-1.15.2-broken-peer",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "anchor": "reader.beginObject()",
+      "token": "beginObject",
+      "definition": false,
+      "completion_token": "beginObject",
+      "completion_excludes": [
+        "toJson"
+      ],
+      "category": "broken-peer",
+      "buffer_edits": [
+        {
+          "source": "moshi/src/main/java/com/squareup/moshi/JsonReader.java",
+          "anchor": "public abstract class JsonReader implements Closeable {",
+          "replacement": "public abstract class JsonReader implements Closeable {\n  public void ktlspBrokenPeer() { int broken = ; }",
+          "source_sha256": "70bc4047e5e02b95cad573864828793ab98f03d1bfde405a6557ac1283f0179a"
+        }
+      ]
+    },
+    {
+      "id": "moshi-1.15.2-unknown-receiver",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "anchor": "ktlspUnknownReceiver.beginObj()",
+      "token": "beginObj",
+      "definition": false,
+      "completion_token": false,
+      "completion_excludes": [
+        "beginObject",
+        "toJson"
+      ],
+      "category": "unknown-receiver",
+      "buffer_edits": [
+        {
+          "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+          "anchor": "reader.beginObject()",
+          "replacement": "ktlspUnknownReceiver.beginObj();\nreader.beginObject()",
+          "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef"
+        }
+      ],
+      "known_control": {
+        "anchor": "reader.beginObject()",
+        "token": "beginObject",
+        "completion_token": "beginObject",
+        "completion_excludes": [
+          "toJson"
+        ]
+      }
+    }
+  ]
+}

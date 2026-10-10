@@ -1,0 +1,21 @@
+{
+  "build_tool": "gradle",
+  "files": {
+    "java": "src/main/java/pluginfixture/JavaUse.java",
+    "kotlin": "src/main/kotlin/pluginfixture/KotlinUse.kt"
+  },
+  "source_sha256": {
+    "java": "306e23d60fb849b252006527ba089a12ef07b975f0532cbe6a28470c07ec792e",
+    "kotlin": "a90bfd5a9fb5b2fb3041f6e11d4c776ac3d471f0021661ccf870f110df2ba75f"
+  },
+  "cases": [
+    {
+      "name": "kotlin",
+      "anchor": "fun lombokMethodFromKotlin() = Person(\"method\").getName()",
+      "source_token": "getName",
+      "member": "name",
+      "before": "fun lombokMethodFromKotlin() = Person(\"method\")",
+      "after": "fun lombokMethodFromKotlin() = Person(\"method\").name"
+    }
+  ]
+}
