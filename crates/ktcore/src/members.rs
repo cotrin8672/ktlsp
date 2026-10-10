@@ -38,6 +38,33 @@ pub struct Candidates<'a> {
     pub extensions: Vec<&'a Entry>,
 }
 
+/// Select a bare member/extension call through the same innermost-first receiver stack used by
+/// navigation. Rejected inner declarations cannot hide an applicable outer receiver, but remain
+/// available for useful invalid-call navigation when no receiver supplies a viable declaration.
+pub fn select_implicit<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: impl IntoIterator<Item = Type>,
+    name: &str,
+    usage: &MemberUse,
+    ctx: &FileCtx,
+) -> Option<(Type, Selection<'a>)> {
+    let mut rejected = None;
+    for receiver in receivers {
+        let selection =
+            candidates(index, &receiver, name, ctx).select(index, &receiver, usage, ctx);
+        if selection.entries.is_empty() {
+            continue;
+        }
+        if selection.applicability != Applicability::Rejected {
+            return Some((receiver, selection));
+        }
+        if rejected.is_none() {
+            rejected = Some((receiver, selection));
+        }
+    }
+    rejected
+}
+
 /// One typed traversal for own/inherited members and visible extensions. Artifact ownership is
 /// provided by the borrowed index view; no language or project-specific fallback belongs here.
 pub fn candidates<'a>(
@@ -251,7 +278,8 @@ fn parameters_applicability(
         if !infer::types_consistent(index, actual, &formal) {
             return Applicability::Rejected;
         }
-        uncertain |= matches!(actual, Type::Unknown) || matches!(formal, Type::Unknown);
+        uncertain |=
+            !infer::type_head_is_known(index, actual) || !infer::type_head_is_known(index, &formal);
     }
     if uncertain {
         Applicability::Unknown

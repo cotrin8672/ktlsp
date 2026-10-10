@@ -268,6 +268,8 @@ struct DepStats {
     jdk_symbols: usize,
     local_stub_files: usize,
     local_stub_symbols: usize,
+    local_source_files: usize,
+    local_source_symbols: usize,
     incomplete_classpath: bool,
     jdk_reused: bool,
 }
@@ -424,9 +426,9 @@ fn spawn_local_jar_index_worker(
                 Ok((batches, changed)) => DependencyResult {
                     coord: None,
                     label,
+                    failed: changed || batches.is_empty(),
                     batches,
                     discovered: Vec::new(),
-                    failed: changed,
                     skipped: false,
                     missing_source: false,
                     jdk: false,
@@ -814,8 +816,15 @@ fn index_dependencies(
                 stats.jdk_symbols += symbol_count;
                 stats.jdk_files += 1;
             } else if result.local_jar {
-                stats.local_stub_symbols += symbol_count;
-                stats.local_stub_files += 1;
+                if batch.origin.as_ref().is_some_and(|origin| {
+                    origin.representation == crate::project_model::SourceRepresentation::Source
+                }) {
+                    stats.local_source_symbols += symbol_count;
+                    stats.local_source_files += 1;
+                } else {
+                    stats.local_stub_symbols += symbol_count;
+                    stats.local_stub_files += 1;
+                }
             } else {
                 files_for_coord.push(IndexedDependencyFile {
                     path: batch.file.clone(),
@@ -1059,6 +1068,8 @@ async fn index_workspace(
             "jdkSymbols": stats.jdk_symbols,
             "localStubFiles": stats.local_stub_files,
             "localStubSymbols": stats.local_stub_symbols,
+            "localSourceFiles": stats.local_source_files,
+            "localSourceSymbols": stats.local_source_symbols,
             "classpathComplete": !stats.incomplete_classpath,
         }),
     );
@@ -1073,10 +1084,13 @@ async fn index_workspace(
     } else {
         String::new()
     };
-    let local_stub_summary = if stats.local_stub_files > 0 {
+    let local_jar_summary = if stats.local_stub_files + stats.local_source_files > 0 {
         format!(
-            ", plus {} local-jar stub files ({} symbols)",
-            stats.local_stub_files, stats.local_stub_symbols
+            ", plus {} local-jar source files ({} symbols) and {} stub files ({} symbols)",
+            stats.local_source_files,
+            stats.local_source_symbols,
+            stats.local_stub_files,
+            stats.local_stub_symbols
         )
     } else {
         String::new()
@@ -1087,7 +1101,7 @@ async fn index_workspace(
         stats.symbols,
         stats.coordinates,
         jdk_summary,
-        local_stub_summary,
+        local_jar_summary,
         stats.failed,
         stats.missing_sources,
         stats.shadowed,
@@ -1168,10 +1182,15 @@ fn project_watchers(
             }
         }
         for jar in model.local_jars() {
-            if let (Some(parent), Some(name)) =
-                (jar.parent(), jar.file_name().and_then(|name| name.to_str()))
+            for artifact in
+                std::iter::once(jar.clone()).chain(classpath::adjacent_sources_jar(&jar))
             {
-                patterns.insert((crate::paths::file_key(parent), name.to_string()));
+                if let (Some(parent), Some(name)) = (
+                    artifact.parent(),
+                    artifact.file_name().and_then(|name| name.to_str()),
+                ) {
+                    patterns.insert((crate::paths::file_key(parent), glob_literal(name)));
+                }
             }
         }
     }
@@ -1298,7 +1317,13 @@ fn project_change(
         {
             return Some(true);
         }
-        if model.artifact_origin(file).is_some() {
+        if model.artifact_origin(file).is_some()
+            || (name.ends_with("-sources.jar")
+                && model.local_jars().iter().any(|jar| {
+                    classpath::adjacent_sources_jar(jar)
+                        .is_some_and(|sources| crate::paths::file_key(&sources) == key)
+                }))
+        {
             return Some(true);
         }
         if model.file_origin(file).is_some()
@@ -3558,6 +3583,47 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn unreadable_local_sources_do_not_report_complete_library_indexing() {
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_bad_local_sources_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let jar = root.join("api.jar");
+        let sources = root.join("api-sources.jar");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        archive
+            .start_file("api/Only.class", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"").unwrap();
+        archive.finish().unwrap();
+        for present in [true, false] {
+            if present {
+                std::fs::write(&sources, b"incomplete build output").unwrap();
+            } else {
+                std::fs::remove_file(&sources).unwrap();
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            spawn_local_jar_index_worker(
+                jar.clone(),
+                classpath::file_origin_id(&jar),
+                root.join("extracted"),
+                tx,
+            );
+            let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                result.failed, present,
+                "unreadable sources must keep coverage incomplete"
+            );
+            assert_eq!(
+                result.batches.is_empty(),
+                present,
+                "corrupt sources must not silently become shallow stubs"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[cfg(windows)]
     fn native_file_keys_roundtrip_through_editor_uris() {
         let expected = "C:/project/space name/Main.kt";
@@ -3608,6 +3674,14 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            project_change(
+                root,
+                Some(&model),
+                &format!("{external}/vendor-sources.jar")
+            ),
+            Some(true)
+        );
+        assert_eq!(
             project_change(root, Some(&model), &format!("{root_key}/libs/new.jar")),
             Some(true)
         );
@@ -3628,6 +3702,13 @@ mod tests {
             None
         );
         let watches = project_watchers(root, Some(&model), true);
+        assert!(
+            watches.iter().any(|watch| match &watch.glob_pattern {
+                GlobPattern::Relative(pattern) => pattern.pattern == "vendor-sources.jar",
+                _ => false,
+            }),
+            "source jar creation, replacement and deletion need automatic watches"
+        );
         assert!(watches
             .iter()
             .all(|watch| matches!(watch.glob_pattern, GlobPattern::Relative(_))));

@@ -754,3 +754,33 @@ The aggregate, guards and gap interpretation are
 use `<project>-ktlsp-sixth-{golden,incomplete}-1`, with raw results, request traces,
 model snapshots and before/after source snapshots. These runs establish remaining
 correctness gaps and do not supply latency or IDEA-parity acceptance.
+
+### Eighth immutable release: CEM source and incomplete-code repair
+
+Binary SHA-256 is
+`20454030ec7356e8c11e1733d7a62fbd2f0bf0dfeb6fb92b0188f0903ea370e7`.
+The two CEM manifests and all queried/edited/oracle sources remain unchanged.
+Every request receives its first response, all eight edit/restore barriers pass,
+and both servers shut down cleanly. The local NeoForge JAR now contributes
+5,865 source files with 103,029 symbols instead of 5,865 class-name stubs.
+
+| CEM probe | Sixth release | Eighth release |
+| --- | --- | --- |
+| Generic holder completion and exact source definition | 0/2 | 2/2 |
+| Superclass completion and exact source definition | 0/2 | 0/2 |
+| Incomplete requests, including paired known receiver | 0/6 | 6/6 |
+| Complete incomplete-code cases | 0/5 | 5/5 |
+| Missing dependency source archives | 3 | 3 |
+
+`super.getBreakSpeed` still reports `unknown-receiver-type`: the actual class
+extends Java `DrillBlockEntity` and delegates `EnchantableBlockEntity`, leaving
+multiple direct supertypes in the current super inference. Its failure is
+preserved. The independent input-coverage assertion still fails on three missing
+archives, so both routed runs retain exit 1. Other five roots were not rerun for
+this focused checkpoint; no aggregate parity or performance result is inferred.
+
+Evidence is `eighth-cem-observations.json`, `eighth-corpus-controller.json`,
+and `cem-working-copy-ktlsp-eighth-{golden,incomplete}-1/artifacts/` under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-probes-20261010/`.
+Before/after controller guards cover the immutable binary, harness/helpers,
+manifests and every queried, edited peer and expected declaration source.

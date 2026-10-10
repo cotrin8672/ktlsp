@@ -274,6 +274,124 @@ fn missing_metadata_and_generated_target_coverage_stay_unknown() {
 }
 
 #[test]
+fn known_source_member_binding_does_not_certify_complete_generated_member_coverage() {
+    let (index, mut store) = fixture();
+    let symbols: Vec<_> = index
+        .entries_for_file(TARGET_FILE)
+        .iter()
+        .map(|entry| (*entry.sym).clone())
+        .collect();
+    store
+        .replace_source(
+            &index,
+            TARGET_FILE,
+            Arc::from(TARGET),
+            Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]),
+            facts(TARGET_FILE, &symbols),
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let target = read.resolve_type("oracle.Target");
+    let Knowledge::Found(owner) = target else {
+        panic!("actual source owner")
+    };
+    let (_, coverage) = read.declared_members(&owner).unwrap();
+    assert!(matches!(coverage, Knowledge::Unknown(_)));
+    let req = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(method(&[JvmType::Int], &JvmType::Int)),
+        Dispatch::Instance,
+    );
+    let id = read.require(req).unwrap();
+    let Knowledge::Found(binding) = &read.resolution(id).unwrap().binding else {
+        panic!("exact authored JVM member must remain usable")
+    };
+    assert_eq!(binding.target.definition().file, TARGET_FILE);
+    assert_eq!(binding.target.signature().unwrap().descriptor(), "(I)I");
+    let candidate = read
+        .resolution(id)
+        .unwrap()
+        .candidates
+        .iter()
+        .find(|candidate| candidate.id == binding.target)
+        .unwrap();
+    assert_eq!(candidate.visibility, Knowledge::Found(Visibility::Public));
+    assert_eq!(candidate.synthetic, Knowledge::Found(false));
+}
+
+#[test]
+fn unknown_competing_signature_still_prevents_an_exact_binding() {
+    let (index, mut store) = fixture();
+    let symbols: Vec<_> = index
+        .entries_for_file(TARGET_FILE)
+        .iter()
+        .map(|entry| (*entry.sym).clone())
+        .collect();
+    let mut members = facts(TARGET_FILE, &symbols);
+    members.iter_mut().find(|fact| matches!(&fact.signature, Knowledge::Found(signature) if signature.descriptor() == "(Ljava/lang/String;)Ljava/lang/String;"))
+        .unwrap().signature = Knowledge::Unknown(vec![IncompleteReason::UnsupportedType("unresolved overload".into())]);
+    store
+        .replace_source(
+            &index,
+            TARGET_FILE,
+            Arc::from(TARGET),
+            Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]),
+            members,
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let req = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(method(&[JvmType::Int], &JvmType::Int)),
+        Dispatch::Instance,
+    );
+    let id = read.require(req).unwrap();
+    assert!(matches!(
+        read.resolution(id).unwrap().binding,
+        Knowledge::Unknown(_)
+    ));
+}
+
+#[test]
+fn incomplete_owner_cannot_prove_missing_wrong_descriptor_or_wrong_static_absent() {
+    let (index, mut store) = fixture();
+    let symbols: Vec<_> = index
+        .entries_for_file(TARGET_FILE)
+        .iter()
+        .map(|entry| (*entry.sym).clone())
+        .collect();
+    store
+        .replace_source(
+            &index,
+            TARGET_FILE,
+            Arc::from(TARGET),
+            Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]),
+            facts(TARGET_FILE, &symbols),
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for (name, parameter, dispatch) in [
+        ("generatedMissing", JvmType::Int, Dispatch::Instance),
+        ("twice", JvmType::Long, Dispatch::Instance),
+        ("twice", JvmType::Int, Dispatch::Static),
+    ] {
+        let req = requirement(
+            &mut read,
+            name,
+            Knowledge::Found(method(&[parameter], &JvmType::Int)),
+            dispatch,
+        );
+        let id = read.require(req).unwrap();
+        assert!(
+            matches!(read.resolution(id).unwrap().binding, Knowledge::Unknown(_)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn inherited_members_are_not_declared_target_members() {
     let (mut index, mut store) = fixture();
     let text = "package oracle\nopen class Base {\n fun inherited(value: Int): Int = value\n}\nclass Derived : Base()\n";

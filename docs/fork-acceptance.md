@@ -41,12 +41,12 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Seventh immutable slice: 839 pass / 3 ignored across 33 suites | Seventh Rust suite verified | Root `rtk cargo test --workspace`, native exit 0 with an isolated cache; `seventh-fixed/cargo-workspace-isolated.{out,verified.json}`. All 90 Rust/build inputs match before/after tests and release compilation |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Eighth immutable slice: 875 pass / 3 ignored across 35 suites | Eighth Rust suite verified | Root `rtk proxy cargo test --workspace`, native exit 0 with an isolated cache; `eighth-fixed/cargo-workspace-isolated.{out,verified.json}`. All 93 Rust/build inputs match before/after tests and release compilation |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Fifth release passes basic 9, Java 99, features 80, semantic 18, mixed 36 and library 13, plus two native UI samples. Seventh passes Java 165/165, including all original 99 expectations and 66 member/unsaved-edit/rename assertions | Java current slice verified; broader rechecks continue | `ktlsp-semantic-gaps-20261010/member-editor-seventh/artifacts/`. Sixth's eight initial Java failures are repaired by immediate initial scanning; no harness sleep was added. Its legacy forced editor shutdown is not graceful-shutdown proof |
-| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Copy resolves 101 materialized classpath entries; offline Kotlin/Java compile succeeds; broad Neovim hover/class-goto smoke passes | Partial | Broad scan also includes extracted Java outside Gradle source roots; class-goto smoke does not independently prove dependency attribution. Exact archive-backed probes, source scope, overrides, diagnostics and performance remain |
+| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Eighth release reads 5,865 NeoForge source files with 103,029 symbols; generic-holder completion and exact navigation pass. All six incomplete requests pass; superclass completion/navigation and three missing source archives still fail | Partial; real editing repair verified | `eighth-cem-observations.json` and guarded golden/incomplete runs under the corpus evidence root. Full CEM diagnostics, overrides and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real six-root controls: fourth ktlsp passes 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 cases and 29/36 qualified requests. All requests use attempt 1; each engine passes 48 edit/restore delivery controls | Failing; reproduced | [fork-corpus.md](fork-corpus.md) records exact per-root results, source hashes, first-response instability and missing-input coverage. Small mixed incomplete fixture passes both engines; it does not replace these failures |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Sixth six-root controls pass 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 and 29/36. Eighth separately repairs CEM to 5/5 cases and 6/6 first-response requests | Partial; real CEM repair verified | [fork-corpus.md](fork-corpus.md) records exact per-root results, source hashes and remaining missing inputs. The other five roots require current rechecks; a paired useful known receiver is required for negative cases |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Not yet measured | Pending | Include invalid and ambiguous cases with independent expected results |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Not yet measured | Pending | Extend existing semantic/editor probes |
@@ -54,8 +54,8 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Baseline omits a Java generic-chain use and renamed snapshot fails compilation. Fixed release and adapted IDEA update all three exact semantic sites, preserve all three complete buffers and compile the renamed snapshot | Mixed fixture verified | Actual corpus, overloads, JVM facades, ambiguous names and extension-provided references remain pending |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Seventh native automatic watching passes 74/76: four actual builds, dependency/generated-source additions, updates, removals, exact targets, preserved dirty buffers and clean shutdown. Three native notification batches and zero explicit notifications. Two stale-member diagnostics remain failing | Partial; automatic refresh verified, diagnostics failing | `ktlsp-gradle-model-20261010/seventh-refresh-automatic/artifacts/`. Unchanged 76 expectations and hashes. Sixth manual 70/72 and automatic 29/76 remain preserved; external Windows Neovim watch roots still need coverage |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Sixth release passes all 144 real KAPT/KSP generated-source editor assertions: 30 first-response completions and six exact source definitions. IDEA passes the same 30 completions and 2/6 exact source targets. Actual v1/v2/restored builds each pass 12 runtime checks; disabled processing removes all three types and both compilers reject their uses. Fourth ktlsp still fails all 12 transformed-API completions | Partial; generated-source slice verified | Portable `processor_project.lua` and `processor-generated.json`; raw evidence below. Same-client processor/config refresh, processor diagnostics and transformed-API analysis remain unverified or failing |
-| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Public semantic-store contract passes 19 API tests, including identities, descriptor/static binding, publication and invalidation. Independent Mixin oracle has 42 cases. No editor host/consumer integration is validated | Pending integration | Prove enabled/disabled completion, diagnostics, navigation and applied rename through a separate consumer; API tests alone do not satisfy the boundary |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Sixth passes 144/144 generated-source checks; IDEA passes 140/144, retaining four exact-source failures. Seventh same-client KAPT/KSP refresh passes 97/114; transformed-API completion still fails 12/12 | Partial; live editing and transformed APIs failing | Portable processor fixtures and raw evidence below. Actual v1/v2/restored builds and disabled compiler rejections independently establish expected APIs. Parser, stale-member and removed-import diagnostics remain gaps |
+| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Public semantic-store contract passes 22 API tests; source-fact producer passes eight. Independent Mixin oracle has 42 cases. No editor host/consumer integration is validated | Pending integration | Prove enabled/disabled completion, diagnostics, navigation and applied rename through a separate consumer; API tests alone do not satisfy the boundary |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
 
@@ -305,6 +305,74 @@ lower the accepted latency distribution. Sampling/profiling runs are separate fr
 timing runs. Initialization timing never substitutes for editor completion timing.
 
 ## Work log
+
+### CEM local sources and implicit receivers: eighth checkpoint
+
+The immutable release is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/eighth-fixed/bin/ktlsp.exe`,
+SHA-256 `20454030ec7356e8c11e1733d7a62fbd2f0bf0dfeb6fb92b0188f0903ea370e7`.
+Root's raw `rtk proxy cargo test --workspace` passes 875 tests with three ignored
+across 35 suites, native exit 0. All 93 inputs match before/after tests and release
+compilation. `eighth-fixed/cargo-workspace-isolated.verified.json`,
+`rust-release-inputs.verified.json` and `release-result.json` retain the guards.
+
+The ordinary CEM probes exposed three independent gaps: its local NeoForge JAR
+was indexed as class-name stubs despite an adjacent source JAR, Kotlin `super`
+had no inferred receiver, and bare extension calls did not propagate the implicit
+receiver's generic return type. The disposable CEM copy already contains both
+actual archives under `build/moddev/artifacts/`; no project source was rewritten.
+`ktlsp-goal-20261010/cem-boundary/` retains the archive identities, `javap`
+output, compiler controls and the unchanged reduction with a same-named decoy.
+
+Local JAR indexing now uses the exact adjacent `-sources.jar` through the existing
+lazy source parser and symbol cache. Its artifact identity includes binary and
+source path, nanosecond modification time and size; this is a stat identity, not a
+content hash. Source-only creation, replacement and removal invalidate it, and the
+editor watches that sibling even before it exists. Missing binaries cannot add
+orphaned source facts. An unreadable source archive leaves indexing incomplete
+instead of silently supplying shallow stubs. Statistics distinguish source files
+from class stubs. The focused local tests pass 9/9; the scoped Java/Kotlin
+completion and exact-source-navigation update/removal/restoration test also
+passes. Their pre-fix failures and post-fix logs are in
+`ktlsp-goal-20261010/local-source-pair/`.
+
+Shared receiver/member selection now covers typed `super`, bare implicit
+extensions and method type arguments without rebinding owning-class variables.
+Unknown argument heads preserve ambiguous candidates; conflicting constraints
+remain Unknown rather than choosing the first argument's type. Compiler-valid
+single-line Kotlin class bodies remain a separate parser gap. The independent
+JDK 21/Kotlin 1.9.23 controls and focused results are under
+`ktlsp-semantic-gaps-20261010/cem-typed-oracle/`. The implicit-receiver suite passes
+21 tests; the existing generic/member suites pass another 62. Named generic
+argument mapping, conflicting-constraint joins and callable local/parameter
+return types remain coverage gaps. The unchanged CEM reduction now passes all ten
+semantic editor checks on the first response, including its same-named decoy,
+with clean shutdown and unchanged source/binary/harness hashes. Evidence is
+`cem-boundary/reduction2-eighth-2/artifacts/` under the goal evidence root; an
+earlier wrapper attempt stopped before Neovim on RTK's stderr warning and remains
+separate. In actual CEM, both generic-holder requests and all six incomplete
+requests now pass. The two `super.getBreakSpeed` requests remain Unknown because
+the real class has both a class superclass and a delegated interface. Three
+missing dependency source archives remain an independent failure. Both actual
+routed runs retain exit 1; [fork-corpus.md](fork-corpus.md) records the evidence.
+
+The extension source-fact producer separately passes eight tests, and its public
+store passes 22. It reads authored annotations, actual source anchors and guarded
+JVM signatures from the shared index. Unsupported/generated identities and
+incomplete absence remain Unknown. A known positive member can bind despite
+incomplete unrelated owner coverage; unknown competing members cannot. Evidence
+is `ktlsp-extension-host-20261011/producer-evidence.json`. Provider hosting,
+lifecycle invalidation and an external consumer's editor results remain pending.
+
+The seventh transformed-compiler-plugin editor run still fails all twelve
+generated-API completion expectations while passing 38 controls. Actual bytecode
+and compiler configuration were inspected independently; model v3 does not carry
+compiler-plugin arguments or annotation-processor paths. Evidence is
+`ktlsp-goal-20261010/plugin-oracle/seventh-artifact-audit/`. Binary/generated
+semantic identities and pre-build editing need a shared solution, not fabricated
+source locations. Processor-live diagnostic reductions also reproduce eleven
+failures with one shallow-stub absence guard passing, under
+`ktlsp-diagnostic-triage-20261011/`; no coverage flags were weakened.
 
 ### Gradle ownership and scoped semantic facts: fifth checkpoint
 

@@ -904,8 +904,8 @@ pub(crate) fn goto_node_with_ctx(
         if index.entries_for_file(file).iter().any(|entry| {
             entry.sym.start_byte == def.start_byte
                 && entry.sym.end_byte == def.end_byte
-                && entry.sym.container.is_some()
                 && matches!(entry.sym.kind, SymbolKind::Function | SymbolKind::Property)
+                && (entry.sym.container.is_some() || uk == UseKind::Call)
         }) {
             if let Some(defs) =
                 resolve_implicit_receiver_member_with_ctx_a(index, ident, ancestors, name, src, ctx)
@@ -981,13 +981,8 @@ fn resolve_implicit_receiver_member_with_ctx_a(
 ) -> Option<Vec<Def>> {
     let member_use = member_use(index, usage, src, ctx);
     let receivers = infer::implicit_receiver_types_with_ancestors(index, ancestors, src, &ctx, 0);
-    for recv_ty in receivers {
-        let hits = member_defs_for_use(index, &recv_ty, name, &member_use, ctx);
-        if !hits.is_empty() {
-            return Some(hits);
-        }
-    }
-    None
+    crate::members::select_implicit(index, receivers, name, &member_use, ctx)
+        .map(|(_, selection)| entries_to_defs(selection.entries))
 }
 
 /// Walk ancestor scopes from `usage` and return the nearest declaration's name node + kind.

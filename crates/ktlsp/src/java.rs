@@ -507,7 +507,7 @@ fn inference_imports(tree: &Tree, src: &str) -> Vec<crate::parser::Import> {
         .collect()
 }
 
-fn type_scope(tree: &Tree, src: &str) -> TypeScope {
+pub(crate) fn type_scope(tree: &Tree, src: &str) -> TypeScope {
     TypeScope::with_default_imports(
         &package_of(tree, src),
         inference_imports(tree, src),
@@ -2424,11 +2424,36 @@ fn receiver_type(
     object: Node<'_>,
 ) -> Option<Type> {
     match object.kind() {
-        "this" => Some(infer::declared_type(
-            index,
-            &type_scope(tree, src).type_ref(&enclosing_type_name(object, src)?, false, Vec::new()),
-            &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
-        )),
+        "this" | "super" => {
+            let receiver = infer::declared_type(
+                index,
+                &type_scope(tree, src).type_ref(
+                    &enclosing_type_name(object, src)?,
+                    false,
+                    Vec::new(),
+                ),
+                &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+            );
+            if object.kind() == "this" {
+                return Some(receiver);
+            }
+            let mut supers = infer::direct_supertypes(index, &receiver);
+            if supers.iter().any(|ty| ty.name().is_none()) {
+                return None;
+            }
+            // Java's unqualified super dispatches through its class superclass, not an
+            // implemented interface. Keep the normalized generic arguments from the core walk.
+            supers.retain(|ty| {
+                index.lookup_type(ty.name().unwrap()).iter().any(|entry| {
+                    entry.sym.kind == SymbolKind::Class
+                        && ty
+                            .package()
+                            .is_none_or(|package| package == entry.sym.package)
+                        && ty.container() == entry.sym.container.as_deref()
+                })
+            });
+            (supers.len() == 1).then(|| supers.pop().unwrap())
+        }
         "identifier" => {
             if let Some(decl) = local_declaration_node(src, object)
                 .or_else(|| same_file_field_declaration(src, object))

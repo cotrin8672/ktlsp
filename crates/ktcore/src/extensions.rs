@@ -15,6 +15,8 @@ use crate::index::{Entry, InferenceIndex, ScopedIndex};
 use crate::knowledge::Knowledge;
 use crate::symbol::{Def, SymbolKind};
 
+pub mod source;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +29,7 @@ pub enum IncompleteReason {
     UnsupportedType(String),
     AmbiguousType,
     AmbiguousMember,
+    UnsupportedSource,
 }
 
 pub type Fact<T> = Knowledge<T, IncompleteReason>;
@@ -908,7 +911,6 @@ impl ReadSession<'_> {
             MemberNames::Prefix(prefix) => candidate.name.starts_with(prefix),
         });
         let mut reasons = Vec::new();
-        add_unknown(&coverage, &mut reasons);
         if matches!(requirement.names, MemberNames::Prefix(_)) {
             reasons.push(IncompleteReason::IncompleteSelector);
         }
@@ -948,6 +950,11 @@ impl ReadSession<'_> {
         for candidate in &eligible {
             add_unknown(&candidate.signature, &mut reasons);
             add_unknown(&candidate.dispatch, &mut reasons);
+        }
+        // A verified authored JVM member remains a positive fact even when the owner may also
+        // contain generated members. Coverage is needed to prove absence, not this exact identity.
+        if eligible.len() != 1 || !reasons.is_empty() {
+            add_unknown(&coverage, &mut reasons);
         }
         let binding = if !reasons.is_empty() {
             Knowledge::Unknown(reasons)

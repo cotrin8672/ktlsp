@@ -960,7 +960,7 @@ pub fn resolve_coordinate(
         .unwrap_or_default()
 }
 
-/// Resolve a local binary jar into parseable Java class stubs.
+/// Resolve a local binary jar using adjacent sources, or shallow class stubs if absent.
 ///
 /// Local `files("libs/foo.jar")` dependencies have no Maven coordinate and often no source jar.
 /// Stubs let imports and type references resolve to a durable target instead of being invisible.
@@ -986,35 +986,52 @@ pub fn resolve_local_jar_stubs_for_origin(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> Vec<FileSymbols> {
-    if crate::classpath::file_origin_id(jar_path) != origin_id {
+    if !jar_path.is_file() || crate::classpath::file_origin_id(jar_path) != origin_id {
         tracing::warn!(path = %jar_path.display(), "local artifact changed since project discovery");
         return Vec::new();
     }
-    let mut batches = resolve_local_jar_stubs_unowned(jar_path, extract_root, kotlin, java);
+    let mut hasher = Sha256::new();
+    hasher.update(SYMCACHE_VERSION);
+    hasher.update(b"|local-jar|");
+    hasher.update(origin_id.as_bytes());
+    let fingerprint = format!("{:x}", hasher.finalize());
+    let (mut batches, representation) = if let Some(sources) =
+        crate::classpath::adjacent_sources_jar(jar_path).filter(|sources| sources.is_file())
+    {
+        let source = LibrarySource {
+            dest: extract_root.join("local-jars").join(&fingerprint),
+            jar: Some(sources),
+            fingerprint: Some(fingerprint),
+            origin_id: origin_id.to_string(),
+        };
+        (
+            resolve_library_source_unowned(&source, kotlin, java),
+            SourceRepresentation::Source,
+        )
+    } else {
+        (
+            resolve_local_jar_stubs_unowned(jar_path, extract_root, &fingerprint, kotlin, java),
+            SourceRepresentation::Stub,
+        )
+    };
     if crate::classpath::file_origin_id(jar_path) != origin_id {
         tracing::warn!(path = %jar_path.display(), "local artifact changed while indexing");
         return Vec::new();
     }
-    tag_batches(&mut batches, origin_id, SourceRepresentation::Stub);
+    tag_batches(&mut batches, origin_id, representation);
     batches
 }
 
 fn resolve_local_jar_stubs_unowned(
     jar_path: &Path,
     extract_root: &Path,
+    fingerprint: &str,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> Vec<FileSymbols> {
     if !jar_path.is_file() {
         return Vec::new();
     }
-    let fingerprint = jar_fingerprint(jar_path).unwrap_or_else(|| {
-        let mut hasher = Sha256::new();
-        hasher.update(SYMCACHE_VERSION);
-        hasher.update(b"|local-jar|");
-        hasher.update(jar_path.to_string_lossy().as_bytes());
-        format!("{:x}", hasher.finalize())
-    });
     let dest = extract_root.join("local-jars").join(&fingerprint);
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
@@ -1033,7 +1050,7 @@ fn resolve_local_jar_stubs_unowned(
     symbols
 }
 
-/// Resolve the local classpath jar that declares `import_fqn`, if any, into class stubs.
+/// Resolve the local classpath jar that declares `import_fqn`, using sources when available.
 pub fn resolve_import_fqn_from_local_jars(
     import_fqn: &str,
     jars: Vec<PathBuf>,
@@ -2189,6 +2206,161 @@ public interface ExecutorService {
             &mut java
         )
         .is_empty());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn local_jar_reads_adjacent_sources_with_members_and_generic_inheritance() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_local_jar_sources_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api.jar");
+        write_sources_jar(&jar, &[("api/Lookup.class", ""), ("api/Getter.class", "")]);
+        write_sources_jar(
+            &tmp.join("api-sources.jar"),
+            &[
+                (
+                    "api/Getter.java",
+                    "package api; public interface Getter<T> { T getOrThrow(); }",
+                ),
+                (
+                    "api/Lookup.java",
+                    "package api; public interface Lookup<T> extends Getter<T> {}",
+                ),
+            ],
+        );
+        let captured = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for _ in 0..2 {
+            let batches = resolve_local_jar_stubs_for_origin(
+                &jar,
+                &captured,
+                &tmp.join("extract"),
+                &mut kotlin,
+                &mut java,
+            );
+            let symbols: Vec<_> = batches.iter().flat_map(|batch| &batch.symbols).collect();
+            let lookup = symbols
+                .iter()
+                .find(|symbol| symbol.name == "Lookup")
+                .unwrap();
+            assert_eq!(lookup.type_params, ["T"]);
+            assert_eq!(lookup.supertypes, ["Getter"]);
+            assert_eq!(lookup.supertype_refs.len(), 1);
+            assert_eq!(lookup.supertype_refs[0].name, "Getter");
+            assert_eq!(lookup.supertype_refs[0].args.len(), 1);
+            assert_eq!(lookup.supertype_refs[0].args[0].name, "T");
+            assert!(symbols.iter().any(|symbol| symbol.name == "getOrThrow"));
+            assert!(batches.iter().all(|batch| {
+                let origin = batch.origin.as_ref().unwrap();
+                origin.origin_id == captured
+                    && origin.representation == SourceRepresentation::Source
+            }));
+            let source = batches
+                .iter()
+                .find(|batch| batch.file.ends_with("/Getter.java"))
+                .unwrap();
+            assert!(materialize_source_file(Path::new(&source.file)));
+            let text = fs::read_to_string(&source.file).unwrap();
+            let method = source
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == "getOrThrow")
+                .unwrap();
+            assert_eq!(&text[method.start_byte..method.end_byte], "getOrThrow");
+        }
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn local_jar_source_only_updates_and_removal_invalidate_origin_and_cache() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_local_source_refresh_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api.jar");
+        let sources = tmp.join("api-sources.jar");
+        write_sources_jar(&jar, &[("api/Only.class", "")]);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let without_sources = crate::classpath::file_origin_id(&jar);
+        let mut previous = without_sources.clone();
+        for (nanos, member) in [(1_000_000, "first"), (2_000_000, "other")] {
+            write_sources_jar(
+                &sources,
+                &[(
+                    "api/Only.java",
+                    &format!("package api; public class Only {{ public void {member}() {{}} }}"),
+                )],
+            );
+            fs::File::options()
+                .write(true)
+                .open(&sources)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::new(1_700_000_000, nanos))
+                .unwrap();
+            let current = crate::classpath::file_origin_id(&jar);
+            assert_ne!(
+                current, previous,
+                "source-only edits must invalidate the artifact"
+            );
+            assert!(resolve_local_jar_stubs_for_origin(
+                &jar,
+                &previous,
+                &tmp.join("extract"),
+                &mut kotlin,
+                &mut java,
+            )
+            .is_empty());
+            for _ in 0..2 {
+                let batches = resolve_local_jar_stubs_for_origin(
+                    &jar,
+                    &current,
+                    &tmp.join("extract"),
+                    &mut kotlin,
+                    &mut java,
+                );
+                let names: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| &batch.symbols)
+                    .map(|symbol| symbol.name.as_str())
+                    .collect();
+                assert!(
+                    names.contains(&member),
+                    "cold and warm results must contain {member}"
+                );
+                assert!(!names.contains(&if member == "first" { "other" } else { "first" }));
+            }
+            previous = current;
+        }
+        fs::remove_file(sources).unwrap();
+        assert_eq!(crate::classpath::file_origin_id(&jar), without_sources);
+        assert!(resolve_local_jar_stubs_for_origin(
+            &jar,
+            &previous,
+            &tmp.join("extract"),
+            &mut kotlin,
+            &mut java,
+        )
+        .is_empty());
+        let fallback = resolve_local_jar_stubs(&jar, &tmp.join("extract"), &mut kotlin, &mut java);
+        assert!(!fallback.is_empty());
+        assert!(fallback.iter().all(|batch| {
+            batch.origin.as_ref().unwrap().representation == SourceRepresentation::Stub
+                && batch.symbols.iter().all(|symbol| symbol.name == "Only")
+        }));
+        write_sources_jar(
+            &tmp.join("api-sources.jar"),
+            &[(
+                "api/Only.java",
+                "package api; public class Only { public void first() {} }",
+            )],
+        );
+        fs::remove_file(&jar).unwrap();
+        assert!(
+            resolve_local_jar_stubs(&jar, &tmp.join("extract"), &mut kotlin, &mut java).is_empty(),
+            "an orphaned source jar must not add a missing binary dependency"
+        );
         fs::remove_dir_all(tmp).unwrap();
     }
 

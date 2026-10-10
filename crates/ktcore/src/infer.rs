@@ -171,6 +171,7 @@ fn infer_depth_with<R: ChildInfer>(
                 }
             }
         }
+        "super_expression" => super_receiver_type(index, node, src, ctx),
         "parenthesized_expression" => match node.named_child(0) {
             Some(inner) => child_infer.infer_child(index, inner, src, ctx, depth + 1),
             None => Type::Unknown,
@@ -858,6 +859,50 @@ fn cached_class_receiver_contribution(
     receiver_cache_store(ctx, declaration, 0, ty)
 }
 
+/// `super` starts at the enclosing declaration's direct supertypes, never its own overrides.
+/// A written qualifier/outer label must identify an actual direct supertype; unresolved or
+/// multiple unqualified receivers remain unknown rather than choosing an arbitrary declaration.
+fn super_receiver_type(index: &dyn InferenceIndex, node: Node, src: &str, ctx: &FileCtx) -> Type {
+    let label = child_of_kind(node, "identifier").map(|label| node_text(label, src));
+    let mut enclosing = node.parent();
+    let declaration = loop {
+        let Some(current) = enclosing else {
+            return Type::Unknown;
+        };
+        if matches!(current.kind(), "class_declaration" | "object_declaration")
+            && label.is_none_or(|label| {
+                name_field(current).is_some_and(|name| node_text(name, src) == label)
+            })
+        {
+            break current;
+        }
+        enclosing = current.parent();
+    };
+    let Some(receiver) = cached_class_receiver_contribution(index, declaration, src, ctx) else {
+        return Type::Unknown;
+    };
+    let qualifier = child_of_kind(node, "user_type")
+        .and_then(|ty| crate::indexer::syntax_type_ref(ty, src))
+        .map(|ty| resolve_type_ref(index, &ty, ctx, 0));
+    let mut supers = direct_supertypes(index, &receiver);
+    if let Some(qualifier) = qualifier {
+        if qualifier.name().is_none() {
+            return Type::Unknown;
+        }
+        supers.retain(|ty| {
+            ty.name() == qualifier.name()
+                && ty.package() == qualifier.package()
+                && ty.container() == qualifier.container()
+        });
+    }
+    supers.dedup();
+    if supers.len() == 1 {
+        supers.pop().unwrap()
+    } else {
+        Type::Unknown
+    }
+}
+
 /// Return the receiver written before an enclosing function's name (`fun Route.setup()`). The
 /// return type and parameter types occur after the name boundary and must not be mistaken for a
 /// lexical receiver.
@@ -1307,12 +1352,52 @@ fn infer_call(
     match callee.kind() {
         "identifier" => {
             let cname = node_text(callee, src);
+            // Locals/parameters are lexically stronger than every implicit receiver. Their
+            // unmodeled callable signatures must not accidentally select a same-named extension.
+            if let Some((binder, _)) = resolve::local_decl(callee, cname, UseKind::Call, src) {
+                let owner = binder.parent().and_then(|decl| {
+                    if decl.kind() == "variable_declaration" {
+                        decl.parent().and_then(|property| property.parent())
+                    } else {
+                        decl.parent()
+                    }
+                });
+                if !owner.is_some_and(|owner| {
+                    matches!(
+                        owner.kind(),
+                        "source_file" | "class_body" | "enum_class_body"
+                    )
+                }) {
+                    return Type::Unknown;
+                }
+            }
             // Constructor: a known type name -> that type (verified before treating it as a function).
             if !index.lookup_type(cname).is_empty() {
                 return resolve_type_name(index, cname, ctx, false);
             }
-            // Free function call.
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
+            let usage = MemberUse::Call(normalized_call_arguments(node, arg_types.clone()));
+            if let Some((receiver, selection)) = members::select_implicit(
+                index,
+                implicit_receiver_types(index, callee, src, ctx, depth + 1),
+                cname,
+                &usage,
+                ctx,
+            ) {
+                return selected_member_type(
+                    index,
+                    &receiver,
+                    cname,
+                    true,
+                    selection,
+                    Some(node),
+                    src,
+                    ctx,
+                    depth,
+                    child_infer,
+                );
+            }
+            // An ordinary visible free function is considered after implicit receivers.
             if let Some((ret_tr, type_params, params)) =
                 free_function_sig(index, cname, ctx, value_arg_count(node), &arg_types, depth)
             {
@@ -1838,6 +1923,9 @@ fn resolve_with_subst(
     }
     if tr.qualification.is_none() {
         if let Some(bound) = subst.get(&tr.name) {
+            if !type_head_is_known(index, bound) {
+                return Type::Unknown;
+            }
             let mut bound = bound.clone();
             if let Type::Class { nullable, .. } = &mut bound {
                 *nullable |= tr.nullable;
@@ -1953,6 +2041,32 @@ fn member_type(
         MemberUse::Value
     };
     let group = members::candidates(index, recv_ty, name, ctx).select(index, recv_ty, &usage, ctx);
+    selected_member_type(
+        index,
+        recv_ty,
+        name,
+        want_function,
+        group,
+        call,
+        src,
+        ctx,
+        depth,
+        child_infer,
+    )
+}
+
+fn selected_member_type(
+    index: &dyn InferenceIndex,
+    recv_ty: &Type,
+    name: &str,
+    want_function: bool,
+    group: members::Selection<'_>,
+    call: Option<Node>,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Type {
     if group.applicability == members::Applicability::Rejected || group.entries.is_empty() {
         return Type::Unknown;
     }
@@ -2002,6 +2116,28 @@ fn resolve_member_type_with_subst(
     }
     let mut subst = receiver_type_bindings(index, recv_ty, entry).unwrap_or_default();
     if let Some(call) = call {
+        // Only method/extension variables are inferred from arguments. Owning-class variables
+        // retain their receiver bindings, including Unknown for an incomplete/raw receiver.
+        let method_params = entry.sym.type_params.iter().cloned().collect();
+        let arguments = normalized_call_arguments(
+            call,
+            synth_arg_types(index, call, src, ctx, depth, child_infer),
+        );
+        for (formal, actual) in entry.sym.params.iter().zip(arguments.types) {
+            let mut argument_bindings = HashMap::new();
+            solve::unify_into(formal, &actual, &method_params, &mut argument_bindings);
+            for (parameter, actual) in argument_bindings {
+                subst
+                    .entry(parameter)
+                    .and_modify(|bound| {
+                        if *bound != actual {
+                            // shortcut: conflicting constraints stay Unknown; replace when join inference is available.
+                            *bound = Type::Unknown;
+                        }
+                    })
+                    .or_insert(actual);
+            }
+        }
         bind_lambda_return_type(
             index,
             op_name,
@@ -2051,8 +2187,7 @@ fn member_type_parameters(index: &dyn InferenceIndex, entry: &Entry) -> HashSet<
 /// args are checked (a trailing lambda / extra args beyond the param list are ignored).
 
 /// Whether `name` is declared as a type parameter of some indexed type/function. Used to tell
-/// an unbound class-level type variable (accept any argument) from a genuinely missing type
-/// name (compare normally).
+/// an unbound class-level type variable from a concrete type name.
 fn is_class_level_type_variable(index: &dyn InferenceIndex, name: &str) -> bool {
     index
         .lookup_by_name(name)
@@ -2076,9 +2211,8 @@ fn args_consistent(
         if p.args.is_empty() && is_class_level_type_variable(index, &p.name) {
             // A class-level type variable we could not bind (the `E` of `MutableList<E>.add`,
             // unbound when the receiver's type arguments are unknown). Treating it as a
-            // concrete type would reject every argument — accept. Genuinely missing type
-            // names (e.g. stdlib types in a partial index) are NOT skipped, so overload
-            // disambiguation on `pick(Int)` vs `pick(String)` still works.
+            // concrete type would reject every argument — accept. Other names use the shared
+            // gradual consistency check, including intrinsic Int/String without library sources.
             continue;
         }
         let pt = resolve_type_ref(index, p, ctx, depth + 1);
@@ -2100,7 +2234,7 @@ pub fn argument_types_consistent(
 }
 
 /// Gradual consistency of an actual argument type with a formal parameter type: an `Unknown` on either
-/// side is consistent; an exact head match is consistent; an actual that is a subtype of the formal is
+/// side or an unindexed symbolic head stays possible; an exact head match or a known subtype is
 /// consistent; otherwise inconsistent.
 pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal: &Type) -> bool {
     let (Some(an), Some(fname)) = (actual.name(), formal.name()) else {
@@ -2133,7 +2267,31 @@ pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal
             .is_none_or(|(a, f)| a == f)
             && actual.container() == formal.container();
     }
+    if !type_head_is_known(index, actual) || !type_head_is_known(index, formal) {
+        return true;
+    }
     is_subtype(index, an, actual.package(), fname)
+}
+
+/// A symbolic name retained from an incomplete declaration is not evidence of a type mismatch.
+/// Fundamental language types have identities without source spans; other heads need an exact
+/// declaration in the current scoped index before overload selection can reject them.
+pub(crate) fn type_head_is_known(index: &dyn InferenceIndex, ty: &Type) -> bool {
+    let Some(name) = ty.name() else {
+        return false;
+    };
+    if ty.container().is_none()
+        && crate::defaults::is_builtin_type(primitive_type_name(name))
+        && ty
+            .package()
+            .is_none_or(|package| package == "kotlin" || package == "java.lang")
+    {
+        return true;
+    }
+    index.lookup_type(name).iter().any(|entry| {
+        entry.sym.package == ty.package().unwrap_or_default()
+            && entry.sym.container.as_deref() == ty.container()
+    })
 }
 
 fn primitive_type_name(name: &str) -> &str {

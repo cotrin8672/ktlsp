@@ -139,6 +139,80 @@ fn assert_goto_into_library(ws: &mut Workspace, key: &str, src: &str, token: &st
 }
 
 #[test]
+fn local_jar_source_refresh_preserves_scope_and_replaces_member_targets() {
+    let tmp = unique_tmp("local_sources_scoped_refresh");
+    let jar = tmp.join("libs/api.jar");
+    let sources = tmp.join("libs/api-sources.jar");
+    write_sources_jar(&jar, &[("api/Only.class", "")]);
+    let model = || {
+        std::sync::Arc::new(ktlsp::classpath::ProjectSnapshot::new(
+            ktlsp::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nEND\t:app\nPROJECT\t:other\t{}\nSOURCE\tmain\t{}\nEND\t:other\n",
+                tmp.join("app").display(), tmp.join("app/src").display(), jar.display(),
+                tmp.join("other").display(), tmp.join("other/src").display(),
+            )),
+        ))
+    };
+    let mut ws = Workspace::new();
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+    let mut previous_source_files: Vec<String> = Vec::new();
+    for member in [Some("first"), Some("other"), None, Some("first")] {
+        if let Some(member) = member {
+            write_sources_jar(
+                &sources,
+                &[(
+                    "api/Only.java",
+                    &format!("package api; public class Only {{ public void {member}() {{}} }}"),
+                )],
+            );
+        } else {
+            fs::remove_file(&sources).unwrap();
+        }
+        ws.set_project_model(model());
+        for previous in &previous_source_files {
+            assert!(
+                ws.index.entries_for_file(previous).is_empty(),
+                "old source facts survived refresh"
+            );
+        }
+        let batches =
+            deps::resolve_local_jar_stubs(&jar, &tmp.join("extracted"), &mut kotlin, &mut java);
+        assert!(!batches.is_empty());
+        previous_source_files = batches.iter().map(|batch| batch.file.clone()).collect();
+        for batch in batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.bump_index_revision();
+        ws.assume_index_complete_for_tests();
+        for (name, text) in [
+            ("Use.kt", "package app\nimport api.Only\nfun use(value: Only) { value.MEMBER() }\n"),
+            ("Use.java", "package app; import api.Only; class Use { void use(Only value) { value.MEMBER(); } }"),
+        ] {
+            let text = text.replace("MEMBER", member.unwrap_or("first"));
+            let key = ktlsp::paths::file_key(&tmp.join("app/src").join(name));
+            ws.open(key.clone(), text.clone());
+            let offset = text.find("value.").unwrap() + "value.".len();
+            let items = ws.complete(&key, offset, false).map(|result| result.items).unwrap_or_default();
+            for candidate in ["first", "other"] {
+                assert_eq!(items.iter().any(|item| item.label == candidate), member == Some(candidate),
+                    "{name} has the wrong {candidate} completion after {member:?}");
+            }
+            if let Some(member) = member {
+                assert_goto_into_library(&mut ws, &key, &text, member, "api/Only.java");
+            } else {
+                assert!(ws.goto_definition(&key, offset).is_empty(), "removed source member still resolves");
+            }
+            let other = ktlsp::paths::file_key(&tmp.join("other/src").join(name));
+            ws.open(other.clone(), text.clone());
+            assert!(ws.goto_definition(&other, text.rfind("Only").unwrap()).is_empty(),
+                "a module without the jar resolved its class");
+        }
+    }
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn goto_uses_newest_selected_library_version() {
     let tmp = unique_tmp("libgoto_version_conflict");
     let older = Coordinate::parse("acme:demo:1.10.2").unwrap();

@@ -114,6 +114,23 @@ pub struct SymbolFacts {
     pub clean: bool,
 }
 
+pub fn extension_source_facts(
+    index: &dyn InferenceIndex,
+    key: &str,
+    tree: &Tree,
+    text: &str,
+) -> Vec<ktcore::extensions::source::SourceDeclaration> {
+    let scope = match SourceLanguage::for_key(key) {
+        SourceLanguage::Java => java::type_scope(tree, text),
+        SourceLanguage::Kotlin => indexer::TypeScope::with_default_imports(
+            &parser::package_of(tree, text),
+            parser::imports_of(tree, text),
+            ktcore::defaults::DEFAULT_IMPORT_PACKAGES,
+        ),
+    };
+    ktcore::extensions::source::extract(index, key, tree, text, &scope)
+}
+
 /// The current file's name-visibility context, mirroring the rules cross-file resolution uses: a
 /// name is visible if explicitly/alias-imported, in the same package, in a wildcard-imported
 /// package, or in a default-import package.

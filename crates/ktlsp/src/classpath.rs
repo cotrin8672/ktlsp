@@ -348,13 +348,32 @@ pub fn maven_origin_id(coordinate: &Coordinate) -> String {
 }
 
 pub fn file_origin_id(path: &Path) -> String {
+    let mut origin = format!("file:{}", file_revision(path));
+    if let Some(sources) = adjacent_sources_jar(path).filter(|sources| sources.is_file()) {
+        origin.push_str("|source:");
+        origin.push_str(&file_revision(&sources));
+    }
+    origin
+}
+
+/// The exact sibling is watched even before a build creates it.
+pub fn adjacent_sources_jar(path: &Path) -> Option<PathBuf> {
+    if path.extension()?.to_str()? != "jar" {
+        return None;
+    }
+    let mut name = path.file_stem()?.to_os_string();
+    name.push("-sources.jar");
+    Some(path.with_file_name(name))
+}
+
+fn file_revision(path: &Path) -> String {
     let metadata = std::fs::metadata(path).ok();
     let size = metadata.as_ref().map_or(0, |m| m.len());
     let mtime = metadata
         .and_then(|m| m.modified().ok())
         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
-    format!("file:{}#{mtime}:{size}", path_key(path))
+    format!("{}#{mtime}:{size}", path_key(path))
 }
 
 pub fn jdk_origin_id(path: &Path) -> String {
