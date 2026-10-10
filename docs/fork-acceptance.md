@@ -190,6 +190,10 @@ failed because the probe cursor was configured incorrectly; it is not a ktlsp bu
 
 ### Neovim IntelliJ oracle
 
+First implementation checkpoint: `25a6a0980b4726036ae7c6a6d77da6a3dcfa7179`,
+published on `origin/codex/java-kotlin-analysis`. The user's pre-existing `AGENTS.md`
+modification is excluded. Later slices continue on that branch.
+
 At the user's request, comparison uses the official
 [JetBrains intellij-lsp.nvim](https://github.com/JetBrains/intellij-lsp.nvim) plugin,
 pinned to `9cfad18005470e4187090013e08f92ec9e437219`, and IntelliJ Server 2026.3 EAP
