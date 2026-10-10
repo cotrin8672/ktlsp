@@ -41,19 +41,19 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / first slice | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. After first fixes and integration fixture repairs: 711 pass / 3 ignored across 29 suites | First slice verified | Root `rtk cargo test --workspace --no-fail-fast`, exit 0; original failures retained below |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Original basic passes 9; extended Java fails 5 useful member cases; features fails 3 then stalls. Fixed release: basic 9, Java 65, features 80, semantic 18 pass | First slice verified | Artifact summaries and assertions inspected; library and real-project acceptance continue |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. First slice: 711 pass / 3 ignored. Generic, dependency-buffer and cycle-guard slice: 735 pass / 3 ignored across 30 suites | Current Rust suite verified | Root `rtk cargo test --workspace --no-fail-fast`, exit 0; original failures retained below |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Original basic passes 9; extended Java fails 5 useful member cases; features fails 3 then stalls. Third fixed release: basic 9, Java 65, features 80, semantic 18, library 13, mixed 36 pass | Current focused editor suite verified | 221 assertions; artifact summaries and mixed compiler snapshots inspected; real-project acceptance continues |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Copy resolves 101 materialized classpath entries; offline Kotlin/Java compile succeeds; real Neovim hover and superclass goto reach Create Java source | Partial | Generic member, override, diagnostics and performance cases remain; class goto alone is insufficient |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Inheritance and generics | Correct inherited members and substituted types across both languages | Ordinary Java inheritance covered; compiler-valid Java generic returns and Kotlin generic supertype substitution return no useful completion | Failed | Exact independent compiler controls and probes below; next shared semantic slice |
+| Inheritance and generics | Correct inherited members and substituted types across both languages | Baseline generic chains fail. Structured Java type arguments and typed Java/Kotlin superclasses resolve release mixed completion/goto both directions. Growing invalid cycles stop without repeated declaration expansion; matching diamonds work and conflicting bindings stay Unknown | Partial; focused repair verified | Direct inherited package collision reproduced: wrong completion and Kotlin goto/diagnostics. Method inference and bounded wildcards also remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Not yet measured | Pending | Include invalid and ambiguous cases with independent expected results |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Not yet measured | Pending | Extend existing semantic/editor probes |
-| Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Focused tests pass Java receiver-type and Kotlin member edits observed by Java completion | Partial | Real Neovim and IDEA shared fixture; both-direction completion/definitions/references still required |
-| Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Not yet measured | Pending | Apply edits and inspect resulting buffers; compile disposable sources |
+| Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
+| Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Baseline omits a Java generic-chain use and renamed snapshot fails compilation. Fixed release and adapted IDEA update all three exact semantic sites, preserve all three complete buffers and compile the renamed snapshot | Mixed fixture verified | Actual corpus, overloads, JVM facades, ambiguous names and extension-provided references remain pending |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Not yet measured | Pending | Existing gradle-live/library plus real-project cases |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | No extension mechanism validated | Pending | Prove smallest contract after ordinary semantic slice; test config/source invalidation |
-| Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Official IntelliJ LSP plugin runs through real Neovim: Maven import, completion, navigation, refs, diagnostics and applied quickfix pass upstream integration smoke | Oracle setup complete | Shared ktlsp/IDEA mixed-source comparison still pending; no parity claim |
+| Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
 
 ## Measurement policy and initial UX targets
@@ -81,6 +81,66 @@ lower the accepted latency distribution. Sampling/profiling runs are separate fr
 timing runs. Initialization timing never substitutes for editor completion timing.
 
 ## Work log
+
+### Generic and dependency-buffer slice: Rust checkpoint
+
+Root verification on the frozen implementation:
+
+```powershell
+rtk proxy powershell -NoProfile -Command '$env:KTLSP_CACHE_DIR="C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/second-slice/rust-cache"; rtk cargo test --workspace --no-fail-fast'
+```
+
+Observed: exit 0, **732 passed / 3 ignored across 30 suites**, 3.51 s reported
+test execution. The external command log is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/second-slice/cargo-workspace.log`.
+All changed Rust files pass `rustfmt --check --edition 2021`; `git diff --check`
+passes. Old dependency symbol and ktcheck durable caches have new format keys,
+because normalized type/supertype facts changed.
+
+The checkpoint release at
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/second-fixed/bin/ktlsp.exe`
+has SHA-256 `22a43e50bcb80df74f1ded6e3f38322460220994897482fdef78719384b4a554`.
+Root inspected successful real-Neovim `second-fixed-mixed` (36/36) and
+`second-fixed-library` (13/13) artifacts under
+`C:/Users/gummy/AppData/Local/Temp/codex-ktlsp-harness-baseline-20261010`.
+Mixed original, unsaved and applied-rename snapshots all compile; all four
+post-delivery freshness requests match on attempt 1. This proves the focused
+repair, not full IDEA parity or performance targets.
+
+After the generic-cycle guard, root reran the full workspace with an explicit
+`KTLSP_CACHE_DIR` under `third-slice/rust-cache`: exit 0, **735 passed / 3 ignored
+across 30 suites**, 4.76 s reported test execution. Log:
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/third-slice/cargo-workspace.log`.
+All changed Rust files pass the targeted formatting check.
+
+The guarded release is
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010/third-fixed/bin/ktlsp.exe`,
+SHA-256 `72a900ebe45b4a04daa027d656cd5d7af14c0d9096f5ccaa600a574d344ea7f0`.
+Its six real-Neovim scenarios pass **221 assertions**: basic 9, Java 65,
+features 80, semantic 18, library 13, mixed 36. Root inspected their summaries
+and the mixed result/compile records under the same harness evidence root,
+`third-fixed-<scenario>/artifacts`. Invalid self-cycles and two-class cycles
+are bounded before expanding a repeated declaration; normal diamonds and
+conflicting generic bindings retain their focused regression expectations.
+
+### Next reproduced gap: imported superclass identity
+
+Compiler-valid Java and Kotlin children explicitly inherit `base.Base` while
+an unrelated `app.Base` also exists. Javac 21 and Kotlin 1.9.23 accept both
+callers; `javap` confirms both children extend `base.Base`. The external
+14-check probe passes 7 and fails 7: four completions offer `baseWrong` instead
+of `baseOnly`, two Kotlin calls to inherited `accept` navigate to `app.Base`,
+and one diagnostics case reports two false argument-shape errors. Java
+navigation and diagnostics controls pass.
+
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-semantic-gaps-20261010/`
+`compile-superclass.ps1`, `superclass-baseline.rs`, `superclass-baseline.exe`,
+and `oracle/superclass`. Reproduce with RTK PowerShell `-File
+compile-superclass.ps1`, then run `superclass-baseline.exe` (expected exit 1
+before repair). Next: preserve typed superclass identities in the remaining
+shared completion, call-validation and resolution readers; add unsaved import
+switches and correct-target exclusions. This is an external reproduction,
+not yet a committed editor acceptance case.
 
 ### Initial investigation
 
@@ -210,3 +270,161 @@ completion and definitions, references, diagnostics and an applied quickfix.
 Evidence: `artifacts/plugin-java-e2e-maven.log` under the oracle directory. This proves
 the comparison setup, not ktlsp/IDEA equivalence. Next compare identical mixed
 sources and unsaved edits using the repository's existing editor harness.
+
+The shared `mixed` fixture now verifies ordinary direct receiver completion and
+exact cross-language definitions through both engines. Compiler-valid generic
+chains `JavaBox<KotlinApi>.value().kotlinGreeting()` and
+`JavaBox<JavaApi>.value().javaGreeting()` complete in IntelliJ Server 263.6379.0,
+while the immutable first-fixed ktlsp release returns no required completion.
+The Java chain also loses its definition/reference/rename use. Evidence roots:
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-mixed-development-20261010/baseline-run`
+and `oracle-run2`. Repeated requests here wait for indexing and are not timing
+samples. The full protocol-neutral references and applied-rename comparison is
+still being verified; IDEA may return selector reference ranges and several
+minimal edits inside an identifier, so compare semantic sites and complete applied
+source rather than assuming identical edit encoding.
+
+The next generic regression baseline has one passing guard and nine failures.
+`generic_interop.rs` covers normalized Java type parameters, structural generic
+returns, reordered inherited type arguments, qualified same-name types, nullable
+substitution and unsaved changes. Independent JDK 21 / Kotlin 1.9.23 extended
+compiler controls pass. Its baseline Cargo output is retained at
+`C:/Users/gummy/AppData/Local/rtk/tee/1791629734_cargo_test.log`.
+
+### Opened dependency-source identity and late indexing
+
+The existing `library` scenario now opens the actual indexed JDK `Connection.java`
+and makes only unsaved changes. Expected behavior is that renaming
+`clearWarnings` to `clearWarningsChanged` removes the old completion, deleting the
+method removes both candidates, and goto reaches the current declaration.
+Closing the dirty source restores its on-disk method; reopening must retain one
+current definition. The probe also checks that the source file was never rewritten.
+
+Against the immutable first-fixed release, the complete lifecycle has **11 passing
+and 2 failing assertions out of 13**. The failures are stale old completion after
+rename and after deletion. Useful closed/new-method completion, exact new-method
+goto and close/reopen behavior pass. Evidence:
+`C:/Users/gummy/AppData/Local/Temp/codex-ktlsp-harness-baseline-20261010/library-lifecycle-original`.
+The earlier `library-lifecycle-baseline` attempt stopped on a test API mistake:
+Neovim's detach function returns no boolean. The corrected probe verifies detached
+state explicitly and was rerun completely in `library-lifecycle-original`.
+
+A focused pre-fix regression shows the same source indexed as
+`C:\Users\gummy\AppData\Local\Temp\ktlsp_dependency_overlay_40216\Helper.java`
+while the editor uses
+`C:/Users/gummy/AppData/Local/Temp/ktlsp_dependency_overlay_40216/Helper.java`.
+The result contains both `clearOriginal` and `clearChanged` instead of only the
+current method. Raw failure:
+`C:/Users/gummy/AppData/Local/rtk/tee/1791629993_cargo_test.log`.
+
+Dependency `FileSymbols` creation now uses the shared lexical file key, and warm
+symbol-cache loading normalizes persisted native path strings. Focused
+`rtk cargo test -p ktlsp --lib deps::tests` passes **27 tests** with an explicit
+external `KTLSP_CACHE_DIR`. Regressions cover both broad and import-seed parsing,
+closed/open source facts, unsaved rename and exact goto, deletion, close/reopen,
+and a legacy native-key cache file. No process-global cache variables are changed
+inside these tests.
+
+Normalizing identity also exposed a separate late-arrival priority bug. A focused
+test delivers closed dependency facts after an open buffer has been edited. The
+unchanged merge operation replaces `clearChanged` with `clearOriginal`; raw failure:
+`C:/Users/gummy/AppData/Local/rtk/tee/1791630674_cargo_test.log`.
+All five LSP dependency/JDK/import merge sites now use
+`Workspace::index_dependency_file`, which checks open-buffer ownership in constant
+time and skips those closed facts. Callers retain their existing revision batching.
+The shared Java/Kotlin regression passes and also verifies unsaved deletion,
+acceptance of another closed file and acceptance after the original buffer closes.
+Focused command:
+`rtk cargo test -p ktlsp --lib workspace::tests::late_dependency_batches_preserve_open_java_and_kotlin_facts`.
+
+The inherited close behavior reindexes disk facts in the volatile tier; this slice
+preserves that behavior. No wrong result from that tier transition has been
+reproduced. A future duplicate-project/library-qualified-name case can test whether
+the closed-library tier needs separate tracking.
+
+The immutable second-fixed release passes the expanded **library 13/13** and
+strict **mixed 36/36** scenarios, both exit 0. Its SHA256 is
+`22a43e50bcb80df74f1ded6e3f38322460220994897482fdef78719384b4a554`.
+Artifacts are under
+`C:/Users/gummy/AppData/Local/Temp/codex-ktlsp-harness-baseline-20261010/second-fixed-library`
+and `second-fixed-mixed`; the build log is `second-fixed-release-build.log` in
+the same evidence directory. Both current document versions are verified outbound
+before four first-response freshness checks. Exact references, both applied
+renames and compilation of original, unsaved and renamed snapshots pass.
+
+The subsequent immutable third-fixed release includes the reviewed recursive
+generic-inheritance guard. Its SHA256 is
+`72a900ebe45b4a04daa027d656cd5d7af14c0d9096f5ccaa600a574d344ea7f0`.
+The complete editor sweep passes **basic 9, java 65, features 80, semantic 18,
+library 13 and mixed 36 assertions**, every scenario exit 0. Evidence is under
+`third-fixed-<scenario>/artifacts` in the same external directory. Mixed uses the
+extracted shared probe helper and retains all strict freshness, exact-reference,
+applied-rename and three compiler checks. These correctness runs were concurrent
+and supply no latency acceptance. They do not establish real-project or full IDEA
+parity acceptance.
+
+### Shared mixed-source comparison and editor delivery
+
+The complete protocol-neutral comparison uses `dev/ktlsp-harness.sh mixed`,
+`dev/mixed_project.lua` and `dev/nvim_mixed.lua`. The Maven fixture contains mutually
+referencing Java/Kotlin types and generic `JavaBox<T>` receiver chains. Original,
+unsaved-edit and applied-rename snapshots compile independently with Kotlin 2.0.21
+and the Java 17 target under JDK 21. Compilation runs on copies outside the indexed
+project; the fixture files remain unchanged.
+
+The immutable first-fixed ktlsp release has **27 passing and 7 failing assertions
+out of 34** in `baseline-run3`. Generic completion fails in both directions;
+Java's generic chain also loses its Kotlin definition, reference and rename site.
+Applying the returned rename therefore leaves the Java generic use unchanged and
+the renamed snapshot fails compilation. Direct receiver cases and eventual unsaved
+completion/navigation pass. Missing generic sites remain failures.
+
+The adapted IntelliJ comparison has **36 passing assertions out of 36** in
+`oracle-run4`, with successful Maven import and all three compiler snapshots passing.
+References must cover exactly the expected identifier sites with no missing,
+duplicate or additional sites. Rename edits must stay inside those identifiers
+without overlap, and the complete resulting buffers must equal the expected source.
+Selector-shaped reference ranges and minimal substring rename edits are accepted
+equally for either engine when they satisfy these semantic checks.
+
+This result requires an explicit Windows URI adapter. The unadapted `oracle-run3`
+returns valid edits with equivalent `file:///C:/...` and `file:///c%3A/...` URI
+spellings, but the plugin's exact-URI document-version ledger misses the latter.
+Neovim rejects edits as stale (`Buffer ... newer than edits.`), only part of the
+rename is applied, and the renamed copy fails compilation. This is a reproduced
+Neovim/plugin integration limitation and remains separate from the passing IntelliJ
+semantic checks. The shared harness normalizes equivalent URIs to open-buffer URIs;
+for IntelliJ it then invokes the official plugin's `versions.fix_workspace_edit`
+against its existing ledger. Version checks are retained. Raw responses and the
+processed `rename-*-apply.json` files are preserved; adapted success is **not a
+vanilla IntelliJ-in-Neovim UX pass**.
+
+Both engines' original first Java completion after editing the two buffers fails
+before a later response succeeds. Transport logs show that the first request flushes
+Java's `didChange`, while Kotlin's notification remains under Neovim's peer-buffer
+debounce until after that response. This is an editing-UX gap before delivery,
+not evidence that a server ignored an already-delivered Kotlin change. Neovim
+0.12.5's `Client:request` calls `changetracking.flush(self, bufnr)`; its existing
+`vim.lsp._changetracking.flush(client)` without a buffer sends all pending changes.
+The updated scenario records a single normal pre-barrier observation, explicitly
+uses that internal all-buffer flush as a **test delivery barrier**, verifies both
+current versions on outbound `rpc.notify`, then checks each first completion and
+definition response without sleeps or retries. No retrying run supplies timing or
+freshness acceptance. The adapted strict IntelliJ run `oracle-run5` passes **38/38**:
+both outbound current versions are 3, all four fresh completion/definition requests
+match on attempt 1 after the barrier, and all compiler snapshots still pass. Its
+normal pre-barrier Java completion fails on its only response and remains recorded.
+`mixed-didchange.json` and phase-labelled `mixed-requests.jsonl` distinguish delivery
+and first-response observations. The same strict scenario passes **36/36** with
+the generic/dependency-source fixes and recursion guard in the immutable third-fixed
+release (`ktlsp.exe` SHA-256
+`72a900ebe45b4a04daa027d656cd5d7af14c0d9096f5ccaa600a574d344ea7f0`).
+All three compiler snapshots pass, both renames preserve the complete expected
+buffers, and all four fresh responses match on attempt 1. Artifact:
+`C:/Users/gummy/AppData/Local/Temp/codex-ktlsp-harness-baseline-20261010/third-fixed-mixed`.
+Extracting the common engine/position helpers for the corpus preserves IntelliJ's
+**38/38** result in `oracle-run6`. This establishes the ordinary mixed fixture;
+real-project breadth, unsaved editing latency and full IDEA parity remain open.
+
+All comparison artifacts above are under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-mixed-development-20261010`.

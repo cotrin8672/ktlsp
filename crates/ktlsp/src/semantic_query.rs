@@ -317,7 +317,9 @@ pub fn member_completion_query_for_type(
         SourceLanguage::Java => ImportStyle::Java,
     };
     let layout = imports::import_layout_with_style(style, tree, src);
-    let Some(receiver_type_name) = ty.name().map(str::to_string) else {
+    let Some(receiver_type_name) =
+        infer::receiver_root_key(index, &ty).or_else(|| ty.name().map(str::to_string))
+    else {
         return Some(CompletionQuery {
             context: complete::CompletionContext::AfterDot,
             prefix,
@@ -559,7 +561,9 @@ pub fn scope_name_query(
     let vis = Visibility::new(&pkg, &imports);
     let file_ctx = infer::FileCtx::from_tree(tree, src);
     for recv_ty in infer::implicit_receiver_types(index, anchor, src, &file_ctx, 0) {
-        let Some(receiver_type_name) = recv_ty.name().map(str::to_string) else {
+        let Some(receiver_type_name) = infer::receiver_root_key(index, &recv_ty)
+            .or_else(|| recv_ty.name().map(str::to_string))
+        else {
             continue;
         };
         let receiver_type_package = recv_ty.package().map(str::to_string);
@@ -653,11 +657,14 @@ fn member_candidates(
         }
         let members_index = source_index
             .filter(|source| {
+                let (container, simple) = match cur.rsplit_once('.') {
+                    Some((container, simple)) => (Some(container), simple),
+                    None => (None, cur.as_str()),
+                };
                 cur_pkg.as_ref().is_some_and(|pkg| {
-                    source
-                        .lookup_type(&cur)
-                        .iter()
-                        .any(|entry| entry.sym.package == *pkg)
+                    source.lookup_type(simple).iter().any(|entry| {
+                        entry.sym.package == *pkg && entry.sym.container.as_deref() == container
+                    })
                 })
             })
             .unwrap_or(index);
@@ -1185,6 +1192,7 @@ mod tests {
                 end_byte: 5,
                 documentation: None,
                 supertypes: Vec::new(),
+                supertype_refs: Vec::new(),
                 ext_receiver: Some("Dog".into()),
                 arity: Some(1),
                 min_arity: Some(1),

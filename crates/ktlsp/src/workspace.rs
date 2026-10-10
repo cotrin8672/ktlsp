@@ -118,6 +118,16 @@ impl Workspace {
         self.open_docs.keys().cloned().collect()
     }
 
+    /// Insert closed dependency facts under a normalized key, preserving authoritative open text.
+    /// Callers bump the revision once for their whole batch.
+    pub fn index_dependency_file(&mut self, key: &str, symbols: Vec<IndexedSymbol>) -> bool {
+        if self.open_docs.contains_key(key) {
+            return false;
+        }
+        self.index.replace_file(key, symbols, Tier::Durable);
+        true
+    }
+
     pub fn project_doc_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.project_file_meta.keys().cloned().collect();
         keys.sort();
@@ -1538,6 +1548,74 @@ mod tests {
             .iter()
             .map(|candidate| candidate.label.clone())
             .collect()
+    }
+
+    #[test]
+    fn late_dependency_batches_preserve_open_java_and_kotlin_facts() {
+        for (key, original, changed, empty) in [
+            (
+                "lib/Helper.java",
+                "package lib;\npublic class Helper {\n public void clearOriginal() {}\n}\n",
+                "package lib;\npublic class Helper {\n public void clearChanged() {}\n}\n",
+                "package lib;\npublic class Helper {}\n",
+            ),
+            (
+                "lib/Helper.kt",
+                "package lib\nclass Helper {\n fun clearOriginal() {}\n}\n",
+                "package lib\nclass Helper {\n fun clearChanged() {}\n}\n",
+                "package lib\nclass Helper {}\n",
+            ),
+        ] {
+            let language = SourceLanguage::for_key(key);
+            let mut parsers = LanguageParsers::new();
+            let facts = |parsers: &mut LanguageParsers, text: &str| {
+                let tree = parsers.parse(language, text);
+                language::symbol_facts(language, &tree, text).symbols
+            };
+            let mut ws = Workspace::new();
+            ws.assume_index_complete_for_tests();
+            assert!(ws.index_dependency_file(key, facts(&mut parsers, original)));
+            ws.open(key, original.to_string());
+            ws.change(key, changed.to_string());
+            let main =
+                "package app\nimport lib.Helper\nfun use(helper: Helper) {\n helper.clear\n}\n";
+            let offset = main.find("helper.clear").unwrap() + "helper.clear".len();
+            ws.open("Main.kt", main.to_string());
+
+            let accepted = ws.index_dependency_file(key, facts(&mut parsers, original));
+            ws.bump_index_revision();
+            let labels = completion_labels(&ws.completion_query("Main.kt", offset).unwrap());
+            assert_eq!(
+                labels,
+                vec!["clearChanged"],
+                "late closed facts replaced {key}: {labels:?}"
+            );
+            assert!(!accepted, "open dependency batches should be skipped");
+            assert_eq!(ws.doc_text(key).as_deref(), Some(changed));
+
+            ws.change(key, empty.to_string());
+            assert!(!ws.index_dependency_file(key, facts(&mut parsers, original)));
+            ws.bump_index_revision();
+            assert!(ws
+                .completion_query("Main.kt", offset)
+                .unwrap()
+                .candidates
+                .is_empty());
+
+            let other = "package lib\nclass OtherClosed\n";
+            let tree = parsers.parse(SourceLanguage::Kotlin, other);
+            let symbols = language::symbol_facts(SourceLanguage::Kotlin, &tree, other).symbols;
+            assert!(ws.index_dependency_file("lib/OtherClosed.kt", symbols));
+            assert_eq!(ws.index.lookup_type("OtherClosed").len(), 1);
+
+            ws.close(key);
+            assert!(ws.index_dependency_file(key, facts(&mut parsers, original)));
+            ws.bump_index_revision();
+            assert_eq!(
+                completion_labels(&ws.completion_query("Main.kt", offset).unwrap()),
+                vec!["clearOriginal"]
+            );
+        }
     }
 
     #[test]

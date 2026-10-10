@@ -148,7 +148,8 @@ fn call_shape_query(
     if normalized != call || uses_named_arguments(normalized) {
         return None;
     }
-    let (callee, callee_ancestors) = infer::callable_callee_with_path(normalized, normalized_ancestors)?;
+    let (callee, callee_ancestors) =
+        infer::callable_callee_with_path(normalized, normalized_ancestors)?;
     match callee.kind() {
         "identifier" => top_level_call_shape_query(
             index,
@@ -242,10 +243,14 @@ fn member_call_shape_query(
     // (`MyList<String>.add` checks `String`, not the bare `E`).
     let entries = entries
         .into_iter()
-        .map(|entry| match infer::receiver_type_bindings(index, &recv_ty, &entry) {
-            Some(bindings) if !bindings.is_empty() => substitute_entry_param_types(entry, &bindings),
-            _ => entry,
-        })
+        .map(
+            |entry| match infer::receiver_type_bindings(index, &recv_ty, &entry) {
+                Some(bindings) if !bindings.is_empty() => {
+                    substitute_entry_param_types(entry, &bindings)
+                }
+                _ => entry,
+            },
+        )
         .collect::<Vec<_>>();
     call_shape_from_entries(index, src, call, symbol, entries, ctx)
 }
@@ -339,8 +344,13 @@ fn substitute_entry_param_types(entry: Entry, bindings: &HashMap<String, Type>) 
 }
 
 fn substitute_type_ref(tr: &TypeRef, bindings: &HashMap<String, Type>) -> TypeRef {
-    if let Some(ty) = bindings.get(&tr.name) {
-        return type_to_type_ref(ty);
+    if let Some(ty) = bindings
+        .get(&tr.name)
+        .filter(|_| tr.qualification.is_none())
+    {
+        let mut resolved = type_to_type_ref(ty);
+        resolved.nullable |= tr.nullable;
+        return resolved;
     }
     if tr.args.is_empty() {
         return tr.clone();
@@ -364,6 +374,7 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
             args,
         } => TypeRef {
             name: name.clone(),
+            qualification: None,
             nullable: *nullable,
             args: args.iter().map(type_to_type_ref).collect(),
             package_candidates: std::sync::Arc::new(package.iter().cloned().collect()),
@@ -902,6 +913,30 @@ mod tests {
     }
 
     #[test]
+    fn generic_parameter_type_roundtrip_keeps_nested_identity_and_nullability() {
+        let mut index = Index::new();
+        index_file(
+            &mut index,
+            "Model.kt",
+            "package model\nclass Outer {\n class Inner\n}\n",
+        );
+        index_file(&mut index, "Other.kt", "package app\nclass Inner\n");
+        let ty = Type::Class {
+            name: "Inner".into(),
+            package: Some("model".into()),
+            container: Some("Outer".into()),
+            nullable: true,
+            args: Vec::new(),
+        };
+        let tr = type_to_type_ref(&ty);
+        assert_eq!(tr.container_candidates, ["Outer"]);
+        assert_eq!(
+            infer::declared_type(&index, &tr, &infer::FileCtx::new("app".into(), Vec::new())),
+            ty
+        );
+    }
+
+    #[test]
     fn indexed_diagnostics_report_missing_call_in_closed_world() {
         let src = "fun main() { missingCall() }\n";
         let mut parser = KotlinParser::new();
@@ -1240,7 +1275,13 @@ mod tests {
         let mut index = Index::new();
         let pkg = package_of(&tree, src);
         index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
-        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        let diagnostics = compute(
+            &index,
+            "Main.kt",
+            src,
+            &tree,
+            &CompletenessFacts::complete(),
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -1259,12 +1300,24 @@ mod tests {
         let mut index = Index::new();
         let pkg = package_of(&tree, src);
         index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
-        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        let diagnostics = compute(
+            &index,
+            "Main.kt",
+            src,
+            &tree,
+            &CompletenessFacts::complete(),
+        );
         // `User` (the type argument) and `decode` (the callee) must not be flagged; `String`
         // is unresolved only because this closed single-file index has no stdlib.
         for diag in &diagnostics {
-            assert_ne!(diag.message, "Unresolved reference: User", "{diagnostics:?}");
-            assert_ne!(diag.message, "Unresolved reference: decode", "{diagnostics:?}");
+            assert_ne!(
+                diag.message, "Unresolved reference: User",
+                "{diagnostics:?}"
+            );
+            assert_ne!(
+                diag.message, "Unresolved reference: decode",
+                "{diagnostics:?}"
+            );
         }
     }
 
@@ -1287,7 +1340,13 @@ mod tests {
         let mut index = Index::new();
         let pkg = package_of(&tree, src);
         index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
-        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        let diagnostics = compute(
+            &index,
+            "Main.kt",
+            src,
+            &tree,
+            &CompletenessFacts::complete(),
+        );
         assert!(
             diagnostics
                 .iter()
@@ -1315,7 +1374,13 @@ mod tests {
         let mut index = Index::new();
         let pkg = package_of(&tree, src);
         index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
-        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        let diagnostics = compute(
+            &index,
+            "Main.kt",
+            src,
+            &tree,
+            &CompletenessFacts::complete(),
+        );
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].code, Some(DiagnosticCode::CallShapeMismatch));
     }
@@ -1341,7 +1406,13 @@ mod tests {
         let mut index = Index::new();
         let pkg = package_of(&tree, src);
         index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
-        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        let diagnostics = compute(
+            &index,
+            "Main.kt",
+            src,
+            &tree,
+            &CompletenessFacts::complete(),
+        );
         assert!(
             diagnostics
                 .iter()
@@ -1372,12 +1443,18 @@ mod tests {
         let mut index = Index::new();
         let pkg = package_of(&tree, src);
         index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
-        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        let diagnostics = compute(
+            &index,
+            "Main.kt",
+            src,
+            &tree,
+            &CompletenessFacts::complete(),
+        );
         assert!(
-            diagnostics
-                .iter()
-                .all(|diag| diag.code != Some(DiagnosticCode::UnresolvedReference)
-                    || diag.message != "Unresolved reference: emit"),
+            diagnostics.iter().all(
+                |diag| diag.code != Some(DiagnosticCode::UnresolvedReference)
+                    || diag.message != "Unresolved reference: emit"
+            ),
             "{diagnostics:?}"
         );
     }

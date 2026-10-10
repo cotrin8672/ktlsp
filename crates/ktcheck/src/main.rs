@@ -580,7 +580,7 @@ fn completeness_from_scans(
 
 // Java symbol extraction now includes record accessors and richer inheritance facts, so caches
 // produced before those facts existed cannot safely drive overload diagnostics.
-const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v5-zstd-rooted";
+const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v6-generic-supertypes";
 const MAX_DURABLE_SNAPSHOTS_PER_ROOT: usize = 2;
 
 fn load_durable_library_symbols_cached(roots: &[PathBuf], scans: &[ScannedFile]) -> DurableLoad {

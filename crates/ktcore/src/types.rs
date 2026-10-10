@@ -4,8 +4,8 @@
 //! - [`TypeRef`] is what the *index* stores for a declaration's return/property/parameter type: a
 //!   simple name, nullability, raw type-args, plus declaration-context package/container
 //!   candidates. The candidates keep `fun f(): Bar` tied to the imports/package of the file that
-//!   declared `f`; inference only falls back to the call site's context when the declaration
-//!   context cannot be resolved from the current index. `TypeRef` is serialized into the symcache.
+//!   declared `f`; qualified or ambiguous references are checked against indexed identities.
+//!   `TypeRef` is serialized into the symcache.
 //! - [`Type`] is a type *resolved at a use site*: a simple name plus the package/container we
 //!   resolved it to.
 //!   [`Type::Unknown`] is a first-class, non-failing outcome that drives the silent-omission
@@ -22,11 +22,16 @@ mod arc_candidates {
     use super::Arc;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(value: &Arc<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        value: &Arc<Vec<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         value.as_ref().serialize(serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<Vec<String>>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<Vec<String>>, D::Error> {
         Vec::<String>::deserialize(deserializer).map(Arc::new)
     }
 }
@@ -34,6 +39,10 @@ mod arc_candidates {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TypeRef {
     pub name: String,
+    /// The syntactic qualifier before the simple name, with explicit imports expanded.
+    /// Resolution matches it against indexed package/container identities; casing is irrelevant.
+    #[serde(default)]
+    pub qualification: Option<String>,
     #[serde(default)]
     pub nullable: bool,
     #[serde(default)]
@@ -48,6 +57,7 @@ impl TypeRef {
     pub fn simple(name: impl Into<String>) -> Self {
         TypeRef {
             name: name.into(),
+            qualification: None,
             nullable: false,
             args: Vec::new(),
             package_candidates: Arc::new(Vec::new()),

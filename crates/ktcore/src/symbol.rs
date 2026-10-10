@@ -54,6 +54,9 @@ pub struct IndexedSymbol {
     pub documentation: Option<String>,
     #[serde(default)]
     pub supertypes: Vec<String>,
+    /// Declared superclass/interface types, including arguments and declaration-file visibility.
+    #[serde(default)]
+    pub supertype_refs: Vec<TypeRef>,
     #[serde(default)]
     pub ext_receiver: Option<String>,
     #[serde(default)]
@@ -102,6 +105,7 @@ impl IndexedSymbol {
             end_byte,
             documentation: None,
             supertypes: Vec::new(),
+            supertype_refs: Vec::new(),
             ext_receiver: None,
             arity: None,
             min_arity: None,

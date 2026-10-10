@@ -169,11 +169,37 @@ dev/ktlsp-harness.sh basic
 ```
 
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
-`library`, `java`, `semantic`, `gradle-live`, or `comprehensive`.
+`library`, `java`, `mixed`, `corpus`, `semantic`, `gradle-live`, or `comprehensive`.
 
 `java` covers incomplete member completion, inherited members, Java receivers of Kotlin types,
 and an unsaved Kotlin declaration edit observed from an unsaved Java buffer on the same client.
 The harness also runs with native Windows Neovim through Git Bash and selects `.exe` binaries.
+
+`library` checks stdlib/JDK definitions and opened dependency sources. Unsaved method renames and
+deletions must update Kotlin completion and navigation; closing and reopening the source must
+restore the disk contents without rewriting the dependency cache.
+
+`mixed` checks Java/Kotlin member completion, generic receivers, exact definitions and references,
+and edits in both unsaved buffers on one client. It applies cross-language renames and checks the
+complete resulting source. Maven and JDK 17+ are required: original, edited, and renamed copies
+must compile, with compiler logs and source snapshots retained in the artifact directory.
+Set `KTLSP_MIXED_MVN` when Maven is outside `PATH`. To run the same assertions through
+`intellij-lsp.nvim`, set `KTLSP_MIXED_SERVER=intellij`, `IJLS_PLUGIN` to its checkout,
+`IJLS_SERVER` to the server executable, and `IJLS_JDK` to the JDK home. Use isolated XDG cache,
+data, and config directories for that temporary plugin; the scenario uses its normal client
+configuration and requires a successful Maven import. These checks do not establish full IDEA parity.
+Equivalent file URIs are normalized before applying edits; IntelliJ edits retain the plugin's
+document-version translation and Neovim's stale-edit checks.
+The scenario records normal peer-buffer debounce separately, then flushes Neovim's pending
+changes for both buffers and checks the first completion/definition responses without retries.
+That explicit test delivery barrier does not establish freshness before the editor sends changes.
+
+`corpus --root <project> --file <manifest.json>` runs read-only completion and exact declaration
+probes on a real project. The manifest supplies relative source files, unique anchors, tokens,
+and expected declaration files/anchors. `KTLSP_PROBE_SERVER=intellij` uses the same official
+plugin configuration as `mixed`, with successful Gradle import required. Source hashes, working-tree
+status, first/last responses and bounded indexing retries are recorded; retries are not timing samples.
+See [the corpus record](docs/fork-corpus.md) for pinned projects, candidate probes and remaining coverage.
 
 `gradle-live` also verifies classpath discovery against a disposable Gradle project that creates
 `compileClasspath` from a late `afterEvaluate` callback. The probe requires cold and warm

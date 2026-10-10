@@ -150,7 +150,7 @@ include version 34. Shell `python`/`python3` resolve to Windows app aliases and
 the `py` launcher reports no installed Python; use the bundled runtime for harness
 scripts. The default `bash` is WSL; use the recorded Git Bash executable.
 
-| Project | Wrapper / Kotlin | Required model details and focused compiler tasks (not run) |
+| Project | Wrapper / Kotlin | Required model details and focused compiler tasks |
 | --- | --- | --- |
 | CEM | 9.6.1 / 2.4.0 | JDK 21; ModDevGradle-generated Minecraft/NeoForge artifacts, non-transitive Create plus explicit dependencies; compile only a disposable snapshot preserving dirty sources |
 | OkHttp | 7.5 / 1.8.21 | Use JDK 17 for wrapper runtime; target Java 8; `:samples:guide:compileJava :samples:guide:compileKotlin`; `:okhttp:copyJavaTemplates` generates Kotlin `okhttp3/OkHttp.kt` under `build/generated/sources/java-templates/java/main`; Android test module is conditional |
@@ -191,9 +191,47 @@ process and isolated build/cache settings recorded in its run artifacts:
 rtk proxy ./gradlew.bat :moshi:compileJava :moshi:compileKotlin :moshi-kotlin:compileKotlin --no-daemon --console=plain
 ```
 
-Classpath import, generation tasks and compiler runs have not yet been executed
-for these clones. The resolved project model, module visibility, generated source
-roots and compiler outputs remain prerequisites for semantic acceptance. Entire
-root indexing and latency must be measured separately from focused submodule
-probes. Keep complete roots in the performance corpus and record source-set scope;
-a fast result from a small module is not a whole-project result.
+## Compiler and model execution
+
+The following checks run against the complete pinned clone, using focused tasks;
+they do not claim a repository-wide build or test suite. All non-CEM commands use
+process-local `JAVA_HOME=C:/Program Files/Java/jdk-17`, `--no-daemon`,
+`--max-workers=4`, and `--console=plain`. Network dependency downloads are allowed.
+Build durations include dependency/build-logic work and concurrent builds; they
+are compiler evidence, not LSP latency measurements.
+
+| Project | Executed task group | Observed result | Evidence |
+| --- | --- | --- | --- |
+| CEM copy | `classes --offline` | Success, Kotlin 2.4.0 / Java 21; warnings retained | `cem-classes-offline.log` |
+| OkHttp | `:samples:guide:compileJava :samples:guide:compileKotlin` | Success, 3m 34s; Kotlin core, TLS, mockwebserver and KAPT-generated guide sources compiled | `okhttp-compile.log` |
+| Moshi | `:moshi:compileJava :moshi:compileKotlin :moshi-kotlin:compileKotlin` | Success, 2m 56s; main and Java 16 MR-JAR sources compiled | `moshi-compile.log` |
+| Retrofit | `:retrofit:compileJava :retrofit:compileKotlin` | Success, 4m 49s; ordinary mutual Java/Kotlin core | `retrofit-compile.log` |
+| Spring | `:spring-beans:compileJava :spring-beans:compileKotlin` | Success, 7m 8s; spring-core, repackaged libraries and spring-jcl dependencies compiled | `spring-compile.log` |
+| Gradle | `:problems:compileJava :problems:compileKotlin` | Success, 28m 46s; included build logic and ordinary Java/Kotlin problem-reporting module compiled | `gradle-compile.log` |
+
+Logs are under `C:/Users/gummy/AppData/Local/Temp/ktlsp-goal-20261010`.
+Initial offline classpath dumps resolve 11 Moshi modules / 52 entries and 19 OkHttp
+modules / 176 entries, but report 11 and 8 unresolved dependencies respectively in
+other modules (codegen and optional sample/support modules). Subsequent online
+dumps all exit successfully with zero unresolved dependencies:
+
+| Project | Modules | Classpath entries | Distinct absent project outputs |
+| --- | --- | --- | --- |
+| Moshi | 11 | 68 | 1 |
+| OkHttp | 19 | 202 | 4 |
+| Retrofit | 26 | 201 | 6 |
+| Spring | 26 | 1,090 | 29 |
+| Gradle | 194 | 11,093 | 82 |
+
+Evidence is in `<project>-classpath-online.log` under the log directory above.
+The dumps use `scripts/classpath-dump.init.gradle.kts` and the same JDK/runtime
+settings as the compiler tasks. Missing paths belong to unbuilt project JARs or
+class directories, including modules outside the focused compiler task group.
+Dependency resolution alone therefore does not prove complete-root model readiness;
+missing project-output handling and source-set visibility remain to be verified.
+
+The resolved project model, module visibility and generated source roots remain
+prerequisites for semantic acceptance. Entire root indexing and latency must be
+measured separately from focused submodule probes. Keep complete roots in the
+performance corpus and record source-set scope; a fast result from a small module
+is not a whole-project result.

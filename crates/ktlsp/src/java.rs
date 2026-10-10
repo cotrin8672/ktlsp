@@ -10,6 +10,7 @@
 //! - `package_declaration` -> `scoped_identifier` (its text is the dotted package)
 
 use std::collections::{BTreeMap, HashSet};
+use std::ops::ControlFlow;
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -17,6 +18,8 @@ use crate::complete::{self, ScopeCompletion, ShapedCompletions};
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
 use crate::imports::{self, ImportStyle};
 use crate::index::{Entry, Index, Tier, Usage};
+use crate::indexer::TypeScope;
+use crate::infer::{self, FileCtx};
 use crate::language;
 use crate::parser::{child_of_kind, name_field, node_text};
 use crate::semantic_query::{
@@ -64,6 +67,7 @@ impl Default for JavaParser {
 /// Extract top-level & member declarations (skips method/constructor bodies, so locals don't leak).
 pub fn extract_symbols(tree: &Tree, src: &str) -> Vec<IndexedSymbol> {
     let package = package_of(tree, src);
+    let scope = type_scope(tree, src);
     // Same sizing heuristic as `extract_usages`, scaled for declaration density: dense files grow
     // once instead of walking the doubling sequence that dominates cold-index profiles.
     let mut out = Vec::with_capacity(src.len() / 128);
@@ -74,6 +78,7 @@ pub fn extract_symbols(tree: &Tree, src: &str) -> Vec<IndexedSymbol> {
             src,
             &package,
             container.as_deref(),
+            &scope,
             &mut out,
             &mut stack,
         );
@@ -192,6 +197,7 @@ fn type_decl<'tree>(
     src: &str,
     package: &str,
     container: Option<&str>,
+    scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
     stack: &mut Vec<(Node<'tree>, Option<String>)>,
 ) {
@@ -199,11 +205,20 @@ fn type_decl<'tree>(
         return;
     };
     let mut sym = indexed_symbol(name, src, kind, package, container);
-    sym.supertypes = supertype_names(node, src);
+    sym.supertype_refs = supertype_refs(node, src, scope);
+    sym.supertypes = sym
+        .supertype_refs
+        .iter()
+        .map(|ty| ty.name.clone())
+        .collect();
+    sym.type_params = type_parameter_names(node, src);
     out.push(sym);
-    let cname = node_text(name, src).to_string();
+    let cname = match container {
+        Some(parent) => format!("{parent}.{}", node_text(name, src)),
+        None => node_text(name, src).to_string(),
+    };
     if node.kind() == "record_declaration" {
-        record_component_accessors(node, src, package, &cname, out);
+        record_component_accessors(node, src, package, &cname, scope, out);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -223,6 +238,7 @@ fn record_component_accessors(
     src: &str,
     package: &str,
     container: &str,
+    scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
 ) {
     let Some(params) = node.child_by_field_name("parameters") else {
@@ -242,12 +258,12 @@ fn record_component_accessors(
         accessor.min_arity = Some(0);
         accessor.return_type = param
             .child_by_field_name("type")
-            .and_then(|ty| type_ref_from_node(ty, src));
+            .and_then(|ty| type_ref_from_node(ty, src, scope));
         out.push(accessor);
     }
 }
 
-fn supertype_names(node: Node<'_>, src: &str) -> Vec<String> {
+fn supertype_refs(node: Node<'_>, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -255,23 +271,23 @@ fn supertype_names(node: Node<'_>, src: &str) -> Vec<String> {
             child.kind(),
             "superclass" | "super_interfaces" | "extends_interfaces"
         ) {
-            collect_type_names(child, src, &mut out);
+            collect_supertype_refs(child, src, scope, &mut out);
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out.dedup();
     out
 }
 
-fn collect_type_names(node: Node<'_>, src: &str, out: &mut Vec<String>) {
+fn collect_supertype_refs(node: Node<'_>, src: &str, scope: &TypeScope, out: &mut Vec<TypeRef>) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         if matches!(
             node.kind(),
             "type_identifier" | "scoped_type_identifier" | "generic_type"
         ) {
-            if let Some(name) = simple_type_name(node, src) {
-                out.push(name);
+            if let Some(ty) = type_ref_from_node(node, src, scope) {
+                out.push(ty);
             }
             continue;
         }
@@ -287,6 +303,7 @@ fn walk_declaration_container<'tree>(
     src: &str,
     package: &str,
     container: Option<&str>,
+    scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
     stack: &mut Vec<(Node<'tree>, Option<String>)>,
 ) {
@@ -299,6 +316,7 @@ fn walk_declaration_container<'tree>(
                 src,
                 package,
                 container,
+                scope,
                 out,
                 stack,
             ),
@@ -308,6 +326,7 @@ fn walk_declaration_container<'tree>(
                 src,
                 package,
                 container,
+                scope,
                 out,
                 stack,
             ),
@@ -317,6 +336,7 @@ fn walk_declaration_container<'tree>(
                 src,
                 package,
                 container,
+                scope,
                 out,
                 stack,
             ),
@@ -324,14 +344,15 @@ fn walk_declaration_container<'tree>(
                 if let Some(name) = name_field(child) {
                     let mut sym =
                         indexed_symbol(name, src, SymbolKind::Function, package, container);
-                    sym.params = parameter_types(child, src);
+                    sym.params = parameter_types(child, src, scope);
+                    sym.type_params = type_parameter_names(child, src);
                     sym.arity = Some(sym.params.len().min(u8::MAX as usize) as u8);
                     sym.min_arity = sym.arity;
                     sym.has_vararg = has_vararg_parameter(child);
                     if child.kind() == "method_declaration" {
                         sym.return_type = child
                             .child_by_field_name("type")
-                            .and_then(|ty| type_ref_from_node(ty, src));
+                            .and_then(|ty| type_ref_from_node(ty, src, scope));
                     } else if let Some(container) = container {
                         sym.return_type = Some(TypeRef::simple(container));
                     }
@@ -342,7 +363,7 @@ fn walk_declaration_container<'tree>(
             "field_declaration" => {
                 let value_type = child
                     .child_by_field_name("type")
-                    .and_then(|ty| type_ref_from_node(ty, src));
+                    .and_then(|ty| type_ref_from_node(ty, src, scope));
                 let mut c2 = child.walk();
                 for vd in child.named_children(&mut c2) {
                     if vd.kind() == "variable_declarator" {
@@ -371,7 +392,7 @@ fn walk_declaration_container<'tree>(
     }
 }
 
-fn parameter_types(node: Node<'_>, src: &str) -> Vec<TypeRef> {
+fn parameter_types(node: Node<'_>, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
     let Some(params) = node.child_by_field_name("parameters") else {
         return Vec::new();
     };
@@ -382,7 +403,7 @@ fn parameter_types(node: Node<'_>, src: &str) -> Vec<TypeRef> {
             out.push(
                 child
                     .child_by_field_name("type")
-                    .and_then(|ty| type_ref_from_node(ty, src))
+                    .and_then(|ty| type_ref_from_node(ty, src, scope))
                     .unwrap_or_default(),
             );
         }
@@ -401,12 +422,79 @@ fn has_vararg_parameter(node: Node<'_>) -> bool {
     has_vararg
 }
 
-fn type_ref_from_node(node: Node<'_>, src: &str) -> Option<TypeRef> {
+fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<TypeRef> {
     let text = node_text(node, src).trim();
     if text.is_empty() {
         return None;
     }
-    Some(TypeRef::simple(text.replace("...", "[]")))
+    match node.kind() {
+        "generic_type" => {
+            let head = node.named_child(0)?;
+            let mut args = Vec::new();
+            if let Some(arguments) = child_of_kind(node, "type_arguments") {
+                let mut cursor = arguments.walk();
+                for argument in arguments.named_children(&mut cursor) {
+                    // Unknown projections keep their position instead of shifting later bindings.
+                    args.push(type_ref_from_node(argument, src, scope).unwrap_or_default());
+                }
+            }
+            Some(scope.type_ref(node_text(head, src), false, args))
+        }
+        "type_identifier" | "scoped_type_identifier" => {
+            Some(scope.type_ref(text, false, Vec::new()))
+        }
+        "wildcard" => None,
+        "annotated_type" => {
+            let mut cursor = node.walk();
+            let ty = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "annotation" && child.kind() != "marker_annotation")
+                .find_map(|child| type_ref_from_node(child, src, scope));
+            ty
+        }
+        _ => Some(TypeRef::simple(text.replace("...", "[]"))),
+    }
+}
+
+fn type_parameter_names(node: Node<'_>, src: &str) -> Vec<String> {
+    let Some(parameters) = node.child_by_field_name("type_parameters") else {
+        return Vec::new();
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(|parameter| {
+            let mut cursor = parameter.walk();
+            let name = parameter
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "type_identifier")
+                .map(|name| node_text(name, src).to_string());
+            name
+        })
+        .collect()
+}
+
+fn inference_imports(tree: &Tree, src: &str) -> Vec<crate::parser::Import> {
+    imports_of(tree, src)
+        .into_iter()
+        .map(|import| crate::parser::Import {
+            path: match import.name {
+                Some(name) if !import.package.is_empty() => format!("{}.{name}", import.package),
+                Some(name) => name,
+                None => import.package,
+            },
+            alias: None,
+            wildcard: import.wildcard,
+        })
+        .collect()
+}
+
+fn type_scope(tree: &Tree, src: &str) -> TypeScope {
+    TypeScope::with_default_imports(
+        &package_of(tree, src),
+        inference_imports(tree, src),
+        &["java.lang"],
+    )
 }
 
 /// A parsed Java import statement. Static imports are ignored for now.
@@ -960,10 +1048,7 @@ fn java_call_entries_with_imports(
         if let Some(container) = enclosing_type_name(name, src) {
             seeds.extend(java_member_entries(
                 index,
-                &ReceiverType {
-                    name: container,
-                    package: Some(package.to_string()),
-                },
+                &Type::class(container, Some(package.to_string())),
                 symbol,
                 SymbolKind::Function,
             ));
@@ -1167,8 +1252,8 @@ fn java_expression_type(
             let ty = expr.child_by_field_name("type")?;
             let receiver = receiver_type_from_type_node(index, file, src, tree, ty)?;
             Some(JavaExprType {
-                name: receiver.name,
-                package: receiver.package,
+                name: receiver.name()?.to_string(),
+                package: receiver.package().map(str::to_string),
             })
         }
         "identifier" => {
@@ -1176,8 +1261,8 @@ fn java_expression_type(
                 .or_else(|| same_file_field_declaration(src, expr))?;
             let receiver = type_of_value_declaration(index, file, src, tree, decl)?;
             Some(JavaExprType {
-                name: receiver.name,
-                package: receiver.package,
+                name: receiver.name()?.to_string(),
+                package: receiver.package().map(str::to_string),
             })
         }
         _ => None,
@@ -1694,14 +1779,16 @@ pub fn type_definition(
     Vec::new()
 }
 
-fn type_defs_for_receiver(index: &Index, ty: &ReceiverType) -> Vec<Def> {
+fn type_defs_for_receiver(index: &Index, ty: &Type) -> Vec<Def> {
+    let Some(name) = ty.name() else {
+        return Vec::new();
+    };
     let mut defs = index
-        .lookup_type(&ty.name)
+        .lookup_type(name)
         .into_iter()
         .filter(|entry| {
-            ty.package
-                .as_ref()
-                .is_none_or(|pkg| entry.sym.package == *pkg)
+            ty.package().is_none_or(|pkg| entry.sym.package == pkg)
+                && ty.container() == entry.sym.container.as_deref()
         })
         .map(|entry| Def {
             file: entry.path.to_string(),
@@ -1715,25 +1802,16 @@ fn type_defs_for_receiver(index: &Index, ty: &ReceiverType) -> Vec<Def> {
 }
 
 fn type_defs_for_name(index: &Index, file: &str, src: &str, tree: &Tree, name: &str) -> Vec<Def> {
-    let simple = name
-        .split('<')
-        .next()
-        .unwrap_or(name)
-        .rsplit('.')
-        .next()
-        .unwrap_or(name);
-    let package = if let Some((pkg, _)) = name.rsplit_once('.') {
-        Some(pkg.to_string())
-    } else {
-        same_file_type_package(index, file, simple)
-            .or_else(|| visible_type_package(index, src, tree, simple))
-    };
+    let _ = file;
+    let ty =
+        type_scope(tree, src).type_ref(name.split('<').next().unwrap_or(name), false, Vec::new());
     type_defs_for_receiver(
         index,
-        &ReceiverType {
-            name: simple.to_string(),
-            package,
-        },
+        &infer::declared_type(
+            index,
+            &ty,
+            &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+        ),
     )
 }
 
@@ -2211,8 +2289,8 @@ fn receiver_member_defs(
             start,
             serde_json::json!({
                 "file": file,
-                "receiver": recv.name,
-                "receiverPackage": recv.package,
+                "receiver": recv.name(),
+                "receiverPackage": recv.package(),
                 "member": name,
                 "kind": kind,
                 "candidateMembers": members.len(),
@@ -2227,17 +2305,18 @@ const JAVA_SUPERTYPE_WALK_CAP: usize = 16;
 
 fn java_member_entries(
     index: &Index,
-    recv: &ReceiverType,
+    recv: &Type,
     name: &str,
     expected_kind: SymbolKind,
 ) -> Vec<Entry> {
     let mut out = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut frontier = vec![(recv.name.clone(), recv.package.clone(), 0_usize)];
-    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > JAVA_SUPERTYPE_WALK_CAP {
-            continue;
-        }
+    let _ = infer::walk_supertypes(index, recv, JAVA_SUPERTYPE_WALK_CAP, |current| {
+        let Some(cur) =
+            infer::receiver_root_key(index, current).or_else(|| current.name().map(str::to_string))
+        else {
+            return ControlFlow::Continue(());
+        };
+        let cur_pkg = current.package();
         out.extend(
             index
                 .members_of(&cur)
@@ -2245,14 +2324,11 @@ fn java_member_entries(
                 .filter(|entry| entry.sym.container.as_deref() == Some(cur.as_str()))
                 .filter(|entry| entry.sym.name == name)
                 .filter(|entry| java_member_kind_matches(entry.sym.kind, expected_kind))
-                .filter(|entry| cur_pkg.as_ref().is_none_or(|pkg| entry.sym.package == *pkg))
+                .filter(|entry| cur_pkg.is_none_or(|pkg| entry.sym.package == pkg))
                 .cloned(),
         );
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            let sup_pkg = java_same_pkg_supertype(index, &sup, cur_pkg.as_deref());
-            frontier.push((sup, sup_pkg, depth + 1));
-        }
-    }
+        ControlFlow::Continue(())
+    });
     out.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -2325,24 +2401,19 @@ fn java_same_pkg_supertype(index: &Index, sup: &str, cur_pkg: Option<&str>) -> O
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReceiverType {
-    name: String,
-    package: Option<String>,
-}
-
 fn receiver_type(
     index: &Index,
     file: &str,
     src: &str,
     tree: &Tree,
     object: Node<'_>,
-) -> Option<ReceiverType> {
+) -> Option<Type> {
     match object.kind() {
-        "this" => Some(ReceiverType {
-            name: enclosing_type_name(object, src)?,
-            package: Some(package_of(tree, src)),
-        }),
+        "this" => Some(infer::declared_type(
+            index,
+            &type_scope(tree, src).type_ref(&enclosing_type_name(object, src)?, false, Vec::new()),
+            &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+        )),
         "identifier" => {
             if let Some(decl) = local_declaration_node(src, object)
                 .or_else(|| same_file_field_declaration(src, object))
@@ -2366,17 +2437,14 @@ fn receiver_type_from_type_identifier(
     src: &str,
     tree: &Tree,
     ident: Node<'_>,
-) -> Option<ReceiverType> {
+) -> Option<Type> {
     let name = node_text(ident, src);
     if name.is_empty() {
         return None;
     }
     let package = same_file_type_package(index, file, name)
         .or_else(|| visible_type_package(index, src, tree, name))?;
-    Some(ReceiverType {
-        name: name.to_string(),
-        package: Some(package),
-    })
+    Some(Type::class(name, Some(package)))
 }
 
 fn java_method_invocation_return_type(
@@ -2385,7 +2453,7 @@ fn java_method_invocation_return_type(
     src: &str,
     tree: &Tree,
     call: Node<'_>,
-) -> Option<ReceiverType> {
+) -> Option<Type> {
     let name = call.child_by_field_name("name")?;
     let symbol = node_text(name, src);
     if symbol.is_empty() {
@@ -2409,20 +2477,33 @@ fn java_method_invocation_return_type(
     }
     let args = java_argument_nodes(src, call)?;
     let arg_count = args.len();
-    let mut result: Option<ReceiverType> = None;
+    let receiver = match call.child_by_field_name("object") {
+        Some(object) => receiver_type(index, file, src, tree, object).unwrap_or(Type::Unknown),
+        None => enclosing_type_name(call, src)
+            .map(|name| Type::class(name, Some(package.clone())))
+            .unwrap_or(Type::Unknown),
+    };
+    let ctx = FileCtx::new(package, inference_imports(tree, src));
+    let mut result: Option<Type> = None;
     for entry in entries {
         let min = entry.sym.min_arity.expect("guarded above") as usize;
         let max = entry.sym.arity.expect("guarded above") as usize;
         if !(min..=max).contains(&arg_count) {
             continue;
         }
-        let ty = receiver_type_from_type_ref(
+        let ty = infer::declared_member_type(
             index,
-            &entry.path,
-            src,
-            tree,
+            &receiver,
+            &entry,
             entry.sym.return_type.as_ref()?,
-        )?;
+            &ctx,
+        );
+        if ty
+            .name()
+            .is_none_or(|name| name == "void" || is_java_primitive_type(name))
+        {
+            return None;
+        }
         match &result {
             None => result = Some(ty),
             Some(prev) if *prev == ty => {}
@@ -2498,7 +2579,7 @@ fn type_of_value_declaration(
     src: &str,
     tree: &Tree,
     decl: Node<'_>,
-) -> Option<ReceiverType> {
+) -> Option<Type> {
     let parent = decl.parent()?;
     let type_node = match parent.kind() {
         "formal_parameter" | "catch_formal_parameter" => parent.child_by_field_name("type")?,
@@ -2515,54 +2596,14 @@ fn receiver_type_from_type_node(
     src: &str,
     tree: &Tree,
     type_node: Node<'_>,
-) -> Option<ReceiverType> {
-    let text = node_text(type_node, src);
-    let raw = text.split('<').next().unwrap_or(text).trim();
-    let simple = simple_java_type_name(text);
-    let package = if let Some((pkg, _)) = raw.rsplit_once('.') {
-        Some(pkg.to_string())
-    } else {
-        same_file_type_package(index, file, &simple)
-            .or_else(|| visible_type_package(index, src, tree, &simple))
-    };
-    Some(ReceiverType {
-        name: simple,
-        package,
-    })
-}
-
-fn receiver_type_from_type_ref(
-    index: &Index,
-    declaring_file: &str,
-    use_src: &str,
-    use_tree: &Tree,
-    ty: &TypeRef,
-) -> Option<ReceiverType> {
-    if ty.name.is_empty() || ty.name == "void" {
-        return None;
-    }
-    let raw = ty.name.split('<').next().unwrap_or(&ty.name).trim();
-    let simple = simple_java_type_name(&ty.name);
-    if simple.is_empty() || is_java_primitive_type(&simple) {
-        return None;
-    }
-    let package = if let Some(candidate) = ty.package_candidates.iter().find(|candidate| {
-        index
-            .lookup_type(&simple)
-            .iter()
-            .any(|entry| entry.sym.package == **candidate)
-    }) {
-        Some(candidate.clone())
-    } else if let Some((pkg, _)) = raw.rsplit_once('.') {
-        Some(pkg.to_string())
-    } else {
-        same_file_type_package(index, declaring_file, &simple)
-            .or_else(|| visible_type_package(index, use_src, use_tree, &simple))
-    };
-    Some(ReceiverType {
-        name: simple,
-        package,
-    })
+) -> Option<Type> {
+    let _ = file;
+    let ty = type_ref_from_node(type_node, src, &type_scope(tree, src))?;
+    Some(infer::declared_type(
+        index,
+        &ty,
+        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+    ))
 }
 
 fn same_file_type_package(index: &Index, file: &str, type_name: &str) -> Option<String> {
@@ -2859,7 +2900,6 @@ pub fn completion_query(
         let synthetic_tree = JavaParser::new().parse(&synthetic);
         let ty = completion_receiver_at(&synthetic_tree, syn_offset)
             .and_then(|receiver| receiver_type(index, file, &synthetic, &synthetic_tree, receiver))
-            .map(|receiver| Type::class(receiver.name, receiver.package))
             .unwrap_or(Type::Unknown);
         return semantic_query::member_completion_query_for_type(
             index,
@@ -3114,13 +3154,16 @@ public class Greeter {
         assert_eq!(by_name("Named").unwrap().kind, SymbolKind::Interface);
         assert_eq!(
             by_name("label").unwrap().container.as_deref(),
-            Some("Named")
+            Some("Greeter.Named")
         );
         assert_eq!(by_name("Color").unwrap().kind, SymbolKind::EnumClass);
         assert_eq!(by_name("RED").unwrap().kind, SymbolKind::EnumEntry);
         assert_eq!(by_name("Inner").unwrap().kind, SymbolKind::Class);
         assert_eq!(by_name("counter").unwrap().kind, SymbolKind::Property);
-        assert_eq!(by_name("bump").unwrap().container.as_deref(), Some("Inner"));
+        assert_eq!(
+            by_name("bump").unwrap().container.as_deref(),
+            Some("Greeter.Inner")
+        );
 
         // A method-body local must NOT be indexed.
         assert!(by_name("name").is_some()); // the field `name`

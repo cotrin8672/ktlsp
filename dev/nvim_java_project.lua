@@ -1,7 +1,7 @@
 ---@diagnostic disable: undefined-global
 -- Headless Neovim probe for Java library goto in a real Gradle project.
 --
---     nvim -l dev/nvim_java_project.lua <project-dir> <file.java> <token> [occurrence]
+--     nvim -l dev/nvim_java_project.lua <project-dir> <file.java> <token> [occurrence] [binary]
 
 local project = arg[1]
 local file = arg[2]
@@ -11,9 +11,12 @@ local occurrence = tonumber(arg[4] or "1")
 assert(project and project ~= "", "usage: nvim_java_project.lua <project-dir> <file.java> <token> [occurrence]")
 assert(file and file ~= "", "usage: nvim_java_project.lua <project-dir> <file.java> <token> [occurrence]")
 
-local bin = vim.fn.getcwd() .. "/target/release/ktlsp"
-if vim.fn.filereadable(bin) == 0 then
-  bin = vim.fn.getcwd() .. "/target/debug/ktlsp"
+local bin = arg[5] or os.getenv("KTLSP_BIN")
+if not bin or bin == "" then
+  bin = vim.fn.getcwd() .. "/target/release/ktlsp"
+  if vim.fn.filereadable(bin) == 0 then
+    bin = vim.fn.getcwd() .. "/target/debug/ktlsp"
+  end
 end
 assert(vim.fn.filereadable(bin) == 1, "ktlsp binary not found")
 assert(vim.fn.filereadable(file) == 1, "probe file not readable: " .. file)

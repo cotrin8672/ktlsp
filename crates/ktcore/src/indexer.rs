@@ -31,7 +31,7 @@ pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Ve
 /// Declaration-file visibility facts used to stamp indexed `TypeRef`s. This keeps `fun f(): Bar`
 /// bound to the imports/package of the file declaring `f`, instead of incorrectly resolving `Bar`
 /// in whichever file later calls `f`.
-struct TypeScope {
+pub struct TypeScope {
     imports: Vec<Import>,
     /// `self.package` + wildcard-import packages + default-import packages, deduped. Invariant
     /// for the whole file, so `type_ref` clones the `Arc` instead of rebuilding ~10 owned
@@ -41,14 +41,18 @@ struct TypeScope {
 
 impl TypeScope {
     fn new(package: &str, imports: Vec<Import>) -> Self {
-        let mut candidates = Vec::with_capacity(1 + DEFAULT_IMPORT_PACKAGES.len());
+        Self::with_default_imports(package, imports, DEFAULT_IMPORT_PACKAGES)
+    }
+
+    pub fn with_default_imports(package: &str, imports: Vec<Import>, defaults: &[&str]) -> Self {
+        let mut candidates = Vec::with_capacity(1 + defaults.len());
         push_candidate(&mut candidates, package.to_string());
         for imp in &imports {
             if imp.wildcard {
                 push_candidate(&mut candidates, imp.package());
             }
         }
-        for pkg in DEFAULT_IMPORT_PACKAGES {
+        for pkg in defaults {
             push_candidate(&mut candidates, (*pkg).to_string());
         }
         TypeScope {
@@ -57,39 +61,41 @@ impl TypeScope {
         }
     }
 
-    fn type_ref(&self, local_name: &str, nullable: bool, args: Vec<TypeRef>) -> TypeRef {
-        // Alias imports rewrite the local name to the imported symbol's real simple name.
+    pub fn type_ref(&self, local_name: &str, nullable: bool, args: Vec<TypeRef>) -> TypeRef {
+        // Expand the first segment of an imported/aliased name, including Outer.Inner.
+        let first = local_name.split('.').next().unwrap_or(local_name);
         for imp in &self.imports {
-            if !imp.wildcard && imp.alias.as_deref() == Some(local_name) {
-                return TypeRef {
-                    name: imp.simple_name().to_string(),
-                    nullable,
-                    args,
-                    package_candidates: std::sync::Arc::new(vec![imp.package()]),
-                    container_candidates: Vec::new(),
-                };
+            if imp.local_name() == Some(first) {
+                let expanded = format!("{}{}", imp.path, &local_name[first.len()..]);
+                return named_type_ref(&expanded, nullable, args, Arc::new(vec![imp.package()]));
             }
         }
-        // Explicit non-aliased imports are exact.
-        for imp in &self.imports {
-            if !imp.wildcard && imp.alias.is_none() && imp.simple_name() == local_name {
-                return TypeRef {
-                    name: local_name.to_string(),
-                    nullable,
-                    args,
-                    package_candidates: std::sync::Arc::new(vec![imp.package()]),
-                    container_candidates: Vec::new(),
-                };
-            }
-        }
-
-        TypeRef {
-            name: local_name.to_string(),
+        named_type_ref(
+            local_name,
             nullable,
             args,
-            package_candidates: std::sync::Arc::clone(&self.package_candidates),
-            container_candidates: Vec::new(),
-        }
+            Arc::clone(&self.package_candidates),
+        )
+    }
+}
+
+fn named_type_ref(
+    name: &str,
+    nullable: bool,
+    args: Vec<TypeRef>,
+    package_candidates: Arc<Vec<String>>,
+) -> TypeRef {
+    let (qualification, name) = match name.rsplit_once('.') {
+        Some((prefix, simple)) => (Some(prefix.to_string()), simple),
+        None => (None, name),
+    };
+    TypeRef {
+        name: name.to_string(),
+        qualification,
+        nullable,
+        args,
+        package_candidates,
+        container_candidates: Vec::new(),
     }
 }
 
@@ -463,13 +469,14 @@ fn push_type(
     kind: SymbolKind,
     package: &str,
     container: Option<&str>,
-    supertypes: Vec<String>,
+    supertype_refs: Vec<TypeRef>,
     type_params: Vec<String>,
     documentation: Option<&str>,
 ) {
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
-        supertypes,
+        supertypes: supertype_refs.iter().map(|ty| ty.name.clone()).collect(),
+        supertype_refs,
         type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -518,11 +525,11 @@ fn param_types_of(decl: Node, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
     out
 }
 
-/// The simple names of a `class_declaration`/`object_declaration`'s declared supertypes
+/// The typed references of a `class_declaration`/`object_declaration`'s declared supertypes
 /// (the `: Base(), Animal` list). Shape (verified via `examples/dump`):
 /// `delegation_specifiers > delegation_specifier > {constructor_invocation > user_type | user_type}
-/// > identifier`. Returns `["Base", "Animal"]` for `class Dog : Base(), Animal`.
-fn supertypes_of(decl: Node, src: &str) -> Vec<String> {
+/// > identifier`. Arguments and qualification retain their declaration-file visibility.
+fn supertypes_of(decl: Node, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
     let mut out = Vec::new();
     let Some(specs) = child_of_kind(decl, "delegation_specifiers") else {
         return out;
@@ -535,8 +542,8 @@ fn supertypes_of(decl: Node, src: &str) -> Vec<String> {
         // The receiver type is the first `user_type` under the specifier (directly, or wrapped in a
         // `constructor_invocation` for the `Base()` superclass-call form).
         if let Some(ut) = find_descendant(spec, "user_type") {
-            if let Some(id) = first_ident(ut) {
-                out.push(node_text(id, src).to_string());
+            if let Some(ty) = type_ref_from(ut, src, Some(scope)) {
+                out.push(ty);
             }
         }
     }
@@ -612,71 +619,13 @@ pub(crate) fn syntax_type_ref(node: Node, src: &str) -> Option<TypeRef> {
 
 fn type_ref_from_user_type(ut: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
     let names = user_type_identifiers(ut, src);
-    let name = names.last()?;
+    names.last()?;
+    let name = names.join(".");
     let args = type_args_of(ut, src, scope);
-    if names.len() > 1 {
-        let prefix = &names[..names.len() - 1];
-        let container = qualified_container_prefix(prefix);
-        if let Some(qualified_pkg) = qualified_package_prefix(prefix) {
-            return Some(TypeRef {
-                name: (*name).to_string(),
-                nullable: false,
-                args,
-                package_candidates: std::sync::Arc::new(vec![qualified_pkg]),
-                container_candidates: container.into_iter().collect(),
-            });
-        }
-        if let Some(scope) = scope {
-            let outer = scope.type_ref(prefix[0], false, Vec::new());
-            if !outer.package_candidates.is_empty() {
-                return Some(TypeRef {
-                    name: (*name).to_string(),
-                    nullable: false,
-                    args,
-                    package_candidates: outer.package_candidates,
-                    container_candidates: container.into_iter().collect(),
-                });
-            }
-        }
-        return Some(TypeRef {
-            name: (*name).to_string(),
-            nullable: false,
-            args,
-            package_candidates: std::sync::Arc::new(Vec::new()),
-            container_candidates: container.into_iter().collect(),
-        });
-    }
     Some(match scope {
-        Some(scope) => scope.type_ref(name, false, args),
-        None => TypeRef {
-            name: (*name).to_string(),
-            nullable: false,
-            args,
-            package_candidates: std::sync::Arc::new(Vec::new()),
-            container_candidates: Vec::new(),
-        },
+        Some(scope) => scope.type_ref(&name, false, args),
+        None => named_type_ref(&name, false, args, Arc::new(Vec::new())),
     })
-}
-
-fn qualified_package_prefix(parts: &[&str]) -> Option<String> {
-    let first_type_segment = parts.iter().position(|part| {
-        part.chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_uppercase())
-    });
-    match first_type_segment {
-        Some(0) | None => None,
-        Some(idx) => Some(parts[..idx].join(".")),
-    }
-}
-
-fn qualified_container_prefix(parts: &[&str]) -> Option<String> {
-    let first_type_segment = parts.iter().position(|part| {
-        part.chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_uppercase())
-    })?;
-    Some(parts[first_type_segment..].join("."))
 }
 
 fn split_qualified_container(name: &str) -> (&str, Option<String>) {
@@ -687,8 +636,7 @@ fn split_qualified_container(name: &str) -> (&str, Option<String>) {
 }
 
 /// The type arguments of a `user_type` (`List<Foo>` -> `[Foo]`). Each `type_projection` wraps a
-/// `user_type`/`nullable_type`; star projections / unparsable args are skipped. Captured at index
-/// time for one-level generic inference (Stage 5).
+/// `user_type`/`nullable_type`; unknown projections keep a placeholder to preserve argument order.
 fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> {
     let mut out = Vec::new();
     let Some(ta) = child_of_kind(ut, "type_arguments") else {
@@ -700,14 +648,10 @@ fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> 
             continue;
         }
         let mut c2 = proj.walk();
-        for child in proj.named_children(&mut c2) {
-            if matches!(child.kind(), "user_type" | "nullable_type") {
-                if let Some(tr) = type_ref_from(child, src, scope) {
-                    out.push(tr);
-                }
-                break;
-            }
-        }
+        let argument = proj
+            .named_children(&mut c2)
+            .find_map(|child| type_ref_from(child, src, scope));
+        out.push(argument.unwrap_or_default());
     }
     out
 }
@@ -861,6 +805,7 @@ fn push_synthetic_member(
         end_byte: anchor.end_byte(),
         documentation: None,
         supertypes: Vec::new(),
+        supertype_refs: Vec::new(),
         ext_receiver: None,
         arity,
         min_arity: arity,
@@ -908,6 +853,7 @@ fn push_data_class_synthetics(
     let (self_name, self_container) = split_qualified_container(container);
     let self_type = TypeRef {
         name: self_name.to_string(),
+        qualification: None,
         nullable: false,
         args: Vec::new(),
         package_candidates: std::sync::Arc::new(vec![package.to_string()]),
@@ -1068,7 +1014,7 @@ fn walk(
             "class_declaration" => {
                 let kind = class_kind(child);
                 if let Some(name) = name_field(child) {
-                    let sts = supertypes_of(child, src);
+                    let sts = supertypes_of(child, src, scope);
                     let tps = type_params_of(child, src);
                     let documentation = pending_kdoc.take();
                     push_type(
@@ -1101,7 +1047,7 @@ fn walk(
             }
             "object_declaration" => {
                 if let Some(name) = name_field(child) {
-                    let sts = supertypes_of(child, src);
+                    let sts = supertypes_of(child, src, scope);
                     // Objects can't be generic -> no type parameters.
                     let documentation = pending_kdoc.take();
                     push_type(

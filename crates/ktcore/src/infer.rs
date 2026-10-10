@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use crate::fxhash::FxHashMap;
 
@@ -619,7 +620,7 @@ fn qualified_type_key(name: &str, container: Option<&str>) -> String {
     }
 }
 
-fn receiver_root_key(index: &dyn InferenceIndex, recv_ty: &Type) -> Option<String> {
+pub fn receiver_root_key(index: &dyn InferenceIndex, recv_ty: &Type) -> Option<String> {
     let root = recv_ty.name()?;
     if let Some(container) = recv_ty.container() {
         return Some(qualified_type_key(root, Some(container)));
@@ -765,9 +766,15 @@ pub(crate) fn implicit_receiver_types_with_ancestors(
     let mut child_infer = LocalChildInfer;
     for (i, n) in ancestors.iter().enumerate().rev() {
         let ty = match n.kind() {
-            "lambda_literal" => {
-                cached_receiver_contribution(index, *n, &ancestors[..i], src, ctx, depth, &mut child_infer)
-            }
+            "lambda_literal" => cached_receiver_contribution(
+                index,
+                *n,
+                &ancestors[..i],
+                src,
+                ctx,
+                depth,
+                &mut child_infer,
+            ),
             "function_declaration" => cached_fn_receiver_contribution(index, *n, src, ctx, depth),
             "class_declaration" | "object_declaration" => {
                 cached_class_receiver_contribution(index, *n, src, ctx)
@@ -808,7 +815,15 @@ fn cached_receiver_contribution(
     if let Some(hit) = receiver_cache_lookup(ctx, lambda, depth) {
         return hit;
     }
-    let ty = lambda_receiver_for_this(index, lambda, lambda_ancestors, src, ctx, depth, child_infer);
+    let ty = lambda_receiver_for_this(
+        index,
+        lambda,
+        lambda_ancestors,
+        src,
+        ctx,
+        depth,
+        child_infer,
+    );
     receiver_cache_store(ctx, lambda, depth, ty)
 }
 
@@ -1629,7 +1644,10 @@ fn select_trailing_lambda_receiver_type(
     let arg_count = value_arg_count(call);
     let arg_types = synth_arg_types(index, call, src, ctx, depth, child_infer);
     if std::env::var("KTDBG").is_ok() {
-        eprintln!("DBG select: arg_count={} arg_types={:?}", arg_count, arg_types);
+        eprintln!(
+            "DBG select: arg_count={} arg_types={:?}",
+            arg_count, arg_types
+        );
     }
     let mut group: Vec<(&Entry, TypeRef)> = entries
         .into_iter()
@@ -1728,7 +1746,6 @@ fn resolve_trailing_lambda_receiver_candidate(
     ))
 }
 
-
 /// The receiver contributed by an entry's trailing lambda. Direct receiver-function parameters
 /// are stored on the function itself. Alias-backed parameters are expanded lazily because their
 /// declaration can live in a different indexed file (as Ktor's `RoutingHandler` does).
@@ -1744,7 +1761,7 @@ pub fn trailing_lambda_receiver_ref(
     if parameter_type.name.is_empty() {
         return None;
     }
-    let resolved_package = resolve_type_ref_package(index, parameter_type, ctx);
+    let resolved_package = type_ref_identity(index, parameter_type, ctx)?.0;
     let aliases: Vec<&Entry> = index
         .lookup_by_name(&parameter_type.name)
         .iter()
@@ -1822,12 +1839,24 @@ fn resolve_with_subst(
     subst: &HashMap<String, Type>,
     depth: usize,
 ) -> Type {
-    if let Some(bound) = subst.get(&tr.name) {
-        return bound.clone();
+    if tr.name.is_empty() {
+        return Type::Unknown;
     }
-    if tparams.contains(&tr.name) {
-        return subst.get(&tr.name).cloned().unwrap_or(Type::Unknown);
+    if tr.qualification.is_none() {
+        if let Some(bound) = subst.get(&tr.name) {
+            let mut bound = bound.clone();
+            if let Type::Class { nullable, .. } = &mut bound {
+                *nullable |= tr.nullable;
+            }
+            return bound;
+        }
+        if tparams.contains(&tr.name) {
+            return Type::Unknown;
+        }
     }
+    let Some((package, container)) = type_ref_identity(index, tr, ctx) else {
+        return Type::Unknown;
+    };
     let args = if depth > MAX_DEPTH {
         Vec::new()
     } else {
@@ -1838,8 +1867,8 @@ fn resolve_with_subst(
     };
     Type::Class {
         name: tr.name.clone(),
-        package: resolve_type_ref_package(index, tr, ctx),
-        container: resolve_type_ref_container(index, tr, ctx),
+        package,
+        container,
         nullable: tr.nullable,
         args,
     }
@@ -1924,22 +1953,19 @@ fn member_type(
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Type {
-    let Some(root) = recv_ty.name() else {
+    let Some(_) = recv_ty.name() else {
         return Type::Unknown;
     };
-    let root_pkg = recv_ty.package().map(str::to_string);
-    let root_key = receiver_root_key(index, recv_ty).unwrap_or_else(|| root.to_string());
-    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut frontier: Vec<(String, Option<String>, usize)> = vec![(root_key, root_pkg, 0)];
     let mut members: Vec<&crate::index::Entry> = Vec::new();
     let mut extensions: Vec<&crate::index::Entry> = Vec::new();
-    while let Some((cur, cur_pkg, d)) = frontier.pop() {
-        if !visited.insert((cur.clone(), cur_pkg.clone())) || d > SUPERTYPE_CAP {
-            continue;
-        }
+    let _ = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
+        let Some(cur) = receiver_root_key(index, current) else {
+            return ControlFlow::Continue(());
+        };
+        let cur_pkg = current.package();
         for e in index.members_of(&cur) {
-            if let Some(p) = &cur_pkg {
-                if &e.sym.package != p {
+            if let Some(p) = cur_pkg {
+                if e.sym.package != p {
                     continue;
                 }
             }
@@ -1957,11 +1983,8 @@ fn member_type(
                 extensions.push(e);
             }
         }
-        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-            let sup_pkg = same_pkg_supertype(index, &sup, cur_pkg.as_deref());
-            frontier.push((sup, sup_pkg, d + 1));
-        }
-    }
+        ControlFlow::Continue(())
+    });
 
     // Priority partition: members before extensions (first non-empty group wins).
     let mut group = if !members.is_empty() {
@@ -2019,8 +2042,7 @@ fn member_type(
             ctx,
             depth + 1,
             child_infer,
-        )
-        .unwrap_or_else(|| resolve_type_ref(index, tr, ctx, depth + 1));
+        );
         match &result {
             None => result = Some(t),
             Some(prev) if *prev == t => {}
@@ -2041,9 +2063,12 @@ fn resolve_member_type_with_subst(
     ctx: &FileCtx,
     depth: usize,
     child_infer: &mut impl ChildInfer,
-) -> Option<Type> {
-    let mut subst = receiver_type_bindings(index, recv_ty, entry)?;
-    let tparams: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
+) -> Type {
+    let tparams = member_type_parameters(index, entry);
+    if tparams.is_empty() {
+        return resolve_type_ref(index, tr, ctx, depth + 1);
+    }
+    let mut subst = receiver_type_bindings(index, recv_ty, entry).unwrap_or_default();
     if let Some(call) = call {
         bind_lambda_return_type(
             index,
@@ -2058,17 +2083,34 @@ fn resolve_member_type_with_subst(
             child_infer,
         );
     }
-    if subst.is_empty() {
-        return None;
+    resolve_with_subst(index, tr, ctx, &tparams, &subst, depth + 1)
+}
+
+/// Resolve normalized member facts using the receiver's instantiated superclass path.
+/// Syntax adapters do not need to pass their language's AST through Kotlin inference.
+pub fn declared_member_type(
+    index: &dyn InferenceIndex,
+    recv_ty: &Type,
+    entry: &Entry,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+) -> Type {
+    let tparams = member_type_parameters(index, entry);
+    if tparams.is_empty() {
+        return resolve_type_ref(index, tr, ctx, 0);
     }
-    Some(resolve_with_subst(
-        index,
-        tr,
-        ctx,
-        &tparams,
-        &subst,
-        depth + 1,
-    ))
+    let subst = receiver_type_bindings(index, recv_ty, entry).unwrap_or_default();
+    resolve_with_subst(index, tr, ctx, &tparams, &subst, 0)
+}
+
+fn member_type_parameters(index: &dyn InferenceIndex, entry: &Entry) -> HashSet<String> {
+    let mut params: HashSet<_> = entry.sym.type_params.iter().cloned().collect();
+    if let Some(container) = entry.sym.container.as_deref() {
+        if let Some(owner) = named_type_params(index, container, &entry.sym.package) {
+            params.extend(owner);
+        }
+    }
+    params
 }
 
 fn generic_receiver_extensions<'a>(
@@ -2199,12 +2241,8 @@ fn is_subtype(index: &dyn InferenceIndex, name: &str, pkg: Option<&str>, target:
     false
 }
 
-/// One-level generic substitution for a single type variable: a member whose declared type is a
-/// bare name that is NOT a known concrete type (i.e. a type parameter like `T`/`E`), accessed on a
-/// receiver with exactly ONE type argument, resolves to that argument — `Box<Foo>.get(): T` -> Foo,
-/// `List<Foo>.first(): T` -> Foo. Deliberately conservative: requiring a single argument and an
-/// unresolvable name means it can never pick the wrong argument of a `Map<K, V>` (two args ->
-/// skipped -> Unknown -> silent omission), preserving the no-wrong-completion contract.
+/// Bind the declaring type's parameters through instantiated superclass/interface paths.
+/// Multiple paths must agree; missing arguments and cycles never select arbitrary bindings.
 pub(crate) fn receiver_type_bindings(
     index: &dyn InferenceIndex,
     recv_ty: &Type,
@@ -2217,6 +2255,40 @@ pub(crate) fn receiver_type_bindings(
             return Some(subst);
         }
     }
+    if let Some(container) = entry.sym.container.as_deref() {
+        let mut result = None;
+        let walked = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
+            if receiver_root_key(index, current).as_deref() == Some(container)
+                && current.package().is_none_or(|pkg| pkg == entry.sym.package)
+            {
+                let Some(declaration) = type_declaration(index, current) else {
+                    return ControlFlow::Break(());
+                };
+                if declaration.sym.type_params.len() != current.args().len() {
+                    return ControlFlow::Break(());
+                }
+                let mut bindings: HashMap<_, _> = declaration
+                    .sym
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(current.args().iter().cloned())
+                    .collect();
+                // A method's own T shadows the owning class's T.
+                bindings.retain(|name, _| !entry.sym.type_params.contains(name));
+                match &result {
+                    Some(previous) if previous != &bindings => return ControlFlow::Break(()),
+                    None => result = Some(bindings),
+                    _ => {}
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if walked.is_break() {
+            return None;
+        }
+        return result;
+    }
     let type_params = receiver_type_params(index, recv_ty, entry)?;
     if type_params.len() != recv_ty.args().len() {
         return None;
@@ -2227,6 +2299,95 @@ pub(crate) fn receiver_type_bindings(
             .zip(recv_ty.args().iter().cloned())
             .collect(),
     )
+}
+
+fn type_declaration<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a Entry> {
+    let mut result: Option<&Entry> = None;
+    for entry in index.lookup_type(ty.name()?) {
+        if ty.package().is_some_and(|pkg| pkg != entry.sym.package)
+            || ty.container() != entry.sym.container.as_deref()
+        {
+            continue;
+        }
+        if let Some(previous) = result {
+            if previous.sym.package != entry.sym.package
+                || previous.sym.type_params != entry.sym.type_params
+                || previous.sym.supertype_refs != entry.sym.supertype_refs
+                || previous.sym.supertypes != entry.sym.supertypes
+            {
+                return None;
+            }
+        }
+        result = Some(entry);
+    }
+    result
+}
+
+/// Visit a receiver and its instantiated supertypes, stopping when `visit` breaks.
+/// Declaration identity is path-local: cycles cannot grow arguments indefinitely, while
+/// separate inheritance paths may still carry conflicting bindings to the same declaration.
+pub fn walk_supertypes(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    max_depth: usize,
+    mut visit: impl FnMut(&Type) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    let mut visited = HashSet::new();
+    let mut frontier = vec![(receiver.clone(), Vec::new())];
+    while let Some((current, mut path)) = frontier.pop() {
+        let Some(name) = current.name() else {
+            continue;
+        };
+        let identity = (
+            name.to_string(),
+            current.package().map(str::to_string),
+            current.container().map(str::to_string),
+        );
+        if path.len() > max_depth || path.contains(&identity) || !visited.insert(current.clone()) {
+            continue;
+        }
+        visit(&current)?;
+        path.push(identity);
+        for supertype in direct_supertypes(index, &current) {
+            frontier.push((supertype, path.clone()));
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+/// Instantiate a type's direct superclasses/interfaces using its actual type arguments.
+pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
+    let Some(declaration) = type_declaration(index, ty) else {
+        return Vec::new();
+    };
+    let params: HashSet<_> = declaration.sym.type_params.iter().cloned().collect();
+    let subst: HashMap<_, _> = if declaration.sym.type_params.len() == ty.args().len() {
+        declaration
+            .sym
+            .type_params
+            .iter()
+            .cloned()
+            .zip(ty.args().iter().cloned())
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let ctx = FileCtx::new(declaration.sym.package.clone(), Vec::new());
+    if declaration.sym.supertype_refs.is_empty() {
+        return declaration
+            .sym
+            .supertypes
+            .iter()
+            .map(|name| resolve_with_subst(index, &TypeRef::simple(name), &ctx, &params, &subst, 0))
+            .collect();
+    }
+    declaration
+        .sym
+        .supertype_refs
+        .iter()
+        .map(|tr| resolve_with_subst(index, tr, &ctx, &params, &subst, 0))
+        .filter(|ty| ty.name().is_some())
+        .collect()
 }
 
 fn bind_lambda_return_type(
@@ -2333,13 +2494,21 @@ fn named_type_params(
     name: &str,
     preferred_pkg: &str,
 ) -> Option<Vec<String>> {
-    let matches = index.lookup_type(name);
-    matches
-        .iter()
-        .find(|e| e.sym.package == preferred_pkg && e.sym.container.is_none())
-        .copied()
-        .or_else(|| (matches.len() == 1).then(|| matches[0]))
-        .map(|e| e.sym.type_params.clone())
+    let (container, simple) = match name.rsplit_once('.') {
+        Some((container, simple)) => (Some(container.to_string()), simple),
+        None => (None, name),
+    };
+    type_declaration(
+        index,
+        &Type::Class {
+            name: simple.to_string(),
+            package: Some(preferred_pkg.to_string()),
+            container,
+            nullable: false,
+            args: Vec::new(),
+        },
+    )
+    .map(|entry| entry.sym.type_params.clone())
 }
 
 /// The declared type ref to read from a member entry: a function's `return_type` (when
@@ -2392,6 +2561,68 @@ mod tests {
     use crate::symbol::{IndexedSymbol, SymbolKind};
 
     #[test]
+    fn inference_stops_a_generic_cycle_before_expanding_the_same_declaration() {
+        use crate::index::{Entry, InferenceIndex};
+        use crate::parser::KotlinParser;
+        use std::cell::Cell;
+
+        struct CountIndex {
+            index: Index,
+            cyclic_member_queries: Cell<usize>,
+        }
+        impl InferenceIndex for CountIndex {
+            fn lookup_by_name(&self, name: &str) -> &[Entry] {
+                self.index.lookup_by_name(name)
+            }
+            fn members_of(&self, name: &str) -> &[Entry] {
+                if name == "A" || name == "B" {
+                    self.cyclic_member_queries
+                        .set(self.cyclic_member_queries.get() + 1);
+                }
+                self.index.members_of(name)
+            }
+            fn extensions_for(&self, name: &str) -> &[Entry] {
+                self.index.extensions_for(name)
+            }
+        }
+
+        let source = "package app\nfun run(value: A<Item>) { value.missing() }\n";
+        for (declarations, expected_queries) in [
+            ("package app\nclass Box<T>\nopen class A<T> : A<Box<T>>()\nclass Item\n", 1),
+            ("package app\nclass Pair<L, R>\nopen class A<T> : A<Pair<T, T>>()\nclass Item\n", 1),
+            ("package app\nclass Pair<L, R>\nopen class A<T> : B<Pair<T, T>>()\nopen class B<T> : A<Pair<T, T>>()\nclass Item\n", 2),
+        ] {
+            let mut parser = KotlinParser::new();
+            let mut raw_index = Index::new();
+            raw_index.replace_file(
+                "Types.kt",
+                crate::indexer::extract_symbols(&parser.parse(declarations), declarations, "app"),
+                Tier::Volatile,
+            );
+            let index = CountIndex {
+                index: raw_index,
+                cyclic_member_queries: Cell::new(0),
+            };
+            let tree = parser.parse(source);
+            let expression = "value.missing()";
+            let start = source.find(expression).unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(
+                super::infer(&index, node, source, &super::FileCtx::from_tree(&tree, source)),
+                crate::types::Type::Unknown
+            );
+            assert_eq!(
+                index.cyclic_member_queries.get(),
+                expected_queries,
+                "different type arguments must not allow revisiting the same declaration: {declarations}"
+            );
+        }
+    }
+
+    #[test]
     fn named_type_params_returns_none_for_empty_lookup() {
         let index = Index::new();
         assert_eq!(named_type_params(&index, "Missing", "demo"), None);
@@ -2418,6 +2649,12 @@ mod tests {
 
 /// Resolve a stored [`TypeRef`] (name + nullability + args) to a [`Type`] at the use site.
 fn resolve_type_ref(index: &dyn InferenceIndex, tr: &TypeRef, ctx: &FileCtx, depth: usize) -> Type {
+    if tr.name.is_empty() {
+        return Type::Unknown;
+    }
+    let Some((package, container)) = type_ref_identity(index, tr, ctx) else {
+        return Type::Unknown;
+    };
     let args = if depth > MAX_DEPTH {
         Vec::new()
     } else {
@@ -2428,24 +2665,117 @@ fn resolve_type_ref(index: &dyn InferenceIndex, tr: &TypeRef, ctx: &FileCtx, dep
     };
     Type::Class {
         name: tr.name.clone(),
-        package: resolve_type_ref_package(index, tr, ctx),
-        container: resolve_type_ref_container(index, tr, ctx),
+        package,
+        container,
         nullable: tr.nullable,
         args,
     }
 }
 
-/// Resolve a stored type reference's package. Indexed declarations carry declaration-context
-/// candidates; those win when they identify an indexed type. Live local annotations have no
-/// candidates and resolve in the current file context.
-fn resolve_type_ref_package(
+/// Resolve normalized declaration facts without requiring a particular source grammar.
+pub fn declared_type(index: &dyn InferenceIndex, tr: &TypeRef, ctx: &FileCtx) -> Type {
+    resolve_type_ref(index, tr, ctx, 0)
+}
+
+fn type_ref_identity(
     index: &dyn InferenceIndex,
     tr: &TypeRef,
     ctx: &FileCtx,
-) -> Option<String> {
-    package_from_decl_candidates(index, tr).or_else(|| resolve_package(index, &tr.name, ctx))
+) -> Option<(Option<String>, Option<String>)> {
+    if tr.qualification.is_some() {
+        qualified_type_identity(index, tr, ctx)
+            .map(|(package, container)| (Some(package), container))
+    } else {
+        let package = if tr.package_candidates.is_empty() {
+            resolve_package(index, &tr.name, ctx)
+        } else {
+            let package = package_from_decl_candidates(index, tr);
+            if package.is_none() && !index.lookup_type(&tr.name).is_empty() {
+                return None;
+            }
+            package
+        };
+        Some((package, resolve_type_ref_container(index, tr, ctx)))
+    }
 }
 
+fn qualified_type_identity(
+    index: &dyn InferenceIndex,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+) -> Option<(String, Option<String>)> {
+    let qualification = tr.qualification.as_deref()?;
+    let expanded;
+    let qualification = if tr.package_candidates.is_empty() {
+        let first = qualification.split('.').next().unwrap_or(qualification);
+        if let Some(import) = ctx
+            .imports
+            .iter()
+            .find(|import| import.local_name() == Some(first))
+        {
+            expanded = format!("{}{}", import.path, &qualification[first.len()..]);
+            expanded.as_str()
+        } else {
+            qualification
+        }
+    } else {
+        qualification
+    };
+    let candidates = index.lookup_type(&tr.name);
+    let matching = |prefix: &str| {
+        let mut identities = HashSet::new();
+        for entry in &candidates {
+            let declaring_prefix = match &entry.sym.container {
+                Some(container) if entry.sym.package.is_empty() => container.clone(),
+                Some(container) => format!("{}.{container}", entry.sym.package),
+                None => entry.sym.package.clone(),
+            };
+            if declaring_prefix == prefix {
+                identities.insert((entry.sym.package.clone(), entry.sym.container.clone()));
+            }
+        }
+        identities
+    };
+    let exact = matching(qualification);
+    if !exact.is_empty() {
+        return (exact.len() == 1).then(|| exact.into_iter().next().unwrap());
+    }
+    let contextual;
+    let packages = if tr.package_candidates.is_empty() {
+        contextual = std::iter::once(ctx.package.clone())
+            .chain(
+                ctx.imports
+                    .iter()
+                    .filter(|import| import.wildcard)
+                    .map(Import::package),
+            )
+            .chain(
+                resolve::DEFAULT_IMPORT_PACKAGES
+                    .iter()
+                    .map(|package| (*package).to_string()),
+            )
+            .collect::<Vec<_>>();
+        contextual.as_slice()
+    } else {
+        tr.package_candidates.as_slice()
+    };
+    let mut identities = HashSet::new();
+    for (position, package) in packages.iter().enumerate() {
+        let prefix = if package.is_empty() {
+            qualification.to_string()
+        } else {
+            format!("{package}.{qualification}")
+        };
+        let matches = matching(&prefix);
+        if position == 0 && !matches.is_empty() {
+            return (matches.len() == 1).then(|| matches.into_iter().next().unwrap());
+        }
+        identities.extend(matches);
+    }
+    (identities.len() == 1).then(|| identities.into_iter().next().unwrap())
+}
+
+/// Resolve a stored container candidate, or the current file's visible nested type.
 fn resolve_type_ref_container(
     index: &dyn InferenceIndex,
     tr: &TypeRef,

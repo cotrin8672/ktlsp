@@ -11,6 +11,8 @@ scenarios:
   basic          generated two-file project; local + cross-file goto
   features       dev/sample feature smoke; refs, completion, auto-import, edits
   java           generated Java/Kotlin project; Java features and unsaved member completion
+  mixed          generated Maven project; compiled mixed-language edits, goto, refs, and rename
+  corpus         existing project comparison; requires --root and --file JSON probe manifest
   library        generated version-catalog project; goto into kotlin-stdlib sources
   semantic       committed semantic probe; chains, receivers, and KMP narrowing
   project        existing project health check; requires --root and --file; optionally probes implementation
@@ -22,7 +24,7 @@ scenarios:
 
 options:
   --root DIR       project root for scenarios that accept one
-  --file FILE      Kotlin/Java file for the project scenario
+  --file FILE      Kotlin/Java file for project probes, or JSON manifest for corpus
   --token TEXT     symbol to use for the project implementation or java-project goto probe
   --target TEXT    expected implementation target URI substring for the project probe
   --occurrence N   textual occurrence to use for a token probe (default: 2)
@@ -36,6 +38,14 @@ options:
   --no-build       skip cargo build
   --run-dir DIR    explicit artifact directory
   -h, --help       show this help
+
+mixed/corpus environment:
+  KTLSP_MIXED_MVN          Maven executable (otherwise mvn/mvn.cmd on PATH)
+  KTLSP_MIXED_MAVEN_REPO   Maven cache (default: artifacts/m2)
+  KTLSP_MIXED_SERVER       ktlsp (default) or intellij
+  KTLSP_PROBE_SERVER       corpus backend: ktlsp (default) or intellij
+  IJLS_PLUGIN/IJLS_SERVER  intellij-lsp.nvim plugin and server paths for intellij
+  IJLS_JDK/JAVA_HOME       JDK for the IntelliJ server
 USAGE
 }
 
@@ -216,6 +226,12 @@ class Greeter(val name: String) {
     fun potato() = 3
 }
 KOTLIN
+  printf '%s\n' "$project"
+}
+
+write_mixed_project() {
+  local project="$projects/mixed"
+  nvim -l "$repo/dev/mixed_project.lua" "$project" || return $?
   printf '%s\n' "$project"
 }
 
@@ -445,6 +461,18 @@ case "$scenario" in
   java)
     project="${root_arg:-$(write_java_project)}"
     run_and_capture java nvim -l "$repo/dev/nvim_java.lua" "$project" "$bin_arg" || run_status=$?
+    ;;
+  mixed)
+    project="${root_arg:-$(write_mixed_project)}"
+    run_and_capture mixed nvim -l "$repo/dev/nvim_mixed.lua" "$project" "$bin_arg" "$artifacts" || run_status=$?
+    ;;
+  corpus)
+    if [ -z "$root_arg" ] || [ -z "$file_arg" ]; then
+      echo "corpus scenario requires --root and --file JSON manifest" >&2
+      run_status=2
+    else
+      run_and_capture corpus nvim -l "$repo/dev/nvim_corpus.lua" "$root_arg" "$file_arg" "$bin_arg" "$artifacts" || run_status=$?
+    fi
     ;;
   semantic)
     project="${root_arg:-$repo/dev/semantic-fixture}"

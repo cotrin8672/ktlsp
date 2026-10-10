@@ -662,7 +662,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v14-typealias-receivers";
+const SYMCACHE_VERSION: &[u8] = b"v15-generic-supertypes";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -690,16 +690,31 @@ fn jar_fingerprint(path: &Path) -> Option<String> {
 }
 
 fn symcache_load(fingerprint: &str, source_dir: &Path) -> Option<Vec<FileSymbols>> {
+    symcache_load_file(
+        &symcache_dir().join(format!("{fingerprint}.zst")),
+        source_dir,
+    )
+}
+
+fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSymbols>> {
     // A missing cache file is a normal miss (not an error).
-    let bytes = fs::read(symcache_dir().join(format!("{fingerprint}.zst"))).ok()?;
+    let bytes = fs::read(cache_file).ok()?;
     let decoded = zstd::stream::decode_all(&bytes[..]).ok()?;
-    let cached: Vec<FileSymbols> = match bincode::deserialize(&decoded) {
+    let mut cached: Vec<FileSymbols> = match bincode::deserialize(&decoded) {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("symcache {fingerprint} is corrupt ({e}); re-parsing");
+            tracing::warn!(
+                "symcache {} is corrupt ({e}); re-parsing",
+                cache_file.display()
+            );
             return None;
         }
     };
+    // Cached facts must have the same identity as the editor's file URI, including caches written
+    // with native separators before path keys were normalized.
+    for batch in &mut cached {
+        batch.file = crate::paths::file_key(Path::new(&batch.file));
+    }
     // A lazy source directory can recreate any indexed entry from its immutable source jar. Legacy
     // fully-extracted directories still require each cached file to exist.
     if source_dir.join(SOURCE_JAR_MARKER).is_file()
@@ -707,7 +722,10 @@ fn symcache_load(fingerprint: &str, source_dir: &Path) -> Option<Vec<FileSymbols
     {
         Some(cached)
     } else {
-        tracing::warn!("symcache {fingerprint} references missing files; re-parsing");
+        tracing::warn!(
+            "symcache {} references missing files; re-parsing",
+            cache_file.display()
+        );
         None
     }
 }
@@ -820,7 +838,7 @@ fn parse_source_file(
     };
     let facts = language::symbol_facts(language, &tree, text);
     (!facts.symbols.is_empty()).then(|| FileSymbols {
-        file: path.to_string_lossy().into_owned(),
+        file: crate::paths::file_key(path),
         symbols: facts.symbols,
     })
 }
@@ -1725,7 +1743,7 @@ fn parse_java_source_file(path: &Path, java: &mut JavaParser) -> Option<FileSymb
         }),
     );
     (!facts.symbols.is_empty()).then(|| FileSymbols {
-        file: path.to_string_lossy().into_owned(),
+        file: crate::paths::file_key(path),
         symbols: facts.symbols,
     })
 }
@@ -1870,6 +1888,127 @@ public interface ExecutorService {
             .symbols
             .iter()
             .any(|sym| sym.name == "awaitTermination"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    fn assert_dependency_buffer_lifecycle(batch: FileSymbols, source: &Path, original: &str) {
+        use crate::index::Tier;
+        use crate::workspace::Workspace;
+
+        let indexed_key = batch.file.clone();
+        let source_key = crate::paths::file_key(source);
+        let main_key = crate::paths::file_key(&source.with_file_name("Main.kt"));
+        let main =
+            "package app\nimport lib.Helper\nfun use(helper: Helper) {\n    helper.clear\n}\n";
+        let offset = main.find("helper.clear").unwrap() + "helper.clear".len();
+        let labels = |ws: &mut Workspace| {
+            ws.completion_query(&main_key, offset)
+                .expect("known dependency receiver should produce a completion query")
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<BTreeSet<_>>()
+        };
+
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.index
+            .replace_file(&batch.file, batch.symbols, Tier::Durable);
+        ws.bump_index_revision();
+        ws.open(main_key.clone(), main.to_string());
+        assert_eq!(
+            labels(&mut ws),
+            BTreeSet::from(["clearOriginal".to_string()])
+        );
+
+        let renamed = original.replace("clearOriginal", "clearChanged");
+        ws.open(source_key.clone(), renamed.clone());
+        assert_eq!(
+            labels(&mut ws),
+            BTreeSet::from(["clearChanged".to_string()]),
+            "opened source must replace closed facts: indexed={indexed_key:?}, editor={source_key:?}"
+        );
+        assert_eq!(ws.index.lookup_type("Helper").len(), 1);
+        let call = main.replace("helper.clear", "helper.clearChanged()");
+        ws.change(&main_key, call.clone());
+        let defs = ws.goto_definition(&main_key, call.find("clearChanged").unwrap());
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].file, source_key);
+        assert_eq!(
+            &renamed[defs[0].start_byte..defs[0].end_byte],
+            "clearChanged"
+        );
+        ws.change(&main_key, main.to_string());
+
+        ws.change(
+            &source_key,
+            "package lib;\npublic class Helper { }\n".to_string(),
+        );
+        assert!(
+            labels(&mut ws).is_empty(),
+            "deleted members must leave no stale completion"
+        );
+        ws.close(&source_key);
+        assert_eq!(
+            labels(&mut ws),
+            BTreeSet::from(["clearOriginal".to_string()])
+        );
+        assert_eq!(fs::read_to_string(source).unwrap(), original);
+        ws.open(source_key.clone(), renamed);
+        assert_eq!(
+            labels(&mut ws),
+            BTreeSet::from(["clearChanged".to_string()])
+        );
+        ws.close(&source_key);
+        assert_eq!(
+            labels(&mut ws),
+            BTreeSet::from(["clearOriginal".to_string()])
+        );
+    }
+
+    #[test]
+    fn dependency_source_edits_replace_closed_facts_for_native_editor_paths() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_dependency_overlay_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("Helper.java");
+        let original =
+            "package lib;\npublic class Helper {\n    public void clearOriginal() {}\n}\n";
+        fs::write(&source, original).unwrap();
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let broad = parse_source_file(&source, original, &mut kotlin, &mut java).unwrap();
+        let seeded = parse_java_source_file(&source, &mut java).unwrap();
+        for batch in [broad, seeded] {
+            assert_dependency_buffer_lifecycle(batch, &source, original);
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn warm_symcache_preserves_dependency_buffer_identity() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ktlsp_cached_dependency_overlay_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("Helper.java");
+        let original =
+            "package lib;\npublic class Helper {\n    public void clearOriginal() {}\n}\n";
+        fs::write(&source, original).unwrap();
+        let mut java = JavaParser::new();
+        let mut legacy_batch = parse_java_source_file(&source, &mut java).unwrap();
+        legacy_batch.file = source.to_string_lossy().into_owned();
+        let serialized = bincode::serialize(&vec![legacy_batch]).unwrap();
+        let cache_file = tmp.join("legacy.zst");
+        fs::write(
+            &cache_file,
+            zstd::stream::encode_all(&serialized[..], 1).unwrap(),
+        )
+        .unwrap();
+        let mut batches = symcache_load_file(&cache_file, &tmp).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_dependency_buffer_lifecycle(batches.remove(0), &source, original);
         let _ = fs::remove_dir_all(&tmp);
     }
 

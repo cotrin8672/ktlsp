@@ -68,6 +68,7 @@ mod tests {
         // formal List<T> vs actual List<Foo> binds T := Foo.
         let formal = TypeRef {
             name: "List".into(),
+            qualification: None,
             nullable: false,
             args: vec![TypeRef::simple("T")],
             package_candidates: std::sync::Arc::new(Vec::new()),

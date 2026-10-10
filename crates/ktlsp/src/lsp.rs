@@ -24,7 +24,6 @@ use crate::complete::ShapedItem;
 use crate::diagnostics::Severity;
 use crate::format::FormatterConfig;
 use crate::hierarchy::HierarchyItem;
-use crate::index::Tier;
 use crate::symbol::{Def, SymbolKind};
 use crate::text::LineIndex;
 use crate::workspace::Workspace;
@@ -149,9 +148,7 @@ impl Backend {
             if files > 0 {
                 let mut guard = ws.lock();
                 for batch in batches {
-                    guard
-                        .index
-                        .replace_file(&batch.file, batch.symbols, Tier::Durable);
+                    guard.index_dependency_file(&batch.file, batch.symbols);
                 }
                 guard.bump_index_revision();
             }
@@ -432,7 +429,6 @@ fn index_dependencies(
     use crate::artifacts::Repos;
     use crate::coords::Coordinate;
     use crate::deps::{self, CoordinateDecision, CoordinateSelector};
-    use crate::index::Tier;
 
     let repos = Repos::defaults();
     let mut coords = deps::coordinates_for_root(root);
@@ -594,9 +590,7 @@ fn index_dependencies(
                         stats.symbols += symbol_count;
                         stats.jdk_symbols += symbol_count;
                         stats.jdk_files += 1;
-                        guard
-                            .index
-                            .replace_file(&batch.file, batch.symbols, Tier::Durable);
+                        guard.index_dependency_file(&batch.file, batch.symbols);
                         stats.files += 1;
                     }
                     // One revision bump for the whole shard drain: readers recompute once after
@@ -646,9 +640,7 @@ fn index_dependencies(
                     symbols: symbol_count,
                 });
             }
-            guard
-                .index
-                .replace_file(&batch.file, batch.symbols, Tier::Durable);
+            guard.index_dependency_file(&batch.file, batch.symbols);
             guard.bump_index_revision();
             stats.files += 1;
         }
@@ -1290,8 +1282,7 @@ impl LanguageServer for Backend {
                 if files > 0 {
                     if let Some(mut ws) = self.ws.try_lock() {
                         for batch in batches {
-                            ws.index
-                                .replace_file(&batch.file, batch.symbols, Tier::Durable);
+                            ws.index_dependency_file(&batch.file, batch.symbols);
                         }
                         ws.bump_index_revision();
                         let defs = ws.goto_definition(&key, offset);
@@ -1812,8 +1803,7 @@ impl LanguageServer for Backend {
                 if !batches.is_empty() {
                     let mut ws = self.ws.lock();
                     for batch in batches {
-                        ws.index
-                            .replace_file(&batch.file, batch.symbols, Tier::Durable);
+                        ws.index_dependency_file(&batch.file, batch.symbols);
                     }
                     ws.bump_index_revision();
                     if let Some(query) = ws.resolved_symbol_query(&key, offset) {
