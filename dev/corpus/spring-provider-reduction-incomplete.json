@@ -1,0 +1,40 @@
+{
+  "probes": [
+    {
+      "id": "partial",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "    getBeanProvider<T>().getObj()",
+      "token": "getObj",
+      "definition": false,
+      "completion_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "    getBeanProvider<T>().getObject()",
+          "replacement": "    getBeanProvider<T>().getObj()"
+        }
+      ],
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131"
+    },
+    {
+      "id": "dangling",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "    getBeanProvider<T>().",
+      "token": ".",
+      "definition": false,
+      "completion_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "buffer_edits": [
+        {
+          "anchor": "    getBeanProvider<T>().getObject()",
+          "replacement": "    getBeanProvider<T>()."
+        }
+      ],
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131"
+    }
+  ]
+}

@@ -19,6 +19,11 @@ The real-project corpus is CreateEnchantableMachinery (CEM), excluding Mixin cod
 from acceptance probes, plus five additional distinct Java/Kotlin projects. Small
 generated fixtures supplement that corpus; they do not replace it.
 
+Overall percentage estimates are withdrawn: implementation and acceptance were mixed
+in the earlier estimate. **0/6 projects currently satisfy every final acceptance gate.**
+Report repaired cases and remaining gates separately; passing a focused fixture does
+not complete a project.
+
 ## Initial environment
 
 - Starting revision: `f2c4c96799f68e11014021b7a77a0ef950770da7`, branch `main`.
@@ -41,7 +46,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Path-cache full-2 passes 1,166 / 0 failed / 4 ignored across 40 suites; tests/release native 0 and all 363 inputs unchanged | Current Rust, formatting and release verified | `ktlsp-path-cache-slice-20261011-1/full-2/result.json`; four new boundary/retraction regressions pass |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Spring receiver slice passes 1,177 / 0 failed / 4 ignored across 40 suites; formatting/release native 0, 369 inputs unchanged | Current Rust, formatting and release verified | `ktlsp-spring-this-20261011-1/full/{results,receipt}.json`; eleven added receiver/recovery/binding regressions |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Earlier ordinary editor: basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Current path-cache saved Java probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/`. Current narrow probe shuts down cleanly in 0.7201557s (n=1); actual server/client RSS remains unmeasured |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -49,7 +54,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Sixth six-root controls pass 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 and 29/36. Tenth-fixed-2 CEM, Retrofit, Moshi, OkHttp and Spring each pass all 6/6 first-response incomplete requests | Partial; five real roots have focused current results, Gradle unmeasured | [fork-corpus.md](fork-corpus.md) records independent coverage failures. Gradle golden fails readiness after allocation failure; incomplete run was interrupted. A paired useful known receiver is required for negative cases |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
-| Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Tenth Retrofit passes all six golden and six incomplete requests, including Java facade names for Kotlin suspend extensions. Spring's main reduction improves, but explicit-this and dangling-dot chains remain gaps | Partial | Guarded `retrofit-tenth-verified-report.json`; `spring-provider-reduction` retains compiler and failing editor evidence. Recovered facts must participate before receiver inference |
+| Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Current Spring reduction repairs four failed requests; real Spring passes all nine original/additional first-response queries, including explicit-this and dangling selectors | Focused repair verified; full-project acceptance partial | Checkpoint 29 below. Real Spring still has ten missing dependency source inputs and a 15-second forced shutdown |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Tenth-fixed-2 applies the complete six-site override family, preserves all five expected buffers and passes actual Java/Kotlin compilation plus 33 bytecode assertions. JVM facade exported-alias/authored renames and external consumer applied renames also pass | Focused fixtures verified; wider corpus and inherited implementation edge pending | `ktlsp-goal-20261010/tenth2-java-rename-compiler-1/`, `retrofit-jvm-editor/portable-release-tenth2-1/artifacts/` and `ktlsp-shadow-tenth-fixed-2-20261011/editor/`. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
@@ -1931,6 +1936,44 @@ The exact next native command requires a reviewed cooperative shutdown/ownership
 seam first; source review is ongoing. The original mixed twelve editing cases,
 KAPT/KSP stale diagnostics, six-project IDEA comparison and useful-result latency/RSS
 acceptance remain OPEN. Production Mixin remains a separate extension project.
+
+### Twenty-ninth checkpoint: extension receivers and unfinished selectors
+
+Unqualified `this` now uses the shared implicit receiver stack, retaining an unknown
+inner receiver instead of guessing an outer class. Kotlin completion supplies recovered
+facts before receiver inference, replaces only the queried file, reapplies its project
+scope and maps declaration names back to authored bytes for provider relations.
+Intermediate selectors select their own receiver. Closed erroneous files use the same
+recovery route; the canonical index and source buffers are not rewritten.
+
+The independent javac/Kotlin 1.9.23/Java-caller/bytecode oracle passes four native stages
+on the durable reduction. Workspace tests pass **1,177 / 0 failed / 4 ignored**; formatting
+and release build pass. The eleven new guards include ambiguous foreign overloads,
+module visibility changes and an enabled/disabled source-provider relation after the cursor.
+
+| Existing Neovim expectations | Before | Current |
+| --- | --- | --- |
+| Reduction golden requests | 7/10 first responses | 10/10 first responses |
+| Reduction incomplete requests | 1/2 first responses | 2/2 first responses |
+| Reduction client checks | 13/16 and 16/17 | 17/17 and 18/18; each adds the in-repository Git-status guard |
+| Real Spring controls plus four unsaved cases | Baseline readiness times out; new queries not run | 9/9 first responses; overall 33/35 checks |
+
+All current requests use one attempt, with delivered/restored unsaved versions and
+unchanged disk bytes. Reduction shutdowns are clean/native 0 in 0.774/0.801 seconds
+(one sample each). Real Spring indexes 9,102 project files and 412 dependencies but
+retains **10 failed/10 missing sources**, then requires forced termination after a
+15.360-second shutdown timeout. Its baseline has watch-driven model supersession;
+the current arm runs after shared Gradle caches have warmed, so startup speed is not
+a paired measurement or a demonstrated benefit of this semantic fix. No whole-server
+RSS or six-project performance acceptance is claimed.
+
+Evidence base: `C:/Users/gummy/AppData/Local/Temp/ktlsp-spring-this-20261011-1/`:
+`compiler/`, `full/`, `baseline-{golden,incomplete}/`, `native-{golden,incomplete}/`,
+`spring-{before,after}-2-editor/` and `semantic-summary.json`. Initial full-root data
+preflight failures are preserved as `spring-{before,after}`; no LSP query ran there.
+Current immutable server SHA-256: `74a3059b1cf19cafd6828927fc5016c4d1906493020798da3e65803649cef476`.
+Next reproduce/fix real-project shutdown and watch supersession; keep source coverage,
+compiler-plugin editing, IDEA comparison and measured six-project latency/RSS open.
 
 ### Current slice: requires-only compatibility artifacts
 

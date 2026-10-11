@@ -264,6 +264,10 @@ and unknown receivers without saving source. Changes and restoration require out
 each query uses one response after Neovim's flush. Negative unknown cases also require a useful
 known receiver in the same edited state. [dev/corpus](dev/corpus/README.md) includes these controls.
 See [the corpus record](docs/fork-corpus.md) for pinned projects, candidate probes and remaining coverage.
+Spring extension-receiver and incomplete-selector regressions use the same route with
+`dev/corpus/fixtures/spring-provider` and the two `spring-provider-reduction*.json` manifests.
+`spring-extensions-editing.json` adds unsaved cases against the pinned real Spring root;
+see [the fixture instructions](dev/corpus/fixtures/spring-provider/README.md).
 Set `KTLSP_CORPUS_EXTRA_PROBES` to an absolute Lua file to exercise an external analysis provider
 with the same corpus client before shutdown. The file returns a function receiving
 `{repo, client, sources, check, project, artifacts}`. Use `check` for assertions and restore any

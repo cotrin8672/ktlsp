@@ -1182,3 +1182,255 @@ fn unsaved_extension_return_edit_replaces_chain_members_and_navigation() {
         );
     }
 }
+
+#[test]
+fn top_level_extension_this_keeps_generic_member_completion_and_navigation() {
+    let mut ws = workspace();
+    add_payload_members(&mut ws);
+    ws.open("ExplicitExtension.kt", "package probe\nfun Base.explicit(key: Key<Payload>): Payload = this.holderLookup(key).getOrThrow(key).payloadOnly()\n".to_string());
+    assert_eq!(
+        infer_expression(&ws, "ExplicitExtension.kt", "this"),
+        Type::class("Base", Some("probe".to_string()))
+    );
+    assert!(labels(
+        &mut ws,
+        "ExplicitExtension.kt",
+        "this.holderLookup(key).get"
+    )
+    .contains("getOrThrow"));
+    let expected = target(&ws, "Lookup.java", "getOrThrow");
+    assert_eq!(
+        goto(
+            &mut ws,
+            "ExplicitExtension.kt",
+            "this.holderLookup(key).getOrThrow(key)",
+            "getOrThrow"
+        ),
+        vec![expected]
+    );
+    assert_eq!(
+        infer_expression(
+            &ws,
+            "ExplicitExtension.kt",
+            "this.holderLookup(key).getOrThrow(key)"
+        ),
+        Type::class("Payload", Some("probe".to_string()))
+    );
+}
+
+#[test]
+fn explicit_extension_this_changes_with_the_unsaved_receiver() {
+    let mut ws = workspace();
+    let original = "package probe\nfun Base.current(): Float = this.getBreakSpeed()\n";
+    for (source, owner) in [
+        (original.to_string(), "Base.java"),
+        (
+            original.replace("Base.current", "Other.current"),
+            "Other.java",
+        ),
+        (original.to_string(), "Base.java"),
+    ] {
+        ws.change("ReceiverEdit.kt", source);
+        assert!(labels(&mut ws, "ReceiverEdit.kt", "this.get").contains("getBreakSpeed"));
+        let expected = target(&ws, owner, "getBreakSpeed");
+        assert_eq!(
+            goto(
+                &mut ws,
+                "ReceiverEdit.kt",
+                "this.getBreakSpeed()",
+                "getBreakSpeed"
+            ),
+            vec![expected]
+        );
+    }
+}
+
+#[test]
+fn missing_extension_this_does_not_take_the_enclosing_class_receiver() {
+    let mut ws = workspace();
+    ws.open("UnknownExtension.kt", "package probe\nclass Outer {\n    fun outerOnly(): Outer = this\n    fun Missing.current() = this.outerOnly()\n}\n".to_string());
+    assert!(labels(&mut ws, "UnknownExtension.kt", "this.outer").is_empty());
+    assert!(goto(
+        &mut ws,
+        "UnknownExtension.kt",
+        "this.outerOnly()",
+        "outerOnly"
+    )
+    .is_empty());
+    assert_eq!(
+        infer_expression(&ws, "UnknownExtension.kt", "this.outerOnly()"),
+        Type::Unknown
+    );
+}
+
+#[test]
+fn extension_this_preserves_inner_scope_receiver_precedence() {
+    let mut ws = workspace();
+    ws.open("ScopedExtension.kt", "package probe\nfun Base.current(other: Other) {\n    other.apply { this.getBreakSpeed() }\n}\n".to_string());
+    let expected = target(&ws, "Other.java", "getBreakSpeed");
+    assert_eq!(
+        goto(
+            &mut ws,
+            "ScopedExtension.kt",
+            "this.getBreakSpeed()",
+            "getBreakSpeed"
+        ),
+        vec![expected]
+    );
+}
+
+const SPRING_EXTENSION_SOURCE: &str =
+    include_str!("../../../dev/corpus/fixtures/spring-provider/BeanFactoryExtensions.kt");
+
+fn spring_workspace() -> Workspace {
+    let mut ws = Workspace::new();
+    for (file, source) in [
+        (
+            "BeanFactory.java",
+            include_str!("../../../dev/corpus/fixtures/spring-provider/BeanFactory.java"),
+        ),
+        (
+            "ObjectProvider.java",
+            include_str!("../../../dev/corpus/fixtures/spring-provider/ObjectProvider.java"),
+        ),
+        (
+            "ResolvableType.java",
+            include_str!("../../../dev/corpus/fixtures/spring-provider/ResolvableType.java"),
+        ),
+        (
+            "ParameterizedTypeReference.java",
+            include_str!(
+                "../../../dev/corpus/fixtures/spring-provider/ParameterizedTypeReference.java"
+            ),
+        ),
+        ("BeanFactoryExtensions.kt", SPRING_EXTENSION_SOURCE),
+    ] {
+        ws.open(file, source.to_string());
+    }
+    ws
+}
+
+#[test]
+fn spring_recovery_restores_later_extension_for_a_dangling_selector() {
+    let mut ws = spring_workspace();
+    let broken = SPRING_EXTENSION_SOURCE.replacen(
+        "getBeanProvider<T>().getObject()",
+        "getBeanProvider<T>().",
+        1,
+    );
+    ws.change("BeanFactoryExtensions.kt", broken.clone());
+    let got = labels(&mut ws, "BeanFactoryExtensions.kt", "getBeanProvider<T>().");
+    assert!(got.contains("getObject"), "{got:?}");
+    assert!(!got.contains("getBeanProvider"), "{got:?}");
+    assert_eq!(ws.doc_text("BeanFactoryExtensions.kt").unwrap(), broken);
+}
+
+#[test]
+fn spring_recovery_keeps_other_file_overloads_ambiguous() {
+    let mut ws = spring_workspace();
+    ws.open("Competing.kt", "package oracle\nclass DifferentProvider<T> { fun wrongProvider(): T = TODO() }\ninline fun <reified T : Any> BeanFactory.getBeanProvider(): DifferentProvider<T> = DifferentProvider<T>()\n".to_string());
+    let broken = SPRING_EXTENSION_SOURCE.replacen(
+        "getBeanProvider<T>().getObject()",
+        "getBeanProvider<T>().",
+        1,
+    );
+    ws.change("BeanFactoryExtensions.kt", broken);
+    let got = labels(&mut ws, "BeanFactoryExtensions.kt", "getBeanProvider<T>().");
+    assert!(got.is_empty(), "ambiguous provider: {got:?}");
+}
+
+#[test]
+fn spring_recovery_respects_module_visibility_and_its_changes() {
+    use ktlsp::project_model::{FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation};
+    let mut ws = spring_workspace();
+    ws.open("Competing.kt", "package oracle\nclass DifferentProvider<T> { fun wrongProvider(): T = TODO() }\ninline fun <reified T : Any> BeanFactory.getBeanProvider(): DifferentProvider<T> = DifferentProvider<T>()\n".to_string());
+    for (file, module) in [
+        ("BeanFactory.java", "a"),
+        ("ObjectProvider.java", "a"),
+        ("ResolvableType.java", "a"),
+        ("ParameterizedTypeReference.java", "a"),
+        ("BeanFactoryExtensions.kt", "a"),
+        ("Competing.kt", "b"),
+    ] {
+        ws.index.set_file_origin(
+            file,
+            FileOrigin {
+                origin_id: module.to_string(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(ProjectScope {
+                    module: module.to_string(),
+                    source_set: "main".to_string(),
+                }),
+            },
+        );
+    }
+    let broken = SPRING_EXTENSION_SOURCE.replacen(
+        "getBeanProvider<T>().getObject()",
+        "getBeanProvider<T>().",
+        1,
+    );
+    ws.change("BeanFactoryExtensions.kt", broken);
+    for include_competitor in [false, true, false] {
+        ws.index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope: ProjectScope {
+                module: "a".to_string(),
+                source_set: "main".to_string(),
+            },
+            ordered_origins: if include_competitor {
+                vec!["a".to_string(), "b".to_string()]
+            } else {
+                vec!["a".to_string()]
+            },
+        }]);
+        ws.bump_index_revision();
+        let got = labels(&mut ws, "BeanFactoryExtensions.kt", "getBeanProvider<T>().");
+        assert_eq!(got.contains("getObject"), !include_competitor, "{got:?}");
+        assert!(!got.contains("wrongProvider"), "{got:?}");
+    }
+}
+
+#[test]
+fn spring_intermediate_selector_completes_the_provider_before_its_call_result() {
+    let mut ws = spring_workspace();
+    let got = labels(&mut ws, "BeanFactoryExtensions.kt", "provider.getObject");
+    assert!(got.contains("getObject"), "{got:?}");
+    let expected = target(&ws, "ObjectProvider.java", "getObject");
+    assert_eq!(
+        goto(
+            &mut ws,
+            "BeanFactoryExtensions.kt",
+            "provider.getObject()",
+            "getObject"
+        ),
+        vec![expected]
+    );
+}
+
+#[test]
+fn spring_closed_incomplete_file_uses_the_same_recovered_receiver() {
+    let directory = std::env::temp_dir().join(format!(
+        "ktlsp-spring-closed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("Closed.kt").to_string_lossy().into_owned();
+    let broken = SPRING_EXTENSION_SOURCE.replacen(
+        "getBeanProvider<T>().getObject()",
+        "getBeanProvider<T>().",
+        1,
+    );
+    std::fs::write(&path, &broken).unwrap();
+    let mut ws = spring_workspace();
+    ws.close("BeanFactoryExtensions.kt");
+    ws.index.remove_file("BeanFactoryExtensions.kt");
+    ws.open(&path, broken);
+    ws.close(&path);
+    let got = labels(&mut ws, &path, "getBeanProvider<T>().");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    assert!(got.contains("getObject"), "{got:?}");
+}

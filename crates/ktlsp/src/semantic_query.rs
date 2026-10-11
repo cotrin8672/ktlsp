@@ -12,7 +12,7 @@ use tree_sitter::{Node, Tree};
 use crate::complete::{self, ScopeCompletion};
 use crate::hierarchy;
 use crate::imports::{self, ImportLayout, ImportStyle};
-use crate::index::{Entry, Index, InferenceIndex, LookupEntries, OriginFacts, Tier};
+use crate::index::{Entry, Index, InferenceIndex, LookupEntries, OriginFacts, ScopedIndex, Tier};
 use crate::infer;
 use crate::knowledge::Knowledge;
 use crate::language::{self, SourceLanguage};
@@ -314,11 +314,16 @@ pub fn completion_query(
     let tree = parser.parse(src);
     let context = complete::completion_context(&tree, src, offset);
     match context {
-        complete::CompletionContext::ScopeName => {
-            scope_name_query(index, file, &tree, src, offset, max_candidates)
-        }
+        complete::CompletionContext::ScopeName => scope_name_query(
+            &ScopedIndex::new(index, file),
+            file,
+            &tree,
+            src,
+            offset,
+            max_candidates,
+        ),
         complete::CompletionContext::AfterDot => {
-            after_dot_query(index, parser, src, offset, max_candidates)
+            after_dot_query(index, parser, file, src, offset, max_candidates)
         }
         complete::CompletionContext::Import => Some(CompletionQuery {
             context,
@@ -342,6 +347,7 @@ pub fn completion_query(
 pub fn after_dot_query(
     index: &dyn InferenceIndex,
     parser: &mut KotlinParser,
+    file: &str,
     src: &str,
     offset: usize,
     max_candidates: usize,
@@ -349,7 +355,35 @@ pub fn after_dot_query(
     let (prefix, synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
     let tree = parser.parse(&synthetic);
     let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
-    member_completion_query(index, &tree, &synthetic, receiver, prefix, max_candidates)
+    let inserted_at = syn_offset - complete::DOT_PLACEHOLDER.len();
+    let mut symbols = language::symbol_facts(SourceLanguage::Kotlin, &tree, &synthetic).symbols;
+    // Keep provider relations tied to authored declarations, never placeholder-shifted names.
+    symbols.retain_mut(|symbol| {
+        if symbol.end_byte <= inserted_at {
+            true
+        } else if symbol.start_byte >= syn_offset {
+            symbol.start_byte -= complete::DOT_PLACEHOLDER.len();
+            symbol.end_byte -= complete::DOT_PLACEHOLDER.len();
+            true
+        } else {
+            false
+        }
+    });
+    let mut source = Index::new();
+    source.replace_file(file, symbols, Tier::Volatile);
+    let recovered = RecoveredTypeIndex {
+        index,
+        source: &source,
+        replaced_file: Some(file),
+    };
+    member_completion_query(
+        &ScopedIndex::new(&recovered, file),
+        &tree,
+        &synthetic,
+        receiver,
+        prefix,
+        max_candidates,
+    )
 }
 
 pub fn member_completion_query(
@@ -362,18 +396,8 @@ pub fn member_completion_query(
 ) -> Option<CompletionQuery> {
     let ctx = infer::FileCtx::from_tree(tree, src);
     if receiver.kind() == "super_expression" {
-        let mut source = Index::new();
-        source.replace_file(
-            "<completion>",
-            language::symbol_facts(SourceLanguage::Kotlin, tree, src).symbols,
-            Tier::Volatile,
-        );
-        let recovered = RecoveredTypeIndex {
-            index,
-            source: &source,
-        };
-        let receivers = infer::super_receivers(&recovered, receiver, src, &ctx);
-        let selected = ktcore::members::super_candidates(&recovered, receivers, &prefix, &ctx);
+        let receivers = infer::super_receivers(index, receiver, src, &ctx);
+        let selected = ktcore::members::super_candidates(index, receivers, &prefix, &ctx);
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         for (_, entries) in selected.providers {
@@ -436,16 +460,19 @@ pub fn member_completion_query_for_type(
         });
     }
     let vis = Visibility::for_file(language, tree, src);
-    // Incomplete selectors can hide later declarations in the live index; use recovered file facts.
-    let mut source_index = Index::new();
-    source_index.replace_file(
-        "<completion>",
-        language::symbol_facts(language, tree, src).symbols,
-        Tier::Volatile,
-    );
+    // Kotlin recovery already supplies scoped file facts before receiver inference.
+    let source_index = (language == SourceLanguage::Java).then(|| {
+        let mut source = Index::new();
+        source.replace_file(
+            "<completion>",
+            language::symbol_facts(language, tree, src).symbols,
+            Tier::Volatile,
+        );
+        source
+    });
     let (candidates, withheld_compiled) = member_candidates(
         index,
-        Some(&source_index),
+        source_index.as_ref(),
         language,
         &ty,
         receiver_kind,
@@ -759,10 +786,30 @@ pub fn scope_name_query(
     })
 }
 
-// Recovery replaces only matching declaration identities; other packages' homonyms remain visible.
+// Kotlin replaces only its query file; Java's type recovery preserves other packages' homonyms.
 struct RecoveredTypeIndex<'a> {
     index: &'a dyn InferenceIndex,
     source: &'a Index,
+    replaced_file: Option<&'a str>,
+}
+
+impl RecoveredTypeIndex<'_> {
+    fn replace_file_entries<'a>(
+        &self,
+        original: LookupEntries<'a>,
+        recovered: &'a [Entry],
+    ) -> LookupEntries<'a> {
+        let Some(file) = self.replaced_file else {
+            return original;
+        };
+        LookupEntries::Selected(
+            original
+                .into_iter()
+                .filter(|entry| entry.path.as_ref() != file)
+                .chain(recovered)
+                .collect(),
+        )
+    }
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
@@ -779,9 +826,16 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
     }
 
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
-        self.index.lookup_by_name(name)
+        self.replace_file_entries(
+            self.index.lookup_by_name(name),
+            self.source.lookup_by_name(name),
+        )
     }
     fn members_of(&self, name: &str) -> LookupEntries<'_> {
+        if self.replaced_file.is_some() {
+            return self
+                .replace_file_entries(self.index.members_of(name), self.source.members_of(name));
+        }
         let (container, simple) = name
             .rsplit_once('.')
             .map_or((None, name), |(container, simple)| {
@@ -804,7 +858,10 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
         LookupEntries::Selected(entries)
     }
     fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
-        self.index.extensions_for(name)
+        self.replace_file_entries(
+            self.index.extensions_for(name),
+            self.source.extensions_for(name),
+        )
     }
     fn origin_facts(&self) -> Option<&OriginFacts> {
         self.index.origin_facts()
@@ -816,6 +873,13 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
         self.index.permits_unique_member_fallback()
     }
     fn lookup_type(&self, name: &str) -> Vec<&Entry> {
+        if self.replaced_file.is_some() {
+            return self
+                .lookup_by_name(name)
+                .into_iter()
+                .filter(|entry| entry.sym.kind.is_type_like())
+                .collect();
+        }
         let recovered = self.source.lookup_type(name);
         let mut entries = self.index.lookup_type(name);
         entries.retain(|entry| {
@@ -826,6 +890,22 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
         });
         entries.extend(recovered);
         entries
+    }
+
+    fn entries_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        top_level_only: bool,
+    ) -> Box<dyn Iterator<Item = &'a Entry> + 'a> {
+        let original = self.index.entries_with_prefix(prefix, top_level_only);
+        match self.replaced_file {
+            Some(file) => Box::new(
+                original
+                    .filter(move |entry| entry.path.as_ref() != file)
+                    .chain(self.source.entries_with_prefix(prefix, top_level_only)),
+            ),
+            None => original,
+        }
     }
 }
 
@@ -841,7 +921,11 @@ fn member_candidates(
 ) -> (Vec<ScopeCompletion>, bool) {
     let mut out: Vec<ScopeCompletion> = Vec::new();
     let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
-    let recovered = source_index.map(|source| RecoveredTypeIndex { index, source });
+    let recovered = source_index.map(|source| RecoveredTypeIndex {
+        index,
+        source,
+        replaced_file: None,
+    });
     let inference_index: &dyn InferenceIndex = match &recovered {
         Some(recovered) => recovered,
         None => index,
@@ -1443,8 +1527,8 @@ mod tests {
         let src = ws.doc_text("Main.kt").unwrap();
         let offset = src.find("fe }").unwrap() + 2;
         let mut parser = KotlinParser::new();
-        let query =
-            after_dot_query(&ws.index, &mut parser, &src, offset, 1000).expect("after-dot query");
+        let query = after_dot_query(&ws.index, &mut parser, "Main.kt", &src, offset, 1000)
+            .expect("after-dot query");
 
         assert_eq!(query.context_label(), "member");
         assert_eq!(query.status_label(), "ok");

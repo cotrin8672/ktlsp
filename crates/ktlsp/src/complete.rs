@@ -627,11 +627,15 @@ pub fn dot_recovery(src: &str, offset: usize) -> Option<(String, String, usize)>
 /// placeholder case and a real partial selector (`b.gr`), since both parse to a navigation_expr.
 pub fn navigation_receiver_at(tree: &Tree, offset: usize) -> Option<Node<'_>> {
     let root = tree.root_node();
-    // Probe at the cursor and just before it (cursor may sit at the end of the placeholder/selector).
-    for probe in [offset, offset.saturating_sub(1)] {
+    // The cursor after a selector may belong to the next call or outer navigation.
+    for probe in [offset.saturating_sub(1), offset] {
         let mut node = root.named_descendant_for_byte_range(probe, probe);
         while let Some(n) = node {
-            if n.kind() == "navigation_expression" {
+            if n.kind() == "navigation_expression"
+                && n.named_child(1).is_some_and(|selector| {
+                    selector.start_byte() <= probe && probe < selector.end_byte()
+                })
+            {
                 return n.named_child(0);
             }
             node = n.parent();
@@ -1128,6 +1132,17 @@ mod tests {
         let tree = parse(&synthetic);
         let recv = navigation_receiver_at(&tree, syn_off).expect("navigation receiver");
         assert_eq!(node_text(recv, &synthetic), "b");
+    }
+
+    #[test]
+    fn dot_recovery_intermediate_selector_end() {
+        let src = "fun read(provider: Provider) = provider.getObject().label()";
+        let off = src.find("provider.getObject").unwrap() + "provider.getObject".len();
+        let (prefix, synthetic, syn_off) = dot_recovery(src, off).unwrap();
+        assert_eq!(prefix, "getObject");
+        let tree = parse(&synthetic);
+        let receiver = navigation_receiver_at(&tree, syn_off).unwrap();
+        assert_eq!(node_text(receiver, &synthetic), "provider");
     }
 
     #[test]

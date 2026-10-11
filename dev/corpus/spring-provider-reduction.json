@@ -1,0 +1,62 @@
+{
+  "probes": [
+    {
+      "id": "implicit-reified-provider-chain",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "    getBeanProvider<T>().getObject()",
+      "token": "getObject",
+      "target_file": "ObjectProvider.java",
+      "target_anchor": "T getObject()",
+      "target_token": "getObject",
+      "completion_excludes": [
+        "getBeanProvider"
+      ],
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131",
+      "target_sha256": "127708b3940725faa59a3cb66b5d32c17c21159c2f97f66d7828f7efd111af99"
+    },
+    {
+      "id": "implicit-java-resolvable-overload",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "getBeanProvider(ResolvableType.forType(",
+      "token": "getBeanProvider",
+      "target_file": "BeanFactory.java",
+      "target_anchor": "getBeanProvider(ResolvableType requiredType)",
+      "target_token": "getBeanProvider",
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131",
+      "target_sha256": "1c07a19b90928a3d8bcc3ddeaeba83c0905dee1d1707f04be688eb56945f2cbc"
+    },
+    {
+      "id": "explicit-reified-provider-chain-control",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "this.getBeanProvider<T>().getObject()",
+      "token": "getObject",
+      "target_file": "ObjectProvider.java",
+      "target_anchor": "T getObject()",
+      "target_token": "getObject",
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131",
+      "target_sha256": "127708b3940725faa59a3cb66b5d32c17c21159c2f97f66d7828f7efd111af99"
+    },
+    {
+      "id": "typed-provider-control",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "provider.getObject().label()",
+      "token": "getObject",
+      "target_file": "ObjectProvider.java",
+      "target_anchor": "T getObject()",
+      "target_token": "getObject",
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131",
+      "target_sha256": "127708b3940725faa59a3cb66b5d32c17c21159c2f97f66d7828f7efd111af99"
+    },
+    {
+      "id": "typed-provider-result-control",
+      "source": "BeanFactoryExtensions.kt",
+      "anchor": "provider.getObject().label()",
+      "token": "label",
+      "target_file": "BeanFactoryExtensions.kt",
+      "target_anchor": "fun label()",
+      "target_token": "label",
+      "source_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131",
+      "target_sha256": "0ea79f5110703e98aa7705392386e15c4d6afdce060f089a8e971ee22ee38131"
+    }
+  ]
+}

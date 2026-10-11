@@ -161,6 +161,12 @@ fn infer_depth_with<R: ChildInfer>(
         // Defensive: should the grammar ever expose a boolean_literal kind.
         "boolean_literal" => intrinsic_type(index, "Boolean"),
         "identifier" => infer_identifier(index, node, src, ctx, depth, child_infer),
+        "this_expression" if node_text(node, src) == "this" => {
+            implicit_receiver_types(index, node, src, ctx, depth)
+                .into_iter()
+                .next()
+                .unwrap_or(Type::Unknown)
+        }
         "this_expression" => {
             if let Some(t) = lambda_receiver_type(index, node, src, ctx, depth, child_infer) {
                 t

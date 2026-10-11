@@ -958,8 +958,9 @@ impl Workspace {
         }
         let text = self.doc_text(key)?;
         semantic_query::after_dot_query(
-            &self.index.scoped_for_file(key),
+            &self.index,
             self.parsers.kotlin_mut(),
+            key,
             &text,
             offset,
             MAX_COMPLETIONS,
@@ -1000,7 +1001,7 @@ impl Workspace {
         }
         let text = self.doc_text(key)?;
         semantic_query::completion_query(
-            &self.index.scoped_for_file(key),
+            &self.index,
             self.parsers.kotlin_mut(),
             key,
             &text,
@@ -1016,8 +1017,9 @@ impl Workspace {
     ) -> Option<semantic_query::CompletionQuery> {
         let text = self.doc_text(key)?;
         let tree = self.salsa.parsed_tree(key, &text, Durability::LOW);
-        if complete::completion_context(&tree, &text, offset)
-            != complete::CompletionContext::AfterDot
+        if tree.root_node().has_error()
+            || complete::completion_context(&tree, &text, offset)
+                != complete::CompletionContext::AfterDot
         {
             return None;
         }

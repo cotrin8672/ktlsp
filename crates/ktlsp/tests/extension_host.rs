@@ -213,6 +213,70 @@ fn shared_relation_drives_goto_and_incomplete_name_completion_with_exact_subrang
     );
 }
 
+#[test]
+fn kotlin_completion_preserves_provider_relations_declared_after_the_cursor() {
+    use ktlsp::index::{Index, InferenceIndex, LookupEntries};
+    use std::cell::Cell;
+    struct BindingReads<'a> {
+        index: &'a Index,
+        target_reads: Cell<usize>,
+    }
+    impl InferenceIndex for BindingReads<'_> {
+        fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+            if name == "twice" {
+                self.target_reads.set(self.target_reads.get() + 1);
+            }
+            InferenceIndex::lookup_by_name(self.index, name)
+        }
+        fn members_of(&self, name: &str) -> LookupEntries<'_> {
+            InferenceIndex::members_of(self.index, name)
+        }
+        fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+            InferenceIndex::extensions_for(self.index, name)
+        }
+        fn contributions_for_file(&self, file: &str) -> &[ContributionSet] {
+            InferenceIndex::contributions_for_file(self.index, file)
+        }
+    }
+    let mut ws = Workspace::with_analysis_providers(vec![Arc::new(Consumer {
+        calls: Arc::new(AtomicUsize::new(0)),
+    })]);
+    let source = "package oracle\n// 補完\nclass Owner {\n    fun use() = this.mirror(3).toString()\n    fun mirror(value: Int): Int = value\n}\n";
+    ws.open("Target.kt", TARGET.into());
+    ws.open("Owner.kt", source.into());
+    let expected = ktcore::symbol::Def {
+        file: "Target.kt".into(),
+        start_byte: TARGET.find("twice").unwrap(),
+        end_byte: TARGET.find("twice").unwrap() + "twice".len(),
+    };
+    assert_eq!(
+        ws.goto_definition("Owner.kt", source.rfind("mirror").unwrap()),
+        vec![expected]
+    );
+    let offset = source.find(".toString").unwrap() + ".to".len();
+    for enabled in [true, false] {
+        ws.configure_analysis_provider("test-consumer", enabled, Arc::from("{}"));
+        let index = BindingReads {
+            index: &ws.index,
+            target_reads: Cell::new(0),
+        };
+        let query = ktlsp::semantic_query::after_dot_query(
+            &index,
+            &mut ktlsp::parser::KotlinParser::new(),
+            "Owner.kt",
+            source,
+            offset,
+            1000,
+        );
+        assert!(query.is_some());
+        assert_eq!(
+            index.target_reads.get() > 0,
+            enabled,
+            "receiver inference must follow the authored declaration's accepted target"
+        );
+    }
+}
+
 fn apply(ws: &Workspace, file: &str, edits: &[ktlsp::edit::TextEdit]) -> String {
     ktlsp::edit::apply_to_text(file, &ws.doc_text(file).unwrap(), edits).unwrap()
 }

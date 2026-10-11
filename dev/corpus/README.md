@@ -31,6 +31,14 @@ Run the pure boundary checks with:
 rtk proxy nvim --headless -l dev/corpus_matcher_test.lua
 ```
 
+## Spring provider-chain regressions
+
+`spring-provider-reduction.json` and `spring-provider-reduction-incomplete.json` use
+the [compiler-verified reduction](fixtures/spring-provider/README.md) through the same
+corpus route. `spring-extensions-editing.json` runs two original controls plus four
+unsaved explicit-receiver/partial/dangling cases against the pinned full Spring root.
+Semantic successes do not override dependency coverage, shutdown or performance gates.
+
 ## CEM source snapshot and declaration oracles
 
 `cem-working-copy.json` records the user's existing source snapshot, including
