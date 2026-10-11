@@ -5847,10 +5847,14 @@ impl Workspace {
         {
             return Err("kotlin-compiler-model-incomplete");
         }
+        let selected_task = source
+            .kotlin_compile_task
+            .as_deref()
+            .ok_or("selected-kotlin-compilation-unknown")?;
         let mut tasks = source
             .compiler_tasks
             .iter()
-            .filter(|task| task.language == CompilerLanguage::Kotlin);
+            .filter(|task| task.language == CompilerLanguage::Kotlin && task.task == selected_task);
         let task = tasks.next().ok_or("selected-kotlin-task-unknown")?;
         if tasks.next().is_some()
             || !task.complete
@@ -5933,6 +5937,9 @@ impl Workspace {
             project_dir: module.project_dir.clone(),
             scope: scope.clone(),
             task: task.clone(),
+            positive_diagnostics_only: source.compiler_tasks.iter().any(|candidate| {
+                candidate.language == CompilerLanguage::Kotlin && candidate.task != task.task
+            }),
             source_roots: source.source_roots.clone(),
             sources: sources.into_values().collect(),
             overlays,
@@ -6032,6 +6039,14 @@ impl Workspace {
             // A failure is not an empty successful compilation and cannot replace accepted reports.
             return Vec::new();
         };
+        if clean && request.positive_diagnostics_only {
+            // An independent main compile does not rerun KAPT/KSP or certify their source generation.
+            // Exit 0 cannot erase accepted errors while auxiliary producer semantics remain unknown.
+            tracing::debug!(
+                "selected Kotlin clean result cannot certify auxiliary producer semantics"
+            );
+            return Vec::new();
+        }
         let mut by_file: BTreeMap<String, Vec<crate::diagnostics::Diagnostic>> = BTreeMap::new();
         for diagnostic in diagnostics {
             let Some(source) = request
@@ -6173,6 +6188,7 @@ mod kotlin_diagnostic_lifecycle_tests {
         let source = SourceSetClasspath {
             name: "main".into(),
             source_roots: vec![root.join("src")],
+            kotlin_compile_task: Some(task.task.clone()),
             compiler_tasks: vec![task],
             ..Default::default()
         };
@@ -6230,6 +6246,103 @@ mod kotlin_diagnostic_lifecycle_tests {
                 message: format!("Unresolved reference '{token}'."),
             }],
         }
+    }
+
+    #[test]
+    fn primary_compilation_selection_ignores_auxiliary_order_and_rejects_unknown_identity() {
+        let (mut ws, editor, _, _) = fixture();
+        let mut modules = request_model(&ws);
+        let source = &mut modules[0].source_sets[0];
+        let mut selected = source.compiler_tasks[0].clone();
+        selected.task = ":app:customPrimaryJvmTask".into();
+        let mut auxiliary = selected.clone();
+        auxiliary.task = ":app:auxiliaryProducer".into();
+        auxiliary.arguments = vec!["-P".into(), "opaque-producer-input=private-path".into()];
+        source.kotlin_compile_task = Some(selected.task.clone());
+        source.compiler_tasks = vec![auxiliary, selected.clone()];
+        ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+        let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        assert_eq!(request.task, selected);
+        assert!(request.positive_diagnostics_only);
+        assert!(!request
+            .task
+            .arguments
+            .iter()
+            .any(|argument| argument == "-P"));
+
+        for mutation in [
+            "missing",
+            "unlisted",
+            "duplicate",
+            "selected-incomplete",
+            "metadata-incomplete",
+        ] {
+            let (mut ws, editor, _, _) = fixture();
+            let mut modules = request_model(&ws);
+            let source = &mut modules[0].source_sets[0];
+            match mutation {
+                "missing" => source.kotlin_compile_task = None,
+                "unlisted" => source.kotlin_compile_task = Some(":app:uncapturedPrimary".into()),
+                "duplicate" => source.compiler_tasks.push(source.compiler_tasks[0].clone()),
+                "selected-incomplete" => source.compiler_tasks[0].complete = false,
+                "metadata-incomplete" => source.compiler_metadata_incomplete = true,
+                _ => unreachable!(),
+            }
+            ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+            assert!(ws.begin_kotlin_diagnostics(&editor).is_err(), "{mutation}");
+            assert!(
+                ws.kotlin_diagnostic_result_id(&editor).is_none(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_scope_accepts_located_errors_but_never_publishes_canonical_empty() {
+        let (mut ws, editor, helper, _) = fixture();
+        let mut modules = request_model(&ws);
+        let source = &mut modules[0].source_sets[0];
+        let mut producer = source.compiler_tasks[0].clone();
+        producer.task = ":app:auxiliaryProducer".into();
+        source.compiler_tasks.push(producer);
+        ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+        let clean = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        assert!(clean.positive_diagnostics_only);
+        assert!(ws
+            .finish_kotlin_diagnostics(
+                &clean,
+                KotlinDiagnosticOutcome::Verified {
+                    diagnostics: Vec::new(),
+                    clean: true
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .is_empty());
+        assert!(
+            ws.kotlin_diagnostic_result_id(&editor).is_none(),
+            "exit 0 does not certify producer closure"
+        );
+        let error = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        let outcome = reported(&error, &editor, "oldApi");
+        assert_eq!(
+            ws.finish_kotlin_diagnostics(&error, outcome, Arc::new(AtomicBool::new(false))),
+            vec![editor.clone()]
+        );
+        let accepted = ws.kotlin_diagnostic_result_id(&editor).unwrap();
+        let clean = ws.begin_kotlin_diagnostics(&helper).unwrap();
+        assert!(ws
+            .finish_kotlin_diagnostics(
+                &clean,
+                KotlinDiagnosticOutcome::Verified {
+                    diagnostics: Vec::new(),
+                    clean: true
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .is_empty());
+        assert_eq!(ws.kotlin_diagnostic_result_id(&editor).unwrap(), accepted);
+        assert_eq!(ws.current_kotlin_diagnostics(&editor).len(), 1);
+        assert!(ws.kotlin_diagnostic_result_id(&helper).is_none());
     }
 
     #[test]

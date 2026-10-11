@@ -3338,6 +3338,8 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub project_dir: PathBuf,
     pub scope: crate::project_model::ProjectScope,
     pub task: crate::classpath::CompilerTask,
+    /// Auxiliary Kotlin tasks may produce semantics this independent invocation cannot certify.
+    pub positive_diagnostics_only: bool,
     pub source_roots: Vec<PathBuf>,
     pub sources: Vec<PathBuf>,
     pub overlays: Vec<KotlinSourceOverlay>,
@@ -3599,10 +3601,49 @@ fn kotlin_editor_arguments(
     let mut destination = false;
     let mut target = false;
     let mut sdk = false;
+    let mut explicit_classpath = false;
+    let path_separator = if cfg!(windows) { ';' } else { ':' };
+    for path in &request.task.classpath {
+        anyhow::ensure!(path.is_absolute(), "kotlin-relative-target-classpath");
+        let text = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("kotlin-classpath-encoding-unhandled"))?;
+        // Kotlin uses a literal File.pathSeparator split; quoted semicolons are not an escape.
+        anyhow::ensure!(
+            !text.contains(path_separator) && !text.contains('\0'),
+            "kotlin-classpath-separator-in-path"
+        );
+    }
     while i < request.task.arguments.len() {
         let argument = &request.task.arguments[i];
         anyhow::ensure!(!argument.contains('\0'), "kotlin-nul-argument");
         match argument.as_str() {
+            "-classpath" | "-cp" => {
+                anyhow::ensure!(!explicit_classpath, "kotlin-duplicate-classpath-argument");
+                let value = request
+                    .task
+                    .arguments
+                    .get(i + 1)
+                    .filter(|value| !value.is_empty() && !value.contains('\0'))
+                    .ok_or_else(|| anyhow::anyhow!("kotlin-classpath-value-unhandled"))?;
+                // KGP 1.8's contributor keeps libraries order and filters non-existing paths.
+                // Retain all declared paths in the environment key/watch, including missing slots.
+                let mut existing = Vec::new();
+                for path in &request.task.classpath {
+                    if kotlin_input_stamp(path)?.is_some() {
+                        existing.push(path.to_str().unwrap());
+                    }
+                }
+                let expected = existing.join(&path_separator.to_string());
+                anyhow::ensure!(
+                    *value == expected,
+                    "kotlin-effective-classpath-needs-recapture"
+                );
+                explicit_classpath = true;
+                result.extend([argument.clone(), value.clone()]);
+                i += 2;
+                continue;
+            }
             "-d" | "-jvm-target" | "-module-name" | "-language-version" | "-api-version"
             | "-jdk-home" => {
                 let value = request
@@ -3681,14 +3722,13 @@ fn kotlin_editor_arguments(
             .ok_or_else(|| anyhow::anyhow!("kotlin-target-sdk-unknown"))?;
         result.extend(["-jdk-home".into(), home.to_string_lossy().into_owned()]);
     }
-    anyhow::ensure!(
-        request.task.classpath.iter().all(|p| p.is_absolute()),
-        "kotlin-relative-target-classpath"
-    );
-    let classpath = std::env::join_paths(&request.task.classpath)?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("kotlin-classpath-encoding-unhandled"))?;
-    result.extend(["-classpath".into(), classpath, "-version".into()]);
+    if !explicit_classpath {
+        let classpath = std::env::join_paths(&request.task.classpath)?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("kotlin-classpath-encoding-unhandled"))?;
+        result.extend(["-classpath".into(), classpath]);
+    }
+    result.push("-version".into());
     result.extend(sources.iter().map(|p| p.to_string_lossy().into_owned()));
     Ok(result)
 }
@@ -4018,6 +4058,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         ],
         current_jvm_tools_jar: None,
         compiler_version: "2.4.0".into(),
+        gradle_plugin_version: "2.4.0".into(),
         gradle_java_home: root.join("jdk"),
         toolchain_java_home: root.join("jdk"),
         run_via_build_tools_api: true,
@@ -4049,6 +4090,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         },
         sources: task.source_files.clone(),
         task,
+        positive_diagnostics_only: false,
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),
         dependency_overlays: Vec::new(),
@@ -4267,6 +4309,130 @@ mod kotlin_editor_compile_tests {
     }
 
     #[test]
+    fn explicit_classpath_preserves_filtered_declared_order_duplicates_and_missing_watch_slot() {
+        let tree = TestDirectory::new();
+        let first = tree.0.join("first 日本 space.jar");
+        let second = tree.0.join("second classes");
+        let generated = tree.0.join("build/generated/ksp/main/classes");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let mut request = kotlin_test_request(&tree.0);
+        request.task.classpath = vec![
+            second.clone(),
+            generated.clone(),
+            first.clone(),
+            second.clone(),
+        ];
+        let effective = std::env::join_paths([&second, &first, &second])
+            .unwrap()
+            .into_string()
+            .unwrap();
+        request
+            .task
+            .arguments
+            .extend(["-cp".into(), effective.clone()]);
+        let output = tree.0.join("private/classes");
+        let arguments = kotlin_editor_arguments(&request, &output, &[]).unwrap();
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["-cp", effective.as_str()]));
+        assert_eq!(
+            arguments.iter().filter(|arg| arg.as_str() == "-cp").count(),
+            1
+        );
+        assert!(!arguments.iter().any(|arg| arg == "-classpath"));
+        assert!(arguments.iter().any(|arg| arg == "-Xallow-no-source-files"));
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        assert_eq!(
+            key.classpath, request.task.classpath,
+            "declared inputs are not filtered or deduplicated"
+        );
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.classpath).unwrap();
+        assert!(
+            plan.covers_read(&crate::paths::file_key(&generated), false),
+            "missing generated slot remains a guarded read"
+        );
+        std::fs::create_dir_all(&generated).unwrap();
+        assert!(kotlin_editor_arguments(&request, &output, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("kotlin-effective-classpath-needs-recapture"));
+        let recaptured = std::env::join_paths(&request.task.classpath)
+            .unwrap()
+            .into_string()
+            .unwrap();
+        *request.task.arguments.last_mut().unwrap() = recaptured.clone();
+        let refreshed = kotlin_editor_arguments(&request, &output, &[]).unwrap();
+        assert!(refreshed
+            .windows(2)
+            .any(|pair| pair == ["-cp", recaptured.as_str()]));
+        assert!(
+            KotlinEnvironmentKey::new(&request).unwrap() != key,
+            "recaptured effective arguments change the compiler identity"
+        );
+    }
+
+    #[test]
+    fn explicit_classpath_rejects_order_changes_duplicate_options_and_ambiguous_paths() {
+        let tree = TestDirectory::new();
+        let first = tree.0.join("one.jar");
+        let second = tree.0.join("two.jar");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(&second, b"two").unwrap();
+        let mut request = kotlin_test_request(&tree.0);
+        request.task.classpath = vec![second.clone(), first.clone()];
+        let effective = std::env::join_paths(&request.task.classpath)
+            .unwrap()
+            .into_string()
+            .unwrap();
+        request
+            .task
+            .arguments
+            .extend(["-classpath".into(), effective.clone()]);
+        let output = tree.0.join("private/classes");
+        assert!(kotlin_editor_arguments(&request, &output, &[]).is_ok());
+        for mutation in [
+            "order",
+            "duplicate",
+            "empty",
+            "missing",
+            "separator",
+            "relative",
+        ] {
+            let mut candidate = kotlin_test_request(&tree.0);
+            candidate.task = request.task.clone();
+            match mutation {
+                "order" => {
+                    *candidate.task.arguments.last_mut().unwrap() =
+                        std::env::join_paths([&first, &second])
+                            .unwrap()
+                            .into_string()
+                            .unwrap()
+                }
+                "duplicate" => candidate
+                    .task
+                    .arguments
+                    .extend(["-cp".into(), effective.clone()]),
+                "empty" => *candidate.task.arguments.last_mut().unwrap() = String::new(),
+                "missing" => {
+                    candidate.task.arguments.pop();
+                }
+                "separator" => candidate.task.classpath.push(tree.0.join(if cfg!(windows) {
+                    "semi;colon.jar"
+                } else {
+                    "colon:path.jar"
+                })),
+                "relative" => candidate.task.classpath.push(PathBuf::from("relative.jar")),
+                _ => unreachable!(),
+            }
+            assert!(
+                kotlin_editor_arguments(&candidate, &output, &[]).is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
     fn compiler_input_identity_includes_ordered_recipe_but_not_source_body() {
         use sha2::Digest;
         let tree = TestDirectory::new();
@@ -4340,6 +4506,23 @@ mod kotlin_editor_compile_tests {
             "opaque captured arguments identify the invocation"
         );
         request.task.arguments.pop();
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .gradle_plugin_version = "1.8.21".into();
+        assert_ne!(
+            identity(&request),
+            original,
+            "verified legacy adapter policy identifies the invocation"
+        );
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .gradle_plugin_version = "2.4.0".into();
         request.task.java_home = None;
         assert_ne!(
             identity(&request),

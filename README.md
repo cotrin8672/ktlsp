@@ -422,6 +422,11 @@ and keeps one client through v1, v2, disabled processing and restored v1. Use JD
 Gradle 7.4.2/Kotlin 1.8.21/KSP cache, and omit `--root`. Actual builds and runtime controls accompany
 native watch delivery, completion, exact generated-source targets, obsolete-API diagnostics and
 preserved unsaved Java/Kotlin buffers. Results are in `artifacts/processor-reload.json`.
+The model selects the public main Kotlin compilation independently of auxiliary KAPT/KSP tasks.
+After each build the probe orders current model/shared analysis refresh before one acceptance sweep;
+Kotlin pulls correlate the transmitted unsaved text with accepted source/model/store generations.
+Producer scopes publish located Kotlin errors but cannot certify clean results or unsaved regeneration.
+Java producer diagnostics remain an open case. Missing observations are recorded as unmeasured.
 Transformed APIs such as Lombok remain covered by their separate compiler-plugin cases.
 
 ## License

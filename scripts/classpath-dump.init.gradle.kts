@@ -2,6 +2,7 @@ import java.util.ArrayDeque
 import java.net.URLClassLoader
 import groovy.json.JsonOutput
 import org.gradle.api.Task
+import org.gradle.api.Project
 import org.gradle.api.Action
 import org.gradle.api.file.FileCollection
 import org.gradle.api.artifacts.component.ComponentIdentifier
@@ -13,6 +14,7 @@ import org.gradle.api.artifacts.result.ResolvedDependencyResult
 import org.gradle.api.artifacts.result.UnresolvedDependencyResult
 import org.gradle.api.file.SourceDirectorySet
 import org.gradle.api.provider.Provider
+import org.gradle.api.tasks.SourceSet
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.process.CommandLineArgumentProvider
@@ -32,6 +34,37 @@ object KtlspCompilerConfiguration {
         return if (value is Provider<*>) value.orNull else value
     }
 
+    // Public JVM compilation ownership, independent of names used by KAPT/KSP auxiliary tasks.
+    // Missing/ambiguous adapters remain unknown rather than selecting the first Kotlin task.
+    fun primaryKotlinCompileTask(project: Project, sourceSet: SourceSet): Task? {
+        val extension = project.extensions.findByName("kotlin") ?: return null
+        return runCatching {
+            val target = read(extension, "getTarget") ?: error("Kotlin target is unavailable")
+            val compilations = read(target, "getCompilations") as? Iterable<*>
+                ?: error("Kotlin compilations are unavailable")
+            val matching = compilations.filterNotNull().filter { compilation ->
+                val getter = compilation.javaClass.methods.firstOrNull {
+                    it.name == "getJavaSourceSet" && it.parameterCount == 0 &&
+                        SourceSet::class.java.isAssignableFrom(it.returnType)
+                }
+                getter?.invoke(compilation) === sourceSet
+            }
+            if (matching.size != 1) return@runCatching null
+            val task = read(matching.single(), "getCompileTaskProvider") as? Task
+                ?: error("Kotlin compilation task is unavailable")
+            val owner = task.project
+            // Gradle 9 can expose distinct Project proxies for the same public project identity.
+            check(owner.path == project.path && owner.projectDir == project.projectDir &&
+                owner.rootProject.projectDir == project.rootProject.projectDir) {
+                "Kotlin compilation task belongs to another project"
+            }
+            task
+        }.getOrElse {
+            project.logger.debug("ktlsp: primary Kotlin compilation is unavailable", it)
+            null
+        }
+    }
+
     private fun kotlinCompilerRecipe(task: Task, toolchain: Any, toolchainJavaHome: java.io.File): Map<String, Any?> {
         // This is KGP's actual ordered compiler runtime input, separate from target libraries.
         val compilerClasspath = (read(task, "getDefaultCompilerClasspath\$kotlin_gradle_plugin_common") as? FileCollection)
@@ -47,8 +80,22 @@ object KtlspCompilerConfiguration {
         val gradleJavaHome = read(gradleJvm, "getJavaHome") as? java.io.File
             ?: error("Kotlin compiler Gradle JDK home is unavailable")
         check(gradleJavaHome.isAbsolute) { "Kotlin compiler Gradle JDK home must be absolute" }
-        val runViaBuildToolsApi = read(task, "getRunViaBuildToolsApi\$kotlin_gradle_plugin_common") as? Boolean
-            ?: error("Kotlin compiler Build Tools API policy is unavailable")
+        val versionHelper = Class.forName("org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapperKt", true, task.javaClass.classLoader)
+        val gradlePluginVersion = versionHelper.getMethod("getKotlinPluginVersion", Project::class.java).invoke(null, task.project) as? String
+            ?: error("Kotlin Gradle plugin version is unavailable")
+        check(gradlePluginVersion.isNotBlank()) { "Kotlin Gradle plugin version is empty" }
+        val buildToolsGetter = task.javaClass.methods.firstOrNull {
+            it.name == "getRunViaBuildToolsApi\$kotlin_gradle_plugin_common" && it.parameterCount == 0
+        }
+        val runViaBuildToolsApi = if (buildToolsGetter != null) {
+            read(task, "getRunViaBuildToolsApi\$kotlin_gradle_plugin_common") as? Boolean
+                ?: error("Kotlin compiler Build Tools API policy is unavailable")
+        } else {
+            // Verified KGP 1.8.21: Tasks -> GradleCompilerEnvironment -> GradleCompilerRunner
+            // passes defaultCompilerClasspath (+ currentJvmJdkToolsJar) directly to the worker.
+            check(gradlePluginVersion == "1.8.21") { "Unverified legacy Kotlin compiler runtime: " + gradlePluginVersion }
+            false
+        }
         val executionStrategy = (read(task, "getCompilerExecutionStrategy") as? Enum<*>)?.name
             ?: error("Kotlin compiler execution strategy is unavailable")
         check(executionStrategy in setOf("DAEMON", "IN_PROCESS", "OUT_OF_PROCESS")) {
@@ -76,6 +123,7 @@ object KtlspCompilerConfiguration {
             "default_classpath" to compilerClasspath.map { it.absolutePath },
             "current_jvm_tools_jar" to toolsJar?.absolutePath,
             "compiler_version" to compilerVersion,
+            "gradle_plugin_version" to gradlePluginVersion,
             "gradle_java_home" to gradleJavaHome.absolutePath,
             "toolchain_java_home" to toolchainJavaHome.absolutePath,
             "run_via_build_tools_api" to runViaBuildToolsApi,
@@ -300,6 +348,7 @@ class KtlspDumpClasspathAction(
 //   SOURCESET\t<name>
 //   SOURCE\t<source set>\t<absolute source root>
 //   OUTPUT\t<source set>\t<absolute output root>
+//   KOTLIN_COMPILE_TASK\t<source set>\t<JSON public compilation task path or null>
 //   COMPILER\t<source set>\t<JSON task configuration, escaped opaque arguments>
 //   SCP\t<source set>\t<absolute classpath entry> (in compilation order)
 //   ARTIFACT\t<source set>\t<absolute file>\tMODULE\t<group>\t<name>\t<version>
@@ -355,12 +404,13 @@ allprojects {
                     roots.addAll(sourceSet.output.generatedSourcesDirs.files)
                     val compileJava = tasks.findByName(sourceSet.compileJavaTaskName) as? JavaCompile
                     // shortcut: these are JVM source-set task names; other compilation models need explicit adapters.
-                    val kotlinTasks = listOf(
+                    val primaryKotlinTask = KtlspCompilerConfiguration.primaryKotlinCompileTask(project, sourceSet)
+                    val kotlinTasks = (listOfNotNull(primaryKotlinTask) + listOf(
                         sourceSet.getCompileTaskName("kotlin"),
                         sourceSet.getTaskName("kapt", "Kotlin"),
                         sourceSet.getTaskName("kaptGenerateStubs", "Kotlin"),
                         sourceSet.getTaskName("ksp", "Kotlin"),
-                    ).mapNotNull { taskName -> tasks.findByName(taskName) }.distinctBy { it.path }
+                    ).mapNotNull { taskName -> tasks.findByName(taskName) }).distinctBy { it.path }
                     val compilers = listOfNotNull(
                         compileJava?.let { KtlspCompilerConfiguration.dump(it, "java") },
                     ) + kotlinTasks.map { KtlspCompilerConfiguration.dump(it, "kotlin") }
@@ -388,6 +438,7 @@ allprojects {
                     roots.map { "SOURCE\t${sourceSetName}\t${it.absolutePath}" } +
                         outputs.map { "OUTPUT\t${sourceSetName}\t${it.absolutePath}" } +
                         provided.map { "PROVIDES\t${sourceSetName}\t${it.absolutePath}" } +
+                        listOf("KOTLIN_COMPILE_TASK\t${sourceSetName}\t${JsonOutput.toJson(primaryKotlinTask?.path)}") +
                         compilers.map { "COMPILER\t${sourceSetName}\t${it}" } +
                         entries.map { "SCP\t${sourceSetName}\t${it.absolutePath}" } +
                         if (actualClasspath.isFailure) listOf("INCOMPLETE\t${sourceSetName}") else emptyList()
