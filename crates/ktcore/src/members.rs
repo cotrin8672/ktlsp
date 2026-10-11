@@ -1,5 +1,6 @@
 //! Receiver member candidates and use-site selection, shared by resolution and inference.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
@@ -12,7 +13,11 @@ use crate::types::{Type, TypeRef};
 pub struct CallArguments {
     /// Missing/broken argument syntax cannot establish an arity mismatch.
     pub count: Option<usize>,
+    /// Written argument order until `bind_arguments` establishes declaration order.
     pub types: Vec<Type>,
+    /// Only named Kotlin calls allocate labels; None is the ordinary positional path.
+    pub names: Option<Vec<Option<String>>>,
+    pub has_spread: bool,
     pub trailing_lambda: bool,
 }
 
@@ -946,6 +951,127 @@ impl<'a> Candidates<'a> {
     }
 }
 
+/// Free-function callers use the same applicability and uncertainty policy as member calls.
+/// The caller supplies its already-visible declaration group; this does not change scope lookup.
+pub(crate) fn select_functions<'a>(
+    index: &dyn InferenceIndex,
+    entries: Vec<&'a Entry>,
+    usage: &MemberUse,
+    ctx: &FileCtx,
+) -> Selection<'a> {
+    Candidates {
+        members: entries,
+        extensions: Vec::new(),
+        local_scopes: Vec::new(),
+        uncertain_receivers: BTreeSet::new(),
+        hierarchy_complete: true,
+    }
+    .select(index, &Type::Unknown, usage, ctx)
+}
+
+/// Supplied actuals and their corresponding formal types always have the same order.
+/// Ordinary positional calls retain their existing borrowed facts and formal slice.
+pub(crate) struct BoundArguments<'a> {
+    pub arguments: Cow<'a, CallArguments>,
+    pub params: Cow<'a, [TypeRef]>,
+}
+
+/// Rebind one candidate, never a name-wide overload group. Unsupported shapes remain possible.
+pub(crate) fn bind_arguments<'a>(
+    entry: &'a Entry,
+    args: &'a CallArguments,
+    mode: CallMode,
+) -> Result<BoundArguments<'a>, Applicability> {
+    let Some(names) = &args.names else {
+        return Ok(BoundArguments {
+            arguments: Cow::Borrowed(args),
+            params: Cow::Borrowed(&entry.sym.params),
+        });
+    };
+    if mode != CallMode::Kotlin
+        || args.count != Some(args.types.len())
+        || names.len() != args.types.len()
+        || args.trailing_lambda
+        || args.has_spread
+        || entry.sym.has_vararg
+    {
+        return Err(Applicability::Unknown);
+    }
+    let Some(formals) = entry.sym.kotlin_parameters.as_deref() else {
+        return Err(Applicability::Unknown);
+    };
+    if formals.len() != entry.sym.params.len()
+        || entry.sym.arity.map(usize::from) != Some(formals.len())
+        || formals.iter().any(|formal| formal.name.is_empty())
+        || formals.iter().enumerate().any(|(position, formal)| {
+            formals[..position]
+                .iter()
+                .any(|previous| previous.name == formal.name)
+        })
+    {
+        return Err(Applicability::Unknown);
+    }
+    if args.types.len() > formals.len() {
+        return Err(Applicability::Rejected);
+    }
+    let mut positions = vec![None; formals.len()];
+    let mut saw_named = false;
+    for (written, name) in names.iter().enumerate() {
+        let position = if let Some(name) = name {
+            saw_named = true;
+            let Some(position) = formals.iter().position(|formal| &formal.name == name) else {
+                return Err(Applicability::Rejected);
+            };
+            position
+        } else {
+            if saw_named {
+                return Err(Applicability::Unknown);
+            }
+            written
+        };
+        if positions[position].replace(written).is_some() {
+            return Err(Applicability::Rejected);
+        }
+    }
+    if positions
+        .iter()
+        .zip(formals.iter())
+        .any(|(position, formal)| position.is_none() && !formal.has_default)
+    {
+        // shortcut: missing defaults stay unknown until inherited/actual defaults are modeled.
+        return Err(Applicability::Unknown);
+    }
+    let params = if args.types.len() == formals.len() {
+        Cow::Borrowed(entry.sym.params.as_slice())
+    } else {
+        Cow::Owned(
+            entry
+                .sym
+                .params
+                .iter()
+                .zip(&positions)
+                .filter(|(_, position)| position.is_some())
+                .map(|(formal, _)| formal.clone())
+                .collect(),
+        )
+    };
+    let types = positions
+        .into_iter()
+        .flatten()
+        .map(|position| args.types[position].clone())
+        .collect();
+    Ok(BoundArguments {
+        arguments: Cow::Owned(CallArguments {
+            count: args.count,
+            types,
+            names: None,
+            has_spread: false,
+            trailing_lambda: false,
+        }),
+        params,
+    })
+}
+
 pub fn function_accepts(
     index: &dyn InferenceIndex,
     receiver: &Type,
@@ -965,10 +1091,18 @@ pub(crate) fn function_applicability(
     ctx: &FileCtx,
     mode: CallMode,
 ) -> Applicability {
+    let bound = match bind_arguments(entry, args, mode) {
+        Ok(bound) => bound,
+        Err(status) => return status,
+    };
+    let named = args.names.is_some();
+    let args = bound.arguments.as_ref();
     let mut uncertain = args.count.is_none()
         || args.trailing_lambda
         || extension_receiver_applicability(index, receiver, entry) == Applicability::Unknown;
-    if let Some(count) = args.count {
+    // Named binding has checked each missing slot against its authored default fact.
+    // Positional min_arity describes a required prefix, not the number of named arguments.
+    if let Some(count) = args.count.filter(|_| !named) {
         let min = if args.trailing_lambda {
             infer::trailing_lambda_min_arity(index, entry, ctx).or(entry.sym.min_arity)
         } else {
@@ -981,29 +1115,23 @@ pub(crate) fn function_applicability(
         }
         uncertain |= min.is_none() || entry.sym.arity.is_none();
     }
-    parameters_applicability(
-        index,
-        receiver,
-        entry,
-        &entry.sym.params,
-        args,
-        ctx,
-        mode,
-        uncertain,
-    )
+    parameters_applicability(index, receiver, entry, &bound, ctx, mode, uncertain)
 }
 
 fn parameters_applicability(
     index: &dyn InferenceIndex,
     receiver: &Type,
     entry: &Entry,
-    params: &[TypeRef],
-    args: &CallArguments,
+    bound: &BoundArguments<'_>,
     ctx: &FileCtx,
     mode: CallMode,
-    uncertain: bool,
+    mut uncertain: bool,
 ) -> Applicability {
-    if let Some(application) = infer::projected_member_application(index, receiver, entry, args) {
+    let args = bound.arguments.as_ref();
+    let params = bound.params.as_ref();
+    uncertain |= params.len() != entry.sym.params.len()
+        && !infer::call_parameter_templates_known(index, entry);
+    if let Some(application) = infer::projected_member_application(index, receiver, entry, bound) {
         return match application.status {
             crate::solve::ConstraintStatus::Rejected => Applicability::Rejected,
             crate::solve::ConstraintStatus::Unknown => Applicability::Unknown,
@@ -1051,6 +1179,9 @@ pub(crate) fn arguments_applicability(
     mode: CallMode,
     mut uncertain: bool,
 ) -> Applicability {
+    if args.names.is_some() {
+        return Applicability::Unknown;
+    }
     uncertain |= args.count.is_some_and(|count| args.types.len() < count);
     for (position, actual) in args.types.iter().enumerate() {
         let formal = formal_type(position);
@@ -1145,6 +1276,9 @@ fn callable_value_applicability(
     args: &CallArguments,
     ctx: &FileCtx,
 ) -> Applicability {
+    if args.names.is_some() {
+        return Applicability::Unknown;
+    }
     let Some(ty) = &entry.sym.value_type else {
         return Applicability::Unknown;
     };
@@ -1156,8 +1290,10 @@ fn callable_value_applicability(
             index,
             receiver,
             entry,
-            params,
-            args,
+            &BoundArguments {
+                arguments: Cow::Borrowed(args),
+                params: Cow::Borrowed(params),
+            },
             ctx,
             CallMode::Kotlin,
             args.count.is_none() || args.trailing_lambda || ty.nullable,

@@ -37,7 +37,15 @@ rtk proxy nvim --headless -l dev/corpus_matcher_test.lua
 the [compiler-verified reduction](fixtures/spring-provider/README.md) through the same
 corpus route. `spring-extensions-editing.json` runs two original controls plus four
 unsaved explicit-receiver/partial/dangling cases against the pinned full Spring root.
-Semantic successes do not override dependency coverage, shutdown or performance gates.
+Record dependency availability, shutdown and performance separately from semantic
+results. An observation deadline leaves unanswered requests unmeasured.
+
+## Named-call regressions
+
+The [named-call fixture](fixtures/named-call-binding/README.md) checks reordered
+arguments, generic overloads, omitted defaults and exact Java/Kotlin targets. Its
+extra hook checks one-file unsaved edits, restoration and genuine ambiguity using
+the same corpus client and first-response policy.
 
 ## CEM source snapshot and declaration oracles
 

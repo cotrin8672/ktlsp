@@ -1086,6 +1086,8 @@ mod tests {
                 &crate::members::CallArguments {
                     count: Some(0),
                     types: Vec::new(),
+                    names: None,
+                    has_spread: false,
                     trailing_lambda: false
                 },
                 &FileCtx::new(String::new(), Vec::new())
@@ -1149,6 +1151,8 @@ mod tests {
             &crate::members::CallArguments {
                 count: Some(0),
                 types: Vec::new(),
+                names: None,
+                has_spread: false,
                 trailing_lambda: false,
             },
             &FileCtx::new("oracle".into(), Vec::new()),
@@ -1177,6 +1181,8 @@ mod tests {
             &crate::members::CallArguments {
                 count: Some(0),
                 types: Vec::new(),
+                names: None,
+                has_spread: false,
                 trailing_lambda: false,
             },
             &FileCtx::new("oracle".into(), Vec::new()),
@@ -1230,6 +1236,8 @@ mod tests {
         let args = CallArguments {
             count: Some(0),
             types: Vec::new(),
+            names: None,
+            has_spread: false,
             trailing_lambda: false,
         };
         let ctx = FileCtx::new("oracle".into(), Vec::new());

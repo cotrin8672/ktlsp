@@ -84,6 +84,13 @@ impl SourceMemberFlags {
     }
 }
 
+/// Authored Kotlin call syntax, distinct from names in a lowered JVM signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KotlinValueParameter {
+    pub name: String,
+    pub has_default: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Class,
@@ -194,6 +201,10 @@ pub struct IndexedSymbol {
     pub value_type: Option<TypeRef>,
     #[serde(default)]
     pub params: Vec<TypeRef>,
+    /// Verified authored Kotlin names and default positions, in the same order as `params`.
+    /// Missing facts do not authorize names/defaults on Java/JVM or incomplete declarations.
+    #[serde(default)]
+    pub kotlin_parameters: Option<Box<Vec<KotlinValueParameter>>>,
     #[serde(default)]
     pub type_params: Vec<String>,
     #[serde(default)]
@@ -233,6 +244,7 @@ impl IndexedSymbol {
             return_type: None,
             value_type: None,
             params: Vec::new(),
+            kotlin_parameters: None,
             type_params: Vec::new(),
             type_parameter_facts: TypeParameterFacts::default(),
             source_member: SourceMemberFlags::default(),

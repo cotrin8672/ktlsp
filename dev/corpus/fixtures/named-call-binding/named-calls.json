@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "project_id": "named-call-binding-editor",
+  "build_tool": "gradle",
+  "scope": "Disposable compiler-control project using the existing corpus/EXTRA_PROBES route; not six-real-project acceptance. Full-formal named/reordered overloads require useful completions and exact callees. Valid default omission is a positive coverage requirement even while unimplemented.",
+  "compiler_baseline": "Independently verified with selected Kotlin 1.9.23, JDK17 compiler host, and JDK8 target/classpath: six-file original, matching-caller and typed-positive Kotlin+javac success; declaration-only reports stale first label and missing chosen; ambiguous reports the intended overload ambiguity. The editor sources remain unannotated.",
+  "extra_probe_hook": "nvim_named_call_probes.lua",
+  "expected_hook_requests": 17,
+  "probes": [
+    {
+      "id": "named-reordered-result",
+      "source": "src/main/kotlin/probe/NamesUse.kt",
+      "anchor": " pick(second=right,first=left).service()",
+      "token": "service",
+      "source_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74",
+      "target_file": "src/main/java/probe/Invocation.java",
+      "target_anchor": "public Class<?> service()",
+      "target_token": "service",
+      "target_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99",
+      "completion_prefix": "",
+      "completion_token": "service",
+      "completion_excludes": [
+        "body"
+      ]
+    },
+    {
+      "id": "named-reordered-callee",
+      "source": "src/main/kotlin/probe/NamesUse.kt",
+      "anchor": " pick(second=right,first=left).service()",
+      "token": "pick",
+      "source_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74",
+      "target_file": "src/main/kotlin/probe/Names.kt",
+      "target_anchor": "fun <A,B> pick(",
+      "target_token": "pick",
+      "target_sha256": "c61f4bd8d7f580580d69edd036f49434ca296e295daea41c2e402d7d1d80f5c1",
+      "completion": false
+    },
+    {
+      "id": "ordinary-positional-result",
+      "source": "src/main/kotlin/probe/NamesUse.kt",
+      "anchor": " pick(left,right).service()",
+      "token": "service",
+      "source_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74",
+      "target_file": "src/main/java/probe/Invocation.java",
+      "target_anchor": "public Class<?> service()",
+      "target_token": "service",
+      "target_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99",
+      "completion_prefix": "",
+      "completion_token": "service",
+      "completion_excludes": [
+        "body"
+      ]
+    },
+    {
+      "id": "default-all-formals-result",
+      "source": "src/main/kotlin/probe/NamesUse.kt",
+      "anchor": " shapes.optional(required=left,ignored=known).service()",
+      "token": "service",
+      "source_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74",
+      "target_file": "src/main/java/probe/Invocation.java",
+      "target_anchor": "public Class<?> service()",
+      "target_token": "service",
+      "target_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99",
+      "completion_prefix": "",
+      "completion_token": "service",
+      "completion_excludes": [
+        "body"
+      ]
+    },
+    {
+      "id": "coverage-default-omitted-result",
+      "source": "src/main/kotlin/probe/NamesUse.kt",
+      "anchor": " shapes.optional(required=left).service()",
+      "token": "service",
+      "source_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74",
+      "target_file": "src/main/java/probe/Invocation.java",
+      "target_anchor": "public Class<?> service()",
+      "target_token": "service",
+      "target_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99",
+      "completion_prefix": "",
+      "completion_token": "service",
+      "completion_excludes": [
+        "body"
+      ]
+    },
+    {
+      "id": "member-invocation-result",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " router.pick(marker=left,type=left).service()",
+      "token": "service",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/java/probe/Invocation.java",
+      "target_anchor": "public Class<?> service()",
+      "target_token": "service",
+      "target_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99",
+      "completion_prefix": "",
+      "completion_token": "service",
+      "completion_excludes": [
+        "body"
+      ]
+    },
+    {
+      "id": "member-invocation-callee",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " router.pick(marker=left,type=left).service()",
+      "token": "pick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun <T> pick(type:",
+      "target_token": "pick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "member-other-result",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " router.pick(type=right,marker=right).body()",
+      "token": "body",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/java/probe/Other.java",
+      "target_anchor": "public String body()",
+      "target_token": "body",
+      "target_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28",
+      "completion_prefix": "",
+      "completion_token": "body",
+      "completion_excludes": [
+        "service"
+      ]
+    },
+    {
+      "id": "member-other-callee",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " router.pick(type=right,marker=right).body()",
+      "token": "pick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun <T> pick(marker:",
+      "target_token": "pick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "free-callee-1",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " freePick(marker=left,type=left)",
+      "token": "freePick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun <T> freePick(",
+      "target_token": "freePick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "free-callee-2",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " freePick(marker=left,type=right)",
+      "token": "freePick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun <T> freePick(",
+      "target_token": "freePick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "free-callee-3",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " freePick(marker=right,value=right)",
+      "token": "freePick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun freePick(",
+      "target_token": "freePick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "free-generic-other-result",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " freePick(marker=left,type=right).body()",
+      "token": "body",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/java/probe/Other.java",
+      "target_anchor": "public String body()",
+      "target_token": "body",
+      "target_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28",
+      "completion_prefix": "",
+      "completion_token": "body",
+      "completion_excludes": [
+        "service"
+      ]
+    },
+    {
+      "id": "local-callee-1",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " localPick(second=left,first=left)",
+      "token": "localPick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/Use.kt",
+      "target_anchor": "fun <T> localPick(",
+      "target_token": "localPick",
+      "target_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "completion": false
+    },
+    {
+      "id": "local-callee-2",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " localPick(second=left,first=right)",
+      "token": "localPick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/Use.kt",
+      "target_anchor": "fun <T> localPick(",
+      "target_token": "localPick",
+      "target_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "completion": false
+    },
+    {
+      "id": "local-callee-3",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " localPick(first=right,second=right)",
+      "token": "localPick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/Use.kt",
+      "target_anchor": "fun localPick(",
+      "target_token": "localPick",
+      "target_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "completion": false
+    },
+    {
+      "id": "local-invocation-result",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " localPick(second=left,first=left).service()",
+      "token": "service",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/java/probe/Invocation.java",
+      "target_anchor": "public Class<?> service()",
+      "target_token": "service",
+      "target_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99",
+      "completion_prefix": "",
+      "completion_token": "service",
+      "completion_excludes": [
+        "body"
+      ]
+    },
+    {
+      "id": "local-generic-other-result",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " localPick(second=left,first=right).body()",
+      "token": "body",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/java/probe/Other.java",
+      "target_anchor": "public String body()",
+      "target_token": "body",
+      "target_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28",
+      "completion_prefix": "",
+      "completion_token": "body",
+      "completion_excludes": [
+        "service"
+      ]
+    },
+    {
+      "id": "qualified-callee-1",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " probe.freePick(marker=left,type=left)",
+      "token": "freePick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun <T> freePick(",
+      "target_token": "freePick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "qualified-callee-2",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " probe.freePick(marker=left,type=right)",
+      "token": "freePick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun <T> freePick(",
+      "target_token": "freePick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    },
+    {
+      "id": "qualified-callee-3",
+      "source": "src/main/kotlin/probe/Use.kt",
+      "anchor": " probe.freePick(marker=right,value=right)",
+      "token": "freePick",
+      "source_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2",
+      "target_file": "src/main/kotlin/probe/NamedRouter.kt",
+      "target_anchor": "fun freePick(",
+      "target_token": "freePick",
+      "target_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08",
+      "completion": false
+    }
+  ]
+}

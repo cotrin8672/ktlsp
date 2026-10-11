@@ -1926,6 +1926,8 @@ fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Ot
         &ktcore::members::MemberUse::Call(ktcore::members::CallArguments {
             count: Some(2),
             types: vec![argument, Type::class("Invocation", Some("probe".into()))],
+            names: None,
+            has_spread: false,
             trailing_lambda: false,
         }),
         &ctx,
@@ -2007,39 +2009,43 @@ fn projected_source_facts_survive_cache_and_unsaved_variance_changes() {
 }
 
 #[test]
-fn projected_named_arguments_remain_unknown_without_positional_rebinding() {
+fn projected_named_arguments_bind_to_their_declared_positions() {
     let source = r#"package probe
 fun <A,B> pick(first:Class<out A>,second:Class<out B>):A=error("fixture")
 fun use(left:Class<Invocation>,right:Class<Other>,known:Other) {
  pick(left,right).service()
- pick(second=right,first=left)
+ pick(second=right,first=left).service()
+ pick(left,second=right).service()
+ pick(`second`=right,`first`=left).service()
  known.body()
 }
 "#;
     let mut ws = projected_workspace(source);
-    assert_member(
-        &mut ws,
-        "Use.kt",
-        "pick(left,right).",
-        "service",
-        "serviceWrong",
-    );
-    assert_exact_definition(
-        &mut ws,
-        "Use.kt",
-        "pick(left,right).service()",
-        "Invocation.java",
-        "service",
-    );
-    let positional = infer_expression(&ws, "Use.kt", "pick(left,right)");
-    assert_eq!(positional, Type::class("Invocation", Some("probe".into())));
-    // This valid named call should ultimately infer Invocation. Until names map to formals,
-    // Unknown records a coverage gap and must not become the positional first argument's Other.
-    assert_eq!(
-        infer_expression(&ws, "Use.kt", "pick(second=right,first=left)"),
-        Type::Unknown
-    );
-    // The incomplete inference must keep the actual callable available for navigation.
+    for expression in [
+        "pick(left,right)",
+        "pick(second=right,first=left)",
+        "pick(left,second=right)",
+        "pick(`second`=right,`first`=left)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::class("Invocation", Some("probe".into()))
+        );
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "service",
+            "body",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.service()"),
+            "Invocation.java",
+            "service",
+        );
+    }
     assert_exact_definition(
         &mut ws,
         "Use.kt",
@@ -2092,6 +2098,8 @@ fun use(request:MissingRequest,valid:Request,type:Class<Invocation>,missing:Miss
     let arguments = ktcore::members::CallArguments {
         count: Some(2),
         types: vec![argument, Type::class("Missing", None)],
+        names: None,
+        has_spread: false,
         trailing_lambda: false,
     };
     let ctx = FileCtx::new("probe".into(), Vec::new());
@@ -2128,4 +2136,1097 @@ fun use(request:MissingRequest,valid:Request,type:Class<Invocation>,missing:Miss
         2,
         "unresolved arguments must not remove possible overloads"
     );
+}
+
+#[test]
+fn named_projected_calls_share_member_extension_and_receiver_constraints() {
+    let source = r#"package probe
+fun <T> Class<T>.choose(other:Class<out T>,marker:Invocation):T=error("fixture")
+fun use(request:KotlinRequest,left:Class<Invocation>,right:Class<Other>,marker:Invocation,known:Other) {
+ request.both(lower=left,exact=left)!!.service()
+ left.choose(marker=marker,other=left).service()
+ request.both(lower=right,exact=left)
+ left.choose(marker=marker,other=right)
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    for expression in [
+        "request.both(lower=left,exact=left)!!",
+        "left.choose(marker=marker,other=left)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::class("Invocation", Some("probe".into()))
+        );
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "service",
+            "body",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.service()"),
+            "Invocation.java",
+            "service",
+        );
+    }
+    for expression in [
+        "request.both(lower=right,exact=left)",
+        "left.choose(marker=marker,other=right)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn named_projected_overloads_use_each_candidates_labels_order_and_types() {
+    let declarations = r#"package probe
+class NamedRouter {
+ fun <T> pick(type:Class<out T>,marker:Class<Invocation>):T=error("fixture")
+ @kotlin.jvm.JvmName("pickOther")
+fun <T> pick(marker:Class<Other>,type:Class<out T>):T=error("fixture")
+ fun <T> uncertain(type:Class<out T>,marker:Class<Invocation>):T=error("fixture")
+ fun <T> uncertain(marker:Missing,type:Class<out T>):Other=error("fixture")
+}
+fun <T> freePick(type:Class<out T>,marker:Class<Invocation>):T=error("fixture")
+@kotlin.jvm.JvmName("freePickOther")
+fun freePick(marker:Class<Other>,value:Class<Other>):Other=error("fixture")
+fun <T> ambiguous(type:Class<out T>,marker:Class<Invocation>):T=error("fixture")
+fun <T> ambiguous(marker:Missing,type:Class<out T>):Other=error("fixture")
+"#;
+    let source = r#"package probe
+fun <T> localPick(first:Class<out T>,second:Class<Invocation>):T=error("fixture")
+@kotlin.jvm.JvmName("localPickOther")
+fun localPick(second:Class<Other>,first:Class<Other>):Other=error("fixture")
+fun use(router:NamedRouter,left:Class<Invocation>,right:Class<Other>,marker:Invocation,known:Other) {
+ router.pick(marker=left,type=left).service()
+ router.pick(type=right,marker=right).body()
+ freePick(marker=left,type=left).service()
+ freePick(marker=left,type=right).body()
+ freePick(marker=right,value=right).body()
+ localPick(second=left,first=left).service()
+ localPick(second=left,first=right).body()
+ localPick(first=right,second=right).body()
+ probe.freePick(marker=left,type=left).service()
+ probe.freePick(marker=left,type=right).body()
+ probe.freePick(marker=right,value=right).body()
+ ambiguous(marker=left,type=left)
+ probe.ambiguous(marker=left,type=left)
+ router.uncertain(marker=left,type=left)
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open("NamedRouter.kt", declarations.into());
+    for (expression, target, name, absent) in [
+        (
+            "router.pick(marker=left,type=left)",
+            "Invocation.java",
+            "service",
+            "body",
+        ),
+        (
+            "freePick(marker=left,type=left)",
+            "Invocation.java",
+            "service",
+            "body",
+        ),
+        (
+            "freePick(marker=left,type=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+        (
+            "router.pick(type=right,marker=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+        (
+            "freePick(marker=right,value=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+        (
+            "probe.freePick(marker=left,type=left)",
+            "Invocation.java",
+            "service",
+            "body",
+        ),
+        (
+            "probe.freePick(marker=left,type=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+        (
+            "probe.freePick(marker=right,value=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+        (
+            "localPick(second=left,first=left)",
+            "Invocation.java",
+            "service",
+            "body",
+        ),
+        (
+            "localPick(second=left,first=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+        (
+            "localPick(first=right,second=right)",
+            "Other.java",
+            "body",
+            "service",
+        ),
+    ] {
+        assert_member(&mut ws, "Use.kt", &format!("{expression}."), name, absent);
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.{name}()"),
+            target,
+            name,
+        );
+    }
+    for (expression, target, declaration) in [
+        (
+            "freePick(marker=left,type=left)",
+            "NamedRouter.kt",
+            "fun <T> freePick(",
+        ),
+        (
+            "freePick(marker=left,type=right)",
+            "NamedRouter.kt",
+            "fun <T> freePick(",
+        ),
+        (
+            "freePick(marker=right,value=right)",
+            "NamedRouter.kt",
+            "fun freePick(",
+        ),
+        (
+            "probe.freePick(marker=left,type=left)",
+            "NamedRouter.kt",
+            "fun <T> freePick(",
+        ),
+        (
+            "probe.freePick(marker=left,type=right)",
+            "NamedRouter.kt",
+            "fun <T> freePick(",
+        ),
+        (
+            "probe.freePick(marker=right,value=right)",
+            "NamedRouter.kt",
+            "fun freePick(",
+        ),
+        (
+            "localPick(second=left,first=left)",
+            "Use.kt",
+            "fun <T> localPick(",
+        ),
+        (
+            "localPick(second=left,first=right)",
+            "Use.kt",
+            "fun <T> localPick(",
+        ),
+        (
+            "localPick(first=right,second=right)",
+            "Use.kt",
+            "fun localPick(",
+        ),
+    ] {
+        let callee = expression.split('(').next().unwrap();
+        let name = callee.rsplit('.').next().unwrap();
+        let offset = source.find(expression).unwrap() + callee.rfind(name).unwrap();
+        let target_source = ws.doc_text(target).unwrap();
+        let expected = target_source.find(declaration).unwrap() + declaration.find(name).unwrap();
+        assert_eq!(
+            ws.goto_definition("Use.kt", offset),
+            vec![ktlsp::symbol::Def {
+                file: target.into(),
+                start_byte: expected,
+                end_byte: expected + name.len(),
+            }],
+            "named callee must select the exact overload: {expression}"
+        );
+    }
+    for expression in [
+        "ambiguous(marker=left,type=left)",
+        "probe.ambiguous(marker=left,type=left)",
+    ] {
+        let callee = expression.split('(').next().unwrap();
+        let offset = source.find(expression).unwrap() + callee.rfind("ambiguous").unwrap();
+        assert!(
+            ws.goto_definition("Use.kt", offset).is_empty(),
+            "unknown competitor must not select a callee: {expression}"
+        );
+    }
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "ambiguous(marker=left,type=left)"),
+        Type::Unknown
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "probe.ambiguous(marker=left,type=left)"),
+        Type::Unknown
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "router.uncertain(marker=left,type=left)"),
+        Type::Unknown
+    );
+    let tree = KotlinParser::new().parse(source);
+    let start = source
+        .find("router.uncertain(marker=left,type=left)")
+        .unwrap();
+    let call = tree
+        .root_node()
+        .descendant_for_byte_range(
+            start,
+            start + "router.uncertain(marker=left,type=left)".len(),
+        )
+        .unwrap();
+    let ctx = FileCtx::from_tree(&tree, source);
+    let arguments = infer::call_arguments(&ws.index, call, source, &ctx);
+    let owner = Type::class("NamedRouter", Some("probe".into()));
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "uncertain", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(arguments.clone()),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown
+    );
+    assert_eq!(
+        selection.entries.len(),
+        2,
+        "unknown fixed formal must keep the competing overload"
+    );
+    let mut symbols: Vec<_> = ws
+        .index
+        .entries_for_file("NamedRouter.kt")
+        .iter()
+        .map(|entry| (*entry.sym).clone())
+        .collect();
+    for name in ["uncertain", "ambiguous"] {
+        let unknown = symbols
+            .iter_mut()
+            .find(|symbol| symbol.name == name && symbol.params[0].name == "Missing")
+            .unwrap();
+        unknown.kotlin_parameters = None;
+    }
+    ws.index
+        .replace_file("NamedRouter.kt", symbols, ktlsp::index::Tier::Volatile);
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "uncertain", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(arguments),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown
+    );
+    assert_eq!(
+        selection.entries.len(),
+        2,
+        "absent source names cannot eliminate an overload"
+    );
+    for expression in [
+        "ambiguous(marker=left,type=left)",
+        "probe.ambiguous(marker=left,type=left)",
+    ] {
+        let callee = expression.split('(').next().unwrap();
+        let offset = source.find(expression).unwrap() + callee.rfind("ambiguous").unwrap();
+        assert!(
+            ws.goto_definition("Use.kt", offset).is_empty(),
+            "missing metadata must retain callee uncertainty: {expression}"
+        );
+    }
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn named_projected_calls_preserve_unknown_for_unsupported_argument_shapes() {
+    let declarations = r#"package probe
+class NamedShapes {
+ fun <A,B> pick(first:Class<out A>,second:Class<out B>):A=error("fixture")
+ fun <T> optional(ignored:Other=Other(),required:Class<out T>):T=error("fixture")
+ fun <T> variable(vararg types:Class<out T>):T=error("fixture")
+ fun <A,B> tail(first:Class<out A>,second:Class<out B>,block:()->Unit):A=error("fixture")
+}
+"#;
+    let source = r#"package probe
+fun use(shapes:NamedShapes,left:Class<Invocation>,right:Class<Other>,spread:Array<Class<Invocation>>,known:Other) {
+ shapes.optional(required=left,ignored=known).service()
+ shapes.optional(required=left).service()
+ shapes.pick(second=right,left)
+ shapes.pick(first=left,first=right)
+ shapes.pick(first=left,missing=right)
+ shapes.pick(first=*left,second=right)
+ shapes.variable(types=*spread)
+ shapes.tail(second=right,first=left) {}
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open("NamedShapes.kt", declarations.into());
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "shapes.optional(required=left,ignored=known).",
+        "service",
+        "body",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "shapes.optional(required=left,ignored=known).service()",
+        "Invocation.java",
+        "service",
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "shapes.optional(required=left)"),
+        Type::class("Invocation", Some("probe".into()))
+    );
+    // Default omission is valid Kotlin and must produce useful completion and exact navigation.
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "shapes.optional(required=left).",
+        "service",
+        "body",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "shapes.optional(required=left).service()",
+        "Invocation.java",
+        "service",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "shapes.optional(required=left)",
+        "NamedShapes.kt",
+        "optional",
+    );
+    for expression in [
+        "shapes.pick(second=right,left)",
+        "shapes.pick(first=left,first=right)",
+        "shapes.pick(first=left,missing=right)",
+        "shapes.pick(first=*left,second=right)",
+        "shapes.variable(types=*spread)",
+        "shapes.tail(second=right,first=left) {}",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    let tree = KotlinParser::new().parse(source);
+    for expression in [
+        "shapes.pick(second=right,left)",
+        "shapes.variable(types=*spread)",
+        "shapes.tail(second=right,first=left) {}",
+    ] {
+        let start = source.find(expression).unwrap();
+        let call = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + expression.len())
+            .unwrap();
+        let ctx = FileCtx::from_tree(&tree, source);
+        let arguments = infer::call_arguments(&ws.index, call, source, &ctx);
+        let name = expression
+            .split('.')
+            .nth(1)
+            .unwrap()
+            .split('(')
+            .next()
+            .unwrap();
+        let owner = Type::class("NamedShapes", Some("probe".into()));
+        let candidates = ktcore::members::candidates(&ws.index, &owner, name, &ctx);
+        let selection = candidates.select(
+            &ws.index,
+            &owner,
+            &ktcore::members::MemberUse::Call(arguments),
+            &ctx,
+        );
+        assert_eq!(
+            selection.applicability,
+            ktcore::members::Applicability::Unknown,
+            "{expression}"
+        );
+        assert_eq!(
+            selection.entries.len(),
+            1,
+            "unsupported call must retain its candidate: {expression}"
+        );
+    }
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn named_projected_formal_name_edits_invalidate_then_restore_cross_file_inference() {
+    let declaration = r#"package probe
+fun <A,B> pick(first:Class<out A>,second:Class<out B>):A=error("fixture")
+"#;
+    let source = "package probe
+fun use(left:Class<Invocation>,right:Class<Other>,known:Other) { pick(second=right,first=left).service();known.body() }
+";
+    let renamed = declaration.replace("first:", "chosen:");
+    let updated = source.replace("first=left", "chosen=left");
+    let mut ws = projected_workspace(source);
+    ws.open("Names.kt", declaration.into());
+    // Warm the caller before changing either file, then query after each one-file edit.
+    for (edit, expression, useful) in [
+        (None, "pick(second=right,first=left)", true),
+        (
+            Some(("Names.kt", renamed.as_str())),
+            "pick(second=right,first=left)",
+            false,
+        ),
+        (
+            Some(("Use.kt", updated.as_str())),
+            "pick(second=right,chosen=left)",
+            true,
+        ),
+        (
+            Some(("Use.kt", source)),
+            "pick(second=right,first=left)",
+            false,
+        ),
+        (
+            Some(("Names.kt", declaration)),
+            "pick(second=right,first=left)",
+            true,
+        ),
+    ] {
+        if let Some((file, text)) = edit {
+            assert_ne!(
+                ws.doc_text(file).as_deref(),
+                Some(text),
+                "each invalidation step must change exactly one file"
+            );
+            ws.change(file, text.into());
+        }
+        let inferred = infer_expression(&ws, "Use.kt", expression);
+        if useful {
+            assert_eq!(inferred, Type::class("Invocation", Some("probe".into())));
+            assert_member(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}."),
+                "service",
+                "body",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}.service()"),
+                "Invocation.java",
+                "service",
+            );
+            assert_exact_definition(&mut ws, "Use.kt", expression, "Names.kt", "pick");
+        } else {
+            assert_eq!(inferred, Type::Unknown);
+            let found = labels(&mut ws, "Use.kt", &format!("{expression}."));
+            assert!(
+                !found.contains("service") && !found.contains("body"),
+                "stale named mapping: {found:?}"
+            );
+        }
+        assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    }
+    assert_eq!(ws.doc_text("Use.kt").as_deref(), Some(source));
+    assert_eq!(ws.doc_text("Names.kt").as_deref(), Some(declaration));
+    let entries = ws.index.entries_for_file("Names.kt");
+    let symbols: Vec<_> = entries.iter().map(|entry| (*entry.sym).clone()).collect();
+    let decoded: Vec<ktlsp::symbol::IndexedSymbol> =
+        bincode::deserialize(&bincode::serialize(&symbols).unwrap()).unwrap();
+    assert_eq!(decoded, symbols);
+    assert_eq!(
+        decoded[0]
+            .kotlin_parameters
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), parameter.has_default))
+            .collect::<Vec<_>>(),
+        [("first", false), ("second", false)]
+    );
+    ws.index
+        .replace_file("Names.kt", decoded, ktlsp::index::Tier::Durable);
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "pick(second=right,first=left)"),
+        Type::class("Invocation", Some("probe".into()))
+    );
+}
+
+#[test]
+fn named_calls_do_not_treat_java_parameter_spelling_as_kotlin_source_names() {
+    let source = "package probe
+fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,known:Other) { request.tag(type=type);kotlin.upper(type=type);kotlin.star(type=type);kotlin.bounded(type=type);kotlin.tag(type=captured);kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
+";
+    let mut ws = projected_workspace(source);
+    for expression in [
+        "request.tag(type=type)",
+        "kotlin.upper(type=type)",
+        "kotlin.star(type=type)",
+        "kotlin.bounded(type=type)",
+        "kotlin.tag(type=captured)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "kotlin.tag(type=type)!!.",
+        "service",
+        "body",
+    );
+    assert_member(&mut ws, "Use.kt", "request.tag(type)!!.", "service", "body");
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "kotlin.tag(type=type)!!.service()",
+        "Invocation.java",
+        "service",
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn incomplete_named_calls_keep_candidates_without_using_a_partial_name_map() {
+    let source = r#"package probe
+fun use(shapes:NamedShapes,left:Class<Invocation>,known:Other) {
+ known.body()
+ shapes.pick(second=left,first=)
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open(
+        "NamedShapes.kt",
+        r#"package probe
+class NamedShapes { fun <A,B> pick(first:Class<out A>,second:Class<out B>):A=error("fixture") }
+"#
+        .into(),
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    let tree = KotlinParser::new().parse(source);
+    let start = source.find("shapes.pick").unwrap() + "shapes.".len();
+    let selector = tree
+        .root_node()
+        .descendant_for_byte_range(start, start + "pick".len())
+        .unwrap();
+    let ctx = FileCtx::from_tree(&tree, source);
+    let usage = ktlsp::resolve::member_use(&ws.index, selector, source, &ctx);
+    let ktcore::members::MemberUse::Call(arguments) = usage else {
+        panic!("unfinished argument syntax must retain a call use");
+    };
+    assert!(
+        arguments.count.is_none(),
+        "broken syntax must not certify a complete binding"
+    );
+    let owner = Type::class("NamedShapes", Some("probe".into()));
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "pick", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(arguments),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown
+    );
+    assert_eq!(selection.entries.len(), 1);
+}
+
+#[test]
+fn named_defaults_bind_leading_middle_and_trailing_slots_for_members_and_free_calls() {
+    let declarations = r#"package probe
+class DefaultBridge {
+ fun <T> leading(ignored:Other=Other(),required:Class<out T>):T=error("fixture")
+ fun <T> middle(required:Class<out T>,ignored:Other=Other(),marker:Class<Invocation>):T=error("fixture")
+ fun <T> trailing(required:Class<out T>,ignored:Other=Other()):T=error("fixture")
+ fun <T> punctuation(noise:String="a=b,c",required:Class<out T> /* = not a default */,ignored:Other /* = */ = run { Other() }):T=error("fixture")
+ fun <T> plain(ignored:Other=Other(),required:T):T=error("fixture")
+ fun concrete(ignored:Other=Other(),required:Invocation):Invocation=error("fixture")
+ fun <T> choose(required:Class<out T>,marker:Class<Invocation>,ignored:Other=Other()):T=error("fixture")
+ @kotlin.jvm.JvmName("chooseOther")
+ fun choose(required:Class<Other>,marker:Class<Other>,ignored:Invocation=Invocation()):Other=error("fixture")
+}
+fun <T> freeLeading(ignored:Other=Other(),required:Class<out T>):T=error("fixture")
+fun <T> freeMiddle(required:Class<out T>,ignored:Other=Other(),marker:Class<Invocation>):T=error("fixture")
+fun <T> freeTrailing(required:Class<out T>,ignored:Other=Other()):T=error("fixture")
+fun <T> freePlain(ignored:Other=Other(),required:T):T=error("fixture")
+"#;
+    let source = r#"package probe
+fun use(bridge:DefaultBridge,left:Class<Invocation>,right:Class<Other>,value:Invocation,known:Other) {
+ bridge.leading(required=left).service()
+ bridge.middle(marker=left,required=left).service()
+ bridge.middle(left,marker=left).service()
+ bridge.trailing(required=left).service()
+ bridge.punctuation(required=left).service()
+ bridge.plain(required=value).service()
+ bridge.concrete(required=value).service()
+ bridge.choose(marker=left,required=left).service()
+ freeLeading(required=left).service()
+ probe.freeLeading(required=left).service()
+ freeMiddle(marker=left,required=left).service()
+ freeTrailing(required=left).service()
+ freePlain(required=value).service()
+ bridge.leading(required=right).body()
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open("Defaults.kt", declarations.into());
+    for expression in [
+        "bridge.leading(required=left)",
+        "bridge.middle(marker=left,required=left)",
+        "bridge.middle(left,marker=left)",
+        "bridge.trailing(required=left)",
+        "bridge.punctuation(required=left)",
+        "bridge.plain(required=value)",
+        "bridge.concrete(required=value)",
+        "bridge.choose(marker=left,required=left)",
+        "freeLeading(required=left)",
+        "probe.freeLeading(required=left)",
+        "freeMiddle(marker=left,required=left)",
+        "freeTrailing(required=left)",
+        "freePlain(required=value)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::class("Invocation", Some("probe".into())),
+            "{expression}"
+        );
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "service",
+            "body",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.service()"),
+            "Invocation.java",
+            "service",
+        );
+        let callee = expression
+            .split('(')
+            .next()
+            .unwrap()
+            .rsplit('.')
+            .next()
+            .unwrap();
+        assert_exact_definition(&mut ws, "Use.kt", expression, "Defaults.kt", callee);
+    }
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "probe.freeLeading(required=left).",
+        "service",
+        "body",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "probe.freeLeading(required=left)",
+        "Defaults.kt",
+        "freeLeading",
+    );
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "bridge.leading(required=right).",
+        "body",
+        "service",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "bridge.leading(required=right).body()",
+        "Other.java",
+        "body",
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn named_default_edits_invalidate_missing_slots_then_restore_cached_call_facts() {
+    let declaration = "package probe\nfun <T> withDefault(ignored:Other=Other(),required:Class<out T>):T=error(\"fixture\")\n";
+    let required = declaration.replace("ignored:Other=Other()", "ignored:Other");
+    let source = "package probe\nfun use(left:Class<Invocation>,known:Other) { withDefault(required=left).service();known.body() }\n";
+    let supplied = source.replace("required=left", "ignored=known,required=left");
+    let mut ws = projected_workspace(source);
+    ws.open("Defaults.kt", declaration.into());
+    for (phase, (decl, caller, expression, useful)) in [
+        (declaration, source, "withDefault(required=left)", true),
+        (
+            required.as_str(),
+            source,
+            "withDefault(required=left)",
+            false,
+        ),
+        (
+            required.as_str(),
+            supplied.as_str(),
+            "withDefault(ignored=known,required=left)",
+            true,
+        ),
+        (
+            required.as_str(),
+            source,
+            "withDefault(required=left)",
+            false,
+        ),
+        (declaration, source, "withDefault(required=left)", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edits = 0;
+        for (file, text) in [("Defaults.kt", decl), ("Use.kt", caller)] {
+            if ws.doc_text(file).as_deref() != Some(text) {
+                ws.change(file, text.into());
+                edits += 1;
+            }
+        }
+        assert_eq!(edits, usize::from(phase > 0));
+        if useful {
+            assert_eq!(
+                infer_expression(&ws, "Use.kt", expression),
+                Type::class("Invocation", Some("probe".into()))
+            );
+            assert_member(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}."),
+                "service",
+                "body",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}.service()"),
+                "Invocation.java",
+                "service",
+            );
+            assert_exact_definition(&mut ws, "Use.kt", expression, "Defaults.kt", "withDefault");
+        } else {
+            assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::Unknown);
+            let found = labels(&mut ws, "Use.kt", &format!("{expression}."));
+            assert!(
+                !found.contains("service") && !found.contains("body"),
+                "stale default facts: {found:?}"
+            );
+        }
+        assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    }
+    assert_eq!(ws.doc_text("Defaults.kt").as_deref(), Some(declaration));
+    assert_eq!(ws.doc_text("Use.kt").as_deref(), Some(source));
+    let symbols: Vec<_> = ws
+        .index
+        .entries_for_file("Defaults.kt")
+        .iter()
+        .map(|entry| (*entry.sym).clone())
+        .collect();
+    let decoded: Vec<ktlsp::symbol::IndexedSymbol> =
+        bincode::deserialize(&bincode::serialize(&symbols).unwrap()).unwrap();
+    assert_eq!(decoded, symbols);
+    assert_eq!(
+        decoded[0]
+            .kotlin_parameters
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), parameter.has_default))
+            .collect::<Vec<_>>(),
+        [("ignored", true), ("required", false)]
+    );
+    ws.index
+        .replace_file("Defaults.kt", decoded, ktlsp::index::Tier::Durable);
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "withDefault(required=left).",
+        "service",
+        "body",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "withDefault(required=left).service()",
+        "Invocation.java",
+        "service",
+    );
+}
+
+#[test]
+fn named_default_calls_retain_competing_unbound_and_unresolved_candidates() {
+    let declarations = r#"package probe
+fun <T> competing(type:Class<out T>,left:Other=Other()):T=error("fixture")
+@kotlin.jvm.JvmName("competingOther")
+fun <T> competing(type:Class<out T>,right:Other=Other()):Other=error("fixture")
+fun <T> unbound(value:T=error("fixture"),marker:Other):T=error("fixture")
+fun <T> unresolved(type:Class<out T>,missing:Missing=error("fixture")):T=error("fixture")
+class DefaultGuards {
+ fun <T> unresolvedMember(type:Class<out T>,missing:Missing=error("fixture")):T=error("fixture")
+ fun <T> unboundMember(value:T=error("fixture"),marker:Other):T=error("fixture")
+ fun <T:Other> boundedMember(required:T,ignored:Other=Other()):T=error("fixture")
+ fun <T> whereBoundedMember(required:T,ignored:Other=Other()):T where T:Other=error("fixture")
+}
+"#;
+    let source = r#"package probe
+fun use(guards:DefaultGuards,left:Class<Invocation>,value:Invocation,known:Other) {
+ competing(type=left)
+ unbound(marker=known)
+ unresolved(type=left)
+ guards.unresolvedMember(type=left)
+ guards.unboundMember(marker=known)
+ guards.boundedMember(required=value)
+ guards.whereBoundedMember(required=value)
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open("Guards.kt", declarations.into());
+    for expression in [
+        "competing(type=left)",
+        "unbound(marker=known)",
+        "unresolved(type=left)",
+        "guards.unresolvedMember(type=left)",
+        "guards.unboundMember(marker=known)",
+        "guards.boundedMember(required=value)",
+        "guards.whereBoundedMember(required=value)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    assert!(ws
+        .goto_definition("Use.kt", source.find("competing(type=left)").unwrap())
+        .is_empty());
+    let tree = KotlinParser::new().parse(source);
+    let ctx = FileCtx::from_tree(&tree, source);
+    let owner = Type::class("DefaultGuards", Some("probe".into()));
+    for (expression, name) in [
+        ("guards.unresolvedMember(type=left)", "unresolvedMember"),
+        ("guards.boundedMember(required=value)", "boundedMember"),
+        (
+            "guards.whereBoundedMember(required=value)",
+            "whereBoundedMember",
+        ),
+    ] {
+        let start = source.find(expression).unwrap();
+        let call = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + expression.len())
+            .unwrap();
+        let usage =
+            ktcore::members::MemberUse::Call(infer::call_arguments(&ws.index, call, source, &ctx));
+        let selection = ktcore::members::candidates(&ws.index, &owner, name, &ctx)
+            .select(&ws.index, &owner, &usage, &ctx);
+        assert_eq!(
+            selection.applicability,
+            ktcore::members::Applicability::Unknown
+        );
+        assert_eq!(selection.entries.len(), 1);
+        if name != "unresolvedMember" {
+            assert!(!selection.entries[0]
+                .sym
+                .type_parameter_facts
+                .known_unbounded());
+        }
+    }
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn qualified_free_calls_preserve_value_roots_and_reject_non_dot_package_paths() {
+    let declaration = "package probe\nfun <T> freeLeading(ignored:Other=Other(),required:Class<out T>):T=error(\"fixture\")\n";
+    let receiver = "package holder\nimport probe.Invocation\nimport probe.Other\nclass Receiver { fun freeLeading(required:Class<Invocation>):Other=error(\"fixture\") }\nval instance:Receiver=error(\"fixture\")\n";
+    for (source, extra) in [
+        (
+            "package app\nimport holder.Receiver\nimport probe.Invocation\nimport probe.Other\nfun use(probe:Receiver,left:Class<Invocation>,known:Other) { probe.freeLeading(required=left).body();known.body() }\n",
+            None,
+        ),
+        (
+            "package app\nimport holder.instance as probe\nimport probe.Invocation\nimport probe.Other\nfun use(left:Class<Invocation>,known:Other) { probe.freeLeading(required=left).body();known.body() }\n",
+            None,
+        ),
+        (
+            "package app\nimport probe.Invocation\nimport probe.Other\nfun use(left:Class<Invocation>,known:Other) { probe.freeLeading(required=left).body();known.body() }\n",
+            Some("package app\nimport holder.Receiver\nval probe:Receiver=error(\"fixture\")\n"),
+        ),
+    ] {
+        let mut ws = projected_workspace(source);
+        ws.open("Defaults.kt", declaration.into());
+        ws.open("Receiver.kt", receiver.into());
+        if let Some(extra) = extra {
+            ws.open("RootValue.kt", extra.into());
+        }
+        let expression = "probe.freeLeading(required=left)";
+        assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::class("Other", Some("probe".into())));
+        assert_member(&mut ws, "Use.kt", &format!("{expression}."), "body", "service");
+        assert_exact_definition(&mut ws, "Use.kt", expression, "Receiver.kt", "freeLeading");
+        assert_exact_definition(&mut ws, "Use.kt", &format!("{expression}.body()"), "Other.java", "body");
+        assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    }
+    let source = "package app\nimport probe.Invocation\nimport probe.Other\nfun use(probe:Missing,left:Class<Invocation>,known:Other) { probe.freeLeading(required=left);known.body() }\n";
+    let mut ws = projected_workspace(source);
+    ws.open("Defaults.kt", declaration.into());
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "probe.freeLeading(required=left)"),
+        Type::Unknown
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    let source = "package app\nimport probe.Invocation\nimport probe.Other\nfun use(left:Class<Invocation>,known:Other) { probe?.freeLeading(required=left);probe::freeLeading;known.body() }\n";
+    ws.change("Use.kt", source.into());
+    for expression in ["probe?.freeLeading(required=left)", "probe::freeLeading"] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn qualified_free_named_defaults_follow_unsaved_formal_and_default_changes() {
+    let declaration = "package target.api\nimport probe.Invocation\nimport probe.Other\nfun <T> withDefault(ignored:Other=Other(),required:Class<out T>):T=error(\"fixture\")\n";
+    let renamed = declaration.replace("required:Class", "renamed:Class");
+    let no_default = renamed.replace("ignored:Other=Other()", "ignored:Other");
+    let source = "package probe\nfun use(left:Class<Invocation>,known:Other) { target.api.withDefault(required=left).service();known.body() }\n";
+    let matching = source.replace("required=left", "renamed=left");
+    let supplied = source.replace("required=left", "ignored=known,renamed=left");
+    let mut ws = projected_workspace(source);
+    ws.open("QualifiedDefaults.kt", declaration.into());
+    for (phase, (decl, caller, expression, useful)) in [
+        (
+            declaration,
+            source,
+            "target.api.withDefault(required=left)",
+            true,
+        ),
+        (
+            renamed.as_str(),
+            source,
+            "target.api.withDefault(required=left)",
+            false,
+        ),
+        (
+            renamed.as_str(),
+            matching.as_str(),
+            "target.api.withDefault(renamed=left)",
+            true,
+        ),
+        (
+            no_default.as_str(),
+            matching.as_str(),
+            "target.api.withDefault(renamed=left)",
+            false,
+        ),
+        (
+            no_default.as_str(),
+            supplied.as_str(),
+            "target.api.withDefault(ignored=known,renamed=left)",
+            true,
+        ),
+        (
+            no_default.as_str(),
+            source,
+            "target.api.withDefault(required=left)",
+            false,
+        ),
+        (
+            declaration,
+            source,
+            "target.api.withDefault(required=left)",
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edits = 0;
+        for (file, text) in [("QualifiedDefaults.kt", decl), ("Use.kt", caller)] {
+            if ws.doc_text(file).as_deref() != Some(text) {
+                ws.change(file, text.into());
+                edits += 1;
+            }
+        }
+        assert_eq!(edits, usize::from(phase > 0));
+        if useful {
+            assert_eq!(
+                infer_expression(&ws, "Use.kt", expression),
+                Type::class("Invocation", Some("probe".into()))
+            );
+            assert_member(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}."),
+                "service",
+                "body",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.kt",
+                expression,
+                "QualifiedDefaults.kt",
+                "withDefault",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}.service()"),
+                "Invocation.java",
+                "service",
+            );
+        } else {
+            assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::Unknown);
+            let found = labels(&mut ws, "Use.kt", &format!("{expression}."));
+            assert!(
+                !found.contains("service") && !found.contains("body"),
+                "stale FQN bindings: {found:?}"
+            );
+        }
+        assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    }
+    assert_eq!(
+        ws.doc_text("QualifiedDefaults.kt").as_deref(),
+        Some(declaration)
+    );
+    assert_eq!(ws.doc_text("Use.kt").as_deref(), Some(source));
 }

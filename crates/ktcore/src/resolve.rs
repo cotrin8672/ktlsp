@@ -1246,6 +1246,9 @@ fn goto_authored_node_with_ctx(
     }
     let parent = ancestors.last().copied();
     let uk = use_kind_in(ident, parent);
+    let named_usage = call_for_use(ident)
+        .and_then(|call| infer::named_call_arguments(index, call, src, ctx))
+        .map(MemberUse::Call);
 
     // Import declarations are neither value nor type positions. Resolve the imported target (or
     // alias) directly by its qualified path.
@@ -1255,15 +1258,24 @@ fn goto_authored_node_with_ctx(
 
     // Fully-qualified top-level names (`pkg.Type`, `pkg.func()`) bypass imports. Handle them before
     // the member path so a package-qualified selector is not mistaken for `receiver.member`.
-    if let Some(defs) = resolve_qualified_a(index, ident, ancestors, name, uk, src) {
-        if !defs.is_empty() {
+    if let Some(defs) = resolve_qualified_a(
+        index,
+        ident,
+        ancestors,
+        name,
+        uk,
+        src,
+        named_usage.as_ref(),
+        ctx,
+    ) {
+        if !defs.is_empty() || named_usage.is_some() {
             return defs;
         }
     }
 
     // Member access: infer the receiver's type and filter members by it (S6), else best-effort.
     if uk == UseKind::MemberSelector {
-        return resolve_member_with_ctx(index, ident, parent, name, src, ctx);
+        return resolve_member_with_ctx(index, ident, parent, name, src, ctx, named_usage.as_ref());
     }
     if let Some(def) = definition_self_in(ident, parent, file) {
         return vec![def];
@@ -1271,7 +1283,13 @@ fn goto_authored_node_with_ctx(
     if let Some(def) = resolve_local_a(ident, ancestors, name, uk, src, file) {
         if ctx.local_entry(&def).is_some() && uk == UseKind::Call {
             return resolve_implicit_receiver_member_with_ctx_a(
-                index, ident, ancestors, name, src, ctx,
+                index,
+                ident,
+                ancestors,
+                name,
+                src,
+                ctx,
+                named_usage.as_ref(),
             )
             .unwrap_or_default();
         }
@@ -1283,17 +1301,51 @@ fn goto_authored_node_with_ctx(
                 && matches!(entry.sym.kind, SymbolKind::Function | SymbolKind::Property)
                 && (entry.sym.container.is_some() || uk == UseKind::Call)
         }) {
-            if let Some(defs) =
-                resolve_implicit_receiver_member_with_ctx_a(index, ident, ancestors, name, src, ctx)
-            {
+            if let Some(defs) = resolve_implicit_receiver_member_with_ctx_a(
+                index,
+                ident,
+                ancestors,
+                name,
+                src,
+                ctx,
+                named_usage.as_ref(),
+            ) {
                 return defs;
+            }
+        }
+        if let Some(usage) = &named_usage {
+            let entries = index.lookup_by_name(name);
+            if entries.iter().any(|entry| {
+                entry.path.as_ref() == file
+                    && entry.sym.start_byte == def.start_byte
+                    && entry.sym.end_byte == def.end_byte
+                    && entry.sym.kind == SymbolKind::Function
+                    && entry.sym.container.is_none()
+                    && entry.sym.ext_receiver.is_none()
+            }) {
+                let group = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.path.as_ref() == file
+                            && entry.sym.kind == SymbolKind::Function
+                            && entry.sym.container.is_none()
+                            && entry.sym.ext_receiver.is_none()
+                    })
+                    .collect();
+                return call_entries_to_defs(index, group, Some(usage), ctx);
             }
         }
         return vec![def];
     }
-    if let Some(defs) =
-        resolve_implicit_receiver_member_with_ctx_a(index, ident, ancestors, name, src, ctx)
-    {
+    if let Some(defs) = resolve_implicit_receiver_member_with_ctx_a(
+        index,
+        ident,
+        ancestors,
+        name,
+        src,
+        ctx,
+        named_usage.as_ref(),
+    ) {
         // An uncertain implicit receiver is not permission to select unrelated global homonyms.
         return defs;
     }
@@ -1302,7 +1354,7 @@ fn goto_authored_node_with_ctx(
             return defs;
         }
     }
-    resolve_cross_file(index, name, uk, ctx)
+    resolve_cross_file(index, name, uk, ctx, named_usage.as_ref())
 }
 
 /// If the cursor is on the defining identifier of a declaration, return its own location.
@@ -1353,8 +1405,11 @@ fn resolve_implicit_receiver_member_with_ctx_a(
     name: &str,
     src: &str,
     ctx: &infer::FileCtx,
+    normalized: Option<&MemberUse>,
 ) -> Option<Vec<Def>> {
-    let member_use = member_use(index, usage, src, ctx);
+    let member_use = normalized
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| std::borrow::Cow::Owned(member_use(index, usage, src, ctx)));
     let receivers = infer::implicit_receiver_types_with_ancestors(index, ancestors, src, &ctx, 0);
     crate::members::select_implicit_at(index, receivers, name, &member_use, ctx, usage.start_byte())
         .map(|(_, selection)| entries_to_defs(selection.entries))
@@ -1409,12 +1464,16 @@ fn resolve_member_with_ctx(
     name: &str,
     src: &str,
     ctx: &infer::FileCtx,
+    normalized: Option<&MemberUse>,
 ) -> Vec<Def> {
     // `selector` is the `.member` identifier; its parent is the navigation_expression.
     if let Some(nav) = parent {
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
                 if receiver.kind() == "super_expression" {
+                    let computed = normalized
+                        .is_none()
+                        .then(|| member_use(index, selector, src, ctx));
                     return members::super_member_candidates(
                         index,
                         infer::super_receivers(index, receiver, src, ctx),
@@ -1424,7 +1483,12 @@ fn resolve_member_with_ctx(
                     .map(|(ty, candidates)| {
                         entries_to_defs(
                             candidates
-                                .select(index, &ty, &member_use(index, selector, src, ctx), ctx)
+                                .select(
+                                    index,
+                                    &ty,
+                                    normalized.unwrap_or_else(|| computed.as_ref().unwrap()),
+                                    ctx,
+                                )
                                 .entries,
                         )
                     })
@@ -1436,11 +1500,14 @@ fn resolve_member_with_ctx(
                 let ty =
                     infer::member_receiver_type(receiver, infer::infer(index, receiver, src, &ctx));
                 if ty.name().is_some() {
+                    let computed = normalized
+                        .is_none()
+                        .then(|| member_use(index, selector, src, ctx));
                     return member_defs_for_use_at(
                         index,
                         &ty,
                         name,
-                        &member_use(index, selector, src, ctx),
+                        normalized.unwrap_or_else(|| computed.as_ref().unwrap()),
                         ctx,
                         selector.start_byte(),
                     );
@@ -1465,29 +1532,41 @@ pub fn member_use(
     src: &str,
     ctx: &infer::FileCtx,
 ) -> MemberUse {
-    let callee = usage
+    if let Some(call) = call_for_use(usage) {
+        return MemberUse::Call(infer::call_arguments(index, call, src, ctx));
+    }
+    let callee = callee_for_use(usage);
+    // With an unfinished argument list the parser can keep a navigation expression and place
+    // `(` in an ERROR sibling. Preserve the call's possible candidates without inventing args.
+    if src
+        .get(callee.end_byte()..)
+        .is_some_and(|suffix| suffix.trim_start_matches([' ', '\t']).starts_with('('))
+    {
+        return MemberUse::Call(crate::members::CallArguments {
+            count: None,
+            types: Vec::new(),
+            names: None,
+            has_spread: false,
+            trailing_lambda: false,
+        });
+    }
+    MemberUse::Value
+}
+
+fn callee_for_use(usage: Node) -> Node {
+    usage
         .parent()
         .filter(|parent| {
             parent.kind() == "navigation_expression" && parent.named_child(1) == Some(usage)
         })
-        .unwrap_or(usage);
-    let Some(mut call) = callee.parent().filter(|parent| {
+        .unwrap_or(usage)
+}
+
+fn call_for_use(usage: Node) -> Option<Node> {
+    let callee = callee_for_use(usage);
+    let mut call = callee.parent().filter(|parent| {
         parent.kind() == "call_expression" && parent.named_child(0) == Some(callee)
-    }) else {
-        // With an unfinished argument list the parser can keep a navigation expression and place
-        // `(` in an ERROR sibling. Preserve the call's possible candidates without inventing args.
-        if src
-            .get(callee.end_byte()..)
-            .is_some_and(|suffix| suffix.trim_start_matches([' ', '\t']).starts_with('('))
-        {
-            return MemberUse::Call(crate::members::CallArguments {
-                count: None,
-                types: Vec::new(),
-                trailing_lambda: false,
-            });
-        }
-        return MemberUse::Value;
-    };
+    })?;
     while let Some(outer) = call.parent().filter(|parent| {
         parent.kind() == "call_expression"
             && parent.named_child(0) == Some(call)
@@ -1495,7 +1574,7 @@ pub fn member_use(
     }) {
         call = outer;
     }
-    MemberUse::Call(infer::call_arguments(index, call, src, ctx))
+    Some(call)
 }
 
 /// Resolve the shared typed member candidates for a normalized call/value use.
@@ -1836,6 +1915,37 @@ enum SourceSetSpecificity {
     Specific,
 }
 
+/// Named free calls share member applicability. Unknown competing declarations remain possible,
+/// but navigation must not turn their written/index order into a selected overload.
+fn call_entries_to_defs(
+    index: &dyn InferenceIndex,
+    entries: Vec<&Entry>,
+    usage: Option<&MemberUse>,
+    ctx: &infer::FileCtx,
+) -> Vec<Def> {
+    if let Some(usage) = usage {
+        if entries
+            .iter()
+            .any(|entry| entry.sym.kind == SymbolKind::Function)
+        {
+            if entries.iter().any(|entry| {
+                entry.sym.kind != SymbolKind::Function || entry.sym.ext_receiver.is_some()
+            }) {
+                return Vec::new();
+            }
+            let selection = members::select_functions(index, entries, usage, ctx);
+            if selection.applicability == members::Applicability::Unknown
+                && selection.entries.len() != 1
+            {
+                return Vec::new();
+            }
+            let defs = entries_to_defs(selection.entries);
+            return if defs.len() == 1 { defs } else { Vec::new() };
+        }
+    }
+    entries_to_defs(entries)
+}
+
 fn entries_to_defs(entries: Vec<&Entry>) -> Vec<Def> {
     narrow_source_set_entries(entries)
         .into_iter()
@@ -1936,14 +2046,19 @@ fn resolve_qualified_a(
     name: &str,
     uk: UseKind,
     src: &str,
+    named_usage: Option<&MemberUse>,
+    ctx: &infer::FileCtx,
 ) -> Option<Vec<Def>> {
-    let (parts, qkind) = qualified_path_and_kind_a(usage, ancestors, uk, src)?;
+    let (parts, qkind) = qualified_path_and_kind_a(index, usage, ancestors, uk, src, ctx)?;
     if !parts.last().is_some_and(|part| part == name) {
         return Some(Vec::new());
     }
-    Some(resolve_absolute_path(index, &parts, |kind| {
-        kind_ok(qkind, kind)
-    }))
+    let entries = absolute_path_entries(index, &parts, |kind| kind_ok(qkind, kind));
+    if named_usage.is_some() && entries.is_empty() {
+        // An unrecognized path may still be an inherited or otherwise typed member access.
+        return None;
+    }
+    Some(call_entries_to_defs(index, entries, named_usage, ctx))
 }
 
 fn resolve_nested_type_in(
@@ -1994,10 +2109,12 @@ fn resolve_nested_type_in(
 }
 
 fn qualified_path_and_kind_a(
+    index: &dyn InferenceIndex,
     usage: Node,
     ancestors: &[Node],
     uk: UseKind,
     src: &str,
+    ctx: &infer::FileCtx,
 ) -> Option<(Vec<String>, UseKind)> {
     let parent = ancestors.last().copied()?;
     if parent.kind() == "user_type" {
@@ -2007,12 +2124,8 @@ fn qualified_path_and_kind_a(
         }
     }
     if parent.kind() == "navigation_expression" {
-        let parts = navigation_parts(parent, src)?;
-        if parts.len() > 1 && parts.last().is_some_and(|(n, _)| *n == usage) {
-            let (first_node, first_name) = &parts[0];
-            if local_decl(*first_node, first_name, UseKind::Value, src).is_some() {
-                return None;
-            }
+        let parts = unshadowed_navigation_parts(index, parent, src, ctx)?;
+        if parts.last().is_some_and(|(n, _)| *n == usage) {
             let qkind = match ancestors
                 .get(ancestors.len().wrapping_sub(2))
                 .map(|p| p.kind())
@@ -2030,6 +2143,72 @@ fn qualified_path_and_kind_a(
         }
     }
     None
+}
+
+/// Recognize an exact package-qualified top-level callable before treating its prefix as a value.
+/// Empty or unsupported paths leave the existing typed-member route in charge.
+pub(crate) fn qualified_top_level_function_entries<'a>(
+    index: &'a dyn InferenceIndex,
+    callee: Node,
+    src: &str,
+    ctx: &infer::FileCtx,
+) -> Option<Vec<&'a Entry>> {
+    let parts = unshadowed_navigation_parts(index, callee, src, ctx)?;
+    let mut entries = absolute_path_entries(index, &part_names(&parts), |kind| {
+        kind == SymbolKind::Function
+    });
+    entries.retain(|entry| entry.sym.container.is_none() && entry.sym.ext_receiver.is_none());
+    (!entries.is_empty()).then_some(entries)
+}
+
+fn unshadowed_navigation_parts<'t>(
+    index: &dyn InferenceIndex,
+    node: Node<'t>,
+    src: &str,
+    ctx: &infer::FileCtx,
+) -> Option<Vec<(Node<'t>, String)>> {
+    let parts = navigation_parts(node, src)?;
+    if parts.len() < 2 {
+        return None;
+    }
+    let (first_node, first_name) = &parts[0];
+    if local_decl(*first_node, first_name, UseKind::Value, src).is_some()
+        || qualified_root_has_binding(index, first_name, ctx)
+    {
+        return None;
+    }
+    Some(parts)
+}
+
+fn qualified_root_has_binding(
+    index: &dyn InferenceIndex,
+    name: &str,
+    ctx: &infer::FileCtx,
+) -> bool {
+    let is_root_binding = |entry: &Entry| {
+        entry.sym.container.is_none()
+            && entry.sym.ext_receiver.is_none()
+            && (entry.sym.kind.is_value_like() || entry.sym.kind.is_type_like())
+    };
+    if ctx.imports.iter().any(|import| {
+        !import.wildcard
+            && import.local_name() == Some(name)
+            && index
+                .lookup_by_name(import.simple_name())
+                .iter()
+                .any(|entry| is_root_binding(entry) && import_path_matches_entry(import, entry))
+    }) {
+        return true;
+    }
+    index.lookup_by_name(name).iter().any(|entry| {
+        is_root_binding(entry)
+            && (entry.sym.package == ctx.package
+                || DEFAULT_IMPORT_PACKAGES.contains(&entry.sym.package.as_str())
+                || ctx
+                    .imports
+                    .iter()
+                    .any(|import| import.wildcard && import.package() == entry.sym.package))
+    })
 }
 
 fn ancestor_of_kind_a<'t>(ancestors: &[Node<'t>], kind: &str) -> Option<Node<'t>> {
@@ -2055,6 +2234,13 @@ fn navigation_parts<'t>(node: Node<'t>, src: &str) -> Option<Vec<(Node<'t>, Stri
     match node.kind() {
         "identifier" => Some(vec![(node, node_text(node, src).to_string())]),
         "navigation_expression" => {
+            let mut cursor = node.walk();
+            if !node
+                .children(&mut cursor)
+                .any(|child| !child.is_named() && child.kind() == ".")
+            {
+                return None;
+            }
             let mut out = navigation_parts(node.named_child(0)?, src)?;
             let selector = node.named_child(1)?;
             if selector.kind() != "identifier" {
@@ -2072,17 +2258,23 @@ fn resolve_absolute_path(
     parts: &[String],
     kind_ok: impl Fn(SymbolKind) -> bool,
 ) -> Vec<Def> {
+    entries_to_defs(absolute_path_entries(index, parts, kind_ok))
+}
+
+fn absolute_path_entries<'a>(
+    index: &'a dyn InferenceIndex,
+    parts: &[String],
+    kind_ok: impl Fn(SymbolKind) -> bool,
+) -> Vec<&'a Entry> {
     let Some(name) = parts.last() else {
         return Vec::new();
     };
     let prefix = &parts[..parts.len() - 1];
-    let hits: Vec<&Entry> = index
+    index
         .lookup_by_name(name)
         .iter()
-        .filter(|e| kind_ok(e.sym.kind))
-        .filter(|e| absolute_path_matches(e, prefix))
-        .collect();
-    entries_to_defs(hits)
+        .filter(|entry| kind_ok(entry.sym.kind) && absolute_path_matches(entry, prefix))
+        .collect()
 }
 
 fn import_path_matches_entry(import: &Import, entry: &Entry) -> bool {
@@ -2222,6 +2414,7 @@ fn resolve_cross_file(
     name: &str,
     uk: UseKind,
     ctx: &infer::FileCtx,
+    named_usage: Option<&MemberUse>,
 ) -> Vec<Def> {
     // `as`-alias: the usage name is an import alias; resolve the *real* name in that package.
     for imp in &ctx.imports {
@@ -2232,7 +2425,7 @@ fn resolve_cross_file(
                 .iter()
                 .filter(|e| kind_ok(uk, e.sym.kind) && import_path_matches_entry(imp, e))
                 .collect();
-            return entries_to_defs(hits);
+            return call_entries_to_defs(index, hits, named_usage, ctx);
         }
     }
 
@@ -2257,12 +2450,12 @@ fn resolve_cross_file(
             .iter()
             .any(|imp| import_path_matches_entry(imp, e))
     }) {
-        return hits;
+        return call_entries_to_defs(index, hits, named_usage, ctx);
     }
 
     // Same package as the current file (Kotlin needs no import for these).
     if let Some(hits) = pick(&candidates, |e| e.sym.package == ctx.package) {
-        return hits;
+        return call_entries_to_defs(index, hits, named_usage, ctx);
     }
 
     // Wildcard-imported packages in declaration order, then Kotlin's implicit default imports in
@@ -2278,7 +2471,7 @@ fn resolve_cross_file(
         .collect();
     for pkg in &star_pkgs {
         if let Some(hits) = pick(&candidates, |e| &e.sym.package == pkg) {
-            return hits;
+            return call_entries_to_defs(index, hits, named_usage, ctx);
         }
     }
 
@@ -2308,7 +2501,7 @@ pub fn is_default_import_pkg(pkg: &str) -> bool {
     DEFAULT_IMPORT_PACKAGES.contains(&pkg)
 }
 
-fn pick(candidates: &[Entry], keep: impl Fn(&Entry) -> bool) -> Option<Vec<Def>> {
+fn pick<'a>(candidates: &'a [Entry], keep: impl Fn(&Entry) -> bool) -> Option<Vec<&'a Entry>> {
     let hits: Vec<&Entry> = candidates.iter().filter(|e| keep(e)).collect();
-    (!hits.is_empty()).then_some(hits).map(entries_to_defs)
+    (!hits.is_empty()).then_some(hits)
 }

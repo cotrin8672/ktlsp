@@ -1566,6 +1566,7 @@ mod tests {
                 function_type_receiver: None,
                 return_type: None,
                 value_type: None,
+                kotlin_parameters: None,
                 params: Vec::new(),
                 type_params: Vec::new(),
                 type_parameter_facts: Default::default(),

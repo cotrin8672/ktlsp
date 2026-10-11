@@ -32,4 +32,4 @@ recovery preserves a source-provider binding after the completion cursor.
 For the full pinned Spring checkout, use `dev/corpus/spring-extensions-editing.json`
 with the same corpus route. It keeps the original two controls and adds four unsaved
 cases. Its first-response semantics pass; missing dependency sources and shutdown
-remain failing gates. See checkpoint 29 in `docs/fork-acceptance.md` for evidence.
+remain operational limitations. See checkpoint 29 in `docs/fork-acceptance.md` for evidence.

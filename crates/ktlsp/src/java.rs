@@ -2914,6 +2914,8 @@ fn java_call_arguments(
             .flatten()
             .map(|node| java_argument_type(index, file, src, tree, node).unwrap_or(Type::Unknown))
             .collect(),
+        names: None,
+        has_spread: false,
         trailing_lambda: false,
     }
 }

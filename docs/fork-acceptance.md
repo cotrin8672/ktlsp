@@ -58,7 +58,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current selected-main slice passes 1,305 / 0 failed / 4 ignored. Primary-task selection, exact effective classpath and positive-only producer controls pass. Formatting and both release binaries pass | Current Rust, formatting and release verified | Checkpoints 39–46; capture/upper-only/LUB inference, where/F-bounds, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current named/default-call slice passes 1,318 / 0 failed / 4 ignored. Shared binding, exact free-call qualification and linear nested-inference controls pass. Formatting and both release binaries pass | Current Rust, formatting and release verified | Checkpoints 39–47; capture/upper-only/LUB inference, where/F-bounds, arbitrary compiler plugins and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 194 matched / 5 unmet, features 78 matched / 2 unmet and semantic 107 passing assertions retain the same expectations. Prior basic 9/9, library 13/13 and saved Java publication 99/99 | Partial; same seven ordinary expectations remain open | Checkpoint 42 native-editors-r4-1; six ordinary push observations lack generation certification, explainResolution is a direct unmet response. Forced cleanup is operational evidence, not an analysis score |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -68,7 +68,7 @@ a useful known receiver in the same edited state.
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Current Spring reduction repairs four failed requests; real Spring passes all nine original/additional first-response queries, including explicit-this and dangling selectors | Focused repair verified; full-project acceptance partial | Checkpoint 29 below. Real Spring still has ten missing dependency source inputs and a 15-second forced shutdown |
 | Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks improve 31/44 to 44/44, preserving the previous 65 checks. Current normalized receiver arguments and inline nominal bounds have shared regression controls; ordinary semantic scenario retains 107 assertions | Focused semantics verified; where/F-bounds and projected receivers remain coverage gaps | Checkpoints 33/39: exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have Rust regression controls; no six-project parity or speed claim |
-| Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Actual Retrofit mixed editing matches all 21 first-attempt RPCs and 25 semantic checks, including typed changes in both languages, references, applied renames and restoration. Shared mixed fixture and opened JDK source rename/delete controls also pass | Focused actual-project repair verified; wider corpus open | Checkpoints 43/45. The latest release retains all 21 first RPCs and 25 checks. Normal Neovim cross-buffer debounce observation is separate; repeated edit stress across the other roots remains pending |
+| Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Actual Retrofit mixed editing matches all 21 first-attempt RPCs and 25 semantic checks, including typed changes in both languages, references, applied renames and restoration. Shared mixed fixture and opened JDK source rename/delete controls also pass | Focused actual-project repair verified; wider corpus open | Checkpoints 43/45/47. The latest release retains all 21 first RPCs and 25 checks. Normal Neovim cross-buffer debounce observation is separate; repeated edit stress across the other roots remains pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Actual Retrofit preserves all four complete expected buffers after applying rename. Tenth-fixed-2 applies the six-site override family and passes independent compilation plus 33 bytecode assertions. JVM facade and external consumer applied renames also pass | Focused actual-project and fixture cases verified; wider corpus and inherited implementation edges pending | Checkpoints 43 and the earlier compiler-backed override-family controls. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Current model-v8 native automatic-watching lifecycle retains all 86 original checks, including Kotlin's obsolete oldApi diagnostic. Four real builds, completion, exact definitions, generated-source changes, dirty buffers and clean shutdown pass | Focused automatic-refresh semantics verified; wider transforming cases open | Checkpoint 46: native-selected-main-r3-gradle-reload-2; eighteen native notifications and zero explicit notifications. Positive Kotlin result has transmitted-text SHA and accepted-store generation proof |
@@ -2940,6 +2940,85 @@ Formatting, six focused new regressions, **1,305 workspace tests / 0 failed /
 `ed991bc2c06956fbca57f8ffea2ffecb6e9bba68c721036f6ab53ce9ab51a6ee`.
 User AGENTS.md and project sources are preserved. Next finish Java producer diagnostics
 and named-argument editing, then continue the wider six-project acceptance.
+
+
+### Forty-seventh checkpoint: shared named/default Kotlin call binding
+
+Source Kotlin function facts retain formal names and default-presence bits. Java,
+JVM and synthetic declarations retain no Kotlin name authority. Written argument
+order and types remain intact; one shared binder matches leading positional and
+named arguments to the same formal slots for applicability, substitutions, return
+inference and navigation. Calls supplying every positional argument borrow their
+existing arguments and formals. Omitted defaults use only supplied argument/formal
+pairs; default initializers never invent generic constraints. Cache versions are
+advanced for the persisted symbol facts.
+
+Exact package-qualified top-level calls reuse the existing free-call algorithm.
+Qualification rejects lexical/imported value or type roots, safe selectors and
+callable references. Known receiver types continue directly through member
+selection. Invalid or ambiguous labels and unknown competing signatures cannot
+arbitrarily choose one declaration. Missing inherited/actual defaults, unsupported
+bounds and unbound omitted generic parameters remain Unknown. A valid bounded
+default call can therefore remain a coverage gap. Fully supplied ordinary generic
+method bounds are a separate preexisting gap.
+
+Nested member calls previously inferred each argument three times per level.
+The same useful-result test at depths one/eight recorded **3/765** child inference
+calls before the fix and **2/16** afterwards. The regression asserts linear work
+at fixed depths, with no wall-clock threshold. A second pre-fix test exposed a
+bounded default call incorrectly accepted; a three-line shared signature guard
+retains it as Unknown. Focused tests change exactly one file per phase and verify
+cache invalidation for formal renaming, default removal, caller repair and complete
+restoration, including package-qualified calls.
+
+Independent selected Kotlin 1.9.23/JDK8-target controls compile original,
+matching-caller and explicitly typed result states, and reject the genuine
+ambiguous and declaration-only states. Five further controls compile leading,
+middle and trailing default positions, reject a removed default and accept the
+matching caller. These are compiler semantics checks, separate from server timing.
+
+The same Neovim reduction makes **47 first RPCs / 65 semantic checks**. The old
+published binary matches 30 and mismatches 35; IDEA and the current binary each
+match all 65, with zero unmeasured results. Expected names and source expectations
+are unchanged. Cases require useful receiver members, exact Kotlin callees and
+Java result-member targets, one-file unsaved declaration/caller edits, paired known
+controls for true ambiguity, and whole-buffer restoration. A portable copy of
+[the fixture](../dev/corpus/fixtures/named-call-binding/README.md), using the existing
+wrapper and corpus harness outside the checkout, also matches all 65.
+
+The unchanged actual Retrofit mixed probe retains all **21 first RPCs / 25 checks**,
+including four complete expected buffers after applying rename. Formatting,
+generic interoperability (60), implicit receivers (63), member selection (62),
+**1,318 workspace tests / zero failed / four ignored**, and both release binaries
+pass. Current ktlsp SHA256:
+8ccba9eacc4757aeb7d3444e027fc88cd195b4216924a33cee03467d5d28d18b.
+
+Evidence is under
+C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-named-recursion-red-1/, native-named-default-bounds-red-1/,
+native-named-default-bounds-green-1/, native-named-default-verification-1/
+(the first generic run exposed the qualified-call gap), native-named-default-verification-2/,
+independent-named-editor-1/, independent-named-defaults-1/,
+native-named-call-old-1/, native-named-call-intellij-1/,
+native-named-call-current-1/, native-named-call-portable-1/,
+native-retrofit-named-binding-mixed-1/ and source-named-release-comparison-1/.
+The binary receipt includes 47 current source guards, including compiler/project
+capture files omitted from an older receipt; it does not retroactively certify that
+older receipt.
+
+The three current ktlsp editor runs acknowledge shutdown and exit zero without
+TerminateProcess. Their newly owned job each has one live descendant at final
+cleanup; its role is unclassified. IDEA's 65 semantic results are complete, while
+its exit callback was not observed after acknowledged shutdown; owned-job cleanup
+is recorded separately. No deadline, arbitrary memory threshold, overall percentage,
+whole-project parity, native UI latency or RSS claim follows from this slice.
+
+The next reproduced ordinary Java reduction receives a valid full empty diagnostic
+report despite independently compiled missing-member, bare-type and import errors.
+Known completion and exact navigation pass in that same state. IDEA comparison of
+the edited diagnostics is still unmeasured: the harness must first reconstruct its
+negotiated incremental changes. Keep those observation repairs separate from product
+diagnostics and retain all original positive expectations.
 
 ### Current slice: requires-only compatibility artifacts
 

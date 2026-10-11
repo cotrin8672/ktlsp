@@ -681,7 +681,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v25-source-generic-projection-constraints";
+const SYMCACHE_VERSION: &[u8] = b"v27-source-named-call-defaults";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

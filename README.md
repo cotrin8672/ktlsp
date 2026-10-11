@@ -151,7 +151,7 @@ A July 2026 protocol-level comparison used Pinterest ktlint (multi-module JVM) a
 | ktlint, warm | References latency | **5.9 ms** | 58.3 ms | ktlsp **9.9x faster** |
 | ktlint, warm | Rename edit computation | **5.4 ms** | 2,903.6 ms | ktlsp **538x faster** |
 | ktlint, warm | Post-index/import RSS | 1,390.9 MiB | **1,173.9 MiB** | ktlsp uses **1.18x the RSS** |
-| Okio KMP, cold | First verified cross-file definition | **0.51 s** | No result within 60 s | ktlsp **>116x sooner** within timeout |
+| Okio KMP, cold | First verified cross-file definition | **0.51 s** | Unmeasured after 60 s observation | No measured comparison |
 
 `ktlsp` becomes useful much earlier and keeps foreground requests fast, but its fully loaded
 dependency/JDK index is not always smaller than JetBrains' persisted model. JetBrains also provides
@@ -322,6 +322,10 @@ checks pass; broader coverage is tracked in [the acceptance record](docs/fork-ac
 Use `dev/corpus/retrofit-2.11.0-template-editing.json` with the same corpus route for
 partial template members, missing closing braces/quotes, and literal-negative controls.
 Those cases edit buffers only and preserve the pinned source bytes.
+The [named-call fixture](dev/corpus/fixtures/named-call-binding/README.md) uses this
+same route for reordered arguments, omitted defaults, overload selection, exact
+Java/Kotlin definitions, and one-file unsaved parameter-name edits. Its 47 first
+requests have 65 shared semantic expectations for ktlsp and IntelliJ.
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus

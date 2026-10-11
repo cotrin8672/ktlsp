@@ -1,0 +1,106 @@
+{
+  "original": {
+    "src/main/java/probe/Invocation.java": {
+      "sha256": "22b8fd28d8164e976a9d180c82873982a2ad6588d8d94e17b56997f7f6889e5a",
+      "normalized_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99"
+    },
+    "src/main/java/probe/Other.java": {
+      "sha256": "427b8ea6a058c7d08c5212471e6f58e3047f9d54a22b6cf40a09e8d82b9cc88f",
+      "normalized_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28"
+    },
+    "src/main/kotlin/probe/NamedRouter.kt": {
+      "sha256": "50df63aefa21fd88bea1a32209a5e8e3f06c22f92b0b5076dabc552fcb8b2854",
+      "normalized_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08"
+    },
+    "src/main/kotlin/probe/Use.kt": {
+      "sha256": "a4b376bd75b5e9e2789f0dc249a807d40541303c48ff48df868f1b5418573544",
+      "normalized_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2"
+    },
+    "src/main/kotlin/probe/Names.kt": {
+      "sha256": "8ee4157e32f7fcdcf1b704c93c7a206cc928611065777511e9385fd981db11be",
+      "normalized_sha256": "c61f4bd8d7f580580d69edd036f49434ca296e295daea41c2e402d7d1d80f5c1"
+    },
+    "src/main/kotlin/probe/NamesUse.kt": {
+      "sha256": "5433e54220773bdae3acc4e2647083a391c2a96d8af7c1e80ca13a3dfc236d49",
+      "normalized_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74"
+    }
+  },
+  "declaration-only": {
+    "src/main/java/probe/Invocation.java": {
+      "sha256": "22b8fd28d8164e976a9d180c82873982a2ad6588d8d94e17b56997f7f6889e5a",
+      "normalized_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99"
+    },
+    "src/main/java/probe/Other.java": {
+      "sha256": "427b8ea6a058c7d08c5212471e6f58e3047f9d54a22b6cf40a09e8d82b9cc88f",
+      "normalized_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28"
+    },
+    "src/main/kotlin/probe/NamedRouter.kt": {
+      "sha256": "50df63aefa21fd88bea1a32209a5e8e3f06c22f92b0b5076dabc552fcb8b2854",
+      "normalized_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08"
+    },
+    "src/main/kotlin/probe/Use.kt": {
+      "sha256": "a4b376bd75b5e9e2789f0dc249a807d40541303c48ff48df868f1b5418573544",
+      "normalized_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2"
+    },
+    "src/main/kotlin/probe/Names.kt": {
+      "sha256": "28b9b8dde1fa66b55fb8b9bcf15a56aa925602d221f0f84691360bf1e1bab9ef",
+      "normalized_sha256": "6713767a08c506cf071dd2ac8299304ba201b1b078666a09f9b4deda8a0f691e"
+    },
+    "src/main/kotlin/probe/NamesUse.kt": {
+      "sha256": "5433e54220773bdae3acc4e2647083a391c2a96d8af7c1e80ca13a3dfc236d49",
+      "normalized_sha256": "5094aa60098b8528b4c06391283ceb10db2c69e2658747e6483acdef3819ed74"
+    }
+  },
+  "matching-caller": {
+    "src/main/java/probe/Invocation.java": {
+      "sha256": "22b8fd28d8164e976a9d180c82873982a2ad6588d8d94e17b56997f7f6889e5a",
+      "normalized_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99"
+    },
+    "src/main/java/probe/Other.java": {
+      "sha256": "427b8ea6a058c7d08c5212471e6f58e3047f9d54a22b6cf40a09e8d82b9cc88f",
+      "normalized_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28"
+    },
+    "src/main/kotlin/probe/NamedRouter.kt": {
+      "sha256": "50df63aefa21fd88bea1a32209a5e8e3f06c22f92b0b5076dabc552fcb8b2854",
+      "normalized_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08"
+    },
+    "src/main/kotlin/probe/Use.kt": {
+      "sha256": "a4b376bd75b5e9e2789f0dc249a807d40541303c48ff48df868f1b5418573544",
+      "normalized_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2"
+    },
+    "src/main/kotlin/probe/Names.kt": {
+      "sha256": "28b9b8dde1fa66b55fb8b9bcf15a56aa925602d221f0f84691360bf1e1bab9ef",
+      "normalized_sha256": "6713767a08c506cf071dd2ac8299304ba201b1b078666a09f9b4deda8a0f691e"
+    },
+    "src/main/kotlin/probe/NamesUse.kt": {
+      "sha256": "288ddf040a8724ab2f7a9f013f88ddd36ab98b03ada2ffb2404ff3a7db92cc27",
+      "normalized_sha256": "974e040b7fdc1f58979cc9d1d65a91ada0e123aae411fd73dcb5c9bbfef61e05"
+    }
+  },
+  "ambiguous": {
+    "src/main/java/probe/Invocation.java": {
+      "sha256": "22b8fd28d8164e976a9d180c82873982a2ad6588d8d94e17b56997f7f6889e5a",
+      "normalized_sha256": "0bc67623c4acf75710143a0d6fcfadd2d2854e6411eaee5248155a25593f2e99"
+    },
+    "src/main/java/probe/Other.java": {
+      "sha256": "427b8ea6a058c7d08c5212471e6f58e3047f9d54a22b6cf40a09e8d82b9cc88f",
+      "normalized_sha256": "04323177df5a7bd856d0961f5cb18d4d6f740e189ead5137d97e252428412c28"
+    },
+    "src/main/kotlin/probe/NamedRouter.kt": {
+      "sha256": "50df63aefa21fd88bea1a32209a5e8e3f06c22f92b0b5076dabc552fcb8b2854",
+      "normalized_sha256": "3c1ca53111bb5398c64faaa2efc295c5f84740d21ffcdf7a4b0b198f6b0e1d08"
+    },
+    "src/main/kotlin/probe/Use.kt": {
+      "sha256": "a4b376bd75b5e9e2789f0dc249a807d40541303c48ff48df868f1b5418573544",
+      "normalized_sha256": "bc6c191086a9d8d006757ecb8afb487e2c600cb87f1147fa4edbde5ae0d670f2"
+    },
+    "src/main/kotlin/probe/Names.kt": {
+      "sha256": "8ee4157e32f7fcdcf1b704c93c7a206cc928611065777511e9385fd981db11be",
+      "normalized_sha256": "c61f4bd8d7f580580d69edd036f49434ca296e295daea41c2e402d7d1d80f5c1"
+    },
+    "src/main/kotlin/probe/NamesUse.kt": {
+      "sha256": "43d36f2749859f7cc9fd5a6918ed37715ccbb627bde1227bc5f11d3afbabfb26",
+      "normalized_sha256": "c7009ea86ed4471dc255d068758cec6bd91e80f745dd186218ce4edf8f4a976e"
+    }
+  }
+}

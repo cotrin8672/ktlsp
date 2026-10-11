@@ -1166,7 +1166,11 @@ fn lambda_receiver_or_element(
     if let Some((receiver, selection)) =
         local_lambda_call_selection(index, call, callee, src, ctx, depth, child_infer)
     {
-        let arg_types = synth_arg_types(index, call, src, ctx, depth, child_infer);
+        let arguments = normalized_call_arguments(
+            call,
+            src,
+            synth_arg_types(index, call, src, ctx, depth, child_infer),
+        );
         let mut result = None;
         for entry in selection.entries {
             if trailing_lambda_receiver_ref(index, entry, ctx).is_some() {
@@ -1181,7 +1185,7 @@ fn lambda_receiver_or_element(
                 entry,
                 parameter,
                 Some(&receiver),
-                &arg_types,
+                &arguments,
                 ctx,
                 depth,
             )?;
@@ -1277,6 +1281,7 @@ fn local_lambda_call_selection<'a>(
     }
     let usage = MemberUse::Call(normalized_call_arguments(
         call,
+        src,
         synth_arg_types(index, call, src, ctx, depth, child_infer),
     ));
     let selection = candidates.select(index, &receiver, &usage, ctx);
@@ -1434,6 +1439,22 @@ fn generic_lambda_receiver_type(
                 depth,
                 child_infer,
             )?;
+            if recv_ty == Type::Unknown {
+                if let Some(entries) =
+                    resolve::qualified_top_level_function_entries(index, callee, src, ctx)
+                {
+                    return select_trailing_lambda_receiver_type(
+                        index,
+                        entries,
+                        None,
+                        call,
+                        src,
+                        ctx,
+                        depth,
+                        child_infer,
+                    );
+                }
+            }
             let (entries, _) = callable_member_entries(
                 candidates,
                 index,
@@ -1654,7 +1675,7 @@ fn infer_call(
                 return resolve_type_name(index, cname, ctx, false);
             }
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
-            let usage = MemberUse::Call(normalized_call_arguments(node, arg_types.clone()));
+            let usage = MemberUse::Call(normalized_call_arguments(node, src, arg_types.clone()));
             if let Some((receiver, selection)) = members::select_implicit_at(
                 index,
                 implicit_receiver_types(index, callee, src, ctx, depth + 1),
@@ -1670,6 +1691,10 @@ fn infer_call(
                     true,
                     selection,
                     Some(node),
+                    match &usage {
+                        MemberUse::Call(arguments) => Some(arguments),
+                        _ => None,
+                    },
                     src,
                     ctx,
                     depth,
@@ -1677,73 +1702,19 @@ fn infer_call(
                 );
             }
             // An ordinary visible free function is considered after implicit receivers.
-            if let Some((ret_tr, type_params, params, parameter_facts)) =
-                free_function_sig(index, cname, ctx, value_arg_count(node), &arg_types, depth)
-            {
-                if params.iter().any(solve::has_projection) {
-                    let normalized = normalized_call_arguments(node, arg_types.clone());
-                    if normalized.count != Some(params.len())
-                        || normalized.count != Some(normalized.types.len())
-                        || normalized.trailing_lambda
-                    {
-                        return Type::Unknown;
-                    }
-                    let application = projected_application(
-                        index,
-                        &params,
-                        &normalized.types,
-                        &type_params,
-                        parameter_facts.known_unbounded(),
-                        ctx,
-                        &HashMap::new(),
-                    );
-                    if application.status != solve::ConstraintStatus::Matched {
-                        return Type::Unknown;
-                    }
-                    let tset = type_params.into_iter().collect();
-                    return resolve_with_subst(
-                        index,
-                        &ret_tr,
-                        ctx,
-                        &tset,
-                        &application.bindings,
-                        depth,
-                    );
-                }
-                if type_params.is_empty() {
-                    return resolve_type_ref(index, &ret_tr, ctx, depth);
-                }
-                // Generic free function (`fun <T> listOf(vararg e: T): List<T>`): unify the formal
-                // parameter types against the synthesized argument types, then substitute the bindings
-                // through the declared return type (`List<T>` with `T := Foo` -> `List<Foo>`).
-                let tset: HashSet<String> = type_params.into_iter().collect();
-                let mut subst: HashMap<String, Type> = HashMap::new();
-                for (i, p) in params.iter().enumerate() {
-                    if let Some(a) = arg_types.get(i) {
-                        solve::unify_into(p, a, &tset, &mut subst);
-                    }
-                }
-                // Vararg / extra args: unify the remaining args against the last formal param.
-                if let Some(last) = params.last() {
-                    for a in arg_types.iter().skip(params.len()) {
-                        solve::unify_into(last, a, &tset, &mut subst);
-                    }
-                }
-                bind_lambda_return_type(
-                    index,
-                    cname,
-                    node,
-                    src,
-                    ctx,
-                    &ret_tr,
-                    &tset,
-                    &mut subst,
-                    depth,
-                    child_infer,
-                );
-                return resolve_with_subst(index, &ret_tr, ctx, &tset, &subst, depth);
-            }
-            Type::Unknown
+            let entries = visible_top_level_entries(index, cname, ctx, SymbolKind::Function);
+            free_function_call_type(
+                index,
+                entries,
+                cname,
+                node,
+                &arg_types,
+                &usage,
+                src,
+                ctx,
+                depth,
+                child_infer,
+            )
         }
         // Method call `recv.method(...)`: infer recv, then method's return type on that type.
         "navigation_expression" => {
@@ -1762,6 +1733,26 @@ fn infer_call(
                 return Type::Unknown;
             };
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
+            if recv_ty == Type::Unknown {
+                if let Some(entries) =
+                    resolve::qualified_top_level_function_entries(index, callee, src, ctx)
+                {
+                    let usage =
+                        MemberUse::Call(normalized_call_arguments(node, src, arg_types.clone()));
+                    return free_function_call_type(
+                        index,
+                        entries,
+                        node_text(sel, src),
+                        node,
+                        &arg_types,
+                        &usage,
+                        src,
+                        ctx,
+                        depth,
+                        child_infer,
+                    );
+                }
+            }
             let result = member_type(
                 index,
                 &recv_ty,
@@ -1782,24 +1773,160 @@ fn infer_call(
     }
 }
 
-/// The signature of a visible free (top-level) function named `local_name`, for generic call
-/// inference: `(return type, formal type-parameter names, value-parameter types)`. Visibility mirrors
-/// goto: alias/explicit import > same package > wildcard/default imports. Overloads are narrowed by
-/// arity and argument-type consistency; unresolved ambiguity returns `None` rather than a guess.
+/// Both visible and package-qualified free calls use the same selected signature and bindings.
+fn free_function_call_type(
+    index: &dyn InferenceIndex,
+    entries: Vec<&Entry>,
+    cname: &str,
+    node: Node,
+    arg_types: &[Type],
+    usage: &MemberUse,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Type {
+    let Some((ret_tr, type_params, params, parameter_facts, rebound)) = free_function_sig(
+        index,
+        entries,
+        ctx,
+        value_arg_count(node),
+        arg_types,
+        usage,
+        depth,
+    ) else {
+        return Type::Unknown;
+    };
+    let was_named = rebound.is_some();
+    let arg_types = rebound.as_deref().unwrap_or(arg_types);
+    if was_named && !parameter_facts.known_unbounded() {
+        return Type::Unknown;
+    }
+    if params.iter().any(solve::has_projection) {
+        let MemberUse::Call(normalized) = usage else {
+            return Type::Unknown;
+        };
+        if normalized.count != Some(params.len())
+            || normalized.count != Some(arg_types.len())
+            || normalized.trailing_lambda
+        {
+            return Type::Unknown;
+        }
+        let application = projected_application(
+            index,
+            &params,
+            arg_types,
+            &type_params,
+            parameter_facts.known_unbounded(),
+            ctx,
+            &HashMap::new(),
+        );
+        if application.status != solve::ConstraintStatus::Matched {
+            return Type::Unknown;
+        }
+        let tset = type_params.into_iter().collect();
+        return resolve_with_subst(index, &ret_tr, ctx, &tset, &application.bindings, depth);
+    }
+    if type_params.is_empty() {
+        return resolve_type_ref(index, &ret_tr, ctx, depth);
+    }
+    // Generic free function (`fun <T> listOf(vararg e: T): List<T>`): unify the formal
+    // parameter types against the synthesized argument types, then substitute the bindings
+    // through the declared return type (`List<T>` with `T := Foo` -> `List<Foo>`).
+    let tset: HashSet<String> = type_params.into_iter().collect();
+    let mut subst: HashMap<String, Type> = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        if let Some(a) = arg_types.get(i) {
+            if was_named {
+                let mut bindings = HashMap::new();
+                solve::unify_into(p, a, &tset, &mut bindings);
+                merge_type_bindings(&mut subst, bindings);
+            } else {
+                solve::unify_into(p, a, &tset, &mut subst);
+            }
+        }
+    }
+    // Vararg / extra args: unify the remaining args against the last formal param.
+    if let Some(last) = params.last() {
+        for a in arg_types.iter().skip(params.len()) {
+            solve::unify_into(last, a, &tset, &mut subst);
+        }
+    }
+    bind_lambda_return_type(
+        index,
+        cname,
+        node,
+        src,
+        ctx,
+        &ret_tr,
+        &tset,
+        &mut subst,
+        depth,
+        child_infer,
+    );
+    resolve_with_subst(index, &ret_tr, ctx, &tset, &subst, depth)
+}
+
+/// Select a free-call signature from an already resolved visible or package-qualified candidate set.
+/// Overloads use the same shared applicability and argument binding before return-type inference.
 fn free_function_sig(
     index: &dyn InferenceIndex,
-    local_name: &str,
+    entries: Vec<&Entry>,
     ctx: &FileCtx,
     arg_count: usize,
     arg_types: &[Type],
+    usage: &MemberUse,
     depth: usize,
 ) -> Option<(
     TypeRef,
     Vec<String>,
     Vec<TypeRef>,
     crate::symbol::TypeParameterFacts,
+    Option<Vec<Type>>,
 )> {
-    let entries = visible_top_level_entries(index, local_name, ctx, SymbolKind::Function);
+    if let MemberUse::Call(arguments) = usage {
+        if arguments.names.is_some() {
+            let selection = members::select_functions(index, entries, usage, ctx);
+            if selection.applicability == members::Applicability::Rejected
+                || selection.entries.len() != 1
+            {
+                return None;
+            }
+            let entry = selection.entries[0];
+            let bound =
+                members::bind_arguments(entry, arguments, members::CallMode::Kotlin).ok()?;
+            if (selection.applicability == members::Applicability::Unknown
+                && entry
+                    .sym
+                    .params
+                    .iter()
+                    .any(|p| solve::has_projection(p) || !p.args.is_empty()))
+                || bound
+                    .arguments
+                    .types
+                    .iter()
+                    .any(|ty| !constraint_type_is_known(index, ty, 0))
+                || entry.sym.params.iter().any(|p| {
+                    !(p.qualification.is_none() && entry.sym.type_params.contains(&p.name))
+                        && p.args.is_empty()
+                        && !constraint_type_is_known(
+                            index,
+                            &resolve_type_ref(index, p, ctx, depth),
+                            0,
+                        )
+                })
+            {
+                return None;
+            }
+            return Some((
+                entry.sym.return_type.clone()?,
+                entry.sym.type_params.clone(),
+                bound.params.into_owned(),
+                entry.sym.type_parameter_facts,
+                Some(bound.arguments.into_owned().types),
+            ));
+        }
+    }
     let mut group: Vec<&Entry> = entries
         .into_iter()
         .filter(|e| e.sym.return_type.is_some())
@@ -1848,6 +1975,7 @@ fn free_function_sig(
         first.sym.type_params.clone(),
         first.sym.params.clone(),
         first.sym.type_parameter_facts,
+        None,
     ))
 }
 
@@ -1972,6 +2100,7 @@ fn callable_member_entries<'a>(
     if candidates.has_local_extensions() {
         let usage = MemberUse::Call(normalized_call_arguments(
             call,
+            src,
             synth_arg_types(index, call, src, ctx, depth, child_infer),
         ));
         let selection = candidates.select(index, receiver, &usage, ctx);
@@ -2050,10 +2179,23 @@ pub fn call_arguments(
 ) -> CallArguments {
     let mut child_infer = LocalChildInfer;
     let types = synth_arg_types(index, call, src, ctx, 0, &mut child_infer);
-    normalized_call_arguments(call, types)
+    normalized_call_arguments(call, src, types)
 }
 
-fn normalized_call_arguments(call: Node, types: Vec<Type>) -> CallArguments {
+/// Resolution needs argument types only when authored labels require candidate-specific binding.
+pub(crate) fn named_call_arguments(
+    index: &dyn InferenceIndex,
+    call: Node,
+    src: &str,
+    ctx: &FileCtx,
+) -> Option<CallArguments> {
+    let mut arguments = normalized_call_arguments(call, src, Vec::new());
+    arguments.names.as_ref()?;
+    arguments.types = synth_arg_types(index, call, src, ctx, 0, &mut LocalChildInfer);
+    Some(arguments)
+}
+
+fn normalized_call_arguments(call: Node, src: &str, types: Vec<Type>) -> CallArguments {
     let mut arguments = call;
     while child_of_kind(arguments, "value_arguments").is_none() && has_trailing_lambda(arguments) {
         let Some(inner) = arguments
@@ -2064,24 +2206,46 @@ fn normalized_call_arguments(call: Node, types: Vec<Type>) -> CallArguments {
         };
         arguments = inner;
     }
-    let named = child_of_kind(arguments, "value_arguments").is_some_and(|args| {
-        let mut cursor = args.walk();
-        let named = args.named_children(&mut cursor).any(|arg| {
+    let value_arguments = child_of_kind(arguments, "value_arguments");
+    let named = value_arguments.is_some_and(|args| {
+        args.named_children(&mut args.walk())
+            .any(|arg| arg.kind() == "value_argument" && named_argument_label(arg).is_some())
+    });
+    let names = if named {
+        value_arguments.map(|args| {
+            args.named_children(&mut args.walk())
+                .filter(|arg| arg.kind() == "value_argument")
+                .map(|arg| {
+                    named_argument_label(arg)
+                        .map(|label| node_text(label, src).trim_matches('`').to_string())
+                })
+                .collect()
+        })
+    } else {
+        None
+    };
+    let has_spread = value_arguments.is_some_and(|args| {
+        args.named_children(&mut args.walk()).any(|arg| {
             arg.kind() == "value_argument"
-                && arg.named_child_count() > 1
                 && arg
-                    .named_child(0)
-                    .is_some_and(|first| first.kind() == "identifier")
-        });
-        named
+                    .children(&mut arg.walk())
+                    .any(|child| child.kind() == "*")
+        })
     });
     CallArguments {
         count: (!call.has_error()).then(|| value_arg_count(call)),
-        // Names can reorder parameters. Without a normalized name map, positional filtering is
-        // not evidence that a named call is inapplicable.
-        types: if named { Vec::new() } else { types },
+        types,
+        names,
+        has_spread,
         trailing_lambda: has_trailing_lambda(call),
     }
+}
+
+fn named_argument_label(arg: Node) -> Option<Node> {
+    (arg.named_child_count() > 1)
+        .then(|| arg.named_child(0))
+        .flatten()
+        .filter(|first| first.kind() == "identifier")
 }
 
 fn select_trailing_lambda_receiver_type(
@@ -2114,7 +2278,7 @@ fn select_trailing_lambda_receiver_type(
     if group.is_empty() {
         return None;
     }
-    let args = normalized_call_arguments(call, arg_types.clone());
+    let args = normalized_call_arguments(call, src, arg_types.clone());
     group.retain(|(entry, _)| {
         members::function_accepts(index, recv_ty.unwrap_or(&Type::Unknown), entry, &args, ctx)
     });
@@ -2125,7 +2289,7 @@ fn select_trailing_lambda_receiver_type(
             entry,
             &receiver_ref,
             recv_ty,
-            &arg_types,
+            &args,
             ctx,
             depth,
         )?);
@@ -2142,22 +2306,25 @@ fn resolve_trailing_lambda_receiver_candidate(
     entry: &Entry,
     receiver_ref: &TypeRef,
     recv_ty: Option<&Type>,
-    arg_types: &[Type],
+    arguments: &CallArguments,
     ctx: &FileCtx,
     depth: usize,
 ) -> Option<Type> {
     let tset: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
+    let arguments = members::bind_arguments(entry, arguments, members::CallMode::Kotlin).ok()?;
+    let arg_types = arguments.arguments.types.as_slice();
+    let params = arguments.params.as_ref();
     let mut subst = match recv_ty {
         Some(receiver) if entry.sym.extension_receiver.is_some() => {
             receiver_type_bindings(index, receiver, entry)?
         }
         _ => HashMap::new(),
     };
-    if entry.sym.params.iter().any(solve::has_projection) {
+    if params.iter().any(solve::has_projection) {
         let declaration_ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
         let application = projected_application(
             index,
-            &entry.sym.params,
+            params,
             arg_types,
             &entry.sym.type_params,
             entry.sym.type_parameter_facts.known_unbounded(),
@@ -2169,7 +2336,7 @@ fn resolve_trailing_lambda_receiver_candidate(
         }
         subst = application.bindings;
     } else {
-        for (i, p) in entry.sym.params.iter().enumerate() {
+        for (i, p) in params.iter().enumerate() {
             if let Some(a) = arg_types.get(i) {
                 let mut argument_bindings = HashMap::new();
                 solve::unify_into(p, a, &tset, &mut argument_bindings);
@@ -2501,14 +2668,16 @@ fn member_type(
     };
     let usage = if want_function {
         let types = arg_types.unwrap_or_default().to_vec();
-        MemberUse::Call(
-            call.map(|call| normalized_call_arguments(call, types.clone()))
-                .unwrap_or(CallArguments {
-                    count: arg_count,
-                    types,
-                    trailing_lambda: false,
-                }),
-        )
+        MemberUse::Call(match call {
+            Some(call) => normalized_call_arguments(call, src, types),
+            None => CallArguments {
+                count: arg_count,
+                types,
+                names: None,
+                has_spread: false,
+                trailing_lambda: false,
+            },
+        })
     } else {
         MemberUse::Value
     };
@@ -2520,6 +2689,10 @@ fn member_type(
         want_function,
         group,
         call,
+        match &usage {
+            MemberUse::Call(arguments) => Some(arguments),
+            _ => None,
+        },
         src,
         ctx,
         depth,
@@ -2534,6 +2707,7 @@ fn selected_member_type(
     want_function: bool,
     group: members::Selection<'_>,
     call: Option<Node>,
+    arguments: Option<&CallArguments>,
     src: &str,
     ctx: &FileCtx,
     depth: usize,
@@ -2557,6 +2731,11 @@ fn selected_member_type(
             None => return Type::Unknown,
         };
         let t = if semantic_entry.is_some() {
+            if let Some(arguments) = arguments.filter(|arguments| arguments.names.is_some()) {
+                if members::bind_arguments(e, arguments, members::CallMode::Kotlin).is_err() {
+                    return Type::Unknown;
+                }
+            }
             declared_type(index, tr, &FileCtx::new(e.sym.package.clone(), Vec::new()))
         } else {
             resolve_member_type_with_subst(
@@ -2566,6 +2745,7 @@ fn selected_member_type(
                 name,
                 tr,
                 call,
+                arguments,
                 src,
                 ctx,
                 depth + 1,
@@ -2588,19 +2768,32 @@ fn resolve_member_type_with_subst(
     op_name: &str,
     tr: &TypeRef,
     call: Option<Node>,
+    arguments: Option<&CallArguments>,
     src: &str,
     ctx: &FileCtx,
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Type {
     let tparams = member_type_parameters(index, entry);
-    if entry.sym.params.iter().any(solve::has_projection) {
-        if let Some(call) = call {
-            let arguments = normalized_call_arguments(
-                call,
-                synth_arg_types(index, call, src, ctx, depth, child_infer),
-            );
-            return declared_member_call_type(index, recv_ty, entry, tr, &arguments, ctx);
+    let projected = entry.sym.params.iter().any(solve::has_projection);
+    let bound = match arguments {
+        Some(arguments) => {
+            match members::bind_arguments(entry, arguments, members::CallMode::Kotlin) {
+                Ok(bound) => Some(bound),
+                Err(_) => return Type::Unknown,
+            }
+        }
+        None => None,
+    };
+    if bound.as_ref().is_some_and(|bound| {
+        bound.params.len() != entry.sym.params.len()
+            && !call_parameter_templates_known(index, entry)
+    }) {
+        return Type::Unknown;
+    }
+    if projected {
+        if let Some(bound) = &bound {
+            return declared_member_bound_type(index, recv_ty, entry, tr, bound, ctx);
         }
     }
     if tparams.is_empty() && entry.sym.extension_receiver.is_none() {
@@ -2614,17 +2807,12 @@ fn resolve_member_type_with_subst(
         return resolve_type_ref(index, tr, ctx, depth + 1);
     }
     let mut subst = receiver_bindings.unwrap_or_default();
-    if let Some(call) = call {
-        // Only method/extension variables are inferred from arguments. Owning-class variables
-        // retain their receiver bindings, including Unknown for an incomplete/raw receiver.
+    if let (Some(call), Some(bound)) = (call, bound.as_ref()) {
+        // Arguments can bind only method variables; receiver variables retain their equalities.
         let method_params = entry.sym.type_params.iter().cloned().collect();
-        let arguments = normalized_call_arguments(
-            call,
-            synth_arg_types(index, call, src, ctx, depth, child_infer),
-        );
-        for (formal, actual) in entry.sym.params.iter().zip(arguments.types) {
+        for (formal, actual) in bound.params.iter().zip(&bound.arguments.types) {
             let mut argument_bindings = HashMap::new();
-            solve::unify_into(formal, &actual, &method_params, &mut argument_bindings);
+            solve::unify_into(formal, actual, &method_params, &mut argument_bindings);
             merge_type_bindings(&mut subst, argument_bindings);
         }
         bind_lambda_return_type(
@@ -2764,12 +2952,69 @@ fn projected_application(
     )
 }
 
-/// Both call selection and return substitution consume this same local constraint result.
+/// A defaulted slot is not a synthesized argument. It must still have modeled declaration types
+/// before removing that slot can turn an uncertain overload into a proven applicable one.
+pub(crate) fn call_parameter_templates_known(index: &dyn InferenceIndex, entry: &Entry) -> bool {
+    if !entry.sym.type_parameter_facts.known_unbounded() {
+        return false;
+    }
+    fn known(
+        index: &dyn InferenceIndex,
+        formal: &TypeRef,
+        ctx: &FileCtx,
+        parameters: &HashSet<String>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_DEPTH || formal.projection == Projection::Star {
+            return false;
+        }
+        if formal.qualification.is_none() && parameters.contains(&formal.name) {
+            return formal.args.is_empty();
+        }
+        let resolved =
+            resolve_with_subst_unprojected(index, formal, ctx, parameters, &HashMap::new(), depth);
+        if !type_head_is_known(index, &resolved) || !receiver_shape_is_known(index, &resolved) {
+            return false;
+        }
+        if formal.args.is_empty() {
+            return constraint_type_is_known(index, &resolved, depth);
+        }
+        if type_declaration_shape(index, &resolved).is_none()
+            || !index
+                .lookup_type(resolved.name().unwrap_or_default())
+                .iter()
+                .filter(|entry| {
+                    entry.sym.package == resolved.package().unwrap_or_default()
+                        && entry.sym.container.as_deref() == resolved.container()
+                })
+                .all(|entry| {
+                    entry.sym.kind != SymbolKind::TypeAlias
+                        && entry.sym.type_parameter_facts.known_unbounded()
+                        && entry.sym.type_parameter_facts.known_invariant()
+                })
+        {
+            return false;
+        }
+        formal
+            .args
+            .iter()
+            .all(|arg| known(index, arg, ctx, parameters, depth + 1))
+    }
+    let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+    let parameters = member_type_parameters(index, entry);
+    entry
+        .sym
+        .params
+        .iter()
+        .all(|formal| known(index, formal, &ctx, &parameters, 0))
+}
+
+/// Both call selection and return substitution consume the same bound formal/actual pairs.
 pub(crate) fn projected_member_application(
     index: &dyn InferenceIndex,
     receiver: &Type,
     entry: &Entry,
-    arguments: &CallArguments,
+    bound: &members::BoundArguments<'_>,
 ) -> Option<solve::Application> {
     if !entry
         .sym
@@ -2779,13 +3024,14 @@ pub(crate) fn projected_member_application(
     {
         return None;
     }
+    let arguments = bound.arguments.as_ref();
     let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
     let receiver_bindings = receiver_type_bindings(index, receiver, entry);
     let missing_receiver = entry.sym.extension_receiver.is_some() && receiver_bindings.is_none();
     let initial = receiver_bindings.unwrap_or_default();
     let mut application = projected_application(
         index,
-        &entry.sym.params,
+        &bound.params,
         &arguments.types,
         &entry.sym.type_params,
         entry.sym.type_parameter_facts.known_unbounded(),
@@ -2796,6 +3042,8 @@ pub(crate) fn projected_member_application(
         || arguments.count != Some(arguments.types.len())
         || arguments.trailing_lambda
         || missing_receiver
+        || (bound.params.len() != entry.sym.params.len()
+            && !call_parameter_templates_known(index, entry))
     {
         application.status = solve::ConstraintStatus::Unknown;
     }
@@ -2811,10 +3059,29 @@ pub fn declared_member_call_type(
     arguments: &CallArguments,
     ctx: &FileCtx,
 ) -> Type {
+    let bound = match members::bind_arguments(entry, arguments, members::CallMode::Kotlin) {
+        Ok(bound) => bound,
+        Err(_) => return Type::Unknown,
+    };
+    declared_member_bound_type(index, receiver, entry, tr, &bound, ctx)
+}
+
+fn declared_member_bound_type(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    tr: &TypeRef,
+    bound: &members::BoundArguments<'_>,
+    ctx: &FileCtx,
+) -> Type {
+    if bound.params.len() != entry.sym.params.len() && !call_parameter_templates_known(index, entry)
+    {
+        return Type::Unknown;
+    }
     if entry.sym.type_params.is_empty() && !entry.sym.params.iter().any(solve::has_projection) {
         return declared_member_type(index, receiver, entry, tr, ctx);
     }
-    let Some(application) = projected_member_application(index, receiver, entry, arguments) else {
+    let Some(application) = projected_member_application(index, receiver, entry, bound) else {
         return declared_member_type(index, receiver, entry, tr, ctx);
     };
     if application.status != solve::ConstraintStatus::Matched {
@@ -3673,6 +3940,72 @@ mod tests {
                 "different type arguments must not allow revisiting the same declaration: {declarations}"
             );
         }
+    }
+
+    #[test]
+    fn nested_named_member_arguments_are_inferred_linearly() {
+        use crate::index::InferenceIndex;
+        use crate::parser::KotlinParser;
+        use crate::types::Type;
+        use tree_sitter::Node;
+
+        struct CountInfer {
+            calls: usize,
+        }
+        impl super::ChildInfer for CountInfer {
+            fn infer_child(
+                &mut self,
+                index: &dyn InferenceIndex,
+                node: Node<'_>,
+                src: &str,
+                ctx: &super::FileCtx,
+                depth: usize,
+            ) -> Type {
+                self.calls += 1;
+                // Use the default local recursion so a child cache cannot hide repeated traversal.
+                super::infer_depth_with(index, node, src, ctx, depth, self)
+            }
+        }
+
+        let mut counts = Vec::new();
+        for depth in [1usize, 8] {
+            let mut expression = "box".to_string();
+            for _ in 0..depth {
+                expression = format!("box.id(value={expression})");
+            }
+            let source = format!(
+                "package app\nclass Box {{ fun id(value: Box): Box = value }}\nfun use(box: Box) {{ val result = {expression} }}\n"
+            );
+            let mut parser = KotlinParser::new();
+            let tree = parser.parse(&source);
+            let mut index = Index::new();
+            index.replace_file(
+                "Named.kt",
+                crate::indexer::extract_symbols(&tree, &source, "app"),
+                Tier::Volatile,
+            );
+            let start = source.find(&expression).unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(node.kind(), "call_expression");
+            assert_eq!(super::node_text(node, &source), expression);
+            let ctx = super::FileCtx::from_tree(&tree, &source);
+            let mut child_infer = CountInfer { calls: 0 };
+            assert_eq!(
+                super::infer_with_child_infer(&index, node, &source, &ctx, 0, &mut child_infer),
+                Type::class("Box", Some("app".into())),
+                "named calls must retain a useful result at depth {depth}"
+            );
+            assert!(child_infer.calls > 0);
+            counts.push(child_infer.calls);
+        }
+        eprintln!("nested named inference callback counts at depths 1/8: {counts:?}");
+        assert!(
+            counts[1] <= 8 * counts[0],
+            "named argument inference must scale with syntax depth: {counts:?}"
+        );
     }
 
     #[test]

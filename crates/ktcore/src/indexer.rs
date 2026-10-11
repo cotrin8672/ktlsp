@@ -17,7 +17,8 @@ use crate::parser::{
     child_of_kind, class_kind, first_ident, imports_of, name_field, node_text, Import,
 };
 use crate::symbol::{
-    ExtensionReceiverFacts, IndexedSymbol, MemberImplementation, SourceMemberFlags, SymbolKind,
+    ExtensionReceiverFacts, IndexedSymbol, KotlinValueParameter, MemberImplementation,
+    SourceMemberFlags, SymbolKind,
 };
 use crate::types::TypeRef;
 
@@ -642,6 +643,7 @@ fn function_symbol(
             .map(Box::new),
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
+        kotlin_parameters: kotlin_parameters_of(decl, src, &shape.parameters),
         type_parameter_facts: type_parameter_facts_of(decl),
         type_params,
         ..IndexedSymbol::new(
@@ -661,6 +663,7 @@ struct FunctionShape {
     has_vararg: bool,
     trailing_lambda_min_arity: Option<u8>,
     last_parameter_min_arity: Option<u8>,
+    parameters: Vec<(bool, bool, bool)>,
 }
 
 /// The positional call shape of a `function_declaration`, derived from the named children under
@@ -679,6 +682,7 @@ fn function_shape(decl: Node) -> FunctionShape {
             has_vararg: false,
             trailing_lambda_min_arity: None,
             last_parameter_min_arity: None,
+            parameters: Vec::new(),
         };
     };
     let mut meta: Vec<(bool, bool, bool)> = Vec::new();
@@ -686,6 +690,9 @@ fn function_shape(decl: Node) -> FunctionShape {
     let mut pending_vararg = false;
     let mut has_vararg = false;
     for child in params.named_children(&mut cursor) {
+        if child.is_extra() {
+            continue;
+        }
         match child.kind() {
             "parameter_modifiers" => {
                 pending_vararg = true;
@@ -741,6 +748,7 @@ fn function_shape(decl: Node) -> FunctionShape {
         has_vararg,
         trailing_lambda_min_arity,
         last_parameter_min_arity,
+        parameters: meta,
     }
 }
 
@@ -906,6 +914,38 @@ fn param_types_of(decl: Node, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
         }
     }
     out
+}
+
+/// Keep authored facts distinct from JVM-lowered receiver/Continuation parameters.
+/// Default positions reuse the same parameter-shape scan that computes positional min_arity.
+fn kotlin_parameters_of(
+    decl: Node,
+    src: &str,
+    shapes: &[(bool, bool, bool)],
+) -> Option<Box<Vec<KotlinValueParameter>>> {
+    let parameters = child_of_kind(decl, "function_value_parameters")?;
+    if parameters.has_error() || parameters.is_missing() {
+        return None;
+    }
+    let mut facts: Vec<KotlinValueParameter> = Vec::with_capacity(shapes.len());
+    for parameter in parameters.named_children(&mut parameters.walk()) {
+        if parameter.kind() != "parameter" {
+            continue;
+        }
+        let name = parameter.named_child(0)?;
+        if name.kind() != "identifier" || name.is_missing() {
+            return None;
+        }
+        let text = node_text(name, src).trim_matches('`');
+        if text.is_empty() || facts.iter().any(|fact| fact.name == text) {
+            return None;
+        }
+        facts.push(KotlinValueParameter {
+            name: text.to_string(),
+            has_default: shapes.get(facts.len())?.0,
+        });
+    }
+    (!facts.is_empty() && facts.len() == shapes.len()).then(|| Box::new(facts))
 }
 
 /// The typed references of a `class_declaration`/`object_declaration`'s declared supertypes
@@ -1315,6 +1355,7 @@ fn push_synthetic_member(
         return_type,
         value_type,
         params,
+        kotlin_parameters: None,
         type_params,
         type_parameter_facts: Default::default(),
         source_member: SourceMemberFlags::default(),

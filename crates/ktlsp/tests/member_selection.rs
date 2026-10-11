@@ -282,6 +282,8 @@ fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
     let args = CallArguments {
         count: Some(1),
         types: vec![Type::class("int", None)],
+        names: None,
+        has_spread: false,
         trailing_lambda: false,
     };
     for name in ["widen", "box", "boxRef"] {
@@ -2032,6 +2034,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         return_type: Option<TypeRef>,
         value_type: Option<TypeRef>,
         params: Vec<TypeRef>,
+        kotlin_parameters: Option<Vec<ktlsp::symbol::KotlinValueParameter>>,
         type_params: Vec<String>,
         type_parameter_facts: ktlsp::symbol::TypeParameterFacts,
     }
@@ -2070,6 +2073,10 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     rich.return_type = Some(receiver.clone());
     rich.value_type = Some(receiver.clone());
     rich.params = vec![receiver];
+    rich.kotlin_parameters = Some(Box::new(vec![ktlsp::symbol::KotlinValueParameter {
+        name: "value".into(),
+        has_default: true,
+    }]));
     rich.type_params = vec!["Payload".into()];
     rich.type_parameter_facts = ktlsp::symbol::TypeParameterFacts::new(true, false);
     let source = "package api; public class Owner { public native void method(); }";
@@ -2093,6 +2100,15 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
             bincode::deserialize::<IndexedSymbol>(&current_bytes).unwrap(),
             symbol
         );
+        let mut absent_names = value.clone();
+        absent_names
+            .as_object_mut()
+            .unwrap()
+            .remove("kotlin_parameters");
+        assert!(serde_json::from_value::<IndexedSymbol>(absent_names)
+            .unwrap()
+            .kotlin_parameters
+            .is_none());
         let mut absent_facts = value.clone();
         absent_facts
             .as_object_mut()

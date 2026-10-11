@@ -1137,8 +1137,32 @@ fn reordered_named_arguments_cannot_be_unified_positionally() {
         "NamedArguments.kt",
         "first(second = other, first = payload)",
     );
-    // Named generic argument mapping remains a coverage gap; never return the positional OtherPayload.
-    assert_eq!(inferred, Type::Unknown);
+    assert_eq!(inferred, Type::class("Payload", Some("probe".into())));
+    let source = ws.doc_text("NamedArguments.kt").unwrap();
+    ws.change(
+        "NamedArguments.kt",
+        source.replace(
+            "first(second = other, first = payload)",
+            "first(second = other, first = payload).payloadOnly()",
+        ),
+    );
+    let found = labels(
+        &mut ws,
+        "NamedArguments.kt",
+        "first(second = other, first = payload).",
+    );
+    assert!(found.contains("payloadOnly"), "{found:?}");
+    assert!(!found.contains("otherOnly"), "{found:?}");
+    let expected = target(&ws, "Extensions.kt", "payloadOnly");
+    assert_eq!(
+        goto(
+            &mut ws,
+            "NamedArguments.kt",
+            "first(second = other, first = payload).payloadOnly()",
+            "payloadOnly"
+        ),
+        vec![expected]
+    );
 }
 
 #[test]
@@ -1676,4 +1700,30 @@ fn local_extension_lambda_receiver_precedes_scope_function_intrinsics() {
             "{declaration}"
         );
     }
+}
+
+#[test]
+fn named_trailing_lambda_receiver_does_not_reuse_written_argument_order() {
+    let mut ws = workspace();
+    add_payload_members(&mut ws);
+    let source = "package probe
+fun <T,U> scope(first:T,second:U,block:T.()->Unit) {}
+fun use(payload:Payload,other:OtherPayload) { scope(payload,other) { payloadOnly() };scope(second=other,first=payload) { payloadOnly() };other.otherOnly() }
+";
+    ws.open("NamedTrailing.kt", source.into());
+    let positional = labels(&mut ws, "NamedTrailing.kt", "scope(payload,other) { ");
+    assert!(positional.contains("payloadOnly"), "{positional:?}");
+    assert!(!positional.contains("otherOnly"), "{positional:?}");
+    let named = labels(
+        &mut ws,
+        "NamedTrailing.kt",
+        "scope(second=other,first=payload) { ",
+    );
+    // Named trailing-lambda binding is still valid unsupported coverage, never the positional OtherPayload.
+    assert!(
+        !named.contains("payloadOnly") && !named.contains("otherOnly"),
+        "{named:?}"
+    );
+    let known = labels(&mut ws, "NamedTrailing.kt", "other.");
+    assert!(known.contains("otherOnly"), "{known:?}");
 }
