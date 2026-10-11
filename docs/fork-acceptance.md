@@ -59,7 +59,7 @@ a useful known receiver in the same edited state.
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
 | Rust baseline / current slices | Workspace tests pass with useful regression expectations | Gradle streaming slice passes 1,254 / 0 failed / 4 ignored; formatting/release native 0 | Current Rust, formatting and release verified | Checkpoint 35: `ktlsp-gradle-stream-20261012-1/native-build-results.json`; bounded/parameterized local receiver constraints remain Unknown |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Earlier ordinary editor: basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Current path-cache saved Java probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/`. Current narrow probe shuts down cleanly in 0.7201557s (n=1); actual server/client RSS remains unmeasured |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Earlier ordinary editor: basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Current path-cache saved Java probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/`. Current narrow probe shuts down cleanly in 0.7201557s (n=1); checkpoint 36 measures owned Moshi server working sets, editor memory remains unmeasured |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -76,7 +76,7 @@ a useful known receiver in the same edited state.
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current path-cache saved Java/Lombok probe retains 99/99: first getter/typed chain, four observed native builds, config/dirty retraction. Earlier KAPT/KSP 102/114 retains twelve stale/removed diagnostics; original mixed twelve editing cases remain OPEN | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/compiled-java-results.json`; compilerClosureComplete=false throughout. Source-less navigation stays unavailable; no producer-absence guard is relaxed |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
-| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA under matched conditions | Earlier paired Gradle RSS approximately 3.19 to 2.66 GiB (n=2/arm); isolated snapshot allocation -82.2%. Current instrumented Java path API requests 23,427,148 to 0 allocation bytes per 32-event batch (n=30), with 6,177 additional retained requested bytes | Narrow resource improvements measured; six-project comparison pending | `ktlsp-receiver-storage-pair-20261011/`, `ktlsp-index-snapshot-cow-measurement-20261011/` and current checkpoint 28. Local API allocation/timing is not whole-server RSS or useful-result RPC/UI latency; broad cold/warm samples remain |
+| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA under matched conditions | Earlier shared snapshot/path API allocation improvements remain verified. Real Moshi has 31/31 correct native UI cycles per engine: warm input-to-popup p50/p95 43.927/48.219 ms for ktlsp and 453.308/763.453 ms for IDEA; post-readiness server working-set medians 854.0/1,892.0 MiB | One real-project editing comparison verified; wider comparison pending | Checkpoints 28 and 36. Memory excludes editor/Gradle children and samples active editing, not idle steady-state; broad cold/warm project comparisons remain |
 
 ## Actual KAPT/KSP compile and runtime controls
 
@@ -2308,6 +2308,50 @@ cannot detect omitted whole modules after a complete block. This slice does not 
 whole-project performance or IDEA parity. Next repair the independently reproduced
 Retrofit Java generic/class-literal/extension-property inference gaps, then compare
 useful native completion and memory under matched conditions.
+
+### Thirty-sixth checkpoint: useful Moshi native completion and memory
+
+The pinned real Moshi root uses the same Neovim 0.12.5 corpus/UI route, source and
+JDK 17 for both engines. The official IntelliJ plugin remains pinned to
+`9cfad18005470e4187090013e08f92ec9e437219`, server `263.6379.0`. Each arm starts
+with a fresh per-arm cache, runs its three golden requests, then starts a new UI
+server using that seeded cache. The Gradle dependency cache is already populated;
+the arms run sequentially. These are editing measurements, not cold-start timings.
+
+Both engines match **3/3 golden first responses** and **31/31 native completion
+cycles**: useful LSP popup, one completion response, keyboard acceptance, exact
+whole-buffer SHA256 and unchanged disk source. The first cycle and thirty warm
+repetitions are separate. No empty or failed completion contributes a timing sample.
+
+| Measurement | ktlsp | IntelliJ LSP |
+| --- | --- | --- |
+| First input to popup handoff (n=1) | 50.816 ms | 2,668.160 ms |
+| Warm completion RPC p50 / p95 (n=30) | 11.003 / 12.893 ms | 421.040 / 723.694 ms |
+| Warm input to popup handoff p50 / p95 (n=30) | 43.927 / 48.219 ms | 453.308 / 763.453 ms |
+| Warm acceptance to verified text p50 / p95 (n=30) | 126.014 / 127.859 ms | 105.863 / 134.707 ms |
+| Working-set median during first post-readiness second | 854.0 MiB | 1,892.0 MiB |
+| Process peak working set through last observed sample | 856.1 MiB | 2,760.7 MiB |
+
+The PID marker is captured from the actual synchronous `vim.system` spawn. External
+observation verifies the executable, creation time, direct editor parent and ancestry
+to the owned harness. IntelliJ's same PID has its bundled `jbr/bin/server/jvm.dll`
+loaded, so its memory observation includes the embedded JVM. The pre-existing user
+Java process is untouched. Memory excludes Neovim/Gradle child processes; the first
+second includes editing and is not idle steady-state. Peak scope ends at the last
+observed sample. Popup handoff is not physical-screen latency. This single case
+establishes neither whole-project semantic parity nor a universal performance budget.
+
+The separate IntelliJ corpus shutdown observation expires after useful responses;
+all UI samples remain valid and the native artifacts retain operational exit 1.
+The subsequent UI server exits cleanly. The earlier corpus process's exit was not
+observed, so residual background work is not independently excluded from the timing
+comparison; repeat with that operational control before claiming a stable speed ratio.
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-moshi-ui-matched-20261012-1/`
+(`native-results.json`, both `artifacts/completion-ui.json`, `source-guards.json`,
+`fixture-publication-receipt.json`). The committed `dev/corpus/moshi-1.15.2-ui.json`
+is byte-identical to the tested manifest. The server is checkpoint 35's immutable
+release. Other project UI/memory comparisons and the real Retrofit generic chain
+remain open; the latter is independently reproduced with compiler controls.
 
 ### Current slice: requires-only compatibility artifacts
 

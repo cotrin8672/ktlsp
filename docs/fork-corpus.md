@@ -15,6 +15,12 @@ metadata. Checkpoint 35 in [fork-acceptance.md](fork-acceptance.md) links comman
 source/binary hashes and native reports. This is focused analysis evidence; matched
 IDEA latency/memory and broader editing acceptance remain open.
 
+Moshi now has a focused native UI comparison: both engines correctly display and
+accept all 31 completions with whole-buffer equality. Checkpoint 36 records the
+first/warm RPC and popup timings, owned-server working sets, exact setup and limits.
+The separate IntelliJ corpus exit observation is incomplete; it is not a semantic
+failure. Measurements on the other roots remain open.
+
 Updated: 2026-10-12 (Asia/Tokyo). Discovery is complete; semantic, compiler,
 IDEA and performance acceptance are **pending**. See [fork-acceptance.md](fork-acceptance.md).
 

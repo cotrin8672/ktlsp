@@ -255,6 +255,9 @@ separates protocol time, input-to-popup handoff, and selection-to-text verificat
 physical-screen timing. Set `KTLSP_UI_SAMPLES` for cycles per language (default 1). Cycle 1 is
 the first after readiness; later cycles are repetitions. These small controls do not establish
 real-project latency budgets. The same UI probe supports the temporary IntelliJ client.
+Accepted completions also require the expected whole-buffer SHA256. The probe records its
+spawned server/editor PIDs and executable in `completion-ui-process.json` for external
+memory observation; it records no launch arguments or environment values.
 
 `corpus --root <project> --file <manifest.json>` runs read-only completion and exact declaration
 probes on a real project. The manifest supplies relative source files, unique anchors, tokens,
@@ -278,6 +281,9 @@ The `gradle-8.14.3.json` and `gradle-8.14.3-incomplete.json` manifests cover Jav
 navigation and unfinished editing after importing the real Gradle project. Discovery
 streams large model output through a temporary file and rejects incomplete project
 blocks; it also supports this project's Kotlin DSL warnings-as-errors policy.
+For pinned Moshi, set `KTLSP_UI_CASES` to the absolute path of
+`dev/corpus/moshi-1.15.2-ui.json` and `KTLSP_UI_SAMPLES=31` with the same corpus route.
+This checks one first-after-readiness and thirty repeated native popup/acceptance cycles.
 Spring extension-receiver and incomplete-selector regressions use the same route with
 `dev/corpus/fixtures/spring-provider` and the two `spring-provider-reduction*.json` manifests.
 `spring-extensions-editing.json` adds unsaved cases against the pinned real Spring root;

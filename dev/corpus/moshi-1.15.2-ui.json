@@ -1,0 +1,20 @@
+{
+  "build_tool": "gradle",
+  "files": {
+    "kotlin": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt"
+  },
+  "source_sha256": {
+    "kotlin": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef"
+  },
+  "cases": [
+    {
+      "name": "kotlin",
+      "anchor": "reader.beginObject()",
+      "source_token": "beginObject",
+      "before": "    reader",
+      "member": "beginObject",
+      "excluded": "toJson",
+      "after": "    reader.beginObject()"
+    }
+  ]
+}

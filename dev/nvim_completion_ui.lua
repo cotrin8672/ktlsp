@@ -30,6 +30,11 @@ if vim.env.KTLSP_UI_CASES then
 end
 local buffers, original = {}, {}
 local client, sample, done
+local function process_marker(phase)
+  if not report.server_process then return end
+  vim.fn.writefile({ vim.json.encode({ phase = phase, time_ns = vim.uv.hrtime(),
+    process = report.server_process }) }, artifacts .. '/completion-ui-process.json')
+end
 vim.o.hidden = true
 vim.o.completeopt = 'menuone,noselect'
 vim.o.showmode = false
@@ -61,6 +66,7 @@ local function finish(err)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, original[name])
   end
   if client then
+    process_marker('before-shutdown')
     report.shutdown = probe.shutdown(client, report.shutdown, 15000)
     report.clean_shutdown = report.shutdown.clean
     report.server_exit_code = report.shutdown.exit and report.shutdown.exit.code
@@ -126,6 +132,9 @@ vim.ui_attach(ns, { ext_popupmenu = true }, guarded(function(event, items)
       vim.defer_fn(guarded(function()
         sample.result_line = vim.api.nvim_get_current_line()
         assert(sample.result_line == sample.case.after, 'accepted completion produced wrong text')
+        sample.result_buffer_sha256 = vim.fn.sha256(
+          table.concat(vim.api.nvim_buf_get_lines(buffers[sample.case.name], 0, -1, false), '\n'))
+        assert(sample.result_buffer_sha256 == sample.expected_buffer_sha256, 'accepted completion changed unexpected buffer text')
         sample.accept_to_text_ms = (vim.uv.hrtime() - sample.accept_ns) / 1e6
         sample.accepted = true
         vim.api.nvim_input('<Esc>')
@@ -166,7 +175,20 @@ end
 report.shutdown = probe.observe_shutdown(config)
 local initial_buf = assert(buffers[cases[1].name], 'missing initial UI buffer')
 vim.api.nvim_set_current_buf(initial_buf)
-local id = assert(vim.lsp.start(config, { bufnr = initial_buf }))
+local system, owned = vim.system
+vim.system = function(cmd, ...)
+  local obj = system(cmd, ...)
+  if vim.deep_equal(cmd, config.cmd) then owned = obj end
+  return obj
+end
+local ok, started = pcall(vim.lsp.start, config, { bufnr = initial_buf })
+vim.system = system
+assert(ok, started)
+local id = assert(started)
+if owned then
+  report.server_process = { pid = owned.pid, editor_pid = vim.uv.os_getpid(), executable = config.cmd[1] }
+  process_marker('spawned')
+end
 local number = 0
 next_case = function()
   if sample then
@@ -182,7 +204,10 @@ next_case = function()
   vim.api.nvim_buf_set_lines(buf, pos.line, pos.line + 1, false, { case.before })
   require('vim.lsp._changetracking').flush(client)
   vim.api.nvim_win_set_cursor(0, { pos.line + 1, #case.before })
+  local expected = vim.deepcopy(original[case.name])
+  expected[pos.line + 1] = case.after
   sample = { case = case, cycle = math.ceil(number / #cases), request_count = 0,
+    expected_buffer_sha256 = vim.fn.sha256(table.concat(expected, '\n')),
     phase = number <= #cases and 'first-after-readiness' or 'warm-repetition' }
   report.samples[#report.samples + 1] = sample
   local current = sample
@@ -215,6 +240,7 @@ local function wait_ready()
     end
   end
   report.ready_ns = vim.uv.hrtime()
+  process_marker('ready')
   report.command_provider = client.server_capabilities.executeCommandProvider
   report.resolve_provider = (client.server_capabilities.completionProvider or {}).resolveProvider
   for _, buf in pairs(buffers) do
