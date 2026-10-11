@@ -7,7 +7,15 @@ unstarted requests, execution state and source-input metadata. A deadline leaves
 unmeasured; unavailable sources matter to correctness when a required case cannot resolve.
 See checkpoint 34 in [fork-acceptance.md](fork-acceptance.md) for the verified classification.
 
-Updated: 2026-10-11 (Asia/Tokyo). Discovery is complete; semantic, compiler,
+Latest verified slice (2026-10-12): Gradle's warnings-as-errors and large project-model
+transport defects are repaired. The unchanged real-project manifests match all six
+incomplete and three golden requests on their first valid responses. Edit delivery
+and restoration complete; ten failed and twenty-five missing source inputs remain
+metadata. Checkpoint 35 in [fork-acceptance.md](fork-acceptance.md) links commands,
+source/binary hashes and native reports. This is focused analysis evidence; matched
+IDEA latency/memory and broader editing acceptance remain open.
+
+Updated: 2026-10-12 (Asia/Tokyo). Discovery is complete; semantic, compiler,
 IDEA and performance acceptance are **pending**. See [fork-acceptance.md](fork-acceptance.md).
 
 ## Revisions and source coverage

@@ -11,7 +11,7 @@
 //! resolution + `kotlinc`/compile-daemon must preserve the `(root, task) -> CompileOutcome`
 //! signature so the merge store and publish plumbing stay untouched.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ pub const DEFAULT_COMPILE_TASK: &str = "compileKotlin";
 /// This does not promise bounded shutdown when process termination itself fails.
 pub(crate) const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Maximum retained diagnostic bytes per stream; classpath data has its own capture budget.
+/// Maximum retained diagnostic bytes per stream; classpath stdout is spooled to disk.
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
 /// One compiler diagnostic over a file at a 1-based (line, column), exactly as the compiler reports
@@ -263,6 +263,19 @@ pub(crate) struct OwnedNativeCompile {
 #[cfg(windows)]
 impl OwnedNativeCompile {
     pub(crate) fn spawn(command: &mut Command, stdout_limit: usize) -> std::io::Result<Self> {
+        Self::spawn_with_stdout(command, |pipe| drain_capped(pipe, stdout_limit))
+    }
+
+    fn spawn_to_file(command: &mut Command, stdout: std::fs::File) -> std::io::Result<Self> {
+        Self::spawn_with_stdout(command, |pipe| drain_to_file(pipe, stdout))
+    }
+
+    fn spawn_with_stdout(
+        command: &mut Command,
+        capture: impl FnOnce(
+            std::process::ChildStdout,
+        ) -> std::io::Result<std::thread::JoinHandle<(String, bool)>>,
+    ) -> std::io::Result<Self> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -274,7 +287,7 @@ impl OwnedNativeCompile {
             err: None,
         };
         if let Some(pipe) = owned.tree.child_mut().stdout.take() {
-            owned.out = Some(drain_capped(pipe, stdout_limit)?);
+            owned.out = Some(capture(pipe)?);
         }
         if let Some(pipe) = owned.tree.child_mut().stderr.take() {
             owned.err = Some(drain_capped(pipe, MAX_OUTPUT_BYTES)?);
@@ -323,6 +336,88 @@ impl Drop for OwnedNativeCompile {
         let _ = join_capped(&mut self.out);
         let _ = join_capped(&mut self.err);
     }
+}
+
+/// File-backed stdout uses the same ownership/EOF rules; its returned string contains IO failures.
+pub(crate) fn run_with_stdout_file(
+    command: &mut Command,
+    stdout: std::fs::File,
+) -> std::io::Result<(std::process::ExitStatus, bool, String, bool, String, bool)> {
+    #[cfg(windows)]
+    {
+        Ok(OwnedNativeCompile::spawn_to_file(command, stdout)?.wait(COMPILE_TIMEOUT, None))
+    }
+    #[cfg(not(windows))]
+    {
+        // shortcut: Unix retains wrapper-only ownership, add process-group cleanup after native proof.
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let mut out = None;
+        let mut err = None;
+        let readers = (|| -> std::io::Result<()> {
+            out = child
+                .stdout
+                .take()
+                .map(|pipe| drain_to_file(pipe, stdout))
+                .transpose()?;
+            err = child
+                .stderr
+                .take()
+                .map(|pipe| drain_capped(pipe, MAX_OUTPUT_BYTES))
+                .transpose()?;
+            Ok(())
+        })();
+        if let Err(error) = readers {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_capped(&mut out);
+            let _ = join_capped(&mut err);
+            return Err(error);
+        }
+        let interrupted = wait_with_timeout(&mut child, COMPILE_TIMEOUT);
+        let status = child.wait();
+        let (out, out_complete) = join_capped(&mut out);
+        let (err, err_complete) = join_capped(&mut err);
+        Ok((status?, interrupted, out, out_complete, err, err_complete))
+    }
+}
+
+/// A failed sink must still drain the pipe, so its producer cannot block before owned cleanup.
+fn drain_to_file<R: Read + Send + 'static, W: Write + Send + 'static>(
+    mut reader: R,
+    writer: W,
+) -> std::io::Result<std::thread::JoinHandle<(String, bool)>> {
+    std::thread::Builder::new()
+        .name("ktlsp-compile-spool".into())
+        .spawn(move || {
+            let mut writer = std::io::BufWriter::new(writer);
+            let mut failure = String::new();
+            let mut chunk = [0; 65536];
+            loop {
+                let n = match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        failure.push_str(&format!("stdout read: {error}; "));
+                        break;
+                    }
+                };
+                if failure.is_empty() {
+                    if let Err(error) = writer.write_all(&chunk[..n]) {
+                        failure.push_str(&format!("stdout write: {error}; "));
+                    }
+                }
+            }
+            if let Err(error) = writer.flush() {
+                failure.push_str(&format!("stdout flush: {error}; "));
+            }
+            let complete = failure.is_empty();
+            (failure, complete)
+        })
 }
 
 /// Drain to EOF with bounded capture; truncation/read failure cannot clear errors.
@@ -1039,7 +1134,15 @@ mod native_compile_ownership_tests {
             handle
         }
         fn write_gradle_wrapper(&self, mode: &str) {
-            assert!(["exit", "large-classpath", "oversized-classpath"].contains(&mode));
+            assert!([
+                "exit",
+                "large-classpath",
+                "oversized-classpath",
+                "truncated-classpath",
+                "failed-classpath",
+                "stderr-overflow-classpath",
+            ]
+            .contains(&mode));
             fn batch_path(path: &Path) -> String {
                 let path = path.to_str().unwrap();
                 assert!(!path.contains(['\r', '\n', '"']));
@@ -1084,11 +1187,11 @@ mod native_compile_ownership_tests {
         let dir = PathBuf::from(std::env::var_os("KTLSP_NATIVE_COMPILE_TEST_DIR").unwrap());
         assert!(dir.is_dir());
         std::fs::write(dir.join("fixture-started"), b"resumed").unwrap();
-        if mode == "large-classpath" || mode == "oversized-classpath" {
-            let size = if mode == "large-classpath" {
-                11 * 1024 * 1024
-            } else {
-                crate::classpath::MAX_DUMP_OUTPUT_BYTES + 8192
+        if mode.ends_with("-classpath") {
+            let size: usize = match mode.as_str() {
+                "large-classpath" => 11 * 1024 * 1024,
+                "oversized-classpath" => 65 * 1024 * 1024,
+                _ => 1024,
             };
             let mut output = std::io::BufWriter::new(std::io::stdout().lock());
             writeln!(output, "\nPROJECT\t:head\t{}", dir.display()).unwrap();
@@ -1098,8 +1201,21 @@ mod native_compile_ownership_tests {
             }
             writeln!(output, "END\t:head").unwrap();
             writeln!(output, "PROJECT\t:tail\t{}", dir.display()).unwrap();
-            writeln!(output, "CP\tC:/classpath/tail.jar\nEND\t:tail").unwrap();
+            writeln!(output, "CP\tC:/classpath/tail.jar").unwrap();
+            if mode != "truncated-classpath" {
+                writeln!(output, "END\t:tail").unwrap();
+            }
             output.flush().unwrap();
+            if mode == "failed-classpath" {
+                std::process::exit(7);
+            }
+            if mode == "stderr-overflow-classpath" {
+                let chunk = [b'x'; 8192];
+                for _ in 0..MAX_OUTPUT_BYTES / chunk.len() + 1 {
+                    std::io::stderr().write_all(&chunk).unwrap();
+                }
+                std::io::stderr().flush().unwrap();
+            }
             return;
         }
         if mode == "leaf" || mode == "leaf-natural" {
@@ -1192,23 +1308,38 @@ mod native_compile_ownership_tests {
     }
 
     #[test]
-    fn classpath_accepts_large_complete_dump_but_rejects_oversized_model() {
+    fn classpath_accepts_complete_dump_above_old_memory_cap_with_tail_module() {
         let fixture = Fixture::new();
-        fixture.write_gradle_wrapper("large-classpath");
-        let model = crate::classpath::load_snapshot(&fixture.0, true).unwrap();
-        assert_eq!(model.modules.len(), 2);
-        assert_eq!(model.modules[0].module, ":head");
-        assert_eq!(model.modules[0].entries.len(), 11038);
         let entry = PathBuf::from(format!("C:/classpath/{}.jar", "x".repeat(1024)));
-        assert!(model.modules[0].entries.iter().all(|found| found == &entry));
-        assert_eq!(model.modules[1].module, ":tail");
-        assert_eq!(
-            model.modules[1].entries,
-            vec![PathBuf::from("C:/classpath/tail.jar")]
-        );
-        fixture.write_gradle_wrapper("oversized-classpath");
-        let error = crate::classpath::load_snapshot(&fixture.0, true).unwrap_err();
-        assert!(error.to_string().contains("interrupted or incomplete"));
+        for (mode, expected) in [("large-classpath", 11038), ("oversized-classpath", 65223)] {
+            fixture.write_gradle_wrapper(mode);
+            let model = crate::classpath::load_snapshot(&fixture.0, true).unwrap();
+            assert_eq!(model.modules.len(), 2);
+            assert_eq!(model.modules[0].module, ":head");
+            assert_eq!(model.modules[0].entries.len(), expected);
+            assert!(model.modules[0].entries.iter().all(|found| found == &entry));
+            assert_eq!(model.modules[1].module, ":tail");
+            assert_eq!(
+                model.modules[1].entries,
+                vec![PathBuf::from("C:/classpath/tail.jar")]
+            );
+        }
+    }
+
+    #[test]
+    fn classpath_rejects_partial_blocks_failed_native_exit_and_stderr_overflow() {
+        for (mode, reason) in [
+            ("truncated-classpath", "unfinished PROJECT :tail"),
+            ("failed-classpath", "classpath dump failed"),
+            ("stderr-overflow-classpath", "stderr capture failed"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write_gradle_wrapper(mode);
+            let error = crate::classpath::load_snapshot(&fixture.0, true).unwrap_err();
+            assert!(error.to_string().contains(reason), "{mode}: {error}");
+            assert!(fixture.0.join("fixture-started").is_file());
+            assert!(crate::classpath::snapshot(&fixture.0).is_none());
+        }
     }
 
     #[test]
@@ -1421,6 +1552,107 @@ mod completed_output_tests {
             .join()
             .unwrap();
         assert_eq!(read, ("kept".into(), false));
+    }
+
+    #[test]
+    fn spooled_reader_preserves_bytes_and_drains_after_write_or_flush_failure() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        struct Counted {
+            bytes: std::io::Cursor<Vec<u8>>,
+            count: Arc<AtomicUsize>,
+            interrupted: bool,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let n = self.bytes.read(buffer)?;
+                self.count.fetch_add(n, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        struct Sink {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            fail_write: bool,
+            fail_flush: bool,
+        }
+        impl Write for Sink {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                if self.fail_write {
+                    return Err(std::io::Error::other("fixture write failure"));
+                }
+                self.bytes.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::other("fixture flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut expected = vec![b'x'; 150_000];
+        expected.extend_from_slice(b"\xff\0tail\n");
+        for (fail_write, fail_flush, reason) in [
+            (false, false, ""),
+            (true, false, "stdout write: fixture write failure"),
+            (false, true, "stdout flush: fixture flush failure"),
+        ] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let count = Arc::new(AtomicUsize::new(0));
+            let result = drain_to_file(
+                Counted {
+                    bytes: std::io::Cursor::new(expected.clone()),
+                    count: count.clone(),
+                    interrupted: false,
+                },
+                Sink {
+                    bytes: bytes.clone(),
+                    fail_write,
+                    fail_flush,
+                },
+            )
+            .unwrap()
+            .join()
+            .unwrap();
+            assert_eq!(result.1, !fail_write && !fail_flush);
+            if reason.is_empty() {
+                assert!(result.0.is_empty());
+            } else {
+                assert!(result.0.contains(reason), "{result:?}");
+            }
+            assert_eq!(count.load(Ordering::Relaxed), expected.len());
+            if !fail_write {
+                assert_eq!(*bytes.lock().unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn spooled_reader_reports_read_failure() {
+        struct FailsAfterPrefix(bool);
+        impl Read for FailsAfterPrefix {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("fixture read failure"));
+                }
+                self.0 = true;
+                buffer[..4].copy_from_slice(b"kept");
+                Ok(4)
+            }
+        }
+        let result = drain_to_file(FailsAfterPrefix(false), std::io::sink())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!result.1);
+        assert!(result.0.contains("stdout read: fixture read failure"));
     }
 }
 

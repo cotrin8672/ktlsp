@@ -58,12 +58,12 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Local-extension slice passes 1,248 / 0 failed / 4 ignored; formatting/release native 0 | Current Rust, formatting and release verified | Checkpoint 33: `ktlsp-kotlin-local-extensions-20261011-1/validation-results.json`; bounded/parameterized local receiver constraints remain Unknown |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Gradle streaming slice passes 1,254 / 0 failed / 4 ignored; formatting/release native 0 | Current Rust, formatting and release verified | Checkpoint 35: `ktlsp-gradle-stream-20261012-1/native-build-results.json`; bounded/parameterized local receiver constraints remain Unknown |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Earlier ordinary editor: basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Current path-cache saved Java probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/`. Current narrow probe shuts down cleanly in 0.7201557s (n=1); actual server/client RSS remains unmeasured |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Sixth six-root controls pass 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 and 29/36. Tenth-fixed-2 CEM, Retrofit, Moshi, OkHttp and Spring each pass all 6/6 first-response incomplete requests | Partial; five real roots have focused current results, Gradle unmeasured | [fork-corpus.md](fork-corpus.md) records independent coverage failures. Gradle golden fails readiness after allocation failure; incomplete run was interrupted. A paired useful known receiver is required for negative cases |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Earlier CEM, Retrofit, Moshi and OkHttp each match all 6/6 first-response requests. Current Spring and Gradle each match 6/6; Gradle also matches all 3/3 golden requests after repairing model transport | Partial; focused cases observed on all six roots, wider editing behavior remains open | Checkpoints 33 and 35 and [fork-corpus.md](fork-corpus.md). A paired useful known receiver is required for negative cases; these cases do not establish whole-project parity |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Current Spring reduction repairs four failed requests; real Spring passes all nine original/additional first-response queries, including explicit-this and dangling selectors | Focused repair verified; full-project acceptance partial | Checkpoint 29 below. Real Spring still has ten missing dependency source inputs and a 15-second forced shutdown |
@@ -2264,6 +2264,50 @@ This slice changes only Lua validation and documentation. The checkpoint-33 Rust
 release artifacts remain unchanged; no new Rust behavior or IDEA parity is claimed.
 Next run the existing real Gradle/Spring incomplete manifests, then the real Retrofit
 unsaved Java-to-Kotlin type change and applied rename with compiler/IDEA controls.
+
+### Thirty-fifth checkpoint: stream large Gradle project models
+
+The current Gradle corpus exposed two project-import defects. Its Kotlin DSL treats
+warnings as errors: the embedded init script had a shadowed local name and deprecated
+observer callbacks. A local rename and two scoped suppressions preserve those callbacks
+without changing the project's warning policy. After that fix, an independent native
+Gradle invocation succeeds and emits **112,887,895 bytes**, with **194 PROJECT / 194 END**
+records. The server still discarded the model at its **64 MiB** stdout capture limit.
+The resulting five required completions returned valid empty responses; this is a
+functional import failure, not a timeout-derived analysis score.
+
+Classpath discovery now drains stdout into a unique temporary file and parses it with
+a buffered reader. It retains the existing Windows process ownership and EOF checks;
+read, write, flush, native-exit and protocol failures cannot publish a partial model.
+Strict discovery rejects nested, mismatched and unfinished project blocks. The public
+partial-text parser keeps its existing best-effort behavior. The memory cap is removed
+from model transport; ordinary compiler diagnostic streams remain bounded.
+
+Focused validation passes **4 output**, **36 classpath** and **7 native ownership** tests,
+including a complete **65 MiB** model with a tail module and failed/truncated controls.
+The workspace passes **1,254 tests, zero failures, four ignored**, formatting passes,
+and the release build succeeds. The immutable release is
+`ktlsp-gradle-stream-20261012-1/bin/ktlsp.exe`, SHA256
+`0369a6dd328615056ff34929f904ade03af41de5df472db175df7f51f47f60a1`.
+The same real Gradle project now matches **6/6 incomplete** and **3/3 golden** requests
+on their first valid responses, without retries. Its partial member, dangling dot,
+broken peer and paired known/unknown receiver cases satisfy **13 semantic checks**.
+Java-to-Kotlin constructor completion/navigation and Kotlin-to-Java interface
+navigation satisfy the three golden checks. Edit delivery, restoration and shutdown
+are recorded separately and complete. The last scan reports 11,325 project files and
+57,686 library files; ten failed and twenty-five missing dependency sources remain
+input metadata. Required targets still resolve exactly.
+
+Evidence is under `C:/Users/gummy/AppData/Local/Temp/ktlsp-gradle-stream-20261012-1`
+(`source-freeze.json`, `native-build-results.json`, `binary-receipt.json`,
+`native-results.json` and both `gradle-stream-*/artifacts/corpus-results.json`), with the
+independent native dump and its receipt in `ktlsp-gradle-init-warnings-20261012-1`.
+Temporary disk usage grows with output; the parsed model and its longest record still
+occupy memory. Unix descendant ownership remains unverified, and the current protocol
+cannot detect omitted whole modules after a complete block. This slice does not claim
+whole-project performance or IDEA parity. Next repair the independently reproduced
+Retrofit Java generic/class-literal/extension-property inference gaps, then compare
+useful native completion and memory under matched conditions.
 
 ### Current slice: requires-only compatibility artifacts
 

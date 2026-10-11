@@ -76,9 +76,9 @@ object KtlspCompilerConfiguration {
                 // Serialized arguments omit these configured task inputs.
                 record["source_files"] = listOf(
                     "getSources", "getJavaSources", "getScriptSources\$kotlin_gradle_plugin_common",
-                ).flatMap { getter ->
-                    (read(task, getter) as? FileCollection)?.files
-                        ?: error("Kotlin compiler sources are unavailable: $getter")
+                ).flatMap { sourceGetter ->
+                    (read(task, sourceGetter) as? FileCollection)?.files
+                        ?: error("Kotlin compiler sources are unavailable: $sourceGetter")
                 }.map { it.absolutePath }.distinct().sorted()
                 record["classpath"] = (read(task, "getLibraries") as? FileCollection)?.files
                     ?.map { it.absolutePath } ?: error("Kotlin compiler classpath is unavailable")
@@ -562,6 +562,8 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                         "outputs" to observer.inventory(selected.outputs.files.files.toList())))
                 }
             })
+            // Retain the execution boundary callback on supported older Gradle versions.
+            @Suppress("DEPRECATION")
             graph.addTaskExecutionListener(object : org.gradle.api.execution.TaskExecutionListener {
                 override fun beforeExecute(task: Task) {
                     val record = linkedMapOf<String, Any?>("task" to task.path, "type" to task.javaClass.name)
@@ -578,6 +580,7 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                     observer.event("task-end", record)
                 }
             })
+            @Suppress("DEPRECATION")
             gradle.buildFinished(object : Action<org.gradle.BuildResult> {
                 override fun execute(result: org.gradle.BuildResult) {
                     observer.event("build-finished", linkedMapOf("failure" to result.failure?.toString(),

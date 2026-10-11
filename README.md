@@ -274,6 +274,10 @@ and unknown receivers without saving source. Changes and restoration require out
 each query uses one response after Neovim's flush. Negative unknown cases also require a useful
 known receiver in the same edited state. [dev/corpus](dev/corpus/README.md) includes these controls.
 See [the corpus record](docs/fork-corpus.md) for pinned projects, candidate probes and remaining coverage.
+The `gradle-8.14.3.json` and `gradle-8.14.3-incomplete.json` manifests cover Java/Kotlin
+navigation and unfinished editing after importing the real Gradle project. Discovery
+streams large model output through a temporary file and rejects incomplete project
+blocks; it also supports this project's Kotlin DSL warnings-as-errors policy.
 Spring extension-receiver and incomplete-selector regressions use the same route with
 `dev/corpus/fixtures/spring-provider` and the two `spring-provider-reduction*.json` manifests.
 `spring-extensions-editing.json` adds unsaved cases against the pinned real Spring root;

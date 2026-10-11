@@ -8,7 +8,7 @@
 //! Pure parsing (`parse_dump`) is unit-tested; `resolve` does the gradle process IO.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -572,23 +572,67 @@ pub fn publish_snapshot(root: &Path, model: Arc<ProjectSnapshot>) {
 ///   CP	<absolute entry>            (repeated)
 ///   UNRESOLVED	<selector>	<problem> (lenient-resolution drops, repeated)
 ///   END	<gradle path>
-/// Lines outside a PROJECT/END block (gradle chatter) are ignored. A block missing its END is still
-/// returned (best-effort), since the entries are already complete by then.
+/// This best-effort helper retains unfinished blocks for callers inspecting partial text. Native
+/// discovery uses the strict streaming parser and never accepts an unfinished or mismatched block.
 ///
 /// `UNRESOLVED` lines are produced from `ResolutionResult` (a CC-compatible `Provider`) by
 /// iterating dependency edges for `UnresolvedDependencyResult` entries.
 pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
+    parse_dump_reader(output.as_bytes(), false).unwrap_or_default()
+}
+
+fn parse_dump_reader(
+    mut reader: impl BufRead,
+    require_complete: bool,
+) -> anyhow::Result<Vec<ModuleClasspath>> {
     let mut out = Vec::new();
     let mut current: Option<ModuleClasspath> = None;
-    for line in output.lines() {
-        let mut parts = line.split('\t');
-        match parts.next() {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let mut parts = line.trim_end_matches(['\r', '\n']).split('\t');
+        let record = parts.next();
+        anyhow::ensure!(
+            !require_complete
+                || current.is_some()
+                || !matches!(
+                    record,
+                    Some(
+                        "BUILD"
+                            | "SOURCESET"
+                            | "SOURCE"
+                            | "OUTPUT"
+                            | "PROVIDES"
+                            | "SCP"
+                            | "ARTIFACT"
+                            | "SUNRESOLVED"
+                            | "INCOMPLETE"
+                            | "COMPILER"
+                            | "CP"
+                            | "UNRESOLVED"
+                    )
+                ),
+            "record outside PROJECT in classpath dump"
+        );
+        match record {
             Some("PROJECT") => {
+                anyhow::ensure!(
+                    !require_complete || current.is_none(),
+                    "nested PROJECT before matching END in classpath dump"
+                );
                 if let Some(done) = current.take() {
                     out.push(done);
                 }
                 let module = parts.next().unwrap_or("").to_string();
                 let dir = parts.next().unwrap_or("");
+                anyhow::ensure!(
+                    !require_complete
+                        || (!module.is_empty() && !dir.is_empty() && parts.next().is_none()),
+                    "invalid PROJECT record in classpath dump"
+                );
                 if !module.is_empty() {
                     current = Some(ModuleClasspath {
                         module,
@@ -709,6 +753,15 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
                 }
             }
             Some("END") => {
+                if require_complete {
+                    anyhow::ensure!(
+                        current.as_ref().is_some_and(|module| {
+                            parts.next() == Some(module.module.as_str()) && parts.next().is_none()
+                        }),
+                        "END does not match PROJECT in classpath dump"
+                    );
+                    anyhow::ensure!(line.ends_with('\n'), "unterminated END in classpath dump");
+                }
                 if let Some(done) = current.take() {
                     out.push(done);
                 }
@@ -717,9 +770,15 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
         }
     }
     if let Some(done) = current.take() {
+        anyhow::ensure!(
+            !require_complete,
+            "unfinished PROJECT {} in classpath dump",
+            done.module
+        );
         out.push(done);
     }
-    out
+    // shortcut: omitted whole blocks are undetectable, add a dump marker when subset discovery must be ruled out.
+    Ok(out)
 }
 
 /// Build files whose mtimes invalidate the cache.
@@ -990,10 +1049,6 @@ fn log_unresolved(modules: &[ModuleClasspath]) {
     );
 }
 
-#[cfg(windows)]
-// The accepted 194-module Gradle model needs over 43 MiB just for classpath/artifact records.
-pub(crate) const MAX_DUMP_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
-
 /// Run the init script via the project's gradle wrapper and parse the dump. Inherits the parent's
 /// environment (so repo-specific flags like SKIP_* are honored when ktlsp is launched with them).
 /// `offline` passes `--offline`: resolution then depends only on the local Gradle cache, which is
@@ -1029,28 +1084,46 @@ fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<Module
         command.arg("--offline");
     }
     #[cfg(windows)]
-    let (status, stdout, stderr) = {
-        command.arg("--no-daemon");
-        let (status, interrupted, stdout, stdout_complete, stderr, stderr_complete) =
-            crate::compile::OwnedNativeCompile::spawn(&mut command, MAX_DUMP_OUTPUT_BYTES)?
-                .wait(crate::compile::COMPILE_TIMEOUT, None);
-        if interrupted || !stdout_complete || !stderr_complete {
-            anyhow::bail!("gradle classpath dump interrupted or incomplete:\n{stderr}");
-        }
-        (status, stdout, stderr)
-    };
-    #[cfg(not(windows))]
-    let output = command.output()?;
-    #[cfg(not(windows))]
-    let (status, stdout, stderr) = (
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    command.arg("--no-daemon");
+    let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stdout_path = std::env::temp_dir().join(format!(
+        "ktlsp-classpath-{}-{nonce}-{sequence}.stdout",
+        std::process::id()
+    ));
+    let mut stdout = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)?;
+    let _stdout_guard = TempFile(&stdout_path);
+    let (status, interrupted, stdout_failure, stdout_complete, stderr, stderr_complete) =
+        crate::compile::run_with_stdout_file(&mut command, stdout.try_clone()?)?;
+    if interrupted {
+        anyhow::bail!(
+            "gradle classpath dump interrupted by deadline or owned-tree cleanup:\n{stderr}"
+        );
+    }
+    if !stdout_complete {
+        let stdout_failure = if stdout_failure.is_empty() {
+            "stdout reader did not complete"
+        } else {
+            &stdout_failure
+        };
+        anyhow::bail!("gradle classpath stdout capture failed: {stdout_failure}");
+    }
+    if !stderr_complete {
+        anyhow::bail!("gradle classpath stderr capture failed or exceeded diagnostic limit");
+    }
     if !status.success() {
         anyhow::bail!("gradle classpath dump failed ({}):\n{}", status, stderr);
     }
-    let modules = parse_dump(&stdout);
+    stdout.rewind()?;
+    let modules = parse_dump_reader(BufReader::new(stdout), true)
+        .map_err(|error| anyhow::anyhow!("invalid gradle classpath dump: {error}"))?;
     if modules.is_empty() {
         anyhow::bail!(
             "classpath dump produced no modules (is this a gradle project with compileClasspath?)"
@@ -1633,11 +1706,72 @@ END\t:lib\n";
     }
 
     #[test]
-    fn parse_block_without_end_is_flushed() {
+    fn best_effort_parse_block_without_end_is_flushed() {
         let dump = "PROJECT\t:lib\t/abs/lib\nCP\t/jars/a.jar\n";
         let m = parse_dump(dump);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].entries, vec![PathBuf::from("/jars/a.jar")]);
+    }
+
+    #[test]
+    fn strict_streaming_parser_rejects_partial_or_mismatched_blocks_after_complete_prefix() {
+        let head = "PROJECT\t:head\t/head\nCP\t/head.jar\nEND\t:head\n";
+        for tail in [
+            "PROJECT\t:tail\t/tail\nCP\t/tail.jar\n",
+            "PROJECT\t:tail\t/tail\nEND\t:other\n",
+            "PROJECT\t:tail\t/tail\nPROJECT\t:nested\t/nested\nEND\t:nested\n",
+            "END\t:head\n",
+            "CP\t/orphan.jar\n",
+            "PROJECT\t\t/tail\nEND\t\n",
+            "PROJECT\t:tail\t\nEND\t:tail\n",
+            "PROJECT\t:tail\t/tail\nEND\t:tail\textra\n",
+            "PROJECT\t:tail\t/tail\nEND\t:tail",
+        ] {
+            let text = format!("{head}{tail}");
+            let reader = BufReader::with_capacity(3, text.as_bytes());
+            assert!(parse_dump_reader(reader, true).is_err(), "{tail:?}");
+        }
+        let reader = BufReader::with_capacity(3, head.as_bytes());
+        let modules = parse_dump_reader(reader, true).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].entries, [PathBuf::from("/head.jar")]);
+    }
+
+    #[test]
+    fn strict_streaming_parser_preserves_large_compiler_records_across_buffers() {
+        let mut compiler = plain_java_configuration();
+        compiler["declared_input_files"] = serde_json::json!([]);
+        compiler["declared_output_roots"] = serde_json::json!([]);
+        compiler["arguments"] = serde_json::json!(["-P", "路\t\n".repeat(150_000)]);
+        let dump = format!(
+            "chatter\r\nPROJECT\t:app\t/app\r\nCOMPILER\tmain\t{compiler}\r\nEND\t:app\r\n"
+        );
+        let reader = BufReader::with_capacity(17, dump.as_bytes());
+        let modules = parse_dump_reader(reader, true).unwrap();
+        assert_eq!(modules.len(), 1);
+        let task = &modules[0].source_sets[0].compiler_tasks[0];
+        assert_eq!(serde_json::to_value(task).unwrap(), compiler);
+    }
+
+    #[test]
+    fn strict_streaming_parser_reports_read_and_utf8_errors_after_complete_prefix() {
+        use std::io::Read;
+        struct FailsAtEof(std::io::Cursor<&'static [u8]>);
+        impl Read for FailsAtEof {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.read(buffer)? {
+                    0 => Err(std::io::Error::other("fixture read failure")),
+                    n => Ok(n),
+                }
+            }
+        }
+        let head = b"PROJECT\t:head\t/head\nEND\t:head\n";
+        let reader = BufReader::with_capacity(3, FailsAtEof(std::io::Cursor::new(head)));
+        let error = parse_dump_reader(reader, true).unwrap_err();
+        assert!(error.to_string().contains("fixture read failure"));
+        let mut invalid = head.to_vec();
+        invalid.extend_from_slice(b"\xff\n");
+        assert!(parse_dump_reader(BufReader::new(invalid.as_slice()), true).is_err());
     }
 
     #[test]

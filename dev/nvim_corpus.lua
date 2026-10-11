@@ -195,7 +195,7 @@ local function finish()
     or ((semantic.unmeasured > 0 or not_run > 0) and 'incomplete') or 'passed'
   operations.status = (#operations.failures == 0 and unavailable == 0) and 'complete' or 'incomplete'
   local coverage = { observed = index_state.libraries and index_state.failed ~= nil and index_state.missing_sources ~= nil,
-    project_files = index_state.project_files or vim.NIL, library_files = index_state.library_files or vim.NIL,
+    project_files_in_last_scan = index_state.project_files or vim.NIL, library_files = index_state.library_files or vim.NIL,
     failed = index_state.failed or vim.NIL, missing_sources = index_state.missing_sources or vim.NIL }
   local status = semantic.status == 'failed' and 'failed'
     or ((semantic.status ~= 'passed' or operations.status ~= 'complete') and 'incomplete') or 'passed'
