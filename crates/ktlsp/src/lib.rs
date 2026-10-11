@@ -27,6 +27,7 @@ pub mod rename;
 pub mod salsa_support;
 pub mod semantic_query;
 pub mod sidecar;
+mod source_encoding;
 pub mod telemetry;
 pub mod trace;
 pub mod trust;

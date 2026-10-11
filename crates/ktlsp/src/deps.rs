@@ -37,6 +37,7 @@ use crate::java::JavaParser;
 use crate::language::{self, SourceLanguage};
 use crate::parser::KotlinParser;
 use crate::project_model::{FileOrigin, SourceRepresentation};
+use crate::source_encoding::{JavaSourceEncoding, SourceTextPolicy};
 use crate::symbol::IndexedSymbol;
 
 /// One file's worth of indexed symbols, keyed by its stable on-disk path (the goto target is
@@ -60,16 +61,24 @@ pub struct LibrarySource {
     jar: Option<PathBuf>,
     fingerprint: Option<String>,
     origin_id: String,
+    policy: Result<SourceTextPolicy, String>,
 }
 
 impl LibrarySource {
     pub fn identity(&self) -> String {
-        if let Some(fingerprint) = &self.fingerprint {
+        let original = if let Some(fingerprint) = &self.fingerprint {
             format!("jar:{fingerprint}")
         } else if let Some(jar) = &self.jar {
             format!("jar:{}", jar.to_string_lossy())
         } else {
             format!("extracted:{}", self.dest.to_string_lossy())
+        };
+        match &self.policy {
+            Ok(policy) => format!("source:{}", policy.cache_key(&original)),
+            Err(reason) => format!(
+                "invalid-source:{:x}",
+                Sha256::digest(format!("{original}:{reason}"))
+            ),
         }
     }
 }
@@ -669,7 +678,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v21-source-member-availability";
+const SYMCACHE_VERSION: &[u8] = b"v22-source-member-availability-encoding-policy";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -744,17 +753,32 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
 struct SourceJarMarker {
     jar: PathBuf,
     fingerprint: String,
+    policy: SourceTextPolicy,
 }
 
 /// Discard materialized text when its source identity changes, including legacy path-only markers.
 fn prepare_lazy_source_dir(jar: &Path, dest: &Path, fingerprint: &str) -> bool {
-    if jar_fingerprint(jar).as_deref() != Some(fingerprint) {
+    prepare_lazy_source_dir_with_policy(jar, dest, fingerprint, &SourceTextPolicy::default())
+}
+
+fn discard_lazy_source_dir(dest: &Path) -> bool {
+    !dest.exists() || fs::remove_dir_all(dest).is_ok()
+}
+
+fn prepare_lazy_source_dir_with_policy(
+    jar: &Path,
+    dest: &Path,
+    fingerprint: &str,
+    policy: &SourceTextPolicy,
+) -> bool {
+    if jar_fingerprint(jar).as_deref() != Some(fingerprint) || policy.validate().is_err() {
         return false;
     }
     let marker = dest.join(SOURCE_JAR_MARKER);
     let expected = SourceJarMarker {
         jar: jar.to_path_buf(),
         fingerprint: fingerprint.to_string(),
+        policy: policy.clone(),
     };
     if fs::read(&marker)
         .ok()
@@ -763,7 +787,7 @@ fn prepare_lazy_source_dir(jar: &Path, dest: &Path, fingerprint: &str) -> bool {
     {
         return true;
     }
-    if dest.exists() && fs::remove_dir_all(dest).is_err() {
+    if !discard_lazy_source_dir(dest) {
         return false;
     }
     if fs::create_dir_all(dest).is_err() {
@@ -788,13 +812,23 @@ pub fn materialize_source_file(path: &Path) -> bool {
         let Ok(marker) = serde_json::from_slice::<SourceJarMarker>(&bytes) else {
             return false;
         };
-        if jar_fingerprint(&marker.jar).as_deref() != Some(marker.fingerprint.as_str()) {
+        if jar_fingerprint(&marker.jar).as_deref() != Some(marker.fingerprint.as_str())
+            || marker.policy.validate().is_err()
+        {
+            let _ = fs::remove_file(path);
             return false;
         }
-        let extracted = jar::extract_source_file(&marker.jar, source_dir, path)
-            .inspect_err(|error| tracing::warn!("materialize {} failed: {error}", path.display()))
-            .unwrap_or(false);
-        if jar_fingerprint(&marker.jar).as_deref() != Some(marker.fingerprint.as_str()) {
+        let extracted = jar::extract_source_file_with_encoding(
+            &marker.jar,
+            source_dir,
+            path,
+            marker.policy.java,
+        )
+        .inspect_err(|error| tracing::warn!("materialize {} failed: {error}", path.display()))
+        .unwrap_or(false);
+        if jar_fingerprint(&marker.jar).as_deref() != Some(marker.fingerprint.as_str())
+            || marker.policy.validate().is_err()
+        {
             let _ = fs::remove_file(path);
             return false;
         }
@@ -850,11 +884,12 @@ fn parse_dir(
 fn parse_source_jar(
     jar_path: &Path,
     dest: &Path,
+    java_encoding: JavaSourceEncoding,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
     let mut out = Vec::new();
-    jar::visit_sources(jar_path, dest, |path, text| {
+    jar::visit_sources_with_encoding(jar_path, dest, java_encoding, |path, text| {
         if let Some(file) = parse_source_file(path, text, kotlin, java) {
             out.push(file);
         }
@@ -889,13 +924,16 @@ pub fn coordinate_source(
     repos: &Repos,
     extract_root: &Path,
 ) -> Option<LibrarySource> {
+    if Coordinate::parse(&coord.label()).as_ref() != Some(coord) {
+        return None;
+    }
     let dest = extract_root
         .join(&coord.group)
         .join(&coord.artifact)
         .join(&coord.version);
 
-    let jar = match artifacts::sources_jar(repos, coord) {
-        Ok(Some(jar)) => Some(jar),
+    let jar = match artifacts::selected_sources_jar(repos, coord) {
+        Ok(Some(selected)) => Some(selected),
         Ok(None) => None,
         Err(e) => {
             tracing::warn!("resolve {} failed: {e}", coord.label());
@@ -903,7 +941,7 @@ pub fn coordinate_source(
         }
     };
 
-    let Some(jar) = jar else {
+    let Some((selected, jar)) = jar else {
         // A lazy directory may contain only a marker or a materialized subset, not the library.
         return (dest.is_dir() && !dest.join(SOURCE_JAR_MARKER).exists()).then_some(
             LibrarySource {
@@ -911,16 +949,25 @@ pub fn coordinate_source(
                 jar: None,
                 fingerprint: None,
                 origin_id: crate::classpath::maven_origin_id(coord),
+                policy: Ok(SourceTextPolicy::default()),
             },
         );
     };
 
     let fingerprint = jar_fingerprint(&jar);
+    let policy = SourceTextPolicy::resolve(&selected, |c| artifacts::cached_pom_files(repos, c))
+        .map_err(|error| {
+            format!(
+                "source encoding metadata for {}: {error:#}",
+                selected.label()
+            )
+        });
     Some(LibrarySource {
         dest,
         jar: Some(jar),
         fingerprint,
         origin_id: crate::classpath::maven_origin_id(coord),
+        policy,
     })
 }
 
@@ -956,6 +1003,23 @@ fn resolve_library_source_unowned(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    let policy = match &source.policy {
+        Ok(policy) => policy,
+        Err(reason) => {
+            anyhow::ensure!(
+                discard_lazy_source_dir(&source.dest),
+                "discard stale source text failed"
+            );
+            anyhow::bail!("{reason}");
+        }
+    };
+    if let Err(error) = policy.validate() {
+        anyhow::ensure!(
+            discard_lazy_source_dir(&source.dest),
+            "discard stale source text failed"
+        );
+        return Err(error);
+    }
     let Some(jar) = &source.jar else {
         return parse_dir(&source.dest, kotlin, java);
     };
@@ -964,7 +1028,7 @@ fn resolve_library_source_unowned(
         .fingerprint
         .as_deref()
         .context("source archive identity unavailable")?;
-    if !prepare_lazy_source_dir(jar, &source.dest, archive_fingerprint) {
+    if !prepare_lazy_source_dir_with_policy(jar, &source.dest, archive_fingerprint, policy) {
         anyhow::bail!(
             "prepare lazy source directory {} failed",
             source.dest.display()
@@ -972,23 +1036,25 @@ fn resolve_library_source_unowned(
     }
 
     // Local companion sources retain the binary-origin cache partition and extraction path.
-    let fingerprint = cache_fingerprint.unwrap_or(archive_fingerprint);
+    let fingerprint = policy.cache_key(cache_fingerprint.unwrap_or(archive_fingerprint));
     // Symbol cache: a hit skips the (dominant) parse cost entirely.
-    if let Some(cached) = symcache_load(fingerprint, &source.dest) {
+    if let Some(cached) = symcache_load(&fingerprint, &source.dest) {
         anyhow::ensure!(
             jar_fingerprint(jar).as_deref() == Some(archive_fingerprint),
             "source archive {} changed while loading cached symbols",
             jar.display()
         );
+        policy.validate()?;
         return Ok(cached);
     }
-    let symbols = parse_source_jar(jar, &source.dest, kotlin, java)?;
+    let symbols = parse_source_jar(jar, &source.dest, policy.java, kotlin, java)?;
     anyhow::ensure!(
         jar_fingerprint(jar).as_deref() == Some(archive_fingerprint),
         "source archive {} changed while parsing symbols",
         jar.display()
     );
-    symcache_store(fingerprint, &symbols);
+    policy.validate()?;
+    symcache_store(&fingerprint, &symbols);
     Ok(symbols)
 }
 
@@ -1057,6 +1123,7 @@ pub fn resolve_local_jar_stubs_for_origin(
             fingerprint: jar_fingerprint(&sources),
             jar: Some(sources),
             origin_id: origin_id.to_string(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         (
             resolve_library_source_unowned(&source, Some(&fingerprint), kotlin, java)?,
@@ -1881,14 +1948,19 @@ fn extract_sources_by_suffix(
             continue;
         };
         let path = dest.join(enclosed);
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut target) = fs::File::create(&path) {
-            if std::io::copy(&mut entry, &mut target).is_ok() {
+        let read =
+            jar::read_source_text(&mut entry, 8192, Path::new(&name), JavaSourceEncoding::Utf8);
+        match read.and_then(|text| {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            jar::write_source_text(&path, &text)
+        }) {
+            Ok(()) => {
                 remaining.remove(&suffix);
                 out.push(path);
             }
+            Err(error) => tracing::warn!("extract source seed {name} failed: {error:#}"),
         }
     }
     crate::trace::span(
@@ -1963,6 +2035,7 @@ mod tests {
             jar: Some(jar.clone()),
             fingerprint: None,
             origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -2041,6 +2114,7 @@ mod tests {
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
             origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -2083,6 +2157,7 @@ mod tests {
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
             origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -2447,6 +2522,7 @@ public interface ExecutorService {
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
             origin_id: "maven:vendor:api:1".to_string(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -2569,6 +2645,7 @@ public interface ExecutorService {
             jar: None,
             fingerprint: None,
             origin_id: "test-extracted-library".into(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -2622,6 +2699,7 @@ public interface ExecutorService {
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
             origin_id: "test-library".into(),
+            policy: Ok(SourceTextPolicy::default()),
         };
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -2635,7 +2713,14 @@ public interface ExecutorService {
                 "the actual decode failure must be reached: {reason}"
             );
             assert!(!symcache_dir()
-                .join(format!("{}.zst", source.fingerprint.as_ref().unwrap()))
+                .join(format!(
+                    "{}.zst",
+                    source
+                        .policy
+                        .as_ref()
+                        .unwrap()
+                        .cache_key(source.fingerprint.as_ref().unwrap())
+                ))
                 .exists());
             assert!(
                 resolve_jdk_sources(&jar, &tmp.join("extract/jdk"), &mut kotlin, &mut java)
@@ -3306,5 +3391,234 @@ worktree = "com.example:worktree:9.9"
         fs::create_dir_all(&root).unwrap();
         assert_eq!(gradle_root(&root), None);
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn source_encoding_policy_only_changes_invalidate_lazy_text_and_warm_symbols() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_encoding_policy_refresh_{}",
+            std::process::id()
+        ));
+        let repos = Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let coordinate = coord("fixture:encoding:1");
+        let base = repos.m2.join("fixture/encoding/1");
+        fs::create_dir_all(&base).unwrap();
+        let archive = base.join("encoding-1-sources.jar");
+        let pom = base.join("encoding-1.pom");
+        let raw = "// Bj\u{f6}rn\npackage api; public class Useful { public void target() {} }\n";
+        write_sources_jar(&archive, &[("api/Useful.java", raw)]);
+        let archive_identity = jar_fingerprint(&archive).unwrap();
+        let metadata = |encoding| {
+            format!("<project><groupId>fixture</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")
+        };
+        fs::write(&pom, metadata("UTF-8")).unwrap();
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let extract = root.join("extracted");
+        let first = coordinate_source(&coordinate, &repos, &extract).unwrap();
+        let first_key = first
+            .policy
+            .as_ref()
+            .unwrap()
+            .cache_key(first.fingerprint.as_ref().unwrap());
+        let mut file = None;
+        for _ in 0..2 {
+            let batches = resolve_library_source(&first, &mut kotlin, &mut java).unwrap();
+            assert_eq!(batches.len(), 1);
+            file = Some(PathBuf::from(&batches[0].file));
+            assert!(batches[0]
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "target"));
+        }
+        let file = file.unwrap();
+        assert!(symcache_dir().join(format!("{first_key}.zst")).exists());
+        assert!(materialize_source_file(&file));
+        assert_eq!(fs::read_to_string(&file).unwrap(), raw);
+        fs::write(&pom, metadata("ISO-8859-1")).unwrap();
+        assert_eq!(
+            jar_fingerprint(&archive).unwrap(),
+            archive_identity,
+            "only metadata changed"
+        );
+        assert!(
+            !materialize_source_file(&file),
+            "captured metadata cannot silently change decoding"
+        );
+        assert!(
+            !file.exists(),
+            "stale text must not survive metadata rejection"
+        );
+        assert!(resolve_library_source(&first, &mut kotlin, &mut java).is_err());
+        let second = coordinate_source(&coordinate, &repos, &extract).unwrap();
+        assert_ne!(first.identity(), second.identity());
+        let expected = raw
+            .as_bytes()
+            .iter()
+            .copied()
+            .map(char::from)
+            .collect::<String>();
+        for _ in 0..2 {
+            let batches = resolve_library_source(&second, &mut kotlin, &mut java).unwrap();
+            let member = batches[0]
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == "target")
+                .unwrap();
+            assert_eq!(&expected[member.start_byte..member.end_byte], "target");
+            assert!(materialize_source_file(&file));
+            assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        }
+        // Pre-policy markers must not retain text decoded under an unknown policy.
+        fs::write(
+            second.dest.join(SOURCE_JAR_MARKER),
+            serde_json::to_vec(
+                &serde_json::json!({"jar": archive, "fingerprint": archive_identity}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&file, "stale legacy file").unwrap();
+        resolve_library_source(&second, &mut kotlin, &mut java).unwrap();
+        assert!(!file.exists());
+        assert!(materialize_source_file(&file));
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        fs::write(&pom, metadata("Windows-1252")).unwrap();
+        let unsupported = coordinate_source(&coordinate, &repos, &extract).unwrap();
+        let reason = resolve_library_source(&unsupported, &mut kotlin, &mut java)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(reason.contains("source encoding metadata"), "{reason}");
+        assert!(!file.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_encoding_uses_selected_jvm_gav_not_requested_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_encoding_selected_jvm_{}",
+            std::process::id()
+        ));
+        let repos = Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let requested = coord("fixture:encoding:1");
+        for (artifact, encoding) in [("encoding", "UTF8"), ("encoding-jvm", "ISO-8859-1")] {
+            let base = repos.m2.join(format!("fixture/{artifact}/1"));
+            fs::create_dir_all(&base).unwrap();
+            fs::write(base.join(format!("{artifact}-1.pom")), format!("<project><groupId>fixture</groupId><artifactId>{artifact}</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")).unwrap();
+        }
+        let archive = repos
+            .m2
+            .join("fixture/encoding-jvm/1/encoding-jvm-1-sources.jar");
+        let payload = b"// Bj\xf6rn\npackage api; public class Useful {}\n";
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        writer
+            .start_file("api/Useful.java", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(payload).unwrap();
+        writer.finish().unwrap();
+        let source = coordinate_source(&requested, &repos, &root.join("extracted")).unwrap();
+        assert_eq!(source.jar.as_ref(), Some(&archive));
+        assert_eq!(
+            source.policy.as_ref().unwrap().java,
+            JavaSourceEncoding::Iso88591
+        );
+        let batches =
+            resolve_library_source(&source, &mut KotlinParser::new(), &mut JavaParser::new())
+                .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert!(materialize_source_file(Path::new(&batches[0].file)));
+        assert_eq!(
+            fs::read_to_string(&batches[0].file).unwrap(),
+            payload.iter().copied().map(char::from).collect::<String>()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_encoding_suffix_seed_never_publishes_invalid_utf8_or_bad_crc() {
+        let root = std::env::temp_dir().join(format!("ktlsp_encoding_seed_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("src.zip");
+        let dest = root.join("seed");
+        let payload = b"// invalid \xff\nclass Bad {}\n";
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        writer
+            .start_file(
+                "java.base/api/Bad.java",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(payload).unwrap();
+        writer.finish().unwrap();
+        let suffixes = BTreeSet::from(["api/Bad.java".into()]);
+        assert!(extract_sources_by_suffix(&archive, &dest, &suffixes).is_empty());
+        assert!(!dest.join("java.base/api/Bad.java").exists());
+        let mut bytes = fs::read(&archive).unwrap();
+        let position = bytes
+            .windows(payload.len())
+            .position(|part| part == payload)
+            .unwrap();
+        bytes[position + payload.len() - 1] ^= 1;
+        fs::write(&archive, bytes).unwrap();
+        assert!(extract_sources_by_suffix(&archive, &dest, &suffixes).is_empty());
+        assert!(!dest.join("java.base/api/Bad.java").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn coordinate_source_rejects_unsafe_fields_before_legacy_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_coordinate_boundary_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let extract = root.join("extracted");
+        fs::create_dir_all(&extract).unwrap();
+        let outside = root.join("outside").join("fixture").join("1");
+        fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel.txt");
+        fs::write(&sentinel, "must remain intact").unwrap();
+        let repos = Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+
+        let valid = coord("fixture:library:1+build");
+        let valid_dest = extract
+            .join(&valid.group)
+            .join(&valid.artifact)
+            .join(&valid.version);
+        fs::create_dir_all(&valid_dest).unwrap();
+        assert!(coordinate_source(&valid, &repos, &extract).is_some());
+
+        let unsafe_coordinate = Coordinate {
+            group: "../outside".into(),
+            artifact: "fixture".into(),
+            version: "1".into(),
+        };
+        assert!(Coordinate::parse(&unsafe_coordinate.label()).is_none());
+        assert!(coordinate_source(&unsafe_coordinate, &repos, &extract).is_none());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "must remain intact");
+        // This probe never passes the returned location to resolve_library_source or removes it.
+        fs::remove_file(&sentinel).unwrap();
     }
 }

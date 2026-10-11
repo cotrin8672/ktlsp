@@ -41,9 +41,9 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Seventeenth-fixed-1 passes 1,076 tests / 3 ignored across 40 suites, native exit 0; all 307 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/seventeenth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Eleventh-fixed-2 Java passes 191/196, including all 17 bare-call and earlier override controls. Five missing diagnostics remain. Tenth-fixed-2 library source lifecycle passes 13/13 | Partial; current ordinary editor slice verified, diagnostic coverage still failing | `ktlsp-goal-20261010/eleventh2-java-1/` and `tenth2-library-1/`. Preserve unknown competitors and inherited overloads. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
-| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Sixteenth preserves plus-version coordinates and indexes 101 dependencies. All four strict first-response completion/goto assertions pass, and actual blank-super popup acceptance produces a compiler-valid whole buffer. One failed archive and two missing sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-sixteenth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides and performance remain |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentieth-fixed-1 passes 1,097 tests / 3 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentieth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Eleventh-fixed-2 Java passes 191/196, including all 17 bare-call and earlier override controls. Five missing diagnostics remain. Eighteenth library source lifecycle passes 13/13 | Partial; current library editing verified, diagnostic coverage still failing | `ktlsp-goal-20261010/eleventh2-java-1/` and `ktlsp-library-eighteenth-replay-20261011/receipt.json`. Library shutdown acknowledgement is unmeasured. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
+| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
 | Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Sixth six-root controls pass 15/30 cases and 18/36 qualified requests; IDEA passes 24/30 and 29/36. Tenth-fixed-2 CEM, Retrofit, Moshi, OkHttp and Spring each pass all 6/6 first-response incomplete requests | Partial; five real roots have focused current results, Gradle unmeasured | [fork-corpus.md](fork-corpus.md) records independent coverage failures. Gradle golden fails readiness after allocation failure; incomplete run was interrupted. A paired useful known receiver is required for negative cases |
@@ -1326,6 +1326,150 @@ after an index revision, rather than on every request. Raw proofs are
 `ktlsp-index-snapshot-cow-measurement-20261011/{sixteenth-before-1,
 seventeenth-after-1}/receipt.json`; implementation and runtime RED evidence are
 in `implementation-1/source-stable-receipt.json` in that directory.
+
+### Eighteenth checkpoint: declared source encoding and real CEM regression
+
+Java source archives now use an exact UTF-8 or ISO-8859-1 decoder selected from
+cached published POM declarations and their static parent/property chain. This
+does not run Maven or establish an effective compiler/plugin model. XML and
+metadata work have explicit size/depth limits; archive CRC errors, unsupported
+encoding declarations and uncertain conditional declarations remain errors.
+Kotlin and JDK source stay strict UTF-8. Policy receipts include exact GAVs and
+POM content hashes in symbol-cache and lazy-materialization identities. Published
+POM fixtures preserve their raw bytes through a narrow Git attribute.
+
+The integrated focused suite passes 74 checks with one existing download case
+ignored. Eighteenth-fixed-1 passes formatting, 1,091 workspace tests with three
+ignored and both release builds, with all 312 input guards unchanged. Server
+SHA-256 is `abe40648e15965e56762e3b43a793d96bf1e3d8c30d8f16d00575cfa86f27b41`.
+The actual library editor replay passes 13 source/JDK lifecycle assertions,
+including unsaved rename/delete and closed-buffer restoration. That existing
+scenario does not capture a normal shutdown acknowledgement; it is unmeasured.
+
+The fresh CEM replay retains the original four assertions and adds three first
+responses for incomplete/complete `TarArchiveOutputStream.getBytesWritten()`.
+All seven pass after actual unsaved delivery. The selected 1.26.0 source is
+materialized losslessly as UTF-8, with exact whole-file hash and UTF-16 range
+433:16-31. Independent Java/Kotlin clients compile against the actual selected
+binary and each emit the expected `getBytesWritten:()J` call. Native popup
+acceptance again captures the entire 85-line Kotlin buffer verbatim; compilation
+and the exact `DrillBlockEntity.getBreakSpeed:()F` invocation both pass.
+
+All 17 CEM semantic/UI/guard conditions pass, with acknowledged shutdown and
+native exit zero for both clients. Strict corpus exit remains **1**: missing
+Patchy and KotlinForForge sources remain, and Guava 32.1.2-jre plus Commons Codec
+1.16.0 now fail metadata admission. Guava has an interpolated JVM boot-classpath
+argument; Codec's parent repeats unrelated release-manager properties. Neither
+failure is hidden by the seven useful responses. Library coverage is 35,321
+files / 827,622 symbols, with two failed and two missing inputs. Next resolve
+only the selected encoding declaration closure, preserving ambiguous encodings
+and argument-boundary controls. Policy arrival watching, existing-file fast
+paths and concurrent materialization remain separate limitations.
+
+Evidence: `ktlsp-source-encoding-20261011/live-integration-1/`,
+`ktlsp-goal-20261010/eighteenth-fixed-1/`,
+`ktlsp-library-eighteenth-replay-20261011/`,
+`ktlsp-cem-compress-compiler-20261011/native-1/result.json` and
+`ktlsp-cem-eighteenth-fixed-1-20261011/`. This is not six-root IDEA, latency,
+generated-API or game-runtime acceptance.
+
+Compiled-member admission remains unimplemented in the normal server. A separate
+Temp observer ran nine actual Gradle invocations: four successful selected-Java
+task results have an independently checked Lombok `getName(): String`; five
+expected failures remain inadmissible, including failure after valid classfiles
+were emitted, disabled processing and an ancestor `lombok.config` change.
+Kotlin `String` to `Int` changes are captured in Java's ordered classpath after
+the upstream task finishes. All owned processes exited and fixture guards match.
+This proves the fixture's observed read set, not arbitrary processor input
+closure or unsaved generated-API support. The original twelve completion failures
+are unchanged. Evidence is
+`ktlsp-compiler-java-receipt-proof-20261011/evidence-summary.json`.
+
+### Nineteenth checkpoint: selected encoding declaration closure
+
+The two CEM metadata regressions above were reproduced independently against
+the actual published POM chains. The reader now rejects differing duplicate
+properties only when the selected encoding depends on them; child declarations
+replace the corresponding parent property. Identical duplicates are unambiguous.
+A fixed `-J-Xbootclasspath/p:` compiler-argument leaf stays one JVM argument even
+when its path payload is interpolated. Argument files, dynamic option selectors,
+unknown argument transport/merge shapes and ambiguous selected encodings still
+fail. This is a bounded declaration reader, not a general effective Maven model.
+
+The original nine focused tests remain unchanged. Three new tests first fail
+against the old reader (native exit 101), then all twelve pass (native exit 0),
+including fourteen argument-boundary rejection controls. Actual Guava and Codec
+source archives also pass CRC and strict UTF-8 decoding for 624 and 80 Java
+entries respectively; decoding alone does not prove editor semantics.
+
+Nineteenth-fixed-1 passes formatting, 1,094 workspace tests with three ignored
+across 40 suites, and both release builds. All 312 inputs match before/after
+tests and release. Server SHA-256 is
+`ce472b72a170632dc70346d7aa83c667e3134ac48f83b041c20592334cd93652`.
+The fresh CEM editor replay passes all seventeen semantic/UI/guard conditions,
+including all seven original and ISO-source first responses. The actual accepted
+85-line buffer compiles with the selected CEM classpath; the expected superclass
+`getBreakSpeed:()F` call is independently present in its bytecode. Both editor
+clients acknowledge shutdown and exit normally; all 395 fixture inputs and
+twelve absent paths remain unchanged.
+
+Strict corpus exit remains **1**. Guava and Codec no longer fail, but Error Prone
+annotations 2.18.0 and Gson 2.10.1 now encounter unsupported compiler metadata.
+The library reports 35,939 files / 844,722 symbols, with two failed inputs and
+two missing sources (Patchy and KotlinForForge). The eighteenth regression
+receipts remain immutable. Next isolate the actual selected declarations in
+these two POM chains without weakening argument-boundary checks.
+
+Evidence: `ktlsp-source-encoding-20261011/cem-closure-followup-1/` and
+`ktlsp-goal-20261010/nineteenth-fixed-1/` and
+`ktlsp-cem-nineteenth-fixed-1-20261011/`. POM arrival watching, materialized-file
+fast paths, concurrent materialization and compiler-generated API admission
+remain open. No six-root IDEA or performance acceptance is implied.
+
+### Twentieth checkpoint: compiler argument collections and source path admission
+
+Actual Error Prone annotations 2.18.0 metadata clears inherited compiler arguments
+with an empty `combine.self="override"`; Gson 2.10.1 uses `compilerArg` instead of
+`arg` for String collection entries. The bounded reader now accepts an empty
+override and validates every direct scalar collection entry independently of its
+element name. Nonempty overrides, nested/attributed arguments, encoding options,
+argument files and unresolved option selectors still fail. Parent uncertainty
+is retained; this does not implement arbitrary Maven configuration merging.
+
+The original reader tests and fourteen rejection controls remain unchanged.
+Two new reader tests first fail against the old implementation. A third test
+reproduces unsafe manually constructed coordinates reaching the legacy extracted
+source fallback; the shared source entry point now validates coordinates before
+any artifact/cache lookup or destination construction. The sentinel reproduction
+never invokes extraction or recursive deletion. All three tests then pass;
+focused coverage is 90 passed, zero failed and one existing ignored download case.
+
+Twentieth-fixed-1 passes formatting, 1,097 workspace tests with three ignored
+across 40 suites, and both release builds. All 312 inputs match before/after tests
+and release. Server SHA-256 is
+`4dacc46cf1cdd8d14054b55804c8304b93ba6abed0ee99aa507f142be83813fe`.
+The fresh CEM replay passes the same seventeen semantic/UI/guard conditions and
+all seven first responses. The actual accepted 85-line buffer compiles verbatim
+against the selected 101 classpath entries, 156 project outputs and seven scripting
+plugin artifacts; bytecode contains the expected superclass `getBreakSpeed:()F`.
+Both clients acknowledge shutdown and exit zero without forced termination.
+All 395 fixture inputs and twelve absent paths remain unchanged.
+
+Error Prone and Gson no longer fail. The actual library index reports 36,040 files
+and 845,935 symbols from 101 dependencies, with **zero failed inputs and two missing
+sources**. Strict corpus exit remains **1** because Patchy 2.2.10 and KotlinForForge
+Neoforge 5.12.0 sources are unavailable. Corpus shutdown takes approximately 3.71
+seconds against the two-second target; the separate UI client takes approximately
+1.65 seconds. Each is one sample, not performance acceptance.
+
+Evidence: `ktlsp-source-encoding-20261011/cem-metadata-followup-2/`,
+`ktlsp-goal-20261010/twentieth-fixed-1/` and
+`ktlsp-cem-twentieth-fixed-1-20261011/`. Independent audit at
+`ktlsp-cem-twentieth-proof-audit-20261011/receipt.json` checks the first responses,
+whole buffer, compiler output, normal exits and all 1,430 guards. Earlier failed
+receipts remain immutable.
+Six-project replay, compiler-generated API admission, POM arrival watching,
+materialized-file fast paths and concurrent materialization remain open.
 
 ### Current slice: requires-only compatibility artifacts
 

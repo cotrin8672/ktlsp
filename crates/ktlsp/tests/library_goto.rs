@@ -899,3 +899,74 @@ fn download_from_maven_central_and_goto() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn source_encoding_policy_refresh_preserves_dirty_source_then_restores_utf8_goto_spans() {
+    for navigate_before_close in [false, true] {
+        let tmp = unique_tmp(&format!("encoding_dirty_close_{navigate_before_close}"));
+        let (coordinate, repos, jar) = snapshot_source(&tmp);
+        let pom = jar.parent().unwrap().join("snapshot-1-SNAPSHOT.pom");
+        let metadata = |encoding| {
+            format!("<project><groupId>fixture</groupId><artifactId>snapshot</artifactId><version>1-SNAPSHOT</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")
+        };
+        let raw = "package api;\n// Bj\u{f6}rn\npublic class Useful { public int target() { return 1; } }\n";
+        write_sources_jar(&jar, &[("api/Useful.java", raw)]);
+        fs::write(&pom, metadata("UTF-8")).unwrap();
+        let extract = tmp.join("extracted");
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let first = deps::coordinate_source(&coordinate, &repos, &extract).unwrap();
+        let batches = deps::resolve_library_source(&first, &mut kotlin, &mut java).unwrap();
+        let file = batches[0].file.clone();
+        assert!(deps::materialize_source_file(Path::new(&file)));
+        let mut ws = Workspace::new();
+        for batch in batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        let dirty =
+            "package api; public class Useful { public int editorUnsaved() { return 7; } }\n";
+        ws.open(file.clone(), raw.into());
+        ws.change(&file, dirty.into());
+        fs::write(&pom, metadata("ISO-8859-1")).unwrap();
+        let second = deps::coordinate_source(&coordinate, &repos, &extract).unwrap();
+        assert_ne!(first.identity(), second.identity());
+        for _ in 0..2 {
+            for batch in deps::resolve_library_source(&second, &mut kotlin, &mut java).unwrap() {
+                assert!(!ws.index_dependency_batch(batch));
+            }
+            assert_eq!(ws.doc_text(&file).as_deref(), Some(dirty));
+            assert!(!Path::new(&file).exists());
+        }
+        let expected = raw
+            .as_bytes()
+            .iter()
+            .copied()
+            .map(char::from)
+            .collect::<String>();
+        if navigate_before_close {
+            let client = "import api.Useful; class Use { int use(Useful helper) { return helper.editorUnsaved(); } }";
+            let key = ktlsp::paths::file_key(&tmp.join("Use.java"));
+            ws.open(key.clone(), client.into());
+            assert_eq!(
+                ws.goto_definition(&key, client.find("editorUnsaved").unwrap())
+                    .len(),
+                1
+            );
+            assert_eq!(ws.doc_text(&file).as_deref(), Some(dirty));
+            assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        }
+        ws.close(&file);
+        assert_eq!(ws.doc_text(&file).as_deref(), Some(expected.as_str()));
+        assert!(!ws
+            .index
+            .entries_for_file(&file)
+            .iter()
+            .any(|entry| entry.sym.name == "editorUnsaved"));
+        let client =
+            "import api.Useful; class Use { int use(Useful helper) { return helper.target(); } }";
+        let key = ktlsp::paths::file_key(&tmp.join("Use.java"));
+        ws.open(key.clone(), client.into());
+        assert_goto_into_library(&mut ws, &key, client, "target", "api/Useful.java");
+        fs::remove_dir_all(tmp).unwrap();
+    }
+}

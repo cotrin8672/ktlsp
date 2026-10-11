@@ -688,6 +688,7 @@ dependencies = [
  "bincode",
  "ktcore",
  "parking_lot",
+ "quick-xml",
  "pprof",
  "salsa",
  "serde",

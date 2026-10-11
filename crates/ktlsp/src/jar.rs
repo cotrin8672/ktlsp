@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::source_encoding::JavaSourceEncoding;
 use anyhow::Context;
 
 /// Cap on source files extracted from a single jar — a defensive bound against a pathological or
@@ -114,6 +116,14 @@ pub fn archive_shared(
 /// layout. Returns the extracted file paths. Safe against zip-slip: entries whose normalized path
 /// would escape `out_dir` (via `..`, absolute paths, or symlink relays) are skipped.
 pub fn extract_sources(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    extract_sources_with_encoding(jar, out_dir, JavaSourceEncoding::Utf8)
+}
+
+pub(crate) fn extract_sources_with_encoding(
+    jar: &Path,
+    out_dir: &Path,
+    java_encoding: JavaSourceEncoding,
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut archive = open_archive(jar)?;
 
     let mut extracted = Vec::new();
@@ -147,8 +157,10 @@ pub fn extract_sources(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut out = fs::File::create(&out_path)?;
-        io::copy(&mut entry, &mut out)?;
+        let capacity = entry.size().min(MAX_ENTRY_SIZE_HINT) as usize;
+        let text = read_source_text(&mut entry, capacity, &rel, java_encoding)
+            .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
+        write_source_text(&out_path, &text)?;
         extracted.push(out_path);
     }
     Ok(extracted)
@@ -160,6 +172,15 @@ pub fn extract_sources(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf
 pub fn visit_sources(
     jar: &Path,
     out_dir: &Path,
+    visit: impl FnMut(&Path, &str),
+) -> anyhow::Result<usize> {
+    visit_sources_with_encoding(jar, out_dir, JavaSourceEncoding::Utf8, visit)
+}
+
+pub(crate) fn visit_sources_with_encoding(
+    jar: &Path,
+    out_dir: &Path,
+    java_encoding: JavaSourceEncoding,
     mut visit: impl FnMut(&Path, &str),
 ) -> anyhow::Result<usize> {
     let mut archive = open_archive(jar)?;
@@ -188,9 +209,8 @@ pub fn visit_sources(
         if !path.starts_with(out_dir) {
             continue;
         }
-        let mut text = String::with_capacity(entry.size().min(MAX_ENTRY_SIZE_HINT) as usize);
-        entry
-            .read_to_string(&mut text)
+        let capacity = entry.size().min(MAX_ENTRY_SIZE_HINT) as usize;
+        let text = read_source_text(&mut entry, capacity, &rel, java_encoding)
             .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
         visit(&path, &text);
         visited += 1;
@@ -207,6 +227,26 @@ pub fn visit_sources_shard(
     out_dir: &Path,
     shard: usize,
     shards: usize,
+    visit: impl FnMut(&Path, &str),
+) -> anyhow::Result<usize> {
+    visit_sources_shard_with_encoding(
+        bytes,
+        jar,
+        out_dir,
+        shard,
+        shards,
+        JavaSourceEncoding::Utf8,
+        visit,
+    )
+}
+
+pub(crate) fn visit_sources_shard_with_encoding(
+    bytes: std::sync::Arc<[u8]>,
+    jar: &Path,
+    out_dir: &Path,
+    shard: usize,
+    shards: usize,
+    java_encoding: JavaSourceEncoding,
     mut visit: impl FnMut(&Path, &str),
 ) -> anyhow::Result<usize> {
     let mut archive = archive_shared(bytes, jar)?;
@@ -235,9 +275,8 @@ pub fn visit_sources_shard(
         if !path.starts_with(out_dir) {
             continue;
         }
-        let mut text = String::with_capacity(entry.size().min(MAX_ENTRY_SIZE_HINT) as usize);
-        entry
-            .read_to_string(&mut text)
+        let capacity = entry.size().min(MAX_ENTRY_SIZE_HINT) as usize;
+        let text = read_source_text(&mut entry, capacity, &rel, java_encoding)
             .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
         visit(&path, &text);
         visited += 1;
@@ -250,6 +289,15 @@ pub fn visit_sources_shard(
 /// Returns `Ok(false)` when no matching source entry exists. Both the requested path and archive
 /// entry are validated so an on-disk marker cannot be used to write outside the cache root.
 pub fn extract_source_file(jar: &Path, out_dir: &Path, path: &Path) -> anyhow::Result<bool> {
+    extract_source_file_with_encoding(jar, out_dir, path, JavaSourceEncoding::Utf8)
+}
+
+pub(crate) fn extract_source_file_with_encoding(
+    jar: &Path,
+    out_dir: &Path,
+    path: &Path,
+    java_encoding: JavaSourceEncoding,
+) -> anyhow::Result<bool> {
     let rel = match path.strip_prefix(out_dir) {
         Ok(rel)
             if matches!(
@@ -273,11 +321,52 @@ pub fn extract_source_file(jar: &Path, out_dir: &Path, path: &Path) -> anyhow::R
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut out = fs::File::create(path)?;
-        io::copy(&mut entry, &mut out)?;
+        let capacity = entry.size().min(MAX_ENTRY_SIZE_HINT) as usize;
+        let text = read_source_text(&mut entry, capacity, rel, java_encoding)
+            .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
+        write_source_text(path, &text)?;
         return Ok(true);
     }
     Ok(false)
+}
+
+pub(crate) fn read_source_text(
+    entry: &mut impl Read,
+    capacity: usize,
+    relative: &Path,
+    java_encoding: JavaSourceEncoding,
+) -> anyhow::Result<String> {
+    let mut bytes = Vec::with_capacity(capacity);
+    // Consume the complete ZIP entry, including CRC validation, before decoding or writing.
+    entry.read_to_end(&mut bytes)?;
+    let encoding = if relative.extension().and_then(|value| value.to_str()) == Some("java") {
+        java_encoding
+    } else {
+        JavaSourceEncoding::Utf8
+    };
+    encoding.decode(bytes)
+}
+
+static SOURCE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn write_source_text(path: &Path, text: &str) -> anyhow::Result<()> {
+    let sequence = SOURCE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("ktlsp.{}.{sequence}.tmp", std::process::id()));
+    // Failed create_new never owns the temporary and must not remove another writer's file.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    Ok(result?)
 }
 
 /// Collect already-extracted `.kt`/`.java` files under a directory (for reusing a prior extraction).
@@ -656,5 +745,139 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+    #[test]
+    fn source_encoding_all_transports_share_normalized_utf8() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_encoding_transports_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("sources.jar");
+        let java = b"// Bj\xf6rn \x80\xa3\npackage api; public class Useful { public void m\xf6ve() {} public void target() {} }\n";
+        let kotlin = "\u{feff}// \u{65e5}\u{672c}\npackage api\nclass KotlinUseful\n";
+        write_binary_jar(
+            &archive,
+            &[
+                ("api/Useful.java", java),
+                ("api/KotlinUseful.kt", kotlin.as_bytes()),
+            ],
+        );
+        let expected = java.iter().copied().map(char::from).collect::<String>();
+        let encoding = JavaSourceEncoding::Iso88591;
+        let visited_root = root.join("visited");
+        let mut visited = std::collections::BTreeMap::new();
+        assert_eq!(
+            visit_sources_with_encoding(&archive, &visited_root, encoding, |p, t| {
+                visited.insert(
+                    p.strip_prefix(&visited_root).unwrap().to_path_buf(),
+                    t.to_owned(),
+                );
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(visited[Path::new("api/Useful.java")], expected);
+        assert_eq!(visited[Path::new("api/KotlinUseful.kt")], kotlin);
+        let bytes: std::sync::Arc<[u8]> = fs::read(&archive).unwrap().into();
+        let mut sharded = std::collections::BTreeMap::new();
+        for shard in 0..2 {
+            visit_sources_shard_with_encoding(
+                bytes.clone(),
+                &archive,
+                &visited_root,
+                shard,
+                2,
+                encoding,
+                |p, t| {
+                    sharded.insert(
+                        p.strip_prefix(&visited_root).unwrap().to_path_buf(),
+                        t.to_owned(),
+                    );
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(sharded, visited);
+        let full = root.join("full");
+        assert_eq!(
+            extract_sources_with_encoding(&archive, &full, encoding)
+                .unwrap()
+                .len(),
+            2
+        );
+        let single = root.join("single");
+        for (relative, text) in visited {
+            let target = single.join(&relative);
+            assert!(
+                extract_source_file_with_encoding(&archive, &single, &target, encoding).unwrap()
+            );
+            assert_eq!(fs::read(&target).unwrap(), text.as_bytes());
+            assert_eq!(fs::read(full.join(relative)).unwrap(), text.as_bytes());
+        }
+        assert!(visit_sources(&archive, &root.join("strict"), |_, _| {}).is_err());
+        assert!(extract_sources(&archive, &root.join("strict-full")).is_err());
+        assert!(!root.join("strict-full/api/Useful.java").exists());
+        for encoding in [JavaSourceEncoding::Utf8, JavaSourceEncoding::Iso88591] {
+            write_binary_jar(&archive, &[("Bad.kt", b"// \xf6\nclass Bad")]);
+            assert!(
+                visit_sources_with_encoding(&archive, &visited_root, encoding, |_, _| {}).is_err()
+            );
+            assert!(extract_source_file_with_encoding(
+                &archive,
+                &single,
+                &single.join("Bad.kt"),
+                encoding
+            )
+            .is_err());
+            assert!(!single.join("Bad.kt").exists());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_encoding_crc_is_checked_before_decode_or_materialization() {
+        let root = std::env::temp_dir().join(format!("ktlsp_encoding_crc_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("sources.jar");
+        for encoding in [JavaSourceEncoding::Utf8, JavaSourceEncoding::Iso88591] {
+            let payload = b"// invalid UTF8 \xff\nclass Corrupt {}\n";
+            write_binary_jar(&archive, &[("Corrupt.java", payload)]);
+            let mut bytes = fs::read(&archive).unwrap();
+            let start = bytes
+                .windows(payload.len())
+                .position(|part| part == payload)
+                .unwrap();
+            bytes[start + payload.len() - 1] ^= 1;
+            fs::write(&archive, &bytes).unwrap();
+            let dest = root.join(format!("{encoding:?}"));
+            let target = dest.join("Corrupt.java");
+            let mut callbacks = 0;
+            let errors = [
+                visit_sources_with_encoding(&archive, &dest, encoding, |_, _| callbacks += 1)
+                    .unwrap_err(),
+                visit_sources_shard_with_encoding(
+                    bytes.clone().into(),
+                    &archive,
+                    &dest,
+                    0,
+                    1,
+                    encoding,
+                    |_, _| callbacks += 1,
+                )
+                .unwrap_err(),
+                extract_sources_with_encoding(&archive, &dest, encoding).unwrap_err(),
+                extract_source_file_with_encoding(&archive, &dest, &target, encoding).unwrap_err(),
+            ];
+            for error in errors {
+                assert!(
+                    format!("{error:#}")
+                        .to_ascii_lowercase()
+                        .contains("checksum"),
+                    "CRC must win over decode: {error:#}"
+                );
+            }
+            assert_eq!(callbacks, 0);
+            assert!(!target.exists());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

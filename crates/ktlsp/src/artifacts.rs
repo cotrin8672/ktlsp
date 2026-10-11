@@ -56,16 +56,24 @@ impl Repos {
 /// Find or download the sources jar for `c`. `Ok(None)` means "no sources jar exists" (a normal,
 /// non-fatal outcome — many artifacts don't publish sources).
 pub fn sources_jar(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<PathBuf>> {
+    Ok(selected_sources_jar(repos, c)?.map(|(_, path)| path))
+}
+
+/// Keep decoding provenance tied to the actual requested/JVM fallback source artifact.
+pub(crate) fn selected_sources_jar(
+    repos: &Repos,
+    c: &Coordinate,
+) -> anyhow::Result<Option<(Coordinate, PathBuf)>> {
     let candidates = source_candidates(c);
     for candidate in &candidates {
         if let Some(p) = find_in_gradle_cache(&repos.gradle_cache, candidate) {
             if has_indexable_sources(&p) {
-                return Ok(Some(p));
+                return Ok(Some((candidate.clone(), p)));
             }
         }
         if let Some(p) = find_in_m2(&repos.m2, candidate) {
             if has_indexable_sources(&p) {
-                return Ok(Some(p));
+                return Ok(Some((candidate.clone(), p)));
             }
         }
     }
@@ -75,7 +83,7 @@ pub fn sources_jar(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<PathB
             match download_sources(repos, candidate) {
                 Ok(Some(p)) => {
                     if has_indexable_sources(&p) {
-                        return Ok(Some(p));
+                        return Ok(Some((candidate.clone(), p)));
                     }
                 }
                 Ok(None) => {}
@@ -395,6 +403,11 @@ fn local_artifact_files(repos: &Repos, c: &Coordinate, name: &str) -> Vec<PathBu
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Published metadata only; this lookup never downloads or follows relativePath.
+pub(crate) fn cached_pom_files(repos: &Repos, c: &Coordinate) -> Vec<PathBuf> {
+    local_artifact_files(repos, c, &pom_name(c))
 }
 
 fn local_embedded_pom_jars(repos: &Repos, c: &Coordinate) -> Vec<PathBuf> {

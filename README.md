@@ -124,6 +124,10 @@ troubleshooting, local validation, and community-marketplace publishing notes.
 caches, Maven Central, installed JDKs, and Android SDKs. Extracted sources and symbol caches are
 stored in the platform cache directory.
 
+Java source archives support strict UTF-8 and declared ISO-8859-1 through cached published POM
+metadata. Unsupported declarations and undecodable sources are reported as incomplete inputs.
+Kotlin and JDK source archives use strict UTF-8.
+
 Useful environment variables:
 
 - `KTLSP_CACHE_DIR` — override writable cache storage
@@ -219,6 +223,9 @@ distribution and Maven artifacts or network access; compilation is captured in `
 `dev/smoke_library.sh` delegates to this same fixture. Unsaved method renames and
 deletions must update Kotlin completion and navigation; closing and reopening the source must
 restore the disk contents without rewriting the dependency cache.
+Declared Java source encoding is also exercised through the `corpus` route with incomplete/full
+library-member probes and exact materialized source positions; see the
+[CEM acceptance record](docs/fork-acceptance.md) for results and remaining input-coverage failures.
 
 `mixed` checks Java/Kotlin member completion, generic receivers, exact definitions and references,
 and edits in both unsaved buffers on one client. It applies cross-language renames and checks the

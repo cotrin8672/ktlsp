@@ -1,8 +1,8 @@
 # Kotlin and Java Language Abstraction
 
-`ktlsp` now has a small shared language boundary in `crates/ktlsp/src/language.rs`. New
-cross-language feature work should start there before adding another `if .java { ... } else { ... }`
-branch in `crates/ktlsp/src/workspace.rs`.
+`ktlsp` shares normalized file facts through `crates/ktlsp/src/language.rs` and JVM member
+queries through `crates/ktcore/src/jvm.rs`. New cross-language feature work should use those
+boundaries before adding another language branch in `crates/ktlsp/src/workspace.rs`.
 
 ## What is shared today
 
@@ -17,6 +17,24 @@ The shared boundary currently owns file-level dispatch and normalized facts:
 
 This is enough for indexing, references, dependency navigation, and auto-import candidate selection
 to use one workspace-level flow for Kotlin and Java.
+
+The shared semantic layer also owns JVM member identities, source/generated callable candidates,
+call selection and return-type projection. Both language adapters use these queries. The shared
+member selector handles direct-super inheritance, visibility and declaration availability;
+incomplete hierarchy or competing overload facts remain `Unknown` rather than proving absence.
+This does not establish complete Java overload conversion or Kotlin inference fidelity.
+
+Analysis providers read normalized semantic facts and publish contributions through
+`ktcore::extensions::ExtensionStore`. The host in `ktlsp::analysis_extensions` invalidates
+contributions after source, model or configuration changes. Completion, diagnostics, navigation,
+references and rename consume the same bindings. The external Mixin test consumer exercises this
+contract through actual LSP requests, including applied edits; production Mixin support remains
+a separate project. Provider registration is explicit, and dynamic loading/ABI is undecided.
+
+Classfile decoding exists, but admitting compiler-generated members into the normal server still
+requires a verified successful build and input/output ownership. Decoding a class alone does not
+prove that its API is current after an unsaved edit or another build. The current coverage and
+remaining acceptance failures are recorded in [fork-acceptance.md](../fork-acceptance.md).
 
 ## What is still language-specific
 
