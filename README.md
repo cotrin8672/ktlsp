@@ -191,6 +191,11 @@ dev/ktlsp-harness.sh basic
 
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
 `library`, `java`, `mixed`, `corpus`, `semantic`, `gradle-live`, or `comprehensive`.
+`features-results.json` and `java-results.json` retain each RPC's first raw response and
+classify unavailable requests as unmeasured. An observation deadline is not a speed target.
+Edited diagnostic probes record the outbound version and source hash before judging the
+first target notification. A versionless notification has an explicit correlation assumption;
+neither it nor a first empty push proves that asynchronous compiler diagnostics are final.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
 and KMP navigation. Imported extension aliases also cover typed return chains with
 same-named decoys, incomplete completion, unsaved import removal/rebinding, references

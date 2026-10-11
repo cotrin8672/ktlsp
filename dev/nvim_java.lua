@@ -14,15 +14,26 @@ if not bin or bin == "" then
 end
 assert(vim.fn.filereadable(bin) == 1, "ktlsp binary not found — run `cargo build` first")
 
-local failures = {}
-local function check(name, ok, detail)
-  if ok then
+local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:gsub("^@", ""))
+local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
+local failures, checks, requests, diagnostic_probes, shutdown = {}, {}, {}, {}, {}
+local function check(name, ok, detail, observation)
+  local outcome = observation and probe.request_outcome(observation.response, observation.error,
+    function() return ok end, observation.attempted) or (ok and "matched" or "mismatch")
+  local measured = outcome == "matched" or outcome == "mismatch"
+  checks[#checks + 1] = { name = name, ok = not not ok, outcome = outcome, measured = measured,
+    kind = observation and "semantic" or "assertion", observation = observation }
+  if not measured then
+    print("UNMEASURED: " .. name .. " (" .. outcome .. ")")
+  elseif ok then
     print("PASS: " .. name)
   else
     print("FAIL: " .. name)
     if detail then
       print("  " .. detail)
     end
+  end
+  if not ok or not measured then
     table.insert(failures, name)
   end
 end
@@ -31,7 +42,8 @@ vim.cmd("edit " .. vim.fn.fnameescape(project .. "/app/Main.java"))
 local bufnr = vim.api.nvim_get_current_buf()
 vim.bo[bufnr].filetype = "java"
 
-local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project })
+local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project,
+  on_exit = function(code, signal) shutdown.exit = { code = code, signal = signal } end })
 assert(id, "vim.lsp.start returned nil")
 vim.wait(8000, function()
   local c = vim.lsp.get_client_by_id(id)
@@ -68,38 +80,28 @@ local function find(anchor, token)
   return nil
 end
 
-local function request(method, params)
-  local res
-  local ok = vim.lsp.buf_request_sync(bufnr, method, params, 3000)
-  if ok then
-    for _, v in pairs(ok) do
-      if v.result ~= nil then
-        res = v.result
-        break
-      end
-    end
+local function request_rpc(method, params, buffer, timeout)
+  local row = { method = method, params = vim.deepcopy(params), attempted = client ~= nil,
+    attempts = client and 1 or 0, timeout_ms = timeout or 3000, started_ns = vim.uv.hrtime() }
+  if client then
+    local ok, response, err = pcall(client.request_sync, client, method, params, timeout or 3000, buffer or bufnr)
+    if ok then row.response, row.error = response, err else row.error = response end
   end
-  return res
+  row.finished_ns = vim.uv.hrtime()
+  row.availability = probe.request_outcome(row.response, row.error, function() return true end, row.attempted)
+  if row.availability == "matched" then row.availability = "responded" end
+  requests[#requests + 1] = row
+  return row.availability == "responded" and row.response or nil, row
 end
 
-local function client_request(method, params)
-  if not client then
-    return nil
-  end
-  local result = nil
-  local done = false
-  client:request(method, params, function(_, res)
-    result = res
-    done = true
-  end, bufnr)
-  vim.wait(3000, function()
-    return done
-  end, 50)
-  if done then
-    return result
-  end
-  return nil
+local function request(method, params)
+  local response, row = request_rpc(method, params)
+  local result = response and response.result
+  if result == vim.NIL then result = nil end
+  return result, row
 end
+
+local client_request = request
 
 local uri = vim.uri_from_bufnr(bufnr)
 
@@ -128,7 +130,7 @@ end
 
 -- documentSymbol should list the Main class and its run method.
 do
-  local res = request("textDocument/documentSymbol", { textDocument = { uri = uri } })
+  local res, res_rpc = request("textDocument/documentSymbol", { textDocument = { uri = uri } })
   local has_main = false
   local has_run = false
   if type(res) == "table" then
@@ -141,12 +143,12 @@ do
       end
     end
   end
-  check("documentSymbol includes Main and run", has_main and has_run, vim.inspect(res))
+  check("documentSymbol includes Main and run", has_main and has_run, vim.inspect(res), res_rpc)
 end
 
 -- workspace/symbol should find Helper from the other file.
 do
-  local res = request("workspace/symbol", { query = "Helper" })
+  local res, res_rpc = request("workspace/symbol", { query = "Helper" })
   local has_helper = false
   if type(res) == "table" then
     for _, s in ipairs(res) do
@@ -155,7 +157,7 @@ do
       end
     end
   end
-  check("workspace/symbol finds Helper", has_helper, vim.inspect(res))
+  check("workspace/symbol finds Helper", has_helper, vim.inspect(res), res_rpc)
 end
 
 -- Goto definition from Main.java to Helper.java.
@@ -163,7 +165,7 @@ do
   local l, c = find("new Helper()", "Helper")
   check("found Helper reference in Main.java", l ~= nil, "line/col")
   if l then
-    local res = request("textDocument/definition", {
+    local res, res_rpc = request("textDocument/definition", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
@@ -195,7 +197,7 @@ do
         end
       end
     end
-    check("goto-definition lands in Helper.java", ok, detail)
+    check("goto-definition lands in Helper.java", ok, detail, res_rpc)
   end
 end
 
@@ -204,7 +206,7 @@ do
   local l, c = find("helper.waitFor(1);", "waitFor")
   check("found overloaded waitFor call in Main.java", l ~= nil, "line/col")
   if l then
-    local res = request("textDocument/definition", {
+    local res, res_rpc = request("textDocument/definition", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
@@ -233,7 +235,7 @@ do
       and loc_range
       and expected_line ~= nil
       and loc_range.start.line == expected_line
-    check("goto-definition narrows overloaded Java method by arity", ok, vim.inspect(res))
+    check("goto-definition narrows overloaded Java method by arity", ok, vim.inspect(res), res_rpc)
   end
 end
 
@@ -242,12 +244,12 @@ do
   local l, c = find("helper.assist();", "helper")
   check("found helper value for typeDefinition", l ~= nil, "line/col")
   if l then
-    local res = request("textDocument/typeDefinition", {
+    local res, res_rpc = request("textDocument/typeDefinition", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
     local ok, detail = result_mentions_uri(res, "Helper.java")
-    check("typeDefinition(helper) returns Helper", ok, detail)
+    check("typeDefinition(helper) returns Helper", ok, detail, res_rpc)
   end
 end
 
@@ -255,7 +257,7 @@ end
 do
   local l, c = find("new Helper()", "Helper")
   if l then
-    local res = request("textDocument/references", {
+    local res, res_rpc = request("textDocument/references", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
       context = { includeDeclaration = true },
@@ -266,7 +268,7 @@ do
       ok = true
       detail = tostring(#res) .. " refs"
     end
-    check("references returns Helper declaration and usage", ok, detail)
+    check("references returns Helper declaration and usage", ok, detail, res_rpc)
   else
     check("references returns Helper declaration and usage", false, "could not find Helper")
   end
@@ -274,9 +276,9 @@ end
 
 -- Folding ranges should expose Java class/method blocks.
 do
-  local res = request("textDocument/foldingRange", { textDocument = { uri = uri } })
+  local res, res_rpc = request("textDocument/foldingRange", { textDocument = { uri = uri } })
   local ok = type(res) == "table" and #res >= 2
-  check("foldingRange returns Java block folds", ok, vim.inspect(res))
+  check("foldingRange returns Java block folds", ok, vim.inspect(res), res_rpc)
 end
 
 -- Selection range should expand from a Java identifier through its method invocation.
@@ -284,18 +286,18 @@ do
   local l, c = find("helper.assist();", "assist")
   check("found selectionRange target in Main.java", l ~= nil, "line/col")
   if l then
-    local res = request("textDocument/selectionRange", {
+    local res, res_rpc = request("textDocument/selectionRange", {
       textDocument = { uri = uri },
       positions = { { line = l, character = c } },
     })
     local item = type(res) == "table" and res[1] or nil
-    check("selectionRange returns Java parent chain", item ~= nil and item.parent ~= nil, vim.inspect(res))
+    check("selectionRange returns Java parent chain", item ~= nil and item.parent ~= nil, vim.inspect(res), res_rpc)
   end
 end
 
 -- Semantic tokens should classify Java-specific declarations, not just Kotlin-shaped identifiers.
 do
-  local res = request("textDocument/semanticTokens/full", { textDocument = { uri = uri } })
+  local res, res_rpc = request("textDocument/semanticTokens/full", { textDocument = { uri = uri } })
   local has_function = false
   local has_parameter = false
   if type(res) == "table" and type(res.data) == "table" then
@@ -308,13 +310,13 @@ do
       end
     end
   end
-  check("semanticTokens/full includes Java function tokens", has_function, vim.inspect(res))
-  check("semanticTokens/full includes Java parameter tokens", has_parameter, vim.inspect(res))
+  check("semanticTokens/full includes Java function tokens", has_function, vim.inspect(res), res_rpc)
+  check("semanticTokens/full includes Java parameter tokens", has_parameter, vim.inspect(res), res_rpc)
 end
 
 -- Inlay hints should report Java `var` inferred local types.
 do
-  local res = request("textDocument/inlayHint", {
+  local res, res_rpc = request("textDocument/inlayHint", {
     textDocument = { uri = uri },
     range = {
       start = { line = 0, character = 0 },
@@ -334,7 +336,7 @@ do
       end
     end
   end
-  check("inlayHint returns Java var type", has_helper_hint, vim.inspect(res))
+  check("inlayHint returns Java var type", has_helper_hint, vim.inspect(res), res_rpc)
 end
 
 -- Call hierarchy should report Java method callers and callees.
@@ -342,14 +344,14 @@ do
   local al, ac = find("helper.assist();", "assist")
   check("found callHierarchy assist target in Main.java", al ~= nil, "line/col")
   if al then
-    local prepared = request("textDocument/prepareCallHierarchy", {
+    local prepared, prepared_rpc = request("textDocument/prepareCallHierarchy", {
       textDocument = { uri = uri },
       position = { line = al, character = ac },
     })
     local item = type(prepared) == "table" and prepared[1] or nil
-    check("prepareCallHierarchy(assist) returns item", item ~= nil and item.name == "assist", vim.inspect(prepared))
+    check("prepareCallHierarchy(assist) returns item", item ~= nil and item.name == "assist", vim.inspect(prepared), prepared_rpc)
     if item then
-      local incoming = request("callHierarchy/incomingCalls", { item = item })
+      local incoming, incoming_rpc = request("callHierarchy/incomingCalls", { item = item })
       local has_run = false
       if type(incoming) == "table" then
         for _, call in ipairs(incoming) do
@@ -359,21 +361,21 @@ do
           end
         end
       end
-      check("callHierarchy/incomingCalls(assist) returns run", has_run, vim.inspect(incoming))
+      check("callHierarchy/incomingCalls(assist) returns run", has_run, vim.inspect(incoming), incoming_rpc)
     end
   end
 
   local rl, rc = find("public void run", "run")
   check("found callHierarchy run target in Main.java", rl ~= nil, "line/col")
   if rl then
-    local prepared = request("textDocument/prepareCallHierarchy", {
+    local prepared, prepared_rpc = request("textDocument/prepareCallHierarchy", {
       textDocument = { uri = uri },
       position = { line = rl, character = rc },
     })
     local item = type(prepared) == "table" and prepared[1] or nil
-    check("prepareCallHierarchy(run) returns item", item ~= nil and item.name == "run", vim.inspect(prepared))
+    check("prepareCallHierarchy(run) returns item", item ~= nil and item.name == "run", vim.inspect(prepared), prepared_rpc)
     if item then
-      local outgoing = request("callHierarchy/outgoingCalls", { item = item })
+      local outgoing, outgoing_rpc = request("callHierarchy/outgoingCalls", { item = item })
       local has_assist = false
       if type(outgoing) == "table" then
         for _, call in ipairs(outgoing) do
@@ -383,24 +385,36 @@ do
           end
         end
       end
-      check("callHierarchy/outgoingCalls(run) returns assist", has_assist, vim.inspect(outgoing))
+      check("callHierarchy/outgoingCalls(run) returns assist", has_assist, vim.inspect(outgoing), outgoing_rpc)
     end
   end
 end
 
--- Java semantic diagnostics should include unused explicit imports.
+-- Observe one fresh notification; empty diagnostics are measured mismatches, not missing responses.
 do
-  local ok = vim.wait(5000, function()
-    local diagnostics = vim.diagnostic.get(bufnr)
-    for _, diagnostic in ipairs(diagnostics) do
-      local message = diagnostic.message or ""
-      if message:find("Unused import: List", 1, true) then
-        return true
+  local observation, finish = probe.observe_diagnostics(client, bufnr)
+  diagnostic_probes[#diagnostic_probes + 1] = observation
+  local count = vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, count, count, false, { "" })
+  require("vim.lsp._changetracking").flush(client)
+  local result = finish(5000)
+  for _, expected in ipairs({
+    { "publishes Java unused-import diagnostic", "Unused import: List" },
+    { "publishes Java unresolved-reference diagnostic", "Unresolved reference: missingCall" },
+    { "publishes Java call-shape diagnostic", "No overload of combine accepts 1 argument" },
+    { "publishes Java argument-type diagnostic", "No overload of adopt accepts argument type (Dog)" },
+  }) do
+    local found = false
+    for _, diagnostic in ipairs(result and result.diagnostics or {}) do
+      if (diagnostic.message or ""):find(expected[2], 1, true) then
+        found = true
+        break
       end
     end
-    return false
-  end, 50)
-  check("publishes Java unused-import diagnostic", ok, vim.inspect(vim.diagnostic.get(bufnr)))
+    check(expected[1], found, vim.inspect(result), observation)
+  end
+  vim.api.nvim_buf_set_lines(bufnr, count, -1, false, {})
+  require("vim.lsp._changetracking").flush(client)
 end
 
 -- Code actions should offer the Java unused-import quickfix as an LSP WorkspaceEdit.
@@ -408,7 +422,7 @@ do
   local l, c = find("import java.util.List;", "List")
   check("found Java unused import for codeAction", l ~= nil, "line/col")
   if l then
-    local actions = request("textDocument/codeAction", {
+    local actions, actions_rpc = request("textDocument/codeAction", {
       textDocument = { uri = uri },
       range = {
         start = { line = l, character = c },
@@ -425,53 +439,8 @@ do
         end
       end
     end
-    check("codeAction removes Java unused import", found, vim.inspect(actions))
+    check("codeAction removes Java unused import", found, vim.inspect(actions), actions_rpc)
   end
-end
-
--- Java diagnostics should include conservative unresolved simple calls once the project scan is complete.
-do
-  local ok = vim.wait(5000, function()
-    local diagnostics = vim.diagnostic.get(bufnr)
-    for _, diagnostic in ipairs(diagnostics) do
-      local message = diagnostic.message or ""
-      if message:find("Unresolved reference: missingCall", 1, true) then
-        return true
-      end
-    end
-    return false
-  end, 50)
-  check("publishes Java unresolved-reference diagnostic", ok, vim.inspect(vim.diagnostic.get(bufnr)))
-end
-
--- Java diagnostics should include conservative wrong-arity call-shape errors.
-do
-  local ok = vim.wait(5000, function()
-    local diagnostics = vim.diagnostic.get(bufnr)
-    for _, diagnostic in ipairs(diagnostics) do
-      local message = diagnostic.message or ""
-      if message:find("No overload of combine accepts 1 argument", 1, true) then
-        return true
-      end
-    end
-    return false
-  end, 50)
-  check("publishes Java call-shape diagnostic", ok, vim.inspect(vim.diagnostic.get(bufnr)))
-end
-
--- Java diagnostics should include conservative argument-type call-shape errors.
-do
-  local ok = vim.wait(5000, function()
-    local diagnostics = vim.diagnostic.get(bufnr)
-    for _, diagnostic in ipairs(diagnostics) do
-      local message = diagnostic.message or ""
-      if message:find("No overload of adopt accepts argument type (Dog)", 1, true) then
-        return true
-      end
-    end
-    return false
-  end, 50)
-  check("publishes Java argument-type diagnostic", ok, vim.inspect(vim.diagnostic.get(bufnr)))
 end
 
 -- Implementation should use Java extends/implements edges.
@@ -479,12 +448,12 @@ do
   local l, c = find("Worker worker", "Worker")
   check("found Worker type in Main.java", l ~= nil, "line/col")
   if l then
-    local impls = request("textDocument/implementation", {
+    local impls, impls_rpc = request("textDocument/implementation", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
     local ok, detail = result_mentions_uri(impls, "Helper.java")
-    check("implementation(Worker) returns Helper", ok, detail)
+    check("implementation(Worker) returns Helper", ok, detail, impls_rpc)
   end
 end
 
@@ -493,12 +462,12 @@ do
   local l, c = find("worker.assist()", "assist")
   check("found Worker.assist member usage in Main.java", l ~= nil, "line/col")
   if l then
-    local impls = request("textDocument/implementation", {
+    local impls, impls_rpc = request("textDocument/implementation", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
     local ok, detail = result_mentions_uri(impls, "Helper.java")
-    check("implementation(Worker.assist) returns Helper.assist", ok, detail)
+    check("implementation(Worker.assist) returns Helper.assist", ok, detail, impls_rpc)
   end
 end
 
@@ -507,14 +476,14 @@ do
   local l, c = find("Worker worker", "Worker")
   check("found Worker typeHierarchy target in Main.java", l ~= nil, "line/col")
   if l then
-    local prepared = request("textDocument/prepareTypeHierarchy", {
+    local prepared, prepared_rpc = request("textDocument/prepareTypeHierarchy", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
     local item = type(prepared) == "table" and prepared[1] or nil
-    check("prepareTypeHierarchy(Worker) returns item", item ~= nil and item.name == "Worker", vim.inspect(prepared))
+    check("prepareTypeHierarchy(Worker) returns item", item ~= nil and item.name == "Worker", vim.inspect(prepared), prepared_rpc)
     if item then
-      local subtypes = client_request("typeHierarchy/subtypes", { item = item })
+      local subtypes, subtypes_rpc = client_request("typeHierarchy/subtypes", { item = item })
       local has_helper = false
       if type(subtypes) == "table" then
         for _, subtype in ipairs(subtypes) do
@@ -524,7 +493,7 @@ do
           end
         end
       end
-      check("typeHierarchy/subtypes(Worker) returns Helper", has_helper, vim.inspect(subtypes))
+      check("typeHierarchy/subtypes(Worker) returns Helper", has_helper, vim.inspect(subtypes), subtypes_rpc)
     end
   end
 end
@@ -534,7 +503,7 @@ do
   local l, c = find("Helper helper", "Helper")
   check("found completion target in Main.java", l ~= nil, "line/col")
   if l then
-    local res = request("textDocument/completion", {
+    local res, res_rpc = request("textDocument/completion", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
@@ -552,7 +521,7 @@ do
         end
       end
     end
-    check("completion offers Helper", ok, detail)
+    check("completion offers Helper", ok, detail, res_rpc)
   end
 end
 
@@ -563,7 +532,7 @@ do
     local original = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)
     vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, { text })
     vim.wait(200)
-    local result = request("textDocument/completion", {
+    local result, result_rpc = request("textDocument/completion", {
       textDocument = { uri = uri },
       position = { line = line, character = #text },
     })
@@ -573,24 +542,24 @@ do
     end
     vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, original)
     vim.wait(200)
-    return labels
+    return labels, result_rpc
   end
 
-  local labels = completion_after_edit("helper.assist();", "        helper.as")
-  check("unsaved Java helper.as offers assist", labels.assist, vim.inspect(labels))
-  check("Java member completion excludes unrelated Other.assistUnrelated", not labels.assistUnrelated, vim.inspect(labels))
+  local labels, labels_rpc = completion_after_edit("helper.assist();", "        helper.as")
+  check("unsaved Java helper.as offers assist", labels.assist, vim.inspect(labels), labels_rpc)
+  check("Java member completion excludes unrelated Other.assistUnrelated", not labels.assistUnrelated, vim.inspect(labels), labels_rpc)
 
-  labels = completion_after_edit("this.runAgain();", "        this.")
-  check("bare Java this. offers runAgain", labels.runAgain, vim.inspect(labels))
+  labels, labels_rpc = completion_after_edit("this.runAgain();", "        this.")
+  check("bare Java this. offers runAgain", labels.runAgain, vim.inspect(labels), labels_rpc)
 
-  labels = completion_after_edit("helper.inherited();", "        helper.inh")
-  check("Java helper.inh offers inherited member", labels.inherited, vim.inspect(labels))
+  labels, labels_rpc = completion_after_edit("helper.inherited();", "        helper.inh")
+  check("Java helper.inh offers inherited member", labels.inherited, vim.inspect(labels), labels_rpc)
 
-  labels = completion_after_edit("kotlinHelper.assist();", "        kotlinHelper.as")
-  check("Java kotlinHelper.as offers Kotlin assist", labels.assist, vim.inspect(labels))
+  labels, labels_rpc = completion_after_edit("kotlinHelper.assist();", "        kotlinHelper.as")
+  check("Java kotlinHelper.as offers Kotlin assist", labels.assist, vim.inspect(labels), labels_rpc)
 
-  labels = completion_after_edit("helper.assist();", "        unknown.as")
-  check("unknown Java receiver has no unrelated completion", next(labels) == nil, vim.inspect(labels))
+  labels, labels_rpc = completion_after_edit("helper.assist();", "        unknown.as")
+  check("unknown Java receiver has no unrelated completion", next(labels) == nil, vim.inspect(labels), labels_rpc)
 
   local kotlin_buf = vim.fn.bufadd(project .. "/app/KotlinHelper.kt")
   vim.fn.bufload(kotlin_buf)
@@ -601,9 +570,9 @@ do
     "package app", "", "class KotlinHelper {", "    fun assistChanged() { }", "}",
   })
   vim.wait(200)
-  labels = completion_after_edit("kotlinHelper.assist();", "        kotlinHelper.as")
-  check("unsaved Kotlin member edit appears in Java completion", labels.assistChanged, vim.inspect(labels))
-  check("Java completion removes the old unsaved Kotlin member", not labels.assist, vim.inspect(labels))
+  labels, labels_rpc = completion_after_edit("kotlinHelper.assist();", "        kotlinHelper.as")
+  check("unsaved Kotlin member edit appears in Java completion", labels.assistChanged, vim.inspect(labels), labels_rpc)
+  check("Java completion removes the old unsaved Kotlin member", not labels.assist, vim.inspect(labels), labels_rpc)
   check("Kotlin declaration remains unsaved", vim.bo[kotlin_buf].modified)
   vim.api.nvim_buf_set_lines(kotlin_buf, 0, -1, false, original)
   vim.wait(200)
@@ -665,14 +634,15 @@ do
   end
   local function once(name, method, position, phase)
     local params = { textDocument = { uri = doc_uri(name) }, position = position }
-    local response, err = client:request_sync(method, params, 3000, buffers[name])
+    local response, row = request_rpc(method, params, buffers[name])
     local result = response and response.result
     report.requests[#report.requests + 1] = {
       phase = phase, method = method, params = params, attempts = 1,
-      result = result, error = response and response.err or err,
+      result = result, response = row.response, error = row.error,
       sent_versions = vim.deepcopy(sent_versions),
     }
-    return result
+    if result == vim.NIL then result = nil end
+    return result, row
   end
   -- A notification on complete valid source is required; an empty local diagnostic store is insufficient.
   for _, name in ipairs({ "java_use", "kotlin_use" }) do
@@ -687,12 +657,12 @@ do
     local position = probe.find(lines(name), receiver .. '.accept("ok")', "accept")
     local _, range = probe.find(lines(target), declaration, "accept")
     local expected = probe.location_key(doc_uri(target), range)
-    local result = once(name, "textDocument/definition", position, phase)
+    local result, result_rpc = once(name, "textDocument/definition", position, phase)
     local locations = probe.locations(result)
     local found = locations[1]
     check(name .. " " .. phase .. " " .. receiver .. ".accept goes to exact declaration",
       #locations == 1 and probe.location_key(found.uri or found.targetUri,
-        found.targetSelectionRange or found.range) == expected, vim.inspect(result))
+        found.targetSelectionRange or found.range) == expected, vim.inspect(result), result_rpc)
   end
   local function completion(name, receiver, expected, excluded, phase)
     local position = probe.find(lines(name), receiver .. ".baseOnly()", "baseOnly")
@@ -700,10 +670,10 @@ do
     local text = before[1]:match("^%s*") .. receiver .. ".ba"
     vim.api.nvim_buf_set_lines(buffers[name], position.line, position.line + 1, false, { text })
     flush(name, name .. " " .. phase .. " " .. receiver .. ".ba")
-    local result = once(name, "textDocument/completion",
+    local result, result_rpc = once(name, "textDocument/completion",
       { line = position.line, character = #text }, phase)
     check(name .. " " .. phase .. " " .. receiver .. ".ba offers " .. expected .. " and excludes " .. excluded,
-      probe.completion_has(result, expected) and not probe.completion_has(result, excluded), vim.inspect(result))
+      probe.completion_has(result, expected) and not probe.completion_has(result, excluded), vim.inspect(result), result_rpc)
     vim.api.nvim_buf_set_lines(buffers[name], position.line, position.line + 1, false, before)
     flush(name)
   end
@@ -729,22 +699,19 @@ do
   end
   -- After switching both imports, valid syntax must still report the two String-to-int errors.
   for _, name in ipairs({ "java_use", "kotlin_use" }) do
+    local observation, finish = probe.observe_diagnostics(client, buffers[name])
+    diagnostic_probes[#diagnostic_probes + 1] = observation
     local edited = lines(name)
     for i, text in ipairs(edited) do edited[i] = text:gsub("%.baseOnly%(", ".baseWrong(") end
-    local key = probe.path_key(vim.api.nvim_buf_get_name(buffers[name]))
-    notifications[key] = nil
     vim.api.nvim_buf_set_lines(buffers[name], 0, -1, false, edited)
     flush(name)
-    local received = vim.wait(5000, function()
-      local result = notifications[key]
-      if not result or #result.diagnostics ~= 2 then return false end
-      for _, diagnostic in ipairs(result.diagnostics) do
-        if diagnostic.code ~= "call_shape_mismatch" then return false end
-      end
-      return true
-    end, 50)
+    local result = finish(5000)
+    local received = result ~= nil and #result.diagnostics == 2
+    for _, diagnostic in ipairs(result and result.diagnostics or {}) do
+      received = received and diagnostic.code == "call_shape_mismatch"
+    end
     check(name .. " changed superclass reports exactly two invalid accept arguments",
-      received, vim.inspect(notifications[key]))
+      received, vim.inspect(result), observation)
   end
   for name, buf in pairs(buffers) do
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, original[name])
@@ -768,7 +735,7 @@ do
   local l, c = find('helper.combine("Ada", 2)', "2")
   check("found signatureHelp target in Main.java", l ~= nil, "line/col")
   if l then
-    local res = request("textDocument/signatureHelp", {
+    local res, res_rpc = request("textDocument/signatureHelp", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
@@ -786,7 +753,7 @@ do
         detail = vim.inspect(res)
       end
     end
-    check("signatureHelp(combine) returns Java signature", ok, detail)
+    check("signatureHelp(combine) returns Java signature", ok, detail, res_rpc)
   end
 end
 
@@ -794,7 +761,7 @@ end
 do
   local l, c = find("new Helper()", "Helper")
   if l then
-    local res = request("textDocument/prepareRename", {
+    local res, res_rpc = request("textDocument/prepareRename", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
     })
@@ -804,7 +771,7 @@ do
       ok = true
       detail = "range"
     end
-    check("prepareRename returns range for Helper", ok, detail)
+    check("prepareRename returns range for Helper", ok, detail, res_rpc)
   else
     check("prepareRename returns range for Helper", false, "could not find Helper")
   end
@@ -814,7 +781,7 @@ end
 do
   local l, c = find("new Helper()", "Helper")
   if l then
-    local res = request("textDocument/rename", {
+    local res, res_rpc = request("textDocument/rename", {
       textDocument = { uri = uri },
       position = { line = l, character = c },
       newName = "Renamed",
@@ -831,7 +798,7 @@ do
         detail = tostring(count) .. " files"
       end
     end
-    check("rename returns edits for Helper", ok, detail)
+    check("rename returns edits for Helper", ok, detail, res_rpc)
   else
     check("rename returns edits for Helper", false, "could not find Helper")
   end
@@ -909,15 +876,15 @@ for _, case in ipairs({
   local position, target_range = probe.find(provider.before, case.anchor, "assist")
   if case.bare_call then
     local bare_position = probe.find(provider.before, case.bare_call, "assist")
-    local target = client:request_sync("textDocument/definition", {
+    local target, target_rpc = request_rpc("textDocument/definition", {
       textDocument = { uri = provider.uri }, position = bare_position,
-    }, 5000, provider.buffer)
+    }, provider.buffer, 5000)
     check("bare Java call resolves to hidden static declaration",
-      probe.exact_definition(target and target.result, provider.path, { target_range }), vim.inspect(target))
+      probe.exact_definition(target and target.result, provider.path, { target_range }), vim.inspect(target), target_rpc)
   end
-  local result = client:request_sync("textDocument/rename", {
+  local result, rename_rpc = request_rpc("textDocument/rename", {
     textDocument = { uri = provider.uri }, position = position, newName = "support",
-  }, 5000, provider.buffer)
+  }, provider.buffer, 5000)
   local edit = result and result.result
   local safe, count, sites = type(edit) == "table", 0, {}
   local expected_sites = {}
@@ -952,7 +919,7 @@ for _, case in ipairs({
     else safe = false end
   end
   safe = safe and count == case.count
-  check(case.sites_label, safe, vim.inspect(result))
+  check(case.sites_label, safe, vim.inspect(result), rename_rpc)
   local applied, message = false, "unsafe or incomplete edits"
   if safe then
     applied, message = pcall(vim.lsp.util.apply_workspace_edit, normalized, client.offset_encoding)
@@ -979,14 +946,17 @@ for _, case in ipairs({
     local use = by_path[probe.path_key(project .. "/" .. case.directory .. "/KotlinUse.kt")]
     local current = vim.api.nvim_buf_get_lines(use.buffer, 0, -1, false)
     local cursor = probe.find(current, case.kotlin_call, "support")
-    local target = client:request_sync("textDocument/definition", {
+    local target, target_rpc = request_rpc("textDocument/definition", {
       textDocument = { uri = use.uri }, position = cursor,
-    }, 5000, use.buffer)
+    }, use.buffer, 5000)
     local _, range = probe.find(provider.expected, case.renamed_anchor, "support")
     check(case.goto_label,
-      probe.exact_definition(target and target.result, provider.path, { range }), vim.inspect(target))
+      probe.exact_definition(target and target.result, provider.path, { range }), vim.inspect(target), target_rpc)
   else
-    check(case.goto_label, false, "rename was not safely applied")
+    local skipped = { method = "textDocument/definition", attempted = false, attempts = 0,
+      availability = "not-run", reason = "rename was not safely applied" }
+    requests[#requests + 1] = skipped
+    check(case.goto_label, false, skipped.reason, skipped)
   end
   for _, file in ipairs(files) do
     vim.api.nvim_buf_set_lines(file.buffer, 0, -1, false, file.before)
@@ -1011,24 +981,30 @@ do
     end
   end
   if edited then
+    local observation, finish = probe.observe_diagnostics(client, bufnr)
+    diagnostic_probes[#diagnostic_probes + 1] = observation
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-    local ok = vim.wait(5000, function()
-      local diagnostics = vim.diagnostic.get(bufnr)
-      for _, diagnostic in ipairs(diagnostics) do
-        if diagnostic.severity == vim.diagnostic.severity.ERROR then
-          return true
-        end
-      end
-      return false
-    end, 50)
-    check("publishes Java syntax diagnostics", ok, vim.inspect(vim.diagnostic.get(bufnr)))
+    require("vim.lsp._changetracking").flush(client)
+    local result = finish(5000)
+    local ok = false
+    for _, diagnostic in ipairs(result and result.diagnostics or {}) do
+      if diagnostic.severity == vim.diagnostic.severity.ERROR then ok = true end
+    end
+    check("publishes Java syntax diagnostics", ok, vim.inspect(result), observation)
   else
     check("publishes Java syntax diagnostics", false, "could not edit combine call")
   end
 end
 
-pcall(function() client:stop(true) end)
+shutdown.force_requested = true
+shutdown.stop_ok, shutdown.stop_error = pcall(function() client:stop(true) end)
 vim.wait(300)
+if vim.env.KTLSP_TRACE then
+  vim.fn.writefile({ vim.json.encode({ checks = checks, requests = requests,
+    diagnostic_probes = diagnostic_probes, shutdown = shutdown, failures = failures,
+    observation_phase = "ordinary editor smoke; deadlines bound observation, not speed acceptance" }) },
+    vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-results.json")
+end
 
 if #failures == 0 then
   print("\nALL PASS")

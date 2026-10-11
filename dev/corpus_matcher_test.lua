@@ -75,6 +75,60 @@ for _, case in ipairs(outcome_cases) do
     case.expected == 'matched' or case.expected == 'mismatch')
 end
 
+for _, case in ipairs({
+  { name = 'versioned diagnostic', version = 2, diagnostics = { { message = 'required' } }, expected = 'matched' },
+  { name = 'versionless empty diagnostic', diagnostics = {}, expected = 'mismatch', limited = true },
+  { name = 'old version ignored', version = 1, diagnostics = {}, expected = 'unanswered' },
+  { name = 'no diagnostic observed', silent = true, expected = 'unanswered' },
+  { name = 'pre-edit diagnostic ignored', before = true, silent = true, expected = 'unanswered' },
+  { name = 'later useful diagnostic cannot replace first empty', version = 2, diagnostics = {}, later = true, expected = 'mismatch' },
+  { name = 'changed buffer cannot certify diagnostic', version = 2, diagnostics = {}, changed = true, expected = 'protocol-error' },
+  { name = 'same text with another edit cannot certify diagnostic', version = 2, diagnostics = {}, reticked = true, expected = 'protocol-error' },
+  { name = 'later buffer version cannot certify diagnostic', version = 2, diagnostics = {}, version_changed = true, expected = 'protocol-error' },
+  { name = 'multiple outbound changes cannot certify diagnostic', version = 2, diagnostics = {}, resent = true, expected = 'protocol-error' },
+  { name = 'failed change send is not measured', send_failed = true, silent = true, expected = 'not-run' },
+  { name = 'diagnostic error is not measured', version = 2, diagnostics = {}, error = { code = -32603 }, expected = 'protocol-error' },
+}) do
+  local buffer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buffer, vim.fn.tempname() .. '.kt')
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'before' })
+  vim.lsp.util.buf_versions[buffer] = 1
+  local forwarded = 0
+  local old_handler = function() forwarded = forwarded + 1 end
+  local old_notify = function() return not case.send_failed end
+  local client = { handlers = { ['textDocument/publishDiagnostics'] = old_handler }, rpc = { notify = old_notify } }
+  local row, finish = probe.observe_diagnostics(client, buffer)
+  local function publish(version, diagnostics)
+    client.handlers['textDocument/publishDiagnostics'](case.error,
+      { uri = vim.uri_from_bufnr(buffer), version = version, diagnostics = diagnostics }, {})
+  end
+  if case.before then publish(1, {}) end
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'after' })
+  vim.lsp.util.buf_versions[buffer] = 2
+  client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 } })
+  if case.changed then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'another edit' }) end
+  if not case.silent then publish(case.version, case.diagnostics) end
+  if case.later then publish(2, { { message = 'required' } }) end
+  if case.reticked then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'after' }) end
+  if case.version_changed then vim.lsp.util.buf_versions[buffer] = 3 end
+  if case.resent then
+    client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 } })
+  end
+  local _, observed = finish(5)
+  check(case.name, probe.request_outcome(observed.response, observed.error,
+    function(result) return #result.diagnostics > 0 end, observed.attempted), case.expected)
+  check(case.name .. ': restores notification handler', client.handlers['textDocument/publishDiagnostics'] == old_handler, true)
+  check(case.name .. ': restores outbound hook', client.rpc.notify == old_notify, true)
+  check(case.name .. ': records outbound version', row.outbound[1].version, 2)
+  if case.limited then
+    check(case.name .. ': versionless generation is explicitly limited', row.generation_certified == false
+      and type(row.generation_limit) == 'string', true)
+  end
+  if not case.silent or case.before then check(case.name .. ': original handler receives notifications', forwarded > 0, true) end
+  vim.lsp.util.buf_versions[buffer] = nil
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
 local _, retrofit = dofile(directory .. '/nvim_retrofit_mixed_probes.lua')
 local function service_references(length, include, members)
   local sites, result = {}, {}

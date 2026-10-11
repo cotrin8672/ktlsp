@@ -2398,6 +2398,46 @@ Next repair named class literals and declaration-scoped extension-property bindi
 in shared facts, then Java wildcard constraint inference. No Kotlin completion or
 rename parity is claimed from the old six passing golden requests.
 
+### Thirty-eighth checkpoint: ordinary editor observation boundaries
+
+The existing `features` and `java` probes now retain each RPC's raw response/error,
+attempt count and observation interval. No response, transport error or unstarted
+request is unmeasured and still causes a nonzero harness exit. A valid empty or wrong
+RPC result fails its original positive expectation; negative assertions cannot pass
+merely because no response arrived. Deadlines bound observation, not speed acceptance.
+
+Diagnostic observation starts before the edit and records outbound document version,
+changedtick and complete source hash. It inspects the first target notification,
+retains rejected notifications and rejects intervening edits or another outbound
+change. Exact versions are checked when supplied. A versionless notification records
+the limited assumption that the first target notification after the outbound change
+belongs to that unchanged buffer. It does not certify the server's analysis generation
+or final compiler pass; a future fast/compiled two-phase stream needs an independent
+accepted-store completion barrier before final diagnostic expectations are judged.
+
+Native Neovim matcher controls pass **123 checks**, fourteen existing lifecycle
+controls pass and all four changed Lua files parse. Against immutable candidate
+`c129e119211c142588dc53bc604a55408a6315cbddac455bdd3c317f15821ce0`,
+the ordinary features probe retains **78 matched / 2 unmet checks**, including
+**43 matched / 2 unmet semantic checks**. Java retains **194 matched / 5 unmet
+checks**, including **55 matched / 5 unmet semantic checks**. Counts also contain
+setup/assertion controls and are not project acceptance percentages. There are no
+unanswered semantic observations in these runs. All seven prior positive demands
+remain: missing type/resolution, missing Java call, arity/type errors and two pairs
+of invalid calls after changing a superclass. The six relevant push observations
+are versionless and generation-uncertified. `explainResolution` still returns a
+valid Unknown under compiler-producer incompleteness. These coverage gaps remain open.
+
+Both scripts explicitly request forced stop; the observed exit 1/signal 15 is kept
+as an operational record, not another semantic failure. The sample's disk hashes
+remain unchanged. Evidence is under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-harness-acceptance-native-20261012-1/`
+(`results.json`, `editor-results.json`, `sample-source-guard.json` and each scenario's
+structured result). The candidate has 1,270 passing Rust tests, four ignored and a
+successful release build; its real stdlib generic-chain repair is still in progress.
+Next verify the shared declaration-shape repair on the unchanged real-library reduction,
+then establish same-generation canonical compiler diagnostics without relaxing these demands.
+
 ### Current slice: requires-only compatibility artifacts
 
 Selected Kotlin compatibility and coroutines JARs can contain a module descriptor

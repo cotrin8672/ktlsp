@@ -83,6 +83,84 @@ function M.request_outcome(response, err, accepts, attempted)
   return accepts(response.result) and 'matched' or 'mismatch'
 end
 
+-- Arm before one edit; callers flush didChange before awaiting its first target notification.
+function M.observe_diagnostics(client, buffer)
+  local uri, tick = vim.uri_from_bufnr(buffer), vim.api.nvim_buf_get_changedtick(buffer)
+  local key = M.path_key(vim.api.nvim_buf_get_name(buffer))
+  local row = { method = 'textDocument/publishDiagnostics', uri = uri, buffer = buffer,
+    before_changedtick = tick, attempted = false, outbound = {}, notifications = {} }
+  local function source_hash()
+    return vim.fn.sha256(table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), '\n')
+      .. (vim.bo[buffer].eol and '\n' or ''))
+  end
+  local function is_target(value)
+    if type(value) ~= 'string' then return false end
+    local ok, path = pcall(vim.uri_to_fname, value)
+    return ok and M.path_key(path) == key
+  end
+  local previous = client.handlers['textDocument/publishDiagnostics']
+  local handler = previous or vim.lsp.handlers['textDocument/publishDiagnostics']
+  local notify, active = client.rpc.notify, true
+  local function on_notify(method, params)
+    local sent = notify(method, params)
+    if active and method == 'textDocument/didChange' and is_target(params.textDocument.uri) then
+      local document = params.textDocument
+      local item = { sent = not not sent, version = document.version,
+        buffer_version = vim.lsp.util.buf_versions[buffer], changedtick = vim.api.nvim_buf_get_changedtick(buffer),
+        source_sha256 = source_hash(), sent_ns = vim.uv.hrtime() }
+      row.outbound[#row.outbound + 1] = item
+      if sent and item.changedtick > tick and item.version == item.buffer_version then
+        row.attempted, row.expected_version, row.source_sha256 = true, item.version, item.source_sha256
+        row.sent_ns, row.changedtick = item.sent_ns, item.changedtick
+      end
+    end
+    return sent
+  end
+  local function on_diagnostics(err, result, ctx, config)
+    if active and type(result) == 'table' and is_target(result.uri) then
+      local item = { response = { result = vim.deepcopy(result) }, error = err,
+        received_ns = vim.uv.hrtime(), version_present = result.version ~= nil and result.version ~= vim.NIL }
+      row.notifications[#row.notifications + 1] = item
+      if not row.attempted then item.rejected = 'before-edited-source-outbound'
+      elseif #row.outbound ~= 1 or source_hash() ~= row.source_sha256
+          or vim.api.nvim_buf_get_changedtick(buffer) ~= row.changedtick
+          or vim.lsp.util.buf_versions[buffer] ~= row.expected_version then
+        item.rejected = 'source-changed-after-outbound'
+      elseif item.version_present and result.version ~= row.expected_version then
+        item.rejected = 'different-document-version'
+      elseif row.response == nil then
+        row.response, row.error, row.received_ns = item.response, err, item.received_ns
+        if type(result.diagnostics) ~= 'table' then row.error = 'invalid-diagnostics-notification' end
+        row.correlation = item.version_present and 'exact-document-version'
+          or 'first-target-after-outbound-with-unchanged-buffer'
+        row.generation_certified = item.version_present
+        if not item.version_present then
+          row.generation_limit = 'server omitted version; assumes the first target notification after didChange belongs to the unchanged buffer snapshot'
+        end
+      end
+    end
+    if handler then handler(err, result, ctx, config) end
+  end
+  client.rpc.notify, client.handlers['textDocument/publishDiagnostics'] = on_notify, on_diagnostics
+  return row, function(timeout)
+    row.observation_timeout_ms = timeout
+    if row.attempted then
+      vim.wait(timeout, function() return row.response ~= nil end, 20)
+    end
+    if #row.outbound ~= 1 or source_hash() ~= row.source_sha256
+        or vim.api.nvim_buf_get_changedtick(buffer) ~= row.changedtick
+        or vim.lsp.util.buf_versions[buffer] ~= row.expected_version then
+      row.response, row.error = nil, row.attempted and 'source-correlation-unavailable' or 'didChange-not-observed'
+    elseif row.response == nil then row.error = 'timeout' end
+    active = false
+    if client.rpc.notify == on_notify then client.rpc.notify = notify end
+    if client.handlers['textDocument/publishDiagnostics'] == on_diagnostics then
+      client.handlers['textDocument/publishDiagnostics'] = previous
+    end
+    return row.error == nil and row.response and row.response.result or nil, row
+  end
+end
+
 function M.completion_has(result, token)
   if type(result) ~= 'table' then return false end
   for _, item in ipairs(result.items or result) do
