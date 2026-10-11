@@ -412,9 +412,89 @@ fn after_dot_unicode_with_space_none() {
 }
 
 #[test]
-fn inside_string_interpolation_none() {
-    // An identifier inside a `${...}` string template expression must be silently omitted.
-    check_none("fun f() { val s = \"x ${y/*^*/}\" }\n");
+fn inside_braced_string_interpolation_scope() {
+    check_contains(
+        r#"fun f() { val year = 2026; val s = "x ${ye/*^*/ar}" }"#,
+        &["year"],
+    );
+}
+
+#[test]
+fn member_completion_in_braced_string_templates() {
+    let declarations =
+        "class Box {\n    fun open() {}\n    val size = 1\n}\nclass Other { fun unrelated() {} }\n";
+    for expression in [
+        r#"fun show(box: Box) = "Response ${box./*^*/size}""#,
+        r#"fun show(box: Box) = "Response ${box./*^*/}""#,
+        r#"fun show(box: Box) = """Response ${box./*^*/size}""""#,
+        r#"fun show(box: Box) = "Response ${if (true) box./*^*/size else 0}""#,
+    ] {
+        let fixture = format!("{declarations}{expression}\n");
+        let got =
+            labels(&fixture).unwrap_or_else(|| panic!("expected template members: {fixture}"));
+        assert!(got.contains("open"), "{fixture}: {got:?}");
+        assert!(got.contains("size"), "{fixture}: {got:?}");
+        assert!(!got.contains("unrelated"), "{fixture}: {got:?}");
+    }
+    let fixture = format!(
+        "{declarations}{}\n",
+        r#"fun show(box: Box) = "Response ${box.op/*^*/en()}""#
+    );
+    let got = labels(&fixture).expect("partial selector inside a template");
+    assert!(got.contains("open"), "{got:?}");
+    assert!(!got.contains("size"), "{got:?}");
+}
+
+#[test]
+fn braced_string_templates_keep_literal_regions_silent() {
+    let declarations = "class Box { val size = 1 }\n";
+    for expression in [
+        r#"fun show(box: Box) = "Response ${box.size} gr/*^*/""#,
+        r#"fun show(box: Box) = "Response ${box.size}./*^*/""#,
+        r#"fun show(box: Box) = "Response ${"gr/*^*/"}""#,
+        r#"fun show(box: Box) = "Response ${box.size /* hidden/*^*/ */}""#,
+        r#"fun show(box: Box) = "Response ${3.1/*^*/4}""#,
+        r#"fun show(box: Box) = "Response \${box./*^*/size}""#,
+        r#"fun show(box: Box) = """Response ${box.size} gr/*^*/""""#,
+    ] {
+        check_none(&format!("{declarations}{expression}\n"));
+    }
+}
+
+#[test]
+fn braced_string_template_completion_follows_unsaved_java_return_type() {
+    let mut ws = Workspace::new();
+    ws.open("ServiceClass.java", "package probe; public class ServiceClass { public String getName() { return null; } public Object cast(Object value) { return value; } }".into());
+    ws.open("ServiceText.java", "package probe; public class ServiceText { public String getName() { return null; } public String substring(int start) { return null; } }".into());
+    let original =
+        "package probe; public class Invocation { public ServiceClass service() { return null; } }";
+    let edited = original.replace("ServiceClass service()", "ServiceText service()");
+    ws.open("Invocation.java", original.into());
+    let (source, offset) = strip_cursor(
+        r#"package probe
+fun show(invocation: Invocation) {
+    val service = invocation.service()
+    val output = "Response from ${service./*^*/name}"
+}
+"#,
+    );
+    ws.open("Use.kt", source);
+    let expect = |ws: &mut Workspace, offered: &str, excluded: &str| {
+        let result = ws
+            .complete("Use.kt", offset, true)
+            .expect("template completion");
+        let labels: HashSet<_> = result.items.into_iter().map(|item| item.label).collect();
+        assert!(labels.contains(offered), "expected {offered}: {labels:?}");
+        assert!(
+            !labels.contains(excluded),
+            "unexpected {excluded}: {labels:?}"
+        );
+    };
+    expect(&mut ws, "cast", "substring");
+    ws.change("Invocation.java", edited);
+    expect(&mut ws, "substring", "cast");
+    ws.change("Invocation.java", original.into());
+    expect(&mut ws, "cast", "substring");
 }
 
 // --------------------------------------------------------------------------------------------

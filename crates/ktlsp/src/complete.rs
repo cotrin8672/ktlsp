@@ -35,7 +35,7 @@ pub enum CompletionContext {
     AfterDot,
     /// Inside an `import` or `package` path.
     Import,
-    /// Not a completion position (string, comment, number).
+    /// Not a completion position (literal text, comment, number).
     None,
 }
 
@@ -441,6 +441,35 @@ fn ancestor_is(node: Node, kinds: &[&str]) -> bool {
     false
 }
 
+/// The nearest literal/comment wins; a braced template expression stops the outer string guard.
+fn non_code_ancestor(node: Node, src: &str, offset: usize) -> bool {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        match n.kind() {
+            "interpolation" => {
+                let closing = n.child(n.child_count().saturating_sub(1));
+                let end = closing
+                    .filter(|child| child.kind() == "}")
+                    .map_or(n.end_byte(), |child| child.start_byte());
+                return !(node_text(n, src).starts_with("${")
+                    && n.start_byte() + 2 <= offset
+                    && offset <= end);
+            }
+            "string_literal"
+            | "multiline_string_literal"
+            | "string_content"
+            | "line_comment"
+            | "block_comment"
+            | "character_literal"
+            | "number_literal"
+            | "float_literal" => return true,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    false
+}
+
 /// The byte slice of the current line up to (and excluding) `offset`, char-boundary safe.
 fn line_prefix(src: &str, offset: usize) -> &str {
     let end = floor_boundary(src, offset);
@@ -452,23 +481,9 @@ fn line_prefix(src: &str, offset: usize) -> &str {
 /// string/comment/number guard FIRST, then import/package, then after-dot (CST + raw-byte
 /// backscan), else `ScopeName`.
 pub fn completion_context(tree: &Tree, src: &str, offset: usize) -> CompletionContext {
-    // 1. String / comment / number guard FIRST. Ascend ancestors because the cursor inside a
-    //    string sits on `string_content` whose parent is `string_literal` — both must be caught.
-    //    Running this first means a `.` inside a string (`"g."`) is None, not AfterDot.
-    //    `interpolation` is the `${...}` template-expression node (verified via `dump`); its child
-    //    identifier sits OUTSIDE `string_content`, so list it explicitly to keep completion silent
-    //    inside string templates even though it nests under `string_literal` today.
-    const LITERAL_KINDS: &[&str] = &[
-        "string_literal",
-        "string_content",
-        "interpolation",
-        "line_comment",
-        "block_comment",
-        "character_literal",
-        "number_literal",
-        "float_literal",
-    ];
-    if nodes_at(tree, offset).any(|n| ancestor_is(n, LITERAL_KINDS)) {
+    // 1. Literal / comment guard FIRST. Code inside `${...}` uses the normal completion route,
+    //    while literal text and nested strings/comments remain non-completable.
+    if nodes_at(tree, offset).any(|n| non_code_ancestor(n, src, offset)) {
         return CompletionContext::None;
     }
 
@@ -1029,12 +1044,11 @@ mod tests {
     }
 
     #[test]
-    fn ctx_string_interpolation_is_none() {
-        // An identifier inside a `${...}` template expression sits under `interpolation`; completion
-        // must stay silent (None).
+    fn ctx_string_interpolation_is_scope_name() {
+        // A braced template contains an ordinary expression with the surrounding lexical scope.
         assert_eq!(
             ctx_after("fun main() {\n    val s = \"x ${y}\"\n}\n", "${y"),
-            CompletionContext::None
+            CompletionContext::ScopeName
         );
     }
 

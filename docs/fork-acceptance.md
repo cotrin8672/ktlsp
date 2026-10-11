@@ -2699,6 +2699,43 @@ Immutable ktlsp release SHA256:
 Next repair braced interpolation completion, repeat the same actual Retrofit hook and
 measure owned compiler/server memory during editing. The six-project goal remains open.
 
+### Forty-third checkpoint: expressions inside Kotlin string templates
+
+The shared completion-context detector now treats the expression in a braced
+`${...}` template as code. It retains the nearest literal/comment guard, so outer
+string text, nested strings, comments, numbers and escaped templates remain silent.
+No receiver-inference branch, source model or completion-result expectation changes.
+
+Regression cases cover lexical names, empty/partial member prefixes, dangling dots,
+raw multiline templates and nested expressions. A Kotlin template also follows an
+unsaved Java return-type change and restoration, including exclusion of the stale
+receiver member. Formatting, **138 completion tests (one ignored)**, the focused
+context test, **1,295 workspace tests (four ignored)** and both release builds pass.
+
+On the actual pinned Retrofit checkout, the unchanged manifest and mixed hook now
+match **all 21 first-attempt RPCs and all 25 semantic checks**, including all four
+complete applied-rename buffers, cross-language references and restoration. This is
+the same focused case set as the existing passing IDEA oracle. Original project and
+harness bytes are unchanged. Standard shutdown/exit completes with code zero and no
+forced termination. The previous unanswered goto remains an unmeasured historical
+observation; this run receives it. No transport change was made.
+
+Six failed and three missing dependency-source inputs remain recorded as coverage
+limits, rather than failing unrelated correct requests. This focused run establishes
+neither whole-project IDEA parity nor the remaining compiler/plugin coverage.
+A tiny direct-stdio control also receives separate requests and exits with stdin
+still open; a general stdout-flush or stdin-EOF bug has not been established.
+
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-java-projection-constraints-20261012-1/`
+(`string-template-completion-1/` source packet; `native-string-template-1/` Rust,
+release and source receipt; `native-retrofit-string-template-1/` editor/trace/report;
+`raw-stdio-control-1/` narrow transport control).
+Immutable ktlsp release SHA256:
+`86f8a37b6bb94d61dff8382fee37d9535e726f7f44dbb20223fb3d0c4ac2818b`.
+Next measure native completion and verified owned compiler/server memory on Retrofit,
+then continue compiler-plugin and remaining real-project editing coverage. The
+six-project goal remains in progress.
+
 ### Current slice: requires-only compatibility artifacts
 
 Selected Kotlin compatibility and coroutines JARs can contain a module descriptor

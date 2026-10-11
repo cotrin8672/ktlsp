@@ -314,8 +314,9 @@ For pinned Retrofit, use `dev/nvim_retrofit_mixed_probes.lua` with
 in memory, checks Kotlin completion/navigation, verifies exact cross-language references,
 applies a four-file rename and compares every complete buffer before restoring it.
 Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and JDK 17
-for Gradle, matching the project's selected main toolchain. The probe exposes current
-remaining real-library editing gaps; an empty response is not a passing fast result.
+for Gradle, matching the project's selected main toolchain. This includes completion inside
+braced Kotlin string templates across unsaved Java return-type changes. The focused
+checks pass; broader coverage is tracked in [the acceptance record](docs/fork-acceptance.md).
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus
