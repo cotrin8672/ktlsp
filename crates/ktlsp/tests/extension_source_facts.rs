@@ -309,3 +309,99 @@ fn nested_java_lang_string_is_not_the_top_level_jvm_builtin() {
         assert!(matches!(named(&facts, source, "probe").member.as_ref().unwrap().signature, Knowledge::Unknown(_)), "{file}");
     }
 }
+
+#[test]
+fn source_member_availability_stays_independent_of_jvm_descriptor_knowledge() {
+    use ktlsp::symbol::{IndexedSymbol, MemberImplementation, SourceMemberFlags};
+    assert_eq!(std::mem::size_of::<SourceMemberFlags>(), 1);
+    eprintln!(
+        "SOURCE_METHOD_LAYOUT flags={} symbol={}",
+        std::mem::size_of::<SourceMemberFlags>(),
+        std::mem::size_of::<IndexedSymbol>()
+    );
+    for (file, source, concrete, abstract_) in [
+        ("Owner.kt", "package oracle\nabstract class Owner {\n external open fun externalOnly(): Int\n internal fun internalOnly(): Int = 1\n suspend fun suspendOnly(): Int = 2\n inline fun inlineOnly(): Int = 3\n abstract fun abstractOnly(): Int\n}\n", vec!["externalOnly", "internalOnly", "suspendOnly", "inlineOnly"], "abstractOnly"),
+        ("Owner.java", "package oracle; public abstract class Owner { public native int nativeOnly(); public abstract int abstractOnly(); }", vec!["nativeOnly"], "abstractOnly"),
+    ] {
+        let mut parsers = LanguageParsers::new();
+        let language = SourceLanguage::for_key(file);
+        let tree = parsers.parse(language, source);
+        let symbols = language::symbol_facts(language, &tree, source).symbols;
+        for name in concrete {
+            let flags = symbols.iter().find(|symbol| symbol.name == name).unwrap().source_member;
+            assert_eq!(flags.implementation(), Some(MemberImplementation::Concrete), "{name}");
+            assert_eq!(flags.dispatch(), Some(Dispatch::Instance), "{name}");
+            if name == "internalOnly" { assert!(flags.is_internal()); assert_eq!(flags.visibility(), None); }
+        }
+        assert_eq!(symbols.iter().find(|symbol| symbol.name == abstract_).unwrap().source_member.implementation(), Some(MemberImplementation::Abstract));
+        let extracted = facts(file, source);
+        for name in ["externalOnly", "internalOnly", "suspendOnly", "inlineOnly"].into_iter().filter(|name| source.contains(name)) {
+            let member = named(&extracted, source, name).member.as_ref().unwrap();
+            assert!(matches!(member.signature, Knowledge::Unknown(_)), "JVM descriptor promoted: {name}");
+            assert!(matches!(member.dispatch, Knowledge::Unknown(_)), "old extension knowledge promoted: {name}");
+        }
+    }
+}
+
+#[test]
+fn source_member_headers_distinguish_abstract_default_invalid_and_unfinished_body() {
+    use ktlsp::symbol::MemberImplementation;
+    for (file, source, known) in [
+        ("Cases.java", "package oracle; interface Cases { int abstractOnly(); default int defaultOnly() { return 1; } public int invalidDefault() { return 2; } }", vec![("abstractOnly", Some(MemberImplementation::Abstract)), ("defaultOnly", Some(MemberImplementation::Concrete)), ("invalidDefault", None)]),
+        ("Cases.java", "package oracle; class Cases { default int invalidClassDefault() { return 1; } }", vec![("invalidClassDefault", None)]),
+        ("Cases.kt", "package oracle\ninterface Cases {\n fun abstractOnly(): Int\n fun defaultOnly(): Int = 1\n}\nopen class Partial { open fun unfinished(): Int { return } }\n", vec![("abstractOnly", Some(MemberImplementation::Abstract)), ("defaultOnly", Some(MemberImplementation::Concrete)), ("unfinished", Some(MemberImplementation::Concrete))]),
+        ("Cases.kt", "package oracle\nclass Cases {\n expect fun expected(): Int\n private abstract fun invalid(): Int\n open fun missingBody(): Int\n}\n", vec![("expected", None), ("invalid", None), ("missingBody", None)]),
+    ] {
+        let language = SourceLanguage::for_key(file);
+        let mut parsers = LanguageParsers::new();
+        let tree = parsers.parse(language, source);
+        let symbols = language::symbol_facts(language, &tree, source).symbols;
+        for (name, expected) in known {
+            let symbol = symbols.iter().find(|symbol| symbol.name == name).unwrap_or_else(|| panic!("{file}: missing {name}"));
+            assert_eq!(symbol.source_member.implementation(), expected, "{file}: {name}");
+        }
+    }
+}
+
+#[test]
+fn java_constructor_is_not_an_ordinary_method_descriptor_with_the_owner_name() {
+    use ktlsp::symbol::MemberImplementation;
+    let source = "package oracle; public class Owner { public Owner(int value) {} public int Owner(int value) { return value; } }";
+    let extracted = facts("Owner.java", source);
+    let constructor_start = source.find("Owner(int value)").unwrap();
+    let method_start = source.rfind("Owner(int value)").unwrap();
+    let constructor = extracted
+        .iter()
+        .find(|fact| fact.definition.start_byte == constructor_start)
+        .unwrap();
+    let method = extracted
+        .iter()
+        .find(|fact| fact.definition.start_byte == method_start)
+        .unwrap();
+    assert!(matches!(
+        constructor.member.as_ref().unwrap().signature,
+        Knowledge::Unknown(_)
+    ));
+    assert_eq!(descriptor(method), "(I)I");
+    let mut parsers = LanguageParsers::new();
+    let tree = parsers.parse(SourceLanguage::Java, source);
+    let symbols = language::symbol_facts(SourceLanguage::Java, &tree, source).symbols;
+    assert_eq!(
+        symbols
+            .iter()
+            .find(|symbol| symbol.start_byte == constructor_start)
+            .unwrap()
+            .source_member
+            .implementation(),
+        Some(MemberImplementation::Constructor)
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .find(|symbol| symbol.start_byte == method_start)
+            .unwrap()
+            .source_member
+            .implementation(),
+        Some(MemberImplementation::Concrete)
+    );
+}

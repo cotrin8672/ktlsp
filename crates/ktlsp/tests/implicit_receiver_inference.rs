@@ -439,6 +439,520 @@ fn kotlin_super_provider_changes_invalidate_positive_and_ambiguous_queries() {
 }
 
 #[test]
+fn super_candidates_blank_keeps_distinct_concrete_names_and_excludes_abstract_names() {
+    let mut ws = workspace();
+    add_super_interfaces(&mut ws);
+    ws.open(
+        "Default.kt",
+        "package probe\ninterface Default { fun defaultOnly(): Float = 2f }\n".into(),
+    );
+    ws.open("Multiple.kt", "package probe\nclass Multiple : Base(), Marker by MarkerImpl(), Default {\n    fun run() { super. }\n}\n".into());
+    let got = labels(&mut ws, "Multiple.kt", "super.");
+    assert!(got.contains("getBreakSpeed"), "{got:?}");
+    assert!(got.contains("defaultOnly"), "{got:?}");
+    assert!(!got.contains("marker"), "abstract delegate member: {got:?}");
+}
+
+#[test]
+fn super_candidates_same_name_abstract_provider_does_not_hide_concrete_provider() {
+    let mut ws = workspace();
+    ws.open(
+        "Marker.kt",
+        "package probe\ninterface Marker { fun getBreakSpeed(): Float }\n".into(),
+    );
+    ws.open("Multiple.kt", "package probe\nclass Multiple : Base(), Marker {\n    override fun getBreakSpeed(): Float = super.getBreakSpeed()\n}\n".into());
+    assert!(labels(&mut ws, "Multiple.kt", "super.").contains("getBreakSpeed"));
+    assert_eq!(
+        goto(
+            &mut ws,
+            "Multiple.kt",
+            "super.getBreakSpeed()",
+            "getBreakSpeed"
+        ),
+        vec![target(&ws, "Base.java", "getBreakSpeed")]
+    );
+}
+
+#[test]
+fn super_candidates_filters_private_static_and_constructor_but_keeps_native() {
+    let mut ws = Workspace::new();
+    ws.open("Access.java", "package foreign; public class Access { public Access() {} private int privateOnly() { return 1; } public static int staticOnly() { return 2; } int packageOnly() { return 3; } protected int protectedOnly() { return 4; } public native int nativeOnly(); public int Access(int value) { return value; } }".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nimport foreign.Access\nclass Use : Access() { fun run() { super. } }\n"
+            .into(),
+    );
+    let got = labels(&mut ws, "Use.kt", "super.");
+    for excluded in ["privateOnly", "staticOnly", "packageOnly"] {
+        assert!(!got.contains(excluded), "{excluded}: {got:?}");
+    }
+    for included in ["protectedOnly", "nativeOnly", "Access"] {
+        assert!(got.contains(included), "{included}: {got:?}");
+    }
+    ws.change("Access.java", "package foreign; public class Access { public Access() {} protected int protectedOnly() { return 4; } }".into());
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(
+        !got.contains("Access"),
+        "constructor is not a super method: {got:?}"
+    );
+    assert!(got.contains("protectedOnly"), "{got:?}");
+}
+
+#[test]
+fn super_candidates_reabstracted_override_never_resurrects_concrete_ancestor() {
+    let mut ws = Workspace::new();
+    ws.open("Grand.java", "package probe; public class Grand { public int hidden() { return 1; } public int useful() { return 2; } }".into());
+    ws.open("Middle.java", "package probe; public abstract class Middle extends Grand { public abstract int hidden(); }".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nabstract class Use : Middle() { fun run() { super. } }\n".into(),
+    );
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(got.contains("useful"), "{got:?}");
+    assert!(
+        !got.contains("hidden"),
+        "abstract override resurrected: {got:?}"
+    );
+}
+
+#[test]
+fn super_candidates_same_name_concrete_overloads_are_ambiguous_across_providers() {
+    let mut ws = workspace();
+    add_payload_members(&mut ws);
+    ws.open("GenericBase.java", "package probe; public class GenericBase<T> { public T pick(T value) { return value; } public T inherited() { return null; } }".into());
+    ws.open(
+        "Default.kt",
+        "package probe\ninterface Default { fun pick(value: String): String = value }\n".into(),
+    );
+    ws.open("Use.kt", "package probe\nclass Use : GenericBase<Payload>(), Default {\n fun run(value: Payload): Payload = super<GenericBase>.pick(value)\n fun chain() = super<GenericBase>.inherited().payloadOnly()\n fun incomplete() { super. }\n}\n".into());
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(
+        !got.contains("pick"),
+        "different argument shapes cannot select a provider: {got:?}"
+    );
+    assert!(got.contains("inherited"), "{got:?}");
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "super<GenericBase>.pick(value)"),
+        Type::class("Payload", Some("probe".into()))
+    );
+    assert!(
+        labels(&mut ws, "Use.kt", "super<GenericBase>.inherited().pay").contains("payloadOnly")
+    );
+}
+
+#[test]
+fn super_candidates_unknown_override_blocks_ancestor_without_erasing_distinct_names() {
+    let mut ws = Workspace::new();
+    ws.open("Grand.java", "package probe; public class Grand { public int pick(String value) { return 1; } public int useful() { return 2; } }".into());
+    ws.open("Middle.java", "package probe; public abstract class Middle extends Grand { public abstract int pick(Missing value); }".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nabstract class Use : Middle() { fun run() { super. } }\n".into(),
+    );
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(!got.contains("pick"), "unknown related override: {got:?}");
+    assert!(got.contains("useful"), "unrelated known name: {got:?}");
+    ws.change("Middle.java", "package probe; public abstract class Middle extends Grand { public abstract int pick(int value); }".into());
+    assert!(
+        labels(&mut ws, "Use.kt", "super.").contains("pick"),
+        "known different overload must not hide ancestor"
+    );
+}
+
+#[test]
+fn super_candidates_source_external_is_concrete_while_internal_access_is_unknown() {
+    let mut ws = Workspace::new();
+    ws.open("KotlinBase.kt", "package probe\nopen class KotlinBase {\n external open fun externalOnly(): Int\n private fun privateOnly(): Int = 1\n internal fun internalOnly(): Int = 2\n open fun useful(): Int = 3\n}\n".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nclass Use : KotlinBase() { fun run() { super. } }\n".into(),
+    );
+    let got = labels(&mut ws, "Use.kt", "super.");
+    for name in ["externalOnly", "useful"] {
+        assert!(got.contains(name), "{name}: {got:?}");
+    }
+    for name in ["privateOnly", "internalOnly"] {
+        assert!(!got.contains(name), "{name}: {got:?}");
+    }
+    ws.change(
+        "Use.kt",
+        "package probe\nclass Use : KotlinBase() { fun run() { super.ext } }\n".into(),
+    );
+    assert!(labels(&mut ws, "Use.kt", "super.ext").contains("externalOnly"));
+}
+
+#[test]
+fn super_candidates_recovery_and_unsaved_body_preserve_later_generic_declarations() {
+    let mut ws = Workspace::new();
+    let source = "package probe\nclass Payload\ninterface Marker { fun marker(): Int }\nclass MarkerImpl : Marker { override fun marker(): Int = 1 }\nclass Use : Later<Payload>(), Marker by MarkerImpl() {\n fun incomplete() { super. }\n}\nopen class Later<T> { open fun inherited(): T = TODO() }\n";
+    ws.open("Use.kt", source.into());
+    assert!(labels(&mut ws, "Use.kt", "super.").contains("inherited"));
+    ws.change(
+        "Use.kt",
+        source.replace(
+            "open class Later<T> { open fun inherited(): T = TODO() }",
+            "abstract class Later<T> { abstract fun inherited(): T }",
+        ),
+    );
+    assert!(!labels(&mut ws, "Use.kt", "super.").contains("inherited"));
+    ws.change("Use.kt", source.into());
+    assert!(labels(&mut ws, "Use.kt", "super.").contains("inherited"));
+}
+
+#[test]
+fn super_candidates_do_not_treat_unknown_private_ancestors_as_override_competitors() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Grand.java",
+        "package probe; public class Grand { private int pick(Missing value) { return 1; } }"
+            .into(),
+    );
+    ws.open("Middle.java", "package probe; public class Middle extends Grand { public int pick(int value) { return value; } }".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nclass Use : Middle() { fun run() { super. } }\n".into(),
+    );
+    assert!(labels(&mut ws, "Use.kt", "super.").contains("pick"));
+}
+
+#[test]
+fn super_candidates_invalid_mixed_static_override_is_unknown_without_resurrection() {
+    let mut ws = Workspace::new();
+    ws.open("Grand.java", "package probe; public class Grand { public int hidden() { return 1; } public int useful() { return 2; } }".into());
+    ws.open("Middle.java", "package probe; public class Middle extends Grand { public static int hidden() { return 3; } }".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nclass Use : Middle() { fun run() { super. } }\n".into(),
+    );
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(
+        !got.contains("hidden"),
+        "invalid instance/static override: {got:?}"
+    );
+    assert!(got.contains("useful"), "{got:?}");
+}
+
+#[test]
+fn super_candidates_kotlin_reabstracted_override_blocks_concrete_ancestor() {
+    let mut ws = Workspace::new();
+    ws.open("Ancestors.kt", "package probe\nopen class Grand { open fun hidden(): Int = 1\n fun useful(): Int = 2 }\nabstract class Middle : Grand() { abstract override fun hidden(): Int }\n".into());
+    ws.open(
+        "Use.kt",
+        "package probe\nabstract class Use : Middle() { fun run() { super. } }\n".into(),
+    );
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(!got.contains("hidden"), "{got:?}");
+    assert!(got.contains("useful"), "{got:?}");
+}
+
+#[test]
+fn super_candidates_package_access_uses_kotlin_lexical_package_through_foreign_middle() {
+    // JDK21 javac rejects the foreign-middle calls, while Kotlin2.4 compiles and
+    // executes all four in package a. The super-form query here is Kotlin source.
+    let mut ws = Workspace::new();
+    ws.open("Base.java", "package a; public class Base { int packageOnly() { return 7; } public int useful() { return 8; } }".into());
+    ws.open(
+        "Same.java",
+        "package a; public class Same extends Base {}".into(),
+    );
+    ws.open(
+        "Foreign.java",
+        "package b; public class Foreign extends a.Base {}".into(),
+    );
+    ws.open(
+        "Again.java",
+        "package a; public class Again extends b.Foreign {}".into(),
+    );
+    for parent in ["a.Base", "a.Same", "b.Foreign", "a.Again"] {
+        for (package, allowed) in [("a", true), ("c", false)] {
+            ws.open(
+                "Use.kt",
+                format!("package {package}\nclass Use : {parent}() {{ fun run() {{ super. }} }}\n"),
+            );
+            let got = labels(&mut ws, "Use.kt", "super.");
+            assert_eq!(
+                got.contains("packageOnly"),
+                allowed,
+                "{package}: {parent}: {got:?}"
+            );
+            assert!(got.contains("useful"), "{package}: {parent}: {got:?}");
+        }
+    }
+}
+
+#[test]
+fn super_candidates_recovery_preserves_package_and_nested_owner_identity() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Foreign.kt",
+        "package other\nclass Outer { open class Later<T> { fun foreignDecoy(): Int = 1 } }\n"
+            .into(),
+    );
+    ws.open(
+        "OtherOwner.kt",
+        "package probe\nclass Different { open class Later<T> { fun nestedDecoy(): Int = 2 } }\n"
+            .into(),
+    );
+    let source = "package probe\nclass Payload\nclass Use : Outer.Later<Payload>() { fun run() { super. } }\nclass Outer { open class Later<T> { open fun inherited(): T = TODO() } }\n";
+    ws.open("Use.kt", source.into());
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(got.contains("inherited"), "{got:?}");
+    for decoy in ["foreignDecoy", "nestedDecoy"] {
+        assert!(!got.contains(decoy), "{decoy}: {got:?}");
+    }
+}
+
+#[test]
+fn super_candidates_preserves_concrete_property_type_target_and_result_chain() {
+    for base in [
+        "package probe\nopen class Base { open val value: Payload = Payload() }\n",
+        "package probe\nopen class Base { open val value: Payload get() = Payload() }\n",
+        "package probe\nopen class Base(open val value: Payload = Payload())\n",
+        "package probe\ninterface Base { val value: Payload get() = Payload() }\n",
+    ] {
+        let mut ws = Workspace::new();
+        ws.open(
+            "Payload.kt",
+            "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\n".into(),
+        );
+        ws.open("Base.kt", base.into());
+        let constructor = if base.contains("interface") { "" } else { "()" };
+        let source = format!("package probe\nclass Use : Base{constructor} {{ override val value: Payload get() = super.value\n fun chain() = super.value.payloadOnly()\n fun incomplete() {{ super. }} }}\n");
+        ws.open("Use.kt", source);
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", "super.value"),
+            Type::class("Payload", Some("probe".into())),
+            "{base}"
+        );
+        let entry = ws
+            .index
+            .lookup_by_name("value")
+            .iter()
+            .find(|entry| entry.path.as_ref() == "Base.kt")
+            .unwrap()
+            .clone();
+        let expected = Def {
+            file: "Base.kt".into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        };
+        assert_eq!(
+            goto(&mut ws, "Use.kt", "super.value", "value"),
+            vec![expected],
+            "{base}"
+        );
+        assert!(
+            labels(&mut ws, "Use.kt", "super.").contains("value"),
+            "{base}"
+        );
+        assert!(
+            labels(&mut ws, "Use.kt", "super.value.pay").contains("payloadOnly"),
+            "{base}"
+        );
+    }
+}
+
+#[test]
+fn super_candidates_preserves_public_protected_fields_and_excludes_private_static_fields() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Payload.kt",
+        "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\n".into(),
+    );
+    ws.open("Base.java", "package probe; public class Base { public Payload value; protected Payload protectedValue; private Payload privateValue; public static Payload staticValue; }".into());
+    ws.open("Use.kt", "package other\nimport probe.Base\nclass Use : Base() { fun exact() = super.value\n fun chain() = super.protectedValue.payloadOnly()\n fun incomplete() { super. } }\n".into());
+    let got = labels(&mut ws, "Use.kt", "super.");
+    for name in ["value", "protectedValue"] {
+        assert!(got.contains(name), "{name}: {got:?}");
+    }
+    for name in ["privateValue", "staticValue"] {
+        assert!(!got.contains(name), "{name}: {got:?}");
+    }
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "super.value"),
+        Type::class("Payload", Some("probe".into()))
+    );
+    assert!(labels(&mut ws, "Use.kt", "super.protectedValue.pay").contains("payloadOnly"));
+}
+
+#[test]
+fn super_candidates_abstract_property_blocks_ancestor_before_availability() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Payload.kt",
+        "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\n".into(),
+    );
+    let concrete = "package probe\nopen class Grand { open val value: Payload = Payload()\n val useful: Payload = Payload() }\nabstract class Base : Grand() { abstract override val value: Payload }\n";
+    ws.open("Base.kt", concrete.into());
+    ws.open("Use.kt", "package probe\nabstract class Use : Base() { fun exact() = super.value\n fun chain() = super.value.payloadOnly()\n fun incomplete() { super. } }\n".into());
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(
+        !got.contains("value"),
+        "abstract override resurrected: {got:?}"
+    );
+    assert!(
+        got.contains("useful"),
+        "distinct concrete value lost: {got:?}"
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "super.value"),
+        Type::Unknown
+    );
+    assert!(!labels(&mut ws, "Use.kt", "super.value.pay").contains("payloadOnly"));
+    ws.change(
+        "Base.kt",
+        concrete.replace(
+            "abstract override val value: Payload",
+            "override val value: Payload get() = Payload()",
+        ),
+    );
+    assert!(labels(&mut ws, "Use.kt", "super.").contains("value"));
+    ws.change("Base.kt", concrete.into());
+    assert!(!labels(&mut ws, "Use.kt", "super.").contains("value"));
+}
+
+#[test]
+fn super_candidates_unsaved_getter_body_keeps_read_header_and_abstract_interface_is_excluded() {
+    let mut ws = Workspace::new();
+    ws.open("Payload.kt", "package probe\nclass Payload\n".into());
+    ws.open("Base.kt", "package probe\nopen class Base { open val value: Payload get() = Payload() }\ninterface AbstractValue { val abstractValue: Payload }\n".into());
+    ws.open("Use.kt", "package probe\nabstract class Use : Base(), AbstractValue { fun incomplete() { super. } }\n".into());
+    let got = labels(&mut ws, "Use.kt", "super.");
+    assert!(got.contains("value"), "{got:?}");
+    assert!(!got.contains("abstractValue"), "{got:?}");
+    ws.change("Base.kt", "package probe\nopen class Base { open val value: Payload get() { return } }\ninterface AbstractValue { val abstractValue: Payload }\n".into());
+    assert!(labels(&mut ws, "Use.kt", "super.").contains("value"));
+}
+
+#[test]
+fn super_candidates_default_getter_is_independent_of_class_initialization_style() {
+    for base in [
+        "package probe\nopen class Base<T> { open val value: T\n init { value = TODO() } }\n",
+        "package probe\nopen class Base<T : Any> { open lateinit var value: T\n init { value = TODO() } }\n",
+        "package probe\nopen class Base<T> { open val value: T by lazy { TODO() } }\n",
+    ] {
+        let mut ws = Workspace::new();
+        ws.open("Payload.kt", "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\n".into());
+        ws.open("Base.kt", base.into());
+        ws.open("Use.kt", "package probe\nclass Use : Base<Payload>() { fun exact() = super.value\n fun chain() = super.value.payloadOnly()\n fun incomplete() { super. } }\n".into());
+        assert_eq!(infer_expression(&ws, "Use.kt", "super.value"), Type::class("Payload", Some("probe".into())), "{base}");
+        assert!(labels(&mut ws, "Use.kt", "super.").contains("value"), "{base}");
+        assert!(labels(&mut ws, "Use.kt", "super.value.pay").contains("payloadOnly"), "{base}");
+    }
+}
+
+#[test]
+fn super_selection_never_readds_private_same_name_overloads() {
+    let mut observed = Vec::new();
+    let mut expected = Vec::new();
+    for private_parameters in ["vararg ignored: Int", "ignored: Int"] {
+        let mut ws = Workspace::new();
+        let base = format!(
+            "package probe\nopen class Base {{\n    open fun pick(): Int = 1\n    private fun pick({private_parameters}): String = \"private\"\n}}\n"
+        );
+        let use_source = "package probe\ninterface Marker\nclass Use : Base(), Marker {\n    fun run(): Int = super.pick()\n}\n";
+        ws.open("Base.kt", base.clone());
+        ws.open("Use.kt", use_source.into());
+        let public = Def {
+            file: "Base.kt".into(),
+            start_byte: base.find("pick()").unwrap(),
+            end_byte: base.find("pick()").unwrap() + "pick".len(),
+        };
+
+        let tree = KotlinParser::new().parse(use_source);
+        let super_start = use_source.find("super.pick()").unwrap();
+        let super_node = tree
+            .root_node()
+            .named_descendant_for_byte_range(super_start, super_start + "super".len())
+            .unwrap();
+        assert_eq!(super_node.kind(), "super_expression");
+        let ctx = FileCtx::from_tree(&tree, use_source);
+        let scoped = ws.index.scoped_for_file("Use.kt");
+        let receivers = infer::super_receivers(&scoped, super_node, use_source, &ctx);
+        let blank = ktcore::members::super_candidates(&scoped, receivers, "", &ctx);
+        let blank_targets: Vec<_> = blank
+            .providers
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .filter(|entry| entry.sym.name == "pick")
+            .map(|entry| Def {
+                file: entry.path.to_string(),
+                start_byte: entry.sym.start_byte,
+                end_byte: entry.sym.end_byte,
+            })
+            .collect();
+        let inferred = infer_expression(&ws, "Use.kt", "super.pick()")
+            .name()
+            .map(str::to_owned);
+        let definitions = goto(&mut ws, "Use.kt", "super.pick()", "pick");
+        observed.push((private_parameters, blank_targets, definitions, inferred));
+        expected.push((
+            private_parameters,
+            vec![public.clone()],
+            vec![public],
+            Some("Int".to_string()),
+        ));
+    }
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn super_call_shape_uses_only_effective_public_overloads() {
+    let mut ws = Workspace::new();
+    ws.assume_index_complete_for_tests();
+    ws.open("Base.kt", "package probe\nopen class Base { open fun pick(): Int = 1; private fun pick(vararg ignored: Int): String = \"private\" }\n".into());
+    let source = "package probe\ninterface Marker\nclass Use : Base(), Marker { fun run() { super.pick(1) } }\n";
+    ws.open("Use.kt", source.into());
+    let tree = KotlinParser::new().parse(source);
+    let start = source.find("super.pick(1)").unwrap();
+    let call = tree
+        .root_node()
+        .named_descendant_for_byte_range(start, start + "super.pick(1)".len())
+        .unwrap();
+    assert_eq!(call.kind(), "call_expression");
+    let facts = ktlsp::resolve::CompletenessFacts::complete();
+    let scoped = ws.index.scoped_for_file("Use.kt");
+    let shape =
+        ktlsp::semantic_query::call_shape_query(&scoped, "Use.kt", &tree, source, call, &facts)
+            .expect("private vararg cannot accept or suppress the public call mismatch");
+    assert_eq!(shape.arg_count, 1);
+    assert_eq!(shape.arities, vec![0]);
+    let diagnostics =
+        ktcore::indexed_diagnostics::compute(&scoped, "Use.kt", source, &tree, &facts);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("No overload of pick")),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn closed_super_goto_keeps_effective_pool_and_rejects_unique_private_fallback() {
+    let directory = std::env::temp_dir().join(format!(
+        "ktlsp-closed-super-private-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("Use.kt").to_string_lossy().into_owned();
+    let source = "package probe\ninterface Marker\nclass Use : Base(), Marker { fun run() { super.pick(); super.hiddenOnly() } }\n";
+    std::fs::write(&path, source).unwrap();
+    let mut ws = Workspace::new();
+    ws.open("Base.kt", "package probe\nopen class Base { open fun pick(): Int = 1; private fun pick(vararg ignored: Int): String = \"private\"; private fun hiddenOnly(): Int = 2 }\n".into());
+    ws.open(&path, source.into());
+    let expected = target(&ws, "Base.kt", "pick");
+    ws.close(&path);
+    assert_eq!(goto(&mut ws, &path, "super.pick()", "pick"), vec![expected]);
+    assert!(goto(&mut ws, &path, "super.hiddenOnly()", "hiddenOnly").is_empty());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+}
+
+#[test]
 fn implicit_chain_references_and_applied_rename_include_every_real_use() {
     let mut ws = workspace();
     let definition = target(&ws, "Lookup.java", "getOrThrow");

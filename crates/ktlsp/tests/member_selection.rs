@@ -2008,7 +2008,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
-    // This is the previous persisted layout, including both inline receiver slots.
+    // The previous21 fields preserve their values/order; the new method flags change the wire.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct InlineSymbol {
         name: String,
@@ -2064,21 +2064,32 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     rich.value_type = Some(receiver.clone());
     rich.params = vec![receiver];
     rich.type_params = vec!["Payload".into()];
+    let source = "package api; public class Owner { public native void method(); }";
+    let tree = ktlsp::java::JavaParser::new().parse(source);
+    rich.source_member = ktlsp::java::extract_symbols(&tree, source)
+        .into_iter()
+        .find(|symbol| symbol.name == "method")
+        .unwrap()
+        .source_member;
 
     for symbol in [empty, rich] {
-        let value = serde_json::to_value(&symbol).unwrap();
+        let mut value = serde_json::to_value(&symbol).unwrap();
+        value.as_object_mut().unwrap().remove("source_member");
         let old: InlineSymbol = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&old).unwrap(), value);
         let old_bytes = bincode::serialize(&old).unwrap();
         let current_bytes = bincode::serialize(&symbol).unwrap();
-        assert_eq!(old_bytes, current_bytes);
+        assert_eq!(old_bytes, current_bytes[..old_bytes.len()]);
+        assert_eq!(current_bytes.len(), old_bytes.len() + 1);
         assert_eq!(
-            bincode::deserialize::<InlineSymbol>(&current_bytes).unwrap(),
-            old
-        );
-        assert_eq!(
-            bincode::deserialize::<IndexedSymbol>(&old_bytes).unwrap(),
+            bincode::deserialize::<IndexedSymbol>(&current_bytes).unwrap(),
             symbol
+        );
+        let mut defaulted = symbol.clone();
+        defaulted.source_member = Default::default();
+        assert_eq!(
+            serde_json::from_value::<IndexedSymbol>(value).unwrap(),
+            defaulted
         );
     }
 }

@@ -240,14 +240,25 @@ fn member_call_shape_query(
     if symbol.is_empty() {
         return None;
     }
-    let recv_ty = infer::infer(index, recv, src, &ctx);
+    let (recv_ty, candidates) = if recv.kind() == "super_expression" {
+        crate::members::super_member_candidates(
+            index,
+            infer::super_receivers(index, recv, src, ctx),
+            &symbol,
+            ctx,
+        )?
+    } else {
+        let ty = infer::infer(index, recv, src, ctx);
+        let candidates = crate::members::candidates(index, &ty, &symbol, ctx);
+        (ty, candidates)
+    };
     if receiver_world_is_library_or_jdk(index, &recv_ty) {
         return None;
     }
     let entries = member_call_entries(
         index,
         &recv_ty,
-        &symbol,
+        candidates,
         &infer::call_arguments(index, call, src, ctx),
         ctx,
     );
@@ -400,11 +411,10 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
 fn member_call_entries(
     index: &dyn InferenceIndex,
     recv_ty: &Type,
-    name: &str,
+    candidates: crate::members::Candidates<'_>,
     args: &crate::members::CallArguments,
     ctx: &infer::FileCtx,
 ) -> Vec<Entry> {
-    let candidates = crate::members::candidates(index, recv_ty, name, ctx);
     let selected = candidates.select(
         index,
         recv_ty,

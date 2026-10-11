@@ -18,3 +18,18 @@ fun probeAccountChain() {
         .getOrThrow()
         .ema
 }
+
+class SuperResult {
+    fun publicOnly(): Int = 1
+}
+
+open class SuperBase {
+    open fun pick(): SuperResult = SuperResult()
+    private fun pick(vararg ignored: Int): String = "private"
+}
+
+interface SuperMarker
+
+class SuperProbe : SuperBase(), SuperMarker {
+    fun probe() = super.pick().publicO
+}

@@ -820,6 +820,9 @@ impl Workspace {
             return None;
         }
         let receiver = nav.named_child(0)?;
+        if receiver.kind() == "super_expression" {
+            return None;
+        }
         let ctx = infer::FileCtx::from_tree(tree, text);
         let receiver_type = self.salsa.expr_type(
             key,

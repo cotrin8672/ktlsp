@@ -344,6 +344,7 @@ fn walk_declaration_container<'tree>(
                 if let Some(name) = name_field(child) {
                     let mut sym =
                         indexed_symbol(name, src, SymbolKind::Function, package, container);
+                    sym.source_member = crate::indexer::source_member_flags(child, src, true);
                     sym.params = parameter_types(child, src, scope);
                     sym.type_params = type_parameter_names(child, src);
                     sym.arity = Some(sym.params.len().min(u8::MAX as usize) as u8);
@@ -361,6 +362,7 @@ fn walk_declaration_container<'tree>(
                 // Do NOT recurse into the body (only locals live there).
             }
             "field_declaration" => {
+                let flags = crate::indexer::source_member_flags(child, src, true);
                 let value_type = child
                     .child_by_field_name("type")
                     .and_then(|ty| type_ref_from_node(ty, src, scope));
@@ -370,6 +372,7 @@ fn walk_declaration_container<'tree>(
                         if let Some(name) = name_field(vd) {
                             let mut sym =
                                 indexed_symbol(name, src, SymbolKind::Property, package, container);
+                            sym.source_member = flags;
                             sym.value_type = value_type.clone();
                             out.push(sym);
                         }

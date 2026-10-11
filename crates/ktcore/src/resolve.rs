@@ -488,6 +488,20 @@ fn member_name_status_a(
     let Some(recv) = nav.named_child(0) else {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
     };
+    if recv.kind() == "super_expression" {
+        return if members::super_member_candidates(
+            index,
+            infer::super_receivers(index, recv, src, ctx),
+            name,
+            ctx,
+        )
+        .is_some()
+        {
+            ResolutionStatus::Found(())
+        } else {
+            ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType])
+        };
+    }
     let recv_ty = infer::infer(index, recv, src, ctx);
     member_name_status_for_receiver(index, file, &recv_ty, name, facts, ctx)
 }
@@ -1283,6 +1297,22 @@ fn resolve_member_with_ctx(
     if let Some(nav) = parent {
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
+                if receiver.kind() == "super_expression" {
+                    return members::super_member_candidates(
+                        index,
+                        infer::super_receivers(index, receiver, src, ctx),
+                        name,
+                        ctx,
+                    )
+                    .map(|(ty, candidates)| {
+                        entries_to_defs(
+                            candidates
+                                .select(index, &ty, &member_use(index, selector, src, ctx), ctx)
+                                .entries,
+                        )
+                    })
+                    .unwrap_or_default();
+                }
                 // Infer the receiver's type (package-qualified) and resolve the member on it —
                 // own members, inherited (supertype walk), and extensions; package-filtered so a
                 // same-named type in another package can't be picked.

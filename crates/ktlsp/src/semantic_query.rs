@@ -294,11 +294,42 @@ pub fn member_completion_query(
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
     let ctx = infer::FileCtx::from_tree(tree, src);
-    let ty = if receiver.kind() == "super_expression" {
-        infer::super_receiver_type(index, receiver, src, &ctx, Some(&prefix))
-    } else {
-        infer::infer(index, receiver, src, &ctx)
-    };
+    if receiver.kind() == "super_expression" {
+        let mut source = Index::new();
+        source.replace_file(
+            "<completion>",
+            language::symbol_facts(SourceLanguage::Kotlin, tree, src).symbols,
+            Tier::Volatile,
+        );
+        let recovered = RecoveredTypeIndex {
+            index,
+            source: &source,
+        };
+        let receivers = infer::super_receivers(&recovered, receiver, src, &ctx);
+        let selected = ktcore::members::super_candidates(&recovered, receivers, &prefix, &ctx);
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for (_, entries) in selected.providers {
+            for entry in entries {
+                push_member_candidate(&mut candidates, &mut seen, entry, &prefix, None);
+            }
+        }
+        candidates.truncate(max_candidates);
+        let status = if selected.incomplete || candidates.is_empty() {
+            // Source hierarchy/implementation facts do not certify generated-API absence.
+            CompletionStatus::Unknown(vec![CompletionIncompletenessReason::QueryScopeIncomplete])
+        } else {
+            CompletionStatus::Found(())
+        };
+        return Some(CompletionQuery {
+            context: complete::CompletionContext::AfterDot,
+            prefix,
+            candidates,
+            status,
+            layout: imports::import_layout_with_style(ImportStyle::Kotlin, tree, src),
+        });
+    }
+    let ty = infer::infer(index, receiver, src, &ctx);
     member_completion_query_for_type(
         index,
         SourceLanguage::Kotlin,
@@ -491,13 +522,29 @@ fn member_call_shape_query(
         return None;
     }
     let ctx = infer::FileCtx::from_tree(tree, src);
-    let recv_ty = infer::infer(index, recv, src, &ctx);
-    let entries = member_call_entries(
-        index,
-        &recv_ty,
-        &symbol,
-        &Visibility::new(&ctx.package, &ctx.imports),
-    );
+    let (recv_ty, entries) = if recv.kind() == "super_expression" {
+        let (ty, candidates) = ktcore::members::super_member_candidates(
+            index,
+            infer::super_receivers(index, recv, src, &ctx),
+            &symbol,
+            &ctx,
+        )?;
+        let entries = candidates
+            .members
+            .into_iter()
+            .filter(|entry| entry.sym.kind == SymbolKind::Function)
+            .collect::<Vec<_>>();
+        (ty, entries)
+    } else {
+        let ty = infer::infer(index, recv, src, &ctx);
+        let entries = member_call_entries(
+            index,
+            &ty,
+            &symbol,
+            &Visibility::new(&ctx.package, &ctx.imports),
+        );
+        (ty, entries)
+    };
     if entries.is_empty() {
         return None;
     }
@@ -656,7 +703,26 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
         self.index.lookup_by_name(name)
     }
     fn members_of(&self, name: &str) -> LookupEntries<'_> {
-        self.index.members_of(name)
+        let (container, simple) = name
+            .rsplit_once('.')
+            .map_or((None, name), |(container, simple)| {
+                (Some(container), simple)
+            });
+        let owners = self.source.lookup_type(simple);
+        let matches_owner = |entry: &&Entry| {
+            owners.iter().any(|owner| {
+                owner.sym.container.as_deref() == container
+                    && owner.sym.package == entry.sym.package
+            })
+        };
+        let mut entries: Vec<_> = self
+            .index
+            .members_of(name)
+            .into_iter()
+            .filter(|entry| !matches_owner(entry))
+            .collect();
+        entries.extend(self.source.members_of(name).iter());
+        LookupEntries::Selected(entries)
     }
     fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
         self.index.extensions_for(name)
@@ -1248,6 +1314,7 @@ mod tests {
                 value_type: None,
                 params: Vec::new(),
                 type_params: Vec::new(),
+                source_member: Default::default(),
             }],
             crate::index::Tier::Durable,
         );

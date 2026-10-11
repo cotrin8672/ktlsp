@@ -12,9 +12,8 @@ pub struct Coordinate {
 
 impl Coordinate {
     /// Parse `group:artifact:version`. Returns `None` for anything that isn't exactly three parts
-    /// of Maven's safe charset — which both rejects version-less BOM-managed entries AND ensures a
-    /// component can never inject a path separator or `..` into a filesystem path / URL built from
-    /// it (defense against a malicious catalog or repository).
+    /// of supported path-safe characters. This rejects version-less BOM-managed entries and
+    /// prevents separators or a `..` component in derived filesystem paths and URLs.
     pub fn parse(s: &str) -> Option<Coordinate> {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() == 3 && parts.iter().all(|p| is_safe_component(p)) {
@@ -78,7 +77,7 @@ fn is_safe_component(s: &str) -> bool {
         && s != "."
         && s != ".."
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
 }
 
 #[cfg(test)]
@@ -104,6 +103,20 @@ mod tests {
         assert!(Coordinate::parse("group:artifact").is_none());
         assert!(Coordinate::parse("a:b:c:d").is_none());
         assert!(Coordinate::parse("a::c").is_none());
+    }
+
+    #[test]
+    fn preserves_plus_in_version_and_source_paths() {
+        let c = Coordinate::parse("net.createmod.ponder:ponder-neoforge:1.0.87+mc1.21.1")
+            .expect("selected module versions may contain a literal plus");
+        assert_eq!(c.version, "1.0.87+mc1.21.1");
+        assert_eq!(
+            c.sources_url("https://maven.createmod.net/"),
+            "https://maven.createmod.net/net/createmod/ponder/ponder-neoforge/1.0.87+mc1.21.1/ponder-neoforge-1.0.87+mc1.21.1-sources.jar"
+        );
+        for version in ["1.0+../x", "1.0+%2f", "1.0+?x", "1.0+#x", "1.0+ x"] {
+            assert!(Coordinate::parse(&format!("g:a:{version}")).is_none());
+        }
     }
 
     #[test]

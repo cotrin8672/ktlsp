@@ -1,5 +1,6 @@
 //! Receiver member candidates and use-site selection, shared by resolution and inference.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use crate::index::{Entry, InferenceIndex};
@@ -60,28 +61,155 @@ impl MemberName<'_> {
     }
 }
 
-/// A competing supertype can be excluded only when its known hierarchy supplies no matching
-/// declaration. Extensions are not super implementations; multiple providers stay ambiguous.
+pub struct SuperCandidates<'a> {
+    /// Each entry retains its instantiated direct-super receiver for generic substitution.
+    pub providers: Vec<(Type, Vec<&'a Entry>)>,
+    pub incomplete: bool,
+}
+
+/// Effective members callable through a Kotlin source `super` form.
+pub fn super_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: Vec<Type>,
+    prefix: &str,
+    ctx: &FileCtx,
+) -> SuperCandidates<'a> {
+    super_matching_candidates(index, receivers, MemberName::Prefix(prefix), ctx)
+}
+
+/// Keep the effective source-super pool through later call/value selection. Returning only its
+/// receiver and collecting ordinary members again would reintroduce private/abstract declarations.
+pub fn super_member_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: Vec<Type>,
+    name: &str,
+    ctx: &FileCtx,
+) -> Option<(Type, Candidates<'a>)> {
+    let mut selected = super_matching_candidates(index, receivers, MemberName::Exact(name), ctx);
+    if selected.providers.len() != 1 {
+        return None;
+    }
+    let (receiver, members) = selected.providers.pop()?;
+    Some((
+        receiver,
+        Candidates {
+            members,
+            extensions: Vec::new(),
+            hierarchy_complete: !selected.incomplete,
+        },
+    ))
+}
+
+/// Provider choice is per exact name, after effective override and implementation selection.
 pub(crate) fn unique_super_receiver(
     index: &dyn InferenceIndex,
     receivers: Vec<Type>,
     name: MemberName<'_>,
     ctx: &FileCtx,
 ) -> Type {
-    let mut result = None;
+    let mut providers = super_matching_candidates(index, receivers, name, ctx).providers;
+    if providers.len() == 1 {
+        providers.pop().unwrap().0
+    } else {
+        Type::Unknown
+    }
+}
+
+fn super_matching_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: Vec<Type>,
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+) -> SuperCandidates<'a> {
+    let mut providers = Vec::new();
+    let mut blocked = BTreeSet::new();
+    let mut incomplete = false;
+    let multiple = receivers.len() > 1;
     for receiver in receivers {
-        let candidates = matching_candidates(index, &receiver, name, ctx);
-        if candidates.members.is_empty() {
-            if !candidates.hierarchy_complete {
-                return Type::Unknown;
+        let raw = collect_candidates(index, &receiver, name, ctx, false);
+        if !raw.hierarchy_complete {
+            incomplete = true;
+            if multiple {
+                // An unresolved direct provider could compete with any otherwise useful name.
+                return SuperCandidates {
+                    providers: Vec::new(),
+                    incomplete,
+                };
             }
-        } else if result.is_some() {
-            return Type::Unknown;
-        } else {
-            result = Some(receiver);
+        }
+        let mut names: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
+        for entry in raw.members {
+            names.entry(&entry.sym.name).or_default().push(entry);
+        }
+        let mut members = Vec::new();
+        for (name, mut entries) in names {
+            // Keep abstract/unknown overrides until dominance has hidden their ancestors.
+            let mut uncertain =
+                remove_overridden_members(index, &receiver, &mut entries, ctx, true);
+            entries.retain(|entry| match super_eligibility(entry, ctx) {
+                Some(eligible) => eligible,
+                None => {
+                    uncertain = true;
+                    false
+                }
+            });
+            if uncertain {
+                blocked.insert(name);
+                incomplete = true;
+            } else {
+                members.extend(entries);
+            }
+        }
+        providers.push((receiver, members));
+    }
+    let mut owners = BTreeMap::new();
+    for (provider, (_, entries)) in providers.iter().enumerate() {
+        for entry in entries {
+            if owners
+                .insert(entry.sym.name.as_str(), provider)
+                .is_some_and(|previous| previous != provider)
+            {
+                blocked.insert(entry.sym.name.as_str());
+                incomplete = true;
+            }
         }
     }
-    result.unwrap_or(Type::Unknown)
+    for (_, entries) in &mut providers {
+        entries.retain(|entry| !blocked.contains(entry.sym.name.as_str()));
+    }
+    providers.retain(|(_, entries)| !entries.is_empty());
+    SuperCandidates {
+        providers,
+        incomplete,
+    }
+}
+
+fn super_eligibility(entry: &Entry, ctx: &FileCtx) -> Option<bool> {
+    use crate::extensions::{Dispatch, Visibility};
+    use crate::symbol::MemberImplementation;
+    let flags = entry.sym.source_member;
+    if matches!(
+        flags.implementation(),
+        Some(MemberImplementation::Abstract | MemberImplementation::Constructor)
+    ) || flags.dispatch() == Some(Dispatch::Static)
+        || flags.visibility() == Some(Visibility::Private)
+    {
+        return Some(false);
+    }
+    if flags.implementation() != Some(MemberImplementation::Concrete)
+        || flags.dispatch() != Some(Dispatch::Instance)
+    {
+        return None;
+    }
+    match flags.visibility() {
+        Some(Visibility::Public | Visibility::Protected) => Some(true),
+        // Kotlin2.4 permits same-package access even through a foreign-package
+        // intermediate superclass; javac uses different inheritance visibility.
+        Some(Visibility::Package) => Some(ctx.package == entry.sym.package),
+        Some(Visibility::Private) => Some(false),
+        // shortcut: source internal is known, but module/friend visibility is not certified here.
+        None => None,
+    }
 }
 
 /// Select a bare member/extension call through the same innermost-first receiver stack used by
@@ -128,6 +256,18 @@ pub(crate) fn matching_candidates<'a>(
     name: MemberName<'_>,
     ctx: &FileCtx,
 ) -> Candidates<'a> {
+    let mut result = collect_candidates(index, receiver, name, ctx, true);
+    remove_overridden_members(index, receiver, &mut result.members, ctx, false);
+    result
+}
+
+fn collect_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+    include_extensions: bool,
+) -> Candidates<'a> {
     let mut members = Vec::new();
     let mut extensions = Vec::new();
     let mut hierarchy_complete = true;
@@ -140,13 +280,15 @@ pub(crate) fn matching_candidates<'a>(
             name.matches(&entry.sym.name)
                 && current.package().is_none_or(|pkg| entry.sym.package == pkg)
         }));
-        extensions.extend(index.extensions_for(&root).into_iter().filter(|entry| {
-            name.matches(&entry.sym.name)
-                && resolve::extension_is_visible(entry, &ctx.imports, &ctx.package)
-        }));
+        if include_extensions {
+            extensions.extend(index.extensions_for(&root).into_iter().filter(|entry| {
+                name.matches(&entry.sym.name)
+                    && resolve::extension_is_visible(entry, &ctx.imports, &ctx.package)
+            }));
+        }
         ControlFlow::Continue(())
     });
-    if let MemberName::Exact(name) = name {
+    if let (true, MemberName::Exact(name)) = (include_extensions, name) {
         extensions.extend(resolve::generic_receiver_extensions(
             index,
             name,
@@ -169,7 +311,6 @@ pub(crate) fn matching_candidates<'a>(
                 && a.sym.end_byte == b.sym.end_byte
         });
     }
-    remove_overridden_members(index, receiver, &mut members, ctx);
     Candidates {
         members,
         extensions,
@@ -183,13 +324,17 @@ fn remove_overridden_members(
     receiver: &Type,
     members: &mut Vec<&Entry>,
     ctx: &FileCtx,
-) {
+    source_super: bool,
+) -> bool {
     if members.len() < 2 {
-        return;
+        return false;
     }
     let signatures: Vec<Option<Vec<Type>>> = members
         .iter()
         .map(|entry| {
+            if entry.sym.kind != crate::symbol::SymbolKind::Function {
+                return None;
+            }
             if !members.iter().any(|other| {
                 other.sym.name == entry.sym.name
                     && other.sym.arity == entry.sym.arity
@@ -202,17 +347,40 @@ fn remove_overridden_members(
         })
         .collect();
     let mut keep = vec![true; members.len()];
+    let mut uncertain = false;
     for (position, inherited) in members.iter().enumerate() {
         keep[position] = !members.iter().enumerate().any(|(other, nearer)| {
-            other != position
-                && signature_inheritance_relation(
+            if other == position {
+                return false;
+            }
+            let metadata = source_super.then(|| super_override_relation(nearer, inherited));
+            if metadata
+                .as_ref()
+                .is_some_and(|relation| relation.is_definitely_absent())
+            {
+                return false;
+            }
+            let mut relation = if source_super
+                && nearer.sym.kind == crate::symbol::SymbolKind::Property
+                && inherited.sym.kind == crate::symbol::SymbolKind::Property
+            {
+                value_inheritance_relation(index, nearer, inherited)
+            } else {
+                signature_inheritance_relation(
                     index,
                     nearer,
                     inherited,
                     &signatures[other],
                     &signatures[position],
                 )
-                .is_found()
+            };
+            if relation.is_found() {
+                if let Some(metadata) = metadata {
+                    relation = metadata;
+                }
+            }
+            uncertain |= source_super && !relation.is_found() && !relation.is_definitely_absent();
+            relation.is_found()
         });
     }
     let mut position = 0;
@@ -221,6 +389,71 @@ fn remove_overridden_members(
         position += 1;
         retain
     });
+    uncertain
+}
+
+fn value_inheritance_relation(
+    index: &dyn InferenceIndex,
+    child: &Entry,
+    parent: &Entry,
+) -> resolve::ResolutionStatus<()> {
+    use crate::knowledge::Knowledge;
+    if child.sym.name != parent.sym.name
+        || child.sym.ext_receiver.is_some()
+        || parent.sym.ext_receiver.is_some()
+    {
+        return Knowledge::DefinitelyAbsent;
+    }
+    let owner = owner_inheritance(index, child, parent);
+    if owner.is_definitely_absent() {
+        return owner;
+    }
+    if owner.is_found() && owner_inheritance(index, parent, child).is_definitely_absent() {
+        return Knowledge::Found(());
+    }
+    Knowledge::Unknown(vec![resolve::IncompletenessReason::UnknownReceiverType])
+}
+
+fn super_override_relation(child: &Entry, parent: &Entry) -> resolve::ResolutionStatus<()> {
+    use crate::extensions::{Dispatch, Visibility};
+    use crate::knowledge::Knowledge;
+    use crate::symbol::MemberImplementation;
+    let child_flags = child.sym.source_member;
+    let parent_flags = parent.sym.source_member;
+    if [child_flags, parent_flags]
+        .iter()
+        .any(|flags| flags.implementation() == Some(MemberImplementation::Constructor))
+        || parent_flags.visibility() == Some(Visibility::Private)
+        || parent_flags.visibility() == Some(Visibility::Package)
+            && child.sym.package != parent.sym.package
+    {
+        return Knowledge::DefinitelyAbsent;
+    }
+    let access_valid = match (child_flags.visibility(), parent_flags.visibility()) {
+        (Some(Visibility::Public), Some(_)) => true,
+        (Some(Visibility::Protected), Some(Visibility::Protected | Visibility::Package)) => true,
+        (Some(Visibility::Package), Some(Visibility::Package)) => true,
+        _ => false,
+    };
+    if child_flags.implementation().is_some()
+        && parent_flags.implementation().is_some()
+        && matches!(
+            (child_flags.dispatch(), parent_flags.dispatch()),
+            (Some(Dispatch::Instance), Some(Dispatch::Instance))
+                | (Some(Dispatch::Static), Some(Dispatch::Static))
+        )
+        && access_valid
+    {
+        Knowledge::Found(())
+    } else {
+        Knowledge::Unknown(vec![
+            resolve::IncompletenessReason::MemberSurfaceIncomplete(crate::symbol::Def {
+                file: child.path.to_string(),
+                start_byte: child.sym.start_byte,
+                end_byte: child.sym.end_byte,
+            }),
+        ])
+    }
 }
 
 /// Known parameter identities after substituting the receiver's owning-class arguments.

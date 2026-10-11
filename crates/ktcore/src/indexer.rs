@@ -16,7 +16,7 @@ use crate::index::Usage;
 use crate::parser::{
     child_of_kind, class_kind, first_ident, imports_of, name_field, node_text, Import,
 };
-use crate::symbol::{IndexedSymbol, SymbolKind};
+use crate::symbol::{IndexedSymbol, MemberImplementation, SourceMemberFlags, SymbolKind};
 use crate::types::TypeRef;
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
@@ -197,6 +197,8 @@ fn push_property_names(
     scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
 ) {
+    let start = out.len();
+    let flags = source_member_flags(decl, src, false);
     let mut cursor = decl.walk();
     for child in decl.named_children(&mut cursor) {
         match child.kind() {
@@ -240,6 +242,9 @@ fn push_property_names(
             _ => {}
         }
     }
+    for symbol in &mut out[start..] {
+        symbol.source_member = flags;
+    }
 }
 
 /// Like `push`, but stamps `ext_receiver` (for extension functions/properties) and `value_type`
@@ -270,6 +275,223 @@ fn push_ext(
     });
 }
 
+/// Classify an already parsed declaration once; body errors do not erase a valid header.
+pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMemberFlags {
+    use crate::extensions::{Dispatch, Visibility};
+    if node.kind() == "constructor_declaration" {
+        return SourceMemberFlags::new(
+            MemberImplementation::Constructor,
+            Dispatch::Instance,
+            Visibility::Public,
+            false,
+            false,
+        );
+    }
+    let value = matches!(
+        node.kind(),
+        "property_declaration" | "class_parameter" | "field_declaration"
+    );
+    if !value && !matches!(node.kind(), "function_declaration" | "method_declaration") {
+        return SourceMemberFlags::default();
+    }
+    let mut cursor = node.walk();
+    if node
+        .children(&mut cursor)
+        .filter(|child| {
+            if node.kind() == "property_declaration" {
+                matches!(
+                    child.kind(),
+                    "modifiers"
+                        | "variable_declaration"
+                        | "multi_variable_declaration"
+                        | "user_type"
+                        | "nullable_type"
+                        | "type_constraints"
+                )
+            } else if node.kind() == "field_declaration" {
+                child.kind() != "variable_declarator"
+            } else {
+                !matches!(child.kind(), "function_body" | "block")
+            }
+        })
+        .any(|child| child.has_error() || child.is_missing())
+    {
+        return SourceMemberFlags::default();
+    }
+    let mut abstract_ = false;
+    let mut static_ = false;
+    let mut private = false;
+    let mut protected = false;
+    let mut public = false;
+    let mut internal = false;
+    let mut native = false;
+    let mut external = false;
+    let mut expect = false;
+    let mut default_ = false;
+    let mut final_ = false;
+    let mut jvm_restricted = false;
+    if let Some(modifiers) = child_of_kind(node, "modifiers") {
+        let mut cursor = modifiers.walk();
+        for modifier in modifiers.children(&mut cursor) {
+            match node_text(modifier, src) {
+                "abstract" => abstract_ = true,
+                "static" => static_ = true,
+                "private" => private = true,
+                "protected" => protected = true,
+                "public" => public = true,
+                "internal" => {
+                    internal = true;
+                    jvm_restricted = true;
+                }
+                "native" => native = true,
+                "external" => {
+                    external = true;
+                    jvm_restricted = true;
+                }
+                "expect" => {
+                    expect = true;
+                    jvm_restricted = true;
+                }
+                "suspend" | "inline" => jvm_restricted = true,
+                "default" => default_ = true,
+                "final" => final_ = true,
+                _ => {}
+            }
+        }
+    }
+    let mut owner = node.parent();
+    let mut interface = false;
+    while let Some(parent) = owner {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "object_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+        ) {
+            interface = parent.kind() == "interface_declaration"
+                || !java && class_kind(parent) == SymbolKind::Interface;
+            if let Some(modifiers) = child_of_kind(parent, "modifiers") {
+                let mut cursor = modifiers.walk();
+                expect |= modifiers
+                    .children(&mut cursor)
+                    .any(|word| node_text(word, src) == "expect");
+            }
+            break;
+        }
+        owner = parent.parent();
+    }
+    let body = child_of_kind(node, if java { "block" } else { "function_body" }).is_some();
+    let native = if java { native } else { external };
+    let conflicting_access =
+        u8::from(private) + u8::from(protected) + u8::from(public) + u8::from(internal) > 1;
+    let visibility = if private {
+        Visibility::Private
+    } else if protected {
+        Visibility::Protected
+    } else if public || !java || interface {
+        Visibility::Public
+    } else {
+        Visibility::Package
+    };
+    if value {
+        let getter = child_of_kind(node, "getter");
+        let getter_body =
+            getter.is_some_and(|getter| child_of_kind(getter, "function_body").is_some());
+        if let Some(getter) = getter {
+            let mut cursor = getter.walk();
+            if getter
+                .children(&mut cursor)
+                .filter(|child| child.kind() != "function_body")
+                .any(|child| child.has_error() || child.is_missing())
+            {
+                return SourceMemberFlags::default();
+            }
+        }
+        let mut cursor = node.walk();
+        let mut after_binding = false;
+        let initializer = node.named_children(&mut cursor).any(|child| {
+            if after_binding
+                && !matches!(
+                    child.kind(),
+                    "getter"
+                        | "setter"
+                        | "property_delegate"
+                        | "modifiers"
+                        | "annotation"
+                        | "type_constraints"
+                )
+            {
+                return true;
+            }
+            after_binding |= matches!(
+                child.kind(),
+                "variable_declaration" | "multi_variable_declaration"
+            );
+            false
+        });
+        // A class property's default getter exists independently of how its
+        // backing value is initialized (init block, lateinit or delegation).
+        let implemented = java
+            || node.kind() == "class_parameter"
+            || getter_body
+            || initializer
+            || !interface && !abstract_;
+        if expect
+            || native
+            || conflicting_access
+            || default_
+            || java && abstract_
+            || abstract_ && implemented
+            || !java && interface && initializer
+            || !implemented && !abstract_ && !interface
+        {
+            return SourceMemberFlags::default();
+        }
+        return SourceMemberFlags::new(
+            if abstract_ || !implemented {
+                MemberImplementation::Abstract
+            } else {
+                MemberImplementation::Concrete
+            },
+            if static_ || java && interface {
+                Dispatch::Static
+            } else {
+                Dispatch::Instance
+            },
+            visibility,
+            internal,
+            jvm_restricted,
+        );
+    }
+    let implicit_abstract = interface && !body && !native && !static_ && !private && !default_;
+    if expect
+        || conflicting_access
+        || java && default_ && (!interface || static_ || private || abstract_)
+        || interface && (native || java && body && !default_ && !static_ && !private)
+        || (abstract_ && (body || native || static_ || private || final_))
+        || native && body
+        || !body && !native && !abstract_ && !implicit_abstract
+    {
+        return SourceMemberFlags::default();
+    }
+    SourceMemberFlags::new(
+        if abstract_ || implicit_abstract {
+            MemberImplementation::Abstract
+        } else {
+            MemberImplementation::Concrete
+        },
+        if static_ {
+            Dispatch::Static
+        } else {
+            Dispatch::Instance
+        },
+        visibility,
+        internal,
+        jvm_restricted,
+    )
+}
+
 /// Push a `Function` symbol, stamping `ext_receiver`, `arity` (the count of value parameters,
 /// saturated at `u8::MAX`), and `return_type` (the declared return annotation, for type inference).
 /// `arity` drives the Stage C snippet shape (`name()$0` vs `name($0)`).
@@ -286,6 +508,7 @@ fn push_function(
 ) {
     let shape = function_shape(decl);
     out.push(IndexedSymbol {
+        source_member: source_member_flags(decl, src, false),
         ext_receiver: ext_receiver.map(str::to_string),
         documentation: documentation.map(str::to_string),
         arity: Some(shape.arity),
@@ -839,6 +1062,7 @@ fn push_ctor_properties(
                 None,
                 vt,
             );
+            out.last_mut().unwrap().source_member = source_member_flags(cp, src, false);
         }
     }
 }
@@ -886,6 +1110,7 @@ fn push_synthetic_member(
         value_type,
         params,
         type_params,
+        source_member: SourceMemberFlags::default(),
     });
 }
 

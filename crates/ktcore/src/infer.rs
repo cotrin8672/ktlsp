@@ -870,11 +870,37 @@ pub fn super_receiver_type(
     ctx: &FileCtx,
     member_prefix: Option<&str>,
 ) -> Type {
+    let mut supers = super_receivers(index, node, src, ctx);
+    let name = if let Some(prefix) = member_prefix {
+        members::MemberName::Prefix(prefix)
+    } else if let Some(selector) = node
+        .parent()
+        .filter(|parent| parent.kind() == "navigation_expression")
+        .and_then(|navigation| navigation.named_child(1))
+    {
+        members::MemberName::Exact(node_text(selector, src))
+    } else {
+        return if supers.len() == 1 && type_head_is_known(index, &supers[0]) {
+            supers.pop().unwrap()
+        } else {
+            Type::Unknown
+        };
+    };
+    members::unique_super_receiver(index, supers, name, ctx)
+}
+
+/// The actual immediate supertypes, including generic arguments and explicit qualifier/label.
+pub fn super_receivers(
+    index: &dyn InferenceIndex,
+    node: Node,
+    src: &str,
+    ctx: &FileCtx,
+) -> Vec<Type> {
     let label = child_of_kind(node, "identifier").map(|label| node_text(label, src));
     let mut enclosing = node.parent();
     let declaration = loop {
         let Some(current) = enclosing else {
-            return Type::Unknown;
+            return Vec::new();
         };
         if matches!(current.kind(), "class_declaration" | "object_declaration")
             && label.is_none_or(|label| {
@@ -886,7 +912,7 @@ pub fn super_receiver_type(
         enclosing = current.parent();
     };
     let Some(receiver) = cached_class_receiver_contribution(index, declaration, src, ctx) else {
-        return Type::Unknown;
+        return Vec::new();
     };
     let qualifier = child_of_kind(node, "user_type")
         .and_then(|ty| crate::indexer::syntax_type_ref(ty, src))
@@ -894,7 +920,7 @@ pub fn super_receiver_type(
     let mut supers = direct_supertypes(index, &receiver);
     if let Some(qualifier) = qualifier {
         if qualifier.name().is_none() {
-            return Type::Unknown;
+            return Vec::new();
         }
         supers.retain(|ty| {
             ty.name() == qualifier.name()
@@ -903,29 +929,7 @@ pub fn super_receiver_type(
         });
     }
     supers.dedup();
-    if supers.len() == 1 {
-        let receiver = supers.pop().unwrap();
-        if type_head_is_known(index, &receiver) {
-            receiver
-        } else {
-            Type::Unknown
-        }
-    } else {
-        let name = if let Some(prefix) = member_prefix {
-            members::MemberName::Prefix(prefix)
-        } else if let Some(selector) = node
-            .parent()
-            .filter(|parent| parent.kind() == "navigation_expression")
-            .and_then(|navigation| navigation.named_child(1))
-        {
-            members::MemberName::Exact(node_text(selector, src))
-        } else {
-            return Type::Unknown;
-        };
-        // shortcut: abstract/default implementations are not distinguished; keep multiple
-        // providers Unknown until normalized declaration facts carry implementation availability.
-        members::unique_super_receiver(index, supers, name, ctx)
-    }
+    supers
 }
 
 /// Return the receiver written before an enclosing function's name (`fun Route.setup()`). The
@@ -1191,8 +1195,16 @@ fn generic_lambda_receiver_type(
         "navigation_expression" => {
             let recv = callee.named_child(0)?;
             let sel = callee.named_child(1)?;
-            let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
-            let entries = member_call_entries(index, &recv_ty, node_text(sel, src), ctx);
+            let (recv_ty, candidates) = navigation_member_candidates(
+                index,
+                recv,
+                node_text(sel, src),
+                src,
+                ctx,
+                depth,
+                child_infer,
+            )?;
+            let entries = callable_member_entries(candidates);
             select_trailing_lambda_receiver_type(
                 index,
                 entries,
@@ -1466,11 +1478,22 @@ fn infer_call(
             let (Some(recv), Some(sel)) = (callee.named_child(0), callee.named_child(1)) else {
                 return Type::Unknown;
             };
-            let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
+            let Some((recv_ty, candidates)) = navigation_member_candidates(
+                index,
+                recv,
+                node_text(sel, src),
+                src,
+                ctx,
+                depth,
+                child_infer,
+            ) else {
+                return Type::Unknown;
+            };
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
             member_type(
                 index,
                 &recv_ty,
+                candidates,
                 node_text(sel, src),
                 true,
                 Some(value_arg_count(node)),
@@ -1661,6 +1684,10 @@ fn member_call_entries<'a>(
     ctx: &FileCtx,
 ) -> Vec<&'a Entry> {
     let candidates = members::candidates(index, recv_ty, name, ctx);
+    callable_member_entries(candidates)
+}
+
+fn callable_member_entries(candidates: members::Candidates<'_>) -> Vec<&Entry> {
     let own: Vec<_> = candidates
         .members
         .into_iter()
@@ -2018,10 +2045,21 @@ fn infer_navigation(
     let (Some(recv), Some(sel)) = (node.named_child(0), node.named_child(1)) else {
         return Type::Unknown;
     };
-    let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
+    let Some((recv_ty, candidates)) = navigation_member_candidates(
+        index,
+        recv,
+        node_text(sel, src),
+        src,
+        ctx,
+        depth,
+        child_infer,
+    ) else {
+        return Type::Unknown;
+    };
     member_type(
         index,
         &recv_ty,
+        candidates,
         node_text(sel, src),
         false,
         None,
@@ -2034,11 +2072,34 @@ fn infer_navigation(
     )
 }
 
+fn navigation_member_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: Node,
+    name: &str,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Option<(Type, members::Candidates<'a>)> {
+    if receiver.kind() == "super_expression" {
+        return members::super_member_candidates(
+            index,
+            super_receivers(index, receiver, src, ctx),
+            name,
+            ctx,
+        );
+    }
+    let ty = child_infer.infer_child(index, receiver, src, ctx, depth + 1);
+    let candidates = members::candidates(index, &ty, name, ctx);
+    Some((ty, candidates))
+}
+
 /// Infer the result of the same call/value member selection used by navigation and references.
 /// Every surviving candidate must agree; missing callable signatures retain `Unknown`.
 fn member_type(
     index: &dyn InferenceIndex,
     recv_ty: &Type,
+    candidates: members::Candidates<'_>,
     name: &str,
     want_function: bool,
     arg_count: Option<usize>,
@@ -2065,7 +2126,7 @@ fn member_type(
     } else {
         MemberUse::Value
     };
-    let group = members::candidates(index, recv_ty, name, ctx).select(index, recv_ty, &usage, ctx);
+    let group = candidates.select(index, recv_ty, &usage, ctx);
     selected_member_type(
         index,
         recv_ty,

@@ -1752,6 +1752,26 @@ CP\t/repo/unsupported/library.jar\nEND\t:unsupported\n",
     }
 
     #[test]
+    fn actual_module_versions_with_plus_remain_source_coordinates() {
+        let coordinate = Coordinate {
+            group: "net.createmod.ponder".into(),
+            artifact: "ponder-neoforge".into(),
+            version: "1.0.87+mc1.21.1".into(),
+        };
+        let jar = "/cache/modules-2/files-2.1/net.createmod.ponder/ponder-neoforge/1.0.87+mc1.21.1/hash/ponder-neoforge-1.0.87+mc1.21.1.jar";
+        let modules = parse_dump(&format!(
+            "PROJECT\t:app\t/repo/app\nSOURCESET\tmain\nSCP\tmain\t{jar}\nARTIFACT\tmain\t{jar}\tMODULE\tnet.createmod.ponder\tponder-neoforge\t1.0.87+mc1.21.1\nEND\t:app\n"
+        ));
+        let model = ProjectSnapshot::new(modules);
+        assert_eq!(model.coordinates(), vec![coordinate.clone()]);
+        assert!(model.local_jars().is_empty());
+        assert_eq!(
+            coordinate_from_gradle_cache_path(Path::new(jar)),
+            Some(coordinate)
+        );
+    }
+
+    #[test]
     fn ancestor_lookup_work_is_bounded_by_path_depth_not_root_count() {
         use std::cell::Cell;
         for count in [8, 5063, 10_000] {

@@ -4,6 +4,86 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::TypeRef;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberImplementation {
+    Concrete,
+    Abstract,
+    Constructor,
+}
+
+/// Source-call facts are independent of whether a JVM descriptor can be certified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceMemberFlags(u8);
+
+impl SourceMemberFlags {
+    pub(crate) fn new(
+        implementation: MemberImplementation,
+        dispatch: crate::extensions::Dispatch,
+        visibility: crate::extensions::Visibility,
+        internal: bool,
+        jvm_restricted: bool,
+    ) -> Self {
+        use crate::extensions::{Dispatch, Visibility};
+        let implementation = match implementation {
+            MemberImplementation::Concrete => 1,
+            MemberImplementation::Abstract => 2,
+            MemberImplementation::Constructor => 3,
+        };
+        let dispatch = match dispatch {
+            Dispatch::Instance => 1,
+            Dispatch::Static => 2,
+        };
+        let access = if internal {
+            5
+        } else {
+            match visibility {
+                Visibility::Public => 1,
+                Visibility::Protected => 2,
+                Visibility::Package => 3,
+                Visibility::Private => 4,
+            }
+        };
+        Self(implementation | dispatch << 2 | access << 4 | u8::from(jvm_restricted) << 7)
+    }
+
+    pub fn implementation(self) -> Option<MemberImplementation> {
+        match self.0 & 3 {
+            1 => Some(MemberImplementation::Concrete),
+            2 => Some(MemberImplementation::Abstract),
+            3 => Some(MemberImplementation::Constructor),
+            _ => None,
+        }
+    }
+
+    pub fn dispatch(self) -> Option<crate::extensions::Dispatch> {
+        use crate::extensions::Dispatch;
+        match self.0 >> 2 & 3 {
+            1 => Some(Dispatch::Instance),
+            2 => Some(Dispatch::Static),
+            _ => None,
+        }
+    }
+
+    pub fn visibility(self) -> Option<crate::extensions::Visibility> {
+        use crate::extensions::Visibility;
+        match self.0 >> 4 & 7 {
+            1 => Some(Visibility::Public),
+            2 => Some(Visibility::Protected),
+            3 => Some(Visibility::Package),
+            4 => Some(Visibility::Private),
+            _ => None,
+        }
+    }
+
+    pub fn is_internal(self) -> bool {
+        self.0 >> 4 & 7 == 5
+    }
+    pub fn jvm_restricted(self) -> bool {
+        self.0 & 128 != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Class,
@@ -86,6 +166,8 @@ pub struct IndexedSymbol {
     pub params: Vec<TypeRef>,
     #[serde(default)]
     pub type_params: Vec<String>,
+    #[serde(default)]
+    pub source_member: SourceMemberFlags,
 }
 
 impl IndexedSymbol {
@@ -119,6 +201,7 @@ impl IndexedSymbol {
             value_type: None,
             params: Vec::new(),
             type_params: Vec::new(),
+            source_member: SourceMemberFlags::default(),
         }
     }
 }

@@ -7,6 +7,7 @@
 -- - KMP source-set narrowing for goto-definition
 -- - Constructor-property goto when the class header and `(` are split across lines
 -- - Alias-backed nested implicit receivers for definition, hover, and completion
+-- - `super` navigation and return completion exclude private vararg overloads
 
 local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:sub(2))
 local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
@@ -250,6 +251,43 @@ do
       loc ~= nil and loc.uri ~= nil and loc.uri:match("feature/src/jvmMain/kotlin/lib/Thing%.kt$") ~= nil,
       loc and loc.uri
     )
+  end
+end
+
+do
+  local b = open_file(files.accounts)
+  local l, c = find(b, "super.pick()", "pick")
+  local declaration_line, declaration_character = find(b, "open fun pick", "pick")
+  check("found super overload goto anchor", l ~= nil and declaration_line ~= nil)
+  if l then
+    local reply = client and client:request_sync("textDocument/definition", {
+      textDocument = { uri = vim.uri_from_bufnr(b) },
+      position = { line = l, character = c },
+    }, 4000, b)
+    local raw = reply and reply.result
+    local locations = type(raw) == "table" and (raw.uri and { raw } or raw) or {}
+    check("first super goto selects only public overload",
+      reply ~= nil and reply.err == nil and #locations == 1
+        and locations[1].uri and locations[1].uri:match("probe/accounts/AccountsProbe%.kt$")
+        and locations[1].range.start.line == declaration_line
+        and locations[1].range.start.character == declaration_character, vim.inspect(reply))
+  end
+  l, c = find(b, "super.pick().publicO", "publicO")
+  check("found super return completion anchor", l ~= nil)
+  if l then
+    local reply = client and client:request_sync("textDocument/completion", {
+      textDocument = { uri = vim.uri_from_bufnr(b) },
+      position = { line = l, character = c + #"publicO" },
+      context = { triggerKind = 1 },
+    }, 4000, b)
+    local raw = reply and reply.result
+    local items = type(raw) == "table" and (raw.items or raw) or {}
+    local found = false
+    for _, item in ipairs(items) do
+      found = found or item.label == "publicOnly"
+    end
+    check("first super return completion preserves public type",
+      reply ~= nil and reply.err == nil and found, vim.inspect(reply))
   end
 end
 

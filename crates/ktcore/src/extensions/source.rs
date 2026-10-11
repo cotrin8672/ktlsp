@@ -358,7 +358,7 @@ fn member_facts(
 ) -> DeclaredMemberFacts {
     let modifiers = child_of_kind(node, "modifiers");
     let mut words = Vec::new();
-    if let Some(modifiers) = modifiers {
+    if let Some(modifiers) = modifiers.filter(|_| symbol.kind != SymbolKind::Function) {
         let mut cursor = modifiers.walk();
         for modifier in modifiers.children(&mut cursor) {
             if !matches!(modifier.kind(), "annotation" | "marker_annotation") {
@@ -369,7 +369,11 @@ fn member_facts(
     let interface = node
         .parent()
         .is_some_and(|parent| parent.kind() == "interface_body");
-    let visibility = if words.contains(&"private") {
+    let method = symbol.kind == SymbolKind::Function;
+    let flags = symbol.source_member;
+    let visibility = if method {
+        flags.visibility().unwrap_or(Visibility::Public)
+    } else if words.contains(&"private") {
         Visibility::Private
     } else if words.contains(&"protected") {
         Visibility::Protected
@@ -386,12 +390,13 @@ fn member_facts(
             annotation.ty.name.as_str(),
             "JvmName" | "JvmStatic" | "JvmField" | "JvmSynthetic" | "JvmOverloads"
         )
-    }) || words.iter().any(|word| {
-        matches!(
-            *word,
-            "suspend" | "external" | "expect" | "inline" | "internal"
-        )
-    });
+    }) || flags.jvm_restricted()
+        || words.iter().any(|word| {
+            matches!(
+                *word,
+                "suspend" | "external" | "expect" | "inline" | "internal"
+            )
+        });
     let plain_owner = java || symbol.container.is_some() && !unsupported_kotlin_owner(node, text);
     // A Kotlin public property denotes accessors as well as a backing field. Only a private
     // authored property has a field identity in this slice; generated accessor identity is separate.
@@ -420,6 +425,15 @@ fn member_facts(
         && !unsupported_jvm
         && plain_owner
         && field_known
+        && (!method
+            || matches!(
+                flags.implementation(),
+                Some(
+                    crate::symbol::MemberImplementation::Concrete
+                        | crate::symbol::MemberImplementation::Abstract
+                )
+            ) && flags.dispatch().is_some()
+                && flags.visibility().is_some())
         && symbol.ext_receiver.is_none();
     let signature = if known {
         signature(index, file, symbol, scope, java, node, text)
@@ -430,15 +444,15 @@ fn member_facts(
         definition: definition(file, symbol),
         signature,
         dispatch: if known {
-            Knowledge::Found(
-                if words.contains(&"static")
-                    || java && interface && symbol.kind == SymbolKind::Property
-                {
-                    Dispatch::Static
-                } else {
-                    Dispatch::Instance
-                },
-            )
+            Knowledge::Found(if method {
+                flags.dispatch().unwrap()
+            } else if words.contains(&"static")
+                || java && interface && symbol.kind == SymbolKind::Property
+            {
+                Dispatch::Static
+            } else {
+                Dispatch::Instance
+            })
         } else {
             unsupported()
         },
