@@ -282,9 +282,11 @@ pub fn resolved_symbol_query(
     let usage = identifier_at(tree, offset)?;
     let symbol = Some(node_text(usage, src).to_string()).filter(|s| !s.is_empty());
     let kind = resolve::use_kind(usage);
-    let targets = resolve::goto(index, file, src, tree, offset);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
+    let targets = resolve::goto_with_ctx(index, file, src, tree, offset, &ctx);
     let entry = targets.first().and_then(|target| {
         hierarchy::entry_for_name_range(index, &target.file, target.start_byte, target.end_byte)
+            .or_else(|| ctx.local_entry(target).cloned())
     });
     let status = if entry.is_some() {
         ResolutionStatus::Found(())
@@ -376,13 +378,15 @@ pub fn after_dot_query(
         source: &source,
         replaced_file: Some(file),
     };
-    member_completion_query(
+    let ctx = infer::FileCtx::from_tree_in_file(&tree, &synthetic, file);
+    member_completion_query_with_ctx(
         &ScopedIndex::new(&recovered, file),
         &tree,
         &synthetic,
         receiver,
         prefix,
         max_candidates,
+        &ctx,
     )
 }
 
@@ -395,6 +399,18 @@ pub fn member_completion_query(
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
     let ctx = infer::FileCtx::from_tree(tree, src);
+    member_completion_query_with_ctx(index, tree, src, receiver, prefix, max_candidates, &ctx)
+}
+
+fn member_completion_query_with_ctx(
+    index: &dyn InferenceIndex,
+    tree: &Tree,
+    src: &str,
+    receiver: Node,
+    prefix: String,
+    max_candidates: usize,
+    ctx: &infer::FileCtx,
+) -> Option<CompletionQuery> {
     if receiver.kind() == "super_expression" {
         let receivers = infer::super_receivers(index, receiver, src, &ctx);
         let selected = ktcore::members::super_candidates(index, receivers, &prefix, &ctx);
@@ -427,8 +443,8 @@ pub fn member_completion_query(
             layout: imports::import_layout_with_style(ImportStyle::Kotlin, tree, src),
         });
     }
-    let ty = infer::infer(index, receiver, src, &ctx);
-    member_completion_query_for_type(
+    let ty = infer::member_receiver_type(receiver, infer::infer(index, receiver, src, &ctx));
+    member_completion_query_for_type_with_ctx(
         index,
         SourceLanguage::Kotlin,
         tree,
@@ -437,6 +453,7 @@ pub fn member_completion_query(
         ktcore::jvm::ReceiverKind::Unknown,
         prefix,
         max_candidates,
+        Some((ctx, receiver.end_byte())),
     )
 }
 
@@ -449,6 +466,31 @@ pub fn member_completion_query_for_type(
     receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: String,
     max_candidates: usize,
+) -> Option<CompletionQuery> {
+    let ctx = (language == SourceLanguage::Kotlin).then(|| infer::FileCtx::from_tree(tree, src));
+    member_completion_query_for_type_with_ctx(
+        index,
+        language,
+        tree,
+        src,
+        ty,
+        receiver_kind,
+        prefix,
+        max_candidates,
+        ctx.as_ref().map(|ctx| (ctx, 0)),
+    )
+}
+
+pub(crate) fn member_completion_query_for_type_with_ctx(
+    index: &dyn InferenceIndex,
+    language: SourceLanguage,
+    tree: &Tree,
+    src: &str,
+    ty: Type,
+    receiver_kind: ktcore::jvm::ReceiverKind,
+    prefix: String,
+    max_candidates: usize,
+    kotlin_ctx: Option<(&infer::FileCtx, usize)>,
 ) -> Option<CompletionQuery> {
     let style = match language {
         SourceLanguage::Kotlin => ImportStyle::Kotlin,
@@ -466,8 +508,6 @@ pub fn member_completion_query_for_type(
             ]),
         });
     }
-    let kotlin_ctx =
-        (language == SourceLanguage::Kotlin).then(|| infer::FileCtx::from_tree(tree, src));
     // Kotlin recovery already supplies scoped file facts before receiver inference.
     let source_index = (language == SourceLanguage::Java).then(|| {
         let mut source = Index::new();
@@ -485,7 +525,7 @@ pub fn member_completion_query_for_type(
         &ty,
         receiver_kind,
         &prefix,
-        kotlin_ctx.as_ref(),
+        kotlin_ctx,
         max_candidates,
     );
     Some(CompletionQuery {
@@ -551,14 +591,19 @@ fn top_level_call_shape_query(
     if !resolve::top_level_call_completeness_reasons(file, tree, src, &symbol, facts).is_empty() {
         return None;
     }
-    let defs = resolve::goto(index, file, src, tree, ident.start_byte());
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
+    let defs = resolve::goto_with_ctx(index, file, src, tree, ident.start_byte(), &ctx);
+    let local_selected = defs.iter().any(|def| ctx.local_entry(def).is_some());
     let mut entries = defs
         .into_iter()
         .filter_map(|def| {
             hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
+                .or_else(|| ctx.local_entry(&def).cloned())
         })
         .collect::<Vec<_>>();
-    entries = expand_same_file_function_overloads(index, file, &symbol, entries);
+    if !local_selected {
+        entries = expand_same_file_function_overloads(index, file, &symbol, entries);
+    }
     if entries.is_empty() {
         return None;
     }
@@ -572,7 +617,6 @@ fn top_level_call_shape_query(
     }
     let arg_count = value_arg_count(call);
     let uses_trailing_lambda = has_trailing_lambda(call);
-    let ctx = infer::FileCtx::from_tree(tree, src);
     let mut arities = entries
         .iter()
         .filter_map(|entry| entry.sym.arity)
@@ -591,7 +635,7 @@ fn top_level_call_shape_query(
             .collect();
         return argument_type_mismatch_query(
             index,
-            tree,
+            &ctx,
             src,
             call,
             symbol,
@@ -628,7 +672,7 @@ fn member_call_shape_query(
     if symbol.is_empty() {
         return None;
     }
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     let (_recv_ty, entries) = if recv.kind() == "super_expression" {
         let (ty, candidates) = ktcore::members::super_member_candidates(
             index,
@@ -643,8 +687,9 @@ fn member_call_shape_query(
             .collect::<Vec<_>>();
         (ty, entries)
     } else {
-        let ty = infer::infer(index, recv, src, &ctx);
-        let candidates = ktcore::members::candidates(index, &ty, &symbol, &ctx);
+        let ty = infer::member_receiver_type(recv, infer::infer(index, recv, src, &ctx));
+        let candidates =
+            ktcore::members::candidates_at(index, &ty, &symbol, &ctx, ident.start_byte());
         let usage = ktcore::members::MemberUse::Call(infer::call_arguments(index, call, src, &ctx));
         let entries = candidates
             .select(index, &ty, &usage, &ctx)
@@ -686,7 +731,7 @@ fn member_call_shape_query(
             .collect();
         return argument_type_mismatch_query(
             index,
-            tree,
+            &ctx,
             src,
             call,
             symbol,
@@ -720,7 +765,7 @@ pub fn scope_name_query(
     let imports = crate::parser::imports_of(tree, src);
     let layout = imports::import_layout(tree, src);
     let vis = Visibility::new(&pkg, &imports);
-    let file_ctx = infer::FileCtx::from_tree(tree, src);
+    let file_ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     for recv_ty in infer::implicit_receiver_types(index, anchor, src, &file_ctx, 0) {
         for candidate in member_candidates(
             index,
@@ -729,7 +774,7 @@ pub fn scope_name_query(
             &recv_ty,
             ktcore::jvm::ReceiverKind::Unknown,
             &prefix,
-            Some(&file_ctx),
+            Some((&file_ctx, anchor.start_byte())),
             max_candidates,
         )
         .0
@@ -926,7 +971,7 @@ fn member_candidates(
     ty: &Type,
     receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: &str,
-    kotlin_ctx: Option<&infer::FileCtx>,
+    kotlin_ctx: Option<(&infer::FileCtx, usize)>,
     max_candidates: usize,
 ) -> (Vec<ScopeCompletion>, bool) {
     let mut out: Vec<ScopeCompletion> = Vec::new();
@@ -1006,7 +1051,11 @@ fn member_candidates(
         }
         ControlFlow::Continue(())
     });
-    if let Some(ctx) = kotlin_ctx {
+    if let Some((ctx, position)) = kotlin_ctx {
+        let locals = ktcore::members::completion_candidates_at(index, ty, prefix, ctx, position);
+        for entry in locals.known_local_extensions() {
+            push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
+        }
         for entry in extensions {
             let mut visible = false;
             for name in resolve::visible_extension_names(entry, &ctx.imports, &ctx.package) {
@@ -1071,7 +1120,7 @@ fn member_candidates(
 
 fn argument_type_mismatch_query(
     index: &dyn InferenceIndex,
-    tree: &Tree,
+    ctx: &infer::FileCtx,
     src: &str,
     call: Node,
     symbol: String,
@@ -1081,8 +1130,7 @@ fn argument_type_mismatch_query(
     if entries.is_empty() {
         return None;
     }
-    let ctx = infer::FileCtx::from_tree(tree, src);
-    let arg_types = synth_arg_types(index, call, src, &ctx);
+    let arg_types = synth_arg_types(index, call, src, ctx);
     let mut labels = Vec::with_capacity(arg_types.len());
     for ty in &arg_types {
         labels.push(type_label(ty)?);
@@ -1093,7 +1141,7 @@ fn argument_type_mismatch_query(
             &entry.sym.params,
             &entry.sym.type_params,
             &arg_types,
-            &ctx,
+            ctx,
         )
     }) {
         return None;

@@ -846,7 +846,7 @@ impl Workspace {
         if receiver.kind() == "super_expression" {
             return None;
         }
-        let ctx = infer::FileCtx::from_tree(tree, text);
+        let ctx = infer::FileCtx::from_tree_in_file(tree, text, key);
         let receiver_type = self.salsa.expr_type(
             key,
             text,
@@ -855,13 +855,15 @@ impl Workspace {
             self.index_revision,
             ExprKey::from_node(receiver),
         );
+        let receiver_type = infer::member_receiver_type(receiver, receiver_type);
         let member_use = resolve::member_use(&self.index.scoped_for_file(key), ident, text, &ctx);
-        let hits = resolve::member_defs_for_use(
+        let hits = resolve::member_defs_for_use_at(
             &self.index.scoped_for_file(key),
             &receiver_type,
             name,
             &member_use,
             &ctx,
+            ident.start_byte(),
         );
         if receiver_type.name().is_some() || !hits.is_empty() {
             return Some(hits);
@@ -1043,7 +1045,9 @@ impl Workspace {
             self.index_revision,
             ExprKey::from_node(receiver),
         );
-        semantic_query::member_completion_query_for_type(
+        let receiver_type = infer::member_receiver_type(receiver, receiver_type);
+        let ctx = infer::FileCtx::from_tree_in_file(&synthetic_tree, &synthetic, key);
+        semantic_query::member_completion_query_for_type_with_ctx(
             &self.index.scoped_for_file(key),
             SourceLanguage::Kotlin,
             &synthetic_tree,
@@ -1052,6 +1056,7 @@ impl Workspace {
             ktcore::jvm::ReceiverKind::Unknown,
             prefix,
             MAX_COMPLETIONS,
+            Some((&ctx, receiver.end_byte())),
         )
     }
 
@@ -1296,6 +1301,7 @@ impl Workspace {
             return language::inlay_hints(
                 SourceLanguage::for_key(key),
                 &self.index.scoped_for_file(key),
+                key,
                 &doc.tree,
                 &doc.text,
                 start_byte,
@@ -1309,6 +1315,7 @@ impl Workspace {
         language::inlay_hints(
             SourceLanguage::for_key(key),
             &self.index.scoped_for_file(key),
+            key,
             &tree,
             &text,
             start_byte,

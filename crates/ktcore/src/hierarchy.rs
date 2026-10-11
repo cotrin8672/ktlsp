@@ -230,14 +230,24 @@ pub fn type_definition(
     text: &str,
     offset: usize,
 ) -> Vec<Def> {
+    let ctx = infer::FileCtx::from_tree(tree, text);
+    type_definition_with_ctx(index, tree, text, offset, &ctx)
+}
+
+pub fn type_definition_with_ctx(
+    index: &dyn InferenceIndex,
+    tree: &Tree,
+    text: &str,
+    offset: usize,
+    ctx: &infer::FileCtx,
+) -> Vec<Def> {
     let Some(node) = tree
         .root_node()
         .named_descendant_for_byte_range(offset, offset)
     else {
         return Vec::new();
     };
-    let ctx = infer::FileCtx::from_tree(tree, text);
-    let ty = infer::infer(index, node, text, &ctx);
+    let ty = infer::infer(index, node, text, ctx);
     let Some(name) = ty.name() else {
         return Vec::new();
     };

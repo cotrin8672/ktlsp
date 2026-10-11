@@ -190,7 +190,7 @@ pub fn reference_status(
     usage: Node,
     facts: &CompletenessFacts,
 ) -> ResolutionStatus<()> {
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     reference_status_with_ctx(index, file, tree, src, usage, facts, &ctx)
 }
 
@@ -309,7 +309,7 @@ pub fn simple_type_name_status(
     if !is_simple_user_type_identifier_in(usage, parent, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleTypeName]);
     }
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     let ancestors = crate::parser::ancestors_of(usage);
     simple_type_name_status_with_ctx(index, file, src, usage, parent, &ancestors, facts, &ctx)
 }
@@ -502,7 +502,19 @@ fn member_name_status_a(
             ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType])
         };
     }
-    let recv_ty = infer::infer(index, recv, src, ctx);
+    let recv_ty = infer::member_receiver_type(recv, infer::infer(index, recv, src, ctx));
+    if ctx.local_extensions.is_some() {
+        let pool = members::candidates_at(index, &recv_ty, name, ctx, usage.start_byte());
+        if !pool.members.is_empty()
+            || !pool.extensions.is_empty()
+            || pool.known_local_extensions().next().is_some()
+        {
+            return ResolutionStatus::Found(());
+        }
+        if pool.has_local_extensions() {
+            return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+        }
+    }
     member_name_status_for_receiver(index, file, &recv_ty, name, facts, ctx)
 }
 
@@ -984,7 +996,7 @@ pub fn member_call_completeness_reasons(
     let Some(recv) = nav.named_child(0) else {
         return vec![IncompletenessReason::UnknownReceiverType];
     };
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     let recv_ty = infer::infer(index, recv, src, &ctx);
     let Some(root) = recv_ty.name() else {
         return vec![IncompletenessReason::UnknownReceiverType];
@@ -1157,7 +1169,7 @@ pub fn goto(
     tree: &Tree,
     offset: usize,
 ) -> Vec<Def> {
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     goto_with_ctx(index, file, src, tree, offset, &ctx)
 }
 
@@ -1206,7 +1218,7 @@ pub fn goto_authored(
     let Some(ident) = identifier_at(tree, offset) else {
         return Vec::new();
     };
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     goto_authored_node_with_ctx(
         index,
         file,
@@ -1254,6 +1266,12 @@ fn goto_authored_node_with_ctx(
         return vec![def];
     }
     if let Some(def) = resolve_local_a(ident, ancestors, name, uk, src, file) {
+        if ctx.local_entry(&def).is_some() && uk == UseKind::Call {
+            return resolve_implicit_receiver_member_with_ctx_a(
+                index, ident, ancestors, name, src, ctx,
+            )
+            .unwrap_or_default();
+        }
         // Class members are also found by the lexical walk. Select the same overload/property
         // partition as an explicit receiver instead of committing to the first declaration.
         if index.entries_for_file(file).iter().any(|entry| {
@@ -1336,7 +1354,7 @@ fn resolve_implicit_receiver_member_with_ctx_a(
 ) -> Option<Vec<Def>> {
     let member_use = member_use(index, usage, src, ctx);
     let receivers = infer::implicit_receiver_types_with_ancestors(index, ancestors, src, &ctx, 0);
-    crate::members::select_implicit(index, receivers, name, &member_use, ctx)
+    crate::members::select_implicit_at(index, receivers, name, &member_use, ctx, usage.start_byte())
         .map(|(_, selection)| entries_to_defs(selection.entries))
 }
 
@@ -1413,14 +1431,16 @@ fn resolve_member_with_ctx(
                 // Infer the receiver's type (package-qualified) and resolve the member on it —
                 // own members, inherited (supertype walk), and extensions; package-filtered so a
                 // same-named type in another package can't be picked.
-                let ty = infer::infer(index, receiver, src, &ctx);
+                let ty =
+                    infer::member_receiver_type(receiver, infer::infer(index, receiver, src, &ctx));
                 if ty.name().is_some() {
-                    return member_defs_for_use(
+                    return member_defs_for_use_at(
                         index,
                         &ty,
                         name,
                         &member_use(index, selector, src, ctx),
                         ctx,
+                        selector.start_byte(),
                     );
                 }
             }
@@ -1486,6 +1506,21 @@ pub fn member_defs_for_use(
 ) -> Vec<Def> {
     entries_to_defs(
         members::candidates(index, ty, name, ctx)
+            .select(index, ty, usage, ctx)
+            .entries,
+    )
+}
+
+pub fn member_defs_for_use_at(
+    index: &dyn InferenceIndex,
+    ty: &Type,
+    name: &str,
+    usage: &MemberUse,
+    ctx: &infer::FileCtx,
+    position: usize,
+) -> Vec<Def> {
+    entries_to_defs(
+        members::candidates_at(index, ty, name, ctx, position)
             .select(index, ty, usage, ctx)
             .entries,
     )

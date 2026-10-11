@@ -27,12 +27,23 @@ pub fn inlay_hints(
     end_byte: usize,
 ) -> Vec<InlayHint> {
     let ctx = FileCtx::from_tree(tree, text);
+    inlay_hints_with_ctx(index, tree, text, start_byte, end_byte, &ctx)
+}
+
+pub fn inlay_hints_with_ctx(
+    index: &dyn InferenceIndex,
+    tree: &Tree,
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+    ctx: &FileCtx,
+) -> Vec<InlayHint> {
     let mut out = Vec::new();
     collect(
         index,
         tree.root_node(),
         text,
-        &ctx,
+        ctx,
         start_byte,
         end_byte,
         &mut out,

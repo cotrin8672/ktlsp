@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::defaults::DEFAULT_IMPORT_PACKAGES;
-use crate::index::Usage;
+use crate::index::{Entry, Tier, Usage};
 use crate::parser::{
     child_of_kind, class_kind, first_ident, imports_of, name_field, node_text, Import,
 };
@@ -25,6 +25,89 @@ pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Ve
     let mut out = Vec::with_capacity(src.len() / 128);
     let scope = TypeScope::new(package, imports_of(tree, src));
     walk(tree.root_node(), src, package, None, &scope, &mut out);
+    out
+}
+
+/// Function-local extensions are query facts, never declarations in the cross-file index.
+#[derive(Clone, Debug)]
+pub struct LocalExtension {
+    pub entry: Entry,
+    pub receiver: TypeRef,
+    pub scope: std::ops::Range<usize>,
+    pub has_type_constraints: bool,
+}
+
+impl PartialEq for LocalExtension {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry.path == other.entry.path
+            && self.entry.sym == other.entry.sym
+            && self.receiver == other.receiver
+            && self.scope == other.scope
+            && self.has_type_constraints == other.has_type_constraints
+    }
+}
+
+impl Eq for LocalExtension {}
+
+pub fn local_extensions(
+    tree: &tree_sitter::Tree,
+    src: &str,
+    file: &str,
+    package: &str,
+    imports: Vec<Import>,
+) -> Vec<LocalExtension> {
+    let scope = TypeScope::new(package, imports);
+    let path: Arc<str> = Arc::from(file);
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_declaration" {
+            // A class-body extension is a member, even when the class itself is local.
+            if let (Some(block), Some(name)) = (
+                node.parent()
+                    .filter(|parent| matches!(parent.kind(), "block" | "lambda_literal")),
+                name_field(node),
+            ) {
+                let mut cursor = node.walk();
+                let receiver = node
+                    .named_children(&mut cursor)
+                    .take_while(|child| *child != name)
+                    .find_map(|child| type_ref_from(child, src, Some(&scope)));
+                if let Some(receiver) = receiver {
+                    let has_type_constraints = child_of_kind(node, "type_constraints").is_some()
+                        || child_of_kind(node, "type_parameters").is_some_and(|parameters| {
+                            let mut cursor = parameters.walk();
+                            let bounded = parameters
+                                .named_children(&mut cursor)
+                                .any(|parameter| has_child_token(parameter, ":"));
+                            bounded
+                        });
+                    let symbol = function_symbol(
+                        node,
+                        name,
+                        src,
+                        package,
+                        None,
+                        Some(&receiver.name),
+                        None,
+                        &scope,
+                    );
+                    out.push(LocalExtension {
+                        entry: Entry {
+                            path: Arc::clone(&path),
+                            tier: Tier::Volatile,
+                            sym: Arc::new(symbol),
+                        },
+                        receiver,
+                        scope: block.byte_range(),
+                        has_type_constraints,
+                    });
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
     out
 }
 
@@ -506,8 +589,30 @@ fn push_function(
     documentation: Option<&str>,
     scope: &TypeScope,
 ) {
+    out.push(function_symbol(
+        decl,
+        name_node,
+        src,
+        package,
+        container,
+        ext_receiver,
+        documentation,
+        scope,
+    ));
+}
+
+fn function_symbol(
+    decl: Node,
+    name_node: Node,
+    src: &str,
+    package: &str,
+    container: Option<&str>,
+    ext_receiver: Option<&str>,
+    documentation: Option<&str>,
+    scope: &TypeScope,
+) -> IndexedSymbol {
     let shape = function_shape(decl);
-    out.push(IndexedSymbol {
+    IndexedSymbol {
         source_member: source_member_flags(decl, src, false),
         ext_receiver: ext_receiver.map(str::to_string),
         documentation: documentation.map(str::to_string),
@@ -529,7 +634,7 @@ fn push_function(
             name_node.start_byte(),
             name_node.end_byte(),
         )
-    });
+    }
 }
 
 struct FunctionShape {

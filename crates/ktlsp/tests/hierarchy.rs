@@ -91,6 +91,23 @@ fn type_definition_uses_inferred_constructor_type() {
 }
 
 #[test]
+fn local_extension_type_definition_uses_the_selected_local_return() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Local.kt";
+    let src = "package app\nclass Versioned\nclass Payload\nfun Versioned.oldApi(): Versioned = this\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): Payload = Payload()\n    val result = v.oldApi()\n    println(result)\n}\n";
+    ws.open(key, src.to_string());
+    let start = src.find("Payload").unwrap();
+    assert_eq!(
+        ws.type_definition(key, src.rfind("result)").unwrap()),
+        vec![ktlsp::symbol::Def {
+            file: key.into(),
+            start_byte: start,
+            end_byte: start + "Payload".len(),
+        }]
+    );
+}
+
+#[test]
 fn java_type_definition_resolves_value_identifier_type() {
     let mut ws = Workspace::new();
     let key = "mem:///Main.java".to_string();

@@ -215,3 +215,257 @@ fn import_alias_rename_refuses_aggregate_candidate_overflow() {
         "a capped reference result must not become a partial rename"
     );
 }
+
+#[test]
+fn local_extension_rename_applies_exact_scoped_overload_edits_to_whole_files() {
+    let cases: &[(&str, &str, &str, &str, &str, &str)] = &[
+        (
+            r#"nested-and-sibling-outerApi"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Payload=Payload()
+ if(true) {
+  fun Versioned.oldApi():Versioned=this
+  val inner:Int=v.oldApi().newApi()
+ }
+ if(false) {
+  fun Versioned.oldApi():Payload=Payload()
+  val sibling:Int=v.oldApi().payloadOnly()
+ }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.outerApi():Payload=Payload()
+ if(true) {
+  fun Versioned.oldApi():Versioned=this
+  val inner:Int=v.oldApi().newApi()
+ }
+ if(false) {
+  fun Versioned.oldApi():Payload=Payload()
+  val sibling:Int=v.oldApi().payloadOnly()
+ }
+ return v.outerApi().payloadOnly()
+}
+"#,
+            r#" fun Versioned.oldApi():Payload=Payload()
+"#,
+            r#"return v.oldApi().payloadOnly()"#,
+            r#"outerApi"#,
+        ),
+        (
+            r#"nested-and-sibling-innerApi"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Payload=Payload()
+ if(true) {
+  fun Versioned.oldApi():Versioned=this
+  val inner:Int=v.oldApi().newApi()
+ }
+ if(false) {
+  fun Versioned.oldApi():Payload=Payload()
+  val sibling:Int=v.oldApi().payloadOnly()
+ }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Payload=Payload()
+ if(true) {
+  fun Versioned.innerApi():Versioned=this
+  val inner:Int=v.innerApi().newApi()
+ }
+ if(false) {
+  fun Versioned.oldApi():Payload=Payload()
+  val sibling:Int=v.oldApi().payloadOnly()
+ }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            r#"  fun Versioned.oldApi():Versioned=this
+"#,
+            r#"v.oldApi().newApi()"#,
+            r#"innerApi"#,
+        ),
+        (
+            r#"nested-and-sibling-siblingApi"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Payload=Payload()
+ if(true) {
+  fun Versioned.oldApi():Versioned=this
+  val inner:Int=v.oldApi().newApi()
+ }
+ if(false) {
+  fun Versioned.oldApi():Payload=Payload()
+  val sibling:Int=v.oldApi().payloadOnly()
+ }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Payload=Payload()
+ if(true) {
+  fun Versioned.oldApi():Versioned=this
+  val inner:Int=v.oldApi().newApi()
+ }
+ if(false) {
+  fun Versioned.siblingApi():Payload=Payload()
+  val sibling:Int=v.siblingApi().payloadOnly()
+ }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            r#"  fun Versioned.oldApi():Payload=Payload()
+"#,
+            r#"val sibling:Int=v.oldApi().payloadOnly()"#,
+            r#"siblingApi"#,
+        ),
+        (
+            r#"typed-overload-intApi"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi(value:Int):Payload=Payload()
+ fun Versioned.oldApi(value:String):Versioned=this
+ return v.oldApi(1).payloadOnly()+v.oldApi("text").newApi()
+}
+"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.intApi(value:Int):Payload=Payload()
+ fun Versioned.oldApi(value:String):Versioned=this
+ return v.intApi(1).payloadOnly()+v.oldApi("text").newApi()
+}
+"#,
+            r#"fun Versioned.oldApi(value:Int)"#,
+            r#"v.oldApi(1)"#,
+            r#"intApi"#,
+        ),
+        (
+            r#"typed-overload-stringApi"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi(value:Int):Payload=Payload()
+ fun Versioned.oldApi(value:String):Versioned=this
+ return v.oldApi(1).payloadOnly()+v.oldApi("text").newApi()
+}
+"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi(value:Int):Payload=Payload()
+ fun Versioned.stringApi(value:String):Versioned=this
+ return v.oldApi(1).payloadOnly()+v.stringApi("text").newApi()
+}
+"#,
+            r#"fun Versioned.oldApi(value:String)"#,
+            r#"v.oldApi("text")"#,
+            r#"stringApi"#,
+        ),
+        (
+            r#"local-over-imported-alias-localApi"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+import compat.compat as oldApi
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Versioned=this
+ return v.oldApi().newApi()
+}
+"#,
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+import compat.compat as oldApi
+fun localUse(v:Versioned):Int {
+ fun Versioned.localApi():Versioned=this
+ return v.localApi().newApi()
+}
+"#,
+            r#"fun Versioned.oldApi():Versioned"#,
+            r#"v.oldApi().newApi()"#,
+            r#"localApi"#,
+        ),
+    ];
+    for &(case_name, source, expected, declaration_anchor, call_anchor, new_name) in cases {
+        let mut ws = Workspace::new();
+        let key = "mem:///LocalUse.kt";
+        let versioned = r#"package vendor; public class Versioned { public int newApi() { return 2; } }
+"#;
+        let payload = r#"package compat
+import vendor.Versioned
+class Payload { fun payloadOnly(): Int = 1 }
+fun Versioned.compat(): Payload = Payload()
+"#;
+        let decoy = r#"package other
+import vendor.Versioned
+import compat.Payload
+fun Versioned.oldApi(): Payload = Payload()
+fun otherUse(v: Versioned): Int = v.oldApi().payloadOnly()
+"#;
+        ws.open("mem:///Versioned.java".to_string(), versioned.to_string());
+        ws.open("mem:///Payload.kt".to_string(), payload.to_string());
+        ws.open("mem:///Other.kt".to_string(), decoy.to_string());
+        ws.open(key.to_string(), source.to_string());
+        let cursor = source.find(call_anchor).unwrap() + call_anchor.find("oldApi").unwrap();
+        let edits = ws.rename(key, cursor, new_name).expect(case_name);
+        assert_eq!(edits.len(), 2, "case={case_name} {edits:?}");
+        assert!(
+            edits.iter().all(|edit| edit.file == key),
+            "case={case_name} {edits:?}"
+        );
+        for (file, original, wanted) in [
+            (key, source, expected),
+            ("mem:///Versioned.java", versioned, versioned),
+            ("mem:///Payload.kt", payload, payload),
+            ("mem:///Other.kt", decoy, decoy),
+        ] {
+            assert_eq!(
+                apply_to_text(file, original, &edits).unwrap(),
+                wanted,
+                "case={case_name} whole file {file}"
+            );
+        }
+        ws.change(key, expected.to_string());
+        let renamed_call = call_anchor.replace("oldApi", new_name);
+        let renamed_declaration = declaration_anchor.replace("oldApi", new_name);
+        let renamed_cursor =
+            expected.find(&renamed_call).unwrap() + renamed_call.find(new_name).unwrap();
+        let expected_target = expected.find(&renamed_declaration).unwrap()
+            + renamed_declaration.find(new_name).unwrap();
+        let definitions = ws.goto_definition(key, renamed_cursor);
+        assert_eq!(definitions.len(), 1, "case={case_name} {definitions:?}");
+        assert_eq!(definitions[0].file, key, "case={case_name}");
+        assert_eq!(
+            definitions[0].start_byte, expected_target,
+            "case={case_name}"
+        );
+        assert_eq!(
+            definitions[0].end_byte,
+            expected_target + new_name.len(),
+            "case={case_name}"
+        );
+    }
+}

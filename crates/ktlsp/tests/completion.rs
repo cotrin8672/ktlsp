@@ -1482,3 +1482,59 @@ fn named_lambda_param_in_let() {
                  //- Main.kt\npackage app\nfun f() {\n    makeFoo().let { result ->\n        result.ba/*^*/\n    }\n}\n";
     check_contains(input, &["bar"]);
 }
+
+#[test]
+fn local_extension_completion_uses_local_name_without_auto_import() {
+    let input = "package app\nclass Versioned {\n    fun newApi(): Int = 2\n}\nclass Payload\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): Payload = Payload()\n    v.old/*^*/\n}\n";
+    let result = shaped(input).expect("known local receiver");
+    let item = item_with(&result, "oldApi").expect("visible local extension");
+    assert_eq!(item.auto_import, None);
+    assert_eq!(item.insert_text, "oldApi()$0");
+}
+
+#[test]
+fn local_extension_return_chain_completion_is_useful() {
+    check_contains(
+        "package app\nclass Versioned\nclass Payload {\n    fun payloadOnly(): Int = 7\n}\nclass OtherPayload {\n    fun payloadOnly(): Int = 0\n}\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): Payload = Payload()\n    v.oldApi().pay/*^*/\n}\n",
+        &["payloadOnly"],
+    );
+}
+
+#[test]
+fn local_extension_generic_return_preserves_receiver_members() {
+    check_contains(
+        "package app\nclass Versioned {\n    fun payloadOnly(): Int = 7\n}\nfun use(v: Versioned) {\n    fun <T> T.keep(): T = this\n    v.keep().pay/*^*/\n}\n",
+        &["payloadOnly"],
+    );
+}
+
+#[test]
+fn local_extension_completion_excludes_not_yet_visible_and_sibling_declarations() {
+    for body in [
+        "v./*^*/\n    fun Versioned.oldApi(): Int = 1",
+        "if (true) {\n        fun Versioned.oldApi(): Int = 1\n    }\n    v./*^*/",
+        "fun sibling() {\n        fun Versioned.oldApi(): Int = 1\n    }\n    v./*^*/",
+        "fun Other.oldApi(): Int = 1\n    v./*^*/",
+    ] {
+        let fixture = "package app\nclass Versioned {\n    fun newApi(): Int = 2\n}\nclass Other\nfun use(v: Versioned) {\n    __body__\n}\n";
+        let input = fixture.replace("__body__", body);
+        check_contains(&input, &["newApi"]);
+        check_excludes(&input, &["oldApi"]);
+    }
+}
+
+#[test]
+fn local_extension_completion_prefers_real_member_snippet() {
+    let input = "package app\nclass Versioned {\n    fun oldApi(): Int = 2\n}\nfun use(v: Versioned) {\n    fun Versioned.oldApi(value: Int): Int = value\n    v.old/*^*/\n}\n";
+    let result = shaped(input).expect("known receiver member");
+    let item = item_with(&result, "oldApi").expect("real member");
+    assert_eq!(item.insert_text, "oldApi()$0");
+    assert_eq!(
+        result
+            .items
+            .iter()
+            .filter(|item| item.label == "oldApi")
+            .count(),
+        1
+    );
+}

@@ -9,6 +9,7 @@
 -- - Alias-backed nested implicit receivers for definition, hover, and completion
 -- - `super` navigation and return completion exclude private vararg overloads
 -- - Imported extension aliases through unsaved rebind, references, and applied rename
+-- - Function-local extensions through unsaved declaration changes and sibling scope exclusion
 
 local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:sub(2))
 local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
@@ -304,15 +305,16 @@ if client then
   local buffers, original, disk, sent_versions = {}, {}, {}, {}
   local alias = { checks = {}, failures = {}, first_responses = {}, deliveries = {}, notifications = {}, disk = {},
     phase = "initial", request_timeout_ms = 4000, timeout_policy = "execution bound, not latency acceptance" }
+  local report, artifact_name, check_prefix = alias, "semantic-extension-alias.json", "extension alias "
   local function save_alias()
     if arg[3] then
-      vim.fn.writefile({ vim.json.encode(alias) }, arg[3] .. "/semantic-extension-alias.json")
+      vim.fn.writefile({ vim.json.encode(report) }, arg[3] .. "/" .. artifact_name)
     end
   end
   local function alias_check(name, ok, detail)
-    alias.checks[#alias.checks + 1] = { name = name, passed = ok == true, detail = detail }
-    if ok ~= true then alias.failures[#alias.failures + 1] = name end
-    check("extension alias " .. name, ok, detail and vim.inspect(detail))
+    report.checks[#report.checks + 1] = { name = name, passed = ok == true, detail = detail }
+    if ok ~= true then report.failures[#report.failures + 1] = name end
+    check(check_prefix .. name, ok, detail and vim.inspect(detail))
     save_alias()
   end
   local function lines(key)
@@ -324,7 +326,7 @@ if client then
     if sent and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
       local document = params.textDocument
       sent_versions[document.uri] = document.version
-      alias.notifications[#alias.notifications + 1] = {
+      report.notifications[#report.notifications + 1] = {
         method = method, uri = document.uri, version = document.version,
       }
     end
@@ -341,7 +343,7 @@ if client then
   alias_check("four source buffers share the existing client", same_client)
 
   local function deliver(phase, keys)
-    alias.phase = phase
+    report.phase = phase
     local expected = {}
     for _, key in ipairs(keys) do expected[key] = vim.lsp.util.buf_versions[buffers[key]] end
     require("vim.lsp._changetracking").flush(client)
@@ -352,13 +354,13 @@ if client then
         expected[key] ~= nil and delivered.sent[key] == expected[key],
         { expected = expected[key], sent = delivered.sent[key] })
     end
-    alias.deliveries[#alias.deliveries + 1] = delivered
+    report.deliveries[#report.deliveries + 1] = delivered
     save_alias()
   end
   local function ask(name, key, method, anchor, token, extra)
     local located, position, range = pcall(probe.find, lines(key), anchor, token)
     if not located then
-      alias.first_responses[#alias.first_responses + 1] = { name = name, phase = alias.phase, attempts = 0,
+      report.first_responses[#report.first_responses + 1] = { name = name, phase = report.phase, attempts = 0,
         method = method, response_received = false, error = position, anchor = anchor, token = token }
       save_alias()
       return nil, false
@@ -368,15 +370,15 @@ if client then
       textDocument = { uri = vim.uri_from_bufnr(buffers[key]) }, position = position,
     }, extra or {})
     local reply, err = client:request_sync(method, params, 4000, buffers[key])
-    alias.first_responses[#alias.first_responses + 1] = { name = name, phase = alias.phase, attempts = 1,
+    report.first_responses[#report.first_responses + 1] = { name = name, phase = report.phase, attempts = 1,
       method = method, params = params, response_received = reply ~= nil, response = reply,
       error = err, protocol_error = reply and reply.err,
       sent_version = sent_versions[params.textDocument.uri] }
     save_alias()
     return reply and reply.result, reply ~= nil and reply.err == nil
   end
-  local function definition(name, key, anchor, token, target, declaration)
-    local _, expected = probe.find(original[target], declaration, token)
+  local function definition(name, key, anchor, token, target, declaration, target_lines)
+    local _, expected = probe.find(target_lines or original[target], declaration, token)
     local raw, ok = ask(name, key, "textDocument/definition", anchor, token)
     alias_check(name, ok and probe.exact_definition(raw, paths[target], { expected }), raw)
   end
@@ -550,10 +552,131 @@ if client then
     alias.disk[key].after_sha256 = vim.fn.sha256(table.concat(current, "\n"))
     alias_check("disk source remains byte unchanged: " .. key, vim.deep_equal(current, disk[key]), alias.disk[key])
   end
-  client.rpc.notify = rpc_notify
   alias.completed = true
   alias.counts = { checks = #alias.checks, failures = #alias.failures, first_responses = #alias.first_responses }
   save_alias()
+
+
+  -- Close the unchanged alias slice before reusing its first-response transport and barriers.
+  local local_extension = { checks = {}, failures = {}, first_responses = {}, deliveries = {}, notifications = {}, disk = {},
+    edits = {}, phase = "initial", request_timeout_ms = 4000,
+    timeout_policy = "execution bound, not latency acceptance", declaration_rename = "unsaved text edit" }
+  report, artifact_name, check_prefix = local_extension, "semantic-local-extension.json", "local extension "
+  paths.local_use = root .. "/probe/extensions/app/LocalUse.kt"
+  buffers.local_use = open_file(paths.local_use)
+  original.local_use = lines("local_use")
+  disk.local_use = vim.fn.readfile(paths.local_use, "b")
+  order[#order + 1] = "local_use"
+  for _, key in ipairs(order) do
+    local_extension.disk[key] = { path = paths[key], before_sha256 = vim.fn.sha256(table.concat(disk[key], "\n")) }
+  end
+  alias_check("local buffer shares the existing client", id == client.id)
+  local local_declaration = "fun Versioned.oldApi(): Payload = Payload() // local declaration"
+  local sibling_declaration = "fun Versioned.oldApi(): Versioned = this // sibling declaration"
+  local local_call = "return v.oldApi().payloadOnly() // local call"
+  local sibling_call = "return v.oldApi().newApi() // sibling call"
+  local function set_local(phase, contents)
+    vim.api.nvim_buf_set_lines(buffers.local_use, 0, -1, false, contents)
+    local expected, actual, equal, exact = vim.deepcopy(original), {}, {}, true
+    expected.local_use = contents
+    for _, key in ipairs(order) do
+      actual[key] = lines(key)
+      equal[key] = vim.deep_equal(actual[key], expected[key])
+      exact = exact and equal[key]
+    end
+    local_extension.edits[#local_extension.edits + 1] = {
+      phase = phase, expected = expected, actual = actual, equal = equal,
+    }
+    alias_check(phase .. " changes only the intended whole buffer", exact)
+    deliver(phase, { "local_use" })
+  end
+  local function sibling_definition(name)
+    definition(name, "local_use", sibling_call, "oldApi", "local_use", sibling_declaration)
+  end
+  local function no_local_definition(name)
+    local raw, ok = ask(name, "local_use", "textDocument/definition", local_call, "oldApi")
+    alias_check(name, ok and #probe.locations(raw) == 0, raw)
+  end
+  local function no_local_completion(name)
+    local raw, ok = ask(name, "local_use", "textDocument/completion", local_call, "oldApi",
+      { context = { triggerKind = 1 } })
+    alias_check(name, ok and not probe.completion_has(raw, "oldApi"), raw)
+  end
+  local function java_control(name)
+    definition(name, "use", "v.newApi()", "newApi", "versioned", "public int newApi()")
+  end
+
+  deliver("initial", order)
+  definition("initial oldApi goto selects its local declaration", "local_use", local_call, "oldApi",
+    "local_use", local_declaration)
+  definition("initial typed return selects Payload rather than the Versioned decoy", "local_use", local_call, "payloadOnly",
+    "payload", "fun payloadOnly()")
+  sibling_definition("initial sibling oldApi selects its own declaration")
+  definition("initial sibling return selects Versioned rather than the Payload decoy", "local_use", sibling_call, "newApi",
+    "versioned", "public int newApi()")
+  java_control("initial Java member paired control stays useful")
+  alias_definition("initial local declarations do not replace another file's imported alias", "fun Versioned.compat()", "compat")
+
+  set_local("incomplete", replaced(original.local_use, local_call, "return v.old // local call"))
+  local completion, completion_ok = ask("incomplete v.old offers the local oldApi without an import", "local_use",
+    "textDocument/completion", "return v.old // local call", "old", { context = { triggerKind = 1 } })
+  local found_local, auto_import = false, false
+  for _, item in ipairs(type(completion) == "table" and (completion.items or completion) or {}) do
+    if item.label == "oldApi" then
+      found_local = true
+      auto_import = auto_import or (item.additionalTextEdits ~= nil
+        and (type(item.additionalTextEdits) ~= "table" or #item.additionalTextEdits > 0))
+    end
+  end
+  alias_check("incomplete v.old offers the local oldApi without an import", completion_ok and found_local and not auto_import,
+    completion)
+
+  local renamed_declaration = "fun Versioned.renamedLocal(): Payload = Payload() // local declaration"
+  local renamed = replaced(original.local_use, local_declaration, renamed_declaration)
+  set_local("declaration-renamed", renamed)
+  no_local_definition("renaming the local declaration removes the old goto in this scope")
+  no_local_completion("renaming the local declaration removes old completion in this scope")
+  sibling_definition("unsaved declaration rename preserves the same-named sibling")
+  local renamed_call = "return v.renamedLocal().payloadOnly() // local call"
+  renamed = replaced(renamed, local_call, renamed_call)
+  set_local("renamed-usage", renamed)
+  definition("renamed usage selects the unsaved local declaration", "local_use", renamed_call, "renamedLocal",
+    "local_use", renamed_declaration, renamed)
+  definition("renamed usage keeps its Payload return chain", "local_use", renamed_call, "payloadOnly",
+    "payload", "fun payloadOnly()")
+
+  set_local("removed", replaced(original.local_use, local_declaration, "// local declaration removed in this buffer"))
+  no_local_definition("removed local declaration has no stale goto or sibling leak")
+  no_local_completion("removed local declaration has no stale completion or sibling leak")
+  sibling_definition("removed local declaration preserves the useful sibling definition")
+  java_control("removed local declaration preserves the Java paired control")
+
+  local rebound = replaced(original.local_use, local_declaration,
+    "fun Versioned.oldApi(): Versioned = this // local declaration")
+  local rebound_call = "return v.oldApi().newApi() // local call"
+  rebound = replaced(rebound, local_call, rebound_call)
+  set_local("rebound", rebound)
+  definition("rebound local goto still selects the same local declaration", "local_use", rebound_call, "oldApi",
+    "local_use", local_declaration)
+  definition("rebound local return selects Versioned rather than the Payload decoy", "local_use", rebound_call, "newApi",
+    "versioned", "public int newApi()")
+
+  restore("final-restored", { "local_use" })
+  definition("restored oldApi selects its local declaration again", "local_use", local_call, "oldApi",
+    "local_use", local_declaration)
+  definition("restored local return selects Payload again", "local_use", local_call, "payloadOnly",
+    "payload", "fun payloadOnly()")
+  java_control("final Java member paired control stays useful")
+  for _, key in ipairs(order) do
+    local current = vim.fn.readfile(paths[key], "b")
+    local_extension.disk[key].after_sha256 = vim.fn.sha256(table.concat(current, "\n"))
+    alias_check("disk source remains byte unchanged: " .. key, vim.deep_equal(current, disk[key]), local_extension.disk[key])
+  end
+  local_extension.completed = true
+  local_extension.counts = { checks = #local_extension.checks, failures = #local_extension.failures,
+    first_responses = #local_extension.first_responses }
+  save_alias()
+  client.rpc.notify = rpc_notify
 else
   check("extension alias uses the existing initialized client", false)
 end

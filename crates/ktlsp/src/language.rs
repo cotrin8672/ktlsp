@@ -313,17 +313,32 @@ pub fn signature_entries(
             } else {
                 callee
             };
-            let entries = resolve::goto(index, file, text, tree, selector.start_byte())
-                .into_iter()
-                .filter_map(|def| {
-                    hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
+            let ctx = crate::infer::FileCtx::from_tree_in_file(tree, text, file);
+            let local_name_bound = ctx.local_extensions.as_ref().is_some_and(|locals| {
+                locals.iter().any(|local| {
+                    local.entry.sym.name == name
+                        && local.scope.contains(&selector.start_byte())
+                        && local.entry.sym.end_byte <= selector.start_byte()
                 })
-                .collect::<Vec<_>>();
+            });
+            let entries =
+                resolve::goto_with_ctx(index, file, text, tree, selector.start_byte(), &ctx)
+                    .into_iter()
+                    .filter_map(|def| {
+                        hierarchy::entry_for_name_range(
+                            index,
+                            &def.file,
+                            def.start_byte,
+                            def.end_byte,
+                        )
+                        .or_else(|| ctx.local_entry(&def).cloned())
+                    })
+                    .collect::<Vec<_>>();
             Some(SignatureEntries {
                 name,
                 active_parameter,
                 entries,
-                unqualified: callee.kind() == "identifier",
+                unqualified: callee.kind() == "identifier" && !local_name_bound,
                 projected_signatures: Vec::new(),
             })
         }
@@ -464,13 +479,21 @@ pub fn semantic_tokens(language: SourceLanguage, tree: &Tree, text: &str) -> Vec
 pub fn inlay_hints(
     language: SourceLanguage,
     index: &dyn InferenceIndex,
+    file: &str,
     tree: &Tree,
     text: &str,
     start_byte: usize,
     end_byte: usize,
 ) -> Vec<InlayHint> {
     match language {
-        SourceLanguage::Kotlin => hints::inlay_hints(index, tree, text, start_byte, end_byte),
+        SourceLanguage::Kotlin => hints::inlay_hints_with_ctx(
+            index,
+            tree,
+            text,
+            start_byte,
+            end_byte,
+            &crate::infer::FileCtx::from_tree_in_file(tree, text, file),
+        ),
         SourceLanguage::Java => hints::java_inlay_hints(index, tree, text, start_byte, end_byte),
     }
 }
@@ -484,7 +507,13 @@ pub fn type_definition(
     offset: usize,
 ) -> Vec<Def> {
     match language {
-        SourceLanguage::Kotlin => hierarchy::type_definition(index, tree, text, offset),
+        SourceLanguage::Kotlin => hierarchy::type_definition_with_ctx(
+            index,
+            tree,
+            text,
+            offset,
+            &crate::infer::FileCtx::from_tree_in_file(tree, text, file),
+        ),
         SourceLanguage::Java => java::type_definition(index, file, tree, text, offset),
     }
 }

@@ -83,7 +83,7 @@ fn infer_expression(ws: &Workspace, file: &str, expression: &str) -> Type {
         &ws.index.scoped_for_file(file),
         node,
         &source,
-        &FileCtx::from_tree(&tree, &source),
+        &FileCtx::from_tree_in_file(&tree, &source, file),
     )
 }
 
@@ -1433,4 +1433,224 @@ fn spring_closed_incomplete_file_uses_the_same_recovered_receiver() {
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(&directory).unwrap();
     assert!(got.contains("getObject"), "{got:?}");
+}
+
+#[test]
+fn local_extension_typed_return_and_generic_receiver_are_inferred() {
+    let mut ws = Workspace::new();
+    ws.open("Local.kt", "package app\nclass Versioned\nclass Payload {\n    fun payloadOnly(): Int = 7\n}\nfun use(v: Versioned): Payload {\n    fun Versioned.oldApi(): Payload = Payload()\n    fun <T> T.keep(): T = this\n    return v.keep().oldApi()\n}\n".to_string());
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.keep()"),
+        Type::class("Versioned", Some("app".to_string()))
+    );
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.keep().oldApi()"),
+        Type::class("Payload", Some("app".to_string()))
+    );
+    assert!(ws.index.lookup_by_name("oldApi").is_empty());
+    assert!(ws.index.lookup_by_name("keep").is_empty());
+}
+
+#[test]
+fn local_extension_inner_unknown_argument_keeps_both_return_types_unknown() {
+    let mut ws = Workspace::new();
+    ws.open("Local.kt", "package app\nclass Versioned\nclass Payload\nclass OtherPayload\nfun use(v: Versioned, unknown: Missing) {\n    fun Versioned.oldApi(value: Int): Payload = Payload()\n    if (true) {\n        fun Versioned.oldApi(value: String): OtherPayload = OtherPayload()\n        v.oldApi(unknown)\n    }\n}\n".to_string());
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.oldApi(unknown)"),
+        Type::Unknown
+    );
+}
+
+#[test]
+fn local_extension_bare_call_uses_its_implicit_receiver() {
+    let mut ws = Workspace::new();
+    ws.open("Local.kt", "package app\nclass Versioned\nclass Payload\nclass OtherPayload\nfun Versioned.oldApi(value: Int): OtherPayload = OtherPayload()\nclass Use {\n    fun Versioned.use(): Payload {\n        fun Versioned.oldApi(value: Int): Payload = Payload()\n        return oldApi(1)\n    }\n}\n".to_string());
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "oldApi(1)"),
+        Type::class("Payload", Some("app".to_string()))
+    );
+}
+
+#[test]
+fn local_extension_unsaved_replacement_updates_chain_without_global_publication() {
+    let mut ws = Workspace::new();
+    let original = "package app\nclass Versioned {\n    fun newApi(): Int = 2\n}\nclass Payload {\n    fun payloadOnly(): Int = 7\n}\nclass Changed {\n    fun changedOnly(): Int = 8\n}\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): Payload = Payload()\n    v.oldApi().payloadOnly()\n}\n";
+    ws.open("Local.kt", original.to_string());
+    assert!(labels(&mut ws, "Local.kt", "v.oldApi().pay").contains("payloadOnly"));
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.oldApi()"),
+        Type::class("Payload", Some("app".to_string()))
+    );
+    let changed = original
+        .replace(
+            "oldApi(): Payload = Payload()",
+            "oldApi(): Changed = Changed()",
+        )
+        .replace("v.oldApi().payloadOnly()", "v.oldApi().changedOnly()");
+    ws.change("Local.kt", changed);
+    assert!(labels(&mut ws, "Local.kt", "v.oldApi().chan").contains("changedOnly"));
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.oldApi()"),
+        Type::class("Changed", Some("app".to_string()))
+    );
+    assert!(ws.index.lookup_by_name("oldApi").is_empty());
+    ws.change(
+        "Local.kt",
+        original.replace("    fun Versioned.oldApi(): Payload = Payload()\n", ""),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.oldApi()"),
+        Type::Unknown
+    );
+    assert!(labels(&mut ws, "Local.kt", "v.oldApi().pay").is_empty());
+}
+
+#[test]
+fn local_extension_unproved_receiver_never_becomes_a_known_target_or_type() {
+    for declaration in [
+        "fun Missing.oldApi(): Payload = Payload()",
+        "fun <T : Any> T.oldApi(): Payload = Payload()",
+        "fun <T> T.oldApi(): Payload where T : Missing = Payload()",
+    ] {
+        let mut ws = Workspace::new();
+        let source = format!("package app\nclass Versioned {{\n    fun newApi(): Int = 2\n}}\nclass Payload {{\n    fun payloadOnly(): Int = 7\n}}\nfun use(v: Versioned) {{\n    {declaration}\n    v.oldApi()\n    v.newApi()\n}}\n");
+        let offset = source.rfind("oldApi()").unwrap();
+        ws.open("Local.kt", source);
+        assert_eq!(
+            infer_expression(&ws, "Local.kt", "v.oldApi()"),
+            Type::Unknown,
+            "{declaration}"
+        );
+        assert!(
+            ws.goto_definition("Local.kt", offset).is_empty(),
+            "{declaration}"
+        );
+        assert_eq!(
+            ws.explain_resolution("Local.kt", offset).unwrap().status,
+            "unknown",
+            "{declaration}"
+        );
+        assert!(labels(&mut ws, "Local.kt", "v.new").contains("newApi"));
+    }
+}
+
+#[test]
+fn local_extension_nullable_receiver_requires_nullable_formal_or_safe_navigation() {
+    for (declaration, expression, known) in [
+        (
+            "fun Versioned.oldApi(): Payload = Payload()",
+            "v.oldApi()",
+            false,
+        ),
+        (
+            "fun Versioned?.oldApi(): Payload = Payload()",
+            "v.oldApi()",
+            true,
+        ),
+        (
+            "fun Versioned.oldApi(): Payload = Payload()",
+            "v?.oldApi()",
+            true,
+        ),
+        (
+            "fun <T : Any> T.oldApi(): Payload = Payload()",
+            "v.oldApi()",
+            false,
+        ),
+    ] {
+        let mut ws = Workspace::new();
+        ws.open("Local.kt", format!("package app\nclass Versioned\nclass Payload\nfun use(v: Versioned?) {{\n    {declaration}\n    {expression}\n}}\n"));
+        let result = infer_expression(&ws, "Local.kt", expression);
+        assert_eq!(
+            result.name(),
+            known.then_some("Payload"),
+            "{declaration}: {expression}"
+        );
+        if known {
+            assert_eq!(
+                result.is_nullable(),
+                expression.contains("?."),
+                "{declaration}: {expression}"
+            );
+        }
+    }
+    let mut ws = Workspace::new();
+    ws.open("Local.kt", "package app\nclass Versioned\nclass Payload { fun payloadOnly(): Int = 7 }\nfun use(v: Versioned?): Int? {\n    fun Versioned.oldApi(): Payload = Payload()\n    return v?.oldApi()?.payloadOnly()\n}\n".to_string());
+    let result = infer_expression(&ws, "Local.kt", "v?.oldApi()?.payloadOnly()");
+    assert_eq!(result.name(), Some("Int"));
+    assert!(result.is_nullable());
+}
+
+#[test]
+fn local_extension_lambda_receiver_precedes_scope_function_intrinsics() {
+    for (declaration, body, expected) in [
+        (
+            "fun Versioned.run(block: Payload.() -> Int): Int = Payload().block()",
+            "v.run { payloadOnly() }",
+            "Int",
+        ),
+        (
+            "fun Versioned.run(value: Int, block: Payload.() -> Int): Int = Payload().block()",
+            "v.run { payloadOnly() }",
+            "String",
+        ),
+        (
+            "fun Versioned.run(block: (Payload) -> Int): Int = block(Payload())",
+            "v.run { it.payloadOnly() }",
+            "Int",
+        ),
+    ] {
+        let mut ws = Workspace::new();
+        let source = format!("package app\nclass Versioned {{\n    fun payloadOnly(): String = \"decoy\"\n}}\nclass Payload {{\n    fun payloadOnly(): Int = 7\n}}\nfun use(v: Versioned) {{\n    {declaration}\n    {body}\n}}\n");
+        let use_offset = source.rfind("payloadOnly()").unwrap();
+        let definition = source
+            .find(if expected == "Int" {
+                "payloadOnly(): Int"
+            } else {
+                "payloadOnly(): String"
+            })
+            .unwrap();
+        ws.open("Local.kt", source);
+        let source = ws.doc_text("Local.kt").unwrap();
+        let tree = KotlinParser::new().parse(&source);
+        let (start, expression) = if body.contains("it.") {
+            (use_offset - "it.".len(), "it.payloadOnly()")
+        } else {
+            (use_offset, "payloadOnly()")
+        };
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, start + expression.len())
+            .unwrap();
+        assert_eq!(&source[node.byte_range()], expression);
+        assert_eq!(
+            infer::infer(
+                &ws.index.scoped_for_file("Local.kt"),
+                node,
+                &source,
+                &FileCtx::from_tree_in_file(&tree, &source, "Local.kt")
+            )
+            .name(),
+            Some(expected),
+            "{declaration}"
+        );
+        assert_eq!(
+            ws.goto_definition("Local.kt", use_offset),
+            vec![Def {
+                file: "Local.kt".into(),
+                start_byte: definition,
+                end_byte: definition + "payloadOnly".len()
+            }],
+            "{declaration}"
+        );
+        let prefix = if body.contains("it.") {
+            "v.run { it.pay"
+        } else {
+            "v.run { pay"
+        };
+        assert!(
+            labels(&mut ws, "Local.kt", prefix).contains("payloadOnly"),
+            "{declaration}"
+        );
+    }
 }

@@ -167,3 +167,125 @@ fn references_include_bare_import_alias_without_same_spelling_decoy() {
         }
     }
 }
+
+#[test]
+fn references_distinguish_local_extension_scopes_and_typed_overloads_after_unsaved_change() {
+    let mut ws = Workspace::new();
+    let key = "mem:///LocalUse.kt";
+    let versioned = r#"package vendor; public class Versioned { public int newApi() { return 2; } }
+"#;
+    let payload = r#"package compat
+import vendor.Versioned
+class Payload { fun payloadOnly(): Int = 1 }
+fun Versioned.compat(): Payload = Payload()
+"#;
+    let decoy = r#"package other
+import vendor.Versioned
+import compat.Payload
+fun Versioned.oldApi(): Payload = Payload()
+fun otherUse(v: Versioned): Int = v.oldApi().payloadOnly()
+"#;
+    ws.open("mem:///Versioned.java".to_string(), versioned.to_string());
+    ws.open("mem:///Payload.kt".to_string(), payload.to_string());
+    ws.open("mem:///Other.kt".to_string(), decoy.to_string());
+    let cases: &[(&str, &str, &[&[usize]])] = &[
+        (
+            "nested-and-sibling",
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Payload=Payload()
+ if(true) {
+  fun Versioned.oldApi():Versioned=this
+  val inner:Int=v.oldApi().newApi()
+ }
+ if(false) {
+  fun Versioned.oldApi():Payload=Payload()
+  val sibling:Int=v.oldApi().payloadOnly()
+ }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            &[&[0, 5], &[1, 2], &[3, 4]],
+        ),
+        (
+            "typed-overload",
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi(value:Int):Payload=Payload()
+ fun Versioned.oldApi(value:String):Versioned=this
+ return v.oldApi(1).payloadOnly()+v.oldApi("text").newApi()
+}
+"#,
+            &[&[0, 2], &[1, 3]],
+        ),
+        (
+            "local-over-imported-alias",
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+import compat.compat as oldApi
+fun localUse(v:Versioned):Int {
+ fun Versioned.oldApi():Versioned=this
+ return v.oldApi().newApi()
+}
+"#,
+            &[&[1, 2]],
+        ),
+        (
+            "sibling-hidden",
+            r#"package app
+import vendor.Versioned
+import compat.Payload
+fun localUse(v:Versioned):Int {
+ if(true) { fun Versioned.oldApi():Payload=Payload() }
+ return v.oldApi().payloadOnly()
+}
+"#,
+            &[&[0]],
+        ),
+    ];
+    for (case_index, &(case_name, source, groups)) in cases.iter().enumerate() {
+        if case_index == 0 {
+            ws.open(key.to_string(), source.to_string());
+        } else {
+            ws.change(key, source.to_string());
+        }
+        let positions: Vec<_> = source
+            .match_indices("oldApi")
+            .map(|(start, _)| start)
+            .collect();
+        for group in groups {
+            let mut expected = group
+                .iter()
+                .map(|&occurrence| {
+                    (
+                        key.to_string(),
+                        positions[occurrence],
+                        positions[occurrence] + "oldApi".len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            let declaration = positions[group[0]];
+            let expected_uses = expected
+                .iter()
+                .filter(|site| site.1 != declaration)
+                .cloned()
+                .collect::<Vec<_>>();
+            for &occurrence in *group {
+                for (include_declaration, wanted) in [(true, &expected), (false, &expected_uses)] {
+                    let actual = ws
+                        .references(key, positions[occurrence], include_declaration)
+                        .into_iter()
+                        .map(|site| (site.file, site.start_byte, site.end_byte))
+                        .collect::<Vec<_>>();
+                    assert_eq!(&actual, wanted, "case={case_name} cursor={occurrence} include_declaration={include_declaration}");
+                }
+            }
+        }
+    }
+}

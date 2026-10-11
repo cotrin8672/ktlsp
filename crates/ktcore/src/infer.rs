@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crate::fxhash::FxHashMap;
 
@@ -41,6 +42,7 @@ const SUPERTYPE_CAP: usize = 32;
 pub struct FileCtx {
     pub package: String,
     pub imports: Vec<Import>,
+    pub local_extensions: Option<Arc<Vec<crate::indexer::LocalExtension>>>,
     inference_cache: RefCell<FxHashMap<(usize, usize, u16), Type>>,
     /// Per-node implicit-receiver contributions, keyed by the boundary node's position + kind +
     /// query depth. Receiver contributions are a pure function of the boundary node within one
@@ -54,6 +56,7 @@ impl FileCtx {
         FileCtx {
             package,
             imports,
+            local_extensions: None,
             inference_cache: RefCell::new(FxHashMap::default()),
             receiver_cache: RefCell::new(FxHashMap::default()),
         }
@@ -61,6 +64,34 @@ impl FileCtx {
 
     pub fn from_tree(tree: &Tree, src: &str) -> Self {
         FileCtx::new(package_of(tree, src), imports_of(tree, src))
+    }
+
+    pub fn from_tree_in_file(tree: &Tree, src: &str, file: &str) -> Self {
+        let mut ctx = Self::from_tree(tree, src);
+        let locals =
+            crate::indexer::local_extensions(tree, src, file, &ctx.package, ctx.imports.clone());
+        if !locals.is_empty() {
+            ctx.local_extensions = Some(Arc::new(locals));
+        }
+        ctx
+    }
+
+    /// Look up an authored local definition without publishing it to the cross-file index.
+    pub fn local_entry(&self, definition: &crate::symbol::Def) -> Option<&Entry> {
+        self.local_extensions.as_ref()?.iter().find_map(|local| {
+            (local.entry.path.as_ref() == definition.file
+                && local.entry.sym.start_byte == definition.start_byte
+                && local.entry.sym.end_byte == definition.end_byte)
+                .then_some(&local.entry)
+        })
+    }
+
+    pub(crate) fn local_extension_at(&self, start: usize, end: usize) -> bool {
+        self.local_extensions.as_ref().is_some_and(|locals| {
+            locals
+                .iter()
+                .any(|local| local.entry.sym.start_byte == start && local.entry.sym.end_byte == end)
+        })
     }
 }
 
@@ -1029,6 +1060,35 @@ fn lambda_receiver_or_element(
     if callee.kind() != "navigation_expression" {
         return None;
     }
+    if let Some((receiver, selection)) =
+        local_lambda_call_selection(index, call, callee, src, ctx, depth, child_infer)
+    {
+        let arg_types = synth_arg_types(index, call, src, ctx, depth, child_infer);
+        let mut result = None;
+        for entry in selection.entries {
+            if trailing_lambda_receiver_ref(index, entry, ctx).is_some() {
+                return None;
+            }
+            let (params, _) = members::function_type_signature(entry.sym.params.last()?)?;
+            let [parameter] = params else {
+                return None;
+            };
+            let ty = resolve_trailing_lambda_receiver_candidate(
+                index,
+                entry,
+                parameter,
+                Some(&receiver),
+                &arg_types,
+                ctx,
+                depth,
+            )?;
+            if result.as_ref().is_some_and(|previous| previous != &ty) {
+                return None;
+            }
+            result = Some(ty);
+        }
+        return result;
+    }
     let sel = node_text(callee.named_child(1)?, src);
     let recv = callee.named_child(0)?;
     let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
@@ -1059,6 +1119,20 @@ fn lambda_receiver_for_this(
     let call_ancestors = &lambda_ancestors[..lambda_ancestors.len() - 2];
     let (call, call_ancestors) = outer_trailing_lambda_call_with_ancestors(call, call_ancestors);
     let (callee, callee_ancestors) = callable_callee_with_path(call, call_ancestors)?;
+    if let Some((receiver, selection)) =
+        local_lambda_call_selection(index, call, callee, src, ctx, depth, child_infer)
+    {
+        return select_trailing_lambda_receiver_type(
+            index,
+            selection.entries,
+            Some(&receiver),
+            call,
+            src,
+            ctx,
+            depth,
+            child_infer,
+        );
+    }
     if let Some(recv_ty) =
         hardcoded_receiver_lambda_type(index, callee, src, ctx, depth, child_infer)
     {
@@ -1074,6 +1148,36 @@ fn lambda_receiver_for_this(
         depth,
         child_infer,
     )
+}
+
+fn local_lambda_call_selection<'a>(
+    index: &'a dyn InferenceIndex,
+    call: Node,
+    callee: Node,
+    src: &str,
+    ctx: &'a FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Option<(Type, members::Selection<'a>)> {
+    if ctx.local_extensions.is_none() || callee.kind() != "navigation_expression" {
+        return None;
+    }
+    let receiver = callee.named_child(0)?;
+    let name = node_text(callee.named_child(1)?, src);
+    let receiver = member_receiver_type(
+        receiver,
+        child_infer.infer_child(index, receiver, src, ctx, depth + 1),
+    );
+    let candidates = members::candidates_at(index, &receiver, name, ctx, callee.start_byte());
+    if !candidates.has_local_extensions() {
+        return None;
+    }
+    let usage = MemberUse::Call(normalized_call_arguments(
+        call,
+        synth_arg_types(index, call, src, ctx, depth, child_infer),
+    ));
+    let selection = candidates.select(index, &receiver, &usage, ctx);
+    (selection.applicability != members::Applicability::Rejected).then_some((receiver, selection))
 }
 
 /// The call expression a lambda literal trails: `lambda_literal -> annotated_lambda ->
@@ -1172,8 +1276,24 @@ fn generic_lambda_receiver_type(
             for implicit_receiver in
                 implicit_receiver_types_with_ancestors(index, callee_ancestors, src, ctx, depth + 1)
             {
-                let entries = member_call_entries(index, &implicit_receiver, name, ctx);
-                if let Some(receiver) = select_trailing_lambda_receiver_type(
+                let candidates = members::candidates_at(
+                    index,
+                    &implicit_receiver,
+                    name,
+                    ctx,
+                    callee.start_byte(),
+                );
+                let (entries, local_selected) = callable_member_entries(
+                    candidates,
+                    index,
+                    &implicit_receiver,
+                    call,
+                    src,
+                    ctx,
+                    depth,
+                    child_infer,
+                );
+                let receiver = select_trailing_lambda_receiver_type(
                     index,
                     entries,
                     Some(&implicit_receiver),
@@ -1182,8 +1302,9 @@ fn generic_lambda_receiver_type(
                     ctx,
                     depth,
                     child_infer,
-                ) {
-                    return Some(receiver);
+                );
+                if local_selected || receiver.is_some() {
+                    return receiver;
                 }
             }
             let entries = visible_top_level_entries(index, name, ctx, SymbolKind::Function);
@@ -1201,7 +1322,7 @@ fn generic_lambda_receiver_type(
         "navigation_expression" => {
             let recv = callee.named_child(0)?;
             let sel = callee.named_child(1)?;
-            let (recv_ty, candidates) = navigation_member_candidates(
+            let (recv_ty, candidates, _) = navigation_member_candidates(
                 index,
                 recv,
                 node_text(sel, src),
@@ -1210,7 +1331,16 @@ fn generic_lambda_receiver_type(
                 depth,
                 child_infer,
             )?;
-            let entries = callable_member_entries(candidates);
+            let (entries, _) = callable_member_entries(
+                candidates,
+                index,
+                &recv_ty,
+                call,
+                src,
+                ctx,
+                depth,
+                child_infer,
+            );
             select_trailing_lambda_receiver_type(
                 index,
                 entries,
@@ -1405,12 +1535,14 @@ fn infer_call(
                         decl.parent()
                     }
                 });
-                if !owner.is_some_and(|owner| {
-                    matches!(
-                        owner.kind(),
-                        "source_file" | "class_body" | "enum_class_body"
-                    )
-                }) {
+                if !ctx.local_extension_at(binder.start_byte(), binder.end_byte())
+                    && !owner.is_some_and(|owner| {
+                        matches!(
+                            owner.kind(),
+                            "source_file" | "class_body" | "enum_class_body"
+                        )
+                    })
+                {
                     return Type::Unknown;
                 }
             }
@@ -1420,12 +1552,13 @@ fn infer_call(
             }
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
             let usage = MemberUse::Call(normalized_call_arguments(node, arg_types.clone()));
-            if let Some((receiver, selection)) = members::select_implicit(
+            if let Some((receiver, selection)) = members::select_implicit_at(
                 index,
                 implicit_receiver_types(index, callee, src, ctx, depth + 1),
                 cname,
                 &usage,
                 ctx,
+                callee.start_byte(),
             ) {
                 return selected_member_type(
                     index,
@@ -1484,7 +1617,7 @@ fn infer_call(
             let (Some(recv), Some(sel)) = (callee.named_child(0), callee.named_child(1)) else {
                 return Type::Unknown;
             };
-            let Some((recv_ty, candidates)) = navigation_member_candidates(
+            let Some((recv_ty, candidates, nullable_result)) = navigation_member_candidates(
                 index,
                 recv,
                 node_text(sel, src),
@@ -1496,7 +1629,7 @@ fn infer_call(
                 return Type::Unknown;
             };
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
-            member_type(
+            let result = member_type(
                 index,
                 &recv_ty,
                 candidates,
@@ -1509,7 +1642,8 @@ fn infer_call(
                 ctx,
                 depth,
                 child_infer,
-            )
+            );
+            navigation_result_type(result, nullable_result)
         }
         _ => Type::Unknown,
     }
@@ -1683,30 +1817,49 @@ fn top_level_entries_exact<'a>(
         .collect()
 }
 
-fn member_call_entries<'a>(
-    index: &'a dyn InferenceIndex,
-    recv_ty: &Type,
-    name: &str,
+fn callable_member_entries<'a>(
+    candidates: members::Candidates<'a>,
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    call: Node,
+    src: &str,
     ctx: &FileCtx,
-) -> Vec<&'a Entry> {
-    let candidates = members::candidates(index, recv_ty, name, ctx);
-    callable_member_entries(candidates)
-}
-
-fn callable_member_entries(candidates: members::Candidates<'_>) -> Vec<&Entry> {
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> (Vec<&'a Entry>, bool) {
+    if candidates.has_local_extensions() {
+        let usage = MemberUse::Call(normalized_call_arguments(
+            call,
+            synth_arg_types(index, call, src, ctx, depth, child_infer),
+        ));
+        let selection = candidates.select(index, receiver, &usage, ctx);
+        return (
+            selection
+                .entries
+                .into_iter()
+                .filter(|entry| entry.sym.kind == SymbolKind::Function)
+                .collect(),
+            selection.applicability != members::Applicability::Rejected,
+        );
+    }
     let own: Vec<_> = candidates
         .members
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|entry| entry.sym.kind == SymbolKind::Function)
         .collect();
     if !own.is_empty() {
-        own
+        (own, false)
     } else {
-        candidates
-            .extensions
-            .into_iter()
-            .filter(|entry| entry.sym.kind == SymbolKind::Function)
-            .collect()
+        (
+            candidates
+                .extensions
+                .iter()
+                .copied()
+                .filter(|entry| entry.sym.kind == SymbolKind::Function)
+                .collect(),
+            false,
+        )
     }
 }
 
@@ -2051,7 +2204,7 @@ fn infer_navigation(
     let (Some(recv), Some(sel)) = (node.named_child(0), node.named_child(1)) else {
         return Type::Unknown;
     };
-    let Some((recv_ty, candidates)) = navigation_member_candidates(
+    let Some((recv_ty, candidates, nullable_result)) = navigation_member_candidates(
         index,
         recv,
         node_text(sel, src),
@@ -2062,7 +2215,7 @@ fn infer_navigation(
     ) else {
         return Type::Unknown;
     };
-    member_type(
+    let result = member_type(
         index,
         &recv_ty,
         candidates,
@@ -2075,7 +2228,8 @@ fn infer_navigation(
         ctx,
         depth,
         child_infer,
-    )
+    );
+    navigation_result_type(result, nullable_result)
 }
 
 fn navigation_member_candidates<'a>(
@@ -2083,21 +2237,49 @@ fn navigation_member_candidates<'a>(
     receiver: Node,
     name: &str,
     src: &str,
-    ctx: &FileCtx,
+    ctx: &'a FileCtx,
     depth: usize,
     child_infer: &mut impl ChildInfer,
-) -> Option<(Type, members::Candidates<'a>)> {
+) -> Option<(Type, members::Candidates<'a>, bool)> {
     if receiver.kind() == "super_expression" {
         return members::super_member_candidates(
             index,
             super_receivers(index, receiver, src, ctx),
             name,
             ctx,
-        );
+        )
+        .map(|(receiver, candidates)| (receiver, candidates, false));
     }
-    let ty = child_infer.infer_child(index, receiver, src, ctx, depth + 1);
-    let candidates = members::candidates(index, &ty, name, ctx);
-    Some((ty, candidates))
+    let original = child_infer.infer_child(index, receiver, src, ctx, depth + 1);
+    let nullable_result = original.is_nullable() && is_safe_navigation_receiver(receiver);
+    let ty = member_receiver_type(receiver, original);
+    let candidates = members::candidates_at(index, &ty, name, ctx, receiver.end_byte());
+    Some((ty, candidates, nullable_result))
+}
+
+fn is_safe_navigation_receiver(receiver: Node) -> bool {
+    receiver
+        .parent()
+        .is_some_and(|nav| nav.kind() == "navigation_expression" && has_child_token(nav, "?."))
+}
+
+fn navigation_result_type(mut result: Type, nullable_result: bool) -> Type {
+    if nullable_result {
+        if let Type::Class { nullable, .. } = &mut result {
+            *nullable = true;
+        }
+    }
+    result
+}
+
+/// A safe navigation tests the non-null receiver before selecting its member.
+pub fn member_receiver_type(receiver: Node, mut ty: Type) -> Type {
+    if is_safe_navigation_receiver(receiver) {
+        if let Type::Class { nullable, .. } = &mut ty {
+            *nullable = false;
+        }
+    }
+    ty
 }
 
 /// Infer the result of the same call/value member selection used by navigation and references.

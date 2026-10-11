@@ -198,6 +198,9 @@ and applied rename edits that preserve alias spelling. These alias requests cons
 their first response and record buffer delivery and exact edits in
 `semantic-extension-alias.json`. Shutdown acknowledgement, exit notification and native
 server exit are recorded separately in `semantic-shutdown.json`.
+Function-local extensions cover lexical and sibling scopes, typed result chains,
+incomplete completion, and unsaved declaration rename/removal/return-type changes in
+`semantic-local-extension.json`; every query consumes its first response.
 Use `corpus` with a completion UI case for real-project blank `super.` acceptance;
 retain the applied buffer and verify it with that project's compiler and plugins.
 

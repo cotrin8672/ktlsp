@@ -23,7 +23,7 @@ pub fn compute(
     tree: &Tree,
     facts: &CompletenessFacts,
 ) -> Vec<Diagnostic> {
-    let ctx = infer::FileCtx::from_tree(tree, src);
+    let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
     compute_with_ctx(index, file, src, tree, facts, &ctx)
 }
 
@@ -195,13 +195,17 @@ fn top_level_call_shape_query(
         return None;
     }
     let defs = resolve::goto_node_with_ctx(index, file, src, ident, ident_ancestors, ctx);
+    let local_selected = defs.iter().any(|def| ctx.local_entry(def).is_some());
     let mut entries = defs
         .into_iter()
         .filter_map(|def| {
             hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
+                .or_else(|| ctx.local_entry(&def).cloned())
         })
         .collect::<Vec<_>>();
-    entries = expand_visible_function_overloads(index, src, file, &symbol, entries, ctx);
+    if !local_selected {
+        entries = expand_visible_function_overloads(index, src, file, &symbol, entries, ctx);
+    }
     if entries
         .iter()
         .any(|entry| !resolve::declaration_surface_status(index, entry, facts).is_found())
@@ -248,8 +252,9 @@ fn member_call_shape_query(
             ctx,
         )?
     } else {
-        let ty = infer::infer(index, recv, src, ctx);
-        let candidates = crate::members::candidates(index, &ty, &symbol, ctx);
+        let ty = infer::member_receiver_type(recv, infer::infer(index, recv, src, ctx));
+        let candidates =
+            crate::members::candidates_at(index, &ty, &symbol, ctx, ident.start_byte());
         (ty, candidates)
     };
     if receiver_world_is_library_or_jdk(index, &recv_ty) {
@@ -421,8 +426,13 @@ fn member_call_entries(
         &crate::members::MemberUse::Call(args.clone()),
         ctx,
     );
-    if !selected.entries.is_empty() {
+    if !selected.entries.is_empty()
+        || selected.applicability == crate::members::Applicability::Unknown
+    {
         return selected.entries.into_iter().cloned().collect();
+    }
+    if candidates.has_local_extensions() {
+        return Vec::new();
     }
     // A rejected call still needs its declared signatures to explain a shape mismatch. A name's
     // existence alone does not make any one of those signatures a navigation/inference result.

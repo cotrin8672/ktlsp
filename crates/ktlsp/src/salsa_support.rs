@@ -99,6 +99,7 @@ impl ExprKey {
 pub struct FileCtxFacts {
     pub package: String,
     pub imports: Vec<parser::Import>,
+    pub local_extensions: Option<std::sync::Arc<Vec<crate::indexer::LocalExtension>>>,
 }
 
 #[salsa::tracked(returns(ref), no_eq)]
@@ -119,9 +120,11 @@ pub fn file_ctx_facts(db: &dyn salsa::Database, file: SourceFile) -> FileCtxFact
     // TODO(language-facade): FileCtxFacts is intentionally still Kotlin-shaped because expression
     // inference consumes ktcore::parser::Import. Making this fully language-neutral requires a
     // shared import fact type first; do not feed Java imports into Kotlin inference as a shortcut.
+    let ctx = infer::FileCtx::from_tree_in_file(tree, text, file.scope_key(db));
     FileCtxFacts {
-        package: parser::package_of(tree, text),
-        imports: parser::imports_of(tree, text),
+        package: ctx.package,
+        imports: ctx.imports,
+        local_extensions: ctx.local_extensions,
     }
 }
 
@@ -147,7 +150,8 @@ fn expr_type_at_depth(
         return Type::Unknown;
     };
     let facts = file_ctx_facts(db, file);
-    let ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone());
+    let mut ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone());
+    ctx.local_extensions = facts.local_extensions.clone();
     let scoped_index = ScopedIndex::new(db.index(), file.scope_key(db));
     if !supports_compositional_expr(node) {
         return infer::infer(&scoped_index, node, file.text(db), &ctx);

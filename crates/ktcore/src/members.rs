@@ -43,6 +43,8 @@ pub struct Selection<'a> {
 pub struct Candidates<'a> {
     pub members: Vec<&'a Entry>,
     pub extensions: Vec<&'a Entry>,
+    local_scopes: Vec<Vec<&'a Entry>>,
+    uncertain_receivers: BTreeSet<(&'a str, usize, usize)>,
     hierarchy_complete: bool,
 }
 
@@ -95,6 +97,8 @@ pub fn super_member_candidates<'a>(
         Candidates {
             members,
             extensions: Vec::new(),
+            local_scopes: Vec::new(),
+            uncertain_receivers: BTreeSet::new(),
             hierarchy_complete: !selected.incomplete,
         },
     ))
@@ -220,13 +224,38 @@ pub fn select_implicit<'a>(
     receivers: impl IntoIterator<Item = Type>,
     name: &str,
     usage: &MemberUse,
-    ctx: &FileCtx,
+    ctx: &'a FileCtx,
+) -> Option<(Type, Selection<'a>)> {
+    select_implicit_in(index, receivers, name, usage, ctx, None)
+}
+
+pub fn select_implicit_at<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: impl IntoIterator<Item = Type>,
+    name: &str,
+    usage: &MemberUse,
+    ctx: &'a FileCtx,
+    position: usize,
+) -> Option<(Type, Selection<'a>)> {
+    select_implicit_in(index, receivers, name, usage, ctx, Some(position))
+}
+
+fn select_implicit_in<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: impl IntoIterator<Item = Type>,
+    name: &str,
+    usage: &MemberUse,
+    ctx: &'a FileCtx,
+    position: Option<usize>,
 ) -> Option<(Type, Selection<'a>)> {
     let mut rejected = None;
     for receiver in receivers {
-        let selection =
-            candidates(index, &receiver, name, ctx).select(index, &receiver, usage, ctx);
-        if selection.entries.is_empty() {
+        let pool = match position {
+            Some(position) => candidates_at(index, &receiver, name, ctx, position),
+            None => candidates(index, &receiver, name, ctx),
+        };
+        let selection = pool.select(index, &receiver, usage, ctx);
+        if selection.entries.is_empty() && selection.applicability != Applicability::Unknown {
             continue;
         }
         if selection.applicability != Applicability::Rejected {
@@ -248,6 +277,115 @@ pub fn candidates<'a>(
     ctx: &FileCtx,
 ) -> Candidates<'a> {
     matching_candidates(index, receiver, MemberName::Exact(name), ctx)
+}
+
+pub fn candidates_at<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    name: &str,
+    ctx: &'a FileCtx,
+    position: usize,
+) -> Candidates<'a> {
+    matching_candidates_at(index, receiver, MemberName::Exact(name), ctx, position)
+}
+
+pub fn completion_candidates_at<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    prefix: &str,
+    ctx: &'a FileCtx,
+    position: usize,
+) -> Candidates<'a> {
+    matching_candidates_at(index, receiver, MemberName::Prefix(prefix), ctx, position)
+}
+
+fn matching_candidates_at<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    name: MemberName<'_>,
+    ctx: &'a FileCtx,
+    position: usize,
+) -> Candidates<'a> {
+    let mut result = matching_candidates(index, receiver, name, ctx);
+    let mut scopes = BTreeMap::new();
+    for local in ctx.local_extensions.iter().flat_map(|locals| locals.iter()) {
+        if !local.scope.contains(&position)
+            || local.entry.sym.end_byte > position
+            || !name.matches(&local.entry.sym.name)
+        {
+            continue;
+        }
+        let applicability = local_receiver_applicability(index, receiver, local, ctx);
+        if applicability == Applicability::Rejected {
+            continue;
+        }
+        if applicability == Applicability::Unknown {
+            result.uncertain_receivers.insert((
+                local.entry.path.as_ref(),
+                local.entry.sym.start_byte,
+                local.entry.sym.end_byte,
+            ));
+        }
+        scopes
+            .entry((local.scope.len(), local.scope.start))
+            .or_insert_with(Vec::new)
+            .push(&local.entry);
+    }
+    result.local_scopes = scopes.into_values().collect();
+    result
+}
+
+fn local_receiver_applicability(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    local: &crate::indexer::LocalExtension,
+    ctx: &FileCtx,
+) -> Applicability {
+    if local.has_type_constraints {
+        // shortcut: local type-parameter bounds are unknown until constraint applicability is modeled.
+        return Applicability::Unknown;
+    }
+    if local.receiver.qualification.is_none()
+        && local.entry.sym.type_params.contains(&local.receiver.name)
+    {
+        return if infer::type_head_is_known(index, receiver) {
+            Applicability::Applicable
+        } else {
+            Applicability::Unknown
+        };
+    }
+    let formal = infer::declared_type(index, &local.receiver, ctx);
+    if !infer::type_head_is_known(index, &formal) || receiver.name().is_none() {
+        return Applicability::Unknown;
+    }
+    if receiver.is_nullable() && !formal.is_nullable() {
+        return Applicability::Rejected;
+    }
+    let mut uncertain = false;
+    let found = infer::walk_supertypes(index, receiver, 32, |current| {
+        uncertain |= !infer::type_head_is_known(index, current);
+        if current.name() == formal.name()
+            && current.package() == formal.package()
+            && current.container() == formal.container()
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break();
+    if found {
+        // Type-argument constraints/variance are not a proof of receiver applicability yet.
+        if local.receiver.args.is_empty() {
+            Applicability::Applicable
+        } else {
+            Applicability::Unknown
+        }
+    } else if uncertain {
+        Applicability::Unknown
+    } else {
+        Applicability::Rejected
+    }
 }
 
 pub(crate) fn matching_candidates<'a>(
@@ -314,6 +452,8 @@ fn collect_candidates<'a>(
     Candidates {
         members,
         extensions,
+        local_scopes: Vec::new(),
+        uncertain_receivers: BTreeSet::new(),
         hierarchy_complete,
     }
 }
@@ -629,6 +769,48 @@ fn owner_inheritance(
 }
 
 impl<'a> Candidates<'a> {
+    pub fn has_local_extensions(&self) -> bool {
+        !self.local_scopes.is_empty()
+    }
+
+    pub fn known_local_extensions(&self) -> impl Iterator<Item = &'a Entry> + '_ {
+        self.local_scopes
+            .iter()
+            .flat_map(|scope| scope.iter().copied())
+            .filter(|entry| self.receiver_is_known(entry))
+    }
+
+    fn receiver_is_known(&self, entry: &Entry) -> bool {
+        !self.uncertain_receivers.contains(&(
+            entry.path.as_ref(),
+            entry.sym.start_byte,
+            entry.sym.end_byte,
+        ))
+    }
+
+    fn selection(&self, entries: Vec<&'a Entry>, applicability: Applicability) -> Selection<'a> {
+        if entries.iter().any(|entry| !self.receiver_is_known(entry)) {
+            return Selection {
+                entries: Vec::new(),
+                applicability: Applicability::Unknown,
+            };
+        }
+        Selection {
+            entries,
+            applicability,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty() && self.extensions.is_empty() && self.local_scopes.is_empty()
+    }
+
+    fn groups(&self) -> impl Iterator<Item = &[&'a Entry]> {
+        std::iter::once(self.members.as_slice())
+            .chain(self.local_scopes.iter().map(Vec::as_slice))
+            .chain(std::iter::once(self.extensions.as_slice()))
+    }
+
     /// Applicable functions have priority over a value's `invoke`. A known arity/type mismatch
     /// cannot hide a callable property; unknown syntax/types retain possible candidates.
     pub fn select(
@@ -640,17 +822,14 @@ impl<'a> Candidates<'a> {
     ) -> Selection<'a> {
         match usage {
             MemberUse::Value => {
-                for entries in [&self.members, &self.extensions] {
+                for entries in self.groups() {
                     let values: Vec<_> = entries
                         .iter()
                         .copied()
                         .filter(|entry| entry.sym.kind.is_value_like())
                         .collect();
                     if !values.is_empty() {
-                        return Selection {
-                            entries: values,
-                            applicability: Applicability::Applicable,
-                        };
+                        return self.selection(values, Applicability::Applicable);
                     }
                 }
             }
@@ -658,24 +837,30 @@ impl<'a> Candidates<'a> {
                 let mut possible = Vec::new();
                 let mut rejected = Vec::new();
                 for functions in [true, false] {
-                    for entries in [&self.members, &self.extensions] {
+                    for entries in self.groups() {
                         let mut viable = Vec::new();
                         let mut uncertain = false;
                         for entry in entries.iter().copied() {
-                            let applicability = if functions && entry.sym.kind.is_callable_like() {
-                                function_applicability(
-                                    index,
-                                    receiver,
-                                    entry,
-                                    args,
-                                    ctx,
-                                    CallMode::Kotlin,
-                                )
-                            } else if !functions && entry.sym.kind.is_value_like() {
-                                callable_value_applicability(index, receiver, entry, args, ctx)
-                            } else {
-                                continue;
-                            };
+                            let mut applicability =
+                                if functions && entry.sym.kind.is_callable_like() {
+                                    function_applicability(
+                                        index,
+                                        receiver,
+                                        entry,
+                                        args,
+                                        ctx,
+                                        CallMode::Kotlin,
+                                    )
+                                } else if !functions && entry.sym.kind.is_value_like() {
+                                    callable_value_applicability(index, receiver, entry, args, ctx)
+                                } else {
+                                    continue;
+                                };
+                            if applicability == Applicability::Applicable
+                                && !self.receiver_is_known(entry)
+                            {
+                                applicability = Applicability::Unknown;
+                            }
                             if applicability == Applicability::Rejected {
                                 // A scalar field is not a rejected callable declaration.
                                 if functions
@@ -694,28 +879,19 @@ impl<'a> Candidates<'a> {
                         }
                         if !viable.is_empty() {
                             if possible.is_empty() && !uncertain {
-                                return Selection {
-                                    entries: viable,
-                                    applicability: Applicability::Applicable,
-                                };
+                                return self.selection(viable, Applicability::Applicable);
                             }
                             possible.extend(viable);
                         }
                     }
                 }
                 if !possible.is_empty() {
-                    return Selection {
-                        entries: possible,
-                        applicability: Applicability::Unknown,
-                    };
+                    return self.selection(possible, Applicability::Unknown);
                 }
                 // An invalid call still names a unique declaration. Navigation can show it while
                 // inference uses the rejected status rather than inventing a successful result.
                 if rejected.len() == 1 {
-                    return Selection {
-                        entries: rejected,
-                        applicability: Applicability::Rejected,
-                    };
+                    return self.selection(rejected, Applicability::Rejected);
                 }
             }
         }

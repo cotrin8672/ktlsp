@@ -1192,3 +1192,106 @@ fun use(v: Versioned): Int = v./*^*/oldApi()
         assert_eq!(got, want, "unsaved import: {import:?}");
     }
 }
+
+#[test]
+fn local_extension_goto_uses_real_local_declaration() {
+    check(
+        "package app\nclass Versioned\nclass Payload\nfun use(v: Versioned): Payload {\n    fun Versioned./*def*/oldApi(): Payload = Payload()\n    return v./*^*/oldApi()\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_return_chain_goto_uses_selected_payload() {
+    check(
+        "package app\nclass Versioned\nclass Payload {\n    fun /*def*/payloadOnly(): Int = 7\n}\nclass OtherPayload {\n    fun payloadOnly(): Int = 0\n}\nfun use(v: Versioned): Int {\n    fun Versioned.oldApi(): Payload = Payload()\n    return v.oldApi()./*^*/payloadOnly()\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_generic_receiver_goto() {
+    check(
+        "package app\nclass Versioned\nfun use(v: Versioned): Versioned {\n    fun <T> T./*def*/keep(): T = this\n    return v./*^*/keep()\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_keeps_real_member_priority() {
+    check(
+        "package app\nclass Versioned {\n    fun /*def*/oldApi(): Int = 2\n}\nfun use(v: Versioned): Int {\n    fun Versioned.oldApi(): Int = 1\n    return v./*^*/oldApi()\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_inner_scope_shadows_outer_scope() {
+    check(
+        "package app\nclass Versioned\nclass OuterPayload\nclass InnerPayload\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): OuterPayload = OuterPayload()\n    if (true) {\n        fun Versioned./*def*/oldApi(): InnerPayload = InnerPayload()\n        v./*^*/oldApi()\n    }\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_outer_scope_remains_when_inner_arguments_do_not_apply() {
+    check(
+        "package app\nclass Versioned\nfun use(v: Versioned) {\n    fun Versioned./*def*/oldApi(value: Int): Int = value\n    if (true) {\n        fun Versioned.oldApi(value: String): String = value\n        v./*^*/oldApi(1)\n    }\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_outer_scope_remains_when_inner_receiver_does_not_apply() {
+    check(
+        "package app\nclass Versioned\nclass Other\nfun use(v: Versioned) {\n    fun Versioned./*def*/oldApi(): Int = 1\n    if (true) {\n        fun Other.oldApi(): Int = 2\n        v./*^*/oldApi()\n    }\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_inner_generic_receiver_precedes_outer_concrete_receiver() {
+    check(
+        "package app\nclass Versioned\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): Int = 1\n    if (true) {\n        fun <T> T./*def*/oldApi(): Int = 2\n        v./*^*/oldApi()\n    }\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_precedes_imported_alias() {
+    check(
+        "//- Versioned.kt\npackage vendor\nclass Versioned\n//- Compatibility.kt\npackage compat\nimport vendor.Versioned\nfun Versioned.compat(): Int = 0\n//- Main.kt\npackage app\nimport vendor.Versioned\nimport compat.compat as oldApi\nfun use(v: Versioned): Int {\n    fun Versioned./*def*/oldApi(): Int = 1\n    return v./*^*/oldApi()\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_retains_same_scope_typed_overloads() {
+    check(
+        "package app\nclass Versioned\nclass Payload\nclass OtherPayload\nfun use(v: Versioned): Payload {\n    fun Versioned./*def*/oldApi(value: Int): Payload = Payload()\n    fun Versioned.oldApi(value: String): OtherPayload = OtherPayload()\n    return v./*^*/oldApi(1)\n}\n",
+    );
+}
+
+#[test]
+fn local_extension_declaration_must_precede_use() {
+    for body in [
+        "v./*^*/oldApi()\n    fun Versioned.oldApi(): Int = 1",
+        "fun nested() = v./*^*/oldApi()\n    fun Versioned.oldApi(): Int = 1",
+        "val nested = { v./*^*/oldApi() }\n    fun Versioned.oldApi(): Int = 1",
+    ] {
+        let fixture = "package app\nclass Versioned\nfun use(v: Versioned) {\n    __body__\n}\n";
+        check(&fixture.replace("__body__", body));
+    }
+}
+
+#[test]
+fn local_extension_is_not_visible_in_sibling_or_other_function() {
+    for body in [
+        "if (true) {\n        fun Versioned.oldApi(): Int = 1\n    }\n    if (true) { v./*^*/oldApi() }",
+        "fun sibling() {\n        fun Versioned.oldApi(): Int = 1\n    }\n    v./*^*/oldApi()",
+    ] {
+        let fixture = "package app\nclass Versioned\nfun use(v: Versioned) {\n    __body__\n}\n";
+        check(&fixture.replace("__body__", body));
+    }
+    check(
+        "//- Local.kt\npackage app\nclass Versioned\nfun owner(v: Versioned) {\n    fun Versioned.oldApi(): Int = 1\n}\n//- Main.kt\npackage app\nfun other(v: Versioned) = v./*^*/oldApi()\n",
+    );
+}
+
+#[test]
+fn local_extension_explicit_return_supports_recursive_call() {
+    check(
+        "package app\nclass Versioned\nclass Payload\nfun use(v: Versioned): Payload {\n    fun Versioned./*def*/oldApi(): Payload = this./*^*/oldApi()\n    return v.oldApi()\n}\n",
+    );
+}

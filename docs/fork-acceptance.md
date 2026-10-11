@@ -1,6 +1,6 @@
 # Fork acceptance and evidence
 
-Updated: 2026-10-11 (Asia/Tokyo). Goal remains **in progress**.
+Updated: 2026-10-12 (Asia/Tokyo). Goal remains **in progress**.
 
 ## Scope
 
@@ -56,7 +56,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Kotlin compiler-input slice passes 1,190 / 0 failed / 4 ignored across 40 suites; formatting/release native 0 | Current Rust, formatting and release verified | `ktlsp-kotlin-compiler-inputs-20261011-1/validation-results.json`; cache round trip retains the configured inputs and rejects model v5 |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Local-extension slice passes 1,248 / 0 failed / 4 ignored; formatting/release native 0 | Current Rust, formatting and release verified | Checkpoint 33: `ktlsp-kotlin-local-extensions-20261011-1/validation-results.json`; bounded/parameterized local receiver constraints remain Unknown |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Earlier ordinary editor: basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Current path-cache saved Java probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/`. Current narrow probe shuts down cleanly in 0.7201557s (n=1); actual server/client RSS remains unmeasured |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -65,6 +65,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Structured Java type arguments and typed superclasses resolve mixed completion/goto both directions. Fourth release repairs imported superclass collisions across completion, goto and diagnostics; unsaved import switches are fresh on the first response. Growing cycles are bounded and incomplete hierarchy facts remain Unknown | Partial; focused repairs verified | Java 99 includes 34 new editor assertions. Method inference, bounded wildcards, declaration shadowing and real-project coverage remain |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Current Spring reduction repairs four failed requests; real Spring passes all nine original/additional first-response queries, including explicit-this and dangling selectors | Focused repair verified; full-project acceptance partial | Checkpoint 29 below. Real Spring still has ten missing dependency source inputs and a 15-second forced shutdown |
+| Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks improve 31/44 to 44/44, preserving the previous 65 checks. Matched first-response completion/goto improves 2/6 to 6/6; IDEA returns 6/6 | Focused semantics verified; constrained receivers remain a coverage gap | Checkpoint 33: exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have Rust regression controls; no six-project parity or speed claim |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Tenth-fixed-2 applies the complete six-site override family, preserves all five expected buffers and passes actual Java/Kotlin compilation plus 33 bytecode assertions. JVM facade exported-alias/authored renames and external consumer applied renames also pass | Focused fixtures verified; wider corpus and inherited implementation edge pending | `ktlsp-goal-20261010/tenth2-java-rename-compiler-1/`, `retrofit-jvm-editor/portable-release-tenth2-1/artifacts/` and `ktlsp-shadow-tenth-fixed-2-20261011/editor/`. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
@@ -2168,6 +2169,67 @@ index. Kotlin's obsolete binary-member diagnostic still needs a complete visible
 extension world and compiler-producer proof. Broad six-project IDEA comparison,
 compiler-plugin editing behavior and matched performance/memory measurements remain
 open. Execution timeouts bound experiments and do not decide semantic acceptance.
+
+### Thirty-third checkpoint: function-local Kotlin extensions
+
+Compiler-valid local extensions were intentionally absent from the cross-file index,
+but semantic queries had no scoped replacement. The core now extracts their authored
+definitions once per file context and carries shared immutable facts through Salsa.
+Candidates retain declaration order and block ranges; real members precede applicable
+inner local extensions, outer scopes and imported extensions. Typed overload selection,
+generic receiver substitution and recursive calls use the existing member algorithms.
+Local declarations never enter the global index or leak into sibling functions.
+
+Navigation, inference, completion, diagnostics, references, rename, signature/hover,
+type-definition and inlay hints receive these same facts. Local lambda receivers are
+selected before spelling-based standard-library shortcuts; an inapplicable local
+`run` still permits the actual standard-library function. Safe navigation selects
+against a non-null receiver and preserves a nullable result. Unresolved receiver
+relationships, written generic bounds and parameterized receiver constraints retain
+Unknown rather than inventing a type or a target. Valid constrained-receiver cases
+therefore remain explicit coverage gaps.
+
+Evidence root: `C:/Users/gummy/AppData/Local/Temp/ktlsp-kotlin-local-extensions-20261011-1`.
+The original immutable release SHA-256 is
+`9e318a840222c184c2cea3c89bc0103615c6d9947fbeaed5ebb21e061751b6fc`; the fixed release is
+`696ed0332e75346a4f67ce8fcaebcb6be74d2a1a0ac824be828fa7afe906c0e2`.
+The same `semantic` scenario improves local checks from **31/44 to 44/44**, with
+all **21 first responses** delivered without retries. Existing **23 ordinary and
+42 alias checks** pass in both arms. Unsaved declaration rename, removal, return-type
+rebinding and restoration include useful paired sibling/Java controls. The portable
+source is `dev/semantic-fixture/probe/extensions/app/LocalUse.kt`; the report is
+`semantic-local-extension.json`. Both servers acknowledge shutdown and exit cleanly;
+source, harness and user-file guards match.
+
+The unchanged three-case corpus manifest issues six completion/definition requests.
+After indexing, the original release matches **2/6**, the fixed release **6/6** and
+IntelliJ LSP **6/6**, all on their first response. IDEA imports the same disposable
+Gradle project and uses JDK 17; its plugin is pinned to
+`9cfad18005470e4187090013e08f92ec9e437219`. Its separate shutdown wait expires after
+the six useful responses; that does not invalidate the observed semantic results.
+See `editor-{before,after}-ready/` and `editor-intellij/`.
+
+Gradle/KGP 8.10.2/1.9.23 and 9.6.1/2.4.0 agree on fourteen scope/overload controls.
+Additional actual compiler runs cover the portable fixture, six complete renamed
+variants, lambda receivers and nullable results: **53 expected outcomes** match,
+including deliberately invalid programs. `compiler-validation-summary.json` links
+their commands, source hashes and diagnostic output. Focused Rust verification passes
+**31 tests across eight suites**. References distinguish nested/sibling scopes and
+typed overloads; rename applies and compares all four complete buffers, then resolves
+the edited uses again. Workspace tests pass **1,248 / 0 failed / 4 ignored**;
+formatting and release build exit zero. See `rust-green-results.json`,
+`validation-results.json`, `source-guards.json` and `binary-receipt.json`.
+The wider `library` probe remains **13/13**; `features` remains **78/80** and Java
+**191/196**, retaining the same earlier missing-type/absence diagnostic gaps. These
+are unresolved analysis expectations, rather than failed source-availability gates.
+The Java client's separate forced termination is retained in the operational record.
+See `editor-regression-results.json` and `regression-{features,library,java}/`.
+
+Next replay the existing Gradle and Spring incomplete manifests on this release,
+then exercise a real Retrofit Java-to-Kotlin unsaved type change and applied rename.
+The Kotlin obsolete-binary diagnostic, compiler-transforming editing cases, wider
+constraint inference and matched six-project IDEA latency/memory measurements remain
+open. Experiment deadlines and cleanup remain separate from analysis acceptance.
 
 ### Current slice: requires-only compatibility artifacts
 

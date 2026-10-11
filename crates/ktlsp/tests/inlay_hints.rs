@@ -2,6 +2,33 @@ use ktlsp::hints::InlayHintKind;
 use ktlsp::workspace::Workspace;
 
 #[test]
+fn local_extension_inlay_hints_use_local_call_results_over_a_global_decoy() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Local.kt";
+    let src = "package app\nclass Versioned\nclass Payload\nfun Versioned.oldApi(): Versioned = this\nfun use(v: Versioned) {\n    fun Versioned.oldApi(): Payload = Payload()\n    val result = v.oldApi()\n    fun inferred() = v.oldApi()\n}\n";
+    ws.open(key, src.to_string());
+    let hints = ws.inlay_hints(key, 0, src.len());
+    for (marker, length) in [
+        ("val result", "val result".len()),
+        ("inferred()", "inferred()".len()),
+    ] {
+        let position = src.find(marker).unwrap() + length;
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.position_byte == position && hint.label == ": Payload"),
+            "{marker}: {hints:?}"
+        );
+        assert!(
+            !hints
+                .iter()
+                .any(|hint| hint.position_byte == position && hint.label == ": Versioned"),
+            "{hints:?}"
+        );
+    }
+}
+
+#[test]
 fn inlay_hints_include_local_types_and_expression_body_returns() {
     let mut ws = Workspace::new();
     let key = "mem:///Main.kt".to_string();
