@@ -3,7 +3,8 @@
 local directory = vim.fs.dirname(debug.getinfo(1, 'S').source:sub(2))
 local helper = dofile(directory .. '/nvim_lsp_probe.lua')
 local names = { 'nvim_lsp_probe.lua', 'nvim_corpus.lua', 'nvim_mixed.lua',
-  'nvim_completion_ui.lua', 'nvim_processor_reload.lua', 'nvim_gradle_reload.lua' }
+  'nvim_completion_ui.lua', 'nvim_processor_reload.lua', 'nvim_gradle_reload.lua',
+  'nvim_semantic_fixture.lua' }
 local function hashes()
   local result = {}
   for _, name in ipairs(names) do
@@ -115,5 +116,5 @@ if arg[1] then
   vim.fn.writefile({ vim.json.encode({ checks = results, before = before, after = after,
     syntax_checked = names, inputs_unchanged = true, real_server_processes = 0 }) }, arg[1])
 end
-print(('PASS %d lifecycle controls; six Lua files parse; no server/index/compiler'):format(#results))
+print(('PASS %d lifecycle controls; %d Lua files parse; no server/index/compiler'):format(#results, #names))
 vim.cmd('qa!')

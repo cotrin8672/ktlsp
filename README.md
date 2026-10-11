@@ -187,6 +187,8 @@ dev/ktlsp-harness.sh basic
 
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
 `library`, `java`, `mixed`, `corpus`, `semantic`, `gradle-live`, or `comprehensive`.
+The `semantic` scenario checks receiver/result chains and KMP navigation, then records
+the shutdown acknowledgement, exit notification and native server exit in `semantic-shutdown.json`.
 
 The mixed, corpus, completion UI and live Gradle probes require an acknowledged shutdown,
 one exit notification and actual server exit code/signal zero. Run

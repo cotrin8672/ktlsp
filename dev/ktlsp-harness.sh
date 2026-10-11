@@ -721,7 +721,7 @@ case "$scenario" in
     ;;
   semantic)
     project="${root_arg:-$repo/dev/semantic-fixture}"
-    run_and_capture semantic nvim -l "$repo/dev/nvim_semantic_fixture.lua" "$project" "$bin_arg" || run_status=$?
+    run_and_capture semantic nvim -l "$repo/dev/nvim_semantic_fixture.lua" "$project" "$bin_arg" "$artifacts" || run_status=$?
     ;;
   project)
     if [ -z "$root_arg" ] || [ -z "$file_arg" ]; then

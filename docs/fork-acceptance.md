@@ -1110,6 +1110,17 @@ implicit receivers, scope/result chains and KMP narrowing. Its existing
 0; clean shutdown is therefore unproved on this route. Both replays leave no
 owned processes. Evidence is
 `ktlsp-semantic-fourteenth-replay-20261011/semantic-final-receipt.json`.
+An additive finalizer-only control uses the same accepted fourteenth binary,
+unchanged semantic assertions and the existing shared lifecycle helper instead
+of `client:stop(true)`. It passes 19/19, including one null shutdown acknowledgement,
+one exit notification and native exit 0/signal 0 with no termination or timeout.
+All copied inputs remain unchanged. The helper's existing 14 mock lifecycle
+controls also pass, and seven Lua files parse. The harness now saves
+`semantic-shutdown.json`; the original forced-exit evidence above is retained.
+This control proves the finalizer, not fifteenth behavior or shutdown speed.
+Evidence is `ktlsp-semantic-shutdown-control-20261011/receipt.json` and
+`ktlsp-shutdown-stage-profile-20261011/lifecycle-selfcheck-after-semantic-finalizer.json`.
+
 The exclusive matched warm-cache ABBA comparison uses unchanged thirteenth-fixed-1
 (A) and fourteenth-fixed-1 (B), the same 933 cache files, 293 source archives,
 55,170,313-byte Gradle model and 307 product/harness inputs. No cold run, fresh
@@ -1139,6 +1150,21 @@ remain false. Evidence is
 `ktlsp-receiver-storage-pair-20261011/{final-receipt.json,ABBA-statistics.json}`.
 This storage change does not close the existing Gradle diagnostics, producer
 freshness, source-coverage or CEM `super.` completion gaps.
+
+An additional instrumented lifecycle sample links against the accepted fourteenth
+release libraries, preserving the benchmark's shutdown routine and deadline.
+It receives a null acknowledgement, sends exit and returns native 0 without
+termination in 6,359 ms. During that interval it consumes 6,296.875 ms of CPU
+(453.125 kernel and 5,843.75 user); private memory falls from 2,985,484,288 bytes
+to 204,394,496 bytes at the last live observation. Stderr stage markers place
+runtime destruction after transport return and measure it at only 1.9043 ms.
+This sample supports CPU work and substantial data release before transport
+returns, rather than an idle runtime waiting for stdin. It does not isolate a
+particular container's destructor or establish the cause of the earlier A2
+timeout. All captured compile/monitor input guards pass, all four owned processes
+exit, and all three retained monitor handles close. This is one diagnostic sample,
+not a replacement timing baseline or performance acceptance. Evidence is
+`ktlsp-shutdown-stage-profile-20261011/diagnostic-summary.json`.
 
 ### CEM blank-super oracle: inspect the accepted code
 

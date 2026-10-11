@@ -8,6 +8,8 @@
 -- - Constructor-property goto when the class header and `(` are split across lines
 -- - Alias-backed nested implicit receivers for definition, hover, and completion
 
+local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:sub(2))
+local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
 local root = arg[1]
 assert(root and root ~= "", "usage: nvim -l dev/nvim_semantic_fixture.lua <project-dir> [ktlsp-bin]")
 
@@ -38,12 +40,14 @@ local function check(name, ok, detail)
 end
 
 local id
+local config = { name = "ktlsp", cmd = { bin }, root_dir = root }
+local shutdown_state = probe.observe_shutdown(config)
 
 local function open_file(path)
   vim.cmd("edit " .. vim.fn.fnameescape(path))
   local bufnr = vim.api.nvim_get_current_buf()
   vim.bo[bufnr].filetype = "kotlin"
-  id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = root })
+  id = vim.lsp.start(config)
   return bufnr
 end
 
@@ -250,9 +254,14 @@ do
 end
 
 if client then
-  pcall(function() client:stop(true) end)
+  local stopped = probe.shutdown(client, shutdown_state, 15000)
+  check("client shuts down gracefully", stopped.clean, vim.inspect(stopped))
 end
-vim.wait(300)
+if arg[3] then
+  local path = arg[3] .. "/semantic-shutdown.json"
+  assert(vim.fn.filereadable(path) == 0, "fresh shutdown artifact required")
+  vim.fn.writefile({ vim.json.encode(shutdown_state) }, path)
+end
 
 if #failures == 0 then
   print("\nALL PASS")
