@@ -92,6 +92,11 @@ pub struct Workspace {
     analysis_extensions: crate::analysis_extensions::AnalysisExtensions,
     annotated_type_owners: HashMap<String, BTreeSet<Def>>,
     observed_compile: Option<ObservedCompileTicket>,
+    kotlin_diagnostic_tickets: BTreeMap<ProjectScope, KotlinDiagnosticTicket>,
+    kotlin_diagnostic_reports: HashMap<String, KotlinFileDiagnostics>,
+    kotlin_source_generations: BTreeMap<ProjectScope, u64>,
+    kotlin_diagnostic_store_epoch: u64,
+    kotlin_diagnostic_changes: BTreeSet<String>,
     class_inventory: RefCell<crate::binary_diagnostics::ClassInventoryCache>,
 }
 
@@ -128,6 +133,11 @@ impl Workspace {
             analysis_extensions: crate::analysis_extensions::AnalysisExtensions::new(providers),
             annotated_type_owners: HashMap::new(),
             observed_compile: None,
+            kotlin_diagnostic_tickets: BTreeMap::new(),
+            kotlin_diagnostic_reports: HashMap::new(),
+            kotlin_source_generations: BTreeMap::new(),
+            kotlin_diagnostic_store_epoch: 0,
+            kotlin_diagnostic_changes: BTreeSet::new(),
             class_inventory: RefCell::default(),
         }
     }
@@ -169,6 +179,7 @@ impl Workspace {
     }
 
     pub fn begin_analysis_generation(&mut self) -> u64 {
+        self.invalidate_kotlin_diagnostics();
         self.class_inventory.get_mut().clear();
         self.invalidate_observed_compile();
         self.analysis_generation = self.analysis_generation.wrapping_add(1);
@@ -215,6 +226,7 @@ impl Workspace {
     }
 
     pub fn set_project_model(&mut self, model: Arc<crate::classpath::ProjectSnapshot>) {
+        self.invalidate_kotlin_diagnostics();
         self.class_inventory.get_mut().clear();
         self.invalidate_observed_compile();
         self.index.replace_scope_visibilities(
@@ -534,7 +546,11 @@ impl Workspace {
     }
 
     pub fn take_extension_diagnostic_changes(&mut self) -> Vec<String> {
-        self.analysis_extensions.take_changed()
+        let mut keys = self.analysis_extensions.take_changed();
+        keys.extend(std::mem::take(&mut self.kotlin_diagnostic_changes));
+        keys.sort();
+        keys.dedup();
+        keys
     }
 
     fn replace_extension_source(&mut self, key: &str, text: &str, tree: &Tree) {
@@ -608,6 +624,7 @@ impl Workspace {
     /// `textDocument/didOpen`.
     pub fn open(&mut self, key: impl Into<String>, text: String) {
         let key = key.into();
+        self.invalidate_kotlin_source(&key);
         self.observe_compiled_source(&key, Some(&text), false);
         let tree = self.salsa.parsed_tree(&key, &text, Durability::LOW);
         let facts = self.salsa.file_facts(&key, &text, Durability::LOW);
@@ -619,6 +636,7 @@ impl Workspace {
     /// `textDocument/didChange` (FULL sync: `text` is the whole new document). Reparses
     /// incrementally by diffing against the cached buffer, then re-indexes from the new tree.
     pub fn change(&mut self, key: &str, text: String) {
+        self.invalidate_kotlin_source(key);
         self.observe_compiled_source(key, Some(&text), true);
         let tree = match self.open_docs.remove(key) {
             Some(mut old) => {
@@ -636,6 +654,8 @@ impl Workspace {
 
     /// `textDocument/didClose`: drop the dirty buffer; re-sync the index from disk (or drop it).
     pub fn close(&mut self, key: &str) {
+        self.invalidate_kotlin_source(key);
+        self.kotlin_diagnostic_reports.remove(key);
         let disk = std::fs::read_to_string(key).ok();
         self.observe_compiled_source(key, disk.as_deref(), false);
         self.open_docs.remove(key);
@@ -2270,6 +2290,7 @@ impl Workspace {
             .filter(|(owner, _)| *owner == key)
             .flat_map(|(_, set)| set.diagnostics().iter().cloned())
             .collect::<Vec<_>>();
+        extra.extend(self.current_kotlin_diagnostics(key));
         if let Some(doc) = self.open_docs.get(key) {
             extra.extend(self.diagnostics_for_tree(key, &doc.text, &doc.tree));
             return extra;
@@ -4750,6 +4771,7 @@ impl Workspace {
     /// `true` only defers a known output event inside this exact active compile. Inputs,
     /// configuration, AP/ancestor/dependency files invalidate before any source-retention filter.
     pub(crate) fn observe_compiled_resource(&mut self, key: &str) -> bool {
+        self.invalidate_kotlin_source(key);
         let module_source = self
             .observed_compile
             .as_ref()
@@ -5664,5 +5686,769 @@ mod observed_compile_lifecycle_tests {
         // Same pre-feature check used by ordinary completion/hover/diagnostics, no per-key rehash.
         ws.refresh_compiled_freshness();
         assert!(ws.analysis_extensions.compiled_receipt().is_none());
+    }
+}
+
+struct KotlinDiagnosticTicket {
+    request: Arc<crate::compile::KotlinDiagnosticRequest>,
+    model: Arc<crate::classpath::ProjectSnapshot>,
+    analysis_generation: u64,
+}
+
+struct KotlinFileDiagnostics {
+    request: Arc<crate::compile::KotlinDiagnosticRequest>,
+    model: Arc<crate::classpath::ProjectSnapshot>,
+    environment_invalid: Arc<std::sync::atomic::AtomicBool>,
+    diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    store_epoch: u64,
+    clean: bool,
+}
+
+impl Workspace {
+    pub(crate) fn kotlin_diagnostic_targets(&self) -> Vec<(ProjectScope, String)> {
+        let mut scopes = BTreeMap::new();
+        let keys: BTreeSet<_> = self
+            .open_docs
+            .keys()
+            .filter(|key| key.ends_with(".kt"))
+            .collect();
+        for key in keys {
+            if let Some(scope) = self.project_scope_for_file(key) {
+                scopes.entry(scope).or_insert_with(|| key.clone());
+            }
+        }
+        scopes.into_iter().collect()
+    }
+
+    fn kotlin_source_affects(
+        &self,
+        request: &crate::compile::KotlinDiagnosticRequest,
+        key: &str,
+    ) -> bool {
+        if self
+            .project_model
+            .as_ref()
+            .and_then(|model| model.file_origin(Path::new(key)))
+            .is_some_and(|origin| {
+                origin.project_scope.as_ref() == Some(&request.scope)
+                    || request.visible_origins.contains(&origin.origin_id)
+            })
+        {
+            return true;
+        }
+        // Keep selected external sources and files without a current model origin protected.
+        request
+            .sources
+            .iter()
+            .any(|path| crate::paths::file_key(path) == key)
+    }
+
+    fn invalidate_kotlin_source(&mut self, key: &str) {
+        let mut affected = BTreeSet::new();
+        if key.ends_with(".kt") || key.ends_with(".java") {
+            if let Some(scope) = self.project_scope_for_file(key) {
+                affected.insert(scope);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for request in self
+            .kotlin_diagnostic_tickets
+            .values()
+            .map(|ticket| &ticket.request)
+            .chain(
+                self.kotlin_diagnostic_reports
+                    .values()
+                    .map(|report| &report.request),
+            )
+        {
+            // Many file reports share one request. Distinct old/current requests must still
+            // check their selected-source fallback until their scope is known affected.
+            if affected.contains(&request.scope) || !seen.insert(Arc::as_ptr(request)) {
+                continue;
+            }
+            if self.kotlin_source_affects(request, key) {
+                affected.insert(request.scope.clone());
+            }
+        }
+        for scope in affected {
+            self.invalidate_kotlin_scope(&scope);
+        }
+    }
+
+    pub(crate) fn invalidate_kotlin_scope(&mut self, scope: &ProjectScope) {
+        for request in self
+            .kotlin_diagnostic_tickets
+            .values()
+            .map(|ticket| &ticket.request)
+            .chain(
+                self.kotlin_diagnostic_reports
+                    .values()
+                    .map(|report| &report.request),
+            )
+        {
+            if &request.scope == scope {
+                request
+                    .invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let changes = &mut self.kotlin_diagnostic_changes;
+        self.kotlin_diagnostic_reports.retain(|key, report| {
+            if &report.request.scope == scope {
+                changes.insert(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.kotlin_diagnostic_tickets.remove(scope);
+        let generation = self
+            .kotlin_source_generations
+            .entry(scope.clone())
+            .or_default();
+        *generation = generation.saturating_add(1);
+    }
+
+    pub(crate) fn invalidate_kotlin_diagnostics(&mut self) {
+        let scopes: BTreeSet<_> = self
+            .kotlin_diagnostic_tickets
+            .keys()
+            .cloned()
+            .chain(
+                self.kotlin_diagnostic_reports
+                    .values()
+                    .map(|report| report.request.scope.clone()),
+            )
+            .collect();
+        for scope in scopes {
+            self.invalidate_kotlin_scope(&scope);
+        }
+    }
+
+    pub(crate) fn begin_kotlin_diagnostics(
+        &mut self,
+        key: &str,
+    ) -> Result<Arc<crate::compile::KotlinDiagnosticRequest>, &'static str> {
+        use crate::classpath::CompilerLanguage;
+        if self.project_refresh_pending {
+            return Err("kotlin-project-model-pending");
+        }
+        let model = self
+            .project_model
+            .clone()
+            .ok_or("kotlin-project-model-unknown")?;
+        let (module, source) = model
+            .owner_for_key(key)
+            .ok_or("kotlin-source-owner-unknown")?;
+        let source = source.ok_or("kotlin-source-set-unknown")?;
+        if source.compiler_metadata_incomplete
+            || source.classpath_incomplete
+            || !source.unresolved.is_empty()
+        {
+            return Err("kotlin-compiler-model-incomplete");
+        }
+        let mut tasks = source
+            .compiler_tasks
+            .iter()
+            .filter(|task| task.language == CompilerLanguage::Kotlin);
+        let task = tasks.next().ok_or("selected-kotlin-task-unknown")?;
+        if tasks.next().is_some()
+            || !task.complete
+            || task.problem.is_some()
+            || task.kotlin_compiler.is_none()
+        {
+            return Err("selected-kotlin-task-incomplete");
+        }
+        let scope = model
+            .file_origin(Path::new(key))
+            .and_then(|origin| origin.project_scope)
+            .ok_or("kotlin-source-scope-unknown")?;
+        let visible_origins: BTreeSet<_> = model
+            .scope_visibilities(&[])
+            .into_iter()
+            .find(|visibility| visibility.scope == scope)
+            .map(|visibility| visibility.ordered_origins.into_iter().collect())
+            .unwrap_or_default();
+        let mut sources: BTreeMap<_, _> = task
+            .source_files
+            .iter()
+            .map(|path| (crate::paths::file_key(path), path.clone()))
+            .collect();
+        let mut overlays = Vec::new();
+        let mut dependency_overlays = Vec::new();
+        for (open_key, doc) in &self.open_docs {
+            let Some(origin) = model.file_origin(Path::new(open_key)) else {
+                continue;
+            };
+            let revision = self
+                .index
+                .jvm_source_for_file(open_key)
+                .map_or(self.index_revision, |source| source.revision);
+            if origin.project_scope.as_ref() == Some(&scope) {
+                if open_key.ends_with(".kt") || open_key.ends_with(".java") {
+                    // Explicit editing policy: owned new buffers join the selected task overlay.
+                    // This is not proof that custom Gradle Spec/Closure filters would include them.
+                    sources.insert(open_key.clone(), std::path::PathBuf::from(open_key));
+                    overlays.push(crate::compile::KotlinSourceOverlay::new(
+                        open_key.clone(),
+                        doc.text.clone(),
+                        revision,
+                    ));
+                }
+            } else if visible_origins.contains(&origin.origin_id) {
+                dependency_overlays.push(crate::compile::KotlinSourceOverlay::new(
+                    open_key.clone(),
+                    doc.text.clone(),
+                    revision,
+                ));
+            }
+        }
+        if !overlays.iter().any(|source| source.key.ends_with(".kt")) {
+            return Err("no-open-owned-kotlin-source");
+        }
+        overlays.sort_by(|a, b| a.key.cmp(&b.key));
+        dependency_overlays.sort_by(|a, b| a.key.cmp(&b.key));
+        let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
+        if self
+            .kotlin_diagnostic_reports
+            .get(key)
+            .is_some_and(|report| {
+                !report
+                    .environment_invalid
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && report.request.check_live().is_ok()
+                    && Arc::ptr_eq(&report.model, &model)
+                    && report.request.generation == generation
+            })
+        {
+            return Err("kotlin-diagnostics-current");
+        }
+        if let Some(previous) = self.kotlin_diagnostic_tickets.remove(&scope) {
+            previous
+                .request
+                .invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let request = Arc::new(crate::compile::KotlinDiagnosticRequest {
+            project_dir: module.project_dir.clone(),
+            scope: scope.clone(),
+            task: task.clone(),
+            source_roots: source.source_roots.clone(),
+            sources: sources.into_values().collect(),
+            overlays,
+            dependency_overlays,
+            visible_origins,
+            generation,
+            invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        self.kotlin_diagnostic_tickets.insert(
+            scope,
+            KotlinDiagnosticTicket {
+                request: request.clone(),
+                model,
+                analysis_generation: self.analysis_generation,
+            },
+        );
+        Ok(request)
+    }
+
+    fn kotlin_overlay_matches(&self, request: &crate::compile::KotlinDiagnosticRequest) -> bool {
+        let Some(model) = &self.project_model else {
+            return false;
+        };
+        let mut actual = BTreeSet::new();
+        for (key, doc) in &self.open_docs {
+            let Some(origin) = model.file_origin(Path::new(key)) else {
+                continue;
+            };
+            let own = origin.project_scope.as_ref() == Some(&request.scope)
+                && (key.ends_with(".kt") || key.ends_with(".java"));
+            if !own && !request.visible_origins.contains(&origin.origin_id) {
+                continue;
+            }
+            let captured = if own {
+                &request.overlays
+            } else {
+                &request.dependency_overlays
+            };
+            let Some(source) = captured.iter().find(|source| &source.key == key) else {
+                return false;
+            };
+            // JVM declaration revisions can remain equal after a body-only edit; exact text matters.
+            let same_identity = match &source.identity {
+                ktcore::jvm::InputIdentity::Source { file, revision } => {
+                    file == key
+                        && self
+                            .index
+                            .jvm_source_for_file(key)
+                            .is_none_or(|current| current.revision == *revision)
+                }
+                _ => false,
+            };
+            if !same_identity || doc.text != source.text {
+                return false;
+            }
+            actual.insert(key.clone());
+        }
+        actual.len() == request.overlays.len() + request.dependency_overlays.len()
+    }
+
+    pub(crate) fn finish_kotlin_diagnostics(
+        &mut self,
+        request: &Arc<crate::compile::KotlinDiagnosticRequest>,
+        outcome: crate::compile::KotlinDiagnosticOutcome,
+        environment_invalid: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Vec<String> {
+        let current = self
+            .kotlin_diagnostic_tickets
+            .get(&request.scope)
+            .is_some_and(|ticket| {
+                Arc::ptr_eq(&ticket.request, request)
+                    && self.analysis_generation == ticket.analysis_generation
+                    && self
+                        .project_model
+                        .as_ref()
+                        .is_some_and(|model| Arc::ptr_eq(model, &ticket.model))
+                    && !self.project_refresh_pending
+                    && request.generation
+                        == *self
+                            .kotlin_source_generations
+                            .get(&request.scope)
+                            .unwrap_or(&0)
+            });
+        if !current
+            || request.check_live().is_err()
+            || environment_invalid.load(std::sync::atomic::Ordering::Acquire)
+            || !self.kotlin_overlay_matches(request)
+        {
+            return Vec::new();
+        }
+        let ticket = self
+            .kotlin_diagnostic_tickets
+            .remove(&request.scope)
+            .unwrap();
+        let crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean } = outcome
+        else {
+            // A failure is not an empty successful compilation and cannot replace accepted reports.
+            return Vec::new();
+        };
+        let mut by_file: BTreeMap<String, Vec<crate::diagnostics::Diagnostic>> = BTreeMap::new();
+        for diagnostic in diagnostics {
+            let Some(source) = request
+                .overlays
+                .iter()
+                .find(|source| source.key == diagnostic.path && source.key.ends_with(".kt"))
+            else {
+                continue;
+            };
+            let index = crate::text::LineIndex::new(&source.text);
+            let Some(line) = diagnostic.line.checked_sub(1) else {
+                return Vec::new();
+            };
+            let Some(column) = diagnostic.col.checked_sub(1) else {
+                return Vec::new();
+            };
+            let start = index.offset(&source.text, line, column);
+            if index.position(&source.text, start) != (line, column) {
+                return Vec::new();
+            }
+            let tail = &source.text[start..];
+            let mut length = 0;
+            for ch in tail
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
+            {
+                length += ch.len_utf8();
+            }
+            if length == 0 {
+                length = tail.chars().next().map_or(0, char::len_utf8);
+            }
+            by_file
+                .entry(source.key.clone())
+                .or_default()
+                .push(crate::diagnostics::Diagnostic {
+                    start_byte: start,
+                    end_byte: start + length,
+                    severity: diagnostic.severity,
+                    code: None,
+                    message: diagnostic.message,
+                });
+        }
+        let keys: Vec<_> = request
+            .overlays
+            .iter()
+            .filter(|source| {
+                source.key.ends_with(".kt") && (clean || by_file.contains_key(&source.key))
+            })
+            .map(|source| source.key.clone())
+            .collect();
+        self.kotlin_diagnostic_store_epoch = self.kotlin_diagnostic_store_epoch.saturating_add(1);
+        for key in &keys {
+            self.kotlin_diagnostic_reports.insert(
+                key.clone(),
+                KotlinFileDiagnostics {
+                    request: request.clone(),
+                    model: ticket.model.clone(),
+                    environment_invalid: environment_invalid.clone(),
+                    diagnostics: by_file.remove(key).unwrap_or_default(),
+                    store_epoch: self.kotlin_diagnostic_store_epoch,
+                    clean,
+                },
+            );
+        }
+        keys
+    }
+
+    fn current_kotlin_report(&self, key: &str) -> Option<&KotlinFileDiagnostics> {
+        let report = self.kotlin_diagnostic_reports.get(key)?;
+        if self.project_refresh_pending
+            || report.request.check_live().is_err()
+            || report
+                .environment_invalid
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .project_model
+                .as_ref()
+                .is_some_and(|model| Arc::ptr_eq(model, &report.model))
+            || !self.open_docs.get(key).is_some_and(|doc| {
+                report
+                    .request
+                    .overlays
+                    .iter()
+                    .any(|source| source.key == key && doc.text == source.text)
+            })
+        {
+            return None;
+        }
+        Some(report)
+    }
+
+    fn current_kotlin_diagnostics(&self, key: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        self.current_kotlin_report(key)
+            .map_or_else(Vec::new, |report| report.diagnostics.clone())
+    }
+
+    pub(crate) fn kotlin_diagnostic_result_id(&self, key: &str) -> Option<String> {
+        let report = self.current_kotlin_report(key)?;
+        Some(format!(
+            "kotlin:{}:{}:{}:{}",
+            self.analysis_generation,
+            report.request.generation,
+            report.store_epoch,
+            self.index_revision
+        ))
+    }
+
+    pub(crate) fn kotlin_diagnostic_trace(&self, key: &str) -> Option<serde_json::Value> {
+        let report = self.current_kotlin_report(key)?;
+        let source = report
+            .request
+            .overlays
+            .iter()
+            .find(|source| source.key == key)?;
+        let source_hash: String = source
+            .text_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Some(serde_json::json!({
+            "path": key, "result_id": self.kotlin_diagnostic_result_id(key),
+            "store_epoch": report.store_epoch, "source_generation": report.request.generation,
+            "source_sha256": source_hash, "count": report.diagnostics.len(), "clean": report.clean,
+            "compiler_version": report.request.task.kotlin_compiler.as_ref().map(|recipe| &recipe.compiler_version),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod kotlin_diagnostic_lifecycle_tests {
+    use super::*;
+    use crate::compile::{CompileDiagnostic, KotlinDiagnosticOutcome};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn fixture() -> (Workspace, String, String, String) {
+        use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+        let root = std::env::temp_dir().join("ktlsp-kotlin-diagnostic-host-only");
+        let task = crate::compile::kotlin_test_request(&root).task;
+        let source = SourceSetClasspath {
+            name: "main".into(),
+            source_roots: vec![root.join("src")],
+            compiler_tasks: vec![task],
+            ..Default::default()
+        };
+        let model = Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+            module: ":".into(),
+            project_dir: root.clone(),
+            build: ":".into(),
+            source_sets: vec![
+                source,
+                SourceSetClasspath {
+                    name: "test".into(),
+                    source_roots: vec![root.join("test")],
+                    ..Default::default()
+                },
+            ],
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+        }]));
+        let mut ws = Workspace::new();
+        ws.set_project_model(model);
+        let helper = crate::paths::file_key(&root.join("src/Helper.kt"));
+        let java = crate::paths::file_key(&root.join("src/Main.java"));
+        let editor = crate::paths::file_key(&root.join("src/Editor.kt"));
+        ws.open(
+            helper.clone(),
+            "class Helper { fun value(): Int = 1 }".into(),
+        );
+        ws.open(java.clone(), "class Main { String unsaved; }".into());
+        ws.open(
+            editor.clone(),
+            "val emoji = \"😀\"; fun use() = Versioned.oldApi()".into(),
+        );
+        (ws, editor, helper, java)
+    }
+
+    fn reported(
+        request: &Arc<crate::compile::KotlinDiagnosticRequest>,
+        key: &str,
+        token: &str,
+    ) -> KotlinDiagnosticOutcome {
+        let source = request
+            .overlays
+            .iter()
+            .find(|source| source.key == key)
+            .unwrap();
+        let (line, column) = crate::text::LineIndex::new(&source.text)
+            .position(&source.text, source.text.find(token).unwrap());
+        KotlinDiagnosticOutcome::Verified {
+            clean: false,
+            diagnostics: vec![CompileDiagnostic {
+                path: key.into(),
+                line: line + 1,
+                col: column + 1,
+                severity: crate::diagnostics::Severity::Error,
+                message: format!("Unresolved reference '{token}'."),
+            }],
+        }
+    }
+
+    #[test]
+    fn new_owned_buffer_and_unsaved_java_kotlin_peers_share_one_selected_request() {
+        let (mut ws, editor, helper, java) = fixture();
+        let test = editor.replace("/src/Editor.kt", "/test/Excluded.kt");
+        ws.open(test.clone(), "class Excluded".into());
+        let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        assert!(!request
+            .task
+            .source_files
+            .iter()
+            .any(|path| crate::paths::file_key(path) == editor));
+        assert!(
+            request
+                .sources
+                .iter()
+                .any(|path| crate::paths::file_key(path) == editor),
+            "owned new buffer policy"
+        );
+        assert_eq!(
+            request
+                .overlays
+                .iter()
+                .map(|source| source.key.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([editor.clone(), helper, java])
+        );
+        assert!(!request
+            .sources
+            .iter()
+            .any(|path| crate::paths::file_key(path) == test));
+        let outcome = reported(&request, &editor, "oldApi");
+        assert_eq!(
+            ws.finish_kotlin_diagnostics(&request, outcome, Arc::new(AtomicBool::new(false))),
+            vec![editor.clone()]
+        );
+        let diagnostic = ws.current_kotlin_diagnostics(&editor).pop().unwrap();
+        let source = request
+            .overlays
+            .iter()
+            .find(|source| source.key == editor)
+            .unwrap();
+        assert_eq!(
+            &source.text[diagnostic.start_byte..diagnostic.end_byte],
+            "oldApi"
+        );
+        assert!(ws
+            .diagnostics(&editor)
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("oldApi")));
+        assert!(ws.kotlin_diagnostic_result_id(&editor).is_some());
+        let proof = ws.kotlin_diagnostic_trace(&editor).unwrap();
+        assert_eq!(proof["source_generation"], request.generation);
+        assert_eq!(proof["source_sha256"].as_str().unwrap().len(), 64);
+        assert!(proof.get("message").is_none() && proof.get("text").is_none());
+    }
+
+    #[test]
+    fn source_aba_model_environment_and_membership_changes_reject_late_publication() {
+        for mutation in [
+            "body",
+            "source-aba",
+            "disk-event-aba",
+            "environment",
+            "model",
+            "new-buffer",
+            "close",
+            "analysis",
+        ] {
+            let (mut ws, editor, helper, _) = fixture();
+            let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+            let invalid = Arc::new(AtomicBool::new(false));
+            let outcome = reported(&request, &editor, "oldApi");
+            match mutation {
+                // Deliberately bypass change hooks/index revisions to exercise exact-text CAS itself.
+                "body" => ws
+                    .open_docs
+                    .get_mut(&helper)
+                    .unwrap()
+                    .text
+                    .push_str(" // body-only"),
+                "source-aba" => {
+                    let original = ws.doc_text(&helper).unwrap();
+                    ws.change(&helper, format!("{original} // B"));
+                    ws.change(&helper, original);
+                    assert!(request.invalid.load(Ordering::Acquire));
+                    assert!(
+                        *ws.kotlin_source_generations.get(&request.scope).unwrap()
+                            > request.generation
+                    );
+                }
+                "disk-event-aba" => {
+                    ws.observe_compiled_resource(&helper);
+                    ws.observe_compiled_resource(&helper);
+                }
+                "environment" => invalid.store(true, Ordering::Release),
+                "model" => ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(
+                    request_model(&ws),
+                ))),
+                "new-buffer" => ws.open(
+                    editor.replace("Editor.kt", "Later.kt"),
+                    "class Later".into(),
+                ),
+                "close" => ws.close(&helper),
+                "analysis" => {
+                    ws.begin_analysis_generation();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                ws.finish_kotlin_diagnostics(&request, outcome, invalid)
+                    .is_empty(),
+                "{mutation}"
+            );
+            assert!(
+                ws.current_kotlin_diagnostics(&editor).is_empty(),
+                "{mutation}"
+            );
+            assert!(
+                ws.kotlin_diagnostic_result_id(&editor).is_none(),
+                "{mutation}"
+            );
+        }
+    }
+
+    fn request_model(ws: &Workspace) -> Vec<crate::classpath::ModuleClasspath> {
+        ws.project_model.as_ref().unwrap().modules.clone()
+    }
+
+    #[test]
+    fn external_selected_source_invalidates_distinct_old_reports_and_current_ticket_once() {
+        let (mut ws, editor, helper, _) = fixture();
+        let current = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        let external = crate::paths::file_key(&current.project_dir.join("external/Selected.kt"));
+        assert!(ws
+            .project_model
+            .as_ref()
+            .unwrap()
+            .file_origin(Path::new(&external))
+            .is_none());
+        let mut older = crate::compile::kotlin_test_request(&current.project_dir);
+        older.scope = current.scope.clone();
+        older.sources = current.sources.clone();
+        older.sources.push(std::path::PathBuf::from(&external));
+        older.overlays = current.overlays.clone();
+        older.generation = current.generation;
+        let older = Arc::new(older);
+        let model = ws.project_model.clone().unwrap();
+        // Several accepted file reports can share an older request with a different source list.
+        for key in [editor, helper] {
+            ws.kotlin_diagnostic_reports.insert(
+                key,
+                KotlinFileDiagnostics {
+                    request: older.clone(),
+                    model: model.clone(),
+                    environment_invalid: Arc::new(AtomicBool::new(false)),
+                    diagnostics: Vec::new(),
+                    store_epoch: 1,
+                    clean: true,
+                },
+            );
+        }
+        ws.invalidate_kotlin_source(&external);
+        assert!(
+            older.invalid.load(Ordering::Acquire),
+            "fallback protects externally selected old sources"
+        );
+        assert!(
+            current.invalid.load(Ordering::Acquire),
+            "all request generations in the affected scope retire"
+        );
+        assert!(ws.kotlin_diagnostic_reports.is_empty());
+        assert!(!ws.kotlin_diagnostic_tickets.contains_key(&current.scope));
+        assert_eq!(
+            *ws.kotlin_source_generations.get(&current.scope).unwrap(),
+            current.generation + 1
+        );
+    }
+
+    #[test]
+    fn failure_and_partial_error_result_cannot_clear_an_accepted_same_epoch_error() {
+        let (mut ws, editor, helper, java) = fixture();
+        let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        let outcome = reported(&request, &editor, "oldApi");
+        ws.finish_kotlin_diagnostics(&request, outcome, Arc::new(AtomicBool::new(false)));
+        let accepted = ws.kotlin_diagnostic_result_id(&editor).unwrap();
+        let retry = ws.begin_kotlin_diagnostics(&helper).unwrap();
+        assert!(ws
+            .finish_kotlin_diagnostics(
+                &retry,
+                KotlinDiagnosticOutcome::Unverified("internal failure".into()),
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_empty());
+        assert_eq!(ws.kotlin_diagnostic_result_id(&editor).unwrap(), accepted);
+        assert_eq!(ws.current_kotlin_diagnostics(&editor).len(), 1);
+        let partial = ws.begin_kotlin_diagnostics(&helper).unwrap();
+        let outcome = reported(&partial, &helper, "value");
+        ws.finish_kotlin_diagnostics(&partial, outcome, Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            ws.kotlin_diagnostic_result_id(&editor).unwrap(),
+            accepted,
+            "exit 1 only replaces files actually reported"
+        );
+        let clean = ws.begin_kotlin_diagnostics(&java).unwrap();
+        ws.finish_kotlin_diagnostics(
+            &clean,
+            KotlinDiagnosticOutcome::Verified {
+                diagnostics: Vec::new(),
+                clean: true,
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(ws.current_kotlin_diagnostics(&editor).is_empty());
+        assert_ne!(
+            ws.kotlin_diagnostic_result_id(&editor).unwrap(),
+            accepted,
+            "exit 0 advances the canonical accepted store"
+        );
     }
 }

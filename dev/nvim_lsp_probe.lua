@@ -83,16 +83,26 @@ function M.request_outcome(response, err, accepts, attempted)
   return accepts(response.result) and 'matched' or 'mismatch'
 end
 
+-- Match Neovim 0.12's LSP full-text encoding: fileformat separators and the eol option.
+-- See runtime/lua/vim/lsp.lua:_buf_get_full_text; didOpen and FULL didChange both use it.
+local line_endings = { unix = '\n', dos = '\r\n', mac = '\r' }
+function M.buffer_full_text(buffer)
+  local ending = line_endings[vim.bo[buffer].fileformat] or '\n'
+  local text = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, true), ending)
+  return vim.bo[buffer].eol and text .. ending or text
+end
+
+function M.buffer_sha256(buffer)
+  return vim.fn.sha256(M.buffer_full_text(buffer))
+end
+
 -- Arm before one edit; callers flush didChange before awaiting its first target notification.
 function M.observe_diagnostics(client, buffer)
   local uri, tick = vim.uri_from_bufnr(buffer), vim.api.nvim_buf_get_changedtick(buffer)
   local key = M.path_key(vim.api.nvim_buf_get_name(buffer))
   local row = { method = 'textDocument/publishDiagnostics', uri = uri, buffer = buffer,
     before_changedtick = tick, attempted = false, outbound = {}, notifications = {} }
-  local function source_hash()
-    return vim.fn.sha256(table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), '\n')
-      .. (vim.bo[buffer].eol and '\n' or ''))
-  end
+  local function source_hash() return M.buffer_sha256(buffer) end
   local function is_target(value)
     if type(value) ~= 'string' then return false end
     local ok, path = pcall(vim.uri_to_fname, value)
@@ -107,11 +117,20 @@ function M.observe_diagnostics(client, buffer)
       local document = params.textDocument
       local item = { sent = not not sent, version = document.version,
         buffer_version = vim.lsp.util.buf_versions[buffer], changedtick = vim.api.nvim_buf_get_changedtick(buffer),
-        source_sha256 = source_hash(), sent_ns = vim.uv.hrtime() }
+        source_sha256 = source_hash(), sent_ns = vim.uv.hrtime(),
+        fileformat = vim.bo[buffer].fileformat, eol = vim.bo[buffer].eol }
+      local changes = params.contentChanges
+      local change = type(changes) == 'table' and #changes == 1 and changes[1] or nil
+      if type(change) == 'table' and change.range == nil and type(change.text) == 'string' then
+        item.wire_source_sha256 = vim.fn.sha256(change.text)
+        item.wire_matches_snapshot = item.wire_source_sha256 == item.source_sha256
+        if not item.wire_matches_snapshot then row.wire_error = 'outbound-full-text-mismatch' end
+      end
       row.outbound[#row.outbound + 1] = item
       if sent and item.changedtick > tick and item.version == item.buffer_version then
         row.attempted, row.expected_version, row.source_sha256 = true, item.version, item.source_sha256
         row.sent_ns, row.changedtick = item.sent_ns, item.changedtick
+        row.wire_source_sha256, row.wire_matches_snapshot = item.wire_source_sha256, item.wire_matches_snapshot
       end
     end
     return sent
@@ -122,7 +141,7 @@ function M.observe_diagnostics(client, buffer)
         received_ns = vim.uv.hrtime(), version_present = result.version ~= nil and result.version ~= vim.NIL }
       row.notifications[#row.notifications + 1] = item
       if not row.attempted then item.rejected = 'before-edited-source-outbound'
-      elseif #row.outbound ~= 1 or source_hash() ~= row.source_sha256
+      elseif row.wire_error or #row.outbound ~= 1 or source_hash() ~= row.source_sha256
           or vim.api.nvim_buf_get_changedtick(buffer) ~= row.changedtick
           or vim.lsp.util.buf_versions[buffer] ~= row.expected_version then
         item.rejected = 'source-changed-after-outbound'
@@ -147,10 +166,11 @@ function M.observe_diagnostics(client, buffer)
     if row.attempted then
       vim.wait(timeout, function() return row.response ~= nil end, 20)
     end
-    if #row.outbound ~= 1 or source_hash() ~= row.source_sha256
+    if row.wire_error or #row.outbound ~= 1 or source_hash() ~= row.source_sha256
         or vim.api.nvim_buf_get_changedtick(buffer) ~= row.changedtick
         or vim.lsp.util.buf_versions[buffer] ~= row.expected_version then
-      row.response, row.error = nil, row.attempted and 'source-correlation-unavailable' or 'didChange-not-observed'
+      row.response, row.error = nil, row.wire_error
+        or (row.attempted and 'source-correlation-unavailable' or 'didChange-not-observed')
     elseif row.response == nil then row.error = 'timeout' end
     active = false
     if client.rpc.notify == on_notify then client.rpc.notify = notify end
@@ -159,6 +179,151 @@ function M.observe_diagnostics(client, buffer)
     end
     return row.error == nil and row.response and row.response.result or nil, row
   end
+end
+
+
+-- Arm before opts.mutate, then observe compiler acceptance rather than desired diagnostic content.
+-- The push probe records editor delivery; semantic items come from one standard diagnostic pull.
+function M.canonical_kotlin_diagnostics(client, buffer, opts)
+  local timeout = assert(opts.observation_timeout_ms, 'missing canonical observation bound')
+  local request_timeout = assert(opts.request_timeout_ms, 'missing diagnostic RPC bound')
+  local uri, key = vim.uri_from_bufnr(buffer), M.path_key(vim.api.nvim_buf_get_name(buffer))
+  local function source_hash() return M.buffer_sha256(buffer) end
+  local path, offset, pending, skip_partial = opts.trace_path or vim.env.KTLSP_TRACE, 0, '', false
+  local initial, baseline_error = path and vim.uv.fs_stat(path), nil
+  if initial then
+    local file = io.open(path, 'rb')
+    if file then
+      local size = file:seek('end')
+      if not size then baseline_error = 'trace-baseline-unavailable'
+      else
+        offset = size
+        if offset > 0 then file:seek('set', offset - 1); skip_partial = file:read(1) ~= '\n' end
+      end
+      file:close()
+    else baseline_error = 'trace-baseline-unavailable' end
+  end
+  local push, finish_push = M.observe_diagnostics(client, buffer)
+  local row = { method = 'textDocument/diagnostic', uri = uri, buffer = buffer, attempted = false,
+    before_source_sha256 = source_hash(), observation_timeout_ms = timeout, request_timeout_ms = request_timeout,
+    edit = opts.edit_label, trace = { path = path, after_bytes = offset, preexisting_partial_line = skip_partial,
+      accepted = {}, pulls = {} }, producer_closure_complete = false, canonical_certified = false }
+  local function epoch(id)
+    if type(id) ~= 'string' then return nil end
+    local analysis, source, store, revision = id:match('^kotlin:(%d+):(%d+):(%d+):(%d+)$')
+    if not revision then return nil end
+    return analysis .. ':' .. source .. ':' .. store, tonumber(source), tonumber(store)
+  end
+  local function target(value)
+    return type(value) == 'string' and M.path_key(value) == key
+  end
+  local function unchanged()
+    return push.attempted and #push.outbound == 1 and push.wire_matches_snapshot == true
+      and not push.wire_error and source_hash() == push.source_sha256
+      and vim.api.nvim_buf_get_changedtick(buffer) == push.changedtick
+      and vim.lsp.util.buf_versions[buffer] == push.expected_version
+  end
+  local function read_trace()
+    local stat = path and vim.uv.fs_stat(path)
+    if not stat then row.trace.last_read_error = 'trace-unavailable'; return end
+    if stat.size < offset or (initial and (stat.ino ~= initial.ino or stat.dev ~= initial.dev)) then
+      row.error = 'trace-replaced-or-truncated'; return
+    end
+    initial = initial or stat
+    local file, error = io.open(path, 'rb')
+    if not file then row.trace.last_read_error = tostring(error); return end
+    local position = file:seek('set', offset)
+    local bytes = position and file:read('*a')
+    local cursor = file:seek()
+    file:close()
+    if not bytes or not cursor then row.error = 'trace-read-unavailable'; return end
+    offset, row.trace.cursor_bytes = cursor, cursor
+    pending = pending .. bytes
+    while true do
+      local newline = pending:find('\n', 1, true)
+      if not newline then break end
+      local line = pending:sub(1, newline - 1):gsub('\r$', '')
+      pending = pending:sub(newline + 1)
+      if skip_partial then skip_partial = false
+      elseif line ~= '' then
+        local ok, event = pcall(vim.json.decode, line)
+        if not ok or type(event) ~= 'table' then row.error = 'invalid-trace-event'; return end
+        local args = type(event.args) == 'table' and event.args or {}
+        if event.name == 'kotlin_diagnostics_accepted' and event.cat == 'compiler'
+          and target(args.path) and args.source_sha256 == push.source_sha256 then
+          local identity, generation, store = epoch(args.result_id)
+          if not identity or generation ~= args.source_generation or store ~= args.store_epoch
+            or type(args.clean) ~= 'boolean' or type(args.count) ~= 'number' or args.count < 0
+            or args.count ~= math.floor(args.count) or type(args.compiler_version) ~= 'string'
+            or type(args.compiler_inputs_sha256) ~= 'string'
+            or not args.compiler_inputs_sha256:match('^%x+$') or #args.compiler_inputs_sha256 ~= 64 then
+            row.error = 'invalid-compiler-acceptance-receipt'; return
+          end
+          if opts.compiler_version and args.compiler_version ~= opts.compiler_version then
+            row.error = 'selected-compiler-version-mismatch'; return
+          end
+          row.trace.accepted[#row.trace.accepted + 1] = args
+        elseif row.rpc_started_ns and event.name == 'diagnostics_pull' and event.cat == 'lsp' and target(args.path) then
+          row.trace.pulls[#row.trace.pulls + 1] = args
+        end
+      end
+    end
+  end
+  local function finish()
+    local _, delivery = finish_push(0)
+    row.push = delivery
+    row.push.role = 'editor-delivery observation; first push may be the fast phase'
+    row.availability = M.request_outcome(row.response, row.error, function() return true end, row.attempted)
+    return row.error == nil and row.response and row.response.result or nil, row
+  end
+  if type(path) ~= 'string' or path == '' then row.error = 'trace-path-unavailable'; return finish() end
+  if baseline_error then row.error = baseline_error; return finish() end
+  local edited, edit_error = pcall(function() opts.mutate(); opts.flush() end)
+  if not edited then row.error = 'fixture-edit-failed: ' .. tostring(edit_error); return finish() end
+  row.source_sha256, row.expected_version, row.changedtick = push.source_sha256, push.expected_version, push.changedtick
+  row.wire_source_sha256, row.wire_matches_snapshot = push.wire_source_sha256, push.wire_matches_snapshot
+  if not unchanged() then row.error = 'edited-source-outbound-unavailable'; return finish() end
+  local observed = vim.wait(timeout, function()
+    if not unchanged() then row.error = 'source-changed-during-canonical-observation'; return true end
+    read_trace()
+    return row.error ~= nil or #row.trace.accepted > 0
+  end, 20)
+  if row.error then return finish() end
+  if not observed then row.error = 'timeout'; return finish() end
+  -- Drain pre-RPC events so an earlier pull cannot certify this invocation.
+  read_trace()
+  if row.error or not unchanged() then
+    row.error = row.error or 'source-changed-before-diagnostic-pull'; return finish()
+  end
+  row.trace.before_rpc_bytes, row.rpc_started_ns, row.attempted = offset, vim.uv.hrtime(), true
+  local called, response, error = pcall(client.request_sync, client, 'textDocument/diagnostic',
+    { textDocument = { uri = uri } }, request_timeout, buffer)
+  if not called then row.error = 'diagnostic-RPC-failed: ' .. tostring(response); return finish() end
+  row.response, row.error = response, error
+  if not row.response or row.response.err ~= nil or row.error ~= nil then return finish() end
+  local result = row.response.result
+  if type(result) ~= 'table' or result.kind ~= 'full' or type(result.items) ~= 'table' or not vim.islist(result.items) then
+    row.error = 'invalid-full-diagnostic-report'; return finish()
+  end
+  read_trace()
+  if row.error or not unchanged() then
+    row.error = row.error or 'source-changed-during-diagnostic-pull'; return finish()
+  end
+  local current = epoch(result.resultId)
+  for _, accepted in ipairs(row.trace.accepted) do
+    if current and epoch(accepted.result_id) == current then row.accepted = accepted end
+  end
+  for _, pull in ipairs(row.trace.pulls) do
+    if pull.result_id == result.resultId and pull.count == #result.items then row.pull = pull end
+  end
+  if not row.accepted or not row.pull then row.error = 'canonical-store-correlation-unavailable'; return finish() end
+  row.canonical_epoch = current
+  row.diagnostic_pass_complete, row.absence_certified = row.accepted.clean, row.accepted.clean
+  if opts.require_complete and not row.accepted.clean then
+    row.error = 'partial-compiler-result-cannot-certify-absence'; return finish()
+  end
+  row.canonical_certified = true
+  return finish()
 end
 
 function M.completion_has(result, token)

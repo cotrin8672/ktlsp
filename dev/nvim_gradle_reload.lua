@@ -16,9 +16,15 @@ local report = { checks = {}, phases = {}, messages = {}, requests = {}, engine 
 local function save()
   vim.fn.writefile({ vim.json.encode(report) }, artifacts .. '/gradle-reload.json')
 end
-local function check(name, passed, detail)
-  report.checks[#report.checks + 1] = { name = name, passed = passed == true, detail = detail }
-  print((passed and 'PASS  ' or 'FAIL  ') .. name)
+local function check(name, passed, detail, observation)
+  local item = { name = name, passed = passed == true, detail = detail }
+  if observation then
+    item.outcome = probe.request_outcome(observation.response, observation.error, function() return passed end, observation.attempted)
+    item.measured = item.outcome == 'matched' or item.outcome == 'mismatch'
+    item.observation, item.passed = observation, item.passed and item.measured
+  end
+  report.checks[#report.checks + 1] = item
+  print((item.measured == false and 'UNMEASURED  ' or (item.passed and 'PASS  ' or 'FAIL  ')) .. name)
   save()
 end
 
@@ -389,13 +395,29 @@ for phase = 1, 3 do
       local ok, locations = exact_goto(buffer, 'versioned.newApi()', 'newApi', '/fixture.reload/versioned/2.0/vendor/Versioned.java')
       check('updated ' .. label .. ' goto exact v2 source declaration', ok, locations)
       report.established[label].newApi = { completion = useful, goto_definition = ok }
-      local diagnostic = request(buffer, 'textDocument/diagnostic')
+      local diagnostic, observation
+      if label == 'Kotlin' then
+        diagnostic, observation = probe.canonical_kotlin_diagnostics(client, buffer, {
+          observation_timeout_ms = wait_ms, request_timeout_ms = 4000, compiler_version = '2.4.0',
+          edit_label = 'one phase 2 comment in the unsaved fixture buffer; original sources stay on disk',
+          mutate = function()
+            vim.api.nvim_buf_set_lines(buffer, -1, -1, false, { '// canonical obsolete-member probe phase 2' })
+          end,
+          flush = flush,
+        })
+        report.requests[#report.requests + 1] = { phase = phase, method = observation.method,
+          uri = observation.uri, result = diagnostic, error = observation.error, response = observation.response }
+      else
+        diagnostic = request(buffer, 'textDocument/diagnostic')
+      end
       local position = probe.find(text(buffer), 'versioned.oldApi()', 'oldApi')
       local found = false
       for _, item in ipairs(diagnostic and diagnostic.items or {}) do
-        if item.range.start.line == position.line and item.message:find('oldApi', 1, true) then found = true end
+        if type(item) == 'table' and type(item.range) == 'table' and type(item.range.start) == 'table'
+          and item.range.start.line == position.line and type(item.message) == 'string'
+          and item.message:find('oldApi', 1, true) then found = true end
       end
-      check('updated ' .. label .. ' stale member has a diagnostic', found, diagnostic)
+      check('updated ' .. label .. ' stale member has a diagnostic', found, diagnostic, observation)
     end
     check_kotlin_metadata(2, '2.0')
   else

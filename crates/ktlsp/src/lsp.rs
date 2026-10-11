@@ -83,6 +83,7 @@ pub struct Backend {
     watches: Arc<Mutex<WatchState>>,
     compile_workers: Arc<tokio::sync::Semaphore>,
     compile_watch: CompilerWatchSlot,
+    kotlin_diagnostics: Arc<Mutex<KotlinDiagnosticState>>,
 }
 
 impl Backend {
@@ -108,6 +109,7 @@ impl Backend {
             watches: Arc::new(Mutex::new(WatchState::default())),
             compile_workers: Arc::new(tokio::sync::Semaphore::new(1)),
             compile_watch: Arc::new(Mutex::new(None)),
+            kotlin_diagnostics: Arc::new(Mutex::new(KotlinDiagnosticState::default())),
         }
     }
 
@@ -135,6 +137,9 @@ impl Backend {
         let watches = self.watches.clone();
         let progress = *self.progress_supported.lock();
         let gradle = *self.gradle_project.lock();
+        let compiler_state = self.kotlin_diagnostics.clone();
+        let compiler_workers = self.compile_workers.clone();
+        let diagnostic_versions = self.doc_versions.clone();
         tokio::spawn(async move {
             let mut delay = initial_delay;
             loop {
@@ -161,6 +166,15 @@ impl Backend {
                     watches.clone(),
                 )
                 .await;
+                schedule_selected_kotlin_diagnostics(
+                    &ws,
+                    &client,
+                    &diagnostic_versions,
+                    &compiler_state,
+                    &compiler_workers,
+                    &watches,
+                    &root,
+                );
                 let mut state = state.lock();
                 if state.requested == generation {
                     state.running = false;
@@ -180,6 +194,7 @@ impl Backend {
         for key in keys {
             self.schedule_one_diagnostic(key);
         }
+        self.schedule_kotlin_diagnostics();
     }
 
     fn schedule_one_diagnostic(&self, key: String) {
@@ -1903,6 +1918,8 @@ impl LanguageServer for Backend {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         self.ws.lock().invalidate_observed_compile();
+        self.ws.lock().invalidate_kotlin_diagnostics();
+        self.schedule_kotlin_diagnostics();
         let options = Some(params.settings);
         configure_analysis_providers(&mut self.ws.lock(), &options);
         let changed = self.ws.lock().take_extension_diagnostic_changes();
@@ -1940,14 +1957,20 @@ impl LanguageServer for Backend {
                 .into(),
             );
         };
-        let items = lsp_diagnostics(&self.ws, &key);
+        let start = Instant::now();
+        let (items, result_id) = lsp_diagnostics_with_result(&self.ws, &key);
+        crate::trace::span(
+            "diagnostics_pull",
+            "lsp",
+            start,
+            serde_json::json!({
+                "path": key, "result_id": result_id, "count": items.len(),
+            }),
+        );
         Ok(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
                 related_documents: None,
-                full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                    result_id: None,
-                    items,
-                },
+                full_document_diagnostic_report: FullDocumentDiagnosticReport { result_id, items },
             })
             .into(),
         )
@@ -1970,13 +1993,14 @@ impl LanguageServer for Backend {
             let Some(uri) = key_to_uri(&key) else {
                 continue;
             };
+            let (diagnostics, result_id) = lsp_diagnostics_with_result(&self.ws, &key);
             items.push(WorkspaceDocumentDiagnosticReport::Full(
                 WorkspaceFullDocumentDiagnosticReport {
                     uri,
                     version: None,
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                        result_id: None,
-                        items: lsp_diagnostics(&self.ws, &key),
+                        result_id,
+                        items: diagnostics,
                     },
                 },
             ));
@@ -3663,25 +3687,36 @@ async fn publish_diagnostics(ws: &Arc<Mutex<Workspace>>, client: &Client, key: &
 }
 
 fn lsp_diagnostics(ws: &Arc<Mutex<Workspace>>, key: &str) -> Vec<Diagnostic> {
-    let (text, fast) = {
+    lsp_diagnostics_with_result(ws, key).0
+}
+
+fn lsp_diagnostics_with_result(
+    ws: &Arc<Mutex<Workspace>>,
+    key: &str,
+) -> (Vec<Diagnostic>, Option<String>) {
+    let (text, diagnostics, result_id) = {
         let mut ws = ws.lock();
         match ws.doc_text(key) {
             Some(text) => {
-                let fast = ws.diagnostics(key);
-                (Some(text), fast)
+                let diagnostics = ws.diagnostics(key);
+                // The compiler-store identity and merged items come from the same locked snapshot.
+                let result_id = ws.kotlin_diagnostic_result_id(key);
+                (Some(text), diagnostics, result_id)
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), None),
         }
     };
-    match text {
+    let items = match text {
         Some(text) => {
             let line_index = LineIndex::new(&text);
-            fast.iter()
+            diagnostics
+                .iter()
                 .map(|d| to_lsp_diagnostic(&line_index, &text, d))
                 .collect()
         }
         None => Vec::new(),
-    }
+    };
+    (items, result_id)
 }
 
 /// Convert a core `Def` (file key + byte range) into an LSP `Location`, reading the target file's
@@ -5432,6 +5467,19 @@ fn run_owned_compile(
 impl Backend {
     fn close_compiler_jobs(&self) {
         self.compile_workers.close();
+        self.ws.lock().invalidate_kotlin_diagnostics();
+        let environments = {
+            let mut state = self.kotlin_diagnostics.lock();
+            state.stopped = true;
+            state.pending.clear();
+            state.order.clear();
+            let active = std::mem::take(&mut state.environments);
+            state.retired.extend(active.into_values());
+            std::mem::take(&mut state.retired)
+        };
+        for environment in environments {
+            environment.close();
+        }
         self.ws.lock().stop_observed_compile();
         let watch = self.compile_watch.lock().take();
         if let Some(watch) = watch {
@@ -5624,5 +5672,329 @@ mod compiled_watch_ack_tests {
         assert!(state.acknowledges(&current));
         state.registration = None;
         assert!(!state.acknowledges(&current));
+    }
+}
+
+#[derive(Default)]
+struct KotlinDiagnosticState {
+    pending: std::collections::BTreeMap<crate::project_model::ProjectScope, String>,
+    order: std::collections::VecDeque<crate::project_model::ProjectScope>,
+    environments: std::collections::BTreeMap<
+        crate::project_model::ProjectScope,
+        Arc<crate::compile::KotlinDiagnosticEnvironment>,
+    >,
+    retired: Vec<Arc<crate::compile::KotlinDiagnosticEnvironment>>,
+    running: bool,
+    stopped: bool,
+}
+
+impl KotlinDiagnosticState {
+    fn enqueue(&mut self, scope: crate::project_model::ProjectScope, key: String) {
+        if self.stopped {
+            return;
+        }
+        if self.pending.insert(scope.clone(), key).is_none() {
+            self.order.push_back(scope);
+        }
+    }
+
+    fn next(&mut self) -> Option<String> {
+        while let Some(scope) = self.order.pop_front() {
+            if let Some(key) = self.pending.remove(&scope) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    fn retain_scopes(
+        &mut self,
+        active: &std::collections::BTreeSet<crate::project_model::ProjectScope>,
+    ) {
+        self.pending.retain(|scope, _| active.contains(scope));
+        self.order.retain(|scope| active.contains(scope));
+        let retired: Vec<_> = self
+            .environments
+            .keys()
+            .filter(|scope| !active.contains(*scope))
+            .cloned()
+            .collect();
+        for scope in retired {
+            if let Some(environment) = self.environments.remove(&scope) {
+                self.retired.push(environment);
+            }
+        }
+    }
+}
+
+fn schedule_selected_kotlin_diagnostics(
+    ws: &Arc<Mutex<Workspace>>,
+    client: &Client,
+    versions: &Arc<Mutex<HashMap<String, u64>>>,
+    state: &Arc<Mutex<KotlinDiagnosticState>>,
+    workers: &Arc<tokio::sync::Semaphore>,
+    watches: &Arc<Mutex<WatchState>>,
+    root: &Path,
+) {
+    if !cfg!(windows) {
+        return;
+    }
+    let targets = ws.lock().kotlin_diagnostic_targets();
+    {
+        let mut state = state.lock();
+        if state.stopped {
+            return;
+        }
+        state.retain_scopes(&targets.iter().map(|(scope, _)| scope.clone()).collect());
+        for (scope, key) in targets {
+            state.enqueue(scope, key);
+        }
+        if state.running || (state.pending.is_empty() && state.retired.is_empty()) {
+            return;
+        }
+        state.running = true;
+    }
+    let ws = ws.clone();
+    let client = client.clone();
+    let versions = versions.clone();
+    let state = state.clone();
+    let workers = workers.clone();
+    let watches = watches.clone();
+    let root = root.to_path_buf();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(DIAGNOSTIC_DEBOUNCE).await;
+            // Retired watches are joined away from interactive requests and Workspace's mutex.
+            let retired = std::mem::take(&mut state.lock().retired);
+            if !retired.is_empty() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for environment in retired {
+                        environment.close();
+                    }
+                })
+                .await;
+            }
+            // The shared semaphore limits selected diagnostics and observed Gradle builds together.
+            // Waiting retains the latest pending source epoch instead of dropping a busy edit.
+            let permit = match workers.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    state.lock().running = false;
+                    return;
+                }
+            };
+            let key = {
+                let mut state = state.lock();
+                if state.stopped {
+                    state.running = false;
+                    return;
+                }
+                match state.next() {
+                    Some(key) => key,
+                    None if !state.retired.is_empty() => continue,
+                    None => {
+                        state.running = false;
+                        return;
+                    }
+                }
+            };
+            let selection = {
+                let mut ws = ws.lock();
+                ws.begin_kotlin_diagnostics(&key)
+                    .map(|request| (request, ws.project_snapshot().unwrap()))
+            };
+            let (request, model) = match selection {
+                Ok(selection) => selection,
+                Err(reason) => {
+                    tracing::debug!(reason, "selected Kotlin diagnostics unavailable");
+                    continue;
+                }
+            };
+            let expected_options = {
+                let watches = watches.lock();
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: project_watchers(&root, Some(&model), watches.relative),
+                })
+                .unwrap()
+            };
+            // Closed disk sources and source-set membership reuse current ACKed project coverage.
+            if !watches.lock().acknowledges(&expected_options) {
+                request
+                    .invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::debug!("selected Kotlin diagnostics need current project watch ACK");
+                continue;
+            }
+            let (wake, mut events) = tokio::sync::mpsc::channel(1);
+            let weak_ws = Arc::downgrade(&ws);
+            let weak_state = Arc::downgrade(&state);
+            let event_client = client.clone();
+            let event_versions = versions.clone();
+            let event_workers = workers.clone();
+            let event_watches = watches.clone();
+            let event_root = root.clone();
+            let worker_ws = ws.clone();
+            let worker_state = state.clone();
+            let worker_request = request.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // The permit belongs to the blocking owner until native cleanup and both EOFs.
+                let _permit = permit;
+                let start = Instant::now();
+                let scope = worker_request.scope.clone();
+                let cached = worker_state.lock().environments.get(&scope)
+                    .filter(|environment| environment.matches(&worker_request)).cloned();
+                let environment = match cached {
+                    Some(environment) => { drop(wake); Ok((environment, false)) }
+                    None => {
+                        let old = worker_state.lock().environments.remove(&scope);
+                        if let Some(old) = old { old.close(); }
+                        crate::compile::KotlinDiagnosticEnvironment::prepare(&worker_request, wake)
+                            .map(|environment| (environment, true))
+                    }
+                };
+                let (environment, prepared) = match environment {
+                    Ok(environment) => environment,
+                    Err(error) => {
+                        // No callback is installed for failed preparation/cleanup: no retry storm.
+                        tracing::debug!(%error, "selected Kotlin compiler inputs unavailable");
+                        return worker_ws.lock().finish_kotlin_diagnostics(&worker_request,
+                            crate::compile::KotlinDiagnosticOutcome::Unverified(error.to_string()),
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                    }
+                };
+                {
+                    let mut state = worker_state.lock();
+                    if state.stopped {
+                        drop(state);
+                        environment.close();
+                        return Vec::new();
+                    }
+                    state.environments.insert(scope.clone(), environment.clone());
+                }
+                if prepared {
+                    let event_invalid = environment.invalid.clone();
+                    // Install only after successful preparation and publication of the watch owner.
+                    // A queued preparation event is still observed; an old/retired callback is ignored.
+                    tokio::spawn(async move {
+                        if events.recv().await.is_none() { return; }
+                        let (Some(ws), Some(state)) = (weak_ws.upgrade(), weak_state.upgrade()) else { return; };
+                        let keys = {
+                            let mut ws = ws.lock();
+                            let state = state.lock();
+                            if state.stopped || !state.environments.get(&scope).is_some_and(|environment|
+                                Arc::ptr_eq(&environment.invalid, &event_invalid)) { return; }
+                            ws.invalidate_kotlin_scope(&scope);
+                            let mut keys = ws.take_extension_diagnostic_changes();
+                            keys.extend(ws.kotlin_diagnostic_targets().into_iter().filter(|(owner, _)| owner == &scope)
+                                .map(|(_, key)| key));
+                            keys.sort(); keys.dedup(); keys
+                        };
+                        for key in keys { schedule_owned_diagnostic(&ws, &event_client, &event_versions, key); }
+                        schedule_selected_kotlin_diagnostics(&ws, &event_client, &event_versions, &state,
+                            &event_workers, &event_watches, &event_root);
+                    });
+                }
+                tracing::debug!(identity = ?environment.input_identity, task = worker_request.task.task.as_str(),
+                    prepared, "selected Kotlin editor compile started");
+                let outcome = crate::compile::run_kotlin_editor_compile(&worker_request, &environment);
+                if let crate::compile::KotlinDiagnosticOutcome::Unverified(reason) = &outcome {
+                    tracing::debug!(reason, "selected Kotlin compiler did not publish a result");
+                }
+                let (keys, proofs) = {
+                    let mut ws = worker_ws.lock();
+                    let keys = ws.finish_kotlin_diagnostics(&worker_request, outcome, environment.invalid.clone());
+                    let proofs: Vec<_> = keys.iter().filter_map(|key| ws.kotlin_diagnostic_trace(key)).collect();
+                    (keys, proofs)
+                };
+                for mut proof in proofs {
+                    if let ktcore::jvm::InputIdentity::Binary { content_sha256 } = &environment.input_identity {
+                        let hash: String = content_sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+                        proof["compiler_inputs_sha256"] = serde_json::Value::String(hash);
+                    }
+                    crate::trace::span("kotlin_diagnostics_accepted", "compiler", start, proof);
+                }
+                keys
+            }).await;
+            match result {
+                Ok(keys) => {
+                    for key in keys {
+                        publish_diagnostics(&ws, &client, &key).await;
+                    }
+                }
+                Err(error) => {
+                    request
+                        .invalid
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    tracing::warn!(%error, "selected Kotlin diagnostic worker failed");
+                }
+            }
+        }
+    });
+}
+
+impl Backend {
+    fn schedule_kotlin_diagnostics(&self) {
+        if !*self.gradle_project.lock() {
+            return;
+        }
+        let Some(root) = self.root.lock().clone() else {
+            return;
+        };
+        schedule_selected_kotlin_diagnostics(
+            &self.ws,
+            &self.client,
+            &self.doc_versions,
+            &self.kotlin_diagnostics,
+            &self.compile_workers,
+            &self.watches,
+            &root,
+        );
+    }
+}
+
+#[cfg(test)]
+mod kotlin_diagnostic_queue_tests {
+    use super::*;
+    use crate::project_model::ProjectScope;
+
+    #[test]
+    fn busy_scope_keeps_latest_buffer_and_preserves_other_scope_progress() {
+        let first = ProjectScope {
+            module: ":first".into(),
+            source_set: "main".into(),
+        };
+        let second = ProjectScope {
+            module: ":second".into(),
+            source_set: "main".into(),
+        };
+        let mut state = KotlinDiagnosticState::default();
+        state.enqueue(first.clone(), "First.kt".into());
+        state.enqueue(second.clone(), "Other.kt".into());
+        for edit in 0..100 {
+            state.enqueue(first.clone(), format!("Latest{edit}.kt"));
+        }
+        assert_eq!(state.pending.len(), 2);
+        assert_eq!(
+            state.order.len(),
+            2,
+            "edits do not create an unbounded JVM queue"
+        );
+        assert_eq!(state.next().as_deref(), Some("Latest99.kt"));
+        assert_eq!(state.next().as_deref(), Some("Other.kt"));
+        assert_eq!(state.next(), None);
+        state.enqueue(first, "Closed.kt".into());
+        state.enqueue(second.clone(), "Open.kt".into());
+        state.retain_scopes(&std::collections::BTreeSet::from([second]));
+        assert_eq!(state.next().as_deref(), Some("Open.kt"));
+        assert_eq!(state.next(), None);
+        state.stopped = true;
+        state.enqueue(
+            ProjectScope {
+                module: ":stopped".into(),
+                source_set: "main".into(),
+            },
+            "Ignored.kt".into(),
+        );
+        assert_eq!(state.next(), None);
     }
 }

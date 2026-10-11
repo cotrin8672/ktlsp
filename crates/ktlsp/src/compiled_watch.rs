@@ -80,6 +80,16 @@ impl WatchPlan {
         Ok(plan)
     }
 
+    /// Explicit compiler read inputs. Build once per selected recipe, then retain its native watch.
+    pub(crate) fn read_inputs(inputs: &[PathBuf]) -> anyhow::Result<Self> {
+        anyhow::ensure!(inputs.len() <= MAX_INPUT_PATHS, "compiler-native-input-cap");
+        let mut plan = Self::default();
+        for input in inputs {
+            plan.add_input(input, input.is_dir())?;
+        }
+        Ok(plan)
+    }
+
     pub(crate) fn covers_read(&self, path: &str, directory: bool) -> bool {
         let path = key(Path::new(path));
         // The callback ignores delegated output writes; a containing read tree cannot prove them.
@@ -276,21 +286,20 @@ impl Signal {
     }
 }
 
-pub(crate) struct NativeCompileWatch {
-    pub(crate) owner: Arc<ObservedCompileRequest>,
+pub(crate) struct NativeInputWatch {
     watcher: Mutex<Option<RecommendedWatcher>>,
     plan: Arc<RwLock<WatchPlan>>,
     signal: Arc<Signal>,
 }
 
-impl NativeCompileWatch {
+impl NativeInputWatch {
     pub(crate) fn new(
-        owner: Arc<ObservedCompileRequest>,
+        invalid: Arc<AtomicBool>,
         plan: WatchPlan,
         wake: mpsc::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
         let signal = Arc::new(Signal {
-            invalid: owner.invalid.clone(),
+            invalid,
             closed: AtomicBool::new(false),
             wake,
         });
@@ -313,7 +322,6 @@ impl NativeCompileWatch {
             }
         }
         Ok(Arc::new(Self {
-            owner,
             watcher: Mutex::new(Some(watcher)),
             plan: shared,
             signal,
@@ -348,9 +356,34 @@ impl NativeCompileWatch {
     }
 }
 
-impl Drop for NativeCompileWatch {
+impl Drop for NativeInputWatch {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Observed class-output receipts retain their existing owner and lifecycle.
+pub(crate) struct NativeCompileWatch {
+    pub(crate) owner: Arc<ObservedCompileRequest>,
+    input: Arc<NativeInputWatch>,
+}
+
+impl NativeCompileWatch {
+    pub(crate) fn new(
+        owner: Arc<ObservedCompileRequest>,
+        plan: WatchPlan,
+        wake: mpsc::Sender<()>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let input = NativeInputWatch::new(owner.invalid.clone(), plan, wake)?;
+        Ok(Arc::new(Self { owner, input }))
+    }
+
+    pub(crate) fn extend(&self, next: WatchPlan) -> anyhow::Result<()> {
+        self.input.extend(next)
+    }
+
+    pub(crate) fn close(&self) {
+        self.input.close();
     }
 }
 
@@ -841,5 +874,50 @@ mod tests {
             .add_path(root.join("project/src/Consumer.java"))
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod selected_kotlin_read_watch_tests {
+    use super::*;
+    use notify::event::{DataChange, ModifyKind};
+
+    #[test]
+    fn retained_binary_read_plan_does_not_restore_authority_after_a_b_a() {
+        let root = std::env::temp_dir().join("ktlsp-kotlin-read-plan-only");
+        let runtime = root.join("runtime/compiler.jar");
+        let plugin = root.join("plugin/scripting.jar");
+        let sdk = root.join("jdk/lib/modules");
+        let plan = WatchPlan::read_inputs(&[runtime.clone(), plugin.clone(), sdk.clone()]).unwrap();
+        assert!(plan.covers_read(&crate::paths::file_key(&runtime), false));
+        assert!(plan.covers_read(&crate::paths::file_key(&plugin), false));
+        assert!(plan.covers_read(&crate::paths::file_key(&sdk), false));
+        assert!(!plan.covers_read(&crate::paths::file_key(&root.join("unread.jar")), false));
+        let (wake, mut events) = mpsc::channel(1);
+        let invalid = Arc::new(AtomicBool::new(false));
+        let signal = Signal {
+            invalid: invalid.clone(),
+            closed: AtomicBool::new(false),
+            wake,
+        };
+        let shared = RwLock::new(plan);
+        for path in [runtime.clone(), runtime, plugin, sdk] {
+            signal.event(
+                &shared,
+                Ok(
+                    Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                        .add_path(path),
+                ),
+            );
+            assert!(
+                invalid.load(Ordering::Acquire),
+                "restored bytes/mtime cannot reverse an input event"
+            );
+        }
+        assert!(events.try_recv().is_ok());
+        assert!(
+            events.try_recv().is_err(),
+            "one bounded wake survives repeated replacement events"
+        );
     }
 }

@@ -16,7 +16,7 @@ Kotlin and Java support includes:
 - semantic tokens, inlay hints, folding, and selection ranges
 - call and type hierarchies
 - navigation into dependency, JDK, and Android SDK sources
-- fast, compiler-free diagnostics
+- fast diagnostics, with selected Kotlin compiler checks in the background on Windows
 
 Results are intentionally conservative: when the index cannot prove an answer, `ktlsp` may return
 no result instead of guessing. Kotlin type inference, overload resolution, and Gradle modeling are
@@ -199,6 +199,9 @@ neither it nor a first empty push proves that asynchronous compiler diagnostics 
 The Gradle reload probe also checks captured Kotlin source/library/JDK inputs. The
 project model records the selected compiler runtime and launch policy separately;
 captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.
+On Windows, supported captured tasks also diagnose private overlays of unsaved owned
+Java/Kotlin sources, including new buffers. Their accepted results use the ordinary
+push/pull diagnostic store; unsupported, failed or stale runs cannot clear it.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
 and KMP navigation. Imported extension aliases also cover typed return chains with
 same-named decoys, incomplete completion, unsaved import removal/rebinding, references
@@ -394,7 +397,17 @@ to check Java's obsolete dependency-member diagnostics against selected classfil
 their actual JDK ancestors; the default tiny JDK fixture covers ordinary reload behavior.
 It also checks the Kotlin task's Java/Kotlin source inputs, configured library classpath
 and selected JDK before and after the dependency version changes, saving the raw model.
-The Kotlin obsolete-member assertion remains a separate unresolved case.
+The Kotlin obsolete-member assertion arms observation before one unsaved edit, waits
+for an accepted compiler receipt for the actual transmitted text, then performs one
+standard diagnostic pull. Its result ID must identify the same analysis, source and
+store generation. Full-text encoding preserves the buffer's LF/CRLF/CR format and
+final-newline setting. The original obsolete-member error remains required: unavailable
+observations are unmeasured, while certified wrong or empty results are mismatches.
+Compiler inputs are fingerprinted off the interactive path and reused with precise
+per-scope native watches. Compiler processes and private outputs stay off completion
+requests. Arbitrary plugin options, unmodeled flags and dirty visible sources in other
+source sets are unsupported. A successful selected pass can clear its captured files;
+it does not certify general compiler-plugin or generated-source closure.
 
 `KTLSP_PROCESSOR_RELOAD=1 dev/ktlsp-harness.sh gradle-live` creates the real KAPT/KSP fixture
 and keeps one client through v1, v2, disabled processing and restored v1. Use JDK 17 and a populated

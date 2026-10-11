@@ -769,7 +769,7 @@ fn parse_legacy(rest: &str, severity: Severity) -> Option<CompileDiagnostic> {
         .trim()
         .to_string();
     Some(CompileDiagnostic {
-        path: path.to_string(),
+        path: compiler_diagnostic_path(path)?,
         line,
         col,
         severity,
@@ -777,20 +777,42 @@ fn parse_legacy(rest: &str, severity: Severity) -> Option<CompileDiagnostic> {
     })
 }
 
-/// Modern form: `file:///abs/Foo.kt:line:col message` (scheme optional; Windows drive aware). Strips
-/// the `file://` scheme *before* locating the `:line:col` boundary, so a path containing spaces isn't
-/// truncated by a naive whitespace split.
+/// Modern form: `file:///abs/Foo.kt:line:col message` (scheme optional; Windows drive aware).
+/// Locate the numeric boundary before decoding a file URI, preserving encoded spaces and colons.
 fn parse_modern(rest: &str, severity: Severity) -> Option<CompileDiagnostic> {
-    let s = strip_file_scheme(rest);
-    let (path, line, col, after) = find_line_col(s)?;
-    let message = s[after..].trim_start_matches(':').trim().to_string();
+    let (path, line, col, after) = find_line_col(rest)?;
+    let message = rest[after..].trim_start_matches(':').trim().to_string();
     Some(CompileDiagnostic {
-        path: path.to_string(),
+        path: compiler_diagnostic_path(path)?,
         line,
         col,
         severity,
         message,
     })
+}
+
+/// Decode only a file URI, never a percent sign in an ordinary native filename.
+fn compiler_diagnostic_path(path: &str) -> Option<String> {
+    if !path.starts_with("file://") {
+        return Some(path.to_string());
+    }
+    let stripped = strip_file_scheme(path);
+    let mut decoded = Vec::new();
+    let mut bytes = stripped.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = (bytes.next()? as char).to_digit(16)?;
+            let low = (bytes.next()? as char).to_digit(16)?;
+            decoded.push((high * 16 + low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    let mut path = String::from_utf8(decoded).ok()?;
+    if !path.starts_with('/') && path.as_bytes().get(1) != Some(&b':') {
+        path.insert_str(0, "//");
+    }
+    Some(path)
 }
 
 /// Locate the first `:<line>:<col>` boundary (two colon-separated integer runs, ending at
@@ -3285,5 +3307,1131 @@ mod observed_path_cache_tests {
         assert!(request
             .verify_prepared_environment("different-environment")
             .is_err());
+    }
+}
+
+// Selected Kotlin/JVM diagnostics use an editor overlay. They never mint class-output receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct KotlinSourceOverlay {
+    pub key: String,
+    pub text: String,
+    pub identity: ktcore::jvm::InputIdentity,
+    pub text_sha256: [u8; 32],
+}
+
+impl KotlinSourceOverlay {
+    pub(crate) fn new(key: String, text: String, revision: u64) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            identity: ktcore::jvm::InputIdentity::Source {
+                file: key.clone(),
+                revision,
+            },
+            text_sha256: Sha256::digest(text.as_bytes()).into(),
+            key,
+            text,
+        }
+    }
+}
+
+pub(crate) struct KotlinDiagnosticRequest {
+    pub project_dir: PathBuf,
+    pub scope: crate::project_model::ProjectScope,
+    pub task: crate::classpath::CompilerTask,
+    pub source_roots: Vec<PathBuf>,
+    pub sources: Vec<PathBuf>,
+    pub overlays: Vec<KotlinSourceOverlay>,
+    /// Visible other source sets are guards, not extra sources in this task's compilation.
+    pub dependency_overlays: Vec<KotlinSourceOverlay>,
+    pub visible_origins: std::collections::BTreeSet<String>,
+    pub generation: u64,
+    pub invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl KotlinDiagnosticRequest {
+    pub(crate) fn check_live(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.invalid.load(std::sync::atomic::Ordering::Acquire),
+            "stale-kotlin-source"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+struct KotlinEnvironmentKey {
+    project_dir: PathBuf,
+    arguments: Vec<String>,
+    classpath: Vec<PathBuf>,
+    java_home: Option<PathBuf>,
+    recipe: crate::classpath::KotlinCompilerRecipe,
+    extra_inputs: Vec<PathBuf>,
+}
+
+impl KotlinEnvironmentKey {
+    fn new(request: &KotlinDiagnosticRequest) -> anyhow::Result<Self> {
+        let recipe = request
+            .task
+            .kotlin_compiler
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("selected-kotlin-recipe-unknown"))?;
+        // A fresh CLI JVM deliberately differs from Gradle's daemon/BTA execution strategy.
+        // Do not silently discard configured daemon JVM properties in this initial adapter.
+        anyhow::ensure!(
+            recipe.normalized_daemon_jvm_arguments.is_empty(),
+            "kotlin-daemon-jvm-options-unhandled"
+        );
+        let sources: std::collections::BTreeSet<_> = request
+            .task
+            .source_files
+            .iter()
+            .map(|p| crate::paths::file_key(p))
+            .collect();
+        let extra_inputs = request
+            .task
+            .declared_input_files
+            .iter()
+            .filter(|p| !sources.contains(&crate::paths::file_key(p)))
+            .cloned()
+            .collect();
+        Ok(Self {
+            project_dir: request.project_dir.clone(),
+            arguments: request.task.arguments.clone(),
+            classpath: request.task.classpath.clone(),
+            java_home: request.task.java_home.clone(),
+            recipe,
+            extra_inputs,
+        })
+    }
+
+    fn input_hasher(&self, environment_sha256: &str) -> anyhow::Result<sha2::Sha256> {
+        use sha2::Digest;
+        let encoded = serde_json::to_vec(&(self, environment_sha256))?;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"ktlsp-kotlin-editor-cli-v1\0");
+        hash.update((encoded.len() as u64).to_be_bytes());
+        hash.update(encoded);
+        Ok(hash)
+    }
+}
+
+type KotlinInputStamp = Option<(std::time::SystemTime, u64, bool)>;
+
+fn kotlin_input_stamp(path: &Path) -> anyhow::Result<KotlinInputStamp> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            anyhow::ensure!(!m.file_type().is_symlink(), "kotlin-input-symlink");
+            Ok(Some((m.modified()?, m.len(), m.is_dir())))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The expensive input inventory and recursive watches are retained across source edits.
+/// A watch invalidation is monotone, including A -> B -> A replacements with restored mtimes.
+pub(crate) struct KotlinDiagnosticEnvironment {
+    key: KotlinEnvironmentKey,
+    pub invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub input_identity: ktcore::jvm::InputIdentity,
+    stamps: Vec<(PathBuf, KotlinInputStamp)>,
+    environment_sha256: String,
+    watch: std::sync::Arc<crate::compiled_watch::NativeInputWatch>,
+}
+
+impl KotlinDiagnosticEnvironment {
+    pub(crate) fn matches(&self, request: &KotlinDiagnosticRequest) -> bool {
+        !self.invalid.load(std::sync::atomic::Ordering::Acquire)
+            && KotlinEnvironmentKey::new(request).ok().as_ref() == Some(&self.key)
+    }
+
+    pub(crate) fn prepare(
+        request: &KotlinDiagnosticRequest,
+        wake: tokio::sync::mpsc::Sender<()>,
+    ) -> anyhow::Result<std::sync::Arc<Self>> {
+        use sha2::Digest;
+        request.check_live()?;
+        let key = KotlinEnvironmentKey::new(request)?;
+        // Validate the entire argument boundary before touching any output or starting a JVM.
+        kotlin_editor_arguments(request, Path::new("unused-private-output"), &[])?;
+        for name in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] {
+            anyhow::ensure!(
+                std::env::var_os(name).filter(|v| !v.is_empty()).is_none(),
+                "ambient-jvm-options-unmodeled"
+            );
+        }
+        let mut inputs: std::collections::BTreeSet<PathBuf> = key
+            .recipe
+            .default_classpath
+            .iter()
+            .chain(key.recipe.current_jvm_tools_jar.iter())
+            .chain(key.classpath.iter())
+            .chain(key.extra_inputs.iter())
+            .cloned()
+            .collect();
+        inputs.extend(kotlin_plugin_paths(&key.arguments)?);
+        let host = &key.recipe.gradle_java_home;
+        anyhow::ensure!(host.is_absolute(), "compiler-host-jdk-relative");
+        anyhow::ensure!(
+            host.join("lib/modules").is_file(),
+            "compiler-host-jdk-layout-unhandled"
+        );
+        // Windows modular JDK runtime image, launcher/native libraries and runtime configuration.
+        // Do not inventory src.zip, jmods, documentation, or the whole JDK tree.
+        inputs.extend([
+            host.join("release"),
+            host.join("bin"),
+            host.join("lib/modules"),
+            host.join("lib/jvm.cfg"),
+            host.join("lib/jrt-fs.jar"),
+            host.join("conf"),
+        ]);
+        if let Some(home) = &key.java_home {
+            anyhow::ensure!(home.is_absolute(), "compiler-target-jdk-relative");
+            inputs.insert(home.join("release"));
+            if home.join("lib/modules").is_file() {
+                inputs.extend([home.join("lib/modules"), home.join("lib/jrt-fs.jar")]);
+            } else {
+                // JavaSdkUtil's ordinary Windows JDK 8 roots. Other layouts remain unverified.
+                anyhow::ensure!(
+                    home.join("jre/lib/rt.jar").is_file(),
+                    "compiler-target-jdk-layout-unhandled"
+                );
+                inputs.extend([home.join("jre/lib"), home.join("lib/tools.jar")]);
+            }
+        }
+        let inputs: Vec<_> = inputs.into_iter().collect();
+        for input in &inputs {
+            anyhow::ensure!(input.is_absolute(), "kotlin-relative-read-input");
+            anyhow::ensure!(
+                !paths_overlap(
+                    input.to_string_lossy().as_ref(),
+                    &crate::paths::file_key(&request.project_dir)
+                ) || !request.project_dir.starts_with(input),
+                "kotlin-unbounded-project-read-input"
+            );
+        }
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&inputs)?;
+        let invalid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch = crate::compiled_watch::NativeInputWatch::new(invalid.clone(), plan, wake)?;
+        let environment_sha256 = environment_hash();
+        let mut hash = key.input_hasher(&environment_sha256)?;
+        let mut stamps = Vec::new();
+        for input in inputs {
+            let before = kotlin_input_stamp(&input)?;
+            hash.update(serde_json::to_vec(&inventory(&input)?)?);
+            anyhow::ensure!(
+                before == kotlin_input_stamp(&input)?,
+                "kotlin-input-changed-during-inventory"
+            );
+            stamps.push((input, before));
+        }
+        let environment = std::sync::Arc::new(Self {
+            key,
+            invalid,
+            input_identity: ktcore::jvm::InputIdentity::Binary {
+                content_sha256: hash.finalize().into(),
+            },
+            stamps,
+            environment_sha256,
+            watch,
+        });
+        environment.check_live()?;
+        request.check_live()?;
+        Ok(environment)
+    }
+
+    pub(crate) fn check_live(&self) -> anyhow::Result<()> {
+        let check = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.invalid.load(std::sync::atomic::Ordering::Acquire),
+                "stale-kotlin-compiler-input"
+            );
+            anyhow::ensure!(
+                environment_hash() == self.environment_sha256,
+                "kotlin-process-environment-changed"
+            );
+            // Lightweight endpoints complement retained events; never rehash the CP/JDK here.
+            for (path, stamp) in &self.stamps {
+                anyhow::ensure!(
+                    kotlin_input_stamp(path)? == *stamp,
+                    "kotlin-input-stamp-changed"
+                );
+            }
+            Ok(())
+        };
+        let result = check();
+        if result.is_err() {
+            // Also wake the owner on IO failure; a read error must not retain accepted authority.
+            self.invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.watch.close();
+        }
+        result
+    }
+
+    pub(crate) fn close(&self) {
+        self.watch.close();
+    }
+}
+
+fn kotlin_plugin_paths(arguments: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    for argument in arguments {
+        if let Some(paths) = argument.strip_prefix("-Xplugin=") {
+            for path in paths.split(',') {
+                let path = PathBuf::from(path);
+                anyhow::ensure!(path.is_absolute(), "kotlin-plugin-path-unhandled");
+                result.push(path);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn kotlin_editor_arguments(
+    request: &KotlinDiagnosticRequest,
+    output: &Path,
+    sources: &[PathBuf],
+) -> anyhow::Result<Vec<String>> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let mut destination = false;
+    let mut target = false;
+    let mut sdk = false;
+    while i < request.task.arguments.len() {
+        let argument = &request.task.arguments[i];
+        anyhow::ensure!(!argument.contains('\0'), "kotlin-nul-argument");
+        match argument.as_str() {
+            "-d" | "-jvm-target" | "-module-name" | "-language-version" | "-api-version"
+            | "-jdk-home" => {
+                let value = request
+                    .task
+                    .arguments
+                    .get(i + 1)
+                    .filter(|v| {
+                        !v.is_empty()
+                            && !v.starts_with('-')
+                            && !v.starts_with('@')
+                            && !v.contains('\0')
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("kotlin-argument-value-unhandled"))?;
+                if argument == "-d" {
+                    anyhow::ensure!(
+                        !destination
+                            && request.task.output_roots.len() == 1
+                            && crate::paths::file_key(Path::new(value))
+                                == crate::paths::file_key(&request.task.output_roots[0]),
+                        "kotlin-destination-unhandled"
+                    );
+                    destination = true;
+                    result.extend([argument.clone(), output.to_string_lossy().into_owned()]);
+                } else {
+                    if argument == "-module-name" {
+                        anyhow::ensure!(
+                            !value.chars().any(|ch| matches!(ch, '/' | '\\')),
+                            "kotlin-module-output-path-unhandled"
+                        );
+                    }
+                    if argument == "-jvm-target" {
+                        target = true;
+                    }
+                    if argument == "-jdk-home" {
+                        anyhow::ensure!(
+                            !sdk && request.task.java_home.as_deref() == Some(Path::new(value)),
+                            "kotlin-target-sdk-unhandled"
+                        );
+                        sdk = true;
+                    }
+                    result.extend([argument.clone(), value.clone()]);
+                }
+                i += 2;
+                continue;
+            }
+            "-no-stdlib"
+            | "-no-reflect"
+            | "-no-jdk"
+            | "-nowarn"
+            | "-Werror"
+            | "-progressive"
+            | "-Xallow-no-source-files" => result.push(argument.clone()),
+            _ if argument.starts_with("-Xplugin=") => {
+                kotlin_plugin_paths(std::slice::from_ref(argument))?;
+                result.push(argument.clone());
+            }
+            // No silent removal of argfiles, script modes, opaque -P values, output/path flags,
+            // KAPT, or unknown compiler flags. Extend this small adapter only with real controls.
+            _ => anyhow::bail!("kotlin-argument-unhandled-at-{i}"),
+        }
+        i += 1;
+    }
+    anyhow::ensure!(destination && target, "kotlin-jvm-task-arguments-unknown");
+    anyhow::ensure!(
+        request.task.arguments.iter().any(|a| a == "-no-stdlib")
+            && request.task.arguments.iter().any(|a| a == "-no-reflect"),
+        "kotlin-implicit-runtime-libraries-unhandled"
+    );
+    let no_jdk = request.task.arguments.iter().any(|a| a == "-no-jdk");
+    anyhow::ensure!(!(sdk && no_jdk), "kotlin-conflicting-sdk-arguments");
+    if !sdk && !no_jdk {
+        let home = request
+            .task
+            .java_home
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("kotlin-target-sdk-unknown"))?;
+        result.extend(["-jdk-home".into(), home.to_string_lossy().into_owned()]);
+    }
+    anyhow::ensure!(
+        request.task.classpath.iter().all(|p| p.is_absolute()),
+        "kotlin-relative-target-classpath"
+    );
+    let classpath = std::env::join_paths(&request.task.classpath)?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("kotlin-classpath-encoding-unhandled"))?;
+    result.extend(["-classpath".into(), classpath, "-version".into()]);
+    result.extend(sources.iter().map(|p| p.to_string_lossy().into_owned()));
+    Ok(result)
+}
+
+/// Kotlin's own UTF-8 @file format; user-provided @files remain unsupported inputs.
+fn kotlin_argument_file(arguments: &[String]) -> anyhow::Result<String> {
+    let mut result = String::new();
+    for argument in arguments {
+        anyhow::ensure!(!argument.contains('\0'), "kotlin-nul-argument");
+        result.push('"');
+        for ch in argument.chars() {
+            if ch == '\\' || ch == '"' {
+                result.push('\\');
+            }
+            result.push(ch);
+        }
+        result.push_str("\"\n");
+    }
+    Ok(result)
+}
+
+struct KotlinEditorOverlay {
+    directory: PathBuf,
+    paths: std::collections::BTreeMap<String, String>,
+    sources: Vec<PathBuf>,
+}
+
+impl KotlinEditorOverlay {
+    fn create(request: &KotlinDiagnosticRequest) -> anyhow::Result<Self> {
+        Self::create_in(
+            request,
+            &crate::deps::cache_home().join("kotlin-editor-compile"),
+        )
+    }
+
+    fn create_in(request: &KotlinDiagnosticRequest, parent: &Path) -> anyhow::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        request.check_live()?;
+        for dependency in &request.dependency_overlays {
+            anyhow::ensure!(
+                std::fs::read_to_string(&dependency.key).ok().as_deref()
+                    == Some(dependency.text.as_str()),
+                "dirty-visible-dependency-source-unhandled"
+            );
+        }
+        let cache_key = crate::paths::file_key(parent);
+        anyhow::ensure!(
+            !request
+                .source_roots
+                .iter()
+                .chain(request.task.output_roots.iter())
+                .any(|root| paths_overlap(&cache_key, &crate::paths::file_key(root))),
+            "kotlin-overlay-cache-overlaps-project-role"
+        );
+        std::fs::create_dir_all(parent)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = parent.join(format!(
+            "{}-{nonce}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory)?;
+        let mut overlay = Self {
+            directory,
+            paths: Default::default(),
+            sources: Vec::new(),
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(overlay.directory.join("owner"))?;
+        std::fs::create_dir(overlay.directory.join("classes"))?;
+        for (i, original) in request.sources.iter().enumerate() {
+            request.check_live()?;
+            anyhow::ensure!(
+                original.is_absolute()
+                    && request
+                        .source_roots
+                        .iter()
+                        .any(|root| original.starts_with(root)),
+                "kotlin-source-outside-owned-roots-unhandled"
+            );
+            let extension = original.extension().and_then(|e| e.to_str());
+            anyhow::ensure!(
+                matches!(extension, Some("kt" | "java")),
+                "kotlin-script-source-unhandled"
+            );
+            let key = crate::paths::file_key(original);
+            let text = match request.overlays.iter().find(|source| source.key == key) {
+                Some(source) => {
+                    use sha2::{Digest, Sha256};
+                    let hash: [u8; 32] = Sha256::digest(source.text.as_bytes()).into();
+                    anyhow::ensure!(
+                        hash == source.text_sha256,
+                        "kotlin-overlay-body-identity-mismatch"
+                    );
+                    source.text.clone()
+                }
+                None => std::fs::read_to_string(original)?,
+            };
+            let destination = match original.strip_prefix(&request.project_dir) {
+                Ok(relative) => overlay.directory.join("sources/project").join(relative),
+                Err(_) => overlay
+                    .directory
+                    .join(format!("sources/external/{i}"))
+                    .join(
+                        original
+                            .file_name()
+                            .ok_or_else(|| anyhow::anyhow!("kotlin-source-name-unknown"))?,
+                    ),
+            };
+            anyhow::ensure!(
+                destination.starts_with(&overlay.directory)
+                    && !destination
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "kotlin-overlay-path-escape"
+            );
+            std::fs::create_dir_all(destination.parent().unwrap())?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            let overlay_key = kotlin_path_key(&crate::paths::file_key(&destination));
+            anyhow::ensure!(
+                overlay.paths.insert(overlay_key, key).is_none(),
+                "kotlin-overlay-source-collision"
+            );
+            overlay.sources.push(destination);
+        }
+        request.check_live()?;
+        Ok(overlay)
+    }
+}
+
+impl Drop for KotlinEditorOverlay {
+    fn drop(&mut self) {
+        // This unique directory was created by this request; originals and Gradle outputs never enter it.
+        if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+            tracing::warn!(%error, "could not remove private Kotlin editor overlay");
+        }
+    }
+}
+
+fn kotlin_path_key(path: &str) -> String {
+    let key = crate::paths::file_key(Path::new(path));
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+pub(crate) enum KotlinDiagnosticOutcome {
+    /// Exit 0 proves this invocation completed; exit 1 admits only the errors it actually reported.
+    Verified {
+        diagnostics: Vec<CompileDiagnostic>,
+        clean: bool,
+    },
+    Unverified(String),
+}
+
+fn selected_kotlin_output(
+    text: &str,
+    expected_version: &str,
+    exit: Option<i32>,
+    interrupted: bool,
+    complete: bool,
+    paths: &std::collections::BTreeMap<String, String>,
+) -> KotlinDiagnosticOutcome {
+    let rejected = |reason: &str| KotlinDiagnosticOutcome::Unverified(reason.to_string());
+    if interrupted {
+        return rejected("kotlin-native-interrupted");
+    }
+    if !complete {
+        return rejected("kotlin-native-output-incomplete");
+    }
+    if !matches!(exit, Some(0 | 1)) {
+        return rejected("kotlin-compiler-failed");
+    }
+    let cleaned = strip_ansi(text);
+    let expected = format!("i: kotlinc-jvm {expected_version} (JRE ");
+    let versions: Vec<_> = cleaned
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("i: kotlinc-jvm "))
+        .collect();
+    if versions.len() != 1 || !versions[0].starts_with(&expected) {
+        return rejected("kotlin-compiler-version-mismatch");
+    }
+    if cleaned.lines().any(|line| {
+        line.starts_with("exception:")
+            || line.starts_with("Exception in thread ")
+            || line.starts_with("\tat ")
+    }) {
+        return rejected("kotlin-compiler-internal-failure");
+    }
+    if cleaned.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("e:") && parse_diagnostic_line(line).is_none()
+    }) {
+        return rejected("kotlin-unlocated-compiler-error");
+    }
+    let mut diagnostics = parse_output(&cleaned, "unused-selected-cli-task").diagnostics;
+    for diagnostic in &mut diagnostics {
+        let Some(original) = paths.get(&kotlin_path_key(&diagnostic.path)) else {
+            return rejected("kotlin-unmapped-diagnostic-path");
+        };
+        if diagnostic.line == 0 || diagnostic.col == 0 {
+            return rejected("kotlin-diagnostic-position-invalid");
+        }
+        diagnostic.path = original.clone();
+    }
+    let has_error = diagnostics.iter().any(|d| d.severity == Severity::Error);
+    if (exit == Some(0) && has_error) || (exit == Some(1) && !has_error) {
+        return rejected("kotlin-compiler-exit-output-mismatch");
+    }
+    KotlinDiagnosticOutcome::Verified {
+        diagnostics,
+        clean: exit == Some(0),
+    }
+}
+
+pub(crate) fn run_kotlin_editor_compile(
+    request: &KotlinDiagnosticRequest,
+    environment: &KotlinDiagnosticEnvironment,
+) -> KotlinDiagnosticOutcome {
+    let run = || -> anyhow::Result<KotlinDiagnosticOutcome> {
+        request.check_live()?;
+        environment.check_live()?;
+        anyhow::ensure!(environment.matches(request), "kotlin-stale-recipe");
+        let overlay = KotlinEditorOverlay::create(request)?;
+        let arguments = kotlin_editor_arguments(
+            request,
+            &overlay.directory.join("classes"),
+            &overlay.sources,
+        )?;
+        let argument_file = overlay.directory.join("compiler.args");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&argument_file)?;
+        file.write_all(kotlin_argument_file(&arguments)?.as_bytes())?;
+        file.flush()?;
+        drop(file);
+        let recipe = &environment.key.recipe;
+        let runtime: Vec<_> = recipe
+            .default_classpath
+            .iter()
+            .chain(recipe.current_jvm_tools_jar.iter())
+            .collect();
+        anyhow::ensure!(!runtime.is_empty(), "kotlin-compiler-runtime-unknown");
+        let runtime = std::env::join_paths(runtime)?;
+        // The private compiler @file avoids Windows' command-line limit for project libraries/sources.
+        // Oversized JVM runtime classpaths need a separately verified launcher adapter.
+        anyhow::ensure!(
+            runtime.to_string_lossy().encode_utf16().count() < 24_000,
+            "kotlin-runtime-command-line-unhandled"
+        );
+        let mut command = Command::new(recipe.gradle_java_home.join(if cfg!(windows) {
+            "bin/java.exe"
+        } else {
+            "bin/java"
+        }));
+        command
+            .current_dir(&request.project_dir)
+            .arg("-Dfile.encoding=UTF-8")
+            .arg("-Dorg.jetbrains.kotlin.cliMessageRenderer=GradleStyle")
+            .arg("-cp")
+            .arg(runtime)
+            .arg("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
+            .arg(format!("@{}", argument_file.display()));
+        #[cfg(windows)]
+        {
+            let (status, interrupted, mut out, out_complete, err, err_complete) =
+                OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)?
+                    .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
+            out.push('\n');
+            out.push_str(&err);
+            request.check_live()?;
+            environment.check_live()?;
+            Ok(selected_kotlin_output(
+                &out,
+                &recipe.compiler_version,
+                status.code(),
+                interrupted,
+                out_complete && err_complete,
+                &overlay.paths,
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            // Preserve the existing Unix lifecycle limitation; do not admit results without tree proof.
+            let _ = command;
+            Ok(KotlinDiagnosticOutcome::Unverified(
+                "native-tree-proof-unavailable".into(),
+            ))
+        }
+    };
+    match run() {
+        Ok(outcome) => outcome,
+        Err(error) => KotlinDiagnosticOutcome::Unverified(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
+    use crate::classpath::{
+        CompilerLanguage, KotlinCompilerExecutionStrategy, KotlinCompilerRecipe,
+    };
+    let mut task = observed_test_request(root).task.clone();
+    task.task = ":compileKotlin".into();
+    task.language = CompilerLanguage::Kotlin;
+    task.task_type = "org.jetbrains.kotlin.gradle.tasks.KotlinCompile".into();
+    task.source_files = vec![root.join("src/Helper.kt"), root.join("src/Main.java")];
+    task.classpath = vec![root.join("libraries/target.jar")];
+    task.java_home = Some(root.join("jdk"));
+    task.kotlin_compiler = Some(KotlinCompilerRecipe {
+        default_classpath: vec![
+            root.join("runtime/compiler.jar"),
+            root.join("runtime/runner.jar"),
+        ],
+        current_jvm_tools_jar: None,
+        compiler_version: "2.4.0".into(),
+        gradle_java_home: root.join("jdk"),
+        toolchain_java_home: root.join("jdk"),
+        run_via_build_tools_api: true,
+        execution_strategy: KotlinCompilerExecutionStrategy::InProcess,
+        normalized_daemon_jvm_arguments: Vec::new(),
+    });
+    task.declared_input_files = task.source_files.clone();
+    task.declared_input_files
+        .push(root.join("runtime/compiler.jar"));
+    task.output_roots = vec![root.join("build/classes/kotlin/main")];
+    task.declared_output_roots = task.output_roots.clone();
+    task.arguments = vec![
+        "-d".into(),
+        task.output_roots[0].to_string_lossy().into_owned(),
+        "-jvm-target".into(),
+        "17".into(),
+        "-module-name".into(),
+        "editing".into(),
+        "-no-stdlib".into(),
+        "-no-reflect".into(),
+        "-Xallow-no-source-files".into(),
+        format!("-Xplugin={}", root.join("plugins/scripting.jar").display()),
+    ];
+    KotlinDiagnosticRequest {
+        project_dir: root.into(),
+        scope: crate::project_model::ProjectScope {
+            module: ":".into(),
+            source_set: "main".into(),
+        },
+        sources: task.source_files.clone(),
+        task,
+        source_roots: vec![root.join("src")],
+        overlays: Vec::new(),
+        dependency_overlays: Vec::new(),
+        visible_origins: Default::default(),
+        generation: 0,
+        invalid: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+#[cfg(test)]
+mod kotlin_editor_compile_tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ktlsp-kotlin-overlay-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn overlay_uses_unsaved_java_kotlin_and_new_buffer_without_modifying_originals() {
+        let tree = TestDirectory::new();
+        let project = tree.0.join("project 日本 space");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let mut request = kotlin_test_request(&project);
+        std::fs::write(
+            project.join("src/Helper.kt"),
+            "class Helper { fun old() = 1 }",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/Main.java"), "class Main { int old; }").unwrap();
+        let editor = project.join("src/Editor.kt");
+        request.sources.push(editor.clone());
+        request.overlays = vec![
+            KotlinSourceOverlay::new(
+                crate::paths::file_key(&project.join("src/Helper.kt")),
+                "class Helper { fun current() = 2 }".into(),
+                3,
+            ),
+            KotlinSourceOverlay::new(
+                crate::paths::file_key(&project.join("src/Main.java")),
+                "class Main { int current; }".into(),
+                4,
+            ),
+            KotlinSourceOverlay::new(
+                crate::paths::file_key(&editor),
+                "fun use() = Helper().old()".into(),
+                5,
+            ),
+        ];
+        let directory;
+        {
+            let overlay =
+                KotlinEditorOverlay::create_in(&request, &tree.0.join("private-cache")).unwrap();
+            directory = overlay.directory.clone();
+            for source in &request.overlays {
+                let copy = overlay
+                    .paths
+                    .iter()
+                    .find(|(_, original)| *original == &source.key)
+                    .unwrap()
+                    .0;
+                assert_eq!(std::fs::read_to_string(copy).unwrap(), source.text);
+            }
+            assert_eq!(overlay.sources.len(), 3);
+            assert!(overlay
+                .sources
+                .iter()
+                .all(|path| path.starts_with(&directory)));
+            let other =
+                KotlinEditorOverlay::create_in(&request, &tree.0.join("private-cache")).unwrap();
+            assert_ne!(other.directory, directory);
+        }
+        assert!(
+            !directory.exists(),
+            "private sources/output are removed only after owner drop"
+        );
+        assert!(
+            !editor.exists(),
+            "a new editor buffer never creates a project source file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/Helper.kt")).unwrap(),
+            "class Helper { fun old() = 1 }"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/Main.java")).unwrap(),
+            "class Main { int old; }"
+        );
+        assert!(!request.task.output_roots[0].exists());
+    }
+
+    #[test]
+    fn overlay_rejects_dirty_visible_dependency_and_corrupt_body_identity() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let dependency = tree.0.join("other/Dependency.kt");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "class Dependency").unwrap();
+        request.dependency_overlays.push(KotlinSourceOverlay::new(
+            crate::paths::file_key(&dependency),
+            "class Dependency { fun unsaved() = 1 }".into(),
+            1,
+        ));
+        assert!(KotlinEditorOverlay::create_in(&request, &tree.0.join("cache")).is_err());
+        request.dependency_overlays.clear();
+        request.sources.truncate(1);
+        let key = crate::paths::file_key(&request.sources[0]);
+        let mut source = KotlinSourceOverlay::new(key, "class Helper".into(), 1);
+        source.text.push_str(" changed after capture");
+        request.overlays.push(source);
+        assert!(KotlinEditorOverlay::create_in(&request, &tree.0.join("cache")).is_err());
+    }
+
+    #[test]
+    fn argument_adapter_keeps_selected_flags_plugins_target_sdk_and_runtime_order() {
+        let root = std::env::temp_dir().join("ktlsp-kotlin-args 日本 space");
+        let mut request = kotlin_test_request(&root);
+        let module_name = request
+            .task
+            .arguments
+            .iter()
+            .position(|arg| arg == "-module-name")
+            .unwrap()
+            + 1;
+        request.task.arguments[module_name] = "ktlsp-live-reload:app".into();
+        request.task.arguments.extend([
+            "-language-version".into(),
+            "2.3".into(),
+            "-api-version".into(),
+            "2.3".into(),
+        ]);
+        let private = root.join("private/classes");
+        let sources = [root.join("private/Editor.kt")];
+        let arguments = kotlin_editor_arguments(&request, &private, &sources).unwrap();
+        assert_eq!(
+            &arguments[..2],
+            &["-d".to_string(), private.to_string_lossy().into_owned()]
+        );
+        assert!(arguments.contains(
+            request
+                .task
+                .arguments
+                .iter()
+                .find(|arg| arg.starts_with("-Xplugin="))
+                .unwrap()
+        ));
+        assert!(arguments.windows(2).any(|pair| pair
+            == [
+                "-jdk-home",
+                request.task.java_home.as_ref().unwrap().to_str().unwrap()
+            ]));
+        assert_eq!(arguments.last().unwrap(), sources[0].to_str().unwrap());
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["-module-name", "ktlsp-live-reload:app"]));
+        for value in ["../outside", "..\\outside"] {
+            let mut request = kotlin_test_request(&root);
+            request.task.arguments[module_name] = value.into();
+            assert!(
+                kotlin_editor_arguments(&request, &private, &sources).is_err(),
+                "{value}"
+            );
+        }
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        request.overlays.push(KotlinSourceOverlay::new(
+            crate::paths::file_key(&sources[0]),
+            "body edit".into(),
+            2,
+        ));
+        request.sources.push(root.join("src/NewEditor.kt"));
+        assert!(
+            KotlinEnvironmentKey::new(&request).unwrap() == key,
+            "source edits reuse the same binary read plan"
+        );
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .default_classpath
+            .reverse();
+        assert!(
+            KotlinEnvironmentKey::new(&request).unwrap() != key,
+            "actual runtime order is part of the cache key"
+        );
+        for argument in [
+            "@user.args",
+            "-script",
+            "-Xfriend-paths=opaque",
+            "-P",
+            "-Xunknown",
+        ] {
+            let mut request = kotlin_test_request(&root);
+            request.task.arguments.push(argument.into());
+            assert!(
+                kotlin_editor_arguments(&request, &private, &sources).is_err(),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_input_identity_includes_ordered_recipe_but_not_source_body() {
+        use sha2::Digest;
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let runtime = request
+            .task
+            .kotlin_compiler
+            .as_ref()
+            .unwrap()
+            .default_classpath
+            .clone();
+        std::fs::create_dir_all(runtime[0].parent().unwrap()).unwrap();
+        for path in &runtime {
+            std::fs::write(path, b"identical runtime bytes").unwrap();
+        }
+        request.task.classpath = runtime.clone();
+        let inventories: Vec<_> = runtime
+            .iter()
+            .map(|path| serde_json::to_vec(&inventory(path).unwrap()).unwrap())
+            .collect();
+        let identity = |request: &KotlinDiagnosticRequest| -> [u8; 32] {
+            let key = KotlinEnvironmentKey::new(request).unwrap();
+            let mut hash = key.input_hasher("same-process-environment").unwrap();
+            for bytes in &inventories {
+                hash.update(bytes);
+            }
+            hash.finalize().into()
+        };
+        let original = identity(&request);
+        request.overlays.push(KotlinSourceOverlay::new(
+            crate::paths::file_key(&tree.0.join("src/Editor.kt")),
+            "changed unsaved body".into(),
+            2,
+        ));
+        request.sources.push(tree.0.join("src/Editor.kt"));
+        assert_eq!(
+            identity(&request),
+            original,
+            "source-only edits retain the binary identity"
+        );
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .default_classpath
+            .reverse();
+        assert_ne!(
+            identity(&request),
+            original,
+            "same files and bytes, different compiler runtime order"
+        );
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .default_classpath
+            .reverse();
+        request.task.classpath.reverse();
+        assert_ne!(
+            identity(&request),
+            original,
+            "target classpath order is also semantic input"
+        );
+        request.task.classpath.reverse();
+        request.task.arguments.push("-nowarn".into());
+        assert_ne!(
+            identity(&request),
+            original,
+            "opaque captured arguments identify the invocation"
+        );
+        request.task.arguments.pop();
+        request.task.java_home = None;
+        assert_ne!(
+            identity(&request),
+            original,
+            "effective target SDK policy identifies the invocation"
+        );
+    }
+
+    #[test]
+    fn owned_argument_file_quotes_utf8_spaces_quotes_and_windows_backslashes() {
+        assert_eq!(
+            kotlin_argument_file(&[
+                "C:\\日本 space\\Editor.kt".into(),
+                "a\"b".into(),
+                String::new()
+            ])
+            .unwrap(),
+            "\"C:\\\\日本 space\\\\Editor.kt\"\n\"a\\\"b\"\n\"\"\n"
+        );
+    }
+
+    #[test]
+    fn selected_compiler_errors_require_version_eof_native_status_and_owned_paths() {
+        let original = "C:/project/Editor.kt";
+        let overlay = "C:/private/日本 space/Editor.kt";
+        let paths = std::collections::BTreeMap::from([(kotlin_path_key(overlay), original.into())]);
+        let version = "i: kotlinc-jvm 2.4.0 (JRE 17.0.14+7)\n";
+        let error = "e: file:///C:/private/%E6%97%A5%E6%9C%AC%20space/Editor.kt:2:20 Unresolved reference 'oldApi'.\n";
+        let output = format!("{version}{error}");
+        match selected_kotlin_output(&output, "2.4.0", Some(1), false, true, &paths) {
+            KotlinDiagnosticOutcome::Verified { diagnostics, clean } => {
+                assert!(!clean);
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(
+                    (
+                        &*diagnostics[0].path,
+                        diagnostics[0].line,
+                        diagnostics[0].col
+                    ),
+                    (original, 2, 20)
+                );
+                assert!(diagnostics[0].message.contains("oldApi"));
+            }
+            KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
+        }
+        assert!(matches!(
+            selected_kotlin_output(version, "2.4.0", Some(0), false, true, &paths),
+            KotlinDiagnosticOutcome::Verified { clean: true, .. }
+        ));
+        for (text, expected, exit, interrupted, complete) in [
+            (output.clone(), "2.1.20", Some(1), false, true),
+            (output.clone(), "2.4.0", Some(1), true, true),
+            (output.clone(), "2.4.0", Some(1), false, false),
+            (output.clone(), "2.4.0", Some(2), false, true),
+            (output.clone(), "2.4.0", Some(0), false, true),
+            (version.into(), "2.4.0", Some(1), false, true),
+            (
+                format!("{output}e: Plugin failure\n"),
+                "2.4.0",
+                Some(1),
+                false,
+                true,
+            ),
+            (
+                format!("{output}exception: internal failure\n"),
+                "2.4.0",
+                Some(1),
+                false,
+                true,
+            ),
+            (
+                output.replace("private/", "unowned/"),
+                "2.4.0",
+                Some(1),
+                false,
+                true,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    selected_kotlin_output(&text, expected, exit, interrupted, complete, &paths),
+                    KotlinDiagnosticOutcome::Unverified(_)
+                ),
+                "{text}"
+            );
+        }
+        assert!(parse_diagnostic_line("e: file:///C:/broken%ZZ.kt:1:1 bad").is_none());
+        assert_eq!(
+            parse_diagnostic_line("e: C:/native%20.kt:1:1 bad")
+                .unwrap()
+                .path,
+            "C:/native%20.kt"
+        );
     }
 }

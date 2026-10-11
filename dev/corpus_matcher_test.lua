@@ -75,6 +75,24 @@ for _, case in ipairs(outcome_cases) do
     case.expected == 'matched' or case.expected == 'mismatch')
 end
 
+-- Independently written full-text payloads follow the installed Neovim LSP encoding.
+for _, case in ipairs({
+  { format = 'unix', eol = true, text = 'first😀\nsecond\n' },
+  { format = 'unix', eol = false, text = 'first😀\nsecond' },
+  { format = 'dos', eol = true, text = 'first😀\r\nsecond\r\n' },
+  { format = 'dos', eol = false, text = 'first😀\r\nsecond' },
+  { format = 'mac', eol = true, text = 'first😀\rsecond\r' },
+  { format = 'mac', eol = false, text = 'first😀\rsecond' },
+}) do
+  local buffer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'first😀', 'second' })
+  vim.bo[buffer].fileformat, vim.bo[buffer].eol = case.format, case.eol
+  local name = case.format .. (case.eol and ' with final separator' or ' without final separator')
+  check(name .. ': exact full text', probe.buffer_full_text(buffer), case.text)
+  check(name .. ': exact full-text hash', probe.buffer_sha256(buffer), vim.fn.sha256(case.text))
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
 for _, case in ipairs({
   { name = 'versioned diagnostic', version = 2, diagnostics = { { message = 'required' } }, expected = 'matched' },
   { name = 'versionless empty diagnostic', diagnostics = {}, expected = 'mismatch', limited = true },
@@ -88,10 +106,15 @@ for _, case in ipairs({
   { name = 'multiple outbound changes cannot certify diagnostic', version = 2, diagnostics = {}, resent = true, expected = 'protocol-error' },
   { name = 'failed change send is not measured', send_failed = true, silent = true, expected = 'not-run' },
   { name = 'diagnostic error is not measured', version = 2, diagnostics = {}, error = { code = -32603 }, expected = 'protocol-error' },
+  { name = 'wrong full-text wire hash cannot certify diagnostic', version = 2, diagnostics = { { message = 'required' } },
+    wrong_wire = true, expected = 'protocol-error' },
+  { name = 'incremental legacy notification retains version correlation', version = 2, diagnostics = { { message = 'required' } },
+    incremental = true, expected = 'matched' },
 }) do
   local buffer = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(buffer, vim.fn.tempname() .. '.kt')
   vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'before' })
+  vim.bo[buffer].fileformat, vim.bo[buffer].eol = 'unix', true
   vim.lsp.util.buf_versions[buffer] = 1
   local forwarded = 0
   local old_handler = function() forwarded = forwarded + 1 end
@@ -105,14 +128,18 @@ for _, case in ipairs({
   if case.before then publish(1, {}) end
   vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'after' })
   vim.lsp.util.buf_versions[buffer] = 2
-  client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 } })
+  local changes = { { text = case.wrong_wire and 'after\r\n' or 'after\n' } }
+  if case.incremental then changes = { { text = 'after', range = identifier } } end
+  client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 },
+    contentChanges = changes })
   if case.changed then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'another edit' }) end
   if not case.silent then publish(case.version, case.diagnostics) end
   if case.later then publish(2, { { message = 'required' } }) end
   if case.reticked then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'after' }) end
   if case.version_changed then vim.lsp.util.buf_versions[buffer] = 3 end
   if case.resent then
-    client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 } })
+    client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 },
+      contentChanges = changes })
   end
   local _, observed = finish(5)
   check(case.name, probe.request_outcome(observed.response, observed.error,
@@ -125,6 +152,136 @@ for _, case in ipairs({
       and type(row.generation_limit) == 'string', true)
   end
   if not case.silent or case.before then check(case.name .. ': original handler receives notifications', forwarded > 0, true) end
+  vim.lsp.util.buf_versions[buffer] = nil
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
+
+-- Canonical compiler receipt controls reuse the real buffer/outbound observer and RPC envelopes.
+for _, case in ipairs({
+  { name = 'fast versionless empty then accepted error', expected = 'matched', final_push = true },
+  { name = 'clean canonical empty is a positive mismatch', clean = true, empty = true, expected = 'mismatch' },
+  { name = 'partial canonical wrong empty is a positive mismatch', empty = true, expected = 'mismatch' },
+  { name = 'pre-arm accepted receipt is stale', preexisting = true, no_accept = true, expected = 'not-run' },
+  { name = 'other source SHA cannot certify result', wrong_sha = true, expected = 'not-run' },
+  { name = 'other file receipt cannot certify result', wrong_path = true, expected = 'not-run' },
+  { name = 'stale canonical store epoch is unmeasured', stale_epoch = true, expected = 'protocol-error' },
+  { name = 'receipt fields must match its epoch', bad_epoch = true, expected = 'not-run' },
+  { name = 'body edit during acceptance wait is unmeasured', changed_wait = true, expected = 'not-run' },
+  { name = 'source ABA during acceptance wait is unmeasured', aba_wait = true, expected = 'not-run' },
+  { name = 'body edit during diagnostic RPC is unmeasured', changed_rpc = true, expected = 'protocol-error' },
+  { name = 'unavailable trace is unmeasured', no_trace = true, expected = 'not-run' },
+  { name = 'unanswered diagnostic RPC is unmeasured', no_reply = true, expected = 'unanswered' },
+  { name = 'error diagnostic RPC is unmeasured', rpc_error = true, expected = 'protocol-error' },
+  { name = 'missing pull trace is unmeasured', no_pull = true, expected = 'protocol-error' },
+  { name = 'partial compiler pass cannot certify absence', require_complete = true, empty = true,
+    negative = true, expected = 'protocol-error' },
+  { name = 'clean compiler pass can certify selected diagnostic absence', require_complete = true, clean = true,
+    empty = true, negative = true, expected = 'matched' },
+  { name = 'unrelated fast index revision preserves canonical epoch', index_changed = true, expected = 'matched' },
+  { name = 'DOS full-text receipt matches wire SHA', fileformat = 'dos', lines = { 'after', 'peer' },
+    wire_text = 'after\r\npeer\r\n', expected = 'matched' },
+  { name = 'old Mac full-text receipt matches wire SHA', fileformat = 'mac', lines = { 'after', 'peer' },
+    wire_text = 'after\rpeer\r', expected = 'matched' },
+  { name = 'DOS without final separator matches wire SHA', fileformat = 'dos', eol_off = true, lines = { 'after', 'peer' },
+    wire_text = 'after\r\npeer', expected = 'matched' },
+  { name = 'Unix without final separator matches wire SHA', eol_off = true, lines = { 'after', 'peer' },
+    wire_text = 'after\npeer', expected = 'matched' },
+  { name = 'wrong full-text wire cannot certify canonical receipt', fileformat = 'dos', lines = { 'after', 'peer' },
+    wire_text = 'after\r\npeer\r\n', wrong_wire = true, expected = 'not-run' },
+  { name = 'missing full-text wire cannot certify canonical receipt', missing_wire = true, expected = 'not-run' },
+  { name = 'format change during acceptance wait is unmeasured', format_wait = true, expected = 'not-run' },
+}) do
+  local buffer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buffer, vim.fn.tempname() .. '.kt')
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'before' })
+  vim.bo[buffer].fileformat, vim.bo[buffer].eol = case.fileformat or 'unix', not case.eol_off
+  vim.lsp.util.buf_versions[buffer] = 1
+  local trace, uri = vim.fn.tempname(), vim.uri_from_bufnr(buffer)
+  vim.fn.writefile({}, trace)
+  local wire_text, after_lines = case.wire_text or 'after\n', case.lines or { 'after' }
+  local source_sha256, requests = vim.fn.sha256(wire_text), 0
+  local items = case.empty and {} or { { message = 'required', severity = 1,
+    range = { start = { line = 0, character = 0 }, ['end'] = { line = 0, character = 5 } } } }
+  local accepted_id = 'kotlin:7:4:3:5'
+  local result_id = case.stale_epoch and 'kotlin:7:4:2:5'
+    or (case.index_changed and 'kotlin:7:4:3:6' or accepted_id)
+  local function append(name, category, args)
+    vim.fn.writefile({ vim.json.encode({ name = name, cat = category, ph = 'X', ts = 1, dur = 1, args = args }) }, trace, 'a')
+  end
+  local function accept()
+    append('kotlin_diagnostics_accepted', 'compiler', {
+      path = case.wrong_path and vim.api.nvim_buf_get_name(buffer) .. '.other' or vim.api.nvim_buf_get_name(buffer),
+      source_sha256 = case.wrong_sha and string.rep('0', 64) or source_sha256,
+      result_id = accepted_id, source_generation = 4, store_epoch = case.bad_epoch and 4 or 3,
+      count = case.clean and #items or 1, clean = case.clean == true,
+      compiler_version = '2.4.0', compiler_inputs_sha256 = string.rep('b', 64),
+    })
+  end
+  if case.preexisting then accept() end
+  local old_handler, old_notify = function() end, function() return true end
+  local client = { handlers = { ['textDocument/publishDiagnostics'] = old_handler }, rpc = { notify = old_notify } }
+  local function publish(diagnostics)
+    client.handlers['textDocument/publishDiagnostics'](nil, { uri = uri, diagnostics = diagnostics }, {})
+  end
+  function client:request_sync(method, params, timeout, target_buffer)
+    requests = requests + 1
+    assert(method == 'textDocument/diagnostic' and params.textDocument.uri == uri and target_buffer == buffer)
+    assert(timeout == 5, 'RPC budget must be preserved')
+    if case.no_reply then return nil, 'timeout' end
+    if case.rpc_error then return { err = { code = -32603 } } end
+    if case.changed_rpc then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'during RPC' }) end
+    if not case.no_pull then append('diagnostics_pull', 'lsp', { path = vim.api.nvim_buf_get_name(buffer),
+      result_id = result_id, count = #items }) end
+    if case.final_push then publish(items) end
+    return { result = { kind = 'full', resultId = result_id, items = items } }
+  end
+  local result, observation = probe.canonical_kotlin_diagnostics(client, buffer, {
+    trace_path = case.no_trace and '' or trace, observation_timeout_ms = 30, request_timeout_ms = 5,
+    compiler_version = '2.4.0', require_complete = case.require_complete,
+    mutate = function()
+      vim.api.nvim_buf_set_lines(buffer, 0, -1, false, after_lines)
+      vim.lsp.util.buf_versions[buffer] = 2
+      local changes = not case.missing_wire and { { text = case.wrong_wire and 'after\npeer\n' or wire_text } } or nil
+      client.rpc.notify('textDocument/didChange', { textDocument = { uri = uri, version = 2 }, contentChanges = changes })
+      publish({})
+      if case.changed_wait or case.aba_wait or case.format_wait then
+        vim.defer_fn(function()
+          if case.format_wait then vim.bo[buffer].fileformat = 'dos'
+          else
+            vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'different body' })
+            if case.aba_wait then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, after_lines) end
+          end
+          accept()
+        end, 5)
+      elseif not case.no_accept then accept() end
+    end,
+    flush = function() end,
+  })
+  local evaluated = false
+  local outcome = probe.request_outcome(observation.response, observation.error, function(report)
+    evaluated = true
+    return case.negative and #report.items == 0 or (not case.negative and #report.items > 0)
+  end, observation.attempted)
+  check(case.name, outcome, case.expected)
+  check(case.name .. ': semantic predicate needs a certified response', evaluated,
+    case.expected == 'matched' or case.expected == 'mismatch')
+  check(case.name .. ': at most one standard pull', requests, observation.attempted and 1 or 0)
+  check(case.name .. ': original handler restored', client.handlers['textDocument/publishDiagnostics'] == old_handler, true)
+  check(case.name .. ': original outbound hook restored', client.rpc.notify == old_notify, true)
+  check(case.name .. ': producer closure stays unknown', observation.producer_closure_complete, false)
+  if case.final_push then
+    check(case.name .. ': first fast empty stays delivery evidence', #observation.push.response.result.diagnostics, 0)
+    check(case.name .. ': accepted partial error is usable positive evidence', observation.canonical_certified, true)
+    check(case.name .. ': partial pass does not certify absence', observation.absence_certified, false)
+  end
+  if case.index_changed then check(case.name .. ': canonical epoch excludes fast revision', observation.canonical_epoch, '7:4:3') end
+  if case.expected == 'matched' or case.expected == 'mismatch' then
+    check(case.name .. ': exposes the correlated RPC items', result == observation.response.result, true)
+    check(case.name .. ': records actual full-text wire SHA', observation.wire_source_sha256, source_sha256)
+    check(case.name .. ': buffer full text agrees with sent wire', observation.wire_matches_snapshot, true)
+  end
+  vim.fn.delete(trace)
   vim.lsp.util.buf_versions[buffer] = nil
   vim.api.nvim_buf_delete(buffer, { force = true })
 end
