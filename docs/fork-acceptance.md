@@ -50,7 +50,9 @@ harness exit codes below include broader operational checks and are not analysis
 
 Commands in this record are run through RTK as required by the local instructions.
 Record exact artifact paths and revisions when each check completes. An attempted
-command, an advertised capability or an empty successful RPC is not a semantic pass.
+command or an advertised capability is not a semantic pass. A valid RPC must satisfy
+the expectation; reviewed unknown-receiver controls may expect an empty result alongside
+a useful known receiver in the same edited state.
 
 ## Acceptance matrix
 
@@ -2230,6 +2232,38 @@ then exercise a real Retrofit Java-to-Kotlin unsaved type change and applied ren
 The Kotlin obsolete-binary diagnostic, compiler-transforming editing cases, wider
 constraint inference and matched six-project IDEA latency/memory measurements remain
 open. Experiment deadlines and cleanup remain separate from analysis acceptance.
+
+### Thirty-fourth checkpoint: separate analysis from experiment completion
+
+The corpus harness now records three independent sections: `semantic`, `operations`
+and dependency-source `coverage`. Each request retains `matched`, `mismatch`,
+`unanswered`, `protocol-error` or `not-run`. Only valid RPC responses evaluate semantic
+expectations. A valid empty positive response remains a functional mismatch; deadline
+and transport errors leave the assertion unmeasured. Planned requests are registered
+before initialization, so an interrupted import cannot become a zero-case pass.
+Unknown source counts are JSON null rather than invented zeroes. Missing dependency
+sources are input metadata, and required navigation cases retain their exact targets.
+
+Unsaved probes require confirmed outbound edits before dependent requests. Failed
+delivery leaves those requests unstarted; restoration is still attempted. If restoration
+cannot be delivered, subsequent probes stop with an incomplete experiment. External
+corpus hooks share the same outcome ledger. No request predicate, retry policy or
+semantic expectation was weakened.
+
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-corpus-outcomes-20261012-1`.
+The headless matcher passes **44 checks**, including absent/error/empty/useful responses
+and reviewed negative controls. The unchanged three-case local-extension corpus records
+**2 matched / 4 mismatched** on the original release and **6 matched / 0 mismatched**
+on the fixed release; all twelve requests use one valid first response. Their operational
+records are complete. An explicit one-millisecond readiness observation control executes
+**zero requests** and records **six not-run**, semantic **not-measured**, experiment
+**incomplete** and unknown source counts. It supplies no product speed or correctness
+conclusion. See `native-results.json`, `native-guards.json` and the three run directories.
+
+This slice changes only Lua validation and documentation. The checkpoint-33 Rust and
+release artifacts remain unchanged; no new Rust behavior or IDEA parity is claimed.
+Next run the existing real Gradle/Spring incomplete manifests, then the real Retrofit
+unsaved Java-to-Kotlin type change and applied rename with compiler/IDEA controls.
 
 ### Current slice: requires-only compatibility artifacts
 

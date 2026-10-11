@@ -1,5 +1,12 @@
 # Real-project corpus discovery
 
+Current interpretation (2026-10-12): historical harness exit codes and source-coverage
+FAIL labels below include operational checks. They are not project analysis scores.
+The corpus report now separates matched/mismatched semantic responses, unanswered or
+unstarted requests, execution state and source-input metadata. A deadline leaves a case
+unmeasured; unavailable sources matter to correctness when a required case cannot resolve.
+See checkpoint 34 in [fork-acceptance.md](fork-acceptance.md) for the verified classification.
+
 Updated: 2026-10-11 (Asia/Tokyo). Discovery is complete; semantic, compiler,
 IDEA and performance acceptance are **pending**. See [fork-acceptance.md](fork-acceptance.md).
 

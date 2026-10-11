@@ -14,12 +14,21 @@ vim.opt.hidden = true
 vim.cmd('filetype plugin indent on')
 vim.lsp.set_log_level('debug')
 
-local checks, failures, sources, prepared = {}, {}, {}, {}
-local function check(name, ok, detail)
-  checks[#checks + 1] = { name = name, ok = not not ok, detail = detail }
-  print((ok and 'PASS ' or 'FAIL ') .. name .. (detail and (' — ' .. detail) or ''))
+local checks, failures, sources, prepared, request_outcomes = {}, {}, {}, {}, {}
+local function check(name, ok, detail, kind, outcome)
+  kind = kind or 'semantic'
+  local measured = outcome == nil or outcome == 'matched' or outcome == 'mismatch'
+  local status = measured and (ok and 'matched' or 'mismatch') or outcome
+  checks[#checks + 1] = { name = name, ok = not not ok, detail = detail, kind = kind,
+    measured = measured, outcome = status, request_outcome = outcome }
+  local label = kind == 'operational' and (ok and 'OPERATION OK ' or 'OPERATION INCOMPLETE ')
+    or (measured and (ok and 'PASS semantic ' or 'FAIL semantic ') or 'UNMEASURED semantic ')
+  print(label .. name .. (detail and (' — ' .. detail) or ''))
   if not ok then failures[#failures + 1] = name end
   return ok
+end
+local function operational(name, ok, detail)
+  return check(name, ok, detail, 'operational')
 end
 local function write(name, value)
   vim.fn.writefile({ vim.json.encode(value) }, artifacts .. '/' .. name)
@@ -96,6 +105,19 @@ for _, case in ipairs(manifest.probes) do
   prepared[#prepared + 1] = prep
 end
 
+-- Keep unstarted requests visible when initialization/import reaches its execution bound.
+for _, prep in ipairs(prepared) do
+  local function register(item, method)
+    item.requests = item.requests or {}
+    local record = { case = item.case.id, method = method, attempts = 0, outcome = 'not-run' }
+    item.requests[method] = record
+    request_outcomes[#request_outcomes + 1] = record
+  end
+  if prep.known_control then register(prep.known_control, 'textDocument/completion') end
+  if prep.case.completion ~= false then register(prep, 'textDocument/completion') end
+  if prep.case.definition ~= false then register(prep, 'textDocument/definition') end
+end
+
 local function git_snapshot()
   local function run(args)
     local command = vim.list_extend({ 'git', '-C', project }, args)
@@ -133,20 +155,53 @@ local active_case
 local function finish()
   if client then
     local stopped = probe.shutdown(client, shutdown_state, 15000)
-    check('client shuts down gracefully', stopped.clean, vim.inspect(stopped))
+    operational('client shuts down gracefully', stopped.clean, vim.inspect(stopped))
   end
   for path, source in pairs(sources) do
-    check('source remains unchanged: ' .. path, vim.deep_equal(vim.fn.readfile(path), source.disk)
+    operational('source remains unchanged: ' .. path, vim.deep_equal(vim.fn.readfile(path), source.disk)
       and not vim.bo[source.buf].modified)
   end
   local after_git = git_snapshot()
   if before_git.status.code == 0 and after_git.status.code == 0 then
-    check('tracked working-tree status remains unchanged', before_git.status.stdout == after_git.status.stdout)
+    operational('tracked working-tree status remains unchanged', before_git.status.stdout == after_git.status.stdout)
   end
   local hashes = {}
   for path, source in pairs(sources) do hashes[path] = source.sha256 end
+  local semantic = { checks = {}, matched = 0, mismatched = 0, unmeasured = 0 }
+  local operations = { checks = {}, failures = {}, request_availability = {
+    ['protocol-error'] = 0, unanswered = 0, ['not-run'] = 0 } }
+  for _, item in ipairs(checks) do
+    if item.kind == 'operational' then
+      operations.checks[#operations.checks + 1] = item
+      if not item.ok then operations.failures[#operations.failures + 1] = item.name end
+    else
+      semantic.checks[#semantic.checks + 1] = item
+      if not item.measured then semantic.unmeasured = semantic.unmeasured + 1
+      elseif item.ok then semantic.matched = semantic.matched + 1
+      else semantic.mismatched = semantic.mismatched + 1 end
+    end
+  end
+  local unavailable, not_run = 0, 0
+  for _, item in ipairs(request_outcomes) do
+    if operations.request_availability[item.outcome] ~= nil then
+      operations.request_availability[item.outcome] = operations.request_availability[item.outcome] + 1
+      unavailable = unavailable + 1
+      if item.outcome == 'not-run' then not_run = not_run + 1 end
+    end
+  end
+  semantic.not_run_requests = not_run
+  semantic.status = semantic.mismatched > 0 and 'failed'
+    or (#semantic.checks == 0 and 'not-measured')
+    or ((semantic.unmeasured > 0 or not_run > 0) and 'incomplete') or 'passed'
+  operations.status = (#operations.failures == 0 and unavailable == 0) and 'complete' or 'incomplete'
+  local coverage = { observed = index_state.libraries and index_state.failed ~= nil and index_state.missing_sources ~= nil,
+    project_files = index_state.project_files or vim.NIL, library_files = index_state.library_files or vim.NIL,
+    failed = index_state.failed or vim.NIL, missing_sources = index_state.missing_sources or vim.NIL }
+  local status = semantic.status == 'failed' and 'failed'
+    or ((semantic.status ~= 'passed' or operations.status ~= 'complete') and 'incomplete') or 'passed'
   write('corpus-results.json', { mode = mode, project = project, manifest = manifest,
     manifest_path = manifest_path, checks = checks, failures = failures, source_sha256 = hashes,
+    status = status, semantic = semantic, operations = operations, coverage = coverage, request_outcomes = request_outcomes,
     server = client and client.server_info, shutdown = shutdown_state, binary = vim.env.KTLSP_BIN or arg[3],
     plugin = vim.env.IJLS_PLUGIN, server_executable = vim.env.IJLS_SERVER,
     removed_environment_names = probe.removed_environment,
@@ -156,31 +211,30 @@ local function finish()
     delivery = delivery_records, outbound_changes = outbound_changes,
     query_positions = 'definition at identifier start; completion after completion_prefix or full identifier',
     performance = 'separate startup observation and post-index first response; not timing acceptance' })
-  print(#failures == 0 and '\nALL CORPUS CHECKS PASSED' or ('\nFAILED: ' .. table.concat(failures, ', ')))
-  vim.cmd(#failures == 0 and 'qa!' or 'cq!')
+  print(('\nSEMANTIC %s: %d matched, %d mismatched, %d unmeasured, %d not-run requests'):format(
+    semantic.status, semantic.matched, semantic.mismatched, semantic.unmeasured, not_run))
+  print('OPERATIONS ' .. operations.status .. '; SOURCE INPUTS ' .. vim.inspect(coverage))
+  if #failures > 0 then print('RAW FAILURES: ' .. table.concat(failures, ', ')) end
+  vim.cmd(status == 'passed' and 'qa!' or 'cq!')
 end
 local initialized = vim.wait(120000, function()
   client = id and vim.lsp.get_client_by_id(id)
   return client and client.initialized
 end, 100)
-check('one client initializes', initialized, mode)
+operational('one client initializes', initialized, mode)
 if not initialized then finish() end
 for _, source in pairs(sources) do vim.lsp.buf_attach_client(source.buf, id) end
 print('SERVER ' .. vim.inspect(client.server_info))
 if mode == 'intellij' then
   local imported
   imported, import_state = probe.import_ready(client, manifest.build_tool or 'gradle',
-    tonumber(vim.env.KTLSP_CORPUS_READY_TIMEOUT_MS) or 600000, check)
+    tonumber(vim.env.KTLSP_CORPUS_READY_TIMEOUT_MS) or 600000, operational)
   if not imported then finish() end
 elseif wait_index then
   -- Same readiness meaning as dev/bench_initialize.py: both log messages must arrive.
   local ready = vim.wait(tonumber(vim.env.KTLSP_CORPUS_READY_TIMEOUT_MS) or 600000,
     function() return index_state.project and index_state.libraries end, 100)
-  check('ktlsp project and dependency indexing finishes', ready, vim.inspect(index_state))
-  local inputs = ready and index_state.failed == 0 and index_state.missing_sources == 0
-  check('ktlsp dependency source inputs are complete', inputs, vim.inspect(index_state))
-  -- Coverage remains a failed acceptance check, while completed indexing still permits
-  -- useful, explicitly limited semantic observations of the selected probes.
+  operational('ktlsp project and dependency indexing finishes', ready, vim.inspect(index_state))
   if not ready then finish() end
 end
 local strict_first = wait_index or mode == 'intellij'
@@ -220,8 +274,9 @@ local function deliver_edits(prep, restore)
   delivery_records[#delivery_records + 1] = { case = prep.case.id, restore = restore,
     expected = expected, outbound = vim.deepcopy(sent_versions), delivered = delivered,
     barrier = 'vim.lsp._changetracking.flush(client)' }
-  check(prep.case.id .. (restore and ': restored buffers delivered' or ': unsaved edits delivered'), delivered)
-  check(prep.case.id .. (restore and ': disk golden and clean buffers restored' or ': edits remain buffer-only'), unchanged)
+  operational(prep.case.id .. (restore and ': restored buffers delivered' or ': unsaved edits delivered'), delivered)
+  operational(prep.case.id .. (restore and ': disk golden and clean buffers restored' or ': edits remain buffer-only'), unchanged)
+  return delivered and unchanged
 end
 
 local function request(prep, method, accepts)
@@ -230,6 +285,7 @@ local function request(prep, method, accepts)
   if method == 'textDocument/completion' then params.context = { triggerKind = 1 } end
   local deadline = vim.uv.hrtime() + (tonumber(vim.env.KTLSP_CORPUS_REQUEST_TIMEOUT_MS) or 15000) * 1000000
   local attempts, result, error, matched, first, response_received = 0, nil, nil, false, nil, false
+  local outcome, attempt_outcomes = 'not-run', {}
   local once = strict_first or prep.has_edits
   local phase = prep.has_edits and 'first-response-after-unsaved-buffer-delivery' or semantic_phase
   local sent_before = vim.deepcopy(sent_versions)
@@ -237,22 +293,26 @@ local function request(prep, method, accepts)
     attempts = attempts + 1
     local response, err = client:request_sync(method, params, 5000, prep.buf)
     result, error = response and response.result, response and response.err or err
-    response_received = response ~= nil and error == nil
-    -- LSP null is a valid negative unknown-receiver response. A timeout/error is not.
-    local negative = method == 'textDocument/completion' and prep.case.completion_token == false
-    matched = response_received and (result ~= nil or negative) and accepts(result)
+    outcome = probe.request_outcome(response, err, accepts)
+    response_received = outcome == 'matched' or outcome == 'mismatch'
+    matched = outcome == 'matched'
+    attempt_outcomes[#attempt_outcomes + 1] = { attempt = attempts, outcome = outcome,
+      error = error, response_received = response ~= nil }
     if not first then first = { result = result, error = error, matched = matched,
-      response_received = response_received } end
+      response_received = response_received, outcome = outcome } end
     if not matched and not once then vim.wait(200) end
   until matched or once or vim.uv.hrtime() >= deadline
+  local record = prep.requests[method]
+  record.attempts, record.outcome, record.first_outcome, record.error = attempts, outcome, first.outcome, error
+  record.response_received = response_received
   vim.fn.writefile({ vim.json.encode({ case = prep.case.id, method = method, params = params,
     attempts = attempts, matched = matched, result = result, error = error, first = first,
-    response_received = response_received,
+    response_received = response_received, outcome = outcome, attempt_outcomes = attempt_outcomes,
     phase = phase, sent_before = sent_before, sent_after = vim.deepcopy(sent_versions) }) },
     artifacts .. '/corpus-requests.jsonl', 'a')
-  print(('REQUEST %s %s attempts=%d first_matched=%s matched=%s'):format(
-    prep.case.id, method, attempts, tostring(first.matched), tostring(matched)))
-  return matched, result, response_received
+  print(('REQUEST %s %s attempts=%d first_matched=%s matched=%s outcome=%s'):format(
+    prep.case.id, method, attempts, tostring(first.matched), tostring(matched), outcome))
+  return matched, result, response_received, outcome
 end
 
 local function exact_definition(prep, result)
@@ -261,7 +321,7 @@ end
 local function completion(prep)
   local token = prep.case.completion_token or prep.case.token
   local positive = prep.case.completion_token ~= false
-  local matched, result, response_received = request(prep, 'textDocument/completion', function(value)
+  local matched, result, response_received, outcome = request(prep, 'textDocument/completion', function(value)
     if positive and not probe.completion_has(value, token) then return false end
     for _, excluded in ipairs(prep.case.completion_excludes or {}) do
       if probe.completion_has(value, excluded) then return false end
@@ -269,35 +329,39 @@ local function completion(prep)
     return true
   end)
   if positive then check(prep.case.id .. ': completion offers ' .. token,
-    result ~= nil and probe.completion_has(result, token)) end
+    response_received and probe.completion_has(result, token), nil, 'semantic', outcome) end
   for _, excluded in ipairs(prep.case.completion_excludes or {}) do
     check(prep.case.id .. ': completion excludes ' .. excluded,
-      response_received and not probe.completion_has(result, excluded))
+      response_received and not probe.completion_has(result, excluded), nil, 'semantic', outcome)
   end
   if not positive and #(prep.case.completion_excludes or {}) == 0 then
-    check(prep.case.id .. ': completion response available', matched)
+    check(prep.case.id .. ': completion response available', matched, nil, 'semantic', outcome)
   end
-  return matched
+  return matched, outcome
 end
 for _, prep in ipairs(prepared) do
-  if prep.has_edits then deliver_edits(prep, false) end
-  if prep.known_control then
-    check(prep.case.id .. ': same-phase known receiver is useful', completion(prep.known_control))
+  local delivered = not prep.has_edits or deliver_edits(prep, false)
+  if delivered then
+    if prep.known_control then
+      local matched, outcome = completion(prep.known_control)
+      check(prep.case.id .. ': same-phase known receiver is useful', matched, nil, 'semantic', outcome)
+    end
+    if prep.case.completion ~= false then completion(prep) end
+    if prep.case.definition ~= false then
+      local matched, result, _, outcome = request(prep, 'textDocument/definition', function(value)
+        return exact_definition(prep, value)
+      end)
+      check(prep.case.id .. ': goto exact declaration', matched, matched and nil or vim.inspect(result), 'semantic', outcome)
+    end
   end
-  if prep.case.completion ~= false then completion(prep) end
-  if prep.case.definition ~= false then
-    local matched, result = request(prep, 'textDocument/definition', function(value)
-      return exact_definition(prep, value)
-    end)
-    check(prep.case.id .. ': goto exact declaration', matched, matched and nil or vim.inspect(result))
-  end
-  if prep.has_edits then deliver_edits(prep, true) end
+  -- Restore even after a failed edit barrier; later probes need confirmed original inputs.
+  if prep.has_edits and not deliver_edits(prep, true) then finish() end
 end
 if vim.env.KTLSP_CORPUS_EXTRA_PROBES then
   local ok, err = pcall(function()
     dofile(vim.env.KTLSP_CORPUS_EXTRA_PROBES)({ repo = vim.fs.dirname(script_dir), client = client,
-      sources = sources, check = check, project = project, artifacts = artifacts })
+      sources = sources, check = check, project = project, artifacts = artifacts, request_outcomes = request_outcomes })
   end)
-  check('external corpus probes complete', ok, ok and nil or tostring(err))
+  operational('external corpus probes complete', ok, ok and nil or tostring(err))
 end
 finish()

@@ -73,6 +73,16 @@ function M.exact_definition(result, target, ranges, uri_suffix)
   return false
 end
 
+-- A deadline bounds observation; only a valid RPC response can measure an expectation.
+function M.request_outcome(response, err, accepts, attempted)
+  if attempted == false then return 'not-run' end
+  if response == nil then
+    return (err == nil or err == 'timeout') and 'unanswered' or 'protocol-error'
+  end
+  if response.err ~= nil or err ~= nil then return 'protocol-error' end
+  return accepts(response.result) and 'matched' or 'mismatch'
+end
+
 function M.completion_has(result, token)
   if type(result) ~= 'table' then return false end
   for _, item in ipairs(result.items or result) do

@@ -204,8 +204,8 @@ incomplete completion, and unsaved declaration rename/removal/return-type change
 Use `corpus` with a completion UI case for real-project blank `super.` acceptance;
 retain the applied buffer and verify it with that project's compiler and plugins.
 
-The mixed, corpus, completion UI and live Gradle probes require an acknowledged shutdown,
-one exit notification and actual server exit code/signal zero. Run
+The mixed, corpus, completion UI and live Gradle probes record shutdown acknowledgement,
+exit notification and actual server exit separately from semantic results. Run
 `nvim --headless -u NONE -i NONE -l dev/nvim_lsp_probe_selfcheck.lua` for fourteen focused
 shutdown controls without starting a server or compiler.
 
@@ -261,9 +261,12 @@ probes on a real project. The manifest supplies relative source files, unique an
 and expected declaration files/anchors. `KTLSP_PROBE_SERVER=intellij` uses the same official
 plugin configuration as `mixed`, with successful build-tool import required. Source hashes, working-tree
 status, first/last responses and bounded indexing retries are recorded; retries are not timing samples.
-Set `KTLSP_CORPUS_WAIT_INDEX=1` to require both project and dependency indexing notifications and
-check the first response without retries. Missing dependency sources remain a failed coverage check;
-the selected semantic probes still run after completed indexing and explicitly record incomplete inputs.
+Set `KTLSP_CORPUS_WAIT_INDEX=1` to wait for both project and dependency indexing notifications and
+check the first response without retries. `corpus-results.json` separates `semantic`, `operations`
+and dependency-source `coverage`. Valid RPC responses are matched against the expectation;
+an empty positive result is a mismatch. Unanswered, protocol-error and unstarted requests remain
+unmeasured. An execution deadline never turns unexecuted cases into passes or semantic failures.
+Missing source counts are metadata; a required navigation case still has to resolve correctly.
 Definition requests use the identifier start; completion requests use its end, or the manifest's
 `completion_prefix`, so an unfiltered first page does not obscure the requested member.
 Optional `buffer_edits` test partial identifiers, dangling dots, syntax errors in a peer file,
@@ -277,8 +280,10 @@ Spring extension-receiver and incomplete-selector regressions use the same route
 see [the fixture instructions](dev/corpus/fixtures/spring-provider/README.md).
 Set `KTLSP_CORPUS_EXTRA_PROBES` to an absolute Lua file to exercise an external analysis provider
 with the same corpus client before shutdown. The file returns a function receiving
-`{repo, client, sources, check, project, artifacts}`. Use `check` for assertions and restore any
+`{repo, client, sources, check, project, artifacts, request_outcomes}`. Use `check` for assertions and restore any
 unsaved edits; the normal source guards, result report and graceful shutdown still run on errors.
+`check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
+from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus
 --root /tmp/project --file /tmp/provider/manifest.json --bin /tmp/provider/server --no-build`.
 This hook enables shared completion, diagnostics, navigation, references and applied-rename

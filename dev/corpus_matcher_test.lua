@@ -47,4 +47,31 @@ check('UTF-16 bounds valid', probe.range_in_source({ start = { line = 0, charact
   ['end'] = { line = 0, character = 2 } }, { '😀' }), true)
 check('UTF-16 column outside source rejected', probe.range_in_source({ start = { line = 0, character = 0 },
   ['end'] = { line = 0, character = 3 } }, { '😀' }), false)
-print(('PASS corpus exact-definition matcher: %d checks'):format(count))
+local outcome_cases = {
+  { name = 'unstarted is not measured', attempted = false, expected = 'not-run' },
+  { name = 'deadline without RPC is unanswered', err = 'timeout', expected = 'unanswered' },
+  { name = 'missing RPC is unanswered', expected = 'unanswered' },
+  { name = 'send failure is operational', err = 'request failed', expected = 'protocol-error' },
+  { name = 'RPC error cannot use its result', response = { result = { useful = true }, err = { code = -32603 } },
+    accepted = true, expected = 'protocol-error' },
+  { name = 'transport error cannot use a result', response = { result = {} }, err = 'interrupted',
+    accepted = true, expected = 'protocol-error' },
+  { name = 'valid nil positive is a functional mismatch', response = {}, expected = 'mismatch' },
+  { name = 'valid JSON null positive is a functional mismatch', response = { result = vim.NIL }, expected = 'mismatch' },
+  { name = 'valid empty positive is a functional mismatch', response = { result = {} }, expected = 'mismatch' },
+  { name = 'valid wrong result is a functional mismatch', response = { result = { wrong = true } }, expected = 'mismatch' },
+  { name = 'valid useful result is matched', response = { result = { useful = true } }, accepted = true, expected = 'matched' },
+  { name = 'valid nil reviewed negative is matched', response = {}, accepted = true, expected = 'matched' },
+  { name = 'valid JSON null reviewed negative is matched', response = { result = vim.NIL }, accepted = true, expected = 'matched' },
+}
+for _, case in ipairs(outcome_cases) do
+  local evaluated = false
+  local actual = probe.request_outcome(case.response, case.err, function()
+    evaluated = true
+    return case.accepted == true
+  end, case.attempted)
+  check(case.name, actual, case.expected)
+  check(case.name .. ': predicate requires a valid RPC', evaluated,
+    case.expected == 'matched' or case.expected == 'mismatch')
+end
+print(('PASS corpus matcher and request outcomes: %d checks'):format(count))
