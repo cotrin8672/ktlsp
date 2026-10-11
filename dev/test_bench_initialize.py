@@ -104,6 +104,20 @@ class BenchmarkChecks(unittest.TestCase):
         self.assertTrue(result["forced_termination"])
         self.assertEqual(proc.events[-2:], ["kill", "wait"])
 
+    def test_shutdown_allows_bounded_large_index_cleanup(self):
+        class DelayedExit(Process):
+            def wait(self, timeout=None):
+                if self.returncode is None and timeout is not None and timeout < 5:
+                    raise subprocess.TimeoutExpired("large-index-cleanup", timeout)
+                return super().wait(timeout)
+
+        proc = DelayedExit()
+        with patch.object(bench, "send_message", proc.send):
+            result = bench.stop_process(proc, proc.messages, [])
+        self.assertTrue(result["graceful"])
+        self.assertFalse(result["forced_termination"])
+        self.assertGreaterEqual(result["elapsed_ms"], 0)
+
     def run_benchmark(self, proc):
         with patch.object(bench.subprocess, "Popen", return_value=proc), \
              patch.object(bench, "JsonRpcReader"), \

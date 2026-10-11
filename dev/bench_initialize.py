@@ -76,7 +76,8 @@ def wait_for_message(
     return None, None
 
 
-def stop_process(proc, messages, stash, timeout_s: float = 3.0) -> Dict[str, Any]:
+def stop_process(proc, messages, stash, timeout_s: float = 15.0) -> Dict[str, Any]:
+    started = time.monotonic()
     status = {"shutdown_response_received": False, "shutdown_ok": False,
               "exit_sent": False, "forced_termination": False}
     try:
@@ -101,6 +102,7 @@ def stop_process(proc, messages, stash, timeout_s: float = 3.0) -> Dict[str, Any
             proc.kill()
         proc.wait()  # Reap after both graceful exit and forced termination.
     status["exit_code"] = proc.returncode
+    status["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
     status["graceful"] = (status["shutdown_ok"] and status["exit_sent"]
                           and not status["forced_termination"] and proc.returncode == 0)
     return status

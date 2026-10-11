@@ -831,7 +831,8 @@ fallback and unpublished loading. The original implementation fails the two new
 failure/concurrency controls. The first repaired run exposed stale Windows
 directory-entry size observations; fresh file reads retain the real partial-write
 assertion and pass. Evidence: `ktlsp-classpath-persistence-20261011/implementation-1/`.
-Actual large-cache CPU cost and memory savings have not yet been measured.
+The whole-release large-cache comparison below establishes no measured memory
+or speed improvement; it does not isolate this persistence change.
 
 The mixed, corpus, UI and live Gradle probes now observe the shutdown response and
 actual `on_exit` result. They require one acknowledged shutdown, one exit
@@ -904,6 +905,66 @@ Evidence: `ktlsp-shadow-twelfth-replay-20261011/final-editor-proof.json`
 The eleventh replay's duplicate shutdown remains a separate historical limitation.
 The server peak near 6 GB and compiler-plugin gaps remain unresolved; this
 checkpoint does not establish whole-project performance or IDEA parity.
+
+### Warm Gradle cache: matched server memory baseline
+
+Eleventh-fixed-2 (A) and twelfth-fixed-2 (B) ran in ABBA order against the same
+dedicated Gradle cache, with no concurrent compiler, editor or build workloads.
+All four runs preserve the same 932 cache files by content, 293 source archives,
+selected project/model inputs and immutable release binaries. The model may be
+resaved with different filesystem timestamps while retaining identical bytes.
+Each run records ten seconds of post-index RSS (101 samples); the table uses
+that interval's median. Decimal MB are used for memory, seconds for time.
+
+| Run | Project index | Library index | Steady RSS MB | Lifetime peak commit MB | Shutdown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1 | 6.703 | 9.453 | 3,704.762 | 3,928.834 | 10.391 |
+| B1 | 7.328 | 10.156 | 3,705.127 | 3,930.870 | 10.578 |
+| B2 | 6.890 | 9.562 | 3,705.537 | 3,932.115 | 10.750 |
+| A2 | 6.500 | 9.266 | 3,699.962 | 3,926.401 | 9.688 |
+
+Both releases retain approximately 3.7 GB after indexing and peak at 3.93 GB
+commit on this warm workload. Two runs per arm do not establish a speedup or a
+p95, and whole-release comparison cannot isolate `BufReader` or query work.
+CPU is not measured. All four servers acknowledge shutdown once and exit zero
+without termination; their roughly ten-second cleanup remains a latency gap.
+The benchmark's former three-second wait forced termination after a valid
+shutdown acknowledgement in the unmeasured cache warmup. That failed warmup is
+retained. The client now waits a bounded fifteen seconds, records actual shutdown
+duration, and still rejects missing acknowledgements, nonzero exits and forced
+termination. Its nine controls pass, including the original timeout/kill checks.
+Increasing the measurement wait does not make slow shutdown acceptable UX.
+
+Each measured run indexes the same 60,746 library files and 1,245,317 symbols,
+including 13,891 JDK files and 285,542 JDK symbols, from 320 dependencies.
+The server-only runs report 11,327 project files; each editor run reports 11,325
+closed project files because its two open buffers are indexed separately.
+Three failed and twenty-six missing source inputs keep coverage **FAIL**;
+`steady_state_accepted` remains false. The existing real-Neovim corpus route then
+passes all three exact first semantic checks on each release, without retries.
+Those correctness-only runs also retain coverage failure and clean native exits.
+The first navigation normally materializes one JDK `Collection.java` file whose
+bytes match the guarded source ZIP entry. Its original cache guard failure is
+preserved; the second correctness run starts from that 933-file state. These
+editor runs are not a matched timing extension of the ABBA experiment.
+
+Evidence: `ktlsp-server-memory-pair-20261011/{ABBA-statistics.json,ABBA-times.json,
+A1.json,B1.json,B2.json,A2.json,corpus-A-cache-delta.json,guards-corpus-B.json}`
+and `shutdown-client-checks.json`. Existing watcher repair prevents the separate
+63 GB client allocation failure; it does not solve this server footprint.
+
+The next allocation hypothesis is confirmed structurally, not yet repaired:
+bincode preserves type-context values but reconstructs a separate candidate
+`Arc` per `TypeRef`. Three immutable cache copies (Guava, Gradle profiler and
+Kotlin stdlib) contain 67,573 duplicate candidate allocations within files.
+The stdlib sample has 25,756 candidate pointers but only 591 distinct ordered
+candidate lists summed per file. These are archive populations, not final selected
+index retention or RSS. Native Rust 1.98.1 layout measurements find
+`IndexedSymbol` at 696 bytes and `TypeRef` at 112 bytes; slot sizes alone do not
+prove allocation savings. Evidence: `ktlsp-warm-sharing-20261011/baseline-receipt.json`.
+The planned first change restores only identical ordered candidate-list sharing
+after accepted cache loads, preserving source identity, type values and cache
+bytes. Inline optional type slots and decode-buffer peaks remain separate work.
 
 ### Current slice: requires-only compatibility artifacts
 
