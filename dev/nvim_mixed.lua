@@ -139,16 +139,16 @@ if mode == 'intellij' then
   end
 end
 local config = probe.config(project, vim.env.KTLSP_BIN or arg[2], artifacts, 'maven')
+local shutdown_state = probe.observe_shutdown(config)
 local id = vim.lsp.start(config, { bufnr = buffers.kotlin })
 local client
 local function finish()
   if client then
-    client:stop()
-    check('client shuts down gracefully', vim.wait(15000, function() return client:is_stopped() end, 100))
-    if not client:is_stopped() then client:stop(true) end
+    local stopped = probe.shutdown(client, shutdown_state, 15000)
+    check('client shuts down gracefully', stopped.clean, vim.inspect(stopped))
   end
   write(artifacts .. '/mixed-results.json', { vim.json.encode({ mode = mode, checks = checks,
-    failures = failures, server = client and client.server_info, compiler = compiler,
+    failures = failures, server = client and client.server_info, shutdown = shutdown_state, compiler = compiler,
     binary = vim.env.KTLSP_BIN or arg[2], plugin = vim.env.IJLS_PLUGIN,
     server_executable = vim.env.IJLS_SERVER, jdk = vim.env.IJLS_JDK or vim.env.JAVA_HOME,
     removed_environment_names = probe.removed_environment,

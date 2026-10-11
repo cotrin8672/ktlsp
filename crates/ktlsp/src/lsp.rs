@@ -2898,9 +2898,8 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        // Synchronous; the lock is never held across an `.await`. `doc_text` is read ONCE only to
-        // build the `LineIndex` and compute the byte offset, then the offset is passed to
-        // `ws.complete`, which internally accesses the cached tree exactly like `goto_definition`.
+        // Synchronous; the lock is never held across an `.await`. Current text builds the line
+        // index and byte offset. One shared completion query supplies trace metadata and items.
         let snippets = *self.snippets_supported.lock();
         let (items, is_incomplete, symbol, semantic) = {
             let mut ws = self.ws.lock();
@@ -2911,14 +2910,8 @@ impl LanguageServer for Backend {
             let line_index = LineIndex::new(&text);
             let offset = line_index.offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
-            let semantic = ws.completion_query(&key, offset).map(|query| {
-                (
-                    query.context_label(),
-                    query.status_label(),
-                    query.reason_labels(),
-                )
-            });
-            match ws.complete(&key, offset, snippets) {
+            let (shaped, semantic) = ws.complete_with_semantic(&key, offset, snippets);
+            match shaped {
                 Some(shaped) => {
                     let incomplete = shaped.is_incomplete;
                     let items = shaped

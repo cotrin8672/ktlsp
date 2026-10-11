@@ -5,7 +5,7 @@ local root, binary, artifacts = vim.fs.abspath(assert(arg[1])), assert(arg[2]), 
 probe.outside_project(root, artifacts)
 assert(vim.fn.isdirectory(root) == 0, 'processor reload fixture must be new')
 local report = { checks = {}, phases = {}, requests = {}, messages = {}, notifications = {}, delivery = {} }
-local client, client_id, exited
+local client, client_id, shutdown_state
 local function check(name, passed, detail)
   report.checks[#report.checks + 1] = { name = name, passed = passed == true, detail = detail }
   vim.fn.writefile({ vim.json.encode(report) }, artifacts .. '/processor-reload.json')
@@ -118,7 +118,7 @@ local function run()
     report.messages[#report.messages + 1] = message
     if log_handler then return log_handler(error, message, context, options) end
   end
-  config.on_exit = function(code, signal) exited = { code = code, signal = signal } end
+  shutdown_state = probe.observe_shutdown(config)
   client_id = assert(vim.lsp.start(config, { bufnr = buffers.Java }))
   check('one real Neovim client initializes', vim.wait(10000, function()
     client = vim.lsp.get_client_by_id(client_id)
@@ -256,15 +256,14 @@ local function run()
       check('phase ' .. number .. ' ' .. label .. ' disk source remains original',
         vim.deep_equal(vim.fn.readfile(vim.api.nvim_buf_get_name(buffer)), originals[buffer]))
     end
-    check('phase ' .. number .. ' keeps the same live client', client.id == client_id and not exited)
+    check('phase ' .. number .. ' keeps the same live client', client.id == client_id and not shutdown_state.exit)
   end
 end
 local ok, error = xpcall(run, debug.traceback)
 check('processor reload probe completes', ok, not ok and error or nil)
 if client then
-  client:stop()
-  check('same client exits gracefully', vim.wait(10000, function() return exited ~= nil end, 50)
-    and exited.code == 0 and exited.signal == 0, exited)
+  report.shutdown = probe.shutdown(client, shutdown_state, 10000)
+  check('same client exits gracefully', report.shutdown.clean, report.shutdown)
 end
 local failed = vim.iter(report.checks):any(function(item) return not item.passed end)
 vim.cmd(failed and 'cquit 1' or 'qa!')

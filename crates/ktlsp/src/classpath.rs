@@ -8,8 +8,10 @@
 //! Pure parsing (`parse_dump`) is unit-tested; `resolve` does the gradle process IO.
 
 use std::collections::BTreeMap;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -649,6 +651,20 @@ struct CacheEntry {
     modules: Vec<ModuleClasspath>,
 }
 
+#[derive(Serialize)]
+struct CacheEntryRef<'a> {
+    model_version: u32,
+    mtimes: &'a BTreeMap<String, u128>,
+    modules: &'a [ModuleClasspath],
+}
+
+static CACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn read_cache_entry(path: &Path) -> Option<CacheEntry> {
+    let file = std::fs::File::open(path).ok()?;
+    serde_json::from_reader(BufReader::new(file)).ok()
+}
+
 fn cache_path(root: &Path) -> PathBuf {
     // One cache file per root, named by a hash of the canonical root path.
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -703,11 +719,8 @@ fn load_snapshot_with(
         }
     }
     let cache = cache_path(root);
-    if let Some(text) = (!force)
-        .then(|| std::fs::read_to_string(&cache).ok())
-        .flatten()
-    {
-        if let Ok(entry) = serde_json::from_str::<CacheEntry>(&text) {
+    if !force {
+        if let Some(entry) = read_cache_entry(&cache) {
             if entry.model_version == MODEL_VERSION
                 && entry.mtimes == build_file_mtimes(root, &entry.modules)
             {
@@ -729,10 +742,10 @@ fn load_snapshot_with(
 pub fn store_snapshot(root: &Path, model: &ProjectSnapshot) {
     write_cache_entry(
         &cache_path(root),
-        &CacheEntry {
+        &CacheEntryRef {
             model_version: MODEL_VERSION,
-            mtimes: model.mtimes.clone(),
-            modules: model.modules.clone(),
+            mtimes: &model.mtimes,
+            modules: &model.modules,
         },
     );
 }
@@ -752,15 +765,13 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
         }
     }
     let cache = module_cache_path(root, module);
-    if let Ok(text) = std::fs::read_to_string(&cache) {
-        if let Ok(entry) = serde_json::from_str::<CacheEntry>(&text) {
-            if entry.model_version == MODEL_VERSION
-                && entry.mtimes == build_file_mtimes(root, &entry.modules)
-            {
-                if let Some(found) = entry.modules.iter().find(|m| m.module == module).cloned() {
-                    publish_modules(root, entry.modules);
-                    return Ok(found);
-                }
+    if let Some(entry) = read_cache_entry(&cache) {
+        if entry.model_version == MODEL_VERSION
+            && entry.mtimes == build_file_mtimes(root, &entry.modules)
+        {
+            if let Some(found) = entry.modules.iter().find(|m| m.module == module).cloned() {
+                publish_modules(root, entry.modules);
+                return Ok(found);
             }
         }
     }
@@ -775,10 +786,10 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
     let mtimes = build_file_mtimes(root, &modules);
     write_cache_entry(
         &cache,
-        &CacheEntry {
+        &CacheEntryRef {
             model_version: MODEL_VERSION,
-            mtimes,
-            modules: modules.clone(),
+            mtimes: &mtimes,
+            modules: &modules,
         },
     );
     publish_modules(root, modules);
@@ -797,20 +808,29 @@ fn publish_modules(root: &Path, modules: Vec<ModuleClasspath>) {
     publish(root, all, mtimes);
 }
 
-fn write_cache_entry(path: &Path, entry: &CacheEntry) {
+fn write_cache_entry(path: &Path, entry: &impl Serialize) {
     let Some(parent) = path.parent() else {
         return;
     };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(text) = serde_json::to_string(entry) else {
+    let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{sequence}.tmp", std::process::id()));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    else {
         return;
     };
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(tmp, path);
+    let _cleanup = TempFile(&tmp);
+    let mut writer = BufWriter::new(file);
+    if serde_json::to_writer(&mut writer, entry).is_err() || writer.flush().is_err() {
+        return;
     }
+    drop(writer);
+    let _ = std::fs::rename(&tmp, path);
 }
 
 fn module_cache_path(root: &Path, module: &str) -> PathBuf {
@@ -1404,6 +1424,223 @@ dependencies {
             .flatten()
             .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_stream_failure_keeps_valid_cache_and_removes_partial_temp() {
+        struct PrefixThenError<'a> {
+            root: &'a Path,
+            reached_disk: &'a std::cell::Cell<bool>,
+        }
+        impl Serialize for PrefixThenError<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                let capacity = std::io::BufWriter::new(std::io::sink()).capacity();
+                map.serialize_entry("partial", &"x".repeat(capacity * 2 + 1024))?;
+                self.reached_disk
+                    .set(
+                        std::fs::read_dir(self.root)
+                            .unwrap()
+                            .flatten()
+                            .any(|entry| {
+                                entry.path().extension().is_some_and(|ext| ext == "tmp")
+                                    && std::fs::read(entry.path())
+                                        .is_ok_and(|bytes| !bytes.is_empty())
+                            }),
+                    );
+                Err(serde::ser::Error::custom("failure after streaming prefix"))
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_cache_stream_failure_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("classpath.json");
+        let original = br#"{"model_version":4,"mtimes":{},"modules":[]}"#;
+        std::fs::write(&path, original).unwrap();
+        let reached_disk = std::cell::Cell::new(false);
+        write_cache_entry(
+            &path,
+            &PrefixThenError {
+                root: &root,
+                reached_disk: &reached_disk,
+            },
+        );
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let stored: CacheEntry = serde_json::from_slice(original).unwrap();
+        assert_eq!(stored.model_version, MODEL_VERSION);
+        assert!(std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .all(|entry| { entry.path().extension().is_none_or(|ext| ext != "tmp") }));
+        assert!(
+            reached_disk.get(),
+            "failure must occur after a real partial disk write"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_concurrent_writers_publish_one_whole_json_and_remove_owned_temps() {
+        #[derive(Serialize)]
+        struct Payload {
+            writer: &'static str,
+            payload: String,
+            complete: bool,
+        }
+        struct Paused<'a> {
+            value: &'a Payload,
+            ready: &'a std::sync::Barrier,
+            release: &'a std::sync::Barrier,
+        }
+        impl Serialize for Paused<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+                let mut record = serializer.serialize_struct("Payload", 3)?;
+                record.serialize_field("writer", self.value.writer)?;
+                record.serialize_field("payload", &self.value.payload)?;
+                self.ready.wait();
+                self.release.wait();
+                record.serialize_field("complete", &self.value.complete)?;
+                record.end()
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_cache_concurrent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("classpath.json");
+        let capacity = std::io::BufWriter::new(std::io::sink()).capacity();
+        let values = [
+            Payload {
+                writer: "first",
+                payload: "a".repeat(capacity * 2 + 1024),
+                complete: true,
+            },
+            Payload {
+                writer: "second",
+                payload: "b".repeat(capacity * 3 + 1024),
+                complete: true,
+            },
+        ];
+        let expected = values
+            .iter()
+            .map(|value| serde_json::to_vec(value).unwrap())
+            .collect::<Vec<_>>();
+        let ready = std::sync::Barrier::new(3);
+        let release = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let cache_path = &path;
+            let ready_ref = &ready;
+            let release_ref = &release;
+            let jobs = values
+                .iter()
+                .map(|value| {
+                    scope.spawn(move || {
+                        write_cache_entry(
+                            cache_path,
+                            &Paused {
+                                value,
+                                ready: ready_ref,
+                                release: release_ref,
+                            },
+                        );
+                    })
+                })
+                .collect::<Vec<_>>();
+            ready.wait();
+            let temps = std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+                .collect::<Vec<_>>();
+            let partial_writes = temps
+                .iter()
+                .all(|entry| !std::fs::read(entry.path()).unwrap().is_empty());
+            release.wait();
+            for job in jobs {
+                job.join().unwrap();
+            }
+            assert_eq!(
+                temps.len(),
+                2,
+                "each concurrent writer must own a distinct temp file"
+            );
+            assert!(partial_writes);
+        });
+        let stored = std::fs::read(&path).unwrap();
+        assert!(
+            expected.contains(&stored),
+            "cache must be one complete writer's JSON"
+        );
+        assert!(std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .all(|entry| { entry.path().extension().is_none_or(|ext| ext != "tmp") }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_snapshot_round_trip_preserves_wire_format_and_does_not_publish() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_cache_snapshot_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("mapped-module")).unwrap();
+        std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
+        let compiler = serde_json::json!({
+            "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
+            "arguments": ["-P", "annotation=one\ttwo\n三"], "annotation_processor_path": [],
+            "java_home": null, "options": {"jvmTarget": "17"}, "output_roots": [],
+            "complete": false, "problem": "opaque producer"
+        });
+        let modules = parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nCOMPILER\tmain\t{compiler}\nEND\t:app\n",
+            root.join("mapped-module").display(), root.join("custom-kotlin").display(),
+            root.join("custom-output").display()
+        ));
+        let mut model = ProjectSnapshot::new(modules);
+        model.mtimes = build_file_mtimes(&root, &model.modules);
+        let original = serde_json::to_vec(&CacheEntry {
+            model_version: MODEL_VERSION,
+            mtimes: model.mtimes.clone(),
+            modules: model.modules.clone(),
+        })
+        .unwrap();
+        store_snapshot(&root, &model);
+        let cache = cache_path(&root);
+        assert_eq!(std::fs::read(&cache).unwrap(), original);
+        let loaded = load_snapshot_with(&root, false, || {
+            panic!("valid disk cache must avoid Gradle")
+        })
+        .unwrap();
+        assert_eq!(loaded.modules, model.modules);
+        assert_eq!(loaded.mtimes, model.mtimes);
+        assert!(snapshot(&root).is_none(), "loading must remain unpublished");
+
+        for invalid in [
+            original[..original.len() - 1].to_vec(),
+            [original.as_slice(), b" trailing"].concat(),
+        ] {
+            std::fs::write(&cache, invalid).unwrap();
+            let calls = std::cell::Cell::new(0);
+            let loaded = load_snapshot_with(&root, false, || {
+                calls.set(calls.get() + 1);
+                Ok(model.modules.clone())
+            })
+            .unwrap();
+            assert_eq!(
+                calls.get(),
+                1,
+                "invalid cache must use the existing dump fallback"
+            );
+            assert_eq!(loaded.modules, model.modules);
+            assert!(snapshot(&root).is_none());
+        }
+        std::fs::remove_file(cache).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

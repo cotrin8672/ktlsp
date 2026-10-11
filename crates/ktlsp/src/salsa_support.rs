@@ -316,7 +316,16 @@ impl SalsaState {
         if self.indexed_revision == revision {
             return;
         }
+        let started = crate::trace::enabled().then(std::time::Instant::now);
         self.db.set_index(index);
+        if let Some(started) = started {
+            crate::trace::span(
+                "inference_snapshot",
+                "index",
+                started,
+                serde_json::json!({ "revision": revision }),
+            );
+        }
         self.index
             .set_revision(&mut self.db)
             .with_durability(Durability::LOW)

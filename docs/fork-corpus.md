@@ -1051,6 +1051,35 @@ Evidence under the same corpus root is
 `1fb5c3199adead18450ebb9e14ba9f3ed4098f236c4b65e085de07f5dd0a12b1`,
 its referenced raw memory JSON/JSONL and logs, and
 `gradle-8.14.3-ktlsp-watch-cap-eleventh2-1/{artifacts,xdg-state/nvim-data/lsp.log}`.
+
+### Twelfth release: CEM native completion UI and lifecycle
+
+The immutable twelfth-fixed-2 binary, SHA-256
+`7c17b5f0991774b37c7cee3bf73936de426f2476f51ada8e3e984a970670dce0`,
+and eleventh-fixed-2 were compared through the same guarded fixed-2 harness.
+Both pass the four unchanged CEM completion/exact-navigation assertions. Both
+index 34,783 library files and 825,029 symbols, with one failed and two missing
+source inputs; coverage remains **FAIL**.
+
+The new native UI probe removes the selector from the unsaved
+`EnchantableDrillBlockEntity.kt` return line, enters insert mode and types the dot
+after `super`. Both versions make one first completion request and receive zero
+items, with the semantic reason `unknown-receiver-type`. No useful menu appears;
+zero successful first/warm samples means no completion performance result. The
+existing fully named selector still resolves to the exact Java declaration.
+The multiple-supertype receiver path is a hypothesis to reduce and verify against
+compiler/IDEA behavior; neither arbitrary-super selection nor relaxed matching is
+an acceptable repair.
+
+Both RPC and UI phases now independently record one acknowledged shutdown, one
+exit notification, actual server exit/signal zero and no forced termination.
+Source/binary/fixture guards remain unchanged. Each overall CEM harness exits one
+because coverage and useful UI completion fail; clean shutdown does not override
+those failures. Evidence:
+`ktlsp-completion-measurement-20261011/run-{baseline,candidate}-2-cem/`.
+The mixed fixture's 62 useful native UI samples per version and their p50/p95 are
+recorded in [fork-acceptance.md](fork-acceptance.md); those timings do not stand in
+for the missing CEM samples or for the other five real roots.
 Source/output/configuration/external-path boundaries also have six focused tests;
-notification-classification cost, server allocation peaks, shutdown and remaining
-dependency coverage require further work.
+notification-classification cost, server allocation peaks and remaining dependency
+coverage require further work.

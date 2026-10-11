@@ -1033,8 +1033,8 @@ impl Workspace {
     ///   inherited members (supertype walk), and applicable extensions. Silent omission (`None`)
     ///   when the receiver type can't be inferred.
     ///
-    /// Open buffers reuse their cached tree (no parse on the hot path); a non-open file is read from
-    /// disk and parsed once, exactly like `goto_definition`.
+    /// Java open buffers reuse their cached tree. Kotlin queries parse their source and, for dot
+    /// recovery, synthetic source. Closed buffers read the current text from disk.
     pub fn complete(
         &mut self,
         key: &str,
@@ -1045,6 +1045,38 @@ impl Workspace {
             return Some(completions);
         }
         let query = self.completion_query(key, offset)?;
+        Self::shape_completion_query(query, snippets_supported)
+    }
+
+    /// Keep the LSP trace summary and rendered items from one ordinary query.
+    /// Preserve the LSP's query-before-provider order; `complete` keeps its public behavior.
+    pub(crate) fn complete_with_semantic(
+        &mut self,
+        key: &str,
+        offset: usize,
+        snippets_supported: bool,
+    ) -> (
+        Option<ShapedCompletions>,
+        Option<(&'static str, &'static str, Vec<String>)>,
+    ) {
+        let query = self.completion_query(key, offset);
+        let semantic = query.as_ref().map(|query| {
+            (
+                query.context_label(),
+                query.status_label(),
+                query.reason_labels(),
+            )
+        });
+        let shaped = self.contributed_completion(key, offset).or_else(|| {
+            query.and_then(|query| Self::shape_completion_query(query, snippets_supported))
+        });
+        (shaped, semantic)
+    }
+
+    fn shape_completion_query(
+        query: semantic_query::CompletionQuery,
+        snippets_supported: bool,
+    ) -> Option<ShapedCompletions> {
         if matches!(
             query.context,
             complete::CompletionContext::Import | complete::CompletionContext::None

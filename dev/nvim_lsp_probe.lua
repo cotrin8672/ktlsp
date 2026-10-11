@@ -137,4 +137,69 @@ function M.import_ready(client, build_tool, timeout, check)
   return ready and imported, state
 end
 
+
+function M.observe_shutdown(config)
+  local state = { shutdown_requests = {}, exit_notifications = {}, terminate_calls = 0 }
+  local callbacks = {}
+  if type(config.on_exit) == 'table' then
+    for _, callback in ipairs(config.on_exit) do callbacks[#callbacks + 1] = callback end
+  elseif config.on_exit then
+    callbacks[1] = config.on_exit
+  end
+  table.insert(callbacks, 1, function(code, signal, client_id)
+    state.exit = { code = code, signal = signal, client_id = client_id, received_ns = vim.uv.hrtime() }
+  end)
+  config.on_exit = callbacks
+  return state
+end
+
+function M.shutdown(client, state, timeout)
+  if state.finished then return state end
+  local rpc = client.rpc
+  local request, notify, terminate = rpc.request, rpc.notify, rpc.terminate
+  rpc.request = function(method, params, callback, ...)
+    if method ~= 'shutdown' then return request(method, params, callback, ...) end
+    local observation = { sent_ns = vim.uv.hrtime() }
+    state.shutdown_requests[#state.shutdown_requests + 1] = observation
+    local sent, id = request(method, params, function(err, result, ...)
+      observation.response = { received_ns = vim.uv.hrtime(), error = err,
+        result_is_null = result == nil or result == vim.NIL }
+      return callback(err, result, ...)
+    end, ...)
+    observation.sent, observation.id = sent, id
+    return sent, id
+  end
+  rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    if method == 'exit' then
+      state.exit_notifications[#state.exit_notifications + 1] = { sent = sent, sent_ns = vim.uv.hrtime() }
+    end
+    return sent
+  end
+  rpc.terminate = function(...)
+    state.terminate_calls = state.terminate_calls + 1
+    return terminate(...)
+  end
+  state.started_ns = vim.uv.hrtime()
+  if not state.exit then client:stop(false) end
+  local observed, wait_reason = vim.wait(timeout, function() return state.exit ~= nil end, 50)
+  state.wait_reason = wait_reason
+  state.timed_out = not observed
+  if not state.exit then
+    state.force_requested = true
+    client:stop(true)
+    vim.wait(1000, function() return state.exit ~= nil end, 20)
+  end
+  state.finished_ns = vim.uv.hrtime()
+  local response = #state.shutdown_requests == 1 and state.shutdown_requests[1].response or nil
+  state.clean = observed and response ~= nil and response.error == nil and response.result_is_null
+    and state.shutdown_requests[1].sent and #state.exit_notifications == 1
+    and state.exit_notifications[1].sent and state.exit.code == 0 and state.exit.signal == 0
+    and state.terminate_calls == 0 and not state.timed_out
+  state.clean = not not state.clean
+  state.finished = true
+  rpc.request, rpc.notify, rpc.terminate = request, notify, terminate
+  return state
+end
+
 return M

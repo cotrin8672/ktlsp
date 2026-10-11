@@ -61,11 +61,10 @@ local function finish(err)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, original[name])
   end
   if client then
-    client:stop()
-    local exited = vim.wait(15000, function() return report.server_exit_code ~= nil end, 50)
-    report.clean_shutdown = exited and client:is_stopped() and report.shutdown_acknowledged
-      and report.exit_sent and report.server_exit_code == 0
-    if not client:is_stopped() then client:stop(true) end
+    report.shutdown = probe.shutdown(client, report.shutdown, 15000)
+    report.clean_shutdown = report.shutdown.clean
+    report.server_exit_code = report.shutdown.exit and report.shutdown.exit.code
+    report.server_exit_signal = report.shutdown.exit and report.shutdown.exit.signal
   end
   local ok = not err and report.disk_unchanged and report.clean_shutdown
   vim.fn.writefile({ vim.json.encode(report) }, artifacts .. '/completion-ui.json')
@@ -164,11 +163,7 @@ config.handlers['workspace/applyEdit'] = function(err, params, ctx, handler_conf
   end
   return result
 end
-local previous_exit = config.on_exit
-config.on_exit = function(code, signal, client_id)
-  report.server_exit_code, report.server_exit_signal = code, signal
-  if previous_exit then previous_exit(code, signal, client_id) end
-end
+report.shutdown = probe.observe_shutdown(config)
 local initial_buf = assert(buffers[cases[1].name], 'missing initial UI buffer')
 vim.api.nvim_set_current_buf(initial_buf)
 local id = assert(vim.lsp.start(config, { bufnr = initial_buf }))

@@ -55,7 +55,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Seventh native automatic watching passes 74/76: four actual builds, dependency/generated-source additions, updates, removals, exact targets, preserved dirty buffers and clean shutdown. Three native notification batches and zero explicit notifications. Two stale-member diagnostics remain failing | Partial; automatic refresh verified, diagnostics failing | `ktlsp-gradle-model-20261010/seventh-refresh-automatic/artifacts/`. Unchanged 76 expectations and hashes. Sixth manual 70/72 and automatic 29/76 remain preserved; external Windows Neovim watch roots still need coverage |
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Ninth same-client KAPT/KSP refresh passes 102/114, repairing unsaved completion; twelve obsolete/removed-API diagnostics fail. Transformed-API completion still fails 12/12 | Partial; generated-source editing works, diagnostic and transformed-API coverage failing | Actual v1/v2/restored builds and disabled compiler rejections establish expected APIs. Raw classfile decoder tests do not supply generated-API editing acceptance |
-| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Eleventh-fixed-2 external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-eleventh-fixed-1-20261011/provider-evidence.json` identifies the actual eleventh-fixed-2 snapshot. Same strict expectations, nineteen delivery barriers and four applied renames. Process shutdown is audited separately from the legacy client assertion |
+| Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Twelfth-fixed-2 external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-twelfth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
 | Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Not yet measured | Pending | Release build; sample counts, p50/p95, cold/warm distinction and RSS |
 
@@ -809,6 +809,101 @@ complete deep copy of every symbol. These findings do not establish the cause of
 the server's measured peak or supply accepted performance results. Optimize the
 shared paths with unchanged semantic expectations, then compare useful editor
 responses and separate client/server memory on the same real roots.
+
+### Current slice: completion work, cache copies and observed shutdown
+
+The ordinary LSP completion path now obtains trace metadata and rendered items
+from one semantic query. Public `Workspace::complete` keeps its provider-first
+behavior; the LSP wrapper keeps the previous query-before-provider ordering.
+Candidate shaping, rank, snippets, limits and honest unknown results are unchanged.
+Focused library, extension-host and member-selection tests pass 299 checks with
+one ignored. Global prefix scanning and inference lookup-map copying remain open.
+A gated `inference_snapshot` span measures replacement time in the actual Salsa
+sync path; it is not an allocation or retained-memory measurement.
+
+Gradle cache persistence now serializes a borrowed view through `BufWriter` and
+decodes through `BufReader`. It avoids cloning the complete module model and
+holding the complete JSON string, while preserving schema version four. Each
+writer owns a unique `create_new` temporary file; errors retain the previous
+cache. All 24 classpath tests pass, including partial disk writes, simultaneous
+writers, exact wire compatibility, mapped sources/compiler options, invalid-cache
+fallback and unpublished loading. The original implementation fails the two new
+failure/concurrency controls. The first repaired run exposed stale Windows
+directory-entry size observations; fresh file reads retain the real partial-write
+assertion and pass. Evidence: `ktlsp-classpath-persistence-20261011/implementation-1/`.
+Actual large-cache CPU cost and memory savings have not yet been measured.
+
+The mixed, corpus, UI and live Gradle probes now observe the shutdown response and
+actual `on_exit` result. They require one acknowledged shutdown, one exit
+notification, native exit/signal zero and no forced termination. Waiting for
+`client:is_stopped()` previously returned while the client was still stopping;
+Neovim's exit then sent a duplicate shutdown. Four direct protocol controls
+confirmed normal server exit zero independently. Fourteen portable client controls
+pass, including timeout, error, duplicate, callback preservation and idempotence.
+These controls do not replace a real-editor replay with the new helper. The first
+mixed replay exposed a caller logging error: the mixed/corpus printers expected
+a string rather than the structured shutdown result. Both call sites now render
+that detail explicitly; the structured result remains in the report. The failed
+setup run is preserved with zero UI samples and is excluded from timing results.
+
+The guarded `twelfth-fixed-2` checkpoint passes **1,037** Rust tests across forty
+suites, zero failures and three ignored tests, using Rust 1.98.1. Formatting and
+both release builds exit zero; all **307** product inputs match before tests,
+after tests and after the release build. The immutable ktlsp binary SHA-256 is
+`7c17b5f0991774b37c7cee3bf73936de426f2476f51ada8e3e984a970670dce0`;
+bench is `6352515f7e6dcdb62b8f87e892f262dd8b5010c0bd674a2dd982ecb8226693d0`.
+Evidence: `ktlsp-goal-20261010/twelfth-fixed-2/`. The preceding fixed-1 binary has
+the same SHA; only the two Lua call sites changed. The new helper still passes
+all fourteen controls and six Lua parse checks. Both immutable releases then ran
+through the same fixed-2 Neovim harness. The mixed fixture supplies one first and
+thirty useful warm-process observations for each language; all 62 exact accepted
+texts pass per release. Every repetition makes unsaved edits, rather than querying
+one unchanged index revision. Times below are milliseconds; popup timing ends at
+the `popupmenu_show` handoff, not physical display.
+
+| Release | Language | First RPC | Warm RPC p50 / p95 | Warm dot-to-menu p50 / p95 |
+| --- | --- | ---: | ---: | ---: |
+| Eleventh-fixed-2 | Java | 2.359 | 2.394 / 2.952 | 33.848 / 34.550 |
+| Eleventh-fixed-2 | Kotlin | 2.714 | 2.473 / 3.179 | 33.860 / 35.180 |
+| Twelfth-fixed-2 | Java | 2.293 | 2.539 / 3.987 | 33.933 / 36.141 |
+| Twelfth-fixed-2 | Kotlin | 2.146 | 2.525 / 2.969 | 33.910 / 34.743 |
+
+This single matched pair shows no established speedup. Brief read-only preparation
+overlapped one mixed run, and whole-release timing cannot isolate completion work
+from cache/tracing changes. Two baseline and four candidate trace lines are
+malformed; client-observed timing/accepted-text records remain intact. No valid
+inference-snapshot spans were observed, so snapshot cost is **not measured**.
+
+CEM's ordinary four completion/navigation assertions pass on both releases, with
+the same 34,783 library files and 825,029 symbols. Coverage still fails with one
+failed and two missing source inputs. The new UI case replaces an unsaved line
+with `return super.`: both releases return an empty first completion with
+`unknown-receiver-type`, so neither has a useful UI sample or warm timing result.
+The class has a superclass and a delegated interface; the multi-super receiver
+selection is the next focused reproduction, not a confirmed fix. Empty replies
+are excluded from performance acceptance. Source, binary and fixture guards match
+throughout all four runs. Mixed and CEM both record acknowledged shutdown, one
+exit notification and actual exit/signal zero without forced termination in their
+RPC and UI phases, independently of semantic/coverage failures. Evidence is
+`ktlsp-completion-measurement-20261011/run-{baseline,candidate}-2-{mixed,cem}/`.
+The aggregate four-run report is `ktlsp-completion-measurement-20261011/four-run-report.json`
+(SHA-256 `0329435bff9473496ec138fc9f40fe74c03569525acfa11bbef375f308b57ce5`).
+
+A separate consumer rebuilt against the frozen 307-input twelfth snapshot passes
+**140/140** unchanged real-Neovim assertions: twenty-nine first responses,
+nineteen delivered-edit barriers and four applied/fully inspected renames.
+Dependency indexing reports zero failed and missing inputs. Consumer build,
+editor and independent finalizer exit zero; shutdown records one null
+acknowledgement, one exit notification, actual server exit/signal zero and no
+termination or remaining owned processes. Product, four consumer inputs,
+twenty-seven fixture sources and both probe files match throughout. Its distinct
+consumer binary SHA-256 is
+`a059b133c5a3a89c3d3a4fe088aae39043f573b08b962f8cc5940002cfefcb98`.
+Evidence: `ktlsp-shadow-twelfth-replay-20261011/final-editor-proof.json`
+(SHA-256 `d30011d306fd69924c4fa906044484a07720ddea670a0443232cf2357986a850`).
+The eleventh replay's duplicate shutdown remains a separate historical limitation.
+The server peak near 6 GB and compiler-plugin gaps remain unresolved; this
+checkpoint does not establish whole-project performance or IDEA parity.
 
 ### Current slice: requires-only compatibility artifacts
 

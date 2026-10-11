@@ -125,15 +125,15 @@ if mode == 'ktlsp' then
   end }
 end
 vim.api.nvim_set_current_buf(prepared[1].buf)
+local shutdown_state = probe.observe_shutdown(config)
 local id = vim.lsp.start(config, { bufnr = prepared[1].buf })
 local client, import_state
 local sent_versions, outbound_changes, delivery_records = {}, {}, {}
 local active_case
 local function finish()
   if client then
-    client:stop()
-    check('client shuts down gracefully', vim.wait(15000, function() return client:is_stopped() end, 100))
-    if not client:is_stopped() then client:stop(true) end
+    local stopped = probe.shutdown(client, shutdown_state, 15000)
+    check('client shuts down gracefully', stopped.clean, vim.inspect(stopped))
   end
   for path, source in pairs(sources) do
     check('source remains unchanged: ' .. path, vim.deep_equal(vim.fn.readfile(path), source.disk)
@@ -147,7 +147,7 @@ local function finish()
   for path, source in pairs(sources) do hashes[path] = source.sha256 end
   write('corpus-results.json', { mode = mode, project = project, manifest = manifest,
     manifest_path = manifest_path, checks = checks, failures = failures, source_sha256 = hashes,
-    server = client and client.server_info, binary = vim.env.KTLSP_BIN or arg[3],
+    server = client and client.server_info, shutdown = shutdown_state, binary = vim.env.KTLSP_BIN or arg[3],
     plugin = vim.env.IJLS_PLUGIN, server_executable = vim.env.IJLS_SERVER,
     removed_environment_names = probe.removed_environment,
     jdk = vim.env.IJLS_JDK or vim.env.JAVA_HOME, gradle_user_home = vim.env.GRADLE_USER_HOME,

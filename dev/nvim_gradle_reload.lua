@@ -103,13 +103,12 @@ local kotlin = open('src/main/kotlin/app/Editor.kt', 'kotlin', kotlin_text)
 local helper = open('src/main/kotlin/app/KotlinHelper.kt', 'kotlin')
 local main = open('src/main/java/app/Main.java', 'java')
 local use = open('src/main/kotlin/app/Use.kt', 'kotlin')
-local exit
 local default_registration = vim.lsp.handlers['client/registerCapability']
 local capabilities = vim.lsp.protocol.make_client_capabilities()
 if not automatic_watches then
   capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = false
 end
-local id = vim.lsp.start({ name = 'ktlsp', root_dir = root, cmd = { binary },
+local config = { name = 'ktlsp', root_dir = root, cmd = { binary },
   capabilities = capabilities,
   cmd_env = { HOME = root .. '/home', KTLSP_JDK_SRC = root .. '/build/fake-jdk-src.zip' },
   handlers = {
@@ -123,7 +122,9 @@ local id = vim.lsp.start({ name = 'ktlsp', root_dir = root, cmd = { binary },
       registration.handled = true
       return result
     end,
-  }, on_exit = function(code, signal) exit = { code = code, signal = signal } end }, { bufnr = java })
+  } }
+local shutdown_state = probe.observe_shutdown(config)
+local id = vim.lsp.start(config, { bufnr = java })
 local initialized = vim.wait(10000, function()
   local client = vim.lsp.get_client_by_id(id)
   return client and client.initialized
@@ -343,10 +344,8 @@ for phase = 1, 3 do
   save()
 end
 
-client:stop()
-local stopped = vim.wait(10000, function() return exit ~= nil end, 50)
-if not stopped then client:stop(true) end
-check('server exits cleanly after the same-connection lifecycle', stopped and exit.code == 0 and exit.signal == 0, exit)
+report.shutdown = probe.shutdown(client, shutdown_state, 10000)
+check('server exits cleanly after the same-connection lifecycle', report.shutdown.clean, report.shutdown)
 local failures = 0
 for _, item in ipairs(report.checks) do if not item.passed then failures = failures + 1 end end
 report.failed, report.total = failures, #report.checks

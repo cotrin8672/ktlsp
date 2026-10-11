@@ -188,6 +188,11 @@ dev/ktlsp-harness.sh basic
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
 `library`, `java`, `mixed`, `corpus`, `semantic`, `gradle-live`, or `comprehensive`.
 
+The mixed, corpus, completion UI and live Gradle probes require an acknowledged shutdown,
+one exit notification and actual server exit code/signal zero. Run
+`nvim --headless -u NONE -i NONE -l dev/nvim_lsp_probe_selfcheck.lua` for fourteen focused
+shutdown controls without starting a server or compiler.
+
 `java` covers incomplete member completion, inherited members, Java receivers of Kotlin types,
 and an unsaved Kotlin declaration edit observed from an unsaved Java buffer on the same client.
 It checks imported superclass identity despite same-name types, exact inherited-member definitions,
