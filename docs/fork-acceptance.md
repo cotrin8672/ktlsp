@@ -2353,6 +2353,51 @@ is byte-identical to the tested manifest. The server is checkpoint 35's immutabl
 release. Other project UI/memory comparisons and the real Retrofit generic chain
 remain open; the latter is independently reproduced with compiler controls.
 
+### Thirty-seventh checkpoint: actual Retrofit unsaved generic baseline
+
+The new `dev/nvim_retrofit_mixed_probes.lua` uses the existing corpus hook on pinned
+Retrofit with its main JDK 8 toolchain and Gradle running on JDK 17. Four original
+files remain unchanged on disk. It changes Java `Invocation.service()` from
+`Class<?>` to `String` in memory, then checks Kotlin's members and exact definitions.
+It restores the type, checks Kotlin/Java references, applies `service` to `serviceType`
+across four complete buffers and inspects fresh navigation/references after rename
+and restoration. A failed prepare-rename leaves dependent operations unmeasured.
+
+Independent compiler controls for original, typed and renamed snapshots and two
+deliberately invalid member calls match all five expected outcomes. The narrower
+tag reduction also compiles with actual Gradle/KGP 1.9.23/JDK 8; two wrong-class
+variants fail at `service` as expected. It separates invariant `Class<T>`, bounded
+Java `Class<? extends T>`, named Kotlin class literals and `KClass<T>.java`.
+
+On checkpoint 35's immutable release, the actual Retrofit run has **18 valid first
+RPC responses: six matched and twelve mismatched**. Three rename-dependent requests
+are not run, and four applied-buffer assertions are consequently unmeasured. These
+are functional empty/missing-reference results, not deadline or source-count scores.
+The small reduction's ordinary receiver and invariant generic control match four
+requests; its other nine requests return valid incorrect/empty results. All seventeen
+reduction requests, including the paired negative cases, run without protocol errors
+and with zero failed or missing sources. Wrong-member exclusions alone do not pass
+when the required positive `body` completion is absent.
+
+The same actual Retrofit hook through the pinned IntelliJ plugin matches **21/21
+first RPC responses and 25/25 semantic checks**, including all four renamed complete
+buffers. This fresh native run exits cleanly. The oracle admits two source-reviewed
+representations: one-argument substring at JDK 8 or its pinned Kotlin stdlib wrapper,
+and exact Java identifier or exact `invocation.service` member-expression reference
+ranges. Wrong overloads, source versions, extra targets, parentheses, duplicate sites
+and broadened Kotlin ranges remain rejected. **64 native matcher checks** pass;
+replaying the earlier payloads accepts all five legitimate IDEA alternatives while
+retaining four ktlsp mismatches and one unrun request.
+
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-retrofit-mixed-oracle-20261012-1/`
+(`native-results.json`, `source-guards.json`, both `artifacts/retrofit-mixed-requests.json`
+and snapshots); independent compiler controls are under
+`ktlsp-retrofit-mixed-unsaved-20261012-1/compiler-results.json` and
+`ktlsp-retrofit-tag-reduction-20261012-1/{native-compiler,native-before,native-oracle}`.
+Next repair named class literals and declaration-scoped extension-property bindings
+in shared facts, then Java wildcard constraint inference. No Kotlin completion or
+rename parity is claimed from the old six passing golden requests.
+
 ### Current slice: requires-only compatibility artifacts
 
 Selected Kotlin compatibility and coroutines JARs can contain a module descriptor

@@ -288,10 +288,17 @@ Spring extension-receiver and incomplete-selector regressions use the same route
 `dev/corpus/fixtures/spring-provider` and the two `spring-provider-reduction*.json` manifests.
 `spring-extensions-editing.json` adds unsaved cases against the pinned real Spring root;
 see [the fixture instructions](dev/corpus/fixtures/spring-provider/README.md).
-Set `KTLSP_CORPUS_EXTRA_PROBES` to an absolute Lua file to exercise an external analysis provider
+Set `KTLSP_CORPUS_EXTRA_PROBES` to an absolute Lua file for custom editing or analysis-provider checks
 with the same corpus client before shutdown. The file returns a function receiving
 `{repo, client, sources, check, project, artifacts, request_outcomes}`. Use `check` for assertions and restore any
 unsaved edits; the normal source guards, result report and graceful shutdown still run on errors.
+For pinned Retrofit, use `dev/nvim_retrofit_mixed_probes.lua` with
+`dev/corpus/retrofit-2.11.0.json`. It changes Java's `Invocation.service()` return type
+in memory, checks Kotlin completion/navigation, verifies exact cross-language references,
+applies a four-file rename and compares every complete buffer before restoring it.
+Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and JDK 17
+for Gradle, matching the project's selected main toolchain. The probe exposes current
+generic inference gaps; an empty response is not a passing fast result.
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus

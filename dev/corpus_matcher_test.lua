@@ -74,4 +74,64 @@ for _, case in ipairs(outcome_cases) do
   check(case.name .. ': predicate requires a valid RPC', evaluated,
     case.expected == 'matched' or case.expected == 'mismatch')
 end
+
+local _, retrofit = dofile(directory .. '/nvim_retrofit_mixed_probes.lua')
+local function service_references(length, include, members)
+  local sites, result = {}, {}
+  -- Independently reviewed Retrofit identifier and Java member-expression positions.
+  for index, point in ipairs({ { 82, 18 }, { 41, 37 }, { 57, 23, 12 }, { 75, 26, 15 } }) do
+    if include or index ~= 1 then
+      local site = location(directory .. '/corpus-matcher-retrofit-' .. index,
+        { start = { line = point[1], character = point[2] }, ['end'] = { line = point[1], character = point[2] + length } })
+      site.member_start = point[3]
+      sites[#sites + 1] = site
+      local actual = vim.deepcopy(site)
+      actual.member_start = nil
+      if members and point[3] then actual.range.start.character = point[3] end
+      result[#result + 1] = actual
+    end
+  end
+  return retrofit.references(probe, sites), result
+end
+for _, length in ipairs({ 7, 11 }) do
+  local accepts, identifiers = service_references(length, true, false)
+  local _, members = service_references(length, true, true)
+  check('service identifiers length ' .. length, accepts(identifiers), true)
+  check('reviewed Java member expressions length ' .. length, accepts(members), true)
+  local duplicate = vim.deepcopy(members)
+  duplicate[4] = identifiers[3]
+  check('identifier/member duplicate length ' .. length, accepts(duplicate), false)
+end
+local accepts, member_refs = service_references(7, true, true)
+local wrong = vim.deepcopy(member_refs)
+wrong[3].uri = vim.uri_from_fname(other)
+check('service reference wrong file rejected', accepts(wrong), false)
+wrong = vim.deepcopy(member_refs)
+wrong[3].range['end'].character = wrong[3].range['end'].character + 2
+check('service call parentheses rejected', accepts(wrong), false)
+wrong = vim.deepcopy(member_refs)
+wrong[3].range.start.character = wrong[3].range.start.character - 1
+check('service wider receiver rejected', accepts(wrong), false)
+wrong = vim.deepcopy(member_refs)
+wrong[2].range.start.character = wrong[2].range.start.character - 11
+check('Kotlin receiver widening rejected', accepts(wrong), false)
+local without_declaration, uses = service_references(7, false, true)
+check('service uses without declaration accepted', without_declaration(uses), true)
+check('unexpected service declaration rejected', without_declaration(member_refs), false)
+check('missing service declaration rejected', accepts(uses), false)
+check('missing service references rejected', accepts(vim.NIL), false)
+local wrapper = { uri = 'jar:file:///cache/kotlin-stdlib-1.9.23-sources.jar!/jvmMain/kotlin/text/StringsJVM.kt',
+  range = { start = { line = 403, character = 32 }, ['end'] = { line = 403, character = 41 } } }
+check('reviewed one-argument substring wrapper accepted', retrofit.substring(probe, wrapper), true)
+check('reviewed JDK8 substring accepted', retrofit.substring(probe,
+  { uri = 'jar:file:///cache/jdk8/src.zip!/java/lang/String.java',
+    range = { start = { line = 1924, character = 18 }, ['end'] = { line = 1924, character = 27 } } }), true)
+wrong = vim.deepcopy(wrapper)
+wrong.range.start.line, wrong.range['end'].line = 412, 412
+check('two-argument substring wrapper rejected', retrofit.substring(probe, wrong), false)
+wrong = vim.deepcopy(wrapper)
+wrong.uri = wrong.uri:gsub('1%.9%.23', '1.9.24')
+check('unreviewed substring source version rejected', retrofit.substring(probe, wrong), false)
+check('multiple substring targets rejected', retrofit.substring(probe, { wrapper, wrapper }), false)
+check('missing substring target rejected', retrofit.substring(probe, vim.NIL), false)
 print(('PASS corpus matcher and request outcomes: %d checks'):format(count))
