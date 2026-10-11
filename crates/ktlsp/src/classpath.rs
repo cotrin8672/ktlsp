@@ -252,6 +252,47 @@ impl ProjectSnapshot {
         Some((module, source.map(|idx| &module.source_sets[idx])))
     }
 
+    /// Configured Java inputs only: this does not prove compiler service absence, binary
+    /// freshness, or generated API closure. Kotlin compiler plugins are a separate surface.
+    pub(crate) fn plain_java_task(&self, key: &str) -> Option<&CompilerTask> {
+        let (_, source) = self.owner_for_key(key)?;
+        let source = source?;
+        if source.compiler_metadata_incomplete
+            || source.classpath_incomplete
+            || !source.unresolved.is_empty()
+        {
+            return None;
+        }
+        let mut java = source
+            .compiler_tasks
+            .iter()
+            .filter(|task| task.language == CompilerLanguage::Java);
+        let task = java.next()?;
+        if java.next().is_some()
+            || !task.complete
+            || task.problem.is_some()
+            || !matches!(
+                task.task_type.as_str(),
+                "org.gradle.api.tasks.compile.JavaCompile"
+                    | "org.gradle.api.tasks.compile.JavaCompile_Decorated"
+            )
+            || task.source_files.is_empty()
+            || !task.arguments.is_empty()
+            || !task.annotation_processor_path.is_empty()
+            || task.java_home.is_none()
+            || task.options.get("fork") != Some(&serde_json::Value::Bool(false))
+            || task.options.get("forkJavaHome") != Some(&serde_json::Value::Null)
+            || task.options.get("forkExecutable") != Some(&serde_json::Value::Null)
+        {
+            return None;
+        }
+        match task.options.get("forkJvmArgs") {
+            Some(serde_json::Value::Null) => Some(task),
+            Some(serde_json::Value::Array(args)) if args.is_empty() => Some(task),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_output_key(&self, key: &str) -> bool {
         find_ancestor(key, |root| {
             self.output_owners.get(root).filter(|output| {
@@ -1286,6 +1327,207 @@ fn coordinate_from_gradle_cache_path(path: &Path) -> Option<Coordinate> {
 
 #[cfg(test)]
 mod tests {
+    fn plain_java_configuration() -> serde_json::Value {
+        serde_json::json!({
+            "task": ":app:compileJava", "language": "java",
+            "task_type": "org.gradle.api.tasks.compile.JavaCompile_Decorated",
+            "arguments": [], "annotation_processor_path": [],
+            "source_files": ["/repo/app/src/main/java/Use.java"],
+            "classpath": ["/repo/vendor.jar"], "java_home": "/jdk",
+            "options": {
+                "fork": false, "forkJavaHome": null,
+                "forkExecutable": null, "forkJvmArgs": []
+            },
+            "output_roots": ["/repo/app/build/classes/java/main"],
+            "complete": true, "problem": null
+        })
+    }
+
+    fn plain_java_snapshot(compilers: &[serde_json::Value]) -> ProjectSnapshot {
+        let records = compilers
+            .iter()
+            .map(|compiler| format!("COMPILER\tmain\t{compiler}\n"))
+            .collect::<String>();
+        ProjectSnapshot::new(parse_dump(&format!(
+            "PROJECT\t:app\t/repo/app\nSOURCE\tmain\t/repo/app/src/main/java\n{records}END\t:app\n"
+        )))
+    }
+
+    #[test]
+    fn plain_java_task_selects_the_caller_despite_kotlin_plugins() {
+        let kotlin = serde_json::json!({
+            "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
+            "arguments": ["-Xplugin=/plugins/transform.jar", "-P", "plugin:transform:enabled=true"],
+            "annotation_processor_path": ["/plugins/kapt.jar"], "java_home": null,
+            "options": {}, "output_roots": [], "complete": true, "problem": null
+        });
+        for task_type in [
+            "org.gradle.api.tasks.compile.JavaCompile",
+            "org.gradle.api.tasks.compile.JavaCompile_Decorated",
+        ] {
+            for jvm_args in [serde_json::Value::Null, serde_json::json!([])] {
+                let mut java = plain_java_configuration();
+                java["task_type"] = task_type.into();
+                java["options"]["forkJvmArgs"] = jvm_args;
+                let model = plain_java_snapshot(&[kotlin.clone(), java]);
+                let task = model
+                    .plain_java_task("/repo/app/src/main/java/Use.java")
+                    .expect("the selected Java task has no configured extra transformations");
+                assert_eq!(task.task, ":app:compileJava");
+                assert_eq!(task.language, CompilerLanguage::Java);
+                assert!(
+                    model
+                        .plain_java_task("/repo/app/src/main/java/New.java")
+                        .is_some(),
+                    "a new unsaved file uses its selected source set's compiler context"
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut java = plain_java_configuration();
+            java["source_files"] = serde_json::json!([r"\repo\app\src\main\java\Use.java"]);
+            assert!(plain_java_snapshot(&[java])
+                .plain_java_task("/repo/app/src/main/java/Use.java")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn plain_java_task_rejects_unproved_compiler_inputs() {
+        let caller = "/repo/app/src/main/java/Use.java";
+        for (label, field, value) in [
+            (
+                "Java plugin",
+                "arguments",
+                serde_json::json!(["-Xplugin:transform"]),
+            ),
+            (
+                "argument file",
+                "arguments",
+                serde_json::json!(["@compiler.args"]),
+            ),
+            (
+                "unclassified argument",
+                "arguments",
+                serde_json::json!(["-parameters"]),
+            ),
+            (
+                "processor path",
+                "annotation_processor_path",
+                serde_json::json!(["/plugins/ap.jar"]),
+            ),
+            (
+                "custom compiler task",
+                "task_type",
+                serde_json::json!("custom.JavaCompile"),
+            ),
+            ("incomplete capture", "complete", serde_json::json!(false)),
+            (
+                "capture problem",
+                "problem",
+                serde_json::json!("provider unavailable"),
+            ),
+            ("unknown JDK", "java_home", serde_json::Value::Null),
+            (
+                "empty source inventory",
+                "source_files",
+                serde_json::json!([]),
+            ),
+        ] {
+            let mut java = plain_java_configuration();
+            java[field] = value;
+            assert!(
+                plain_java_snapshot(&[java])
+                    .plain_java_task(caller)
+                    .is_none(),
+                "{label}"
+            );
+        }
+        for (option, value) in [
+            ("fork", serde_json::json!(true)),
+            ("fork", serde_json::json!("false")),
+            ("fork", serde_json::Value::Null),
+            ("forkJavaHome", serde_json::json!("/other-jdk")),
+            ("forkJavaHome", serde_json::json!(false)),
+            ("forkExecutable", serde_json::json!("/custom/javac")),
+            ("forkExecutable", serde_json::json!(false)),
+            (
+                "forkJvmArgs",
+                serde_json::json!(["-javaagent:transform.jar"]),
+            ),
+            ("forkJvmArgs", serde_json::json!("")),
+            ("forkJvmArgs", serde_json::json!({})),
+        ] {
+            let mut java = plain_java_configuration();
+            java["options"][option] = value;
+            assert!(
+                plain_java_snapshot(&[java])
+                    .plain_java_task(caller)
+                    .is_none(),
+                "{option}"
+            );
+        }
+        for option in ["fork", "forkJavaHome", "forkExecutable", "forkJvmArgs"] {
+            let mut java = plain_java_configuration();
+            java["options"].as_object_mut().unwrap().remove(option);
+            assert!(
+                plain_java_snapshot(&[java])
+                    .plain_java_task(caller)
+                    .is_none(),
+                "missing {option}"
+            );
+        }
+        let mut legacy = plain_java_configuration();
+        legacy.as_object_mut().unwrap().remove("source_files");
+        assert!(plain_java_snapshot(&[legacy])
+            .plain_java_task(caller)
+            .is_none());
+    }
+
+    #[test]
+    fn plain_java_task_requires_one_complete_selected_source_set() {
+        let caller = "/repo/app/src/main/java/Use.java";
+        assert!(plain_java_snapshot(&[]).plain_java_task(caller).is_none());
+        let java = plain_java_configuration();
+        let mut duplicate = java.clone();
+        duplicate["task"] = ":app:anotherJavaCompile".into();
+        assert!(plain_java_snapshot(&[java.clone(), duplicate])
+            .plain_java_task(caller)
+            .is_none());
+        for reason in ["compiler metadata", "classpath", "unresolved dependency"] {
+            let mut model = plain_java_snapshot(&[java.clone()]);
+            let source = &mut model.modules[0].source_sets[0];
+            match reason {
+                "compiler metadata" => source.compiler_metadata_incomplete = true,
+                "classpath" => source.classpath_incomplete = true,
+                _ => source.unresolved.push("vendor:missing:1".into()),
+            }
+            assert!(model.plain_java_task(caller).is_none(), "{reason}");
+        }
+        let model = plain_java_snapshot(&[java]);
+        for outside in [
+            "/repo/app/Use.java",
+            "/repo/app/src/main/java2/Use.java",
+            "/other/Use.java",
+        ] {
+            assert!(model.plain_java_task(outside).is_none(), "{outside}");
+        }
+        let java = plain_java_configuration();
+        let model = ProjectSnapshot::new(parse_dump(&format!(
+            "PROJECT\t:app\t/repo/app\nSOURCE\tmain\t/repo/app/src/main/java\nCOMPILER\tmain\t{java}\nSOURCE\ttest\t/repo/app/src/test/java\nEND\t:app\n"
+        )));
+        assert!(model
+            .plain_java_task("/repo/app/src/main/java/New.java")
+            .is_some());
+        assert!(
+            model
+                .plain_java_task("/repo/app/src/test/java/New.java")
+                .is_none(),
+            "another source set cannot borrow the main Java task"
+        );
+    }
+
     #[test]
     fn compiler_configuration_preserves_task_identity_and_opaque_options() {
         let compiler = serde_json::json!({

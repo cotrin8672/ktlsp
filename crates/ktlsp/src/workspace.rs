@@ -2,6 +2,7 @@
 //! the LSP layer drives. All keys are the caller's canonical identity string (a path or URI
 //! string); we never re-derive identity from the filesystem at query time.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
@@ -91,6 +92,7 @@ pub struct Workspace {
     analysis_extensions: crate::analysis_extensions::AnalysisExtensions,
     annotated_type_owners: HashMap<String, BTreeSet<Def>>,
     observed_compile: Option<ObservedCompileTicket>,
+    class_inventory: RefCell<crate::binary_diagnostics::ClassInventoryCache>,
 }
 
 impl Default for Workspace {
@@ -126,6 +128,7 @@ impl Workspace {
             analysis_extensions: crate::analysis_extensions::AnalysisExtensions::new(providers),
             annotated_type_owners: HashMap::new(),
             observed_compile: None,
+            class_inventory: RefCell::default(),
         }
     }
 
@@ -166,6 +169,7 @@ impl Workspace {
     }
 
     pub fn begin_analysis_generation(&mut self) -> u64 {
+        self.class_inventory.get_mut().clear();
         self.invalidate_observed_compile();
         self.analysis_generation = self.analysis_generation.wrapping_add(1);
         self.completeness.project_scan_complete = false;
@@ -211,6 +215,7 @@ impl Workspace {
     }
 
     pub fn set_project_model(&mut self, model: Arc<crate::classpath::ProjectSnapshot>) {
+        self.class_inventory.get_mut().clear();
         self.invalidate_observed_compile();
         self.index.replace_scope_visibilities(
             model.scope_visibilities(&self.global_origins.iter().cloned().collect::<Vec<_>>()),
@@ -2256,8 +2261,34 @@ impl Workspace {
         text: &str,
         tree: &Tree,
     ) -> Vec<crate::diagnostics::Diagnostic> {
+        let scoped = self.index.scoped_for_file(key);
+        let model = self
+            .project_model
+            .as_deref()
+            .filter(|_| !self.project_refresh_pending);
+        let caller = model
+            .and_then(|model| model.plain_java_task(key))
+            .filter(|_| is_java_path(key));
+        let services = OnceCell::new();
+        let inventory = |owner: &crate::index::Entry| {
+            let (model, task) = (model?, caller?);
+            if owner.tier != Tier::Durable
+                || self.open_docs.contains_key(owner.path.as_ref())
+                || !services.get_or_init(|| self.class_inventory.borrow_mut().plain_caller(task))
+            {
+                return None;
+            }
+            let origin = self.index.file_origin(&owner.path)?;
+            self.class_inventory
+                .borrow_mut()
+                .inventory(model, task, key, owner, &origin.origin_id)
+        };
+        let index = crate::binary_diagnostics::BinaryDiagnostics {
+            index: &scoped,
+            inventory: &inventory,
+        };
         language::diagnostics(
-            &self.index.scoped_for_file(key),
+            &index,
             SourceLanguage::for_key(key),
             key,
             text,

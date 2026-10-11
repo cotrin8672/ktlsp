@@ -652,3 +652,233 @@ fn kotlin_missing_import_with_an_unknown_producer_is_not_declared_absent() {
         matches!(status, resolve::ResolutionStatus::Unknown(reasons) if reasons.contains(&IncompletenessReason::CompilerProducerIncomplete))
     );
 }
+
+struct BinaryInventoryIndex {
+    index: ktlsp::index::Index,
+    classes: std::collections::BTreeMap<String, std::sync::Arc<ktcore::classfile::ClassFileFacts>>,
+    caller_known: bool,
+}
+
+impl ktlsp::index::InferenceIndex for BinaryInventoryIndex {
+    fn lookup_by_name(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
+        ktlsp::index::InferenceIndex::lookup_by_name(&self.index, name)
+    }
+    fn members_of(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
+        ktlsp::index::InferenceIndex::members_of(&self.index, name)
+    }
+    fn extensions_for(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
+        ktlsp::index::InferenceIndex::extensions_for(&self.index, name)
+    }
+    fn origin_facts(&self) -> Option<&ktlsp::index::OriginFacts> {
+        ktlsp::index::InferenceIndex::origin_facts(&self.index)
+    }
+    fn java_class_inventory(
+        &self,
+        owner: &ktlsp::index::Entry,
+    ) -> Option<std::sync::Arc<ktcore::classfile::ClassFileFacts>> {
+        self.caller_known
+            .then(|| self.classes.get(owner.path.as_ref()).cloned())
+            .flatten()
+    }
+}
+
+fn binary_inventory() -> BinaryInventoryIndex {
+    use ktcore::classfile::{ClassFileFacts, MemberFacts};
+    use ktcore::jvm::{ClassIdentity, InputIdentity};
+    use std::sync::Arc;
+    let mut index = ktlsp::index::Index::new();
+    let mut classes = std::collections::BTreeMap::new();
+    for (file, source, internal, origin, parent, methods) in [
+        (
+            "Versioned.java",
+            "package vendor; public class Versioned { public int newApi() { return 2; } }",
+            "vendor/Versioned",
+            "vendor-v2",
+            Some("java/lang/Object"),
+            vec!["newApi", "generated"],
+        ),
+        (
+            "Object.java",
+            "package java.lang; public class Object {}",
+            "java/lang/Object",
+            "jdk-test",
+            None,
+            vec!["toString"],
+        ),
+    ] {
+        let tree = ktlsp::java::JavaParser::new().parse(source);
+        index.replace_file(
+            file,
+            ktlsp::java::extract_symbols(&tree, source),
+            Tier::Durable,
+        );
+        index.set_file_origin(
+            file,
+            FileOrigin {
+                origin_id: origin.into(),
+                representation: SourceRepresentation::Source,
+                project_scope: None,
+            },
+        );
+        classes.insert(
+            file.into(),
+            Arc::new(ClassFileFacts {
+                identity: ClassIdentity {
+                    origin_id: origin.into(),
+                    internal_name: internal.into(),
+                    input: InputIdentity::Binary {
+                        content_sha256: [1; 32],
+                    },
+                },
+                major_version: 61,
+                minor_version: 0,
+                access_flags: 1,
+                super_name: parent.map(Arc::from),
+                interfaces: Vec::new(),
+                signature: None,
+                source_file: Some(Arc::from(file)),
+                attribute_names: Vec::new(),
+                fields: Vec::new(),
+                methods: methods
+                    .into_iter()
+                    .map(|name| MemberFacts {
+                        name: Arc::from(name),
+                        descriptor: Arc::from("()I"),
+                        access_flags: 1,
+                        signature: None,
+                        attribute_names: Vec::new(),
+                    })
+                    .collect(),
+            }),
+        );
+    }
+    BinaryInventoryIndex {
+        index,
+        classes,
+        caller_known: true,
+    }
+}
+
+fn inventory_status(
+    index: &BinaryInventoryIndex,
+    file: &str,
+    name: &str,
+    facts: &ktlsp::resolve::CompletenessFacts,
+) -> ktlsp::resolve::ResolutionStatus<()> {
+    ktlsp::resolve::member_name_status_for_receiver(
+        index,
+        file,
+        &ktlsp::types::Type::class("Versioned", Some("vendor".into())),
+        name,
+        facts,
+        &ktlsp::infer::FileCtx::new("app".into(), Vec::new()),
+    )
+}
+
+#[test]
+fn selected_java_binary_inventory_diagnoses_an_obsolete_member_without_global_producer_closure() {
+    let index = binary_inventory();
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    assert!(inventory_status(&index, "Use.java", "oldApi", &facts).is_definitely_absent());
+    assert!(inventory_status(&index, "Use.java", "newApi", &facts).is_found());
+    for name in ["generated", "toString"] {
+        assert!(
+            !inventory_status(&index, "Use.java", name, &facts).is_definitely_absent(),
+            "{name}"
+        );
+    }
+    assert!(!inventory_status(&index, "Use.kt", "oldApi", &facts).is_definitely_absent());
+}
+
+#[test]
+fn java_binary_inventory_requires_the_current_origin_caller_and_every_ancestor() {
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    for gap in [
+        "ancestor",
+        "caller",
+        "origin",
+        "identity",
+        "cycle",
+        "annotation",
+    ] {
+        let mut index = binary_inventory();
+        match gap {
+            "ancestor" => {
+                index.classes.remove("Object.java");
+            }
+            "caller" => index.caller_known = false,
+            "origin" => {
+                std::sync::Arc::make_mut(index.classes.get_mut("Versioned.java").unwrap())
+                    .identity
+                    .origin_id = "vendor-v1".into()
+            }
+            "identity" => {
+                std::sync::Arc::make_mut(index.classes.get_mut("Versioned.java").unwrap())
+                    .identity
+                    .internal_name = "decoy/Versioned".into()
+            }
+            "cycle" => {
+                std::sync::Arc::make_mut(index.classes.get_mut("Object.java").unwrap()).super_name =
+                    Some("vendor/Versioned".into())
+            }
+            "annotation" => {
+                let owner = index.index.lookup_type("Versioned")[0];
+                facts.member_surfaces_unknown.insert(ktlsp::symbol::Def {
+                    file: owner.path.to_string(),
+                    start_byte: owner.sym.start_byte,
+                    end_byte: owner.sym.end_byte,
+                });
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !inventory_status(&index, "Use.java", "oldApi", &facts).is_definitely_absent(),
+            "{gap}"
+        );
+        facts.member_surfaces_unknown.clear();
+    }
+}
+
+#[test]
+fn java_binary_inventory_visits_interfaces_and_accepts_a_diamond_without_closing_missing_branches()
+{
+    let mut index = binary_inventory();
+    let source = "package vendor; public interface Contract {}";
+    let tree = ktlsp::java::JavaParser::new().parse(source);
+    index.index.replace_file(
+        "Contract.java",
+        ktlsp::java::extract_symbols(&tree, source),
+        Tier::Durable,
+    );
+    index.index.set_file_origin(
+        "Contract.java",
+        FileOrigin {
+            origin_id: "vendor-v2".into(),
+            representation: SourceRepresentation::Source,
+            project_scope: None,
+        },
+    );
+    let mut contract = (*index.classes["Versioned.java"]).clone();
+    contract.identity.internal_name = "vendor/Contract".into();
+    contract.methods.clear();
+    index
+        .classes
+        .insert("Contract.java".into(), std::sync::Arc::new(contract));
+    std::sync::Arc::make_mut(index.classes.get_mut("Versioned.java").unwrap())
+        .interfaces
+        .push("vendor/Contract".into());
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    assert!(inventory_status(&index, "Use.java", "oldApi", &facts).is_definitely_absent());
+    let inherited = index.classes["Object.java"].methods[0].clone();
+    std::sync::Arc::make_mut(index.classes.get_mut("Contract.java").unwrap())
+        .methods
+        .push(inherited);
+    assert!(!inventory_status(&index, "Use.java", "toString", &facts).is_definitely_absent());
+    std::sync::Arc::make_mut(index.classes.get_mut("Contract.java").unwrap())
+        .interfaces
+        .push("missing/Parent".into());
+    assert!(!inventory_status(&index, "Use.java", "oldApi", &facts).is_definitely_absent());
+}

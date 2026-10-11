@@ -532,6 +532,12 @@ pub fn member_name_status_for_receiver(
         ]);
     };
 
+    if file.ends_with(".java") {
+        if let Some(status) = java_binary_member_status(index, recv_ty, name, facts) {
+            return status;
+        }
+    }
+
     let mut reasons = hierarchy_package_reasons(index, recv_ty, facts);
     reasons.extend(visible_package_reasons_with_ctx(
         file,
@@ -570,6 +576,97 @@ pub fn member_name_status_for_receiver(
     } else {
         ResolutionStatus::Unknown(reasons)
     }
+}
+
+fn java_binary_member_status(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    member: &str,
+    facts: &CompletenessFacts,
+) -> Option<ResolutionStatus<()>> {
+    let mut root = receiver.package()?.replace('.', "/");
+    if !root.is_empty() {
+        root.push('/');
+    }
+    if let Some(container) = receiver.container() {
+        root.push_str(&container.replace('.', "$"));
+        root.push('$');
+    }
+    root.push_str(receiver.name()?);
+    index.java_class_inventory(binary_owner(index, &root)?)?;
+
+    let mut pending = vec![(root, false, 0)];
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    while let Some((internal, leaving, depth)) = pending.pop() {
+        if leaving {
+            active.remove(&internal);
+            complete.insert(internal);
+            continue;
+        }
+        if complete.contains(&internal) {
+            continue;
+        }
+        let absent = (|| {
+            if depth >= 32
+                || complete.len() + active.len() >= 128
+                || !active.insert(internal.clone())
+            {
+                return None;
+            }
+            let owner = binary_owner(index, &internal)?;
+            let class = index.java_class_inventory(owner)?;
+            let origin = index.origin_facts()?.file_origin(&owner.path)?;
+            if class.identity.origin_id != origin.origin_id
+                || class.identity.internal_name != internal
+                || !matches!(
+                    class.identity.input,
+                    crate::jvm::InputIdentity::Binary { .. }
+                )
+                || facts.member_surfaces_unknown.contains(&to_def(owner))
+                || (class.super_name.is_none() && internal != "java/lang/Object")
+                || class
+                    .fields
+                    .iter()
+                    .chain(&class.methods)
+                    .any(|item| item.name.as_ref() == member)
+            {
+                return None;
+            }
+            pending.push((internal.clone(), true, depth));
+            for parent in class.super_name.iter().chain(&class.interfaces) {
+                pending.push((parent.to_string(), false, depth + 1));
+            }
+            Some(())
+        })();
+        if absent.is_none() {
+            // A raw name can suppress an error without claiming source callability.
+            return Some(ResolutionStatus::Unknown(vec![
+                IncompletenessReason::UnknownReceiverType,
+            ]));
+        }
+    }
+    Some(if index.scope_is_complete() {
+        ResolutionStatus::DefinitelyAbsent
+    } else {
+        ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete])
+    })
+}
+
+fn binary_owner<'a>(index: &'a dyn InferenceIndex, internal: &str) -> Option<&'a Entry> {
+    let (package, owner) = internal.rsplit_once('/').unwrap_or(("", internal));
+    let package = package.replace('/', ".");
+    let (container, name) = owner
+        .rsplit_once('$')
+        .map_or((None, owner), |(container, name)| {
+            (Some(container.replace('$', ".")), name)
+        });
+    let entries = index.lookup_type(name);
+    let mut selected = entries.into_iter().filter(|entry| {
+        entry.sym.package == package && entry.sym.container.as_deref() == container.as_deref()
+    });
+    let owner = selected.next()?;
+    selected.next().is_none().then_some(owner)
 }
 
 fn receiver_world_is_library_or_jdk(

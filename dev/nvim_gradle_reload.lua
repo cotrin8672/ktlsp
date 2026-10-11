@@ -110,7 +110,7 @@ if not automatic_watches then
 end
 local config = { name = 'ktlsp', root_dir = root, cmd = { binary },
   capabilities = capabilities,
-  cmd_env = { HOME = root .. '/home', KTLSP_JDK_SRC = root .. '/build/fake-jdk-src.zip' },
+  cmd_env = { HOME = root .. '/home', KTLSP_JDK_SRC = vim.env.KTLSP_JDK_SRC or root .. '/build/fake-jdk-src.zip' },
   handlers = {
     ['window/logMessage'] = function(_, message)
       report.messages[#report.messages + 1] = message

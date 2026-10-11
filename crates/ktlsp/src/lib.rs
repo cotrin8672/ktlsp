@@ -7,6 +7,7 @@
 pub mod actions;
 pub mod analysis_extensions;
 pub mod artifacts;
+mod binary_diagnostics;
 pub mod catalog;
 pub mod classpath;
 pub mod commands;

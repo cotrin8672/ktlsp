@@ -348,6 +348,10 @@ to `modules/editing`; it requires its generated project, so omit `--root`. Resul
 are recorded in `artifacts/gradle-reload.json` and `artifacts/gradle-phase*-compile.out`.
 Set `KTLSP_GRADLE_RELOAD_AUTOWATCH=1` to require Neovim's native watched-file notifications;
 the default is an explicit standard-notification control.
+The probe honors `KTLSP_JDK_SRC`. Set it to the Java compile toolchain's `lib/src.zip`
+to check Java's obsolete dependency-member diagnostics against selected classfiles and
+their actual JDK ancestors; the default tiny JDK fixture covers ordinary reload behavior.
+The Kotlin obsolete-member assertion remains a separate unresolved case.
 
 `KTLSP_PROCESSOR_RELOAD=1 dev/ktlsp-harness.sh gradle-live` creates the real KAPT/KSP fixture
 and keeps one client through v1, v2, disabled processing and restored v1. Use JDK 17 and a populated

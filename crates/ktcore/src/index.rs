@@ -230,6 +230,15 @@ pub trait InferenceIndex {
         Vec::new()
     }
 
+    /// Exact selected classfile inventory for a Java caller with known compiler semantics.
+    /// Raw class bytes alone must not certify a caller with unknown source transformations.
+    fn java_class_inventory(
+        &self,
+        _owner: &Entry,
+    ) -> Option<Arc<crate::classfile::ClassFileFacts>> {
+        None
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_>;
     fn members_of(&self, type_name: &str) -> LookupEntries<'_>;
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_>;
@@ -1281,6 +1290,12 @@ impl<'a> ScopedIndex<'a> {
 }
 
 impl InferenceIndex for ScopedIndex<'_> {
+    fn java_class_inventory(&self, owner: &Entry) -> Option<Arc<crate::classfile::ClassFileFacts>> {
+        self.entry_is_visible(owner)
+            .then(|| self.index.java_class_inventory(owner))
+            .flatten()
+    }
+
     fn may_have_compiled_callables(&self) -> bool {
         self.index.may_have_compiled_callables()
     }

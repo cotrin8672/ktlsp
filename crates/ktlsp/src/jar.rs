@@ -26,6 +26,142 @@ fn open_archive(jar: &Path) -> anyhow::Result<zip::ZipArchive<io::Cursor<Vec<u8>
         .with_context(|| format!("read jar {}", jar.display()))
 }
 
+pub(crate) fn read_class_file(
+    path: &Path,
+    entry_name: &str,
+    origin_id: &str,
+) -> Result<Option<ktcore::classfile::ClassFileFacts>, String> {
+    let read = || -> anyhow::Result<Option<ktcore::classfile::ClassFileFacts>> {
+        anyhow::ensure!(
+            !entry_name.is_empty()
+                && Path::new(entry_name)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "class entry must be a relative path without parents"
+        );
+        let limit = ktcore::classfile::MAX_CLASS_FILE_BYTES;
+        let decode = |reader: &mut dyn Read, size: u64| {
+            anyhow::ensure!(size <= limit as u64, "class entry too large");
+            let mut bytes = Vec::with_capacity(size.min(8192) as usize);
+            reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() <= limit && bytes.len() as u64 == size,
+                "class entry size mismatch"
+            );
+            ktcore::classfile::decode(origin_id, &bytes).map(Some)
+        };
+        let metadata = fs::metadata(path)?;
+        if metadata.is_dir() {
+            let mut file = match fs::File::open(path.join(entry_name)) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            anyhow::ensure!(metadata.is_file(), "class entry is not a file");
+            return decode(&mut file, metadata.len());
+        }
+        anyhow::ensure!(
+            metadata.is_file(),
+            "classpath entry is not a file or directory"
+        );
+        let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
+        // shortcut: Version-specific class selection is unsupported; reject only the affected owner.
+        anyhow::ensure!(
+            !archive.file_names().any(|name| {
+                name.strip_prefix("META-INF/versions/")
+                    .and_then(|name| name.split_once('/'))
+                    .is_some_and(|(version, name)| {
+                        !version.is_empty()
+                            && version.bytes().all(|byte| byte.is_ascii_digit())
+                            && name == entry_name
+                    })
+            }),
+            "versioned class entry is unsupported"
+        );
+        let mut entry = match archive.by_name(entry_name) {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(!entry.is_dir(), "class entry is not a file");
+        let size = entry.size();
+        decode(&mut entry, size)
+    };
+    read().map_err(|error| format!("read class {entry_name} from {}: {error:#}", path.display()))
+}
+
+pub(crate) fn plain_java_classpath_entry(path: &Path) -> bool {
+    const SERVICES: [&str; 2] = [
+        "META-INF/services/javax.annotation.processing.Processor",
+        "META-INF/services/com.sun.source.util.Plugin",
+    ];
+    const MANIFEST: &str = "META-INF/MANIFEST.MF";
+    if path.is_dir() {
+        for service in SERVICES {
+            match fs::symlink_metadata(path.join(service)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return false,
+            }
+        }
+        let manifest = path.join(MANIFEST);
+        return match fs::symlink_metadata(&manifest) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Ok(_) => fs::File::open(manifest).is_ok_and(manifest_has_no_classpath),
+            Err(_) => false,
+        };
+    }
+    if !path.is_file()
+        || !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+    {
+        return false;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    if archive
+        .file_names()
+        .any(|name| name != MANIFEST && name.eq_ignore_ascii_case(MANIFEST))
+    {
+        return false;
+    }
+    for service in SERVICES {
+        if !matches!(
+            archive.by_name(service),
+            Err(zip::result::ZipError::FileNotFound)
+        ) {
+            return false;
+        }
+    }
+    let plain = match archive.by_name(MANIFEST) {
+        Ok(entry) => manifest_has_no_classpath(entry),
+        Err(zip::result::ZipError::FileNotFound) => true,
+        Err(_) => false,
+    };
+    plain
+}
+
+fn manifest_has_no_classpath(reader: impl Read) -> bool {
+    const LIMIT: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    if reader.take(LIMIT + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > LIMIT {
+        return false;
+    }
+    let Ok(manifest) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    !manifest.lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("Class-Path"))
+    })
+}
+
 /// Empty compatibility artifacts need no source definitions. Metadata and nested archives do not
 /// prove emptiness, and unreadable archives stay errors.
 /// Proof work is bounded to 50,000 entries and one 16 MiB descriptor; the compressed archive is
@@ -476,6 +612,210 @@ mod tests {
             zip.write_all(body).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn selected_class_reader_decodes_exact_entry_and_origin() {
+        let class =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_selected_class_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.jar");
+        for entry in [
+            "pluginfixture/Person.class",
+            "classes/pluginfixture/Person.class",
+        ] {
+            write_binary_jar(&path, &[("unselected.class", b"invalid"), (entry, class)]);
+            let facts = read_class_file(&path, entry, "selected-origin")
+                .unwrap()
+                .unwrap();
+            assert_eq!(facts.identity.origin_id, "selected-origin");
+            assert_eq!(facts.identity.internal_name, "pluginfixture/Person");
+            assert!(facts.methods.iter().any(|member| {
+                member.name.as_ref() == "getName"
+                    && member.descriptor.as_ref() == "()Ljava/lang/String;"
+            }));
+            assert!(read_class_file(&path, "missing.class", "selected-origin")
+                .unwrap()
+                .is_none());
+            assert!(read_class_file(&path, "unselected.class", "selected-origin").is_err());
+            assert!(read_class_file(&path, entry, "").is_err());
+            let disk_entry = root.join(entry);
+            fs::create_dir_all(disk_entry.parent().unwrap()).unwrap();
+            fs::write(disk_entry, class).unwrap();
+            let disk_facts = read_class_file(&root, entry, "selected-origin")
+                .unwrap()
+                .unwrap();
+            assert_eq!(disk_facts, facts);
+        }
+        assert!(read_class_file(&root, "missing.class", "origin")
+            .unwrap()
+            .is_none());
+        for unsafe_name in [
+            "",
+            "../Person.class",
+            "/Person.class",
+            "nested/../../Person.class",
+        ] {
+            assert!(
+                read_class_file(&root, unsafe_name, "origin").is_err(),
+                "{unsafe_name}"
+            );
+        }
+        write_binary_jar(
+            &path,
+            &[("META-INF/versions/9/pluginfixture/Person.class", class)],
+        );
+        assert!(read_class_file(&path, "pluginfixture/Person.class", "origin").is_err());
+        write_binary_jar(
+            &path,
+            &[
+                ("META-INF/versions/9/module-info.class", b"unselected"),
+                ("pluginfixture/Person.class", class),
+            ],
+        );
+        assert!(
+            read_class_file(&path, "pluginfixture/Person.class", "origin")
+                .unwrap()
+                .is_some()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_class_reader_rejects_io_checksum_and_size_errors() {
+        let class =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_selected_class_io_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.jar");
+        assert!(read_class_file(&path, "Person.class", "origin").is_err());
+        fs::write(&path, b"not a zip").unwrap();
+        assert!(read_class_file(&path, "Person.class", "origin").is_err());
+        write_binary_jar(&path, &[("Person.class", class)]);
+        let mut corrupt = fs::read(&path).unwrap();
+        let start = corrupt
+            .windows(class.len())
+            .position(|bytes| bytes == class)
+            .unwrap();
+        corrupt[start + class.len() - 1] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        assert!(read_class_file(&path, "Person.class", "origin").is_err());
+        let oversized = vec![0; ktcore::classfile::MAX_CLASS_FILE_BYTES + 1];
+        write_binary_jar(&path, &[("Person.class", &oversized)]);
+        assert!(read_class_file(&path, "Person.class", "origin").is_err());
+        fs::write(root.join("Person.class"), &oversized).unwrap();
+        assert!(read_class_file(&root, "Person.class", "origin").is_err());
+        fs::write(root.join("Person.class"), b"not a classfile").unwrap();
+        assert!(read_class_file(&root, "Person.class", "origin").is_err());
+        let mut forged = fs::read(&path).unwrap();
+        let central = forged
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        forged[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&path, forged).unwrap();
+        assert!(read_class_file(&path, "Person.class", "origin").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plain_java_classpath_checks_services_and_manifest_in_jars_and_directories() {
+        let cases: &[(&str, &[(&str, &str)], bool)] = &[
+            ("empty", &[], true),
+            (
+                "manifest",
+                &[("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n\r\n")],
+                true,
+            ),
+            (
+                "processor",
+                &[(
+                    "META-INF/services/javax.annotation.processing.Processor",
+                    "",
+                )],
+                false,
+            ),
+            (
+                "plugin",
+                &[("META-INF/services/com.sun.source.util.Plugin", "")],
+                false,
+            ),
+            (
+                "redirect",
+                &[(
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\nClass-Path: dependency.jar\n",
+                )],
+                false,
+            ),
+            (
+                "empty_redirect",
+                &[("META-INF/MANIFEST.MF", "cLaSs-PaTh:\r\n")],
+                false,
+            ),
+        ];
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_plain_classpath_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for (name, entries, expected) in cases {
+            let jar = root.join(format!("{name}.JAR"));
+            write_jar(&jar, entries);
+            assert_eq!(plain_java_classpath_entry(&jar), *expected, "jar {name}");
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            for (entry, contents) in *entries {
+                let path = directory.join(entry);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, contents).unwrap();
+            }
+            assert_eq!(
+                plain_java_classpath_entry(&directory),
+                *expected,
+                "directory {name}"
+            );
+        }
+        assert!(!plain_java_classpath_entry(&root.join("missing.jar")));
+        write_jar(&root.join("unknown.zip"), &[]);
+        assert!(!plain_java_classpath_entry(&root.join("unknown.zip")));
+        fs::write(root.join("corrupt.jar"), b"not a zip").unwrap();
+        assert!(!plain_java_classpath_entry(&root.join("corrupt.jar")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plain_java_classpath_rejects_unreadable_and_oversized_manifests() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_plain_manifest_io_{}", std::process::id()));
+        fs::create_dir_all(root.join("META-INF")).unwrap();
+        let manifest = root.join("META-INF/MANIFEST.MF");
+        let jar = root.join("test.jar");
+        for body in [b"\xff".as_slice(), vec![b'x'; 64 * 1024 + 1].as_slice()] {
+            fs::write(&manifest, body).unwrap();
+            write_binary_jar(&jar, &[("META-INF/MANIFEST.MF", body)]);
+            assert!(!plain_java_classpath_entry(&root));
+            assert!(!plain_java_classpath_entry(&jar));
+        }
+        write_jar(&jar, &[("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")]);
+        let mut corrupt = fs::read(&jar).unwrap();
+        let start = corrupt
+            .windows(17)
+            .position(|bytes| bytes == b"Manifest-Version:")
+            .unwrap();
+        corrupt[start] ^= 1;
+        fs::write(&jar, corrupt).unwrap();
+        assert!(!plain_java_classpath_entry(&jar));
+        write_jar(
+            &jar,
+            &[("meta-inf/manifest.mf", "Class-Path: hidden.jar\n")],
+        );
+        assert!(!plain_java_classpath_entry(&jar));
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        assert!(!plain_java_classpath_entry(&root));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
