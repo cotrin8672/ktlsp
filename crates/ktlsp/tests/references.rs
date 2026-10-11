@@ -83,3 +83,87 @@ fn references_on_non_identifier_is_empty() {
     let ws_off = src.find("{ }").unwrap() + 1; // whitespace inside the block
     assert!(ws.references(&key, ws_off, true).is_empty());
 }
+
+#[test]
+fn references_include_file_local_extension_import_aliases() {
+    let mut ws = Workspace::new();
+    let api_key = "mem:///Api.kt";
+    let api = "package lib\nclass Value\nfun Value.compat(): Int = 1\n";
+    let alias_key = "mem:///Alias.kt";
+    let alias = "package app\nimport lib.Value\nimport lib.compat as oldApi\nfun use(v: Value): Int = v.oldApi()\n";
+    let second_key = "mem:///Second.kt";
+    let second = "package another\nimport lib.Value\nimport lib.compat as secondApi\nfun use(v: Value): Int = v.secondApi()\n";
+    let decoy = "package decoy\nclass Other\nfun Other.oldApi(): Int = 2\nfun use(v: Other): Int = v.oldApi()\n";
+    for (key, text) in [
+        (api_key, api),
+        (alias_key, alias),
+        (second_key, second),
+        ("mem:///Decoy.kt", decoy),
+    ] {
+        ws.open(key.to_string(), text.to_string());
+    }
+    let site = |key: &str, text: &str, name: &str, occurrence: usize| {
+        let start = text.match_indices(name).nth(occurrence).unwrap().0;
+        (key.to_string(), start, start + name.len())
+    };
+    let declaration = site(api_key, api, "compat", 0);
+    let mut expected = vec![
+        declaration.clone(),
+        site(alias_key, alias, "compat", 0),
+        site(alias_key, alias, "oldApi", 0),
+        site(alias_key, alias, "oldApi", 1),
+        site(second_key, second, "compat", 0),
+        site(second_key, second, "secondApi", 0),
+        site(second_key, second, "secondApi", 1),
+    ];
+    expected.sort();
+    for (key, cursor) in [
+        (api_key, api.find("compat").unwrap()),
+        (alias_key, alias.rfind("oldApi").unwrap()),
+    ] {
+        let actual = ws
+            .references(key, cursor, true)
+            .into_iter()
+            .map(|r| (r.file, r.start_byte, r.end_byte))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "references from {key}");
+        let actual = ws
+            .references(key, cursor, false)
+            .into_iter()
+            .map(|r| (r.file, r.start_byte, r.end_byte))
+            .collect::<Vec<_>>();
+        let without_declaration = expected
+            .iter()
+            .filter(|site| **site != declaration)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, without_declaration, "uses from {key}");
+    }
+}
+
+#[test]
+fn references_include_bare_import_alias_without_same_spelling_decoy() {
+    let mut ws = Workspace::new();
+    let api_key = "mem:///Api.kt";
+    let api = "package lib\nfun compat(): Int = 1\n";
+    let alias_key = "mem:///Alias.kt";
+    let alias = "package app\nimport lib.compat as oldApi\nfun use(): Int = oldApi()\n";
+    let decoy_key = "mem:///Decoy.kt";
+    let decoy = "package decoy\nfun oldApi(): Int = 2\nfun use(): Int = oldApi()\n";
+    for (key, text) in [(api_key, api), (alias_key, alias), (decoy_key, decoy)] {
+        ws.open(key.to_string(), text.to_string());
+    }
+    let refs = ws.references(alias_key, alias.rfind("oldApi").unwrap(), true);
+    assert_eq!(refs.len(), 4, "{refs:?}");
+    assert!(refs.iter().all(|r| r.file != decoy_key));
+    for name in ["compat", "oldApi"] {
+        for (start, _) in alias.match_indices(name) {
+            assert!(
+                refs.iter().any(|r| {
+                    r.file == alias_key && r.start_byte == start && r.end_byte == start + name.len()
+                }),
+                "missing {name} at {start}: {refs:?}"
+            );
+        }
+    }
+}

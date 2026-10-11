@@ -282,8 +282,8 @@ fn collect_candidates<'a>(
         }));
         if include_extensions {
             extensions.extend(index.extensions_for(&root).into_iter().filter(|entry| {
-                name.matches(&entry.sym.name)
-                    && resolve::extension_is_visible(entry, &ctx.imports, &ctx.package)
+                resolve::visible_extension_names(entry, &ctx.imports, &ctx.package)
+                    .any(|visible_name| name.matches(visible_name))
             }));
         }
         ControlFlow::Continue(())

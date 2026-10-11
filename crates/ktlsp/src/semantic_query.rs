@@ -402,7 +402,14 @@ pub fn member_completion_query(
         let mut seen = HashSet::new();
         for (_, entries) in selected.providers {
             for entry in entries {
-                push_member_candidate(&mut candidates, &mut seen, entry, &prefix, None);
+                push_member_candidate(
+                    &mut candidates,
+                    &mut seen,
+                    entry,
+                    &entry.sym.name,
+                    &prefix,
+                    None,
+                );
             }
         }
         candidates.truncate(max_candidates);
@@ -459,7 +466,8 @@ pub fn member_completion_query_for_type(
             ]),
         });
     }
-    let vis = Visibility::for_file(language, tree, src);
+    let kotlin_ctx =
+        (language == SourceLanguage::Kotlin).then(|| infer::FileCtx::from_tree(tree, src));
     // Kotlin recovery already supplies scoped file facts before receiver inference.
     let source_index = (language == SourceLanguage::Java).then(|| {
         let mut source = Index::new();
@@ -477,7 +485,7 @@ pub fn member_completion_query_for_type(
         &ty,
         receiver_kind,
         &prefix,
-        &vis,
+        kotlin_ctx.as_ref(),
         max_candidates,
     );
     Some(CompletionQuery {
@@ -636,12 +644,14 @@ fn member_call_shape_query(
         (ty, entries)
     } else {
         let ty = infer::infer(index, recv, src, &ctx);
-        let entries = member_call_entries(
-            index,
-            &ty,
-            &symbol,
-            &Visibility::new(&ctx.package, &ctx.imports),
-        );
+        let candidates = ktcore::members::candidates(index, &ty, &symbol, &ctx);
+        let usage = ktcore::members::MemberUse::Call(infer::call_arguments(index, call, src, &ctx));
+        let entries = candidates
+            .select(index, &ty, &usage, &ctx)
+            .entries
+            .into_iter()
+            .filter(|entry| entry.sym.kind == SymbolKind::Function)
+            .collect::<Vec<_>>();
         (ty, entries)
     };
     if entries.is_empty() {
@@ -719,7 +729,7 @@ pub fn scope_name_query(
             &recv_ty,
             ktcore::jvm::ReceiverKind::Unknown,
             &prefix,
-            &vis,
+            Some(&file_ctx),
             max_candidates,
         )
         .0
@@ -916,11 +926,12 @@ fn member_candidates(
     ty: &Type,
     receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: &str,
-    vis: &Visibility,
+    kotlin_ctx: Option<&infer::FileCtx>,
     max_candidates: usize,
 ) -> (Vec<ScopeCompletion>, bool) {
     let mut out: Vec<ScopeCompletion> = Vec::new();
     let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
+    let mut extensions = Vec::new();
     let recovered = source_index.map(|source| RecoveredTypeIndex {
         index,
         source,
@@ -988,20 +999,46 @@ fn member_candidates(
                     continue;
                 }
             }
-            push_member_candidate(&mut out, &mut seen, e, prefix, None);
+            push_member_candidate(&mut out, &mut seen, e, &e.sym.name, prefix, None);
         }
-        if language == SourceLanguage::Kotlin {
-            for e in index.extensions_for(&cur) {
-                let import_path = if vis.is_visible(&e.sym.package, &e.sym.name) {
-                    None
-                } else {
-                    Some(fqn(&e.sym.package, &e.sym.name))
-                };
-                push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
-            }
+        if kotlin_ctx.is_some() {
+            extensions.extend(index.extensions_for(&cur));
         }
         ControlFlow::Continue(())
     });
+    if let Some(ctx) = kotlin_ctx {
+        for entry in extensions {
+            let mut visible = false;
+            for name in resolve::visible_extension_names(entry, &ctx.imports, &ctx.package) {
+                visible = true;
+                push_member_candidate(&mut out, &mut seen, entry, name, prefix, None);
+            }
+            if !visible {
+                push_member_candidate(
+                    &mut out,
+                    &mut seen,
+                    entry,
+                    &entry.sym.name,
+                    prefix,
+                    Some(fqn(&entry.sym.package, &entry.sym.name)),
+                );
+            }
+        }
+        for alias in ctx
+            .imports
+            .iter()
+            .filter_map(|import| import.alias.as_deref())
+        {
+            if !alias.starts_with(prefix) {
+                continue;
+            }
+            for entry in
+                resolve::generic_receiver_extensions(index, alias, &ctx.imports, &ctx.package)
+            {
+                push_member_candidate(&mut out, &mut seen, entry, alias, prefix, None);
+            }
+        }
+    }
     if language == SourceLanguage::Java {
         for candidate in java_callables {
             if let ktcore::jvm::CallableCandidate::Jvm { owner, facts } = candidate {
@@ -1030,69 +1067,6 @@ fn member_candidates(
     }
     out.truncate(max_candidates);
     (out, withheld_compiled)
-}
-
-fn member_call_entries<'a>(
-    index: &'a dyn InferenceIndex,
-    recv_ty: &Type,
-    name: &str,
-    vis: &Visibility,
-) -> Vec<&'a Entry> {
-    let mut members: Vec<&Entry> = Vec::new();
-    let mut extensions: Vec<&Entry> = Vec::new();
-    let _ = infer::walk_supertypes(index, recv_ty, 32, |current| {
-        let Some(cur) = infer::receiver_root_key(index, current) else {
-            return ControlFlow::Continue(());
-        };
-        for e in index.members_of(&cur) {
-            if let Some(p) = current.package() {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            if e.sym.name == name && e.sym.kind == SymbolKind::Function {
-                members.push(e);
-            }
-        }
-        for e in index.extensions_for(&cur) {
-            if e.sym.name == name
-                && e.sym.kind == SymbolKind::Function
-                && vis.is_visible(&e.sym.package, &e.sym.name)
-            {
-                extensions.push(e);
-            }
-        }
-        for e in generic_receiver_extensions(index, name, vis) {
-            if e.sym.kind == SymbolKind::Function {
-                extensions.push(e);
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    if !members.is_empty() {
-        members
-    } else {
-        extensions
-    }
-}
-
-fn generic_receiver_extensions<'a>(
-    index: &'a dyn InferenceIndex,
-    name: &str,
-    vis: &Visibility,
-) -> Vec<&'a Entry> {
-    index
-        .lookup_by_name(name)
-        .iter()
-        .filter(|e| e.sym.kind == SymbolKind::Function && e.sym.container.is_none())
-        .filter(|e| {
-            e.sym
-                .ext_receiver
-                .as_deref()
-                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
-        })
-        .filter(|e| vis.is_visible(&e.sym.package, &e.sym.name))
-        .collect()
 }
 
 fn argument_type_mismatch_query(
@@ -1235,17 +1209,17 @@ fn push_member_candidate(
     out: &mut Vec<ScopeCompletion>,
     seen: &mut HashSet<(String, SymbolKind)>,
     e: &Entry,
+    name: &str,
     prefix: &str,
     import_path: Option<String>,
 ) {
-    let name = &e.sym.name;
     if !name.starts_with(prefix) {
         return;
     }
-    if !seen.insert((name.clone(), e.sym.kind)) {
+    if !seen.insert((name.to_string(), e.sym.kind)) {
         return;
     }
-    let mut c = ScopeCompletion::new(name.clone(), e.sym.kind);
+    let mut c = ScopeCompletion::new(name.to_string(), e.sym.kind);
     c.tier = e.tier;
     c.arity = e.sym.arity;
     c.package = e.sym.package.clone();
@@ -1851,6 +1825,27 @@ mod tests {
         assert_eq!(query.symbol, "ping");
         assert_eq!(query.arg_count, 1);
         assert_eq!(query.arities, vec![0]);
+    }
+
+    #[test]
+    fn call_shape_query_keeps_applicable_import_alias_extension() {
+        let src = "package app\nimport lib.Value\nimport lib.compat as oldApi\nfun use(v: Value): Int = v.oldApi()\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Api.kt", "package lib\nclass Value { fun oldApi(s: String): String = s }\nfun Value.compat(): Int = 1\n".to_string());
+        ws.open("Main.kt", src.to_string());
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "oldApi()");
+        assert!(call_shape_query(
+            &ws.index,
+            "Main.kt",
+            &tree,
+            src,
+            call,
+            &resolve::CompletenessFacts::complete(),
+        )
+        .is_none());
     }
 
     #[test]

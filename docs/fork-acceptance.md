@@ -2102,6 +2102,73 @@ extension candidate reductions need compiler/editor reproduction before widening
 negative diagnostics. Broad six-project IDEA parity and matched performance
 measurements remain open.
 
+### Thirty-second checkpoint: imported Kotlin extension aliases
+
+The compiler-valid `Versioned.compat()` extension imported as `oldApi` was omitted
+from qualified member resolution, inference and completion: candidates compared
+the written alias against the authored name. The shared resolver now enumerates
+visible call-site names while preserving the original declaration, package and
+definition range. Generic receiver extensions query the real imported name bucket.
+An alias hides the original name even from same-package and wildcard visibility;
+an explicit unaliased import restores it. No synthetic alias declarations enter
+the global index. Completion uses these same names, keeps inherited real members
+ahead of extensions, and call-shape queries use shared typed applicability.
+
+References discover aliases only in candidate Kotlin files from the existing
+reverse index, resolve their actual import targets and re-resolve usage sites.
+Authored rename changes declarations, direct calls and import targets while
+preserving alias declarations and alias calls. `prepareRename` returns the cursor's
+file/range. Closed-file queries, unsaved import rebinding and close-to-disk recovery
+are covered. Ambiguous overload imports, same-spelling aliases and candidate-cap
+overflow currently refuse rename; import splitting and alias-binding rename remain
+coverage gaps, rather than partial edits being returned as a successful rename.
+
+Evidence root: `C:/Users/gummy/AppData/Local/Temp/ktlsp-kotlin-extension-alias-20261011-1`.
+The four portable sources are under `dev/semantic-fixture/probe/extensions/`.
+Gradle/KGP **8.10.2/1.9.23** and **9.6.1/2.4.0**, running on JDK 17, compile the
+original, rebound and authored-renamed versions. The rebound version left with the
+wrong receiver's `payloadOnly(): String` fails with an actual `Int` return mismatch.
+Separate compiler controls confirm alias hiding, explicit restoration, multiple
+aliases, removed imports and unrelated receivers. Commands and compiler output are
+in `compiler-*-results.json` and `compiler-*.log`.
+
+The immutable before/after release SHA-256 values are
+`b65411c484a6a45fbac6e0d21e0cafc100a0109dfb4cdf847eb8ae2f93a31e4d` and
+`9e318a840222c184c2cea3c89bc0103615c6d9947fbeaed5ebb21e061751b6fc`.
+The same real-Neovim `semantic` scenario retains its 23 checks and adds 42 alias
+checks. Alias checks improve **30/42 to 42/42**; the existing 23 pass in both arms.
+All **18 first requests** receive protocol responses in each arm, with no protocol
+errors or retries. The checks include incomplete `v.old`, exact typed return-chain
+targets, unsaved import removal/rebinding/restoration, references and an actually
+applied rename compared against all four complete buffers. Both servers acknowledge
+shutdown and exit cleanly; harness/source/user-file hashes match. An earlier
+unique-name fixture let five return-chain checks pass without establishing receiver
+inference. The reported comparison adds same-named, differently typed receiver
+decoys in both arms; the earlier artifacts are preserved separately.
+
+Workspace tests pass **1,218 / 0 failed / 4 ignored** across 40 suites. Formatting
+and release build exit zero. The `library` editor probe passes **13/13**. Wider
+editor diagnostics remain open: `features` returns **78/80**, and `java` **191/196**.
+The previous release also misses the same two feature expectations and five Java
+diagnostics; its feature run additionally returns a nil implementation result.
+That extra observation is retained without attributing an unrelated improvement to
+this patch. Missing-type explanation reports `compiler-producer-incomplete` and
+`unknown`; expectations were not weakened or marked passed. The Java probe's
+forced client termination is recorded separately from its diagnostic coverage gaps.
+See `semantic-{before,after}-decoy/`, `editor-before-regression-results.json`,
+`editor-regression-results.json`, `validation-results.json` and `slice-evidence.json`.
+No latency, process-RSS or six-project IDEA-equivalence claim follows from these
+fixture results.
+
+Next reduce the compiler-valid function-local extension in
+`compiler-project/src/main/kotlin/app/LocalUse.kt`, using
+`local-extension-next.json` through the existing `corpus` harness. Local extensions
+must retain lexical scope and typed receiver selection rather than enter the global
+index. Kotlin's obsolete binary-member diagnostic still needs a complete visible
+extension world and compiler-producer proof. Broad six-project IDEA comparison,
+compiler-plugin editing behavior and matched performance/memory measurements remain
+open. Execution timeouts bound experiments and do not decide semantic acceptance.
+
 ### Current slice: requires-only compatibility artifacts
 
 Selected Kotlin compatibility and coroutines JARs can contain a module descriptor

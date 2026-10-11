@@ -1367,8 +1367,18 @@ impl Workspace {
         self.rename_member_family(&target)?;
         let text = self.doc_text(&target.file)?;
         let placeholder = text.get(target.start_byte..target.end_byte)?.to_string();
+        let range = if let Some(doc) = self.open_docs.get(key) {
+            self.identifier_at_key(key, &doc.tree, offset)?.byte_range()
+        } else {
+            let (_, tree) = self.parsed_closed_doc(key)?;
+            self.identifier_at_key(key, &tree, offset)?.byte_range()
+        };
         Some(crate::rename::PreparedRename {
-            range: target,
+            range: Def {
+                file: key.to_string(),
+                start_byte: range.start,
+                end_byte: range.end,
+            },
             placeholder,
         })
     }
@@ -1411,7 +1421,7 @@ impl Workspace {
         }
         let mut refs = BTreeSet::new();
         for member in family {
-            for site in self.references(&member.file, member.start_byte, true) {
+            for site in self.references_with_policy(&member.file, member.start_byte, true, true)? {
                 // A fixed JVM export name is independent of the authored Kotlin identifier.
                 if self
                     .jvm_member_at(&site.file, site.start_byte)
@@ -1421,7 +1431,7 @@ impl Workspace {
                 }
             }
         }
-        if refs.is_empty() || !refs.iter().any(|r| *r == target) {
+        if refs.is_empty() || refs.len() > RENAME_REF_CAP || !refs.iter().any(|r| *r == target) {
             return None;
         }
         let edits = crate::rename::edits_for_refs(refs.into_iter().collect(), new_name);
@@ -1760,7 +1770,8 @@ impl Workspace {
         }) {
             return None;
         }
-        let mut sites = self.references(&target.file, target.start_byte, false);
+        let mut sites =
+            self.references_with_policy(&target.file, target.start_byte, false, true)?;
         sites.retain(|site| {
             self.jvm_member_at(&site.file, site.start_byte)
                 .is_some_and(|candidate| candidate.identity.as_ref() == Some(identity))
@@ -1978,7 +1989,7 @@ impl Workspace {
             }
         }
         let mut refs = match &subject {
-            RenameTarget::Member(_) => self.references(key, offset, true),
+            RenameTarget::Member(_) => self.references_with_policy(key, offset, true, true)?,
             RenameTarget::Declaration(_) => {
                 let mut out = Vec::new();
                 for name in &names {
@@ -2514,11 +2525,22 @@ impl Workspace {
     /// Goto-grade precision: every candidate usage of the name is re-resolved and kept only if it
     /// resolves to the same definition as the cursor. Optionally includes the declaration site.
     pub fn references(&mut self, key: &str, offset: usize, include_declaration: bool) -> Vec<Def> {
+        self.references_with_policy(key, offset, include_declaration, false)
+            .unwrap_or_default()
+    }
+
+    fn references_with_policy(
+        &mut self,
+        key: &str,
+        offset: usize,
+        include_declaration: bool,
+        for_rename: bool,
+    ) -> Option<Vec<Def>> {
         self.refresh_compiled_freshness();
         let start = std::time::Instant::now();
         let target = match self.goto_definition(key, offset).into_iter().next() {
             Some(d) => d,
-            None => return Vec::new(),
+            None => return None,
         };
         let mut names = self.reference_names(&target);
         if names.is_empty() {
@@ -2526,10 +2548,8 @@ impl Workspace {
                 names.insert(name);
             }
         }
-        let mut candidates: Vec<RefEntry> = names
-            .iter()
-            .flat_map(|name| self.index.lookup_refs(name).iter().cloned())
-            .collect();
+        let (mut candidates, alias_sites) =
+            self.reference_candidates(&target, &names, for_rename)?;
         // Backstop against a pathologically common name in a very large project.
         const MAX_CANDIDATES: usize = 5000;
         if candidates.len() > MAX_CANDIDATES {
@@ -2538,6 +2558,16 @@ impl Workspace {
                 candidates.len()
             );
             candidates.truncate(MAX_CANDIDATES);
+        }
+        if for_rename {
+            // Import aliases keep their own spelling when the authored declaration is renamed.
+            candidates.retain(|site| {
+                !alias_sites.contains(&Def {
+                    file: site.path.to_string(),
+                    start_byte: site.start_byte,
+                    end_byte: site.end_byte,
+                })
+            });
         }
         // Group by file so each file is parsed at most once (not once per usage within it).
         let mut by_path: HashMap<Arc<str>, Vec<RefEntry>> = HashMap::new();
@@ -2579,6 +2609,9 @@ impl Workspace {
         }
         out.sort();
         out.dedup();
+        if for_rename && out.len() > RENAME_REF_CAP {
+            return None;
+        }
         crate::trace::span(
             "workspace.references.resolve_candidates",
             "workspace",
@@ -2591,7 +2624,114 @@ impl Workspace {
                 "count": out.len(),
             }),
         );
-        out
+        Some(out)
+    }
+
+    fn reference_candidates(
+        &mut self,
+        target: &Def,
+        names: &BTreeSet<String>,
+        for_rename: bool,
+    ) -> Option<(Vec<RefEntry>, BTreeSet<Def>)> {
+        let mut candidates: Vec<_> = names
+            .iter()
+            .flat_map(|name| self.index.lookup_refs(name).iter().cloned())
+            .collect();
+        let mut alias_sites = BTreeSet::new();
+        if candidates.len() > RENAME_REF_CAP {
+            return (!for_rename).then_some((candidates, alias_sites));
+        }
+        // The real imported terminal is already indexed. Only its candidate files need parsing.
+        let paths = candidates
+            .iter()
+            .filter(|site| !SourceLanguage::for_key(&site.path).is_java())
+            .map(|site| site.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut seen = candidates
+            .iter()
+            .map(|site| (site.path.clone(), site.start_byte, site.end_byte))
+            .collect::<BTreeSet<_>>();
+        for path in paths {
+            let aliases = if let Some(doc) = self.open_docs.get(path.as_ref()) {
+                self.matching_import_aliases(&path, &doc.text, &doc.tree, target, names)
+            } else {
+                let Some((text, tree)) = self.parsed_closed_doc(&path) else {
+                    if for_rename {
+                        return None;
+                    }
+                    continue;
+                };
+                self.matching_import_aliases(&path, &text, &tree, target, names)
+            };
+            for (alias, imported_name, unambiguous) in aliases {
+                // shortcut: same-spelling aliases need qualified-use projection before rename.
+                if for_rename && (!unambiguous || alias == imported_name) {
+                    return None;
+                }
+                for site in self
+                    .index
+                    .lookup_refs(&alias)
+                    .iter()
+                    .filter(|site| site.path == path)
+                {
+                    if for_rename {
+                        alias_sites.insert(Def {
+                            file: path.to_string(),
+                            start_byte: site.start_byte,
+                            end_byte: site.end_byte,
+                        });
+                    }
+                    if seen.insert((site.path.clone(), site.start_byte, site.end_byte)) {
+                        candidates.push(site.clone());
+                    }
+                    if candidates.len() > RENAME_REF_CAP {
+                        return (!for_rename).then_some((candidates, alias_sites));
+                    }
+                }
+            }
+        }
+        Some((candidates, alias_sites))
+    }
+
+    /// (Local alias spelling, real import spelling, unique imported declaration).
+    fn matching_import_aliases(
+        &self,
+        key: &str,
+        text: &str,
+        tree: &Tree,
+        target: &Def,
+        names: &BTreeSet<String>,
+    ) -> Vec<(String, String, bool)> {
+        let mut aliases = Vec::new();
+        let mut cursor = tree.root_node().walk();
+        for import in tree.root_node().named_children(&mut cursor) {
+            if import.kind() != "import" {
+                continue;
+            }
+            let Some(alias) = crate::parser::child_of_kind(import, "identifier") else {
+                continue;
+            };
+            let Some(path) = crate::parser::child_of_kind(import, "qualified_identifier") else {
+                continue;
+            };
+            let Some(imported) = path.named_child(path.named_child_count().saturating_sub(1))
+            else {
+                continue;
+            };
+            let imported_name = node_text(imported, text);
+            if !names.contains(imported_name) {
+                continue;
+            }
+            let definitions = self.goto_definition_for_tree(key, text, tree, imported.start_byte());
+            if definitions.contains(target) {
+                aliases.push((
+                    node_text(alias, text).to_string(),
+                    imported_name.to_string(),
+                    definitions.len() == 1,
+                ));
+            }
+        }
+        aliases
     }
 
     fn reference_names(&self, target: &Def) -> BTreeSet<String> {
@@ -3212,6 +3352,99 @@ mod tests {
             0
         );
         assert_eq!(ws.index.contributions_for_file("Current.kt").len(), 1);
+    }
+
+    #[test]
+    fn closed_import_alias_references_and_rename_refresh_after_unsaved_import_close() {
+        let root = unique_tmp("closed-import-alias");
+        std::fs::create_dir_all(&root).unwrap();
+        let api_path = root.join("Api.kt");
+        let alias_path = root.join("Alias.kt");
+        let other_path = root.join("Other.kt");
+        let api = "package lib\nclass Value\nfun Value.compat(): Int = 1\n";
+        let alias = "package app\nimport lib.Value\nimport lib.compat as oldApi\nfun use(v: Value): Int = v.oldApi()\n";
+        let other = "package other\nimport lib.Value\nfun Value.compat(): Int = 2\n";
+        for (path, text) in [(&api_path, api), (&alias_path, alias), (&other_path, other)] {
+            std::fs::write(path, text).unwrap();
+        }
+        let api_key = crate::paths::file_key(&api_path);
+        let alias_key = crate::paths::file_key(&alias_path);
+        let other_key = crate::paths::file_key(&other_path);
+        let declaration = Def {
+            file: api_key.clone(),
+            start_byte: api.find("compat").unwrap(),
+            end_byte: api.find("compat").unwrap() + "compat".len(),
+        };
+        let mut expected = vec![declaration.clone()];
+        for name in ["compat", "oldApi"] {
+            for (start, _) in alias.match_indices(name) {
+                expected.push(Def {
+                    file: alias_key.clone(),
+                    start_byte: start,
+                    end_byte: start + name.len(),
+                });
+            }
+        }
+        expected.sort();
+        let mut ws = Workspace::new();
+        assert_eq!(ws.scan(&root), 3);
+        assert!(
+            ws.open_docs.is_empty(),
+            "all initial queries use closed-file parsing"
+        );
+        assert_eq!(
+            ws.references(&api_key, declaration.start_byte, true),
+            expected
+        );
+        let edits = ws
+            .rename(&api_key, declaration.start_byte, "freshCompat")
+            .unwrap();
+        assert_eq!(edits.len(), 2, "{edits:?}");
+        let expected_api = api.replace("compat", "freshCompat");
+        let expected_alias = alias.replace("lib.compat as oldApi", "lib.freshCompat as oldApi");
+        for (key, original, after) in [
+            (&api_key, api, expected_api.as_str()),
+            (&alias_key, alias, expected_alias.as_str()),
+            (&other_key, other, other),
+        ] {
+            assert_eq!(
+                crate::edit::apply_to_text(key, original, &edits).unwrap(),
+                after
+            );
+            assert_eq!(std::fs::read_to_string(key).unwrap(), original);
+        }
+        let dirty = alias
+            .replace("lib.compat as oldApi", "other.compat as dirtyApi")
+            .replace("v.oldApi()", "v.dirtyApi()");
+        ws.open(alias_key.clone(), dirty.clone());
+        assert_eq!(
+            ws.goto_definition(&alias_key, dirty.rfind("dirtyApi").unwrap()),
+            vec![Def {
+                file: other_key,
+                start_byte: other.find("compat").unwrap(),
+                end_byte: other.find("compat").unwrap() + "compat".len(),
+            }]
+        );
+        assert_eq!(
+            ws.references(&api_key, declaration.start_byte, true),
+            vec![declaration.clone()]
+        );
+        ws.close(&alias_key);
+        assert!(ws.open_docs.is_empty());
+        assert_eq!(
+            ws.references(&api_key, declaration.start_byte, true),
+            expected
+        );
+        let restored_edits = ws
+            .rename(&api_key, declaration.start_byte, "freshCompat")
+            .unwrap();
+        assert_eq!(restored_edits.len(), 2, "{restored_edits:?}");
+        assert_eq!(
+            crate::edit::apply_to_text(&alias_key, alias, &restored_edits).unwrap(),
+            expected_alias
+        );
+        assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), alias);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn unique_tmp(prefix: &str) -> std::path::PathBuf {

@@ -192,8 +192,12 @@ dev/ktlsp-harness.sh basic
 Editor-facing changes should also run the smallest relevant harness scenario: `features`,
 `library`, `java`, `mixed`, `corpus`, `semantic`, `gradle-live`, or `comprehensive`.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
-and KMP navigation, then records the shutdown acknowledgement, exit notification and
-native server exit in `semantic-shutdown.json`.
+and KMP navigation. Imported extension aliases also cover typed return chains with
+same-named decoys, incomplete completion, unsaved import removal/rebinding, references
+and applied rename edits that preserve alias spelling. These alias requests consume
+their first response and record buffer delivery and exact edits in
+`semantic-extension-alias.json`. Shutdown acknowledgement, exit notification and native
+server exit are recorded separately in `semantic-shutdown.json`.
 Use `corpus` with a completion UI case for real-project blank `super.` acceptance;
 retain the applied buffer and verify it with that project's compiler and plugins.
 

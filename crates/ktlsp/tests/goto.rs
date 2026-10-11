@@ -905,3 +905,290 @@ fn default_import_precedence_beats_index_insertion_order() {
          //- Main.kt\npackage app\nfun f(s: /*^*/String) {}\n",
     );
 }
+
+#[test]
+fn aliased_extension_goto_uses_imported_package() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Wrong.kt
+package wrong
+import vendor.Versioned
+fun Versioned.compat(): Int = 0
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned./*def*/compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/oldApi()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_return_type_feeds_member_chain() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Wrong.kt
+package wrong
+import vendor.Versioned
+class OtherPayload {
+    fun payloadOnly(): Int = 0
+}
+fun Versioned.compat(): OtherPayload = OtherPayload()
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+class Payload {
+    fun /*def*/payloadOnly(): Int = 1
+}
+fun Versioned.compat(): Payload = Payload()
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v.oldApi()./*^*/payloadOnly()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_generic_receiver_goto_uses_imported_package() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Wrong.kt
+package wrong
+fun <T> T.compat(): Int = 0
+//- Compatibility.kt
+package compat
+fun <T> T./*def*/compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/oldApi()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_generic_receiver_preserves_return_binding() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned {
+    fun /*def*/payloadOnly(): Int = 1
+}
+class Other {
+    fun payloadOnly(): Int = 0
+}
+//- Compatibility.kt
+package compat
+fun <T> T.compat(): T = this
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v.oldApi()./*^*/payloadOnly()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_does_not_make_canonical_name_visible() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned.compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/compat()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_hides_wildcard_imported_canonical_name() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned.compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.*
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/compat()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_hides_same_package_canonical_name() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned.compat(): Int = 1
+//- Main.kt
+package compat
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/compat()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_rejects_wrong_receiver_type() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+class Other
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned.compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Other
+import compat.compat as oldApi
+fun use(v: Other): Int = v./*^*/oldApi()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_keeps_real_member_priority() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned {
+    fun /*def*/oldApi(): Int = 2
+}
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned.compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/oldApi()
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_retains_typed_overload_selection() {
+    check(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned./*def*/compat(value: Int): Int = value
+fun Versioned.compat(value: String): String = value
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/oldApi(1)
+"#,
+    );
+}
+
+#[test]
+fn aliased_extension_allows_canonical_and_multiple_alias_imports() {
+    for name in ["compat", "oldApi", "olderApi"] {
+        let fixture = r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned./*def*/compat(): Int = 1
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat
+import compat.compat as oldApi
+import compat.compat as olderApi
+fun use(v: Versioned): Int = v./*^*/__visible_name__()
+"#;
+        check(&fixture.replace("__visible_name__", name));
+    }
+}
+
+#[test]
+fn aliased_extension_unsaved_import_rebind_and_removal_invalidate_goto() {
+    let fx = parse_fixture(
+        r#"//- Versioned.kt
+package vendor
+class Versioned
+//- Compatibility.kt
+package compat
+import vendor.Versioned
+fun Versioned./*def*/compat(): Int = 1
+//- Other.kt
+package other
+import vendor.Versioned
+fun Versioned./*def*/compat(): Int = 2
+//- Main.kt
+package app
+import vendor.Versioned
+import compat.compat as oldApi
+fun use(v: Versioned): Int = v./*^*/oldApi()
+"#,
+    );
+    let mut ws = Workspace::new();
+    for (key, text) in &fx.files {
+        ws.open(key.clone(), text.clone());
+    }
+    let original = &fx.files.iter().find(|(key, _)| key == "Main.kt").unwrap().1;
+    for (import, target) in [
+        ("import compat.compat as oldApi\n", Some("Compatibility.kt")),
+        ("import other.compat as oldApi\n", Some("Other.kt")),
+        ("", None),
+        ("import compat.compat as oldApi\n", Some("Compatibility.kt")),
+    ] {
+        let text = original.replace("import compat.compat as oldApi\n", import);
+        let offset = text.rfind("oldApi").unwrap();
+        ws.change("Main.kt", text);
+        let got: BTreeSet<_> = ws
+            .goto_definition("Main.kt", offset)
+            .into_iter()
+            .map(|def| (def.file, def.start_byte, def.end_byte))
+            .collect();
+        let want: BTreeSet<_> = fx
+            .defs
+            .iter()
+            .filter(|(key, _)| Some(key.as_str()) == target)
+            .map(|(key, offset)| (key.clone(), *offset, offset + "compat".len()))
+            .collect();
+        assert_eq!(got, want, "unsaved import: {import:?}");
+    }
+}

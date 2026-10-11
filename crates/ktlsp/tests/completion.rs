@@ -776,6 +776,75 @@ fn extension_already_imported_no_auto_import() {
 }
 
 #[test]
+fn imported_extension_alias_completes_written_name_without_import() {
+    let input = "//- Versioned.java\npackage vendor;\npublic class Versioned { public int newApi() { return 2; } }\n//- Compatibility.kt\npackage compat\nimport vendor.Versioned\nclass Payload { fun payloadOnly(): Int = 7 }\nfun Versioned.compat(): Payload = Payload()\n//- Main.kt\npackage app\nimport vendor.Versioned\nimport compat.compat as oldApi\nfun use(v: Versioned) { v.old/*^*/ }\n";
+    let result = shaped(input).expect("known Java receiver");
+    let item = item_with(&result, "oldApi").expect("import alias is the callable name");
+    assert_eq!(item.auto_import, None);
+    assert_eq!(item.insert_text, "oldApi()$0");
+}
+
+#[test]
+fn imported_extension_aliases_keep_each_written_name() {
+    let input = "//- Versioned.java\npackage vendor;\npublic class Versioned { public int newApi() { return 2; } }\n//- Compatibility.kt\npackage compat\nimport vendor.Versioned\nfun Versioned.compat(): Int = 7\n//- Main.kt\npackage app\nimport vendor.Versioned\nimport compat.compat as oldApi\nimport compat.compat as newerApi\nfun use(v: Versioned) { v./*^*/ }\n";
+    let result = shaped(input).expect("known Java receiver");
+    for label in ["oldApi", "newerApi", "newApi"] {
+        let item = item_with(&result, label).unwrap_or_else(|| panic!("missing {label}"));
+        assert_eq!(item.auto_import, None);
+    }
+    assert!(
+        item_with(&result, "compat").is_none(),
+        "alias-only import must not insert an invisible original name"
+    );
+}
+
+#[test]
+fn imported_extension_alias_infers_return_chain_completion() {
+    check_contains(
+        "//- Versioned.java\npackage vendor;\npublic class Versioned {}\n//- Compatibility.kt\npackage compat\nimport vendor.Versioned\nclass Payload { fun payloadOnly(): Int = 7 }\nfun Versioned.compat(): Payload = Payload()\n//- Main.kt\npackage app\nimport vendor.Versioned\nimport compat.compat as oldApi\nfun use(v: Versioned) { v.oldApi().pay/*^*/ }\n",
+        &["payloadOnly"],
+    );
+}
+
+#[test]
+fn imported_generic_extension_alias_completes_written_name() {
+    check_contains(
+        "//- Versioned.java\npackage vendor;\npublic class Versioned {}\n//- Compatibility.kt\npackage compat\nfun <T> T.compat(): Int = 7\n//- Main.kt\npackage app\nimport vendor.Versioned\nimport compat.compat as oldApi\nfun use(v: Versioned) { v.old/*^*/ }\n",
+        &["oldApi"],
+    );
+}
+
+#[test]
+fn imported_extension_alias_hides_original_from_star_and_same_package() {
+    for (package, extra_import) in [("app", "import compat.*\n"), ("compat", "")] {
+        let input = format!("//- Versioned.java\npackage vendor;\npublic class Versioned {{}}\n//- Compatibility.kt\npackage compat\nimport vendor.Versioned\nfun Versioned.compat(): Int = 7\n//- Main.kt\npackage {package}\nimport vendor.Versioned\nimport compat.compat as oldApi\n{extra_import}fun use(v: Versioned) {{ v./*^*/ }}\n");
+        let result = shaped(&input).expect("known Java receiver");
+        assert!(item_with(&result, "oldApi").is_some());
+        assert!(item_with(&result, "compat").is_none());
+    }
+}
+
+#[test]
+fn imported_extension_alias_and_explicit_original_both_complete() {
+    let input = "//- Versioned.java\npackage vendor;\npublic class Versioned {}\n//- Compatibility.kt\npackage compat\nimport vendor.Versioned\nfun Versioned.compat(): Int = 7\n//- Main.kt\npackage app\nimport vendor.Versioned\nimport compat.compat as oldApi\nimport compat.compat\nfun use(v: Versioned) { v./*^*/ }\n";
+    let result = shaped(input).expect("known Java receiver");
+    for label in ["oldApi", "compat"] {
+        let item = item_with(&result, label).unwrap_or_else(|| panic!("missing {label}"));
+        assert_eq!(item.auto_import, None);
+    }
+}
+
+#[test]
+fn imported_extension_alias_does_not_replace_inherited_member_signature() {
+    let input = "//- Types.kt\npackage vendor\nopen class Base { fun oldApi(): Int = 1 }\nclass Child : Base()\n//- Compatibility.kt\npackage compat\nimport vendor.Child\nfun Child.compat(value: Int): Int = value\n//- Main.kt\npackage app\nimport vendor.Child\nimport compat.compat as oldApi\nfun use(v: Child) { v.old/*^*/ }\n";
+    let result = shaped(input).expect("known inherited member");
+    assert_eq!(
+        item_with(&result, "oldApi").unwrap().insert_text,
+        "oldApi()$0"
+    );
+}
+
+#[test]
 fn silent_omission_unknown_receiver() {
     // The receiver type can't be inferred -> None.
     assert!(shaped("fun f(x: Unknown) {\n    x./*^*/\n}\n").is_none());

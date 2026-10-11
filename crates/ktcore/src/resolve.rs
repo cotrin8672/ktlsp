@@ -1491,15 +1491,22 @@ pub fn member_defs_for_use(
     )
 }
 
-pub(crate) fn generic_receiver_extensions<'a>(
+/// Generic-receiver extensions visible under the written canonical or aliased call-site name.
+pub fn generic_receiver_extensions<'a>(
     index: &'a dyn InferenceIndex,
     name: &str,
     imports: &[Import],
     current_pkg: &str,
 ) -> Vec<&'a Entry> {
-    index
-        .lookup_by_name(name)
-        .iter()
+    std::iter::once(name)
+        .chain(
+            imports
+                .iter()
+                .filter(|imp| imp.alias.is_some() && imp.local_name() == Some(name))
+                .map(Import::simple_name)
+                .filter(|real_name| *real_name != name),
+        )
+        .flat_map(|lookup_name| index.lookup_by_name(lookup_name))
         .filter(|e| e.sym.container.is_none())
         .filter(|e| {
             e.sym
@@ -1507,8 +1514,32 @@ pub(crate) fn generic_receiver_extensions<'a>(
                 .as_deref()
                 .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
         })
-        .filter(|e| extension_is_visible(e, imports, current_pkg))
+        .filter(|e| visible_extension_names(e, imports, current_pkg).any(|visible| visible == name))
         .collect()
+}
+
+/// Call-site names for an extension, preserving its authored declaration and definition range.
+/// An alias hides the canonical name from package/wildcard visibility, but an explicit unaliased
+/// import restores it. Aliases follow the canonical name in import order.
+pub fn visible_extension_names<'a>(
+    entry: &'a Entry,
+    imports: &'a [Import],
+    current_pkg: &str,
+) -> impl Iterator<Item = &'a str> {
+    let matching_imports = imports
+        .iter()
+        .filter(move |imp| import_path_matches_entry(imp, entry));
+    let canonical = if matching_imports.clone().any(|imp| imp.alias.is_none()) {
+        true
+    } else if matching_imports.clone().any(|imp| imp.alias.is_some()) {
+        false
+    } else {
+        extension_is_visible(entry, imports, current_pkg)
+    };
+    canonical
+        .then_some(entry.sym.name.as_str())
+        .into_iter()
+        .chain(matching_imports.filter_map(|imp| imp.alias.as_deref()))
 }
 
 pub(crate) fn extension_is_visible(e: &Entry, imports: &[Import], current_pkg: &str) -> bool {
