@@ -1650,3 +1650,482 @@ fn conflicting_nominal_shapes_never_become_known_receiver_arguments() {
             .is_empty());
     }
 }
+
+const PROJECTED_REQUEST: &str = r#"package probe;
+public class Request {
+ public @javax.annotation.Nullable <T> T tag(Class<? extends T> type) { return null; }
+ public <T> T upper(Class<? super T> type) { return null; }
+ public <T> T star(Class<?> type) { return null; }
+ public <T> T both(Class<T> exact, Class<? extends T> lower) { return null; }
+ public <T> T different(Class<? extends T> left, Class<? extends T> right) { return null; }
+ public <T extends Invocation> T bounded(Class<? extends T> type) { return null; }
+ public <T> T nested(Class<? extends Class<T>> type) { return null; }
+ public <T> T invariantNested(Pair<Class<? extends T>,Class<T>> pair) { return null; }
+ public <T> T variant(Variant<? extends T> type) { return null; }
+ public <T extends Invocation> T boundedOwner(BoundedOwner<? extends T> type) { return null; }
+}
+"#;
+const PROJECTED_KOTLIN_REQUEST: &str = r#"package probe
+class KotlinRequest {
+ fun <T> tag(type: Class<out T>): T? = null
+ fun <T> upper(type: Class<in T>): T? = null
+ fun <T> star(type: Class<*>): T? = null
+ fun <T> both(exact: Class<T>, lower: Class<out T>): T? = null
+ fun <T> bounded(type: Class<out T>): T? where T : Invocation = null
+}
+"#;
+
+fn projected_workspace(source: &str) -> Workspace {
+    let mut ws = reflection_workspace(source);
+    ws.open("Request.java", PROJECTED_REQUEST.into());
+    ws.open("KotlinRequest.kt", PROJECTED_KOTLIN_REQUEST.into());
+    ws.open(
+        "Nullable.java",
+        "package javax.annotation; public @interface Nullable {}".into(),
+    );
+    ws.open(
+        "Pair.java",
+        "package probe; public class Pair<A,B> {}".into(),
+    );
+    ws.open(
+        "Variant.kt",
+        "package probe\nclass Variant<out T> { fun body() {} }\n".into(),
+    );
+    ws.open(
+        "BoundedOwner.java",
+        "package probe; public class BoundedOwner<T extends Invocation> { public void body() {} }"
+            .into(),
+    );
+    ws
+}
+
+#[test]
+fn projected_arguments_infer_their_own_target_in_java_and_kotlin() {
+    let kotlin = r#"package probe
+import kotlin.reflect.KClass
+fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other: Class<Other>, typed: KClass<Invocation>) {
+ request.tag(type)!!.service()
+ kotlin.tag(type)!!.service()
+ request.tag(Invocation::class.java)!!.service()
+ request.tag(typed.java)!!.service()
+ request.tag(other)!!.body()
+ kotlin.tag(other)!!.body()
+}
+"#;
+    let mut ws = projected_workspace(kotlin);
+    for expression in [
+        "request.tag(type)!!",
+        "kotlin.tag(type)!!",
+        "request.tag(Invocation::class.java)!!",
+        "request.tag(typed.java)!!",
+    ] {
+        let ty = infer_expression(&ws, "Use.kt", expression);
+        assert_eq!(ty.name(), Some("Invocation"), "{expression}: {ty:?}");
+        assert_eq!(ty.package(), Some("probe"));
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "service",
+            "serviceWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.service()"),
+            "Invocation.java",
+            "service",
+        );
+    }
+    for expression in ["request.tag(other)!!", "kotlin.tag(other)!!"] {
+        let ty = infer_expression(&ws, "Use.kt", expression);
+        assert_eq!(ty.name(), Some("Other"));
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "body",
+            "service",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.body()"),
+            "Other.java",
+            "body",
+        );
+    }
+    let java = "package probe; class Use { void use(Request request, KotlinRequest kotlin, Class<Invocation> type, Class<Other> other) { request.tag(type).service(); kotlin.tag(type).service(); request.tag(other).body(); kotlin.tag(other).body(); } }";
+    ws.open("Use.java", java.into());
+    for expression in ["request.tag(type)", "kotlin.tag(type)"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{expression}."),
+            "service",
+            "serviceWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{expression}.service()"),
+            "Invocation.java",
+            "service",
+        );
+    }
+    for expression in ["request.tag(other)", "kotlin.tag(other)"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{expression}."),
+            "body",
+            "service",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{expression}.body()"),
+            "Other.java",
+            "body",
+        );
+    }
+}
+
+#[test]
+fn projected_constraints_distinguish_equality_lower_and_unsupported_bounds() {
+    let source = r#"package probe
+fun <T> Pair<T,Other>.from(type: Class<out T>): T = error("fixture")
+fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other: Class<Other>, star: Class<*>, unknown: Class<Missing>, nested: Class<Class<Invocation>>, pair: Pair<Class<Invocation>,Class<Invocation>>, receiver: Pair<Invocation,Other>, variant: Variant<Invocation>, bounded: BoundedOwner<Invocation>, known: Other) {
+ request.both(type,type)!!.service()
+ kotlin.both(type,type)!!.service()
+ request.nested(nested)!!.service()
+ receiver.from(type).service()
+ receiver.from(other)
+ request.invariantNested(pair)
+ request.upper(type)
+ kotlin.upper(type)
+ request.star(type)
+ kotlin.star(type)
+ request.tag(star)
+ request.tag(unknown)
+ request.both(type,other)
+ request.different(type,other)
+ request.bounded(type)
+ kotlin.bounded(type)
+ request.variant(variant)
+ request.boundedOwner(bounded)
+ variant.body()
+ bounded.body()
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    for expression in [
+        "request.both(type,type)!!",
+        "kotlin.both(type,type)!!",
+        "request.nested(nested)!!",
+        "receiver.from(type)",
+    ] {
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "service",
+            "serviceWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.service()"),
+            "Invocation.java",
+            "service",
+        );
+    }
+    // These guards record incomplete coverage, not functional acceptance of valid upper/bounded calls.
+    for expression in [
+        "request.upper(type)",
+        "kotlin.upper(type)",
+        "request.star(type)",
+        "kotlin.star(type)",
+        "request.tag(star)",
+        "request.tag(unknown)",
+        "request.both(type,other)",
+        "request.different(type,other)",
+        "request.bounded(type)",
+        "kotlin.bounded(type)",
+        "request.variant(variant)",
+        "request.boundedOwner(bounded)",
+        "request.invariantNested(pair)",
+        "receiver.from(other)",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    for prefix in ["variant.", "bounded.", "known."] {
+        assert_member(&mut ws, "Use.kt", prefix, "body", "service");
+    }
+}
+
+#[test]
+fn projected_overloads_keep_unknown_candidates_and_reject_exact_invariant_decoys() {
+    let source = r#"package probe
+fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Other) {
+ request.pick(type,marker).service()
+ request.uncertain(type,marker)
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open(
+        "other/Class.java",
+        "package other; public class Class<T> {}".into(),
+    );
+    ws.open("Request.java",r#"package probe; public class Request {
+ public <T> T pick(Class<? extends T> type, Invocation marker) { return null; }
+ public Other pick(Class<Other> type, Other marker) { return null; }
+ public <T> T uncertain(Class<? extends T> type, Invocation marker) { return null; }
+ public <T extends Invocation> Other uncertain(other.Class<? extends T> type, Other marker) { return null; }
+}"#.into());
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "request.pick(type,marker).",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "request.pick(type,marker).service()",
+        "Invocation.java",
+        "service",
+    );
+    // A mismatching nominal head without a complete absence proof remains a possible overload.
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.uncertain(type,marker)"),
+        Type::Unknown
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    // The bounded competitor stays possible rather than disappearing as an unknown argument.
+    let owner = Type::class("Request", Some("probe".into()));
+    let argument = Type::Class {
+        name: "Class".into(),
+        package: Some("java.lang".into()),
+        container: None,
+        nullable: false,
+        args: vec![Type::class("Invocation", Some("probe".into()))],
+    };
+    let ctx = FileCtx::new("probe".into(), Vec::new());
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "uncertain", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(ktcore::members::CallArguments {
+            count: Some(2),
+            types: vec![argument, Type::class("Invocation", Some("probe".into()))],
+            trailing_lambda: false,
+        }),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown
+    );
+    assert_eq!(
+        selection.entries.len(),
+        2,
+        "unsupported overload must remain possible"
+    );
+}
+
+#[test]
+fn projected_source_facts_survive_cache_and_unsaved_variance_changes() {
+    use ktlsp::types::Projection;
+    let source = "package probe\nfun use(request: Request,type:Class<Invocation>,known:Other) { request.tag(type)!!.service(); known.body() }\n";
+    let mut ws = projected_workspace(source);
+    let class = ws.index.lookup_type("BoundedOwner");
+    assert!(class[0].sym.type_parameter_facts.known_invariant());
+    assert!(!class[0].sym.type_parameter_facts.known_unbounded());
+    for file in ["Request.java", "KotlinRequest.kt"] {
+        let entries = ws.index.entries_for_file(file);
+        let symbols: Vec<_> = entries.iter().map(|entry| (*entry.sym).clone()).collect();
+        let bytes = bincode::serialize(&symbols).unwrap();
+        let decoded: Vec<ktlsp::symbol::IndexedSymbol> = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, symbols);
+        for (name, projection) in [
+            ("tag", Projection::Out),
+            ("upper", Projection::In),
+            ("star", Projection::Star),
+        ] {
+            let symbol = decoded.iter().find(|symbol| symbol.name == name).unwrap();
+            assert_eq!(symbol.params[0].args[0].projection, projection);
+        }
+    }
+    let entry = ws
+        .index
+        .lookup_by_name("tag")
+        .iter()
+        .find(|entry| entry.path.as_ref() == "Request.java")
+        .unwrap();
+    let projected = infer::declared_member_type(
+        &ws.index,
+        &Type::class("Request", Some("probe".into())),
+        entry,
+        &entry.sym.params[0],
+        &FileCtx::new("probe".into(), Vec::new()),
+    );
+    assert!(
+        matches!(&projected.args()[0],Type::Projected {projection:Projection::Out,bound} if **bound == Type::Unknown)
+    );
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "request.tag(type)!!.",
+        "service",
+        "serviceWrong",
+    );
+    ws.change(
+        "Request.java",
+        PROJECTED_REQUEST.replace("Class<? extends T> type", "Class<? super T> type"),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.tag(type)!!"),
+        Type::Unknown
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    ws.change("Request.java", PROJECTED_REQUEST.into());
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "request.tag(type)!!.",
+        "service",
+        "serviceWrong",
+    );
+}
+
+#[test]
+fn projected_named_arguments_remain_unknown_without_positional_rebinding() {
+    let source = r#"package probe
+fun <A,B> pick(first:Class<out A>,second:Class<out B>):A=error("fixture")
+fun use(left:Class<Invocation>,right:Class<Other>,known:Other) {
+ pick(left,right).service()
+ pick(second=right,first=left)
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "pick(left,right).",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "pick(left,right).service()",
+        "Invocation.java",
+        "service",
+    );
+    let positional = infer_expression(&ws, "Use.kt", "pick(left,right)");
+    assert_eq!(positional, Type::class("Invocation", Some("probe".into())));
+    // This valid named call should ultimately infer Invocation. Until names map to formals,
+    // Unknown records a coverage gap and must not become the positional first argument's Other.
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "pick(second=right,first=left)"),
+        Type::Unknown
+    );
+    // The incomplete inference must keep the actual callable available for navigation.
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "pick(second=right,first=left)",
+        "Use.kt",
+        "pick",
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+}
+
+#[test]
+fn projected_fixed_unknown_parameters_do_not_certify_calls() {
+    let source = r#"package probe
+fun use(request:MissingRequest,valid:Request,type:Class<Invocation>,missing:Missing,known:Other) {
+ request.tag(type,missing)
+ valid.tag(type)!!.service()
+ known.body()
+}
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open("MissingRequest.java","package probe; public class MissingRequest { public <T> T tag(Class<? extends T> type,Missing marker) { return null; } }".into());
+    // An unresolved fixed parameter cannot certify a call merely because both symbolic heads agree.
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.tag(type,missing)"),
+        Type::Unknown
+    );
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "valid.tag(type)!!.",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "valid.tag(type)!!.service()",
+        "Invocation.java",
+        "service",
+    );
+    assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    let owner = Type::class("MissingRequest", Some("probe".into()));
+    let argument = Type::Class {
+        name: "Class".into(),
+        package: Some("java.lang".into()),
+        container: None,
+        nullable: false,
+        args: vec![Type::class("Invocation", Some("probe".into()))],
+    };
+    let arguments = ktcore::members::CallArguments {
+        count: Some(2),
+        types: vec![argument, Type::class("Missing", None)],
+        trailing_lambda: false,
+    };
+    let ctx = FileCtx::new("probe".into(), Vec::new());
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "tag", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(arguments.clone()),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown
+    );
+    assert_eq!(
+        selection.entries.len(),
+        1,
+        "unknown fixed parameter must retain its callable"
+    );
+    ws.change("MissingRequest.java","package probe; public class MissingRequest { public <T> T tag(Class<? extends T> type,Missing marker) { return null; } public <T> T tag(Class<? extends T> type,Other marker) { return null; } }".into());
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "tag", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(arguments),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown
+    );
+    assert_eq!(
+        selection.entries.len(),
+        2,
+        "unresolved arguments must not remove possible overloads"
+    );
+}

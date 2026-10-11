@@ -363,6 +363,15 @@ fn type_label(ty: Type) -> Option<String> {
 
 fn format_type(ty: &Type) -> Option<String> {
     match ty {
+        Type::Projected { projection, bound } => {
+            let prefix = match projection {
+                crate::types::Projection::Out => "out ",
+                crate::types::Projection::In => "in ",
+                _ => return None,
+            };
+            format_type(bound).map(|bound| format!("{prefix}{bound}"))
+        }
+        Type::Star => Some("*".to_string()),
         Type::Unknown => None,
         Type::Class {
             name,

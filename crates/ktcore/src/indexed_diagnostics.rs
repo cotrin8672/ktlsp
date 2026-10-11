@@ -379,6 +379,13 @@ fn substitute_type_ref(tr: &TypeRef, bindings: &HashMap<String, Type>) -> TypeRe
     {
         let mut resolved = type_to_type_ref(ty);
         resolved.nullable |= tr.nullable;
+        if tr.projection != crate::types::Projection::Invariant {
+            if resolved.projection != crate::types::Projection::Invariant {
+                resolved.name.clear();
+                resolved.args.clear();
+            }
+            resolved.projection = tr.projection;
+        }
         return resolved;
     }
     if tr.args.is_empty() {
@@ -403,11 +410,21 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
             args,
         } => TypeRef {
             name: name.clone(),
+            projection: Default::default(),
             qualification: None,
             nullable: *nullable,
             args: args.iter().map(type_to_type_ref).collect(),
             package_candidates: std::sync::Arc::new(package.iter().cloned().collect()),
             container_candidates: container.iter().cloned().collect(),
+        },
+        Type::Projected { projection, bound } => {
+            let mut ty = type_to_type_ref(bound);
+            ty.projection = *projection;
+            ty
+        }
+        Type::Star => TypeRef {
+            projection: crate::types::Projection::Star,
+            ..TypeRef::default()
         },
         Type::Unknown => TypeRef::default(),
     }
@@ -781,7 +798,7 @@ fn type_label(ty: &Type) -> Option<String> {
             }
             Some(out)
         }
-        Type::Unknown => None,
+        Type::Unknown | Type::Projected { .. } | Type::Star => None,
     }
 }
 

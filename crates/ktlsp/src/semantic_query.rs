@@ -1259,6 +1259,15 @@ fn type_label(ty: &Type) -> Option<String> {
             }
             Some(out)
         }
+        Type::Projected { projection, bound } => {
+            let prefix = match projection {
+                crate::types::Projection::Out => "out ",
+                crate::types::Projection::In => "in ",
+                _ => return None,
+            };
+            type_label(bound).map(|bound| format!("{prefix}{bound}"))
+        }
+        Type::Star => Some("*".to_string()),
         Type::Unknown => None,
     }
 }
@@ -1552,6 +1561,7 @@ mod tests {
                 value_type: None,
                 params: Vec::new(),
                 type_params: Vec::new(),
+                type_parameter_facts: Default::default(),
                 source_member: Default::default(),
             }],
             crate::index::Tier::Durable,

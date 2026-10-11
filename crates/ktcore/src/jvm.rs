@@ -1049,6 +1049,7 @@ mod tests {
             params: Vec::new(),
             return_type: TypeRef {
                 name: "String".into(),
+                projection: Default::default(),
                 qualification: Some("java.lang".into()),
                 ..TypeRef::default()
             },
@@ -1112,6 +1113,7 @@ mod tests {
             params: Vec::new(),
             return_type: TypeRef {
                 name: "String".into(),
+                projection: Default::default(),
                 qualification: Some("java.lang".into()),
                 ..TypeRef::default()
             },
@@ -1206,6 +1208,7 @@ mod tests {
             params: Vec::new(),
             return_type: TypeRef {
                 name: "String".into(),
+                projection: Default::default(),
                 qualification: Some("java.lang".into()),
                 ..TypeRef::default()
             },

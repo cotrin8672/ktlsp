@@ -144,7 +144,7 @@ impl TypeScope {
         )
     }
 
-    fn without_shadowed_imports(&self, type_params: &[String]) -> Option<Self> {
+    pub fn without_shadowed_imports(&self, type_params: &[String]) -> Option<Self> {
         let shadowed = |import: &Import| {
             import
                 .local_name()
@@ -174,6 +174,7 @@ fn named_type_ref(
     };
     TypeRef {
         name: name.to_string(),
+        projection: Default::default(),
         qualification,
         nullable,
         args,
@@ -335,6 +336,7 @@ fn push_property_names(
     for symbol in &mut out[start..] {
         symbol.source_member = flags;
         symbol.type_params = type_params.clone();
+        symbol.type_parameter_facts = type_parameter_facts_of(decl);
         symbol.extension_receiver = ext_receiver.clone();
     }
 }
@@ -640,6 +642,7 @@ fn function_symbol(
             .map(Box::new),
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
+        type_parameter_facts: type_parameter_facts_of(decl),
         type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -793,6 +796,7 @@ fn push_type_alias(
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
         type_params: type_params_of(decl, src),
+        type_parameter_facts: type_parameter_facts_of(decl),
         function_type_receiver: function_type_receiver.map(Box::new),
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -821,6 +825,10 @@ fn push_type(
         documentation: documentation.map(str::to_string),
         supertypes: supertype_refs.iter().map(|ty| ty.name.clone()).collect(),
         supertype_refs,
+        type_parameter_facts: name_node
+            .parent()
+            .map(|decl| type_parameter_facts_of(decl))
+            .unwrap_or_default(),
         type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -833,9 +841,40 @@ fn push_type(
     });
 }
 
-/// The formal type-parameter names of a `function_declaration` / `class_declaration` (the `<T, R>`):
-/// the first `identifier` of each `type_parameter` under the `type_parameters` child. Empty when the
-/// declaration is non-generic. Verified via `examples/dump`.
+/// Bounds and declaration variance are independent facts; malformed headers prove neither.
+fn type_parameter_facts_of(decl: Node) -> crate::symbol::TypeParameterFacts {
+    let mut header_cursor = decl.walk();
+    if decl.named_children(&mut header_cursor).any(|child| {
+        child.kind() != "function_body" && child.kind() != "class_body" && child.has_error()
+    }) {
+        return Default::default();
+    }
+    let Some(parameters) = child_of_kind(decl, "type_parameters") else {
+        return crate::symbol::TypeParameterFacts::new(
+            child_of_kind(decl, "type_constraints").is_none(),
+            true,
+        );
+    };
+    if parameters.has_error() {
+        return Default::default();
+    }
+    let mut unbounded = child_of_kind(decl, "type_constraints").is_none();
+    let mut invariant = true;
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "type_parameter" {
+            continue;
+        }
+        unbounded &= !has_child_token(parameter, ":");
+        invariant &= find_descendant(parameter, "variance_modifier").is_none();
+    }
+    if decl.kind() == "function_declaration" && !invariant {
+        unbounded = false;
+    }
+    crate::symbol::TypeParameterFacts::new(unbounded, invariant)
+}
+
+/// The formal type-parameter names: the first identifier of each type_parameter.
 fn type_params_of(decl: Node, src: &str) -> Vec<String> {
     let Some(tps) = child_of_kind(decl, "type_parameters") else {
         return Vec::new();
@@ -1033,6 +1072,7 @@ fn function_type_ref(node: Node, src: &str, scope: Option<&TypeScope>) -> Option
     args.push(result);
     Some(TypeRef {
         name: format!("Function{arity}"),
+        projection: Default::default(),
         args,
         package_candidates: Arc::new(vec!["kotlin".to_string()]),
         ..TypeRef::default()
@@ -1063,8 +1103,7 @@ fn split_qualified_container(name: &str) -> (&str, Option<String>) {
     }
 }
 
-/// The type arguments of a `user_type` (`List<Foo>` -> `[Foo]`). Each `type_projection` wraps a
-/// `user_type`/`nullable_type`; unknown projections keep a placeholder to preserve argument order.
+/// Each type argument retains its use-site projection, bound context and original position.
 fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> {
     let mut out = Vec::new();
     let Some(ta) = child_of_kind(ut, "type_arguments") else {
@@ -1075,16 +1114,26 @@ fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> 
         if proj.kind() != "type_projection" {
             continue;
         }
-        if child_of_kind(proj, "variance_modifier").is_some() {
-            // Keep the slot unknown until use-site variance is represented; `out T` is not `T`.
-            out.push(TypeRef::default());
-            continue;
-        }
         let mut c2 = proj.walk();
         let argument = proj
             .named_children(&mut c2)
             .find_map(|child| type_ref_from(child, src, scope));
-        out.push(argument.unwrap_or_default());
+        let mut argument = argument.unwrap_or_default();
+        argument.projection = if has_child_token(proj, "*") {
+            crate::types::Projection::Star
+        } else if let Some(variance) = child_of_kind(proj, "variance_modifier") {
+            match node_text(variance, src) {
+                "out" => crate::types::Projection::Out,
+                "in" => crate::types::Projection::In,
+                _ => {
+                    argument.name.clear();
+                    crate::types::Projection::Invariant
+                }
+            }
+        } else {
+            crate::types::Projection::Invariant
+        };
+        out.push(argument);
     }
     out
 }
@@ -1267,6 +1316,7 @@ fn push_synthetic_member(
         value_type,
         params,
         type_params,
+        type_parameter_facts: Default::default(),
         source_member: SourceMemberFlags::default(),
     });
 }
@@ -1303,6 +1353,7 @@ fn push_data_class_synthetics(
     let (self_name, self_container) = split_qualified_container(container);
     let self_type = TypeRef {
         name: self_name.to_string(),
+        projection: Default::default(),
         qualification: None,
         nullable: false,
         args: Vec::new(),

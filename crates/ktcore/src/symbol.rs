@@ -122,6 +122,23 @@ impl SymbolKind {
     }
 }
 
+/// Independent declaration facts: method bounds and constructor variance are not interchangeable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TypeParameterFacts(u8);
+
+impl TypeParameterFacts {
+    pub fn new(unbounded: bool, invariant: bool) -> Self {
+        Self(u8::from(unbounded) | (u8::from(invariant) << 1))
+    }
+    pub fn known_unbounded(self) -> bool {
+        self.0 & 1 != 0
+    }
+    pub fn known_invariant(self) -> bool {
+        self.0 & 2 != 0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionReceiverFacts {
     pub ty: TypeRef,
@@ -180,6 +197,8 @@ pub struct IndexedSymbol {
     #[serde(default)]
     pub type_params: Vec<String>,
     #[serde(default)]
+    pub type_parameter_facts: TypeParameterFacts,
+    #[serde(default)]
     pub source_member: SourceMemberFlags,
 }
 
@@ -215,6 +234,7 @@ impl IndexedSymbol {
             value_type: None,
             params: Vec::new(),
             type_params: Vec::new(),
+            type_parameter_facts: TypeParameterFacts::default(),
             source_member: SourceMemberFlags::default(),
         }
     }
@@ -313,6 +333,7 @@ mod tests {
         symbol.function_type_receiver = Some(Box::new(ty()));
         symbol.return_type = Some(TypeRef {
             name: "Qualified".into(),
+            projection: Default::default(),
             qualification: Some("other".into()),
             nullable: true,
             ..ty()

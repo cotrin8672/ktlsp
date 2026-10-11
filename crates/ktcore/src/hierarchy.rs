@@ -215,6 +215,7 @@ fn member_signatures_match(target: &Entry, candidate: &Entry) -> bool {
 
 fn type_ref_shapes_match(target: &TypeRef, candidate: &TypeRef) -> bool {
     target.name == candidate.name
+        && target.projection == candidate.projection
         && target.nullable == candidate.nullable
         && target.args.len() == candidate.args.len()
         && target

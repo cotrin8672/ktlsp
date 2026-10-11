@@ -1244,7 +1244,9 @@ impl ReadSession<'_> {
                 .join(".");
                 self.resolve_type(&qualified)
             }
-            crate::types::Type::Unknown => {
+            crate::types::Type::Unknown
+            | crate::types::Type::Projected { .. }
+            | crate::types::Type::Star => {
                 unknown(IncompleteReason::UnsupportedType(ty.name.clone()))
             }
         }

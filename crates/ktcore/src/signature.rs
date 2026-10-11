@@ -161,6 +161,20 @@ fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
 }
 
 fn type_ref_label(ty: &TypeRef) -> String {
+    match ty.projection {
+        crate::types::Projection::Star => return "*".to_string(),
+        crate::types::Projection::Out | crate::types::Projection::In => {
+            let prefix = if ty.projection == crate::types::Projection::Out {
+                "out "
+            } else {
+                "in "
+            };
+            let mut bound = ty.clone();
+            bound.projection = crate::types::Projection::Invariant;
+            return format!("{prefix}{}", type_ref_label(&bound));
+        }
+        crate::types::Projection::Invariant => {}
+    }
     if ty.name.is_empty() {
         return "_".to_string();
     }

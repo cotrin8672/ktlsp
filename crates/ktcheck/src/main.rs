@@ -600,8 +600,7 @@ fn record_annotation_surfaces(scans: &[ScannedFile], index: &Index, facts: &mut 
 }
 
 // IndexedSymbol's positional encoding now includes structured extension receivers and bounds.
-const DURABLE_CACHE_VERSION: &[u8] =
-    b"ktcheck-durable-v13-source-generic-extension-receivers-bounds";
+const DURABLE_CACHE_VERSION: &[u8] = b"ktcheck-durable-v14-source-generic-projection-constraints";
 const MAX_DURABLE_SNAPSHOTS_PER_ROOT: usize = 2;
 
 fn load_durable_library_symbols_cached(roots: &[PathBuf], scans: &[ScannedFile]) -> DurableLoad {

@@ -29,7 +29,7 @@ use crate::parser::{
 use crate::resolve::{self, UseKind};
 use crate::solve;
 use crate::symbol::SymbolKind;
-use crate::types::{Type, TypeRef};
+use crate::types::{Projection, Type, TypeRef};
 
 /// Recursion guard for the inference walk (chained calls, initializer cycles like `val x = x`).
 pub const MAX_DEPTH: usize = 16;
@@ -1677,9 +1677,39 @@ fn infer_call(
                 );
             }
             // An ordinary visible free function is considered after implicit receivers.
-            if let Some((ret_tr, type_params, params)) =
+            if let Some((ret_tr, type_params, params, parameter_facts)) =
                 free_function_sig(index, cname, ctx, value_arg_count(node), &arg_types, depth)
             {
+                if params.iter().any(solve::has_projection) {
+                    let normalized = normalized_call_arguments(node, arg_types.clone());
+                    if normalized.count != Some(params.len())
+                        || normalized.count != Some(normalized.types.len())
+                        || normalized.trailing_lambda
+                    {
+                        return Type::Unknown;
+                    }
+                    let application = projected_application(
+                        index,
+                        &params,
+                        &normalized.types,
+                        &type_params,
+                        parameter_facts.known_unbounded(),
+                        ctx,
+                        &HashMap::new(),
+                    );
+                    if application.status != solve::ConstraintStatus::Matched {
+                        return Type::Unknown;
+                    }
+                    let tset = type_params.into_iter().collect();
+                    return resolve_with_subst(
+                        index,
+                        &ret_tr,
+                        ctx,
+                        &tset,
+                        &application.bindings,
+                        depth,
+                    );
+                }
                 if type_params.is_empty() {
                     return resolve_type_ref(index, &ret_tr, ctx, depth);
                 }
@@ -1763,7 +1793,12 @@ fn free_function_sig(
     arg_count: usize,
     arg_types: &[Type],
     depth: usize,
-) -> Option<(TypeRef, Vec<String>, Vec<TypeRef>)> {
+) -> Option<(
+    TypeRef,
+    Vec<String>,
+    Vec<TypeRef>,
+    crate::symbol::TypeParameterFacts,
+)> {
     let entries = visible_top_level_entries(index, local_name, ctx, SymbolKind::Function);
     let mut group: Vec<&Entry> = entries
         .into_iter()
@@ -1802,6 +1837,7 @@ fn free_function_sig(
         && !group.iter().all(|e| {
             opt_type_ref_same_shape(e.sym.return_type.as_ref(), first.sym.return_type.as_ref())
                 && e.sym.type_params == first.sym.type_params
+                && e.sym.type_parameter_facts == first.sym.type_parameter_facts
                 && type_ref_list_same_shape(&e.sym.params, &first.sym.params)
         })
     {
@@ -1811,6 +1847,7 @@ fn free_function_sig(
         first.sym.return_type.clone().unwrap(),
         first.sym.type_params.clone(),
         first.sym.params.clone(),
+        first.sym.type_parameter_facts,
     ))
 }
 
@@ -1849,6 +1886,8 @@ fn type_ref_list_same_shape(a: &[TypeRef], b: &[TypeRef]) -> bool {
 
 fn type_ref_same_shape(a: &TypeRef, b: &TypeRef) -> bool {
     a.name == b.name
+        && a.projection == b.projection
+        && a.qualification == b.qualification
         && a.nullable == b.nullable
         && a.args.len() == b.args.len()
         && a.args
@@ -2114,11 +2153,28 @@ fn resolve_trailing_lambda_receiver_candidate(
         }
         _ => HashMap::new(),
     };
-    for (i, p) in entry.sym.params.iter().enumerate() {
-        if let Some(a) = arg_types.get(i) {
-            let mut argument_bindings = HashMap::new();
-            solve::unify_into(p, a, &tset, &mut argument_bindings);
-            merge_type_bindings(&mut subst, argument_bindings);
+    if entry.sym.params.iter().any(solve::has_projection) {
+        let declaration_ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+        let application = projected_application(
+            index,
+            &entry.sym.params,
+            arg_types,
+            &entry.sym.type_params,
+            entry.sym.type_parameter_facts.known_unbounded(),
+            &declaration_ctx,
+            &subst,
+        );
+        if application.status != solve::ConstraintStatus::Matched {
+            return None;
+        }
+        subst = application.bindings;
+    } else {
+        for (i, p) in entry.sym.params.iter().enumerate() {
+            if let Some(a) = arg_types.get(i) {
+                let mut argument_bindings = HashMap::new();
+                solve::unify_into(p, a, &tset, &mut argument_bindings);
+                merge_type_bindings(&mut subst, argument_bindings);
+            }
         }
     }
     if let (None, Some(recv_name), Some(actual_recv)) = (
@@ -2183,6 +2239,7 @@ pub fn trailing_lambda_receiver_ref(
     let first = *aliases.first()?;
     if !aliases.iter().all(|candidate| {
         candidate.sym.type_params == first.sym.type_params
+            && candidate.sym.type_parameter_facts == first.sym.type_parameter_facts
             && opt_type_ref_same_shape(
                 candidate.sym.function_type_receiver.as_deref(),
                 first.sym.function_type_receiver.as_deref(),
@@ -2225,6 +2282,13 @@ fn substitute_alias_type_ref(
     if let Some(actual) = bindings.get(template.name.as_str()) {
         let mut actual = (*actual).clone();
         actual.nullable |= template.nullable;
+        if template.projection != Projection::Invariant {
+            if actual.projection != Projection::Invariant {
+                actual.name.clear();
+                actual.args.clear();
+            }
+            actual.projection = template.projection;
+        }
         return Some(actual);
     }
     let mut resolved = template.clone();
@@ -2239,6 +2303,23 @@ fn substitute_alias_type_ref(
 /// Like `resolve_type_ref`, but a name in `tparams` resolves to its binding in `subst` (or `Unknown`
 /// when unbound — never a wrong guess) instead of being looked up as a concrete type.
 fn resolve_with_subst(
+    index: &dyn InferenceIndex,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+    tparams: &HashSet<String>,
+    subst: &HashMap<String, Type>,
+    depth: usize,
+) -> Type {
+    if tr.projection == Projection::Star {
+        return Type::Star;
+    }
+    Type::projected(
+        tr.projection,
+        resolve_with_subst_unprojected(index, tr, ctx, tparams, subst, depth),
+    )
+}
+
+fn resolve_with_subst_unprojected(
     index: &dyn InferenceIndex,
     tr: &TypeRef,
     ctx: &FileCtx,
@@ -2513,6 +2594,15 @@ fn resolve_member_type_with_subst(
     child_infer: &mut impl ChildInfer,
 ) -> Type {
     let tparams = member_type_parameters(index, entry);
+    if entry.sym.params.iter().any(solve::has_projection) {
+        if let Some(call) = call {
+            let arguments = normalized_call_arguments(
+                call,
+                synth_arg_types(index, call, src, ctx, depth, child_infer),
+            );
+            return declared_member_call_type(index, recv_ty, entry, tr, &arguments, ctx);
+        }
+    }
     if tparams.is_empty() && entry.sym.extension_receiver.is_none() {
         return resolve_type_ref(index, tr, ctx, depth + 1);
     }
@@ -2578,6 +2668,160 @@ pub fn declared_member_type(
     }
     let subst = receiver_bindings.unwrap_or_default();
     resolve_with_subst(index, tr, ctx, &tparams, &subst, 0)
+}
+
+// Closed type values used in projected constraints must not smuggle unmodeled aliases or bounds.
+fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize) -> bool {
+    if depth > MAX_DEPTH || !receiver_arguments_known(index, ty, depth) {
+        return false;
+    }
+    if let Some(declaration) = type_declaration_shape(index, ty) {
+        if declaration.sym.kind == SymbolKind::TypeAlias {
+            return false;
+        }
+        if !ty.args().is_empty()
+            && !index
+                .lookup_type(ty.name().unwrap_or_default())
+                .iter()
+                .filter(|entry| {
+                    entry.sym.package == ty.package().unwrap_or_default()
+                        && entry.sym.container.as_deref() == ty.container()
+                })
+                .all(|entry| entry.sym.type_parameter_facts.known_unbounded())
+        {
+            return false;
+        }
+    }
+    ty.args()
+        .iter()
+        .all(|arg| constraint_type_is_known(index, arg, depth + 1))
+}
+
+// Equality can reject distinct ordinary nominal identities; JVM mapped types and aliases need
+// their own identity normalization. Gradual compatibility is never used as an absence proof.
+fn constraint_types_distinct(index: &dyn InferenceIndex, a: &Type, b: &Type, depth: usize) -> bool {
+    if depth > MAX_DEPTH
+        || a == b
+        || !constraint_type_is_known(index, a, depth)
+        || !constraint_type_is_known(index, b, depth)
+    {
+        return false;
+    }
+    let same_head =
+        a.name() == b.name() && a.package() == b.package() && a.container() == b.container();
+    if same_head {
+        return a.args().len() == b.args().len()
+            && a.args()
+                .iter()
+                .zip(b.args())
+                .any(|(a, b)| constraint_types_distinct(index, a, b, depth + 1));
+    }
+    let ordinary = |ty: &Type| {
+        ty.package().is_some_and(|package| {
+            package != "kotlin"
+                && !package.starts_with("kotlin.")
+                && package != "java"
+                && !package.starts_with("java.")
+        })
+    };
+    ordinary(a) && ordinary(b)
+}
+
+fn projected_application(
+    index: &dyn InferenceIndex,
+    params: &[TypeRef],
+    actuals: &[Type],
+    type_params: &[String],
+    known_unbounded: bool,
+    ctx: &FileCtx,
+    initial: &HashMap<String, Type>,
+) -> solve::Application {
+    let parameters = type_params.iter().cloned().collect();
+    solve::constrain_application(
+        params,
+        actuals,
+        &parameters,
+        initial,
+        known_unbounded,
+        |formal| resolve_with_subst_unprojected(index, formal, ctx, &parameters, initial, 0),
+        |actual| constraint_type_is_known(index, actual, 0),
+        |actual| {
+            type_declaration_shape(index, actual).is_some()
+                && index
+                    .lookup_type(actual.name().unwrap_or_default())
+                    .iter()
+                    .filter(|entry| {
+                        entry.sym.package == actual.package().unwrap_or_default()
+                            && entry.sym.container.as_deref() == actual.container()
+                    })
+                    .all(|entry| {
+                        entry.sym.type_parameter_facts.known_invariant()
+                            && entry.sym.type_parameter_facts.known_unbounded()
+                    })
+        },
+        |actual, bound| receiver_satisfies_upper_bound(index, actual, bound),
+        |actual, other| constraint_types_distinct(index, actual, other, 0),
+    )
+}
+
+/// Both call selection and return substitution consume this same local constraint result.
+pub(crate) fn projected_member_application(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    arguments: &CallArguments,
+) -> Option<solve::Application> {
+    if !entry
+        .sym
+        .params
+        .iter()
+        .any(|ty| solve::has_projection(ty) || !ty.args.is_empty())
+    {
+        return None;
+    }
+    let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+    let receiver_bindings = receiver_type_bindings(index, receiver, entry);
+    let missing_receiver = entry.sym.extension_receiver.is_some() && receiver_bindings.is_none();
+    let initial = receiver_bindings.unwrap_or_default();
+    let mut application = projected_application(
+        index,
+        &entry.sym.params,
+        &arguments.types,
+        &entry.sym.type_params,
+        entry.sym.type_parameter_facts.known_unbounded(),
+        &ctx,
+        &initial,
+    );
+    if entry.sym.has_vararg
+        || arguments.count != Some(arguments.types.len())
+        || arguments.trailing_lambda
+        || missing_receiver
+    {
+        application.status = solve::ConstraintStatus::Unknown;
+    }
+    Some(application)
+}
+
+/// A language adapter supplies already synthesized arguments, without using another grammar's AST.
+pub fn declared_member_call_type(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    tr: &TypeRef,
+    arguments: &CallArguments,
+    ctx: &FileCtx,
+) -> Type {
+    if entry.sym.type_params.is_empty() && !entry.sym.params.iter().any(solve::has_projection) {
+        return declared_member_type(index, receiver, entry, tr, ctx);
+    }
+    let Some(application) = projected_member_application(index, receiver, entry, arguments) else {
+        return declared_member_type(index, receiver, entry, tr, ctx);
+    };
+    if application.status != solve::ConstraintStatus::Matched {
+        return Type::Unknown;
+    }
+    let parameters = member_type_parameters(index, entry);
+    resolve_with_subst(index, tr, ctx, &parameters, &application.bindings, 0)
 }
 
 fn merge_type_bindings(subst: &mut HashMap<String, Type>, bindings: HashMap<String, Type>) {
@@ -2969,7 +3213,11 @@ fn bind_receiver_template(
     bindings: &mut HashMap<String, Type>,
     depth: usize,
 ) -> bool {
-    if depth > MAX_DEPTH || formal.name.is_empty() || !type_head_is_known(index, actual) {
+    if depth > MAX_DEPTH
+        || formal.name.is_empty()
+        || formal.projection != Projection::Invariant
+        || !type_head_is_known(index, actual)
+    {
         return false;
     }
     if formal.qualification.is_none() && params.contains_key(&formal.name) {
@@ -3454,6 +3702,21 @@ mod tests {
 
 /// Resolve a stored [`TypeRef`] (name + nullability + args) to a [`Type`] at the use site.
 fn resolve_type_ref(index: &dyn InferenceIndex, tr: &TypeRef, ctx: &FileCtx, depth: usize) -> Type {
+    if tr.projection == Projection::Star {
+        return Type::Star;
+    }
+    Type::projected(
+        tr.projection,
+        resolve_type_ref_unprojected(index, tr, ctx, depth),
+    )
+}
+
+fn resolve_type_ref_unprojected(
+    index: &dyn InferenceIndex,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Type {
     if tr.name.is_empty() {
         return Type::Unknown;
     }

@@ -205,6 +205,8 @@ fn type_decl<'tree>(
         return;
     };
     let mut sym = indexed_symbol(name, src, kind, package, container);
+    let declaration_scope = java_declaration_scope(node, src, scope);
+    let scope = declaration_scope.as_ref().unwrap_or(scope);
     sym.supertype_refs = supertype_refs(node, src, scope);
     sym.supertypes = sym
         .supertype_refs
@@ -212,6 +214,7 @@ fn type_decl<'tree>(
         .map(|ty| ty.name.clone())
         .collect();
     sym.type_params = type_parameter_names(node, src);
+    sym.type_parameter_facts = java_type_parameter_facts(node);
     out.push(sym);
     let cname = match container {
         Some(parent) => format!("{parent}.{}", node_text(name, src)),
@@ -345,8 +348,11 @@ fn walk_declaration_container<'tree>(
                     let mut sym =
                         indexed_symbol(name, src, SymbolKind::Function, package, container);
                     sym.source_member = crate::indexer::source_member_flags(child, src, true);
+                    let declaration_scope = java_declaration_scope(child, src, scope);
+                    let scope = declaration_scope.as_ref().unwrap_or(scope);
                     sym.params = parameter_types(child, src, scope);
                     sym.type_params = type_parameter_names(child, src);
+                    sym.type_parameter_facts = java_type_parameter_facts(child);
                     sym.arity = Some(sym.params.len().min(u8::MAX as usize) as u8);
                     sym.min_arity = sym.arity;
                     sym.has_vararg = has_vararg_parameter(child);
@@ -446,7 +452,37 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
         "type_identifier" | "scoped_type_identifier" => {
             Some(scope.type_ref(&type_path(node, src)?, false, Vec::new()))
         }
-        "wildcard" => None,
+        "wildcard" => {
+            use crate::types::Projection;
+            let mut projection = Projection::Star;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "extends" => projection = Projection::Out,
+                    "super" => projection = Projection::In,
+                    _ => {}
+                }
+            }
+            let mut cursor = node.walk();
+            let mut bound = node
+                .named_children(&mut cursor)
+                .filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "type_identifier"
+                            | "scoped_type_identifier"
+                            | "generic_type"
+                            | "annotated_type"
+                    )
+                })
+                .find_map(|child| type_ref_from_node(child, src, scope))
+                .unwrap_or_default();
+            if node.has_error() {
+                bound = TypeRef::default();
+            }
+            bound.projection = projection;
+            Some(bound)
+        }
         "annotated_type" => {
             let mut cursor = node.walk();
             let ty = node
@@ -475,6 +511,40 @@ fn type_path(node: Node<'_>, src: &str) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+fn java_declaration_scope(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<TypeScope> {
+    let mut names = Vec::new();
+    let mut declaration = Some(node);
+    while let Some(current) = declaration {
+        names.extend(type_parameter_names(current, src));
+        declaration = current.parent();
+    }
+    scope.without_shadowed_imports(&names)
+}
+
+fn java_type_parameter_facts(node: Node<'_>) -> crate::symbol::TypeParameterFacts {
+    let mut header_cursor = node.walk();
+    if node.named_children(&mut header_cursor).any(|child| {
+        !matches!(
+            child.kind(),
+            "block" | "class_body" | "interface_body" | "enum_body" | "annotation_type_body"
+        ) && child.has_error()
+    }) {
+        return Default::default();
+    }
+    let Some(parameters) = node.child_by_field_name("type_parameters") else {
+        return crate::symbol::TypeParameterFacts::new(true, true);
+    };
+    if parameters.has_error() {
+        return Default::default();
+    }
+    let mut cursor = parameters.walk();
+    let unbounded = parameters
+        .named_children(&mut cursor)
+        .all(|parameter| child_of_kind(parameter, "type_bound").is_none());
+    // Java constructors are invariant even when a parameter has an explicit bound.
+    crate::symbol::TypeParameterFacts::new(unbounded, true)
 }
 
 fn type_parameter_names(node: Node<'_>, src: &str) -> Vec<String> {
@@ -1135,9 +1205,27 @@ fn java_call_entries_with_imports(
     package: &str,
     imports: &[Import],
 ) -> Vec<Entry> {
+    let arguments = java_call_arguments(index, file, src, tree, call);
+    java_call_entries_with_arguments(
+        index, file, src, tree, call, name, symbol, package, imports, &arguments,
+    )
+}
+
+fn java_call_entries_with_arguments(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+    name: Node<'_>,
+    symbol: &str,
+    package: &str,
+    imports: &[Import],
+    arguments: &ktcore::members::CallArguments,
+) -> Vec<Entry> {
     let explicit_call =
         call.kind() == "method_invocation" && call.child_by_field_name("object").is_some();
-    let mut arguments = java_call_arguments(index, file, src, tree, call);
+    let mut arguments = arguments.clone();
     // Keep alternative arities for signature help and shape diagnostics while typing arguments.
     arguments.count = None;
     let member_call =
@@ -2942,7 +3030,10 @@ fn java_method_invocation_return_type(
     if symbol.is_empty() {
         return None;
     }
-    if let Some(candidates) = java_member_call_candidates(index, file, src, tree, call) {
+    let arguments = java_call_arguments(index, file, src, tree, call);
+    if let Some(candidates) =
+        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments)
+    {
         if candidates.applicability == ktcore::members::Applicability::Rejected {
             return None;
         }
@@ -2976,8 +3067,8 @@ fn java_method_invocation_return_type(
     }
     let package = package_of(tree, src);
     let imports = imports_of(tree, src);
-    let entries = java_call_entries_with_imports(
-        index, file, src, tree, call, name, symbol, &package, &imports,
+    let entries = java_call_entries_with_arguments(
+        index, file, src, tree, call, name, symbol, &package, &imports, &arguments,
     );
     if entries.is_empty() {
         return None;
@@ -3006,11 +3097,12 @@ fn java_method_invocation_return_type(
         if !(min..=max).contains(&arg_count) {
             continue;
         }
-        let ty = infer::declared_member_type(
+        let ty = infer::declared_member_call_type(
             index,
             &receiver,
             &entry,
             entry.sym.return_type.as_ref()?,
+            &arguments,
             &ctx,
         );
         if ty
@@ -4281,6 +4373,74 @@ class Child extends Base {
                 diag.code == Some(crate::diagnostics::DiagnosticCode::CallShapeMismatch)
             }),
             "diagnostics were {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nested_java_argument_inference_shares_the_leaf_lookup() {
+        use crate::index::{InferenceIndex, LookupEntries};
+        use std::cell::Cell;
+
+        struct CountIndex {
+            index: Index,
+            leaf_queries: Cell<usize>,
+        }
+        impl InferenceIndex for CountIndex {
+            fn may_have_compiled_callables(&self) -> bool {
+                InferenceIndex::may_have_compiled_callables(&self.index)
+            }
+            fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::lookup_by_name(&self.index, name)
+            }
+            fn members_of(&self, name: &str) -> LookupEntries<'_> {
+                if name == "LeafOwner" {
+                    self.leaf_queries.set(self.leaf_queries.get() + 1);
+                }
+                InferenceIndex::members_of(&self.index, name)
+            }
+            fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::extensions_for(&self.index, name)
+            }
+            fn entries_for_file(&self, file: &str) -> Vec<Entry> {
+                InferenceIndex::entries_for_file(&self.index, file)
+            }
+        }
+
+        let mut counts = Vec::new();
+        for depth in [1, 8] {
+            let mut expression = "leaf.leaf()".to_string();
+            for _ in 0..depth {
+                expression = format!("result.id({expression})");
+            }
+            let source = format!("package demo; class Result {{ public Result id(Result value) {{ return value; }} }} class LeafOwner {{ public Result leaf() {{ return null; }} }} class Use {{ void use(Result result,LeafOwner leaf) {{ {expression}; }} }}");
+            let tree = JavaParser::new().parse(&source);
+            let mut raw = Index::new();
+            raw.replace_file("Use.java", extract_symbols(&tree, &source), Tier::Volatile);
+            let index = CountIndex {
+                index: raw,
+                leaf_queries: Cell::new(0),
+            };
+            let start = source.find(&expression).unwrap();
+            let call = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(call.kind(), "method_invocation");
+            assert_eq!(node_text(call, &source), expression);
+            assert_eq!(
+                java_method_invocation_return_type(&index, "Use.java", &source, &tree, call),
+                Some(Type::class("Result", Some("demo".into()))),
+                "the complete nested call must retain its useful result at depth {depth}"
+            );
+            counts.push(index.leaf_queries.get());
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "deeper argument nesting must not repeat the leaf inference"
+        );
+        assert!(
+            (1..=4).contains(&counts[1]),
+            "leaf work must be bounded independently of nesting: {counts:?}"
         );
     }
 }

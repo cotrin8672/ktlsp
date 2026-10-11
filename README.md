@@ -214,8 +214,10 @@ incomplete completion, and unsaved declaration rename/removal/return-type change
 `semantic-local-extension.json`; every query consumes its first response.
 Shared generic interoperability tests also cover parameterized extension receivers,
 inline nominal bounds, class literals and real-stdlib expect/actual declaration shapes.
-Java projected arguments and Kotlin where/F-bounds remain coverage gaps; see the current
-[acceptance record](docs/fork-acceptance.md) for real-library results and measurements.
+Java/Kotlin source calls also share a conservative equality/lower/upper constraint
+slice for projected arguments such as Class<? extends T>. Unknown captures, upper-only
+variables, differing lower bounds and Kotlin where/F-bounds remain coverage gaps; see
+the current [acceptance record](docs/fork-acceptance.md) for real-library results and measurements.
 Use `corpus` with a completion UI case for real-project blank `super.` acceptance;
 retain the applied buffer and verify it with that project's compiler and plugins.
 
@@ -313,7 +315,7 @@ in memory, checks Kotlin completion/navigation, verifies exact cross-language re
 applies a four-file rename and compares every complete buffer before restoring it.
 Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and JDK 17
 for Gradle, matching the project's selected main toolchain. The probe exposes current
-generic inference gaps; an empty response is not a passing fast result.
+remaining real-library editing gaps; an empty response is not a passing fast result.
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus

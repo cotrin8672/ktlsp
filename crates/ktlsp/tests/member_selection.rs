@@ -2033,6 +2033,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         value_type: Option<TypeRef>,
         params: Vec<TypeRef>,
         type_params: Vec<String>,
+        type_parameter_facts: ktlsp::symbol::TypeParameterFacts,
     }
 
     let empty = IndexedSymbol::new("Empty", SymbolKind::Class, "api", None, 0, 5);
@@ -2070,6 +2071,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     rich.value_type = Some(receiver.clone());
     rich.params = vec![receiver];
     rich.type_params = vec!["Payload".into()];
+    rich.type_parameter_facts = ktlsp::symbol::TypeParameterFacts::new(true, false);
     let source = "package api; public class Owner { public native void method(); }";
     let tree = ktlsp::java::JavaParser::new().parse(source);
     rich.source_member = ktlsp::java::extract_symbols(&tree, source)
@@ -2091,6 +2093,14 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
             bincode::deserialize::<IndexedSymbol>(&current_bytes).unwrap(),
             symbol
         );
+        let mut absent_facts = value.clone();
+        absent_facts
+            .as_object_mut()
+            .unwrap()
+            .remove("type_parameter_facts");
+        let decoded: IndexedSymbol = serde_json::from_value(absent_facts).unwrap();
+        assert!(!decoded.type_parameter_facts.known_unbounded());
+        assert!(!decoded.type_parameter_facts.known_invariant());
         let mut defaulted = symbol.clone();
         defaulted.source_member = Default::default();
         assert_eq!(

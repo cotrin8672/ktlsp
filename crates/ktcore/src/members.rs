@@ -1003,6 +1003,14 @@ fn parameters_applicability(
     mode: CallMode,
     uncertain: bool,
 ) -> Applicability {
+    if let Some(application) = infer::projected_member_application(index, receiver, entry, args) {
+        return match application.status {
+            crate::solve::ConstraintStatus::Rejected => Applicability::Rejected,
+            crate::solve::ConstraintStatus::Unknown => Applicability::Unknown,
+            crate::solve::ConstraintStatus::Matched if !uncertain => Applicability::Applicable,
+            _ => Applicability::Unknown,
+        };
+    }
     arguments_applicability(
         index,
         args,
@@ -1027,6 +1035,15 @@ fn parameters_applicability(
     )
 }
 
+fn argument_shape_is_known(index: &dyn InferenceIndex, ty: &Type) -> bool {
+    infer::type_head_is_known(index, ty)
+        && ty.projection() == crate::types::Projection::Invariant
+        && ty
+            .args()
+            .iter()
+            .all(|arg| argument_shape_is_known(index, arg))
+}
+
 pub(crate) fn arguments_applicability(
     index: &dyn InferenceIndex,
     args: &CallArguments,
@@ -1045,8 +1062,10 @@ pub(crate) fn arguments_applicability(
             }
             return Applicability::Rejected;
         }
-        uncertain |=
-            !infer::type_head_is_known(index, actual) || !infer::type_head_is_known(index, &formal);
+        uncertain |= !infer::type_head_is_known(index, actual)
+            || !infer::type_head_is_known(index, &formal)
+            || !argument_shape_is_known(index, actual)
+            || !argument_shape_is_known(index, &formal);
     }
     if uncertain {
         Applicability::Unknown

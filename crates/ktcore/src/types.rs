@@ -36,9 +36,42 @@ mod arc_candidates {
     }
 }
 
+/// Use-site projection. The bound stays in the same TypeRef, preserving declaration context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+#[repr(u8)]
+pub enum Projection {
+    #[default]
+    Invariant = 0,
+    Out = 1,
+    In = 2,
+    Star = 3,
+}
+
+impl From<Projection> for u8 {
+    fn from(value: Projection) -> Self {
+        value as u8
+    }
+}
+
+impl TryFrom<u8> for Projection {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Invariant),
+            1 => Ok(Self::Out),
+            2 => Ok(Self::In),
+            3 => Ok(Self::Star),
+            _ => Err("invalid type projection"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TypeRef {
     pub name: String,
+    #[serde(default)]
+    pub projection: Projection,
     /// The syntactic qualifier before the simple name, with explicit imports expanded.
     /// Resolution matches it against indexed package/container identities; casing is irrelevant.
     #[serde(default)]
@@ -57,6 +90,7 @@ impl TypeRef {
     pub fn simple(name: impl Into<String>) -> Self {
         TypeRef {
             name: name.into(),
+            projection: Projection::Invariant,
             qualification: None,
             nullable: false,
             args: Vec::new(),
@@ -75,10 +109,35 @@ pub enum Type {
         nullable: bool,
         args: Vec<Type>,
     },
+    /// Only projected arguments allocate a bound; ordinary Class values keep their layout.
+    Projected {
+        projection: Projection,
+        bound: Box<Type>,
+    },
+    Star,
     Unknown,
 }
 
 impl Type {
+    pub fn projected(projection: Projection, bound: Type) -> Type {
+        match projection {
+            Projection::Invariant => bound,
+            Projection::Star => Type::Star,
+            Projection::Out | Projection::In => Type::Projected {
+                projection,
+                bound: Box::new(bound),
+            },
+        }
+    }
+
+    pub fn projection(&self) -> Projection {
+        match self {
+            Type::Projected { projection, .. } => *projection,
+            Type::Star => Projection::Star,
+            _ => Projection::Invariant,
+        }
+    }
+
     pub fn class(name: impl Into<String>, package: Option<String>) -> Self {
         Type::Class {
             name: name.into(),
@@ -92,21 +151,21 @@ impl Type {
     pub fn name(&self) -> Option<&str> {
         match self {
             Type::Class { name, .. } => Some(name),
-            Type::Unknown => None,
+            Type::Unknown | Type::Projected { .. } | Type::Star => None,
         }
     }
 
     pub fn package(&self) -> Option<&str> {
         match self {
             Type::Class { package, .. } => package.as_deref(),
-            Type::Unknown => None,
+            Type::Unknown | Type::Projected { .. } | Type::Star => None,
         }
     }
 
     pub fn container(&self) -> Option<&str> {
         match self {
             Type::Class { container, .. } => container.as_deref(),
-            Type::Unknown => None,
+            Type::Unknown | Type::Projected { .. } | Type::Star => None,
         }
     }
 
@@ -117,7 +176,7 @@ impl Type {
     pub fn args(&self) -> &[Type] {
         match self {
             Type::Class { args, .. } => args,
-            Type::Unknown => &[],
+            Type::Unknown | Type::Projected { .. } | Type::Star => &[],
         }
     }
 
@@ -136,7 +195,7 @@ impl Type {
                 nullable: false,
                 args,
             },
-            Type::Unknown => Type::Unknown,
+            other => other,
         }
     }
 }
