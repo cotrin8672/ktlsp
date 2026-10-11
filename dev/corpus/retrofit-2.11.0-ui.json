@@ -1,0 +1,19 @@
+{
+  "build_tool": "gradle",
+  "files": {
+    "kotlin": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt"
+  },
+  "source_sha256": {
+    "kotlin": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26"
+  },
+  "cases": [
+    {
+      "name": "kotlin",
+      "source_token": "body",
+      "anchor": "val body = response.body()",
+      "member": "body",
+      "before": "          val body = response",
+      "after": "          val body = response.body()"
+    }
+  ]
+}

@@ -58,7 +58,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current projected-constraint slice passes 1,292 / 0 failed / 4 ignored; generic interoperability 49/49, member selection 62/62 and nested-argument lookup guard. Formatting and both release binaries pass | Current Rust, formatting and release verified | Checkpoints 39–42; capture/upper-only/LUB inference, where/F-bounds, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current string-template slice passes 1,295 / 0 failed / 4 ignored; completion 138 with one ignored, generic interoperability 49/49, member selection 62/62 and nested-argument lookup guard. Formatting and both release binaries pass | Current Rust, formatting and release verified | Checkpoints 39–43; capture/upper-only/LUB inference, where/F-bounds, arbitrary compiler plugins and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 194 matched / 5 unmet, features 78 matched / 2 unmet and semantic 107 passing assertions retain the same expectations. Prior basic 9/9, library 13/13 and saved Java publication 99/99 | Partial; same seven ordinary expectations remain open | Checkpoint 42 native-editors-r4-1; six ordinary push observations lack generation certification, explainResolution is a direct unmet response. Forced cleanup is operational evidence, not an analysis score |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -68,15 +68,15 @@ a useful known receiver in the same edited state.
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Current Spring reduction repairs four failed requests; real Spring passes all nine original/additional first-response queries, including explicit-this and dangling selectors | Focused repair verified; full-project acceptance partial | Checkpoint 29 below. Real Spring still has ten missing dependency source inputs and a 15-second forced shutdown |
 | Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks improve 31/44 to 44/44, preserving the previous 65 checks. Current normalized receiver arguments and inline nominal bounds have shared regression controls; ordinary semantic scenario retains 107 assertions | Focused semantics verified; where/F-bounds and projected receivers remain coverage gaps | Checkpoints 33/39: exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have Rust regression controls; no six-project parity or speed claim |
-| Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Release mixed fixture: both directions complete and navigate on their first request after both changes are outbound; opened JDK source rename/delete no longer leaves stale facts | Partial; focused repair verified | Normal Neovim cross-buffer debounce observation is separate; actual corpus and repeated edit stress remain pending |
-| Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Tenth-fixed-2 applies the complete six-site override family, preserves all five expected buffers and passes actual Java/Kotlin compilation plus 33 bytecode assertions. JVM facade exported-alias/authored renames and external consumer applied renames also pass | Focused fixtures verified; wider corpus and inherited implementation edge pending | `ktlsp-goal-20261010/tenth2-java-rename-compiler-1/`, `retrofit-jvm-editor/portable-release-tenth2-1/artifacts/` and `ktlsp-shadow-tenth-fixed-2-20261011/editor/`. Ambiguous or read-only family members refuse partial edits |
+| Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Actual Retrofit mixed editing matches all 21 first-attempt RPCs and 25 semantic checks, including typed changes in both languages, references, applied renames and restoration. Shared mixed fixture and opened JDK source rename/delete controls also pass | Focused actual-project repair verified; wider corpus open | Checkpoint 43. Normal Neovim cross-buffer debounce observation is separate; repeated edit stress across the other roots remains pending |
+| Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Actual Retrofit preserves all four complete expected buffers after applying rename. Tenth-fixed-2 applies the six-site override family and passes independent compilation plus 33 bytecode assertions. JVM facade and external consumer applied renames also pass | Focused actual-project and fixture cases verified; wider corpus and inherited implementation edges pending | Checkpoints 43 and the earlier compiler-backed override-family controls. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Current native automatic-watching lifecycle passes all 86 original checks, including Kotlin's deleted oldApi diagnostic. Four real builds, completion, exact definitions, generated-source changes, dirty buffers and clean shutdown pass | Focused automatic-refresh semantics verified; wider transforming cases open | Checkpoint 41: native-worker-canonical5/editor/artifacts under the selected-compiler slice; model v7, native watches and zero explicit notifications. Positive Kotlin result has transmitted-text SHA and accepted-store generation proof |
 | Kotlin compiler inputs | Capture and use the task's actual source selection, ordered libraries, compiler runtime and selected JDK across refresh | Selected 1.9.23/2.4.0 runtime recipes match independent probes. Actual private-overlay diagnostics report unsaved errors; 1.9 also clears a repaired new buffer and preserves UTF-16 positions after Japanese/emoji text | Captured inputs and focused unsaved diagnostics verified | Checkpoints 40/41; opaque plugin options, other hosts/source sets, transformed/generated APIs and general producer closure remain open |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current path-cache saved Java/Lombok probe retains 99/99: first getter/typed chain, four observed native builds, config/dirty retraction. Earlier KAPT/KSP 102/114 retains twelve stale/removed diagnostics; original mixed twelve editing cases remain OPEN | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/compiled-java-results.json`; compilerClosureComplete=false throughout. Source-less navigation stays unavailable; no producer-absence guard is relaxed |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current path-cache saved Java/Lombok probe retains 99/99: first getter/typed chain, four observed native builds, config/dirty retraction. Earlier KAPT/KSP run records 102 matched and twelve unresolved diagnostic expectations; its four pulls lack accepted compiler-generation receipts | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | The twelve earlier observations do not establish final current-generation mismatches. Selected KGP 1.8.21 runtime is independently verified; task selection and effective-classpath repairs remain in progress. Compiler closure stays false |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
-| Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
-| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA under matched conditions | Earlier shared snapshot/path API allocation improvements remain verified. Real Moshi has 31/31 correct native UI cycles per engine: warm input-to-popup p50/p95 43.927/48.219 ms for ktlsp and 453.308/763.453 ms for IDEA; post-readiness server working-set medians 854.0/1,892.0 MiB | One real-project editing comparison verified; wider comparison pending | Checkpoints 28 and 36. Memory excludes editor/Gradle children and samples active editing, not idle steady-state; broad cold/warm project comparisons remain |
+| Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Actual Retrofit's same focused 21 RPC / 25 semantic cases pass in both engines. Shared mixed fixture retains adapted IntelliJ LSP 38/38 and ktlsp 36/36, including strict first responses after change delivery | Shared fixture and focused actual-project cases verified | Checkpoint 43. Windows URI/version adapter remains explicit; these cases do not establish whole-project parity |
+| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA with conditions recorded | Real Moshi and Retrofit each have 31/31 correct native UI cycles per engine. Latest Retrofit warm input-to-popup p50/p95 is 36.300/37.496 ms for ktlsp and 417.937/691.911 ms for IDEA; ready-phase server working-set medians are 885.625/1,591.334 MiB | Two focused real-project editing comparisons observed; wider comparison pending | Checkpoint 44 records samples, owned compiler overlap, memory scope and JVM difference. One sequential pair supplies no stable causal speedup or whole-project speed claim |
 
 ## Actual KAPT/KSP compile and runtime controls
 
@@ -322,7 +322,7 @@ Gradle task-completion receipt. It supplies no editor improvement or general
 processor-isolation proof. Evidence is
 `C:/Users/gummy/AppData/Local/Temp/ktlsp-plugin-readset-proof-20261011/{readset-report.txt,results.json,commands.json}`.
 
-## Measurement policy and initial UX targets
+## Measurement policy
 
 Compilation is an independent semantic oracle, not editing acceptance. The user
 explicitly requires useful unfinished-code completion, live Gradle library/build
@@ -333,23 +333,22 @@ build, a server restart that hides stale facts, or an empty fast response cannot
 substitute for these checks.
 
 Before claiming speed, collect a native-host baseline and retain each sample alongside
-its semantic assertion. The following initial targets express the desired editor UX;
-they are **provisional engineering targets**, not universal pass/fail thresholds,
-measured results or a claim of IDEA parity. Record host load and cache conditions;
-use matched comparisons to distinguish implementation cost from environmental delay:
+its semantic assertion. Record host load, JVMs, project state and cache conditions;
+use matched comparisons to distinguish implementation cost from environmental delay.
+Earlier agent-selected millisecond and startup-second targets are withdrawn. An
+experiment deadline bounds observation and never decides semantic acceptance.
 
-- Warm completion protocol latency: p95 <= 100 ms, at least 30 valid samples per
-  project and request class.
-- Input-to-completion-display latency in Neovim: p95 <= 200 ms, measured separately
-  from RPC latency with an actual completion UI probe.
-- Warm definition/hover: p95 <= 100 ms; references/rename: p95 <= 500 ms.
-- Unsaved-edit result freshness: correct result on the first request after delivery
-  of the document change; report debounce and end-to-end time separately.
-- Cold first useful project result: <= 10 s; full dependency/JDK readiness: <= 120 s.
-  Both require at least three cold process runs with isolated caches.
-- Warm restart readiness: <= 5 s, at least five process restarts.
-- Report steady-state working set/RSS and peak memory separately; set a concrete
-  memory budget after baseline project sizes and host capacity are recorded.
+- Report completion RPC latency and native input-to-popup latency separately, with
+  sample count and p50/p95 for useful results. Keep the first request separate from
+  repeated requests; use at least 30 repeated samples for a focused UI comparison.
+- Report definition, hover, references and rename by request class and project.
+- Require correct unsaved-edit results on the first request after change delivery;
+  record editor debounce and end-to-end time separately.
+- Distinguish cold process/index startup, cached restart and warm requests. A single
+  startup observation supplies neither a distribution nor a speed acceptance claim.
+- Report active-editing and idle working sets, sampled peaks and OS lifetime peaks
+  with their actual scopes. Derive any case-specific optimization budget from the
+  recorded baseline; keep it separate from correctness and experiment deadlines.
 
 The earlier steady-RSS/peak-commit/client-memory limits (3 GiB/4 GiB/128 MiB) and
 two-second shutdown target were agent-selected investigation targets. They are
@@ -2735,6 +2734,81 @@ Immutable ktlsp release SHA256:
 Next measure native completion and verified owned compiler/server memory on Retrofit,
 then continue compiler-plugin and remaining real-project editing coverage. The
 six-project goal remains in progress.
+
+### Forty-fourth checkpoint: native Retrofit completion and owned memory
+
+The current immutable release from checkpoint 43 and IntelliJ LSP each accept the
+expected `Response.body()` completion in **31/31 native Neovim cycles** on the pinned
+Retrofit checkout. Every cycle checks a genuine LSP popup item, one completion RPC
+and the exact complete resulting buffer. Original project bytes remain unchanged.
+The portable case is `dev/corpus/retrofit-2.11.0-ui.json`, routed through the existing
+corpus UI harness. No new test framework or product configuration is introduced.
+
+Both measured arms use the same 750 ms preparation pause before keyboard input;
+that pause is outside the input-to-popup clock and is not an acceptance deadline.
+The first request after readiness is kept separate from thirty repeated requests:
+
+| Measurement, milliseconds | ktlsp | IntelliJ LSP |
+| --- | ---: | ---: |
+| First RPC, n=1 | 6.756 | 2,021.758 |
+| First input-to-popup, n=1 | 39.213 | 2,047.903 |
+| Repeated RPC p50 / p95, n=30 | 4.612 / 5.257 | 386.363 / 659.919 |
+| Repeated input-to-popup p50 / p95, n=30 | 36.300 / 37.496 | 417.937 / 691.911 |
+| Repeated accept-to-buffer p50 / p95, n=30 | 56.452 / 57.635 | 110.618 / 171.209 |
+
+These are native popup handoff and buffer-update measurements, not physical-screen
+timing. One sequential pair with fresh server caches and shared prewarmed Gradle
+dependencies establishes no stable causal speedup or whole-project parity. Both
+launches request JAVA_HOME=JDK 17, but IDEA creates an owned JDK 21 helper. Its exact
+role and actual Gradle JVM are unmeasured, so identical JVM conditions and matched
+cold-import performance are not claimed.
+
+Read-only Windows sampling opens only newly owned processes after image, creation
+time and parent checks. Preexisting processes are excluded before opening handles.
+The current server and selected compiler are measured separately; same-poll tree
+sums include observed helpers and can double count shared pages:
+
+| Working set, MiB | ktlsp | IntelliJ LSP |
+| --- | ---: | ---: |
+| Ready-phase server median | 885.625 (281 samples) | 1,591.334 (450 samples) |
+| Ready-phase observed-tree median | 894.727 | 2,177.010 |
+| Lifecycle sampled server peak | 885.711 | 2,263.816 |
+| Lifecycle sampled external-compiler peak | 321.820 | Unmeasured |
+| Lifecycle sampled observed-tree peak | 1,221.934 | 2,849.977 |
+
+Ready-phase samples cover editing and preparation pauses, not idle steady state.
+Sampled peaks are not OS lifetime peaks. Maximum observed polling gaps are 110 ms
+and 688 ms respectively; short-lived children can be missed. IDEA's embedded JVM
+is included in its native server working set. Its unobserved external compiler is
+not recorded as zero memory.
+
+Verified selected-compiler process lifetimes overlap **13/30** repeated ktlsp RPC
+intervals, with conservative clock-offset uncertainty of 234,900 ns. This proves
+process overlap, not CPU activity. Those thirteen input-to-popup samples have
+p50/p95 36.394/37.894 ms. After all timing cycles, a separate unsaved-error probe
+receives one standard diagnostic pull backed by the accepted Kotlin 1.9.23 worker
+receipt and exact transmitted source SHA. Compiler closure remains false; the
+probe certifies a positive diagnostic, not absence or transformed-API completeness.
+
+ktlsp completes standard shutdown with exit zero. IDEA acknowledges shutdown and its
+native server independently exits zero, while the Neovim shutdown callback remains
+unavailable and the editor exits one. One newly owned JDK 21 helper requires cleanup
+afterward. This operational observation does not invalidate the completed UI cases.
+The wrapper's 573.919 seconds includes post-measurement helper waiting and supplies
+neither startup nor request-latency evidence.
+
+Evidence is under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/`:
+`native-retrofit-ui-resource-2/`, `native-retrofit-ijls-ui-resource-1/`,
+`retrofit-ui-comparison-1.json` and `retrofit-ui-environment-clarification-1.json`.
+Source-only packets are `source-ui-resource-candidate/` and
+`source-ui-resource-candidate-2/`; the latter changes only the unique preparation
+pause. Release SHA256 remains
+`86f8a37b6bb94d61dff8382fee37d9535e726f7f44dbb20223fb3d0c4ac2818b`.
+Project, product-source, harness and user AGENTS.md guards pass throughout.
+Next repair named-argument binding and selected KGP 1.8.21 task/classpath capture,
+then calibrate missing-template-delimiter cases against compiler and IDEA results.
+The six-project goal remains in progress.
 
 ### Current slice: requires-only compatibility artifacts
 

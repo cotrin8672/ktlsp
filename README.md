@@ -300,7 +300,9 @@ streams large model output through a temporary file and rejects incomplete proje
 blocks; it also supports this project's Kotlin DSL warnings-as-errors policy.
 For pinned Moshi, set `KTLSP_UI_CASES` to the absolute path of
 `dev/corpus/moshi-1.15.2-ui.json` and `KTLSP_UI_SAMPLES=31` with the same corpus route.
-This checks one first-after-readiness and thirty repeated native popup/acceptance cycles.
+For pinned Retrofit, use `dev/corpus/retrofit-2.11.0-ui.json` with that sample count.
+These check one first-after-readiness and thirty repeated native popup/acceptance cycles,
+including the exact whole buffer after accepting each completion.
 Spring extension-receiver and incomplete-selector regressions use the same route with
 `dev/corpus/fixtures/spring-provider` and the two `spring-provider-reduction*.json` manifests.
 `spring-extensions-editing.json` adds unsaved cases against the pinned real Spring root;
