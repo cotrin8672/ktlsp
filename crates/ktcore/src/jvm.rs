@@ -329,18 +329,334 @@ pub fn member_candidates<'a>(
             );
         }
     }
+    // Only the uniquely selected scoped authored owner can expose an admitted binary surface.
+    // The generated callable has its real ClassIdentity but deliberately has no source Def.
+    if index.may_have_compiled_callables() {
+        if let Type::Class {
+            name,
+            package: Some(package),
+            container,
+            ..
+        } = receiver
+        {
+            let owners: Vec<_> = index
+                .lookup_type(name)
+                .into_iter()
+                .filter(|entry| {
+                    entry.sym.package == *package
+                        && entry.sym.container.as_ref() == container.as_ref()
+                })
+                .collect();
+            if let [owner] = owners.as_slice() {
+                if index.scope_is_complete() {
+                    let definition = Def {
+                        file: owner.path.to_string(),
+                        start_byte: owner.sym.start_byte,
+                        end_byte: owner.sym.end_byte,
+                    };
+                    for set in index.contributions_for_file(&definition.file) {
+                        for (source_owner, class, descriptor, facts) in set.compiled_callables() {
+                            if source_owner == &definition && facts.name.starts_with(prefix) {
+                                out.push(CallableCandidate::Jvm {
+                                    owner: JvmOwner::Compiled {
+                                        class: &class.identity,
+                                        descriptor,
+                                        tier: owner.tier,
+                                    },
+                                    facts,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    normalize_compiled_candidates(index, receiver, &mut out);
     out
+}
+
+fn compiled_key<'a>(
+    candidate: CallableCandidate<'a>,
+) -> Option<(&'a ClassIdentity, &'a str, &'a str)> {
+    match candidate {
+        CallableCandidate::Jvm {
+            owner: JvmOwner::Compiled {
+                class, descriptor, ..
+            },
+            facts,
+        } => Some((class, facts.name.as_str(), descriptor)),
+        _ => None,
+    }
+}
+
+fn normalize_compiled_candidates(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    candidates: &mut Vec<CallableCandidate<'_>>,
+) {
+    if !candidates
+        .iter()
+        .any(|candidate| compiled_key(*candidate).is_some())
+    {
+        return;
+    }
+    // Provider ownership stays independent. Equal accepted semantic facts are one callable.
+    let mut seen: crate::fxhash::FxHashMap<_, Vec<&CallableFacts>> = Default::default();
+    candidates.retain(|candidate| {
+        let Some(key) = compiled_key(*candidate) else {
+            return true;
+        };
+        let CallableCandidate::Jvm { facts, .. } = *candidate else {
+            unreachable!()
+        };
+        let existing = seen.entry(key).or_default();
+        if existing.contains(&facts) {
+            return false;
+        }
+        existing.push(facts);
+        true
+    });
+    let compiled: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| compiled_key(*candidate).is_some_and(|key| seen[&key].len() == 1))
+        .collect();
+    candidates.retain(|candidate| match *candidate {
+        CallableCandidate::Authored(entry) => !compiled
+            .iter()
+            .any(|compiled| compiled_overrides_authored(index, receiver, *compiled, entry)),
+        _ => true,
+    });
+}
+
+fn conflicting_compiled_facts(candidates: &[CallableCandidate<'_>]) -> bool {
+    let mut seen: crate::fxhash::FxHashMap<_, &CallableFacts> = Default::default();
+    for candidate in candidates {
+        let Some(key) = compiled_key(*candidate) else {
+            continue;
+        };
+        let CallableCandidate::Jvm { facts, .. } = *candidate else {
+            unreachable!()
+        };
+        if let Some(previous) = seen.insert(key, facts) {
+            if previous != facts {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether an admitted compiled callable overrides this selected authored member.
+/// Callers must select candidates in the receiver's source-set scope first. False does not
+/// prove the absence of other binary surfaces outside the currently admitted getter subset.
+pub fn compiled_overrides_authored(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    candidate: CallableCandidate<'_>,
+    inherited: &Entry,
+) -> bool {
+    use crate::extensions::{Dispatch, Visibility};
+    use std::ops::ControlFlow;
+
+    let CallableCandidate::Jvm {
+        owner: JvmOwner::Compiled {
+            class, descriptor, ..
+        },
+        facts,
+    } = candidate
+    else {
+        return false;
+    };
+    let Type::Class {
+        name,
+        package: Some(package),
+        container: None,
+        ..
+    } = receiver
+    else {
+        return false;
+    };
+    let owner = if package.is_empty() {
+        name.clone()
+    } else {
+        format!("{}/{}", package.replace('.', "/"), name)
+    };
+    if class.internal_name != owner
+        || descriptor != "()Ljava/lang/String;"
+        || facts.is_static
+        || !facts.params.is_empty()
+        || !facts.type_params.is_empty()
+        || facts.name != inherited.sym.name
+        || inherited.sym.has_vararg
+        || inherited.sym.ext_receiver.is_some()
+        || inherited.sym.source_member.dispatch() != Some(Dispatch::Instance)
+        || inherited.sym.source_member.jvm_restricted()
+        || !matches!(
+            inherited.sym.source_member.visibility(),
+            Some(Visibility::Public | Visibility::Protected)
+        ) && !(inherited.sym.source_member.visibility() == Some(Visibility::Package)
+            && inherited.sym.package == *package)
+    {
+        return false;
+    }
+    let ctx = FileCtx::new(package.clone(), Vec::new());
+    if crate::members::method_signature(index, receiver, inherited, &ctx) != Some(Vec::new()) {
+        return false;
+    }
+    let Some(parent_owner) = inherited.sym.container.as_deref() else {
+        return false;
+    };
+    let child_owner = infer::receiver_root_key(index, receiver);
+    if child_owner.as_deref() == Some(parent_owner) && inherited.sym.package == *package {
+        return false;
+    }
+    let found = infer::walk_supertypes(index, receiver, 32, |current| {
+        if current.package() == Some(inherited.sym.package.as_str())
+            && infer::receiver_root_key(index, current).as_deref() == Some(parent_owner)
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break();
+    if !found {
+        return false;
+    }
+    let (container, simple) = parent_owner
+        .rsplit_once('.')
+        .map_or((None, parent_owner), |(container, simple)| {
+            (Some(container.to_string()), simple)
+        });
+    let parent = Type::Class {
+        name: simple.to_string(),
+        package: Some(inherited.sym.package.clone()),
+        container,
+        nullable: false,
+        args: Vec::new(),
+    };
+    !infer::walk_supertypes(index, &parent, 32, |current| {
+        if current.package() == Some(package.as_str())
+            && infer::receiver_root_key(index, current) == child_owner
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+/// A language adapter may prove a value receiver. A type spelling alone does not prove
+/// absence of a shadowing value, especially when compiler-generated fields are unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiverKind {
+    Type,
+    Value,
+    Unknown,
+}
+
+/// Only the admitted compiled surface uses this dispatch proof. Authored-only and existing
+/// source-JVM calls preserve their selection policy until their own dispatch facts are modeled.
+pub fn select_call_for_receiver_kind<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    mut candidates: Vec<CallableCandidate<'a>>,
+    name: &str,
+    args: &crate::members::CallArguments,
+    ctx: &FileCtx,
+    receiver_kind: ReceiverKind,
+) -> CallSelection<'a> {
+    use crate::members::Applicability;
+    if receiver_kind == ReceiverKind::Value
+        || !candidates.iter().any(|candidate| {
+            candidate.name() == name
+                && matches!(candidate,
+            CallableCandidate::Jvm { owner: JvmOwner::Compiled { .. }, facts } if !facts.is_static)
+        })
+    {
+        return select_call(index, receiver, candidates, name, args, ctx);
+    }
+    candidates.retain(|candidate| candidate.name() == name);
+    let conflicting = conflicting_compiled_facts(&candidates);
+    let (mut blocked, remaining): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|candidate| {
+            candidate.name() == name
+                && matches!(candidate,
+            CallableCandidate::Jvm { owner: JvmOwner::Compiled { .. }, facts } if !facts.is_static)
+        });
+    let remaining = select_call(index, receiver, remaining, name, args, ctx);
+    // A proven type cannot call the instance surface, but can still select a real static
+    // overload. Unknown receiver syntax does not establish that the instance is ineligible.
+    if !conflicting
+        && receiver_kind == ReceiverKind::Type
+        && remaining.applicability != Applicability::Rejected
+        && !remaining.candidates.is_empty()
+        && remaining
+            .candidates
+            .iter()
+            .all(|candidate| match candidate {
+                CallableCandidate::Authored(entry) => {
+                    entry.sym.source_member.dispatch() == Some(crate::extensions::Dispatch::Static)
+                }
+                CallableCandidate::Jvm { facts, .. } => facts.is_static,
+            })
+    {
+        return remaining;
+    }
+    let applicability = if !conflicting
+        && receiver_kind == ReceiverKind::Type
+        && remaining.applicability == Applicability::Rejected
+    {
+        Applicability::Rejected
+    } else {
+        Applicability::Unknown
+    };
+    // Keep provenance and genuine unknown competitors. Consumers must not turn removal of
+    // a blocked compiled callable into a second authored/global lookup.
+    blocked.extend(remaining.candidates);
+    CallSelection {
+        candidates: blocked,
+        applicability,
+        compiled_dispatch_blocked: true,
+    }
 }
 
 pub struct CallSelection<'a> {
     pub candidates: Vec<CallableCandidate<'a>>,
     pub applicability: crate::members::Applicability,
+    compiled_dispatch_blocked: bool,
 }
 
 impl<'a> CallSelection<'a> {
+    /// An unsupported dispatch keeps provenance but cannot expose a signature or source target.
+    pub fn consumable_candidates(&self) -> &[CallableCandidate<'a>] {
+        if self.compiled_dispatch_blocked {
+            &[]
+        } else {
+            &self.candidates
+        }
+    }
+
     pub fn navigation_candidates(&self) -> &[CallableCandidate<'a>] {
-        if self.applicability == crate::members::Applicability::Rejected
-            && self.candidates.len() > 1
+        if self.compiled_dispatch_blocked {
+            return &[];
+        }
+        if (self.applicability == crate::members::Applicability::Rejected
+            && self.candidates.len() > 1)
+            || ((self.applicability == crate::members::Applicability::Unknown
+                || self.candidates.len() > 1)
+                && self.candidates.iter().any(|candidate| {
+                    matches!(
+                        candidate,
+                        CallableCandidate::Jvm {
+                            owner: JvmOwner::Compiled { .. },
+                            ..
+                        }
+                    )
+                }))
         {
             &[]
         } else {
@@ -363,7 +679,8 @@ pub fn select_call<'a>(
         .filter(|candidate| candidate.name() == name)
         .collect();
     let mut accepted = Vec::new();
-    let mut uncertain = false;
+    let conflicting = conflicting_compiled_facts(&named);
+    let mut uncertain = conflicting;
     for candidate in &named {
         let applicability = match *candidate {
             CallableCandidate::Authored(entry) => {
@@ -409,7 +726,11 @@ pub fn select_call<'a>(
     let applicability = if accepted.is_empty() {
         // Keep rejected signatures for diagnostics; navigation requires a unique declaration.
         accepted = named;
-        Applicability::Rejected
+        if conflicting {
+            Applicability::Unknown
+        } else {
+            Applicability::Rejected
+        }
     } else if uncertain {
         Applicability::Unknown
     } else {
@@ -418,6 +739,7 @@ pub fn select_call<'a>(
     CallSelection {
         candidates: accepted,
         applicability,
+        compiled_dispatch_blocked: false,
     }
 }
 
@@ -428,6 +750,24 @@ pub fn projected_return_type(candidate: CallableCandidate<'_>) -> Option<Type> {
     (facts.return_type.name == "Object"
         && facts.return_type.qualification.as_deref() == Some("java.lang"))
     .then(|| Type::class("Object", Some("java.lang".into())))
+}
+
+/// Preserve the source-JVM lowering behavior; derive admitted Java results through the current
+/// scoped type resolver. Missing/ambiguous java.lang.String remains Unknown, never guessed Object.
+pub fn projected_return_type_in_context(
+    index: &dyn InferenceIndex,
+    candidate: CallableCandidate<'_>,
+    ctx: &FileCtx,
+) -> Option<Type> {
+    if let CallableCandidate::Jvm {
+        owner: JvmOwner::Compiled { .. },
+        facts,
+    } = candidate
+    {
+        let result = infer::declared_type(index, &facts.return_type, ctx);
+        return (!matches!(result, Type::Unknown)).then_some(result);
+    }
+    projected_return_type(candidate)
 }
 
 #[derive(Clone, Debug)]
@@ -755,5 +1095,253 @@ mod tests {
         );
         assert!(index.lookup_by_name("getName").is_empty());
         assert!(index.lookup_type("Person").is_empty());
+    }
+
+    #[test]
+    fn compiled_same_identity_with_different_facts_is_unknown() {
+        let index = crate::index::Index::new();
+        let class = ClassIdentity {
+            origin_id: "selected-project".into(),
+            internal_name: "oracle/Person".into(),
+            input: InputIdentity::Binary {
+                content_sha256: [7; 32],
+            },
+        };
+        let facts = CallableFacts {
+            name: "getName".into(),
+            params: Vec::new(),
+            return_type: TypeRef {
+                name: "String".into(),
+                qualification: Some("java.lang".into()),
+                ..TypeRef::default()
+            },
+            type_params: Vec::new(),
+            definition: None,
+            fixed_name: None,
+            jvm_name_annotation: None,
+            is_static: false,
+        };
+        let mut conflicting = facts.clone();
+        conflicting.is_static = true;
+        let candidate = CallableCandidate::Jvm {
+            owner: JvmOwner::Compiled {
+                class: &class,
+                descriptor: "()Ljava/lang/String;",
+                tier: Tier::Volatile,
+            },
+            facts: &facts,
+        };
+        let conflicting_candidate = CallableCandidate::Jvm {
+            owner: JvmOwner::Compiled {
+                class: &class,
+                descriptor: "()Ljava/lang/String;",
+                tier: Tier::Volatile,
+            },
+            facts: &conflicting,
+        };
+        let selection = select_call(
+            &index,
+            &Type::class("Person", Some("oracle".into())),
+            vec![candidate, conflicting_candidate],
+            "getName",
+            &crate::members::CallArguments {
+                count: Some(0),
+                types: Vec::new(),
+                trailing_lambda: false,
+            },
+            &FileCtx::new("oracle".into(), Vec::new()),
+        );
+        assert_eq!(
+            selection.applicability,
+            crate::members::Applicability::Unknown
+        );
+        assert_eq!(selection.candidates.len(), 2);
+        assert!(selection.navigation_candidates().is_empty());
+        let mut rejected_shape = facts.clone();
+        rejected_shape.params.push(TypeRef::simple("Int"));
+        let conflicting_candidate = CallableCandidate::Jvm {
+            owner: JvmOwner::Compiled {
+                class: &class,
+                descriptor: "()Ljava/lang/String;",
+                tier: Tier::Volatile,
+            },
+            facts: &rejected_shape,
+        };
+        let selection = select_call(
+            &index,
+            &Type::class("Person", Some("oracle".into())),
+            vec![candidate, conflicting_candidate],
+            "getName",
+            &crate::members::CallArguments {
+                count: Some(0),
+                types: Vec::new(),
+                trailing_lambda: false,
+            },
+            &FileCtx::new("oracle".into(), Vec::new()),
+        );
+        assert_eq!(
+            selection.applicability,
+            crate::members::Applicability::Unknown
+        );
+        assert!(selection.navigation_candidates().is_empty());
+    }
+
+    #[test]
+    fn compiled_instance_dispatch_requires_a_proven_value_without_changing_authored_static_calls() {
+        use crate::extensions::{Dispatch, Visibility};
+        use crate::members::{Applicability, CallArguments};
+        use crate::symbol::{MemberImplementation, SourceMemberFlags};
+        use std::sync::Arc;
+
+        let index = crate::index::Index::new();
+        let class = ClassIdentity {
+            origin_id: "selected-project".into(),
+            internal_name: "oracle/Person".into(),
+            input: InputIdentity::Binary {
+                content_sha256: [7; 32],
+            },
+        };
+        let facts = CallableFacts {
+            name: "getName".into(),
+            params: Vec::new(),
+            return_type: TypeRef {
+                name: "String".into(),
+                qualification: Some("java.lang".into()),
+                ..TypeRef::default()
+            },
+            type_params: Vec::new(),
+            definition: None,
+            fixed_name: None,
+            jvm_name_annotation: None,
+            is_static: false,
+        };
+        let candidate = CallableCandidate::Jvm {
+            owner: JvmOwner::Compiled {
+                class: &class,
+                descriptor: "()Ljava/lang/String;",
+                tier: Tier::Volatile,
+            },
+            facts: &facts,
+        };
+        let receiver = Type::class("Person", Some("oracle".into()));
+        let args = CallArguments {
+            count: Some(0),
+            types: Vec::new(),
+            trailing_lambda: false,
+        };
+        let ctx = FileCtx::new("oracle".into(), Vec::new());
+        for (kind, expected, usable) in [
+            (ReceiverKind::Value, Applicability::Applicable, 1),
+            (ReceiverKind::Type, Applicability::Rejected, 0),
+            (ReceiverKind::Unknown, Applicability::Unknown, 0),
+        ] {
+            let selected = select_call_for_receiver_kind(
+                &index,
+                &receiver,
+                vec![candidate],
+                "getName",
+                &args,
+                &ctx,
+                kind,
+            );
+            assert_eq!(selected.applicability, expected, "{kind:?}");
+            assert_eq!(selected.candidates.len(), 1, "retain provenance");
+            assert_eq!(selected.consumable_candidates().len(), usable, "{kind:?}");
+            assert_eq!(selected.navigation_candidates().len(), usable, "{kind:?}");
+            assert!(selected.candidates[0].definition().is_none());
+        }
+        let mut conflicting = facts.clone();
+        conflicting.is_static = true;
+        let conflict = CallableCandidate::Jvm {
+            owner: JvmOwner::Compiled {
+                class: &class,
+                descriptor: "()Ljava/lang/String;",
+                tier: Tier::Volatile,
+            },
+            facts: &conflicting,
+        };
+        let selected = select_call_for_receiver_kind(
+            &index,
+            &receiver,
+            vec![candidate, conflict],
+            "getName",
+            &args,
+            &ctx,
+            ReceiverKind::Type,
+        );
+        assert_eq!(selected.applicability, Applicability::Unknown);
+        assert_eq!(selected.candidates.len(), 2);
+        assert!(selected.consumable_candidates().is_empty());
+
+        let mut symbol = IndexedSymbol::new(
+            "getName",
+            SymbolKind::Function,
+            "oracle",
+            Some("Person".into()),
+            10,
+            17,
+        );
+        symbol.arity = Some(0);
+        symbol.min_arity = Some(0);
+        symbol.source_member = SourceMemberFlags::new(
+            MemberImplementation::Concrete,
+            Dispatch::Static,
+            Visibility::Public,
+            false,
+            false,
+        );
+        let entry = Entry {
+            path: Arc::from("/authored/Person.java"),
+            tier: Tier::Volatile,
+            sym: Arc::new(symbol),
+        };
+        for kind in [ReceiverKind::Type, ReceiverKind::Unknown] {
+            let authored = CallableCandidate::Authored(&entry);
+            let old = select_call(&index, &receiver, vec![authored], "getName", &args, &ctx);
+            let new = select_call_for_receiver_kind(
+                &index,
+                &receiver,
+                vec![authored],
+                "getName",
+                &args,
+                &ctx,
+                kind,
+            );
+            assert_eq!(new.applicability, old.applicability);
+            assert_eq!(
+                new.navigation_candidates()[0].definition(),
+                old.navigation_candidates()[0].definition()
+            );
+            assert_eq!(new.consumable_candidates().len(), 1);
+        }
+        let mut static_facts = facts.clone();
+        static_facts.is_static = true;
+        let source = SourceFile {
+            file: "/source/Api.kt".into(),
+            revision: 1,
+            tier: Tier::Volatile,
+            facts: SourceFileFacts {
+                input_hash: 1,
+                package: "oracle".into(),
+                owner: "ApiKt".into(),
+                owner_annotation: None,
+                callables: vec![static_facts],
+            },
+        };
+        let projected = CallableCandidate::Jvm {
+            owner: JvmOwner::Source(&source),
+            facts: &source.facts.callables[0],
+        };
+        let selected = select_call_for_receiver_kind(
+            &index,
+            &receiver,
+            vec![projected],
+            "getName",
+            &args,
+            &ctx,
+            ReceiverKind::Unknown,
+        );
+        assert_eq!(selected.applicability, Applicability::Applicable);
+        assert_eq!(selected.consumable_candidates().len(), 1);
     }
 }

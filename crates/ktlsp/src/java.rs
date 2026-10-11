@@ -1145,8 +1145,9 @@ fn java_call_entries_with_imports(
     let resolved_member_call = member_call.is_some();
     let defs = if let Some(selection) = member_call {
         selection
-            .candidates
-            .into_iter()
+            .consumable_candidates()
+            .iter()
+            .copied()
             .filter_map(|candidate| match candidate {
                 ktcore::jvm::CallableCandidate::Authored(_) => candidate.definition(),
                 _ => None,
@@ -2604,6 +2605,142 @@ fn receiver_type_from_type_identifier(
     )
 }
 
+/// Classify the call receiver once. Known values win over identically named types.
+/// Missing authored fields are not proof that compiler-generated fields are absent.
+fn java_member_receiver(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+) -> Option<(Type, ktcore::jvm::ReceiverKind)> {
+    use ktcore::jvm::ReceiverKind;
+    let Some(object) = call.child_by_field_name("object") else {
+        let receiver = Type::class(enclosing_type_name(call, src)?, Some(package_of(tree, src)));
+        return Some((receiver, implicit_receiver_kind(call, src)));
+    };
+    match object.kind() {
+        "identifier" => {
+            if let Some(declaration) = local_declaration_node(src, object) {
+                return Some((
+                    type_of_value_declaration(index, file, src, tree, declaration)
+                        .unwrap_or(Type::Unknown),
+                    ReceiverKind::Value,
+                ));
+            }
+            if let Some(declaration) = same_file_field_declaration(src, object) {
+                let mut field = declaration;
+                while field.kind() != "field_declaration" {
+                    let Some(parent) = field.parent() else {
+                        break;
+                    };
+                    field = parent;
+                }
+                let dispatch = crate::indexer::source_member_flags(field, src, true).dispatch();
+                let kind = if dispatch == Some(ktcore::extensions::Dispatch::Static)
+                    || implicit_receiver_kind(call, src) == ReceiverKind::Value
+                {
+                    ReceiverKind::Value
+                } else {
+                    ReceiverKind::Unknown
+                };
+                return Some((
+                    type_of_value_declaration(index, file, src, tree, declaration)
+                        .unwrap_or(Type::Unknown),
+                    kind,
+                ));
+            }
+            let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
+            if let Some(owner) = enclosing_type_name(object, src) {
+                let enclosing = infer::declared_type(
+                    index,
+                    &type_scope(tree, src).type_ref(&owner, false, Vec::new()),
+                    &ctx,
+                );
+                let fields =
+                    ktcore::members::candidates(index, &enclosing, node_text(object, src), &ctx)
+                        .members
+                        .into_iter()
+                        .filter(|entry| entry.sym.kind == SymbolKind::Property)
+                        .collect::<Vec<_>>();
+                let mut complete = index.scope_is_complete();
+                let _ =
+                    infer::walk_supertypes(index, &enclosing, JAVA_SUPERTYPE_WALK_CAP, |current| {
+                        complete &= current.name().is_some() && current.package().is_some();
+                        ControlFlow::Continue(())
+                    });
+                if let [field] = fields.as_slice() {
+                    let visible = matches!(
+                        field.sym.source_member.visibility(),
+                        Some(
+                            ktcore::extensions::Visibility::Public
+                                | ktcore::extensions::Visibility::Protected
+                        )
+                    ) || field.sym.source_member.visibility()
+                        == Some(ktcore::extensions::Visibility::Package)
+                        && field.sym.package == ctx.package;
+                    let dispatch = field.sym.source_member.dispatch();
+                    if complete
+                        && visible
+                        && !static_imports_of(tree, src).may_resolve(node_text(object, src))
+                        && (dispatch == Some(ktcore::extensions::Dispatch::Static)
+                            || dispatch == Some(ktcore::extensions::Dispatch::Instance)
+                                && implicit_receiver_kind(call, src) == ReceiverKind::Value)
+                    {
+                        if let Some(value) = &field.sym.value_type {
+                            let ty =
+                                infer::declared_member_type(index, &enclosing, field, value, &ctx);
+                            return Some((ty, ReceiverKind::Value));
+                        }
+                    }
+                }
+            }
+            // No compiler/value-namespace closure is available here. Even a known class name
+            // could denote an unresolved imported or generated field; do not prove Type.
+            receiver_type_from_type_identifier(index, file, src, tree, object)
+                .map(|receiver| (receiver, ReceiverKind::Unknown))
+        }
+        "object_creation_expression" | "method_invocation" => {
+            receiver_type(index, file, src, tree, object)
+                .map(|receiver| (receiver, ReceiverKind::Value))
+        }
+        "this" | "super" => receiver_type(index, file, src, tree, object)
+            .map(|receiver| (receiver, implicit_receiver_kind(call, src))),
+        _ => receiver_type(index, file, src, tree, object)
+            .map(|receiver| (receiver, ReceiverKind::Unknown)),
+    }
+}
+
+fn implicit_receiver_kind(node: Node<'_>, src: &str) -> ktcore::jvm::ReceiverKind {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            return if crate::indexer::source_member_flags(parent, src, true).dispatch()
+                == Some(ktcore::extensions::Dispatch::Instance)
+            {
+                ktcore::jvm::ReceiverKind::Value
+            } else {
+                ktcore::jvm::ReceiverKind::Unknown
+            };
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "record_declaration"
+                | "enum_declaration"
+                | "annotation_type_declaration"
+        ) {
+            break;
+        }
+        current = parent.parent();
+    }
+    ktcore::jvm::ReceiverKind::Unknown
+}
+
 fn java_member_call_candidates<'a>(
     index: &'a dyn InferenceIndex,
     file: &str,
@@ -2635,17 +2772,39 @@ fn java_member_call_candidates_with_arguments<'a>(
     let name = node_text(call.child_by_field_name("name")?, src);
     let object = call.child_by_field_name("object");
     let receiver = match object {
-        Some(object) => receiver_type(index, file, src, tree, object)?,
-        None => Type::class(enclosing_type_name(call, src)?, Some(package_of(tree, src))),
+        Some(object) => receiver_type(index, file, src, tree, object),
+        None => enclosing_type_name(call, src)
+            .map(|name| Type::class(name, Some(package_of(tree, src)))),
     };
-    let selection = ktcore::jvm::select_call(
-        index,
-        &receiver,
-        ktcore::jvm::member_candidates(index, &receiver, name),
-        name,
-        arguments,
-        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
-    );
+    let receiver = receiver
+        .or_else(|| java_member_receiver(index, file, src, tree, call).map(|(ty, _)| ty))?;
+    let mut candidates = ktcore::jvm::member_candidates(index, &receiver, name);
+    let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
+    let selection = if candidates.iter().any(|candidate| {
+        matches!(
+            candidate,
+            ktcore::jvm::CallableCandidate::Jvm {
+                owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                ..
+            }
+        )
+    }) {
+        let (verified_receiver, kind) = java_member_receiver(index, file, src, tree, call)?;
+        if verified_receiver != receiver {
+            candidates = ktcore::jvm::member_candidates(index, &verified_receiver, name);
+        }
+        ktcore::jvm::select_call_for_receiver_kind(
+            index,
+            &verified_receiver,
+            candidates,
+            name,
+            arguments,
+            &ctx,
+            kind,
+        )
+    } else {
+        ktcore::jvm::select_call(index, &receiver, candidates, name, arguments, &ctx)
+    };
     // An absent implicit member leaves the existing import/name lookup available.
     (object.is_some() || !selection.candidates.is_empty()).then_some(selection)
 }
@@ -2704,6 +2863,21 @@ fn java_argument_type(
     None
 }
 
+pub(crate) fn jvm_call_selection_at<'a>(
+    index: &'a dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Option<ktcore::jvm::CallSelection<'a>> {
+    let usage = identifier_at(tree, offset)?;
+    let call = usage.parent()?;
+    if call.kind() != "method_invocation" || call.child_by_field_name("name") != Some(usage) {
+        return None;
+    }
+    java_member_call_candidates(index, file, src, tree, call)
+}
+
 pub fn jvm_member_at(
     index: &dyn InferenceIndex,
     file: &str,
@@ -2711,38 +2885,49 @@ pub fn jvm_member_at(
     tree: &Tree,
     offset: usize,
 ) -> Option<ktcore::jvm::ResolvedMember> {
-    let usage = identifier_at(tree, offset)?;
-    let call = usage.parent()?;
-    if call.kind() != "method_invocation" || call.child_by_field_name("name") != Some(usage) {
-        return None;
-    }
-    let candidates = java_member_call_candidates(index, file, src, tree, call)?;
+    let candidates = jvm_call_selection_at(index, file, src, tree, offset)?;
     let [candidate] = candidates.navigation_candidates() else {
         return None;
     };
     candidate.resolved(index)
 }
 
+/// Return projected signatures and whether unqualified authored/global fallback is allowed.
 pub fn jvm_call_signatures(
     index: &dyn InferenceIndex,
     file: &str,
     src: &str,
     tree: &Tree,
     call: Node<'_>,
-) -> Vec<crate::signature::Signature> {
+) -> (Vec<crate::signature::Signature>, bool) {
+    let unqualified =
+        call.kind() == "method_invocation" && call.child_by_field_name("object").is_none();
     let mut arguments = java_call_arguments(index, file, src, tree, call);
     arguments.count = None;
     let Some(selection) =
         java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments)
     else {
-        return Vec::new();
+        return (Vec::new(), unqualified);
     };
-    selection
-        .candidates
-        .into_iter()
+    let allow_fallback = unqualified
+        && !(selection.consumable_candidates().is_empty()
+            && selection.candidates.iter().any(|candidate| {
+                matches!(
+                    candidate,
+                    ktcore::jvm::CallableCandidate::Jvm {
+                        owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                        ..
+                    }
+                )
+            }));
+    let signatures = selection
+        .consumable_candidates()
+        .iter()
+        .copied()
         .filter(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
         .map(crate::signature::signature_for_callable)
-        .collect()
+        .collect();
+    (signatures, allow_fallback)
 }
 
 fn java_method_invocation_return_type(
@@ -2772,7 +2957,21 @@ fn java_method_invocation_return_type(
             if !candidate.accepts_count(java_argument_nodes(src, call).map(|args| args.len())) {
                 return None;
             }
-            return ktcore::jvm::projected_return_type(*candidate);
+            if matches!(
+                candidate,
+                ktcore::jvm::CallableCandidate::Jvm {
+                    owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                    ..
+                }
+            ) && candidates.applicability != ktcore::members::Applicability::Applicable
+            {
+                return None;
+            }
+            return ktcore::jvm::projected_return_type_in_context(
+                index,
+                *candidate,
+                &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+            );
         }
     }
     let package = package_of(tree, src);
@@ -3223,15 +3422,36 @@ pub fn completion_query(
         // An unfinished `h.name` statement can parse as a type; a call forces a receiver expression.
         synthetic.insert_str(syn_offset, "()");
         let synthetic_tree = JavaParser::new().parse(&synthetic);
-        let ty = completion_receiver_at(&synthetic_tree, syn_offset)
-            .and_then(|receiver| receiver_type(index, file, &synthetic, &synthetic_tree, receiver))
-            .unwrap_or(Type::Unknown);
+        let receiver = completion_receiver_at(&synthetic_tree, syn_offset);
+        let (ty, receiver_kind) = if index.may_have_compiled_callables() {
+            receiver
+                .and_then(|receiver| {
+                    java_member_receiver(
+                        index,
+                        file,
+                        &synthetic,
+                        &synthetic_tree,
+                        receiver.parent()?,
+                    )
+                })
+                .unwrap_or((Type::Unknown, ktcore::jvm::ReceiverKind::Unknown))
+        } else {
+            (
+                receiver
+                    .and_then(|receiver| {
+                        receiver_type(index, file, &synthetic, &synthetic_tree, receiver)
+                    })
+                    .unwrap_or(Type::Unknown),
+                ktcore::jvm::ReceiverKind::Unknown,
+            )
+        };
         return semantic_query::member_completion_query_for_type(
             index,
             language::SourceLanguage::Java,
             &synthetic_tree,
             &synthetic,
             ty,
+            receiver_kind,
             prefix,
             max_candidates,
         );

@@ -32,9 +32,20 @@ implementation that exercises this contract through actual LSP requests, includi
 Production Mixin support will be a separate LSPExtension project. Provider registration is explicit,
 and dynamic loading/ABI is undecided.
 
-Classfile decoding exists, but admitting compiler-generated members into the normal server still
-requires a verified successful build and input/output ownership. Decoding a class alone does not
-prove that its API is current after an unsaved edit or another build. The current coverage and
+The extension store can attach host-owned classfile facts to an exact scoped Java source owner.
+Providers receive session-bound handles; binary replacement, source edits and project-model changes
+invalidate their reads and contributions. The first admitted callable shape is a public instance
+method with no arguments returning `java.lang.String`. Shared call selection preserves overloads
+and unknown competitors, requires a proven value receiver, and never invents a source declaration
+for a generated method.
+Incomplete Java member completion uses the same receiver proof. Rename refuses an authored ancestor
+whose admitted generated override has no editable source, preserving polymorphic dispatch.
+These admitted-call readers currently cover Java; Kotlin's generated callable/property projection
+remains open.
+
+Publishing compiler-generated members in the normal server still requires a verified successful
+build and input/output ownership. That producer is not connected yet. Decoding a class alone does
+not prove that its API is current after an unsaved edit or another build. The current coverage and
 remaining acceptance failures are recorded in [fork-acceptance.md](../fork-acceptance.md).
 
 ## What is still language-specific

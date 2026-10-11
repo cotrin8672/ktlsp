@@ -56,6 +56,7 @@ pub struct ResolvedSymbolQuery {
     reference: ReferenceQuery,
     pub targets: Vec<Def>,
     pub entry: Option<Entry>,
+    compiled_signature: Option<crate::signature::Signature>,
 }
 
 impl ResolvedSymbolQuery {
@@ -65,6 +66,16 @@ impl ResolvedSymbolQuery {
 
     pub fn symbol_summary(&self) -> Option<SymbolSummary> {
         self.entry.as_ref().map(SymbolSummary::from_entry)
+    }
+
+    pub fn hover_markdown(&self) -> Option<String> {
+        self.symbol_summary()
+            .map(|summary| summary.hover_markdown())
+            .or_else(|| {
+                self.compiled_signature
+                    .as_ref()
+                    .map(|signature| format!("```java\n{}\n```", signature.label))
+            })
     }
 }
 
@@ -92,6 +103,7 @@ pub enum CompletionIncompletenessReason {
     ImportContext,
     NonCompletablePosition,
     UnknownReceiverType,
+    UnknownReceiverKind,
     QueryScopeIncomplete,
 }
 
@@ -101,6 +113,7 @@ impl CompletionIncompletenessReason {
             CompletionIncompletenessReason::ImportContext => "import-context",
             CompletionIncompletenessReason::NonCompletablePosition => "non-completable-position",
             CompletionIncompletenessReason::UnknownReceiverType => "unknown-receiver-type",
+            CompletionIncompletenessReason::UnknownReceiverKind => "unknown-receiver-kind",
             CompletionIncompletenessReason::QueryScopeIncomplete => "query-scope-incomplete",
         }
     }
@@ -213,6 +226,59 @@ pub fn resolved_symbol_query(
     offset: usize,
     facts: &CompletenessFacts,
 ) -> Option<ResolvedSymbolQuery> {
+    if SourceLanguage::for_key(file) == SourceLanguage::Java && index.may_have_compiled_callables()
+    {
+        if let Some(selection) = crate::java::jvm_call_selection_at(index, file, src, tree, offset)
+        {
+            if selection.candidates.iter().any(|candidate| {
+                matches!(
+                    candidate,
+                    ktcore::jvm::CallableCandidate::Jvm {
+                        owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                        ..
+                    }
+                )
+            }) {
+                if selection.applicability == ktcore::members::Applicability::Applicable {
+                    if let [candidate @ ktcore::jvm::CallableCandidate::Jvm {
+                        owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                        ..
+                    }] = selection.consumable_candidates()
+                    {
+                        return Some(ResolvedSymbolQuery {
+                            reference: ReferenceQuery {
+                                kind: UseKind::MemberSelector,
+                                symbol: Some(candidate.name().into()),
+                                status: ResolutionStatus::Found(()),
+                            },
+                            targets: Vec::new(),
+                            entry: None,
+                            compiled_signature: Some(crate::signature::signature_for_callable(
+                                *candidate,
+                            )),
+                        });
+                    }
+                }
+                // Preserve the selected compiled provenance; a rejected or ambiguous call
+                // cannot become an unrelated authored/global name through a second lookup.
+                return Some(ResolvedSymbolQuery {
+                    reference: ReferenceQuery {
+                        kind: UseKind::MemberSelector,
+                        symbol: selection
+                            .candidates
+                            .first()
+                            .map(|candidate| candidate.name().into()),
+                        status: ResolutionStatus::Unknown(vec![
+                            resolve::IncompletenessReason::CompilerProducerIncomplete,
+                        ]),
+                    },
+                    targets: Vec::new(),
+                    entry: None,
+                    compiled_signature: None,
+                });
+            }
+        }
+    }
     let usage = identifier_at(tree, offset)?;
     let symbol = Some(node_text(usage, src).to_string()).filter(|s| !s.is_empty());
     let kind = resolve::use_kind(usage);
@@ -233,6 +299,7 @@ pub fn resolved_symbol_query(
         },
         targets,
         entry,
+        compiled_signature: None,
     })
 }
 
@@ -336,6 +403,7 @@ pub fn member_completion_query(
         tree,
         src,
         ty,
+        ktcore::jvm::ReceiverKind::Unknown,
         prefix,
         max_candidates,
     )
@@ -347,6 +415,7 @@ pub fn member_completion_query_for_type(
     tree: &Tree,
     src: &str,
     ty: Type,
+    receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: String,
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
@@ -374,11 +443,12 @@ pub fn member_completion_query_for_type(
         language::symbol_facts(language, tree, src).symbols,
         Tier::Volatile,
     );
-    let candidates = member_candidates(
+    let (candidates, withheld_compiled) = member_candidates(
         index,
         Some(&source_index),
         language,
         &ty,
+        receiver_kind,
         &prefix,
         &vis,
         max_candidates,
@@ -386,7 +456,9 @@ pub fn member_completion_query_for_type(
     Some(CompletionQuery {
         context: complete::CompletionContext::AfterDot,
         prefix,
-        status: if candidates.is_empty() && !index.scope_is_complete() {
+        status: if withheld_compiled {
+            CompletionStatus::Unknown(vec![CompletionIncompletenessReason::UnknownReceiverKind])
+        } else if candidates.is_empty() && !index.scope_is_complete() {
             CompletionStatus::Unknown(vec![CompletionIncompletenessReason::QueryScopeIncomplete])
         } else if candidates.is_empty() {
             CompletionStatus::DefinitelyAbsent
@@ -522,7 +594,7 @@ fn member_call_shape_query(
         return None;
     }
     let ctx = infer::FileCtx::from_tree(tree, src);
-    let (recv_ty, entries) = if recv.kind() == "super_expression" {
+    let (_recv_ty, entries) = if recv.kind() == "super_expression" {
         let (ty, candidates) = ktcore::members::super_member_candidates(
             index,
             infer::super_receivers(index, recv, src, &ctx),
@@ -618,10 +690,13 @@ pub fn scope_name_query(
             None,
             SourceLanguage::Kotlin,
             &recv_ty,
+            ktcore::jvm::ReceiverKind::Unknown,
             &prefix,
             &vis,
             max_candidates,
-        ) {
+        )
+        .0
+        {
             if !items.iter().any(|existing| {
                 existing.label == candidate.label && existing.kind == candidate.kind
             }) {
@@ -691,6 +766,10 @@ struct RecoveredTypeIndex<'a> {
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn may_have_compiled_callables(&self) -> bool {
+        self.index.may_have_compiled_callables()
+    }
+
     fn jvm_sources(&self, owner: &str) -> Vec<&ktcore::jvm::SourceFile> {
         self.index.jvm_sources(owner)
     }
@@ -755,10 +834,11 @@ fn member_candidates(
     source_index: Option<&Index>,
     language: SourceLanguage,
     ty: &Type,
+    receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: &str,
     vis: &Visibility,
     max_candidates: usize,
-) -> Vec<ScopeCompletion> {
+) -> (Vec<ScopeCompletion>, bool) {
     let mut out: Vec<ScopeCompletion> = Vec::new();
     let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
     let recovered = source_index.map(|source| RecoveredTypeIndex { index, source });
@@ -766,6 +846,39 @@ fn member_candidates(
         Some(recovered) => recovered,
         None => index,
     };
+    // Prefer the accepted generated declaration's presentation to an inherited homonym.
+    // Recovery still supplies authored members; exact call selection remains in ktcore::jvm.
+    let mut java_callables = (language == SourceLanguage::Java)
+        .then(|| ktcore::jvm::member_candidates(index, ty, prefix))
+        .unwrap_or_default();
+    let mut withheld_compiled = false;
+    java_callables.retain(|candidate| {
+        let blocked = matches!(candidate, ktcore::jvm::CallableCandidate::Jvm {
+            owner: ktcore::jvm::JvmOwner::Compiled { .. }, facts
+        } if !facts.is_static && receiver_kind != ktcore::jvm::ReceiverKind::Value);
+        withheld_compiled |= blocked;
+        !blocked
+    });
+    for candidate in &java_callables {
+        if let ktcore::jvm::CallableCandidate::Jvm {
+            owner: ktcore::jvm::JvmOwner::Compiled { class, tier, .. },
+            facts,
+        } = candidate
+        {
+            if seen.insert((facts.name.clone(), SymbolKind::Function)) {
+                let mut item = ScopeCompletion::new(facts.name.clone(), SymbolKind::Function);
+                item.arity = candidate.arity();
+                item.tier = *tier;
+                let (package, name) = class
+                    .internal_name
+                    .rsplit_once('/')
+                    .unwrap_or(("", &class.internal_name));
+                item.package = package.replace('/', ".");
+                item.container = Some(name.to_string());
+                out.push(item);
+            }
+        }
+    }
     let _ = infer::walk_supertypes(inference_index, ty, 32, |current| {
         let Some(cur) = infer::receiver_root_key(inference_index, current) else {
             return ControlFlow::Continue(());
@@ -806,25 +919,33 @@ fn member_candidates(
         ControlFlow::Continue(())
     });
     if language == SourceLanguage::Java {
-        for candidate in ktcore::jvm::member_candidates(index, ty, prefix) {
-            if let ktcore::jvm::CallableCandidate::Jvm {
-                owner: ktcore::jvm::JvmOwner::Source(source),
-                facts,
-            } = candidate
-            {
+        for candidate in java_callables {
+            if let ktcore::jvm::CallableCandidate::Jvm { owner, facts } = candidate {
                 if seen.insert((facts.name.clone(), SymbolKind::Function)) {
                     let mut item = ScopeCompletion::new(facts.name.clone(), SymbolKind::Function);
                     item.arity = candidate.arity();
-                    item.tier = source.tier;
-                    item.package = source.facts.package.clone();
-                    item.container = Some(source.facts.owner.clone());
+                    item.tier = owner.tier();
+                    let (package, container) = match owner {
+                        ktcore::jvm::JvmOwner::Source(source) => {
+                            (source.facts.package.clone(), source.facts.owner.clone())
+                        }
+                        ktcore::jvm::JvmOwner::Compiled { class, .. } => {
+                            let (package, name) = class
+                                .internal_name
+                                .rsplit_once('/')
+                                .unwrap_or(("", &class.internal_name));
+                            (package.replace('/', "."), name.to_string())
+                        }
+                    };
+                    item.package = package;
+                    item.container = Some(container);
                     out.push(item);
                 }
             }
         }
     }
     out.truncate(max_candidates);
-    out
+    (out, withheld_compiled)
 }
 
 fn member_call_entries<'a>(
@@ -1843,5 +1964,920 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             &resolve::CompletenessFacts::complete()
         )
         .is_none());
+    }
+
+    const COMPILED_OWNER: &str = "/compiled/a/Person.java";
+    const COMPILED_BASE: &str = "/compiled/common/Base.java";
+    const COMPILED_USE: &str = "/compiled/a/Use.java";
+    const COMPILED_OTHER_SCOPE: &str = "/compiled/b/Use.java";
+
+    // Pure normalized-fact controls, not a Gradle task-success or classfile-freshness oracle.
+    // A later native compiler control must independently establish the generated override bytes.
+    fn compiled_override_workspace(providers: &[&str]) -> Workspace {
+        compiled_override_workspace_with_owner(
+            providers,
+            "package oracle; public class Person extends Base { private String name; }",
+        )
+    }
+
+    fn compiled_override_workspace_with_owner(providers: &[&str], owner_source: &str) -> Workspace {
+        use ktcore::classfile::{ClassFileFacts, MemberFacts};
+        use ktcore::extensions::ExtensionStore;
+        use ktcore::jvm::{ClassIdentity, InputIdentity};
+        use ktcore::project_model::{
+            FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut ws = Workspace::new();
+        let sources = [
+            (COMPILED_BASE, "package oracle; public class Base { public String getName() { return null; } public String getName(int n) { return null; } public String otherName() { return null; } }", "common"),
+            (COMPILED_OWNER, owner_source, "a"),
+            ("/compiled/a/Other.java", "package oracle; public class Other { public String getName() { return null; } }", "a"),
+            (COMPILED_USE, "package oracle; class Use { void run(Person p, Base b, Other o) { p.getName(); p.getName(1); p.otherName(); b.getName(); o.getName(); p.getName().length(); } }", "a"),
+            ("/compiled/b/Person.java", "package oracle; public class Person extends Base {}", "b"),
+            (COMPILED_OTHER_SCOPE, "package oracle; class Use { void run(Person p) { p.getName(); } }", "b"),
+            // Minimal parsed JDK declaration model isolates result-type lookup from indexing.
+            // These are existing String declarations, not synthesized members on Person.
+            ("/compiled/jdk/String.java", "package java.lang; public final class String { public int length() { return 0; } }", "jdk"),
+        ];
+        for (file, source, _) in sources {
+            ws.open(file, source.into());
+        }
+        let scope = |module: &str| ProjectScope {
+            module: module.into(),
+            source_set: "main".into(),
+        };
+        for (file, _, module) in sources {
+            ws.index.set_file_origin(
+                file,
+                FileOrigin {
+                    origin_id: module.into(),
+                    representation: SourceRepresentation::Source,
+                    project_scope: (module != "jdk").then(|| scope(module)),
+                },
+            );
+        }
+        ws.index.replace_scope_visibilities(
+            ["a", "b", "common"]
+                .into_iter()
+                .map(|module| ScopeVisibility {
+                    scope: scope(module),
+                    ordered_origins: vec![module.into(), "common".into(), "jdk".into()],
+                })
+                .collect(),
+        );
+        ws.assume_index_complete_for_tests();
+        let source = ws.doc_text(COMPILED_OWNER).unwrap();
+        let tree = crate::java::JavaParser::new().parse(&source);
+        let declarations = crate::language::extension_source_facts(
+            &ws.index.scoped_for_file(COMPILED_OWNER),
+            COMPILED_OWNER,
+            &tree,
+            &source,
+        );
+        let mut store = ExtensionStore::default();
+        store
+            .replace_source_declarations(
+                &ws.index,
+                COMPILED_OWNER,
+                Arc::from(source),
+                Knowledge::Found(()),
+                declarations,
+            )
+            .unwrap();
+        store.set_namespace_coverage(Knowledge::Found(()));
+        for provider in providers {
+            store.configure_provider(provider, true, Arc::from("{}"));
+        }
+        let owner = {
+            let mut read = store
+                .begin(&ws.index, providers[0], COMPILED_OWNER)
+                .unwrap();
+            let Knowledge::Found(owner) = read.resolve_type("oracle.Person") else {
+                panic!("selected owner")
+            };
+            owner
+        };
+        let class = Arc::new(ClassFileFacts {
+            identity: ClassIdentity {
+                origin_id: "a".into(),
+                internal_name: "oracle/Person".into(),
+                input: InputIdentity::Binary {
+                    content_sha256: [7; 32],
+                },
+            },
+            major_version: 61,
+            minor_version: 0,
+            access_flags: 0x0021,
+            super_name: Some(Arc::from("oracle/Base")),
+            interfaces: Vec::new(),
+            signature: None,
+            source_file: Some(Arc::from("Person.java")),
+            attribute_names: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![MemberFacts {
+                name: Arc::from("getName"),
+                descriptor: Arc::from("()Ljava/lang/String;"),
+                access_flags: 0x0001,
+                signature: None,
+                attribute_names: Vec::new(),
+            }],
+        });
+        store
+            .replace_compiled_input(&ws.index, &owner, Some(class))
+            .unwrap();
+        for provider in providers {
+            let mut read = store.begin(&ws.index, provider, COMPILED_OWNER).unwrap();
+            let Knowledge::Found(class) = read.compiled_class(&owner).unwrap() else {
+                panic!("accepted compiled input")
+            };
+            for method in read.compiled_methods(&class).unwrap() {
+                assert!(read.admit_java_method(&method).unwrap().is_found());
+            }
+            let pending = read.finish();
+            store.commit(pending).unwrap();
+        }
+        let mut sets = BTreeMap::new();
+        sets.insert(
+            COMPILED_OWNER.into(),
+            providers
+                .iter()
+                .map(|provider| {
+                    store
+                        .contributions(provider, COMPILED_OWNER)
+                        .unwrap()
+                        .clone()
+                })
+                .collect(),
+        );
+        ws.index.replace_contributions(sets);
+        ws
+    }
+
+    fn compiled_usage(ws: &mut Workspace, file: &str, text: &str) -> usize {
+        let source = ws.doc_text(file).unwrap();
+        source.find(text).unwrap() + text.find('.').unwrap() + 1
+    }
+
+    fn compiled_declaration(ws: &Workspace, file: &str, name: &str, arity: u8) -> Def {
+        let entries = ws.index.lookup_by_name(name);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path.as_ref() == file && entry.sym.arity == Some(arity))
+            .unwrap();
+        Def {
+            file: file.into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        }
+    }
+
+    #[test]
+    fn compiled_override_has_one_completion_known_result_and_no_fake_source_target() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        assert!(ws.goto_definition(COMPILED_USE, offset).is_empty());
+        assert!(ws.references(COMPILED_USE, offset, true).is_empty());
+        assert!(ws.prepare_rename(COMPILED_USE, offset).is_none());
+        assert!(ws.rename(COMPILED_USE, offset, "changed").is_none());
+        let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
+        assert_eq!(resolved.reference().status_label(), "ok");
+        assert_eq!(
+            resolved.hover_markdown().as_deref(),
+            Some("```java\ngetName(): String\n```")
+        );
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.entry.is_none());
+
+        let completion = ws
+            .completion_query(COMPILED_USE, offset + "getName".len())
+            .unwrap();
+        let items: Vec<_> = completion
+            .candidates
+            .iter()
+            .filter(|item| item.label == "getName")
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].arity, Some(0));
+        assert_eq!(items[0].container.as_deref(), Some("Person"));
+        let source = ws.doc_text(COMPILED_USE).unwrap();
+        let chain = source.find("p.getName().length()").unwrap() + "p.getName().le".len();
+        let result_completion = ws.completion_query(COMPILED_USE, chain).unwrap();
+        assert_eq!(result_completion.status_label(), "ok");
+        assert!(result_completion
+            .candidates
+            .iter()
+            .any(|item| item.label == "length"));
+    }
+
+    #[test]
+    fn compiled_override_preserves_authored_overloads_owners_scopes_and_applied_rename() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        {
+            let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName(1)");
+            let source = ws.doc_text(COMPILED_USE).unwrap();
+            let tree = crate::java::JavaParser::new().parse(&source);
+            let scoped = ws.index.scoped_for_file(COMPILED_USE);
+            let selected =
+                crate::java::jvm_call_selection_at(&scoped, COMPILED_USE, &source, &tree, offset)
+                    .unwrap();
+            assert_eq!(
+                selected.applicability,
+                ktcore::members::Applicability::Applicable
+            );
+            assert!(
+                matches!(
+                    selected.candidates.as_slice(),
+                    [ktcore::jvm::CallableCandidate::Authored(_)]
+                ),
+                "arity-rejected compiled getter leaves the legitimate authored overload alone"
+            );
+            assert_eq!(selected.navigation_candidates().len(), 1);
+        }
+        for (file, needle, target_file, name, arity) in [
+            (COMPILED_USE, "p.getName(1)", COMPILED_BASE, "getName", 1),
+            (COMPILED_USE, "p.otherName()", COMPILED_BASE, "otherName", 0),
+            (COMPILED_USE, "b.getName()", COMPILED_BASE, "getName", 0),
+            (
+                COMPILED_USE,
+                "o.getName()",
+                "/compiled/a/Other.java",
+                "getName",
+                0,
+            ),
+            (
+                COMPILED_OTHER_SCOPE,
+                "p.getName()",
+                COMPILED_BASE,
+                "getName",
+                0,
+            ),
+        ] {
+            let offset = compiled_usage(&mut ws, file, needle);
+            let target = compiled_declaration(&ws, target_file, name, arity);
+            assert_eq!(
+                ws.goto_definition(file, offset),
+                vec![target],
+                "{file}: {needle}"
+            );
+        }
+        let base = compiled_declaration(&ws, COMPILED_BASE, "getName", 0);
+        let generated_use = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        let references = ws.references(COMPILED_BASE, base.start_byte, true);
+        assert!(!references
+            .iter()
+            .any(|site| site.file == COMPILED_USE && site.start_byte == generated_use));
+        // Base b = new Person() dispatches to the generated getter. Renaming only Base
+        // and its authored references would silently change that behavior, so refuse both APIs.
+        let base_use = compiled_usage(&mut ws, COMPILED_USE, "b.getName()");
+        let other_scope_use = compiled_usage(&mut ws, COMPILED_OTHER_SCOPE, "p.getName()");
+        for (file, offset) in [
+            (COMPILED_BASE, base.start_byte),
+            (COMPILED_USE, base_use),
+            (COMPILED_OTHER_SCOPE, other_scope_use),
+        ] {
+            assert!(ws.prepare_rename(file, offset).is_none(), "{file}");
+            assert!(ws.rename(file, offset, "support").is_none(), "{file}");
+        }
+        // A different overload/name/owner still has a fully editable family. Apply every edit
+        // and compare whole buffers, including the generated owner's unchanged source.
+        for (target_file, name, arity, old_decl, new_decl, old_use, new_use) in [
+            (
+                COMPILED_BASE,
+                "getName",
+                1,
+                "getName(int n)",
+                "support(int n)",
+                "p.getName(1)",
+                "p.support(1)",
+            ),
+            (
+                COMPILED_BASE,
+                "otherName",
+                0,
+                "otherName()",
+                "support()",
+                "p.otherName()",
+                "p.support()",
+            ),
+            (
+                "/compiled/a/Other.java",
+                "getName",
+                0,
+                "getName()",
+                "support()",
+                "o.getName()",
+                "o.support()",
+            ),
+        ] {
+            let target = compiled_declaration(&ws, target_file, name, arity);
+            assert!(ws.prepare_rename(target_file, target.start_byte).is_some());
+            let edits = ws
+                .rename(target_file, target.start_byte, "support")
+                .unwrap();
+            assert!(edits.iter().all(|edit| edit.file != COMPILED_OWNER));
+            for file in [
+                COMPILED_BASE,
+                COMPILED_USE,
+                COMPILED_OTHER_SCOPE,
+                COMPILED_OWNER,
+                "/compiled/a/Other.java",
+            ] {
+                let before = ws.doc_text(file).unwrap();
+                let expected = if file == target_file {
+                    before.replacen(old_decl, new_decl, 1)
+                } else if file == COMPILED_USE {
+                    before.replace(old_use, new_use)
+                } else {
+                    before.clone()
+                };
+                let actual = crate::edit::apply_to_text(file, &before, &edits).unwrap();
+                assert_eq!(actual, expected, "whole buffer {file}: {name}/{arity}");
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_override_rename_preserves_a_different_selected_parent_origin() {
+        use ktcore::project_model::{FileOrigin, ProjectScope, SourceRepresentation};
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        let file = "/compiled/b/Base.java";
+        let source =
+            "package oracle; public class Base { public String getName() { return null; } }";
+        ws.open(file, source.into());
+        ws.index.set_file_origin(
+            file,
+            FileOrigin {
+                origin_id: "b".into(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(ProjectScope {
+                    module: "b".into(),
+                    source_set: "main".into(),
+                }),
+            },
+        );
+        let target = compiled_declaration(&ws, file, "getName", 0);
+        let usage = compiled_usage(&mut ws, COMPILED_OTHER_SCOPE, "p.getName()");
+        assert_eq!(
+            ws.goto_definition(COMPILED_OTHER_SCOPE, usage),
+            vec![target.clone()]
+        );
+        let generated = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        assert!(ws.goto_definition(COMPILED_USE, generated).is_empty());
+        assert!(ws.prepare_rename(file, target.start_byte).is_some());
+        let edits = ws.rename(file, target.start_byte, "support").unwrap();
+        for check in [
+            file,
+            COMPILED_OTHER_SCOPE,
+            COMPILED_BASE,
+            COMPILED_OWNER,
+            COMPILED_USE,
+        ] {
+            let before = ws.doc_text(check).unwrap();
+            let expected = if check == file {
+                before.replacen("getName()", "support()", 1)
+            } else if check == COMPILED_OTHER_SCOPE {
+                before.replace("p.getName()", "p.support()")
+            } else {
+                before.clone()
+            };
+            let actual = crate::edit::apply_to_text(check, &before, &edits).unwrap();
+            assert_eq!(actual, expected, "whole buffer {check}");
+        }
+    }
+
+    #[test]
+    fn compiled_override_rename_preserves_static_and_private_authored_members() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        for (file, source) in [
+            ("/compiled/a/StaticControl.java", "package oracle; class StaticControl { public static String getName() { return null; } void use() { getName(); } }"),
+            ("/compiled/a/PrivateControl.java", "package oracle; class PrivateControl { private String getName() { return null; } void use() { getName(); } }"),
+        ] {
+            open_compiled_dispatch_source(&mut ws, file, source);
+            let target = compiled_declaration(&ws, file, "getName", 0);
+            assert!(ws.prepare_rename(file, target.start_byte).is_some());
+            let edits = ws.rename(file, target.start_byte, "support").unwrap();
+            for check in [file, COMPILED_BASE, COMPILED_OWNER, COMPILED_USE, COMPILED_OTHER_SCOPE] {
+                let before = ws.doc_text(check).unwrap();
+                let expected = if check == file {
+                    before.replace("getName", "support")
+                } else {
+                    before.clone()
+                };
+                let actual = crate::edit::apply_to_text(check, &before, &edits).unwrap();
+                assert_eq!(actual, expected, "whole buffer {check}");
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_same_member_admitted_by_two_providers_is_one_callable() {
+        let mut ws = compiled_override_workspace(&["compiled-one", "compiled-two"]);
+        let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        let source = ws.doc_text(COMPILED_USE).unwrap();
+        let tree = crate::java::JavaParser::new().parse(&source);
+        let scoped = ws.index.scoped_for_file(COMPILED_USE);
+        let selection =
+            crate::java::jvm_call_selection_at(&scoped, COMPILED_USE, &source, &tree, offset)
+                .unwrap();
+        assert_eq!(
+            selection.applicability,
+            ktcore::members::Applicability::Applicable
+        );
+        assert_eq!(selection.candidates.len(), 1);
+        assert!(selection.candidates[0].definition().is_none());
+        assert!(ktcore::jvm::projected_return_type_in_context(
+            &scoped,
+            selection.candidates[0],
+            &infer::FileCtx::new("oracle".into(), Vec::new())
+        )
+        .is_some());
+        let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
+        assert_eq!(resolved.reference().status_label(), "ok");
+        assert!(resolved.targets.is_empty());
+        assert!(ws.rename(COMPILED_USE, offset, "changed").is_none());
+        assert_eq!(ws.index.contributions_for_file(COMPILED_OWNER).len(), 2);
+    }
+
+    #[test]
+    fn compiled_unknown_authored_competitor_is_retained_without_base_fallback() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        let base = compiled_declaration(&ws, COMPILED_BASE, "getName", 0);
+        let mut symbols: Vec<_> = ws
+            .index
+            .entries_for_file(COMPILED_BASE)
+            .iter()
+            .map(|entry| (*entry.sym).clone())
+            .collect();
+        symbols
+            .iter_mut()
+            .find(|symbol| symbol.start_byte == base.start_byte)
+            .unwrap()
+            .arity = None;
+        ws.index
+            .replace_file(COMPILED_BASE, symbols, Tier::Volatile);
+        let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        let source = ws.doc_text(COMPILED_USE).unwrap();
+        let tree = crate::java::JavaParser::new().parse(&source);
+        let scoped = ws.index.scoped_for_file(COMPILED_USE);
+        let selection =
+            crate::java::jvm_call_selection_at(&scoped, COMPILED_USE, &source, &tree, offset)
+                .unwrap();
+        assert_eq!(
+            selection.applicability,
+            ktcore::members::Applicability::Unknown
+        );
+        assert_eq!(selection.candidates.len(), 2);
+        assert!(selection.navigation_candidates().is_empty());
+        assert!(ws.goto_definition(COMPILED_USE, offset).is_empty());
+        assert!(ws.references(COMPILED_USE, offset, true).is_empty());
+        assert!(ws.prepare_rename(COMPILED_USE, offset).is_none());
+        assert!(ws.rename(COMPILED_USE, offset, "changed").is_none());
+        let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
+        assert_eq!(resolved.reference().status_label(), "unknown");
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.hover_markdown().is_none());
+    }
+
+    fn open_compiled_dispatch_source(ws: &mut Workspace, file: &str, source: &str) {
+        use ktcore::project_model::{FileOrigin, ProjectScope, SourceRepresentation};
+        ws.open(file, source.into());
+        ws.index.set_file_origin(
+            file,
+            FileOrigin {
+                origin_id: "a".into(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(ProjectScope {
+                    module: "a".into(),
+                    source_set: "main".into(),
+                }),
+            },
+        );
+    }
+
+    fn assert_compiled_dispatch_value(ws: &mut Workspace, file: &str, offset: usize) {
+        let resolved = ws.resolved_symbol_query(file, offset).unwrap();
+        assert_eq!(resolved.reference().status_label(), "ok", "{file}:{offset}");
+        assert_eq!(
+            resolved.hover_markdown().as_deref(),
+            Some("```java\ngetName(): String\n```")
+        );
+        assert!(resolved.targets.is_empty());
+        assert!(ws.goto_definition(file, offset).is_empty());
+        assert!(ws.references(file, offset, true).is_empty());
+        assert!(ws.prepare_rename(file, offset).is_none());
+        assert!(ws.rename(file, offset, "changed").is_none());
+        let signature = ws.signature_help(file, offset + "getName(".len()).unwrap();
+        let mut labels: Vec<_> = signature
+            .signatures
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec!["getName(): String", "getName(p1: int): String"]
+        );
+        let source = ws.doc_text(file).unwrap();
+        let length = source[offset..].find("length").unwrap() + offset;
+        let completion = ws.completion_query(file, length + 2).unwrap();
+        assert!(
+            completion
+                .candidates
+                .iter()
+                .any(|item| item.label == "length"),
+            "{file}"
+        );
+    }
+
+    fn assert_compiled_dispatch_unknown(ws: &mut Workspace, file: &str, offset: usize) {
+        let source = ws.doc_text(file).unwrap();
+        let tree = crate::java::JavaParser::new().parse(&source);
+        let scoped = ws.index.scoped_for_file(file);
+        let selected =
+            crate::java::jvm_call_selection_at(&scoped, file, &source, &tree, offset).unwrap();
+        assert_eq!(
+            selected.applicability,
+            ktcore::members::Applicability::Unknown,
+            "parsed syntax lacks a value-namespace closure"
+        );
+        assert!(selected.candidates.iter().any(|candidate| matches!(
+            candidate,
+            ktcore::jvm::CallableCandidate::Jvm {
+                owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                ..
+            }
+        )));
+        assert!(selected.consumable_candidates().is_empty());
+        assert!(selected.navigation_candidates().is_empty());
+        let resolved = ws.resolved_symbol_query(file, offset).unwrap();
+        assert_eq!(
+            resolved.reference().status_label(),
+            "unknown",
+            "{file}:{offset}"
+        );
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.hover_markdown().is_none());
+        assert!(ws.goto_definition(file, offset).is_empty());
+        assert!(ws.references(file, offset, true).is_empty());
+        assert!(ws.prepare_rename(file, offset).is_none());
+        assert!(ws.rename(file, offset, "changed").is_none());
+        assert!(ws.signature_help(file, offset + "getName(".len()).is_none());
+        let length = source[offset..].find("length").unwrap() + offset;
+        assert!(
+            !ws.completion_query(file, length + 2)
+                .is_some_and(|query| query.candidates.iter().any(|item| item.label == "length")),
+            "no useful fabricated return on {file}"
+        );
+    }
+
+    #[test]
+    fn compiled_dispatch_parsed_parameter_local_own_inherited_and_new_values_keep_getter() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        let sources = [
+            ("/compiled/a/ParameterUse.java", "package oracle; class ParameterUse { void run(Person p) { p.getName().length(); } }"),
+            ("/compiled/a/NewUse.java", "package oracle; class NewUse { void run() { new Person().getName().length(); } }"),
+            ("/compiled/a/LocalUse.java", "package oracle; class LocalUse { void run() { Person Person = new Person(); Person.getName().length(); } }"),
+            ("/compiled/a/OwnFieldUse.java", "package oracle; class OwnFieldUse { Person Person; void run() { Person.getName().length(); } }"),
+            ("/compiled/a/Holder.java", "package oracle; public class Holder { public Person Person; }"),
+            ("/compiled/a/InheritedUse.java", "package oracle; class InheritedUse extends Holder { void run() { Person.getName().length(); } }"),
+        ];
+        for (file, source) in sources {
+            open_compiled_dispatch_source(&mut ws, file, source);
+        }
+        for (file, source) in sources
+            .into_iter()
+            .filter(|(_, source)| source.contains("getName"))
+        {
+            assert_compiled_dispatch_value(&mut ws, file, source.find("getName").unwrap());
+        }
+    }
+
+    #[test]
+    fn compiled_dispatch_type_spelling_unknown_import_and_incomplete_parent_do_not_invent_value() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        for (file, source) in [
+            ("/compiled/a/TypeUse.java", "package oracle; class TypeUse { void run() { Person.getName().length(); } }"),
+            ("/compiled/a/ImportedUse.java", "package oracle; import static missing.Values.Person; class ImportedUse { void run() { Person.getName().length(); } }"),
+            ("/compiled/a/UncertainUse.java", "package oracle; class UncertainUse extends Missing { void run() { Person.getName().length(); } }"),
+        ] {
+            open_compiled_dispatch_source(&mut ws, file, source);
+            assert_compiled_dispatch_unknown(&mut ws, file, source.find("getName").unwrap());
+        }
+        // Authored static calls retain their existing selection policy, independent of case.
+        let file = "/compiled/a/StaticUse.java";
+        let source = "package oracle; class staticApi { public static String stable() { return null; } } class StaticUse { void run() { staticApi.stable(); } }";
+        open_compiled_dispatch_source(&mut ws, file, source);
+        let offset = source.rfind("stable").unwrap();
+        let target = compiled_declaration(&ws, file, "stable", 0);
+        assert_eq!(ws.goto_definition(file, offset), vec![target]);
+        assert!(ws.signature_help(file, offset + "stable(".len()).is_some());
+    }
+
+    #[test]
+    fn compiled_dispatch_implicit_instance_and_static_context_use_one_gate_including_signature_fallback(
+    ) {
+        // Normalized host facts deliberately contain only the admitted generated getter;
+        // this test does not prove these source bytes match a successful compiler output.
+        let source = "package oracle; public class Person extends Base { private String name; void instanceProbe() { getName().length(); } static void staticProbe() { getName().length(); } }";
+        let mut ws = compiled_override_workspace_with_owner(&["compiled-one"], source);
+        open_compiled_dispatch_source(
+            &mut ws,
+            "/compiled/a/Free.kt",
+            "package oracle\nfun getName(): String = \"decoy\"\n",
+        );
+        assert!(
+            ws.index
+                .lookup_by_name("getName")
+                .iter()
+                .any(|entry| entry.sym.container.is_none()),
+            "real unrelated top-level candidate"
+        );
+        let instance = source.find("instanceProbe").unwrap();
+        let instance = instance + source[instance..].find("getName").unwrap();
+        let static_call = source.find("staticProbe").unwrap();
+        let static_call = static_call + source[static_call..].find("getName").unwrap();
+        assert_compiled_dispatch_value(&mut ws, COMPILED_OWNER, instance);
+        assert_compiled_dispatch_unknown(&mut ws, COMPILED_OWNER, static_call);
+    }
+
+    #[test]
+    fn compiled_incomplete_completion_keeps_proven_values_including_inherited_fields() {
+        let mut ws = compiled_override_workspace_with_owner(
+            &["compiled-one"],
+            "package oracle; public class Person { private String name; }",
+        );
+        open_compiled_dispatch_source(
+            &mut ws,
+            "/compiled/a/Holder.java",
+            "package oracle; public class Holder { public Person person; }",
+        );
+        for (file, source) in [
+            ("/compiled/a/ParameterCompletion.java", "package oracle; class ParameterCompletion { void run(Person p) { p.ge } }"),
+            ("/compiled/a/LocalCompletion.java", "package oracle; class LocalCompletion { void run() { Person Person = new Person(); Person.ge } }"),
+            ("/compiled/a/OwnCompletion.java", "package oracle; class OwnCompletion { Person person; void run() { person.ge } }"),
+            ("/compiled/a/InheritedCompletion.java", "package oracle; class InheritedCompletion extends Holder { void run() { person.ge } }"),
+            ("/compiled/a/NewCompletion.java", "package oracle; class NewCompletion { void run() { new Person().ge } }"),
+        ] {
+            open_compiled_dispatch_source(&mut ws, file, source);
+            let query = ws.completion_query(file, source.rfind(".ge").unwrap() + 3).unwrap();
+            assert_eq!(query.status_label(), "ok", "{file}");
+            assert_eq!(query.candidates.iter().filter(|item| item.label == "getName").count(), 1, "{file}");
+        }
+    }
+
+    #[test]
+    fn compiled_incomplete_completion_withholds_unproven_type_and_import_receivers() {
+        let mut ws = compiled_override_workspace_with_owner(
+            &["compiled-one"],
+            "package oracle; public class Person { private String name; }",
+        );
+        for (file, source) in [
+            ("/compiled/a/TypeCompletion.java", "package oracle; class TypeCompletion { void run() { Person.ge } }"),
+            ("/compiled/a/ImportCompletion.java", "package oracle; import static missing.Values.Person; class ImportCompletion { void run() { Person.ge } }"),
+            ("/compiled/a/ParentCompletion.java", "package oracle; class ParentCompletion extends Missing { void run() { Person.ge } }"),
+        ] {
+            open_compiled_dispatch_source(&mut ws, file, source);
+            let query = ws.completion_query(file, source.rfind(".ge").unwrap() + 3).unwrap();
+            assert_eq!(query.status_label(), "unknown", "{file}");
+            assert!(!query.candidates.iter().any(|item| item.label == "getName"), "{file}");
+        }
+    }
+
+    #[test]
+    fn compiled_rejected_call_does_not_resolve_to_a_top_level_property() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        ws.open(COMPILED_BASE, "package oracle; public class Base {}".into());
+        let free = "/compiled/a/RejectedFree.kt";
+        open_compiled_dispatch_source(&mut ws, free, "val getName: String = \"decoy\"\n");
+        assert!(
+            ws.index.lookup_by_name("getName").iter().any(|entry| {
+                entry.path.as_ref() == free
+                    && entry.sym.kind == SymbolKind::Property
+                    && entry.sym.container.is_none()
+            }),
+            "real parsed top-level value, not a fake candidate"
+        );
+
+        let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName(1)");
+        let source = ws.doc_text(COMPILED_USE).unwrap();
+        let tree = crate::java::JavaParser::new().parse(&source);
+        let scoped = ws.index.scoped_for_file(COMPILED_USE);
+        let selected =
+            crate::java::jvm_call_selection_at(&scoped, COMPILED_USE, &source, &tree, offset)
+                .unwrap();
+        assert_eq!(
+            selected.applicability,
+            ktcore::members::Applicability::Rejected
+        );
+        assert_eq!(selected.candidates.len(), 1);
+        assert!(matches!(
+            selected.candidates[0],
+            ktcore::jvm::CallableCandidate::Jvm {
+                owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                ..
+            }
+        ));
+        assert!(ws.goto_definition(COMPILED_USE, offset).is_empty());
+
+        let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
+        assert_eq!(resolved.reference().symbol(), Some("getName"));
+        assert_eq!(resolved.reference().status_label(), "unknown");
+        assert_eq!(
+            resolved.reference().reason_labels(),
+            vec!["compiler-producer-incomplete"]
+        );
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.entry.is_none());
+        assert!(resolved.hover_markdown().is_none());
+
+        // A genuine zero-argument compiled call still exposes its signature without a fake Def.
+        let valid = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        let resolved = ws.resolved_symbol_query(COMPILED_USE, valid).unwrap();
+        assert_eq!(resolved.reference().status_label(), "ok");
+        assert_eq!(
+            resolved.hover_markdown().as_deref(),
+            Some("```java\ngetName(): String\n```")
+        );
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.entry.is_none());
+    }
+
+    #[test]
+    fn compiled_private_parent_does_not_become_a_generated_call_source_target() {
+        let mut ws = compiled_override_workspace(&["compiled-one"]);
+        ws.open(
+            COMPILED_BASE,
+            "package oracle; public class Base { private String getName() { return null; } }"
+                .into(),
+        );
+        let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+        let targets = {
+            let source = ws.doc_text(COMPILED_USE).unwrap();
+            let tree = crate::java::JavaParser::new().parse(&source);
+            let scoped = ws.index.scoped_for_file(COMPILED_USE);
+            let selected =
+                crate::java::jvm_call_selection_at(&scoped, COMPILED_USE, &source, &tree, offset)
+                    .unwrap();
+            assert_eq!(
+                selected.applicability,
+                ktcore::members::Applicability::Applicable
+            );
+            assert_eq!(selected.candidates.len(), 2);
+            assert!(selected.candidates.iter().any(|candidate| matches!(
+                candidate,
+                ktcore::jvm::CallableCandidate::Authored(entry)
+                    if entry.sym.source_member.visibility()
+                        == Some(ktcore::extensions::Visibility::Private)
+            )));
+            selected
+                .navigation_candidates()
+                .iter()
+                .filter_map(|candidate| candidate.definition())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            ws.goto_definition(COMPILED_USE, offset).is_empty(),
+            "an inaccessible private ancestor is not the generated method source"
+        );
+        assert!(targets.is_empty());
+        assert!(ws.references(COMPILED_USE, offset, true).is_empty());
+        assert!(ws.prepare_rename(COMPILED_USE, offset).is_none());
+        assert!(ws.rename(COMPILED_USE, offset, "changed").is_none());
+        let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
+        assert_eq!(resolved.reference().status_label(), "unknown");
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.hover_markdown().is_none());
+    }
+
+    #[test]
+    fn authored_private_parent_single_call_navigation_and_applied_rename_are_preserved() {
+        let mut ws = Workspace::new();
+        let file = "/compiled/plain/Base.java";
+        let source = "class Base { private String getName() { return null; } String readName() { return getName(); } }";
+        ws.open(file, source.into());
+        ws.assume_index_complete_for_tests();
+        assert!(!ws.index.may_have_compiled_callables());
+        let target = compiled_declaration(&ws, file, "getName", 0);
+        let offset = source.rfind("getName").unwrap();
+        assert_eq!(ws.goto_definition(file, offset), vec![target.clone()]);
+        let refs = ws.references(file, offset, true);
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&target));
+        assert!(refs
+            .iter()
+            .any(|site| site.file == file && site.start_byte == offset));
+        assert!(ws.prepare_rename(file, offset).is_some());
+        let edits = ws.rename(file, offset, "support").unwrap();
+        assert!(edits.iter().all(|edit| edit.file == file));
+        assert_eq!(
+            crate::edit::apply_to_text(file, source, &edits).unwrap(),
+            source.replace("getName", "support"),
+        );
+    }
+
+    #[test]
+    fn compiled_unknown_and_ambiguous_mixed_calls_do_not_restart_authored_name_lookup() {
+        for unknown_overload in [true, false] {
+            let mut ws = compiled_override_workspace(&["compiled-one"]);
+            if unknown_overload {
+                let declaration = compiled_declaration(&ws, COMPILED_BASE, "getName", 0);
+                let mut symbols: Vec<_> = ws
+                    .index
+                    .entries_for_file(COMPILED_BASE)
+                    .iter()
+                    .map(|entry| (*entry.sym).clone())
+                    .collect();
+                symbols
+                    .iter_mut()
+                    .find(|symbol| symbol.start_byte == declaration.start_byte)
+                    .unwrap()
+                    .arity = None;
+                ws.index
+                    .replace_file(COMPILED_BASE, symbols, Tier::Volatile);
+            } else {
+                // Deliberately mixed host facts: an authored static candidate cannot be erased
+                // by an admitted instance callable. This is not a successful compiler oracle.
+                ws.open(COMPILED_BASE,
+                    "package oracle; public class Base { public static String getName() { return null; } }".into());
+            }
+            let free = "/compiled/a/MixedFree.kt";
+            let free_source = "val getName: String = \"decoy\"\nfun readName(): String = getName\n";
+            open_compiled_dispatch_source(&mut ws, free, free_source);
+            let declaration = ws
+                .index
+                .lookup_by_name("getName")
+                .into_iter()
+                .find(|entry| entry.path.as_ref() == free && entry.sym.container.is_none())
+                .unwrap();
+            let decoy = Def {
+                file: free.into(),
+                start_byte: declaration.sym.start_byte,
+                end_byte: declaration.sym.end_byte,
+            };
+            // Ordinary authored Kotlin resolution remains useful and names the real property.
+            let authored = ws
+                .resolved_symbol_query(free, free_source.rfind("getName").unwrap())
+                .unwrap();
+            assert_eq!(authored.reference().status_label(), "ok");
+            assert_eq!(authored.targets, vec![decoy]);
+            assert!(authored.hover_markdown().is_some());
+
+            let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
+            let source = ws.doc_text(COMPILED_USE).unwrap();
+            let tree = crate::java::JavaParser::new().parse(&source);
+            let scoped = ws.index.scoped_for_file(COMPILED_USE);
+            let selected =
+                crate::java::jvm_call_selection_at(&scoped, COMPILED_USE, &source, &tree, offset)
+                    .unwrap();
+            assert_eq!(
+                selected.applicability,
+                if unknown_overload {
+                    ktcore::members::Applicability::Unknown
+                } else {
+                    ktcore::members::Applicability::Applicable
+                }
+            );
+            assert_eq!(
+                selected.candidates.len(),
+                2,
+                "a genuine competing candidate is retained"
+            );
+            assert!(selected
+                .candidates
+                .iter()
+                .any(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Authored(_))));
+            assert!(selected.candidates.iter().any(|candidate| matches!(
+                candidate,
+                ktcore::jvm::CallableCandidate::Jvm {
+                    owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                    ..
+                }
+            )));
+
+            assert!(
+                ws.goto_definition(COMPILED_USE, offset).is_empty(),
+                "mixed pool must not collapse to its sole authored Def: unknown={unknown_overload}"
+            );
+            assert!(ws.references(COMPILED_USE, offset, true).is_empty());
+            assert!(ws.prepare_rename(COMPILED_USE, offset).is_none());
+            assert!(ws.rename(COMPILED_USE, offset, "changed").is_none());
+
+            let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
+            assert_eq!(
+                resolved.reference().status_label(),
+                "unknown",
+                "unknown={unknown_overload}"
+            );
+            assert_eq!(
+                resolved.reference().reason_labels(),
+                vec!["compiler-producer-incomplete"]
+            );
+            assert!(resolved.targets.is_empty());
+            assert!(resolved.entry.is_none());
+            assert!(resolved.hover_markdown().is_none());
+        }
     }
 }

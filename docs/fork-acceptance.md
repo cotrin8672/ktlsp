@@ -41,8 +41,8 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentyfirst-fixed-1 passes 1,098 tests / 3 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentyfirst-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Eleventh-fixed-2 Java passes 191/196, including all 17 bare-call and earlier override controls. Five missing diagnostics remain. Eighteenth library source lifecycle passes 13/13 | Partial; current library editing verified, diagnostic coverage still failing | `ktlsp-goal-20261010/eleventh2-java-1/` and `ktlsp-library-eighteenth-replay-20261011/receipt.json`. Library shutdown acknowledgement is unmeasured. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentyfourth-fixed-1 passes 1,119 tests / 3 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentyfourth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Twentyfourth release Java passes 191/196 with the same five diagnostic failures; semantic passes all 23 checks. Eighteenth library source lifecycle passes 13/13 | Partial; current ordinary Java/semantic regression checks verified, diagnostic coverage still failing | `ktlsp-compiled-foundation-twentyfourth-editor-20261011/retry-1/` and `ktlsp-library-eighteenth-replay-20261011/receipt.json`. Compiler producer is not connected. Semantic shutdown is clean but 4.439 seconds exceeds the 2-second budget. Legacy forced Java shutdown is not graceful-shutdown proof |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -1548,6 +1548,88 @@ Evidence under the recorded Temp root: `ktlsp-goal-20261010/twentyfirst-fixed-1/
 `ktlsp-watch-atime-reduction-20261011/causal-audit.json`.
 Next: remove the access-time refresh feedback without losing writes or overflow
 invalidation, then resume the held Spring/Gradle editor replays with a fresh binding.
+
+### Twenty-fourth checkpoint: admitted compiled-callable foundation
+
+Compiler facts can now enter the same contribution store through an exact scoped
+authored Java owner. Providers receive opaque session-bound class/method handles;
+binary changes, unsaved source replacement and model changes invalidate positive
+and negative reads, committed contributions and pending work. Equal decoded inputs
+remain a no-op. Four public-API regressions use the committed real classfile fixture
+to exercise origin/scope separation, cross-session rejection, revision/CAS controls
+and unsupported shapes. Altered normalized metadata in negative controls is not a
+successful-compilation oracle.
+
+The admitted surface is deliberately limited to public, nonstatic, nongeneric,
+zero-argument Java methods returning `java.lang.String`. Exact duplicate provider
+facts describe one callable without merging provider ownership; conflicting facts
+remain Unknown. Known inherited overrides are dominated without deleting other
+overloads or unknown competitors. Java result inference, hover, signature help and
+incomplete member completion require the same value-receiver proof. A type spelling,
+an unresolved imported value and an incomplete parent never establish an instance.
+Generated methods have no invented source declaration. An authored ancestor rename
+is refused if it would leave an admitted generated override unchanged and alter
+polymorphic dispatch. Other overloads, names, owners and scoped parents retain
+applied and whole-buffer-inspected edits.
+
+The first core and four reader regressions have actual failing runtime assertions
+before their repairs. Dispatch verification separately preserves two erroneous
+signature-label/count expectations and their corrections; those failures are not
+reported as product defects. Two incomplete-completion regressions and three
+rename/name-fallback regressions also fail at runtime before repair. A further
+independent review found mixed applicable candidates could lose the generated
+candidate when navigation filtered missing source ranges. Two actual navigation
+assertions fail before the shared gate repair and pass afterward; the reader group
+now passes 14 tests. An additional authored-only private-call control verifies exact
+navigation/references and an applied whole-buffer rename. The four public-API tests
+also verify that the compiled-presence cache retracts with contributions while an
+immutable snapshot retains its original state.
+
+The valid private-ancestor case conservatively remains Unknown. Preventing a false
+ancestor target is a consistency repair; useful selection of the generated method
+still requires visibility-aware candidate filtering and remains a coverage gap.
+
+Twentysecond-fixed-1 passes 1,111 tests and twentythird-fixed-1 passes 1,117 tests,
+each with zero failures, three ignored, 40 suites and unchanged 312-input guards.
+Both release builds succeed. They are preserved intermediate checkpoints. Final
+twentyfourth-fixed-1 passes all 1,119 tests, zero failed, three ignored, 40 suites,
+with formatting and release builds successful. Its 312 guarded inputs match before
+and after tests, release and editor replay. The server SHA-256 is
+`bfac0eb253a4b366bf7517ce038a01ae703dafbb7b59cbeafaf310ad2c593a2b`.
+
+The same immutable release runs the unchanged existing Neovim Java and semantic
+routes. Java passes 191/196 with exactly the five previously recorded diagnostics
+still failing. Semantic passes all 23 checks, acknowledges shutdown once, sends one
+exit and records actual server exit zero with no forced termination. Its 4.439
+seconds exceed the two-second budget. Both monitor receipts preserve all 633 input
+guards. MSYS ancestry did not capture actual Neovim/server handles, so client/server
+RSS and complete native process ownership remain unmeasured for these runs; the
+observed wrapper processes all exit. No latency distribution or steady-state memory
+claim follows. The first editor preparation confused a receipt JSON hash with the
+monitor Python hash and stopped before native launch. That attempt remains preserved;
+the fresh retry verifies the script against its original successful-run guard.
+
+Evidence under the recorded Temp root:
+`ktlsp-admitted-compiled-foundation-20261011/`, including `dispatch/`,
+`ktlsp-compiled-input-public-api-draft-20261011/`,
+`ktlsp-compiled-override-rename-draft-20261011/current-rebase-2/`,
+`ktlsp-compiled-resolution-fallback-draft-20261011/`,
+`ktlsp-compiled-navigation-gate-draft-20261011/`,
+`ktlsp-goal-20261010/{twentysecond-fixed-1,twentythird-fixed-1,twentyfourth-fixed-1}/`
+and `ktlsp-compiled-foundation-twentyfourth-editor-20261011/retry-1/`.
+
+The default server has no connected native compiler producer. Attaching decoded
+facts is a trusted-host operation requiring a verified successful build and fresh
+input/output ownership; these API tests do not supply that verification. Kotlin
+generated-call/property projection is also open. All twelve transformed-API editor
+failures remain failures. Native process ownership and Windows notification drafts
+are unapplied and uncompiled, access-time feedback is not fixed, and no six-project
+correctness, latency or memory acceptance follows from this slice.
+Next: establish the owned native build lifecycle and conservative invalidation,
+retain declared-task-input/output categories before flattening, reject overlapping
+or unproved processor ownership, then connect only successful fresh compiled inputs.
+The held native process and notification drafts must be compiled and exercised
+before use. Resume the real-project and compiler-plugin editor failures afterward.
 
 ### Current slice: requires-only compatibility artifacts
 

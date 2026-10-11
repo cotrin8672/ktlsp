@@ -2523,11 +2523,11 @@ impl LanguageServer for Backend {
                 )
             });
             let hover = query
-                .and_then(|query| query.symbol_summary())
-                .map(|s| Hover {
+                .and_then(|query| query.hover_markdown())
+                .map(|value| Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
-                        value: s.hover_markdown(),
+                        value,
                     }),
                     range: None,
                 });
@@ -2577,10 +2577,10 @@ impl LanguageServer for Backend {
                             query.reference().status_label(),
                             query.reference().reason_labels(),
                         ));
-                        hover = query.symbol_summary().map(|summary| Hover {
+                        hover = query.hover_markdown().map(|value| Hover {
                             contents: HoverContents::Markup(MarkupContent {
                                 kind: MarkupKind::Markdown,
-                                value: summary.hover_markdown(),
+                                value,
                             }),
                             range: None,
                         });

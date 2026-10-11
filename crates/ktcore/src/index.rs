@@ -87,6 +87,7 @@ pub struct Index {
     refs_by_name: FxHashMap<Arc<str>, Vec<RefEntry>>,
     origins: OriginFacts,
     contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
+    has_compiled_callables: bool,
     jvm_sources: Arc<JvmSources>,
     jvm_revision: u64,
 }
@@ -98,6 +99,7 @@ pub struct InferenceIndexSnapshot {
     ext_by_receiver: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
     origins: OriginFacts,
     contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
+    has_compiled_callables: bool,
     jvm_sources: Arc<JvmSources>,
 }
 
@@ -219,6 +221,11 @@ impl OriginFacts {
 }
 
 pub trait InferenceIndex {
+    /// Conservative by default so adapters cannot silently hide accepted compiler facts.
+    fn may_have_compiled_callables(&self) -> bool {
+        true
+    }
+
     fn jvm_sources(&self, _owner: &str) -> Vec<&crate::jvm::SourceFile> {
         Vec::new()
     }
@@ -416,6 +423,7 @@ impl Index {
             ext_by_receiver: self.ext_by_receiver.clone(),
             origins: self.origins.clone(),
             contributions: self.contributions.clone(),
+            has_compiled_callables: self.has_compiled_callables,
             jvm_sources: self.jvm_sources.clone(),
         }
     }
@@ -486,6 +494,10 @@ impl Index {
         &mut self,
         contributions: BTreeMap<String, Vec<crate::extensions::ContributionSet>>,
     ) {
+        self.has_compiled_callables = contributions
+            .values()
+            .flatten()
+            .any(|set| set.compiled_callables().next().is_some());
         self.contributions = Arc::new(contributions);
     }
 
@@ -881,6 +893,10 @@ impl Index {
 }
 
 impl InferenceIndex for Index {
+    fn may_have_compiled_callables(&self) -> bool {
+        self.has_compiled_callables
+    }
+
     fn jvm_sources(&self, owner: &str) -> Vec<&crate::jvm::SourceFile> {
         self.jvm_sources
             .owners
@@ -932,6 +948,10 @@ impl InferenceIndex for Index {
 }
 
 impl InferenceIndex for InferenceIndexSnapshot {
+    fn may_have_compiled_callables(&self) -> bool {
+        self.has_compiled_callables
+    }
+
     fn jvm_sources(&self, owner: &str) -> Vec<&crate::jvm::SourceFile> {
         self.jvm_sources
             .owners
@@ -1261,6 +1281,10 @@ impl<'a> ScopedIndex<'a> {
 }
 
 impl InferenceIndex for ScopedIndex<'_> {
+    fn may_have_compiled_callables(&self) -> bool {
+        self.index.may_have_compiled_callables()
+    }
+
     fn jvm_sources(&self, owner: &str) -> Vec<&crate::jvm::SourceFile> {
         self.index
             .jvm_sources(owner)

@@ -1021,6 +1021,7 @@ impl Workspace {
             &synthetic_tree,
             &synthetic,
             receiver_type,
+            ktcore::jvm::ReceiverKind::Unknown,
             prefix,
             MAX_COMPLETIONS,
         )
@@ -1552,6 +1553,23 @@ impl Workspace {
                     .into_iter()
                     .cloned()
                     .collect();
+            // Renaming only the authored ancestor would change dispatch through that ancestor
+            // while leaving a generated override unchanged. It has no editable source range.
+            if scoped.may_have_compiled_callables()
+                && ktcore::jvm::member_candidates(&scoped, &receiver, &family[0].sym.name)
+                    .into_iter()
+                    .any(|compiled| {
+                        compiled.definition().is_none()
+                            && members.iter().any(|member| {
+                                definitions.contains(&rename_definition(member))
+                                    && ktcore::jvm::compiled_overrides_authored(
+                                        &scoped, &receiver, compiled, member,
+                                    )
+                            })
+                    })
+            {
+                return None;
+            }
             let Some(implementation) = members
                 .iter()
                 .find(|member| definitions.contains(&rename_definition(member)))

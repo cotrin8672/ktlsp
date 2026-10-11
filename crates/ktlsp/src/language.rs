@@ -330,13 +330,14 @@ pub fn signature_entries(
         SourceLanguage::Java => {
             let (call, callee, name, active_parameter) = java::call_at(tree, text, offset)?;
             let entries = java::java_call_entries(index, file, text, tree, call, callee, &name);
+            let (projected_signatures, unqualified) =
+                java::jvm_call_signatures(index, file, text, tree, call);
             Some(SignatureEntries {
                 name,
                 active_parameter,
                 entries,
-                projected_signatures: java::jvm_call_signatures(index, file, text, tree, call),
-                unqualified: call.kind() == "method_invocation"
-                    && call.child_by_field_name("object").is_none(),
+                projected_signatures,
+                unqualified,
             })
         }
     }

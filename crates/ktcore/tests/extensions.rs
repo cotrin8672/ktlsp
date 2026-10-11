@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ktcore::diagnostics::{Diagnostic, Severity};
 use ktcore::extensions::*;
-use ktcore::index::{Index, Tier};
+use ktcore::index::{Index, InferenceIndex, Tier};
 use ktcore::indexer::extract_symbols;
 use ktcore::knowledge::Knowledge;
 use ktcore::parser::KotlinParser;
@@ -1137,4 +1137,474 @@ fn private_field_facts_are_readable_and_the_field_binding_uses_the_real_target_d
     wrong_static.dispatch = Knowledge::Found(Dispatch::Static);
     let id = read.require(wrong_static).unwrap();
     assert!(read.resolution(id).unwrap().binding.is_definitely_absent());
+}
+
+// These are public semantic-host contract tests. The immutable Person.class is decoded here;
+// no test fabricates a successful Gradle/compiler invocation or a filesystem freshness receipt.
+// The host indexes the real class-name range only and leaves source-member coverage Unknown.
+const COMPILED_HOST_A: &str = "/compiled/app-a/Person.java";
+const COMPILED_HOST_B: &str = "/compiled/app-b/Person.java";
+const COMPILED_HOST_PROVIDER: &str = "compiled-contract";
+const COMPILED_HOST_SOURCE: &str =
+    include_str!("fixtures/classfile/sources/pluginfixture/Person.java");
+const COMPILED_HOST_BYTES: &[u8] = include_bytes!("fixtures/classfile/pluginfixture/Person.class");
+
+fn compiled_host_fixture() -> (
+    Index,
+    ExtensionStore,
+    Arc<ktcore::classfile::ClassFileFacts>,
+) {
+    let mut index = Index::new();
+    let mut store = ExtensionStore::default();
+    let start = COMPILED_HOST_SOURCE.find("Person").unwrap();
+    for (file, origin) in [(COMPILED_HOST_A, "app-a"), (COMPILED_HOST_B, "app-b")] {
+        index.replace_file(
+            file,
+            vec![IndexedSymbol::new(
+                "Person",
+                SymbolKind::Class,
+                "pluginfixture",
+                None,
+                start,
+                start + "Person".len(),
+            )],
+            Tier::Volatile,
+        );
+        index.set_file_origin(
+            file,
+            FileOrigin {
+                origin_id: origin.into(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(ProjectScope {
+                    module: origin.into(),
+                    source_set: "main".into(),
+                }),
+            },
+        );
+        store
+            .replace_source(
+                &index,
+                file,
+                Arc::from(COMPILED_HOST_SOURCE),
+                Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    index.replace_scope_visibilities(
+        ["app-a", "app-b"]
+            .into_iter()
+            .map(|origin| ScopeVisibility {
+                scope: ProjectScope {
+                    module: origin.into(),
+                    source_set: "main".into(),
+                },
+                ordered_origins: vec![origin.into()],
+            })
+            .collect(),
+    );
+    store.configure_provider(COMPILED_HOST_PROVIDER, true, Arc::from("{}"));
+    let class = Arc::new(ktcore::classfile::decode("app-a", COMPILED_HOST_BYTES).unwrap());
+    assert!(!index.may_have_compiled_callables());
+    (index, store, class)
+}
+
+fn compiled_host_type(index: &Index, store: &mut ExtensionStore, file: &str) -> TypeId {
+    let mut read = store.begin(index, COMPILED_HOST_PROVIDER, file).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("pluginfixture.Person") else {
+        panic!("exact source owner")
+    };
+    owner
+}
+
+fn compiled_host_getter_pending(
+    index: &Index,
+    store: &mut ExtensionStore,
+    file: &str,
+    getter: usize,
+) -> PendingContributions {
+    let mut read = store.begin(index, COMPILED_HOST_PROVIDER, file).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("pluginfixture.Person") else {
+        panic!("source owner")
+    };
+    let Knowledge::Found(class) = read.compiled_class(&owner).unwrap() else {
+        panic!("attached class")
+    };
+    let methods = read.compiled_methods(&class).unwrap();
+    assert!(read.admit_java_method(&methods[getter]).unwrap().is_found());
+    read.finish()
+}
+
+fn compiled_host_published_members(
+    index: &mut Index,
+    store: &ExtensionStore,
+    file: &str,
+) -> Vec<ktcore::jvm::MemberIdentity> {
+    let mut sets = std::collections::BTreeMap::<String, Vec<ContributionSet>>::new();
+    for (_, owner, set) in store.contribution_sets() {
+        sets.entry(owner.into()).or_default().push(set.clone());
+    }
+    index.replace_contributions(sets);
+    let scoped = index.scoped_for_file(file);
+    ktcore::jvm::member_candidates(
+        &scoped,
+        &ktcore::types::Type::class("Person", Some("pluginfixture".into())),
+        "getName",
+    )
+    .into_iter()
+    .map(|candidate| {
+        assert!(
+            candidate.definition().is_none(),
+            "a binary method has no invented source range"
+        );
+        candidate.identity(&scoped).unwrap()
+    })
+    .collect()
+}
+
+#[test]
+fn compiled_host_exact_origin_scope_and_store_are_not_interchangeable() {
+    let (mut index, mut store, class_a) = compiled_host_fixture();
+    let owner_a = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
+    let owner_b = compiled_host_type(&index, &mut store, COMPILED_HOST_B);
+    assert_eq!(owner_a.qualified_name(), owner_b.qualified_name());
+    assert_ne!(owner_a.definition(), owner_b.definition());
+    assert_eq!(
+        store.replace_compiled_input(&index, &owner_b, Some(class_a.clone())),
+        Err(ContractError::ForeignIdentity)
+    );
+    let mut foreign_store = ExtensionStore::default();
+    assert_eq!(
+        foreign_store.replace_compiled_input(&index, &owner_a, Some(class_a.clone())),
+        Err(ContractError::ForeignIdentity)
+    );
+    {
+        let mut read = store
+            .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_B)
+            .unwrap();
+        assert_eq!(
+            read.compiled_class(&owner_a).err(),
+            Some(ContractError::ForeignIdentity)
+        );
+        assert!(matches!(
+            read.compiled_class(&owner_b).unwrap(),
+            Knowledge::Unknown(_)
+        ));
+    }
+    store
+        .replace_compiled_input(&index, &owner_a, Some(class_a.clone()))
+        .unwrap();
+    let class_b = Arc::new(ktcore::classfile::decode("app-b", COMPILED_HOST_BYTES).unwrap());
+    assert_eq!(
+        class_a.identity.input, class_b.identity.input,
+        "same actual bytes"
+    );
+    store
+        .replace_compiled_input(&index, &owner_b, Some(class_b))
+        .unwrap();
+    let getter = class_a
+        .methods
+        .iter()
+        .position(|method| method.name.as_ref() == "getName")
+        .unwrap();
+    let a = compiled_host_getter_pending(&index, &mut store, COMPILED_HOST_A, getter);
+    store.commit(a).unwrap();
+    let b = compiled_host_getter_pending(&index, &mut store, COMPILED_HOST_B, getter);
+    store.commit(b).unwrap();
+    let a = compiled_host_published_members(&mut index, &store, COMPILED_HOST_A);
+    let b = compiled_host_published_members(&mut index, &store, COMPILED_HOST_B);
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    assert_eq!(a[0].class.origin_id, "app-a");
+    assert_eq!(b[0].class.origin_id, "app-b");
+    assert_ne!(
+        a[0], b[0],
+        "same FQN/descriptor/bytes in two modules are different members"
+    );
+}
+
+#[test]
+fn compiled_host_negative_arrival_and_cross_session_capabilities_cannot_publish_old_work() {
+    let (mut index, mut store, class) = compiled_host_fixture();
+    let owner = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert!(matches!(
+        read.compiled_class(&owner).unwrap(),
+        Knowledge::Unknown(_)
+    ));
+    let negative = read.finish();
+    store.commit(negative).unwrap();
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert!(matches!(
+        read.compiled_class(&owner).unwrap(),
+        Knowledge::Unknown(_)
+    ));
+    let old_negative = read.finish();
+    store
+        .replace_compiled_input(&index, &owner, Some(class.clone()))
+        .unwrap();
+    assert!(store
+        .contributions(COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .is_none());
+    assert_eq!(store.commit(old_negative), Err(ContractError::Stale));
+
+    let getter = class
+        .methods
+        .iter()
+        .position(|method| method.name.as_ref() == "getName")
+        .unwrap();
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    let Knowledge::Found(old_class) = read.compiled_class(&owner).unwrap() else {
+        panic!("class")
+    };
+    let old_method = read.compiled_methods(&old_class).unwrap()[getter].clone();
+    assert!(read.admit_java_method(&old_method).unwrap().is_found());
+    let old_pending = read.finish();
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert_eq!(
+        read.compiled_methods(&old_class).err(),
+        Some(ContractError::ForeignIdentity)
+    );
+    assert_eq!(
+        read.admit_java_method(&old_method),
+        Err(ContractError::ForeignIdentity)
+    );
+    let Knowledge::Found(current) = read.compiled_class(&owner).unwrap() else {
+        panic!("current class")
+    };
+    let current_method = read.compiled_methods(&current).unwrap()[getter].clone();
+    assert!(read.admit_java_method(&current_method).unwrap().is_found());
+    let current_pending = read.finish();
+    assert_eq!(store.commit(old_pending), Err(ContractError::Stale));
+    store.commit(current_pending).unwrap();
+    assert_eq!(
+        compiled_host_published_members(&mut index, &store, COMPILED_HOST_A).len(),
+        1
+    );
+}
+
+#[test]
+fn compiled_host_revisions_source_model_and_clear_retract_sets_and_pending_but_noop_is_current() {
+    for change in ["class", "source", "model", "clear"] {
+        let (mut index, mut store, class) = compiled_host_fixture();
+        let owner = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
+        let other = compiled_host_type(&index, &mut store, COMPILED_HOST_B);
+        store
+            .replace_compiled_input(&index, &owner, Some(class.clone()))
+            .unwrap();
+        let getter = class
+            .methods
+            .iter()
+            .position(|method| method.name.as_ref() == "getName")
+            .unwrap();
+        let mut read = store
+            .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_B)
+            .unwrap();
+        assert!(matches!(
+            read.compiled_class(&other).unwrap(),
+            Knowledge::Unknown(_)
+        ));
+        let independent = read.finish();
+        store.commit(independent).unwrap();
+        let first = compiled_host_getter_pending(&index, &mut store, COMPILED_HOST_A, getter);
+        store.commit(first).unwrap();
+        assert_eq!(
+            compiled_host_published_members(&mut index, &store, COMPILED_HOST_A).len(),
+            1
+        );
+        assert!(index.may_have_compiled_callables());
+        assert!(index
+            .scoped_for_file(COMPILED_HOST_A)
+            .may_have_compiled_callables());
+        let published_snapshot = index.inference_snapshot();
+        let noop = compiled_host_getter_pending(&index, &mut store, COMPILED_HOST_A, getter);
+        // Equal facts from a separate decode are a no-op, not an artificial new revision.
+        let equal = Arc::new(ktcore::classfile::decode("app-a", COMPILED_HOST_BYTES).unwrap());
+        store
+            .replace_compiled_input(&index, &owner, Some(equal))
+            .unwrap();
+        store.commit(noop).unwrap();
+        let old = compiled_host_getter_pending(&index, &mut store, COMPILED_HOST_A, getter);
+        let published_before = store.publication_revision();
+        match change {
+            "class" => {
+                // A valid changed SourceFile hint changes the decoded content SHA. This is an
+                // input-revision control, not evidence of a successful compilation of new text.
+                let mut bytes = COMPILED_HOST_BYTES.to_vec();
+                let hint = bytes
+                    .windows(b"Person.java".len())
+                    .position(|part| part == b"Person.java")
+                    .unwrap();
+                bytes[hint] = b'Q';
+                let changed = Arc::new(ktcore::classfile::decode("app-a", &bytes).unwrap());
+                assert_ne!(changed.identity.input, class.identity.input);
+                store
+                    .replace_compiled_input(&index, &owner, Some(changed))
+                    .unwrap();
+            }
+            "source" => store
+                .replace_source(
+                    &index,
+                    COMPILED_HOST_A,
+                    Arc::from(format!("{COMPILED_HOST_SOURCE}\n// unsaved change\n")),
+                    Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),
+                    Vec::new(),
+                )
+                .unwrap(),
+            "model" => store.invalidate_model(),
+            "clear" => store.clear_compiled_inputs(),
+            _ => unreachable!(),
+        }
+        assert!(
+            store
+                .contributions(COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+                .is_none(),
+            "{change}"
+        );
+        assert!(store.publication_revision() > published_before, "{change}");
+        assert_eq!(store.commit(old), Err(ContractError::Stale), "{change}");
+        if change != "model" {
+            assert!(
+                store
+                    .contributions(COMPILED_HOST_PROVIDER, COMPILED_HOST_B)
+                    .is_some(),
+                "unread module remains current: {change}"
+            );
+        }
+        if matches!(change, "source" | "model") {
+            assert_eq!(
+                store.replace_compiled_input(&index, &owner, Some(class.clone())),
+                Err(ContractError::Stale),
+                "{change}"
+            );
+        }
+        assert!(compiled_host_published_members(&mut index, &store, COMPILED_HOST_A).is_empty());
+        assert!(!index.may_have_compiled_callables(), "retracted: {change}");
+        assert!(
+            published_snapshot.may_have_compiled_callables(),
+            "immutable snapshot: {change}"
+        );
+        if change == "class" {
+            let current = compiled_host_getter_pending(&index, &mut store, COMPILED_HOST_A, getter);
+            store.commit(current).unwrap();
+            let members = compiled_host_published_members(&mut index, &store, COMPILED_HOST_A);
+            assert_eq!(members.len(), 1);
+            assert_ne!(members[0].class.input, class.identity.input);
+        } else {
+            let fresh_owner = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
+            let mut read = store
+                .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+                .unwrap();
+            assert!(
+                matches!(
+                    read.compiled_class(&fresh_owner).unwrap(),
+                    Knowledge::Unknown(_)
+                ),
+                "{change}"
+            );
+            drop(read);
+            assert!(
+                compiled_host_published_members(&mut index, &store, COMPILED_HOST_A).is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn compiled_host_unsupported_shape_is_unknown_and_does_not_certify_source_or_invent_definitions() {
+    let (mut index, mut store, class) = compiled_host_fixture();
+    let owner = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
+    store
+        .replace_compiled_input(&index, &owner, Some(class.clone()))
+        .unwrap();
+    let getter = class
+        .methods
+        .iter()
+        .position(|method| method.name.as_ref() == "getName")
+        .unwrap();
+    let constructor = class
+        .methods
+        .iter()
+        .position(|method| method.name.as_ref() == "<init>")
+        .unwrap();
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    let Knowledge::Found(handle) = read.compiled_class(&owner).unwrap() else {
+        panic!("actual decoded class")
+    };
+    let handles = read.compiled_methods(&handle).unwrap();
+    assert_eq!(
+        read.admit_java_method(&handles[constructor]).unwrap(),
+        Knowledge::Unknown(vec![IncompleteReason::UnsupportedSource])
+    );
+    assert!(read.admit_java_method(&handles[getter]).unwrap().is_found());
+    assert!(
+        matches!(
+            read.declared_members(&owner).unwrap().1,
+            Knowledge::Unknown(_)
+        ),
+        "positive binary method is not source completeness"
+    );
+    let accepted = read.finish();
+    store.commit(accepted).unwrap();
+    assert_eq!(
+        compiled_host_published_members(&mut index, &store, COMPILED_HOST_A).len(),
+        1
+    );
+
+    // Explicit normalized-metadata fault injection tests the admission gate only. These cloned
+    // negative facts are not passed off as independently decoded or freshly compiled outputs.
+    for shape in [
+        "nonpublic-class",
+        "generic-class",
+        "static",
+        "synthetic",
+        "generic-method",
+        "descriptor",
+    ] {
+        let mut unsupported = (*class).clone();
+        match shape {
+            "nonpublic-class" => unsupported.access_flags &= !0x0001,
+            "generic-class" => {
+                unsupported.signature = Some(Arc::from("<T:Ljava/lang/Object;>Ljava/lang/Object;"))
+            }
+            "static" => unsupported.methods[getter].access_flags |= 0x0008,
+            "synthetic" => unsupported.methods[getter].access_flags |= 0x1000,
+            "generic-method" => {
+                unsupported.methods[getter].signature = Some(Arc::from("()Ljava/lang/String;"))
+            }
+            "descriptor" => unsupported.methods[getter].descriptor = Arc::from("()I"),
+            _ => unreachable!(),
+        }
+        store
+            .replace_compiled_input(&index, &owner, Some(Arc::new(unsupported)))
+            .unwrap();
+        let mut read = store
+            .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+            .unwrap();
+        let Knowledge::Found(handle) = read.compiled_class(&owner).unwrap() else {
+            panic!("host attached metadata")
+        };
+        let method = read.compiled_methods(&handle).unwrap()[getter].clone();
+        assert_eq!(
+            read.admit_java_method(&method).unwrap(),
+            Knowledge::Unknown(vec![IncompleteReason::UnsupportedSource]),
+            "{shape}"
+        );
+        let pending = read.finish();
+        store.commit(pending).unwrap();
+        assert!(
+            compiled_host_published_members(&mut index, &store, COMPILED_HOST_A).is_empty(),
+            "{shape}"
+        );
+    }
 }
