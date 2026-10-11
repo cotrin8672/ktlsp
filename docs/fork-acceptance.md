@@ -20,9 +20,19 @@ from acceptance probes, plus five additional distinct Java/Kotlin projects. Smal
 generated fixtures supplement that corpus; they do not replace it.
 
 Overall percentage estimates are withdrawn: implementation and acceptance were mixed
-in the earlier estimate. **0/6 projects currently satisfy every final acceptance gate.**
-Report repaired cases and remaining gates separately; passing a focused fixture does
-not complete a project.
+in the earlier estimate. Report verified behavior and remaining cases per project.
+Do not infer a project's analysis failure from a run timeout, unavailable source
+archive or cleanup failure, or collapse those observations into a "0/6" score.
+Focused fixtures also do not establish whole-project IDEA parity.
+
+Acceptance concerns useful and correct analysis during editing: unfinished code,
+unsaved Java/Kotlin changes, dependency/build updates, compiler plugins and consistent
+extension facts. Compare responsiveness and memory with IDEA under the same host,
+project state and cache conditions. A deadline bounds an experiment; if it prevents
+requests from running, those requests are unmeasured. Investigate a repeatable server
+stall as a product issue separately. A missing source archive fails a navigation case
+only when that case requires its source and cannot resolve correctly. Historical
+harness exit codes below include broader operational checks and are not analysis scores.
 
 ## Initial environment
 
@@ -62,7 +72,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current path-cache saved Java/Lombok probe retains 99/99: first getter/typed chain, four observed native builds, config/dirty retraction. Earlier KAPT/KSP 102/114 retains twelve stale/removed diagnostics; original mixed twelve editing cases remain OPEN | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/compiled-java-results.json`; compilerClosureComplete=false throughout. Source-less navigation stays unavailable; no producer-absence guard is relaxed |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
-| Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Earlier paired Gradle RSS approximately 3.19 to 2.66 GiB (n=2/arm); isolated snapshot allocation -82.2%. Current instrumented Java path API requests 23,427,148 to 0 allocation bytes per 32-event batch (n=30), with 6,177 additional retained requested bytes | Narrow resource improvements measured; six-project latency/RSS acceptance pending | `ktlsp-receiver-storage-pair-20261011/`, `ktlsp-index-snapshot-cow-measurement-20261011/` and current checkpoint 28. Local API allocation/timing is not whole-server RSS or useful-result RPC/UI latency; broad cold/warm samples remain |
+| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA under matched conditions | Earlier paired Gradle RSS approximately 3.19 to 2.66 GiB (n=2/arm); isolated snapshot allocation -82.2%. Current instrumented Java path API requests 23,427,148 to 0 allocation bytes per 32-event batch (n=30), with 6,177 additional retained requested bytes | Narrow resource improvements measured; six-project comparison pending | `ktlsp-receiver-storage-pair-20261011/`, `ktlsp-index-snapshot-cow-measurement-20261011/` and current checkpoint 28. Local API allocation/timing is not whole-server RSS or useful-result RPC/UI latency; broad cold/warm samples remain |
 
 ## Actual KAPT/KSP compile and runtime controls
 
@@ -320,7 +330,9 @@ substitute for these checks.
 
 Before claiming speed, collect a native-host baseline and retain each sample alongside
 its semantic assertion. The following initial targets express the desired editor UX;
-they are **unverified targets**, not measured results or a claim of IDEA parity:
+they are **provisional engineering targets**, not universal pass/fail thresholds,
+measured results or a claim of IDEA parity. Record host load and cache conditions;
+use matched comparisons to distinguish implementation cost from environmental delay:
 
 - Warm completion protocol latency: p95 <= 100 ms, at least 30 valid samples per
   project and request class.
@@ -335,15 +347,12 @@ they are **unverified targets**, not measured results or a claim of IDEA parity:
 - Report steady-state working set/RSS and peak memory separately; set a concrete
   memory budget after baseline project sizes and host capacity are recorded.
 
-After the native 64 GiB host baseline and the selected Gradle scope of about
-1.25 million symbols, use these initial resource targets for subsequent
-acceptance runs: server steady RSS <= 3 GiB and lifetime peak commit <= 4 GiB per
-corpus root; native Neovim lifetime peak commit <= 128 MiB, including watch
-registration; normal shutdown <= 2 s after the null acknowledgement and exit
-notification. These are UX targets, separate from the larger abort guards below.
-They are recorded after the fourteenth descriptive comparison and do not turn
-that comparison into an accepted memory or shutdown result. Missing semantics,
-incomplete indexing or a forced exit still fail acceptance.
+The earlier steady-RSS/peak-commit/client-memory limits (3 GiB/4 GiB/128 MiB) and
+two-second shutdown target were agent-selected investigation targets. They are
+withdrawn as acceptance gates. Continue measuring actual memory and investigating
+excessive allocation, watch scaling and reproducible stalls. Report cleanup outcomes
+separately; they neither invalidate a completed semantic assertion nor prove that
+an unexecuted assertion works. Host resource abort guards remain execution safeguards.
 
 An isolated Gradle follow-up exposed a client-memory scaling failure: 8,796 watch
 patterns took about 88 seconds to register, with Neovim lifetime peak commit
@@ -1972,8 +1981,10 @@ Evidence base: `C:/Users/gummy/AppData/Local/Temp/ktlsp-spring-this-20261011-1/`
 `spring-{before,after}-2-editor/` and `semantic-summary.json`. Initial full-root data
 preflight failures are preserved as `spring-{before,after}`; no LSP query ran there.
 Current immutable server SHA-256: `74a3059b1cf19cafd6828927fc5016c4d1906493020798da3e65803649cef476`.
-Next reproduce/fix real-project shutdown and watch supersession; keep source coverage,
-compiler-plugin editing, IDEA comparison and measured six-project latency/RSS open.
+The subsequent user correction withdraws timeout/source-availability gates as described
+in Scope and Measurement policy. Next address reproduced editing/analysis gaps and
+complete matched IDEA comparisons. Shutdown and watch supersession remain investigation
+notes; the current Spring semantic queries pass, while broader cases are unverified.
 
 ### Current slice: requires-only compatibility artifacts
 
