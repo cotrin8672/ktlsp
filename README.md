@@ -314,7 +314,8 @@ rtk proxy bash -o igncr dev/ktlsp-harness.sh corpus \
   --release --no-build --bin "$accepted_ktlsp" --run-dir "$fixture_parent/run"
 ```
 
-The saved Java-only regression passes 99 checks in checkpoint 27. It requires a real
+The saved Java-only regression passes 99 checks in checkpoints 27 and 28, including
+the compiler-path preparation change. It requires a real
 selected `:compileJava` execution before the first generated
 `getName` completion, then checks String inference, configuration changes, dirty-buffer
 retraction and fresh rebuilds. Source-less navigation and rename remain unavailable;

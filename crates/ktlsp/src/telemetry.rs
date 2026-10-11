@@ -49,16 +49,18 @@ pub fn now_ms() -> u128 {
 
 /// Resolve the telemetry destination, or `None` when telemetry should be skipped.
 pub fn log_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KTLSP_COMPILE_LOG") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Some(path) = explicit_log_path(std::env::var("KTLSP_COMPILE_LOG").ok()) {
+        return Some(path);
     }
     default_log_path(
         std::env::var_os(crate::deps::CACHE_DIR_ENV),
         crate::paths::user_home().map(PathBuf::into_os_string),
         "compile-timing.jsonl",
     )
+}
+
+fn explicit_log_path(value: Option<String>) -> Option<PathBuf> {
+    value.filter(|path| !path.is_empty()).map(PathBuf::from)
 }
 
 fn default_log_path(
@@ -116,18 +118,13 @@ mod tests {
     }
 
     #[test]
-    fn log_path_prefers_env() {
-        // SAFETY: single-threaded test; restores the var.
-        let prev = std::env::var("KTLSP_COMPILE_LOG").ok();
-        std::env::set_var("KTLSP_COMPILE_LOG", "/tmp/ktlsp-test-telemetry.jsonl");
+    fn explicit_log_path_accepts_nonempty_override() {
+        assert_eq!(explicit_log_path(None), None);
+        assert_eq!(explicit_log_path(Some(String::new())), None);
         assert_eq!(
-            log_path(),
+            explicit_log_path(Some("/tmp/ktlsp-test-telemetry.jsonl".into())),
             Some(PathBuf::from("/tmp/ktlsp-test-telemetry.jsonl"))
         );
-        match prev {
-            Some(v) => std::env::set_var("KTLSP_COMPILE_LOG", v),
-            None => std::env::remove_var("KTLSP_COMPILE_LOG"),
-        }
     }
 
     #[test]

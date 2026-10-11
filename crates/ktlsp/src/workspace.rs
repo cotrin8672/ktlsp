@@ -4365,7 +4365,7 @@ impl Workspace {
                 .map_err(|_| "clock-unknown")?
                 .as_nanos()
         );
-        let request = Arc::new(crate::compile::ObservedCompileRequest {
+        let mut request = crate::compile::ObservedCompileRequest {
             root: root.to_path_buf(),
             project_dir: module.project_dir.clone(),
             scope,
@@ -4392,10 +4392,12 @@ impl Workspace {
             nonce,
             invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
+            prepared_paths: None,
+        };
         request
-            .validate_roles()
+            .prepare_paths()
             .map_err(|_| "compiler-input-output-overlap-or-unknown")?;
+        let request = Arc::new(request);
         self.observed_compile = Some(ObservedCompileTicket {
             request: request.clone(),
             model: model.clone(),
@@ -4896,6 +4898,40 @@ mod observed_compile_lifecycle_tests {
             class: Arc::new(ktcore::classfile::decode("lifecycle-owner", CLASS).unwrap()),
         };
         (ws, request, key, owner)
+    }
+
+    #[test]
+    fn prepared_paths_still_retract_the_actual_admitted_getter_on_config_aba() {
+        const CLASS: &[u8] =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let (mut ws, mut request, key, owner) = getter_owner_fixture();
+        Arc::get_mut(&mut request).unwrap().prepare_paths().unwrap();
+        let receipt = crate::compile::observed_test_receipt_with_source(
+            request.clone(),
+            &key,
+            &owner.text,
+            &owner.class_file,
+            CLASS,
+        );
+        ws.analysis_extensions
+            .accept_compiled(&ws.index, receipt, vec![owner])
+            .unwrap();
+        ws.bump_index_revision();
+        let count = |ws: &Workspace| {
+            ktcore::jvm::member_candidates(
+                &ws.index.scoped_for_file(&key),
+                &ktcore::types::Type::class("Person", Some("pluginfixture".into())),
+                "getName",
+            )
+            .len()
+        };
+        assert_eq!(count(&ws), 1);
+        let config = crate::paths::file_key(&request.root.join("gradle.properties"));
+        assert!(!ws.observe_compiled_resource(&config));
+        assert!(!ws.observe_compiled_resource(&config));
+        assert!(request.invalid.load(Ordering::Acquire));
+        assert!(ws.analysis_extensions.compiled_receipt().is_none());
+        assert_eq!(count(&ws), 0);
     }
 
     fn admitted_getter_fixture() -> (

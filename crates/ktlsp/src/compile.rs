@@ -1431,6 +1431,12 @@ pub(crate) struct CompileOwner {
     pub origin_id: String,
 }
 
+pub(crate) struct PreparedCompilePaths {
+    output_roots: Vec<String>,
+    watch_paths: Vec<String>,
+    environment_sha256: String,
+}
+
 pub(crate) struct ObservedCompileRequest {
     pub root: PathBuf,
     pub project_dir: PathBuf,
@@ -1446,6 +1452,7 @@ pub(crate) struct ObservedCompileRequest {
     pub nonce: String,
     pub invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub prepared_paths: Option<PreparedCompilePaths>,
 }
 
 pub(crate) struct CompiledOwnerInput {
@@ -1489,13 +1496,62 @@ impl ObservedCompileRequest {
     }
 
     pub fn is_known_output(&self, key: &str) -> bool {
-        // Only role-checked outputs can be deferred. Inputs remain inputs inside build/.
-        self.validate_roles().is_ok()
-            && self
-                .compiler_tasks
-                .iter()
-                .flat_map(|task| &task.declared_output_roots)
-                .any(|root| path_under(key, &crate::paths::file_key(root)))
+        self.checked_output_roots()
+            .iter()
+            .any(|root| path_under(key, root))
+    }
+
+    fn checked_output_roots(&self) -> std::borrow::Cow<'_, [String]> {
+        if let Some(paths) = &self.prepared_paths {
+            return std::borrow::Cow::Borrowed(&paths.output_roots);
+        }
+        // Unpublished/test requests still require current role validation before deferral.
+        std::borrow::Cow::Owned(if self.validate_roles().is_ok() {
+            self.output_roots()
+        } else {
+            Vec::new()
+        })
+    }
+
+    fn output_roots(&self) -> Vec<String> {
+        self.compiler_tasks
+            .iter()
+            .flat_map(|task| &task.declared_output_roots)
+            .map(|root| crate::paths::file_key(root))
+            .collect()
+    }
+
+    pub fn prepare_paths(&mut self) -> anyhow::Result<()> {
+        // Seal the input plan while exclusively owned, before publishing the request Arc.
+        self.prepared_paths = None;
+        self.check_live()?;
+        self.validate_roles()?;
+        let environment_sha256 = environment_hash();
+        let output_roots = self.output_roots();
+        let watch_paths = self.watch_paths_with_outputs(&output_roots);
+        anyhow::ensure!(
+            environment_sha256 == environment_hash(),
+            "compiler environment changed while preparing paths"
+        );
+        self.check_live()?;
+        self.prepared_paths = Some(PreparedCompilePaths {
+            output_roots,
+            watch_paths,
+            environment_sha256,
+        });
+        Ok(())
+    }
+
+    fn verify_prepared_environment(&self, current: &str) -> anyhow::Result<()> {
+        let paths = self
+            .prepared_paths
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("compiler input paths were not prepared"))?;
+        anyhow::ensure!(
+            paths.environment_sha256 == current,
+            "compiler environment changed after path preparation"
+        );
+        Ok(())
     }
 
     pub fn validate_roles(&self) -> anyhow::Result<()> {
@@ -1642,10 +1698,15 @@ impl ObservedCompileRequest {
     }
 
     fn planned_reads(&self) -> Vec<PathBuf> {
+        self.planned_reads_with_outputs(&self.checked_output_roots())
+    }
+
+    fn planned_reads_with_outputs(&self, outputs: &[String]) -> Vec<PathBuf> {
+        let is_output = |key: &str| outputs.iter().any(|root| path_under(key, root));
         let mut paths: std::collections::BTreeSet<_> = self
             .source_roots
             .iter()
-            .filter(|root| !self.is_known_output(root))
+            .filter(|root| !is_output(root))
             .map(PathBuf::from)
             .collect();
         for directory in [&self.root, &self.project_dir] {
@@ -1679,7 +1740,7 @@ impl ObservedCompileRequest {
             paths.extend(task.annotation_processor_path.iter().cloned());
             for input in &task.declared_input_files {
                 let key = crate::paths::file_key(input);
-                if !self.is_known_output(&key) {
+                if !is_output(&key) {
                     paths.insert(input.clone());
                 }
             }
@@ -1702,7 +1763,7 @@ impl ObservedCompileRequest {
             }
         }
         for entry in &self.classpath {
-            if !self.is_known_output(entry) {
+            if !is_output(entry) {
                 paths.insert(PathBuf::from(entry));
             }
         }
@@ -1716,9 +1777,16 @@ impl ObservedCompileRequest {
         paths.into_iter().collect()
     }
 
-    pub fn initial_watch_paths(&self) -> Vec<String> {
+    pub fn initial_watch_paths(&self) -> std::borrow::Cow<'_, [String]> {
+        if let Some(paths) = &self.prepared_paths {
+            return std::borrow::Cow::Borrowed(&paths.watch_paths);
+        }
+        std::borrow::Cow::Owned(self.watch_paths_with_outputs(&self.checked_output_roots()))
+    }
+
+    fn watch_paths_with_outputs(&self, outputs: &[String]) -> Vec<String> {
         let mut paths: Vec<_> = self
-            .planned_reads()
+            .planned_reads_with_outputs(outputs)
             .iter()
             .map(|p| crate::paths::file_key(p))
             .collect();
@@ -1871,7 +1939,7 @@ impl SuccessfulCompileReceipt {
     }
 
     pub fn watch_paths(&self) -> Vec<String> {
-        let mut paths = self.request.initial_watch_paths();
+        let mut paths = self.request.initial_watch_paths().into_owned();
         paths.extend(self.inputs.iter().chain(&self.outputs).filter_map(|value| {
             value
                 .get("path")
@@ -1894,6 +1962,7 @@ pub(crate) fn run_observed_compile(
         use std::sync::Arc;
         request.check_live()?;
         request.validate_roles()?;
+        request.verify_prepared_environment(&environment_hash())?;
         // shortcut: native tree completion is verified on Windows; admit other hosts after equivalent native tests.
         anyhow::ensure!(
             cfg!(windows),
@@ -1927,6 +1996,7 @@ pub(crate) fn run_observed_compile(
             before.push(record);
         }
         let environment_sha256 = environment_hash();
+        request.verify_prepared_environment(&environment_sha256)?;
         let extra = vec![
             "--rerun-tasks".to_string(),
             "--no-build-cache".into(),
@@ -2477,6 +2547,7 @@ pub(crate) fn observed_test_request(root: &Path) -> std::sync::Arc<ObservedCompi
         nonce: "lifecycle-fixture-only".into(),
         invalid: Arc::new(AtomicBool::new(false)),
         cancelled: Arc::new(AtomicBool::new(false)),
+        prepared_paths: None,
     })
 }
 
@@ -2879,5 +2950,104 @@ mod compiled_output_binding_tests {
                 .is_ok(),
             "identical stamp duplicates"
         );
+    }
+}
+
+#[cfg(test)]
+mod observed_path_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn prepared_paths_preserve_input_and_output_boundaries() {
+        let root = std::env::temp_dir().join("ktlsp-prepared-path-boundaries");
+        let mut owned = observed_test_request(&root);
+        let request = Arc::get_mut(&mut owned).unwrap();
+        let ap = root.join("ap/processor.jar");
+        let plugin = root.join("plugins/compiler.jar");
+        let external = root.join("dependencies/api.jar");
+        let options = root.join("ap/options.json");
+        request.task.annotation_processor_path.push(ap.clone());
+        request
+            .task
+            .arguments
+            .push(format!("-Xplugin={}", plugin.display()));
+        request.task.declared_input_files.push(options.clone());
+        request.task.java_home = Some(root.join("jdk"));
+        request.compiler_tasks[0] = request.task.clone();
+        request.classpath.push(crate::paths::file_key(&external));
+        let unprepared = request.initial_watch_paths().into_owned();
+        request.prepare_paths().unwrap();
+        let first = request.initial_watch_paths();
+        assert_eq!(first.as_ref(), unprepared.as_slice());
+        for input in [
+            root.join("src/Person.java"),
+            root.join("gradle.properties"),
+            root.join("jdk/lib/modules"),
+            ap,
+            plugin,
+            external,
+            options,
+        ] {
+            let key = crate::paths::file_key(&input);
+            assert!(request.observes_path(&key), "{key}");
+            assert!(!request.is_known_output(&key), "{key}");
+        }
+        let output = &request.task.declared_output_roots[0];
+        assert!(request.is_known_output(&crate::paths::file_key(&output.join("Person.class"))));
+        assert!(
+            !request.is_known_output(&crate::paths::file_key(&output.with_extension("sibling")))
+        );
+        assert!(!request.observes_path(&crate::paths::file_key(
+            &root.join("unplanned/options.json")
+        )));
+    }
+
+    #[test]
+    fn overlapping_read_cannot_prepare_output_deferral_or_reuse_an_old_plan() {
+        let root = std::env::temp_dir().join("ktlsp-prepared-path-overlap");
+        let mut owned = observed_test_request(&root);
+        let request = Arc::get_mut(&mut owned).unwrap();
+        request.prepare_paths().unwrap();
+        let output = request.task.declared_output_roots[0].join("processor.jar");
+        request.task.annotation_processor_path.push(output.clone());
+        request.compiler_tasks[0] = request.task.clone();
+        assert!(request.prepare_paths().is_err());
+        assert!(request.prepared_paths.is_none());
+        assert!(!request.is_known_output(&crate::paths::file_key(&output)));
+    }
+
+    #[test]
+    fn prepared_paths_do_not_turn_negative_parent_guards_into_read_coverage() {
+        let root = std::env::temp_dir().join("ktlsp-prepared-negative-coverage");
+        let mut owned = observed_test_request(&root);
+        let request = Arc::get_mut(&mut owned).unwrap();
+        request.prepare_paths().unwrap();
+        let plan = crate::compiled_watch::WatchPlan::build(request, &request.initial_watch_paths())
+            .unwrap();
+        let known = serde_json::json!({
+            "path":crate::paths::file_key(&root.join("gradle.properties")), "kind":"absent"
+        });
+        let unprotected = serde_json::json!({
+            "path":crate::paths::file_key(&root.parent().unwrap().join("unplanned-source-parent/lombok.config")),
+            "kind":"absent"
+        });
+        for field in OBSERVED_INPUT_FIELDS {
+            let mut inputs = serde_json::json!({});
+            for other in OBSERVED_INPUT_FIELDS {
+                inputs[other] = serde_json::json!([]);
+            }
+            inputs[field] = serde_json::json!([known.clone()]);
+            assert!(validate_prearmed_inputs(&plan, &inputs).is_ok(), "{field}");
+            inputs[field] = serde_json::json!([unprotected.clone()]);
+            assert!(validate_prearmed_inputs(&plan, &inputs).is_err(), "{field}");
+        }
+        assert!(ensure_prearmed_read(&plan, &unprotected).is_err());
+        assert!(request
+            .verify_prepared_environment(&environment_hash())
+            .is_ok());
+        assert!(request
+            .verify_prepared_environment("different-environment")
+            .is_err());
     }
 }

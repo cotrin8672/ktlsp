@@ -41,8 +41,8 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Full-4 passes 1,162 / 0 failed / 4 ignored across 40 suites; tests/release native 0 and all 363 inputs unchanged | Current Rust, formatting and release verified | `ktlsp-compiler-producer-20261011/product-1/full-4/result.json`; later fixture-only lombok.config entry is recorded separately in the native binding |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Full-2 basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Full-4 saved Java observed-build probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-compiler-java-clean-binding-20261011-3-selected-roots/editor-root-1/artifacts/`. New narrow probe shuts down cleanly in 0.8926658s (n=1); older larger shutdown gaps and actual server/client RSS remain unmeasured/unresolved |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Path-cache full-2 passes 1,166 / 0 failed / 4 ignored across 40 suites; tests/release native 0 and all 363 inputs unchanged | Current Rust, formatting and release verified | `ktlsp-path-cache-slice-20261011-1/full-2/result.json`; four new boundary/retraction regressions pass |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Earlier ordinary editor: basic 9/9, features 78/80, library 13/13, Java 191/196, semantic 23/23. Current path-cache saved Java probe passes 99/99 | Partial; same two features/five Java completeness-policy failures remain | `ktlsp-compiler-producer-full2-smokes-20261011` and `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/`. Current narrow probe shuts down cleanly in 0.7201557s (n=1); actual server/client RSS remains unmeasured |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -54,10 +54,10 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Tenth-fixed-2 applies the complete six-site override family, preserves all five expected buffers and passes actual Java/Kotlin compilation plus 33 bytecode assertions. JVM facade exported-alias/authored renames and external consumer applied renames also pass | Focused fixtures verified; wider corpus and inherited implementation edge pending | `ktlsp-goal-20261010/tenth2-java-rename-compiler-1/`, `retrofit-jvm-editor/portable-release-tenth2-1/artifacts/` and `ktlsp-shadow-tenth-fixed-2-20261011/editor/`. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Seventh native automatic watching passes 74/76: four actual builds, dependency/generated-source additions, updates, removals, exact targets, preserved dirty buffers and clean shutdown. Three native notification batches and zero explicit notifications. Two stale-member diagnostics remain failing | Partial; automatic refresh verified, diagnostics failing | `ktlsp-gradle-model-20261010/seventh-refresh-automatic/artifacts/`. Unchanged 76 expectations and hashes. Sixth manual 70/72 and automatic 29/76 remain preserved; external Windows Neovim watch roots still need coverage |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Full-4 saved Java/Lombok observed compilation passes 99/99: initial getter/typed chain, four real native builds, config/dirty retraction. Earlier KAPT/KSP 102/114 retains twelve stale/removed diagnostics; original mixed twelve transformed-API editing cases remain OPEN | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | `ktlsp-compiler-java-clean-binding-20261011-3-selected-roots/editor-root-1/artifacts/compiled-java-results.json`; compilerClosureComplete=false throughout. Source-less navigation stays unavailable; no producer-absence guard is relaxed |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current path-cache saved Java/Lombok probe retains 99/99: first getter/typed chain, four observed native builds, config/dirty retraction. Earlier KAPT/KSP 102/114 retains twelve stale/removed diagnostics; original mixed twelve editing cases remain OPEN | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/compiled-java-results.json`; compilerClosureComplete=false throughout. Source-less navigation stays unavailable; no producer-absence guard is relaxed |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
-| Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Matched thirteenth/fourteenth large-Gradle RSS falls from approximately 3.19 to 2.66 GiB, with two samples per arm. Seventeenth reduces isolated snapshot allocation by 82.2%; its semantic editor passes 23 checks but shutdown takes approximately 4.4 seconds against a two-second target | Resource improvements measured; six-project acceptance pending | `ktlsp-receiver-storage-pair-20261011/`, `ktlsp-index-snapshot-cow-measurement-20261011/` and `ktlsp-semantic-seventeenth-replay-20261011/receipt.json`. Current release needs useful-result p50/p95 and cold/warm RSS samples |
+| Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Earlier paired Gradle RSS approximately 3.19 to 2.66 GiB (n=2/arm); isolated snapshot allocation -82.2%. Current instrumented Java path API requests 23,427,148 to 0 allocation bytes per 32-event batch (n=30), with 6,177 additional retained requested bytes | Narrow resource improvements measured; six-project latency/RSS acceptance pending | `ktlsp-receiver-storage-pair-20261011/`, `ktlsp-index-snapshot-cow-measurement-20261011/` and current checkpoint 28. Local API allocation/timing is not whole-server RSS or useful-result RPC/UI latency; broad cold/warm samples remain |
 
 ## Actual KAPT/KSP compile and runtime controls
 
@@ -1835,9 +1835,102 @@ Useful generated completion after unsaved edits, the original mixed twelve cases
 six-project IDEA parity and latency/RSS acceptance remain OPEN. Production Mixin
 support belongs in a separate project; extension loading/ABI remains OPEN.
 
-Next, review and measure the source-only request-path reuse proposal in
-`ktlsp-observed-compile-path-cache-proposal-20261011`. It is unapplied and untested;
-repeated path/role reconstruction is a source-level cost finding, not a measured speedup.
+The then-unapplied request-path reuse proposal is implemented and measured in
+checkpoint 28 below. Earlier source-only observations are not performance evidence.
+
+### Twenty-eighth checkpoint: prepare immutable compiler paths once
+
+Compiler resource checks rebuilt watch paths and repeatedly validated the whole
+input/output role set. Requests now prepare normalized output/watch keys while
+exclusively owned, before Arc publication. Notifications borrow that immutable plan.
+Native compilation still freshly validates roles and checks the prepared environment
+before and after its input inventory. Read coverage, negative guards, post-build
+hashes, dirty-source rejection and final publication checks remain in place.
+
+Four new regressions cover source/config/toolchain/processor/plugin/classpath
+boundaries, failed preparation clearing an old plan, all nine prearmed input roles,
+and retraction of an actual admitted getter after configuration A-to-B-to-A.
+The telemetry test now checks its explicit-path helper without changing process-wide
+environment variables. The former test could race environment hashing in parallel
+tests; this is a source-level race finding, not a reproduced product failure.
+
+The first full run fails one new getter regression: the test omitted the existing
+publication step after queuing compiled facts. Only the test adds
+`bump_index_revision()`; its useful-getter 1-to-0 expectation is unchanged.
+`full-1` and `test-publication-correction.json` preserve that failure.
+Fresh `full-2` passes 1,166 tests, zero failed and four ignored across 40 suites.
+Formatting and locked/offline release builds pass; all 363 product inputs match
+before/after tests and release. Evidence root:
+`ktlsp-path-cache-slice-20261011-1/`.
+
+The allocation experiment is a Temp-only ignored release test, not a new product
+benchmark framework. Both arms use identical instrumentation apart from the setup
+hook and frozen path/event expectations. Timing and allocation passes are separate;
+each completed row has 30 timing batches and 30 allocation batches, 32 events each.
+
+| Request shape | Before | Prepared paths | Status |
+| --- | --- | --- | --- |
+| Actual exported Java task, 40 watch keys | 23,427,148 requested allocation bytes/batch; p50/p95 33.8522/36.7479 ms | 0 requested bytes/batch; p50/p95 0.0031/0.0032 ms | Paired instrumented local API result |
+| CEM-sized synthetic CP101, 142 keys | Watch keys/events match; timing-loop deadline fails before a completed row | 0 requested bytes/batch; p50/p95 0.01655/0.021 ms | Candidate only; no paired timing claim |
+| Gradle-sized synthetic CP212, 255 keys | NOT_RUN after CEM failure | 0 requested bytes/batch; p50/p95 0.0115/0.0189 ms | Candidate only |
+
+Java retained requested bytes rise from 8,286 to 14,463 (+6,177), including 6,105
+cache bytes and 72 request-storage bytes. Candidate CEM/Gradle cache setup retains
+26,355/49,711 requested bytes; those shapes have no completed baseline allocation
+row. Every completed row frees its tracked allocations after drop. These counters
+measure System allocator requested bytes, not allocator overhead or OS RSS.
+Peaks reset per phase; constructor/setup/first-call measurements are n=1.
+
+The baseline v1/v2 native-101 failures remain immutable. V2 exports the completed
+Java row before CEM exceeds a 120-second iteration assertion; its native test
+takes 139.87 seconds, so this is not a hard process timeout. Candidate v2 completes
+all three shapes. The allocator TLS check remains installed during timed passes,
+and execution order is fixed baseline then candidate. This is not uninstrumented
+product, Workspace/latch, watcher delivery, inference, RPC, UI or compilation timing.
+CEM/Gradle requests are structural model-derived fixtures, not real-project runs.
+
+Measurement evidence is `measurement-1/{baseline-v2.out,candidate-v2-results.json,root-measurement-audit-2.json}`.
+Candidate results SHA-256:
+`04fa977fd2185b46e0f44bc1c0bb425f1bc807827f020a5189b2f098d48254be`.
+The independent audit passes 70 checks and preserves 387 frozen input hashes:
+`ktlsp-path-cache-measurement-review-20261011-1/audit-receipt.json`,
+SHA-256 `1d29bff709efc8aa6bcf4df78fa027d78e074c1e862a29f18dad9aef1d8d5a5d`.
+The corrected root receipt labels retained requested bytes explicitly; its earlier
+receipt remains preserved. No resident-memory reduction is claimed.
+
+A fresh real-Neovim corpus run passes 99/99, including all 89 callback checks.
+All 38 semantic requests receive their first response with one attempt, zero
+semantic retries and one initial getter query. Four distinct raw observer sequences
+prove selected `:compileJava` execution, stable inputs/outputs and zero diagnostics;
+all four report `compilerClosureComplete=false`. Dirty/configuration retraction,
+provider disable/re-enable and fresh compilation expectations are unchanged.
+
+Normal LSP shutdown has one null ACK, one exit notification, native exit 0, no
+forced termination and 0.7201557 seconds (n=1). At capture time, 757 guards and
+43 artifacts remain unchanged; four monitored wrappers terminate and three retained
+handles close. MSYS still hides actual Neovim/server process roles, so complete
+OS descendant ownership and their RSS/cap enforcement remain unmeasured.
+Configuration control is explicit `didChangeConfiguration`, not a native config-file
+watcher test. Useful generated completion during unsaved edits remains open.
+
+Current server SHA-256:
+`a0291541cfa88518aab742e22d87259611281eb9324eb612ed73e25f03d84e0e`;
+bench SHA-256:
+`3eec7702799f7d8bdda068cccc39894c695295071066be9b25054e1f570fdf21`.
+Native evidence: `native-java-1/{monitor-corpus.json,editor-root-1/artifacts/}`.
+Root terminal audit: `native-audit-1/audit.json`,
+SHA-256 `1294092accb8a00466dd9aa25399c5eff8febce0f33d91083c9a9ef70b006fc8`.
+The product/full-run guards apply before these later documentation edits.
+
+Next reproduce/fix the default Kotlin daemon control without changing the user's
+compiler strategy, relaxing executed/EOF/whole-build gates or terminating existing
+daemons. Review evidence is `ktlsp-owned-kotlin-daemon-review-20261011/`;
+the matched failing control is
+`ktlsp-native-gradle-default-control-291a6df-20261011/native/root-matched-arm-audit.json`.
+The exact next native command requires a reviewed cooperative shutdown/ownership
+seam first; source review is ongoing. The original mixed twelve editing cases,
+KAPT/KSP stale diagnostics, six-project IDEA comparison and useful-result latency/RSS
+acceptance remain OPEN. Production Mixin remains a separate extension project.
 
 ### Current slice: requires-only compatibility artifacts
 
