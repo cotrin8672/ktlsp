@@ -33,21 +33,19 @@ pub struct Repos {
 }
 
 impl Repos {
-    /// Default real-machine locations under `$HOME` (falls back to the temp dir if HOME is unset,
+    /// Default real-machine locations under the user's home (falls back to the temp dir if unknown,
     /// so we never scatter caches into the current working directory).
     pub fn defaults() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let ktlsp_cache = std::env::var_os("KTLSP_CACHE_DIR")
+        let home = crate::paths::user_home().unwrap_or_else(std::env::temp_dir);
+        let gradle = std::env::var_os("GRADLE_USER_HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".cache/ktlsp"));
+            .unwrap_or_else(|| home.join(".gradle"));
         Repos {
-            gradle_cache: home.join(".gradle/caches"),
+            gradle_cache: gradle.join("caches"),
             m2: home.join(".m2/repository"),
             central_base: "https://repo1.maven.org/maven2".to_string(),
-            download_dir: ktlsp_cache.join("jars"),
+            download_dir: crate::deps::cache_home().join("jars"),
             allow_download: true,
         }
     }
@@ -1195,6 +1193,64 @@ mod tests {
     use super::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    #[cfg(windows)]
+    fn default_repositories_support_native_home_and_gradle_override() {
+        const CASE: &str = "KTLSP_TEST_REPO_HOME_CASE";
+        if let Ok(case) = std::env::var(CASE) {
+            let profile = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+            let home = if case == "explicit" {
+                profile.join("explicit")
+            } else {
+                profile.clone()
+            };
+            let gradle = if case == "gradle-override" {
+                profile.join("gradle-location")
+            } else {
+                home.join(".gradle")
+            };
+            let repos = Repos::defaults();
+            assert_eq!(repos.gradle_cache, gradle.join("caches"));
+            assert_eq!(repos.m2, home.join(".m2/repository"));
+            assert_eq!(repos.download_dir, profile.join("isolated-ktlsp/jars"));
+            assert_eq!(crate::deps::cache_home(), profile.join("isolated-ktlsp"));
+            return;
+        }
+        let profile =
+            std::env::temp_dir().join(format!("ktlsp-native-repos-{}", std::process::id()));
+        let mut failures = Vec::new();
+        for case in ["absent", "empty", "explicit", "gradle-override"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "artifacts::tests::default_repositories_support_native_home_and_gradle_override"])
+                .env(CASE, case).env("USERPROFILE", &profile)
+                .env("KTLSP_CACHE_DIR", profile.join("isolated-ktlsp"))
+                .env_remove("HOME").env_remove("GRADLE_USER_HOME");
+            match case {
+                "empty" => {
+                    command.env("HOME", "").env("GRADLE_USER_HOME", "");
+                }
+                "explicit" => {
+                    command.env("HOME", profile.join("explicit"));
+                }
+                "gradle-override" => {
+                    command.env("GRADLE_USER_HOME", profile.join("gradle-location"));
+                }
+                _ => {}
+            }
+            let output = command.output().unwrap();
+            if !output.status.success()
+                || !String::from_utf8_lossy(&output.stdout).contains("1 passed")
+            {
+                failures.push(format!(
+                    "{case}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     #[test]
     fn http_failures_classify_definitive_vs_transient() {

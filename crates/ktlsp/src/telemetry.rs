@@ -7,7 +7,7 @@
 //! never disturb diagnostics.
 //!
 //! Destination: `KTLSP_COMPILE_LOG` if set, else `KTLSP_CACHE_DIR/compile-timing.jsonl`, else
-//! `~/.cache/ktlsp/compile-timing.jsonl` (alongside the trust store). No env and no `HOME` ->
+//! `~/.cache/ktlsp/compile-timing.jsonl` (alongside the trust store). No env and unknown home ->
 //! telemetry is silently skipped.
 
 use std::ffi::OsString;
@@ -56,7 +56,7 @@ pub fn log_path() -> Option<PathBuf> {
     }
     default_log_path(
         std::env::var_os(crate::deps::CACHE_DIR_ENV),
-        std::env::var_os("HOME"),
+        crate::paths::user_home().map(PathBuf::into_os_string),
         "compile-timing.jsonl",
     )
 }

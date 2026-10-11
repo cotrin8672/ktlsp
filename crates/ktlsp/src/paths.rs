@@ -1,4 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Preserve an explicit Unix-style home while supporting native Windows launches.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(std::env::home_dir)
+}
 
 /// Match editor file-URI keys without resolving the filesystem or changing Unix filenames.
 pub fn file_key(path: &Path) -> String {

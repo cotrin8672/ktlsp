@@ -572,9 +572,12 @@ static ANDROID_SOURCES_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new((
 static ANDROID_DOWNLOAD_FAILURES: LazyLock<Mutex<BTreeMap<u32, Instant>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-/// ktlsp's cache root (`KTLSP_CACHE_DIR`, `~/.cache/ktlsp`, or under the temp dir if HOME is unset).
+/// ktlsp's cache root (`KTLSP_CACHE_DIR`, `~/.cache/ktlsp`, or under the temp dir if home is unknown).
 pub fn cache_home() -> PathBuf {
-    cache_home_from(std::env::var_os(CACHE_DIR_ENV), std::env::var_os("HOME"))
+    cache_home_from(
+        std::env::var_os(CACHE_DIR_ENV),
+        crate::paths::user_home().map(PathBuf::into_os_string),
+    )
 }
 
 fn cache_home_from(cache_dir: Option<OsString>, home: Option<OsString>) -> PathBuf {
@@ -638,8 +641,8 @@ fn common_jdk_src_zip() -> Option<PathBuf> {
         PathBuf::from("/Library/Java/JavaVirtualMachines"),
         PathBuf::from("/usr/lib/jvm"),
     ];
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join("Library/Java/JavaVirtualMachines"));
+    if let Some(home) = crate::paths::user_home() {
+        roots.push(home.join("Library/Java/JavaVirtualMachines"));
     }
     for root in roots {
         if let Some(path) = find_src_zip_under(&root) {
@@ -1565,7 +1568,7 @@ fn android_sdk_roots(root: &Path) -> Vec<PathBuf> {
             roots.insert(PathBuf::from(value));
         }
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::paths::user_home() {
         roots.insert(home.join("Library/Android/sdk"));
         roots.insert(home.join("Android/Sdk"));
     }

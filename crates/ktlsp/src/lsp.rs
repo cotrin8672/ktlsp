@@ -1402,7 +1402,7 @@ fn project_change(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if name.ends_with(".gradle")
+    if (name.ends_with(".gradle") && name != ".gradle")
         || name.ends_with(".gradle.kts")
         || name.ends_with(".toml")
         || matches!(name, "gradle.properties" | "gradle-wrapper.properties")
@@ -4392,6 +4392,10 @@ mod tests {
             ("nested/libs/version-sources.jar", Some(true)),
             ("gradle/wrapper/gradle-wrapper.properties", Some(true)),
             ("gradle/libs.versions.toml", Some(true)),
+            (".gradle", None),
+            ("buildSrc/.gradle", None),
+            (".gradle/buildOutputCleanup/cache.properties", None),
+            ("gradle/custom.gradle", Some(true)),
             ("sources/module-0/src-other/Decoy.java", None),
             ("outputs/module-0/classes-other/Decoy.class", None),
             ("src/test/resources/Fake.kt", None),

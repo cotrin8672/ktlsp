@@ -27,9 +27,10 @@ This does not establish complete Java overload conversion or Kotlin inference fi
 Analysis providers read normalized semantic facts and publish contributions through
 `ktcore::extensions::ExtensionStore`. The host in `ktlsp::analysis_extensions` invalidates
 contributions after source, model or configuration changes. Completion, diagnostics, navigation,
-references and rename consume the same bindings. The external Mixin test consumer exercises this
-contract through actual LSP requests, including applied edits; production Mixin support remains
-a separate project. Provider registration is explicit, and dynamic loading/ABI is undecided.
+references and rename consume the same bindings. The external Mixin consumer is a test-only
+implementation that exercises this contract through actual LSP requests, including applied edits.
+Production Mixin support will be a separate LSPExtension project. Provider registration is explicit,
+and dynamic loading/ABI is undecided.
 
 Classfile decoding exists, but admitting compiler-generated members into the normal server still
 requires a verified successful build and input/output ownership. Decoding a class alone does not

@@ -9,7 +9,7 @@ development. Acceptance requires useful and correct completion, inference,
 diagnostics, navigation, references and rename across both languages and unsaved
 buffers, using the same Gradle dependencies and generated sources.
 
-Provide a public analysis extension boundary for a separate Mixin support project.
+Provide a public analysis extension boundary for a separate Mixin LSPExtension project.
 The extension must read shared semantic results and contribute facts used consistently
 by existing features. A small representative Mixin test may prove that boundary;
 shipping a Mixin implementation is outside this project's scope. Source and extension
@@ -41,7 +41,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentieth-fixed-1 passes 1,097 tests / 3 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentieth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentyfirst-fixed-1 passes 1,098 tests / 3 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentyfirst-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Eleventh-fixed-2 Java passes 191/196, including all 17 bare-call and earlier override controls. Five missing diagnostics remain. Eighteenth library source lifecycle passes 13/13 | Partial; current library editing verified, diagnostic coverage still failing | `ktlsp-goal-20261010/eleventh2-java-1/` and `ktlsp-library-eighteenth-replay-20261011/receipt.json`. Library shutdown acknowledgement is unmeasured. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -1470,6 +1470,84 @@ whole buffer, compiler output, normal exits and all 1,430 guards. Earlier failed
 receipts remain immutable.
 Six-project replay, compiler-generated API admission, POM arrival watching,
 materialized-file fast paths and concurrent materialization remain open.
+
+### Twentieth corpus replay: partial and stopped after Spring
+
+Nine runs use the immutable twentieth server and unchanged probe expectations.
+Moshi passes 3/3 golden requests and all 29 incomplete-editing checks; Retrofit
+passes 6/6 and 29/29, with exact facade and Java member targets. OkHttp's corrected
+incomplete run passes 29/29. Coverage remains independent: Moshi has zero failed
+or missing inputs; OkHttp has one failed input; Retrofit has six failed and three
+missing inputs. These failures retain strict harness failure status.
+
+Earlier direct-native CEM incomplete and OkHttp golden runs omitted `HOME`, unlike
+the Bash setup. Their results remain preserved and cannot establish paired corpus
+acceptance. The first CEM Bash monitor also missed client/server identities across
+MSYS ancestry, so its memory is unmeasured. A separate regression reproduces native
+Windows cache lookup failures with absent/empty `HOME` and a Gradle-home override;
+all four child-process conditions pass after the shared home lookup repair.
+Subsequent full/release/editor evidence is recorded in the twenty-first checkpoint below.
+
+Spring passes its first four golden requests, but has ten failed and ten missing
+inputs. Peak server commit is 4,930,125,824 bytes, above the prospective 4 GiB budget.
+Client shutdown times out at fifteen seconds. A new owned Gradle daemon survives
+the controller and is stopped; all owned processes are then absent. Safety memory
+caps were not exceeded. The remaining Spring/Gradle and corrected setup runs are
+held for a fresh release binding, rather than counted as passes.
+
+The valid initial model is followed by 25 forced refreshes. Re-emitted model
+content is identical after normalizing module order. Actual notifications include
+read-time JAR changes and `.gradle` cache directories; the latter incorrectly match
+the script suffix. A later native Neovim reduction proves access-time feedback;
+that reduction does not yet supply a product fix. All 1,048 input guards match. Evidence is
+`ktlsp-six-project-twentieth-native-20261011/{terminal-hold-after-run09,owned-absence-after-run09,run-09-refresh-cause-audit}.json`
+and `ktlsp-native-home-draft-20261011/focused-red-green.json` under the recorded Temp root.
+No six-project correctness or performance acceptance follows from this partial run.
+
+### Twenty-first checkpoint: native Windows home lookup and directory notifications
+
+Native Windows launches can omit `HOME`. The shared lookup now preserves an explicit
+nonempty `HOME` and otherwise uses the operating system's home directory. Gradle cache
+lookup honors a nonempty `GRADLE_USER_HOME`; Maven, download, dependency, SDK and timing
+paths reuse the existing shared policies. The child-process regression fails before
+the repair for absent/empty `HOME` and the Gradle override, then passes all four
+conditions. A separate regression rejects `.gradle` cache-directory notifications
+as build scripts while retaining actual `gradle/custom.gradle` refreshes.
+
+Formatting, all 1,098 workspace tests (zero failed, three ignored, 40 suites) and
+both release builds pass. The 312 guarded inputs match before/after tests, release
+and independent review. Server SHA-256 is
+`13fae4f535aca108ba40b8da6719a9da2dd8dd238bc1c3d8a8117e0b01dadb3e`.
+The existing real-Neovim `basic` route passes nine assertions. Its forced stop and
+MSYS ancestry leave graceful shutdown and client/server memory unproved for that run.
+
+The direct-native CEM replay unconditionally removes both `HOME` and
+`GRADLE_USER_HOME` before launching Neovim, retains the real `USERPROFILE`, and uses
+a fresh isolated cache with the validated model seed. All six first responses use
+one attempt; all 29 incomplete/unsaved editing checks pass. All 1,316 guards remain
+unchanged. The index has 101 dependencies, 36,040 library files, 845,935 symbols,
+zero failed inputs and the same two missing sources, so the strict harness retains
+exit 1. Shutdown receives one null acknowledgement, sends one exit and the actual
+server exits zero without forced termination; all owned processes exit. Its 2.614
+seconds still exceed the two-second budget. This is one run, not latency acceptance.
+An earlier replay also passes the editing checks but lacks unconditional environment
+removal; its `HOME` condition remains unproved rather than being promoted to a pass.
+
+The separate access-time reduction runs installed Neovim 0.12.5/libuv 1.52.1 on
+disposable files. A passive read after assigning an old access time produces both
+a raw change event and the actual `vim._watch` Changed callback while content hash,
+size and last-write time remain unchanged. All 24 assertions pass, including real
+write and rename controls; all owned processes exit. This establishes the feedback
+cause. No Changed-event suppression or native replacement is applied yet: real
+concurrent writes and notification failure must remain conservatively invalidating.
+
+Evidence under the recorded Temp root: `ktlsp-goal-20261010/twentyfirst-fixed-1/`,
+`ktlsp-native-home-draft-20261011/focused-red-green.json`,
+`ktlsp-project-watch-filter-20261011/{red-cargo,green-cargo}.log`,
+`ktlsp-home-twentyfirst-20261011/root-audit.json` and
+`ktlsp-watch-atime-reduction-20261011/causal-audit.json`.
+Next: remove the access-time refresh feedback without losing writes or overflow
+invalidation, then resume the held Spring/Gradle editor replays with a fresh binding.
 
 ### Current slice: requires-only compatibility artifacts
 
