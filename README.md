@@ -319,6 +319,9 @@ Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and 
 for Gradle, matching the project's selected main toolchain. This includes completion inside
 braced Kotlin string templates across unsaved Java return-type changes. The focused
 checks pass; broader coverage is tracked in [the acceptance record](docs/fork-acceptance.md).
+Use `dev/corpus/retrofit-2.11.0-template-editing.json` with the same corpus route for
+partial template members, missing closing braces/quotes, and literal-negative controls.
+Those cases edit buffers only and preserve the pinned source bytes.
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus

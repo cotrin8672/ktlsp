@@ -497,6 +497,62 @@ fun show(invocation: Invocation) {
     expect(&mut ws, "cast", "substring");
 }
 
+#[test]
+fn member_completion_in_incomplete_braced_string_templates() {
+    let declarations =
+        "class Box {\n    fun open() {}\n    val size = 1\n}\nclass Other { fun unrelated() {} }\n";
+    for line in [
+        r#"        "前置き😀 ${box.op/*^*/.${box.size}" +"#,
+        r#"        "前置き😀 ${box.op/*^*/}.${box.size} +"#,
+    ] {
+        let fixture = format!(
+            "{declarations}fun show(box: Box) {{\n    val output = (\n{line}\n        \" continuation\"\n    )\n}}\n"
+        );
+        let got = labels(&fixture)
+            .unwrap_or_else(|| panic!("expected incomplete template members: {fixture}"));
+        assert!(got.contains("open"), "{fixture}: {got:?}");
+        assert!(!got.contains("size"), "{fixture}: {got:?}");
+        assert!(!got.contains("unrelated"), "{fixture}: {got:?}");
+    }
+}
+
+#[test]
+fn incomplete_braced_templates_follow_unsaved_java_return_type_and_restore() {
+    let mut ws = Workspace::new();
+    ws.open("ServiceClass.java", "package probe; public class ServiceClass { public String getName() { return null; } public Object cast(Object value) { return value; } }".into());
+    ws.open("ServiceText.java", "package probe; public class ServiceText { public String getName() { return null; } public String substring(int start) { return null; } }".into());
+    let original =
+        "package probe; public class Invocation { public ServiceClass service() { return null; } }";
+    let edited = original.replace("ServiceClass service()", "ServiceText service()");
+    ws.open("Invocation.java", original.into());
+    for line in [
+        r#"        "Response from ${service./*^*/name.${service.name}" +"#,
+        r#"        "Response from ${service./*^*/name}.${service.name} +"#,
+    ] {
+        let (source, offset) = strip_cursor(&format!(
+            "package probe\nfun show(invocation: Invocation) {{\n    val service = invocation.service()\n    val output = (\n{line}\n        \" continuation\"\n    )\n}}\n"
+        ));
+        ws.open("Use.kt", source.clone());
+        let expect = |ws: &mut Workspace, offered: &str, excluded: &str| {
+            let result = ws
+                .complete("Use.kt", offset, true)
+                .expect("incomplete template completion");
+            let labels: HashSet<_> = result.items.into_iter().map(|item| item.label).collect();
+            assert!(labels.contains(offered), "expected {offered}: {labels:?}");
+            assert!(
+                !labels.contains(excluded),
+                "unexpected {excluded}: {labels:?}"
+            );
+            assert_eq!(ws.doc_text("Use.kt").as_deref(), Some(source.as_str()));
+        };
+        expect(&mut ws, "cast", "substring");
+        ws.change("Invocation.java", edited.clone());
+        expect(&mut ws, "substring", "cast");
+        ws.change("Invocation.java", original.into());
+        expect(&mut ws, "cast", "substring");
+    }
+}
+
 // --------------------------------------------------------------------------------------------
 // Stage B: member completion after a dot (`receiver.`)
 // --------------------------------------------------------------------------------------------

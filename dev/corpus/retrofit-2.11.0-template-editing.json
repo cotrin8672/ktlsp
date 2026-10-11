@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "project_id": "retrofit-2.11.0-string-template-editing",
+  "revision": "cc76c22a68e090f3dd898cbcb0bac30414f59c31",
+  "build_tool": "gradle",
+  "scope": "Five focused editing cases on the pinned production KotlinExtensions.kt: typed Class control, closed partial template, missing closing brace, missing closing quote, and literal-negative with a useful control in the same buffer. Six first-response completion RPCs; original mixed-project expectations stay separate.",
+  "compiler_baseline": "The completed service.cast(null) counterpart compiles with the captured Retrofit Kotlin 1.9.23 main inputs, all 55 sources and the selected JDK 8 target. See fork-acceptance checkpoint 45.",
+  "oracle_status": "All six first-response completion RPCs and seven semantic assertions match in the official IntelliJ LSP adapter. This establishes these focused incomplete editing expectations, not whole-project IDEA parity. See fork-acceptance checkpoint 45.",
+  "probes": [
+    {
+      "id": "retrofit-template-known-class-control",
+      "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "anchor": "knownClass.cast(null)",
+      "token": "cast",
+      "completion_prefix": "ca",
+      "definition": false,
+      "completion_token": "cast",
+      "category": "typed-class-control",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+          "anchor": "val method = invocation.method()",
+          "replacement": "val method = invocation.method()\n            val knownClass: Class<*> = service\n            knownClass.cast(null)"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-template-partial-ca",
+      "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "anchor": "\"Response from ${service.ca}.${method.name}\" +",
+      "token": "ca",
+      "completion_prefix": "ca",
+      "definition": false,
+      "completion_token": "cast",
+      "category": "partial-template-member",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+          "anchor": "\"Response from ${service.name}.${method.name}\" +",
+          "replacement": "\"Response from ${service.ca}.${method.name}\" +"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-template-missing-closing-brace",
+      "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "anchor": "\"Response from ${service.ca.${method.name}\" +",
+      "token": "ca",
+      "completion_prefix": "ca",
+      "definition": false,
+      "completion_token": "cast",
+      "category": "partial-template-missing-brace",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+          "anchor": "\"Response from ${service.name}.${method.name}\" +",
+          "replacement": "\"Response from ${service.ca.${method.name}\" +"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-template-missing-closing-quote",
+      "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "anchor": "\"Response from ${service.ca}.${method.name} +",
+      "token": "ca",
+      "completion_prefix": "ca",
+      "definition": false,
+      "completion_token": "cast",
+      "category": "partial-template-missing-quote",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+          "anchor": "\"Response from ${service.name}.${method.name}\" +",
+          "replacement": "\"Response from ${service.ca}.${method.name} +"
+        }
+      ]
+    },
+    {
+      "id": "retrofit-template-outer-literal-negative",
+      "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "anchor": "\"Response service.ca from ${service.name}.${method.name}\" +",
+      "token": "ca",
+      "completion_prefix": "ca",
+      "definition": false,
+      "completion_token": false,
+      "category": "literal-negative-with-same-phase-typed-class-control",
+      "buffer_edits": [
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+          "anchor": "val method = invocation.method()",
+          "replacement": "val method = invocation.method()\n            val knownClass: Class<*> = service\n            knownClass.cast(null)"
+        },
+        {
+          "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+          "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+          "anchor": "\"Response from ${service.name}.${method.name}\" +",
+          "replacement": "\"Response service.ca from ${service.name}.${method.name}\" +"
+        }
+      ],
+      "completion_excludes": [
+        "cast"
+      ],
+      "known_control": {
+        "anchor": "knownClass.cast(null)",
+        "token": "cast",
+        "completion_prefix": "ca",
+        "completion_token": "cast"
+      }
+    }
+  ]
+}

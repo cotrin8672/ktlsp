@@ -314,6 +314,13 @@ pub fn completion_query(
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
     let tree = parser.parse(src);
+    let recovered = complete::incomplete_template_source(&tree, src, offset);
+    let src = recovered.as_deref().unwrap_or(src);
+    let tree = if recovered.is_some() {
+        parser.parse(src)
+    } else {
+        tree
+    };
     let context = complete::completion_context(&tree, src, offset);
     match context {
         complete::CompletionContext::ScopeName => scope_name_query(

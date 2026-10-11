@@ -470,6 +470,84 @@ fn non_code_ancestor(node: Node, src: &str, offset: usize) -> bool {
     false
 }
 
+/// A completion-only view for a braced template whose missing delimiter broke its code scope.
+/// Keep every authored byte offset and line break; the buffer and shared index stay untouched.
+pub(crate) fn incomplete_template_source(tree: &Tree, src: &str, offset: usize) -> Option<String> {
+    if !tree.root_node().has_error() || !src.is_char_boundary(offset) {
+        return None;
+    }
+    let mut target = None;
+    for node in nodes_at(tree, offset) {
+        let mut current = Some(node);
+        let mut expression = None;
+        while let Some(node) = current {
+            match node.kind() {
+                "interpolation" if expression.is_none() => {
+                    let closing = node.child(node.child_count().saturating_sub(1));
+                    let end = closing
+                        .filter(|child| child.kind() == "}")
+                        .map_or(node.end_byte(), |child| child.start_byte());
+                    if !node_text(node, src).starts_with("${")
+                        || offset < node.start_byte() + 2
+                        || offset > end
+                    {
+                        return None;
+                    }
+                    expression = Some((node.start_byte() + 2, false));
+                }
+                "ERROR" if expression.is_none() && node_text(node, src).starts_with("${") => {
+                    expression = Some((node.start_byte() + 2, true));
+                }
+                "string_literal" => {
+                    let (start, missing_brace) = expression?;
+                    let mut cursor = node.walk();
+                    let crosses_literal_line = node.named_children(&mut cursor).any(|child| {
+                        child.kind() == "string_content"
+                            && child.start_byte() >= offset
+                            && node_text(child, src).contains(['\r', '\n'])
+                    });
+                    if !missing_brace && !crosses_literal_line {
+                        return None;
+                    }
+                    target = Some((node, start));
+                    break;
+                }
+                "multiline_string_literal"
+                | "string_content"
+                | "line_comment"
+                | "block_comment"
+                | "character_literal"
+                | "number_literal"
+                | "float_literal" => return None,
+                _ => {}
+            }
+            current = node.parent();
+        }
+    }
+    let (literal, start) = target?;
+    if start > offset || literal.end_byte() < offset {
+        return None;
+    }
+    let line_end = src[offset..]
+        .find(['\r', '\n'])
+        .map_or(src.len(), |length| offset + length);
+    let end = literal.end_byte().min(line_end);
+    // In an unterminated ordinary string, the authored concatenation operator is parsed as text.
+    let plus = (literal.end_byte() > line_end)
+        .then(|| src[offset..end].trim_end().strip_suffix('+'))
+        .flatten()
+        .map(|prefix| offset + prefix.len());
+    let mut view = src.as_bytes().to_vec();
+    for range in [literal.start_byte()..start, offset..end] {
+        for (index, byte) in view[range.clone()].iter_mut().enumerate() {
+            if !matches!(*byte, b'\r' | b'\n') && Some(range.start + index) != plus {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(view).ok()
+}
+
 /// The byte slice of the current line up to (and excluding) `offset`, char-boundary safe.
 fn line_prefix(src: &str, offset: usize) -> &str {
     let end = floor_boundary(src, offset);
@@ -1050,6 +1128,68 @@ mod tests {
             ctx_after("fun main() {\n    val s = \"x ${y}\"\n}\n", "${y"),
             CompletionContext::ScopeName
         );
+    }
+
+    #[test]
+    fn incomplete_template_view_preserves_offsets_and_surrounding_scope() {
+        let closed = r#"        "前置き😀 ${box.op}.${box.size}" +"#;
+        for (line, missing_quote) in [
+            (closed.replacen("op}", "op", 1), false),
+            (closed.replacen("\" +", " +", 1), true),
+        ] {
+            let src = format!(
+                "class Box {{ val size = 1 }}\r\nfun show(box: Box) {{\r\n    val output = (\r\n{line}\r\n        \" continuation\"\r\n    )\r\n}}\r\n"
+            );
+            let offset = src.find("box.op").unwrap() + "box.op".len();
+            let start = src.find("\"前置き").unwrap();
+            let expression = src.find("${box.op").unwrap() + 2;
+            let line_end = offset + src[offset..].find('\r').unwrap();
+            let end = if missing_quote {
+                line_end
+            } else {
+                offset + src[offset..line_end].rfind('"').unwrap() + 1
+            };
+            let view = incomplete_template_source(&parse(&src), &src, offset)
+                .unwrap_or_else(|| panic!("expected template recovery: {src}"));
+            assert_eq!(view.len(), src.len());
+            assert_eq!(&view[..start], &src[..start]);
+            assert_eq!(&view[expression..offset], &src[expression..offset]);
+            assert_eq!(&view[end..], &src[end..]);
+            for (index, (before, after)) in src.bytes().zip(view.bytes()).enumerate() {
+                if before == b'\r' || before == b'\n' {
+                    assert_eq!(after, before, "line break at {index}");
+                }
+            }
+            let plus = src[..line_end].rfind('+').unwrap();
+            assert_eq!(view.as_bytes()[plus], b'+');
+            let tree = parse(&view);
+            assert!(!tree.root_node().has_error(), "{view}");
+            assert_eq!(
+                completion_context(&tree, &view, offset),
+                CompletionContext::AfterDot
+            );
+            let identifier = identifier_at(&tree, offset - 1).unwrap();
+            assert!(ancestor_is(identifier, &["block"]));
+            assert!(ancestor_is(identifier, &["function_declaration"]));
+        }
+    }
+
+    #[test]
+    fn incomplete_template_view_keeps_closed_and_non_code_contexts() {
+        for src in [
+            r#"fun f(box: Box) = "Response ${box.op}""#,
+            "fun broken(\nfun f(box: Box) = \"Response ${box.op}\"\n",
+            "fun broken(\nfun f(box: Box) = \"\"\"Response ${box.op}\n continuation\"\"\"\n",
+            "fun f(box: Box) = \"Response \\${box.op +\n continuation\"\n",
+            "fun f(box: Box) = \"Response ${\"box.op\"} +\n continuation\"\n",
+            "fun f(box: Box) = \"Response ${box.size /* box.op */} +\n continuation\"\n",
+        ] {
+            let offset = src.find("box.op").unwrap() + "box.op".len();
+            assert!(
+                incomplete_template_source(&parse(src), src, offset).is_none(),
+                "unexpected template recovery: {src}"
+            );
+        }
     }
 
     #[test]
