@@ -41,7 +41,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Sixteenth-fixed-1 passes 1,076 tests / 3 ignored across 40 suites, native exit 0; all 307 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/sixteenth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Seventeenth-fixed-1 passes 1,076 tests / 3 ignored across 40 suites, native exit 0; all 307 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/seventeenth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Eleventh-fixed-2 Java passes 191/196, including all 17 bare-call and earlier override controls. Five missing diagnostics remain. Tenth-fixed-2 library source lifecycle passes 13/13 | Partial; current ordinary editor slice verified, diagnostic coverage still failing | `ktlsp-goal-20261010/eleventh2-java-1/` and `tenth2-library-1/`. Preserve unknown competitors and inherited overloads. Producer incompleteness must be resolved without assuming a closed world. Legacy forced Java shutdown is not graceful-shutdown proof |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Sixteenth preserves plus-version coordinates and indexes 101 dependencies. All four strict first-response completion/goto assertions pass, and actual blank-super popup acceptance produces a compiler-valid whole buffer. One failed archive and two missing sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-sixteenth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -57,7 +57,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Ninth same-client KAPT/KSP refresh passes 102/114, repairing unsaved completion; twelve obsolete/removed-API diagnostics fail. Transformed-API completion still fails 12/12 | Partial; generated-source editing works, diagnostic and transformed-API coverage failing | Actual v1/v2/restored builds and disabled compiler rejections establish expected APIs. Raw classfile decoder tests do not supply generated-API editing acceptance |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
-| Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Matched thirteenth/fourteenth large-Gradle RSS falls from approximately 3.19 to 2.66 GiB, with two samples per arm. Current sixteenth editor checks verify useful results but do not establish latency budgets; semantic shutdown takes approximately 4.2 seconds against a two-second target | Resource improvement measured; six-project acceptance pending | `ktlsp-receiver-storage-pair-20261011/` and `ktlsp-semantic-sixteenth-replay-20261011/receipt.json`. Current release needs useful-result p50/p95 and cold/warm RSS samples |
+| Correctness plus latency | Meaningful responses meet recorded budgets on all six projects | Matched thirteenth/fourteenth large-Gradle RSS falls from approximately 3.19 to 2.66 GiB, with two samples per arm. Seventeenth reduces isolated snapshot allocation by 82.2%; its semantic editor passes 23 checks but shutdown takes approximately 4.4 seconds against a two-second target | Resource improvements measured; six-project acceptance pending | `ktlsp-receiver-storage-pair-20261011/`, `ktlsp-index-snapshot-cow-measurement-20261011/` and `ktlsp-semantic-seventeenth-replay-20261011/receipt.json`. Current release needs useful-result p50/p95 and cold/warm RSS samples |
 
 ## Actual KAPT/KSP compile and runtime controls
 
@@ -1275,11 +1275,57 @@ All 1,387 editor guards, the current 395-file inventory and 12 explicit absent-f
 guards remain unchanged; the compiler's 1,389 guards also match. Those absent
 files were empty game-world/download data in the older temporary copy; its
 original 407-file comparison failure is preserved. The strict harness still
-exits 1 because commons-compress 1.26.0 fails UTF-8 decoding and two dependencies
-lack sources. Evidence is `ktlsp-cem-sixteenth-fixed-1-20261011/{run-cem-first,
+exits 1 because commons-compress 1.26.0 fails UTF-8 decoding and patchy 2.2.10 plus
+kotlinforforge-neoforge 5.12.0 lack sources. Evidence is
+`ktlsp-cem-sixteenth-fixed-1-20261011/{run-cem-first,
 actual-accepted-compiler}/result.json`. Next address shared snapshot allocation
 and declared source encodings; compiler-producer admission, unknown ancestor
 overloads, classifier/source visibility and six-project IDEA parity remain open.
+
+### Seventeenth checkpoint: share inference snapshot buckets
+
+The three private inference lookup maps now share immutable string keys and
+entry buckets with their snapshots. Existing-key insertion allocates no key;
+editing detaches only the affected buckets. The public borrowed lookup API,
+selection order, source facts and serialized caches are unchanged. The existing
+snapshot regression first fails at runtime (symbol reference count 8 instead of
+4); after the repair, all 38 focused index/Salsa/workspace checks pass. They cover
+same-FQN library survivors, frozen ownership/type/JVM revisions, replacement,
+removal and unchanged buckets as well as closed and open Kotlin query paths.
+
+Seventeenth-fixed-1 passes formatting, all 1,076 workspace tests with three
+ignored and both release builds. All 307 input guards match. Its server SHA-256
+is `7f9037c7819395f975075a46dae2b0a007bc51d69a126f8ae1f1fe153a83b8f8`.
+The release semantic editor passes 23/23 with one acknowledged shutdown, one
+exit notification and native exit 0/signal 0, without termination. The roughly
+4.4-second shutdown still fails the two-second budget. CEM and the external
+consumer evidence above remain sixteenth results; they were not rerun for this
+private storage change. Evidence is `ktlsp-goal-20261010/seventeenth-fixed-1/`,
+`ktlsp-semantic-seventeenth-replay-20261011/` and the measurement directory below.
+
+The before/after release helpers parse the same three guarded source JARs into
+28,071 symbols and 10,740 lookup buckets. No old bincode cache is decoded. Each
+arm records 30 raw samples, uses the identical allocator self-check and helper
+source, and verifies unchanged inputs/artifacts plus identical symbol inventory.
+
+| Isolated measurement | Sixteenth | Seventeenth |
+| --- | ---: | ---: |
+| Snapshot requested allocation bytes | 2,916,559 | 518,448 |
+| Snapshot allocation operations | 21,483 | 3 |
+| Snapshot p50 / p95 (ms) | 2.0232 / 3.9297 | 0.0771 / 0.1601 |
+| Unique base-index retained bytes | 77,767,080 | 77,908,625 |
+| Unique base-index retained allocations | 311,574 | 322,314 |
+
+The snapshot allocation falls 82.2%, at a base cost of 141,545 requested bytes
+and 10,740 allocations. Snapshots still copy three hash tables in O(bucket count);
+the first mutation of a shared bucket copies that bucket's entries. This is
+allocation-instrumented isolated indexing, excluding allocator overhead, C
+allocations, RSS and snapshot destruction time. It is not LSP timing or a new
+large-project memory result. Production snapshots occur when Salsa synchronizes
+after an index revision, rather than on every request. Raw proofs are
+`ktlsp-index-snapshot-cow-measurement-20261011/{sixteenth-before-1,
+seventeenth-after-1}/receipt.json`; implementation and runtime RED evidence are
+in `implementation-1/source-stable-receipt.json` in that directory.
 
 ### Current slice: requires-only compatibility artifacts
 

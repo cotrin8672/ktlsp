@@ -53,12 +53,12 @@ pub struct RefEntry {
     pub end_byte: usize,
 }
 
-/// Push an entry into a name->entries bucket, cloning the key only when the bucket is new.
-fn push_entry(map: &mut FxHashMap<String, Vec<Entry>>, key: &str, entry: Entry) {
+/// Push an entry into a name->entries bucket, allocating its shared key only when new.
+fn push_entry(map: &mut FxHashMap<Arc<str>, Arc<Vec<Entry>>>, key: &str, entry: Entry) {
     if let Some(entries) = map.get_mut(key) {
-        entries.push(entry);
+        Arc::make_mut(entries).push(entry);
     } else {
-        map.insert(key.to_string(), vec![entry]);
+        map.insert(Arc::from(key), Arc::new(vec![entry]));
     }
 }
 
@@ -73,14 +73,14 @@ pub struct Index {
     /// Source of truth: each file's tier + symbols (for whole-file replace/remove).
     files: FxHashMap<String, (Tier, Vec<Arc<IndexedSymbol>>)>,
     /// Derived lookup: simple name -> entries (both tiers merged).
-    by_name: FxHashMap<String, Vec<Entry>>,
+    by_name: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
     /// Derived lookup for member completion: container type simple-name -> member entries (the
     /// hot path for `receiver.` completion, so it gets a dedicated maintained map). Keyed off
     /// `sym.container`; top-level symbols (no container) are not recorded here.
-    members_by_container: FxHashMap<String, Vec<Entry>>,
+    members_by_container: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
     /// Derived lookup for member completion: extension-receiver type simple-name -> extension
     /// entries (`fun T.f` / `val T.p`). Keyed off `sym.ext_receiver`.
-    ext_by_receiver: FxHashMap<String, Vec<Entry>>,
+    ext_by_receiver: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
     /// Reverse index source of truth: each file's identifier usages (project files only).
     ref_files: FxHashMap<String, Vec<Usage>>,
     /// Derived reverse lookup: simple name -> usage sites.
@@ -93,9 +93,9 @@ pub struct Index {
 
 #[derive(Clone, Default)]
 pub struct InferenceIndexSnapshot {
-    by_name: FxHashMap<String, Vec<Entry>>,
-    members_by_container: FxHashMap<String, Vec<Entry>>,
-    ext_by_receiver: FxHashMap<String, Vec<Entry>>,
+    by_name: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
+    members_by_container: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
+    ext_by_receiver: FxHashMap<Arc<str>, Arc<Vec<Entry>>>,
     origins: OriginFacts,
     contributions: Arc<BTreeMap<String, Vec<crate::extensions::ContributionSet>>>,
     jvm_sources: Arc<JvmSources>,
@@ -406,8 +406,9 @@ impl Index {
 
     /// Immutable inference-only view for Salsa queries.
     ///
-    /// Reverse-reference maps are excluded. Immutable ownership maps are shared,
-    /// so an ordinary source edit does not copy every project's origin strings.
+    /// Lookup tables are copied, while immutable keys and buckets are shared.
+    /// Editing detaches only changed buckets. Reverse-reference maps are excluded;
+    /// ownership maps, extension contributions and JVM facts stay shared too.
     pub fn inference_snapshot(&self) -> InferenceIndexSnapshot {
         InferenceIndexSnapshot {
             by_name: self.by_name.clone(),
@@ -682,9 +683,9 @@ impl Index {
 
     /// Remove every entry contributed by `path` from one bucket of a name->entries map, pruning
     /// the now-empty bucket.
-    fn drop_from(map: &mut FxHashMap<String, Vec<Entry>>, key: &str, path: &str) {
+    fn drop_from(map: &mut FxHashMap<Arc<str>, Arc<Vec<Entry>>>, key: &str, path: &str) {
         if let Some(entries) = map.get_mut(key) {
-            entries.retain(|e| e.path.as_ref() != path);
+            Arc::make_mut(entries).retain(|e| e.path.as_ref() != path);
             if entries.is_empty() {
                 map.remove(key);
             }
@@ -706,7 +707,10 @@ impl Index {
 
     /// All entries with the given simple name (borrowed; callers clone only what they keep).
     pub fn lookup_by_name(&self, name: &str) -> &[Entry] {
-        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+        self.by_name
+            .get(name)
+            .map(|entries| entries.as_slice())
+            .unwrap_or(&[])
     }
 
     /// All entries in deterministic file/start order. Returns owned `Entry`s so callers cannot
@@ -762,7 +766,7 @@ impl Index {
     pub fn members_of(&self, type_name: &str) -> &[Entry] {
         self.members_by_container
             .get(type_name)
-            .map(Vec::as_slice)
+            .map(|entries| entries.as_slice())
             .unwrap_or(&[])
     }
 
@@ -771,7 +775,7 @@ impl Index {
     pub fn extensions_for(&self, receiver_type: &str) -> &[Entry] {
         self.ext_by_receiver
             .get(receiver_type)
-            .map(Vec::as_slice)
+            .map(|entries| entries.as_slice())
             .unwrap_or(&[])
     }
 
@@ -781,7 +785,7 @@ impl Index {
     pub fn lookup_type(&self, name: &str) -> Vec<&Entry> {
         self.by_name
             .get(name)
-            .map(Vec::as_slice)
+            .map(|entries| entries.as_slice())
             .unwrap_or(&[])
             .iter()
             .filter(|e| e.sym.kind.is_type_like())
@@ -946,14 +950,19 @@ impl InferenceIndex for InferenceIndexSnapshot {
     }
 
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
-        LookupEntries::All(self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[]))
+        LookupEntries::All(
+            self.by_name
+                .get(name)
+                .map(|entries| entries.as_slice())
+                .unwrap_or(&[]),
+        )
     }
 
     fn members_of(&self, type_name: &str) -> LookupEntries<'_> {
         LookupEntries::All(
             self.members_by_container
                 .get(type_name)
-                .map(Vec::as_slice)
+                .map(|entries| entries.as_slice())
                 .unwrap_or(&[]),
         )
     }
@@ -962,7 +971,7 @@ impl InferenceIndex for InferenceIndexSnapshot {
         LookupEntries::All(
             self.ext_by_receiver
                 .get(receiver_type)
-                .map(Vec::as_slice)
+                .map(|entries| entries.as_slice())
                 .unwrap_or(&[]),
         )
     }
@@ -1969,7 +1978,47 @@ mod tests {
     #[test]
     fn inference_snapshot_does_not_observe_later_mutations() {
         let mut idx = Index::new();
-        idx.replace_file("a.kt", vec![member("before", "Box")], Tier::Volatile);
+        idx.replace_file(
+            "a.kt",
+            vec![
+                typ("Box", &["Base"]),
+                member("before", "Box"),
+                extension("fetch", "Box"),
+            ],
+            Tier::Volatile,
+        );
+        idx.replace_file(
+            "b.kt",
+            vec![
+                typ("Box", &["LibraryBase"]),
+                member("keep", "Box"),
+                extension("keepExt", "Box"),
+                typ("Other", &[]),
+                member("stay", "Other"),
+                extension("stayExt", "Other"),
+            ],
+            Tier::Durable,
+        );
+        let owner = origin(
+            "project-api",
+            Some(scope("app")),
+            SourceRepresentation::Source,
+        );
+        idx.set_file_origin("a.kt", owner.clone());
+        idx.set_file_origin(
+            "b.kt",
+            origin("library-v1", None, SourceRepresentation::Source),
+        );
+        idx.replace_scope_visibilities(vec![visibility("app", &["project-api", "library-v1"])]);
+        let mut jvm = crate::jvm::SourceFileFacts {
+            input_hash: 1,
+            package: "p".into(),
+            owner: "AKt".into(),
+            owner_annotation: None,
+            callables: Vec::new(),
+        };
+        idx.replace_jvm_source("a.kt", Some(jvm.clone()), Tier::Volatile);
+        let revision = idx.jvm_source_for_file("a.kt").unwrap().revision;
         idx.replace_file_refs(
             "a.kt",
             vec![Usage {
@@ -1978,10 +2027,65 @@ mod tests {
                 end_byte: 16,
             }],
         );
+        let symbol = Arc::clone(&idx.lookup_by_name("before")[0].sym);
+        let symbol_refs = Arc::strong_count(&symbol);
 
         let snapshot = idx.inference_snapshot();
+        let cloned = snapshot.clone();
+        assert_eq!(
+            Arc::strong_count(&symbol),
+            symbol_refs,
+            "snapshots must not copy entries"
+        );
+        for (live, frozen) in [
+            (&idx.by_name, &snapshot.by_name),
+            (&idx.members_by_container, &snapshot.members_by_container),
+            (&idx.ext_by_receiver, &snapshot.ext_by_receiver),
+            (&snapshot.by_name, &cloned.by_name),
+            (&snapshot.members_by_container, &cloned.members_by_container),
+            (&snapshot.ext_by_receiver, &cloned.ext_by_receiver),
+        ] {
+            assert_eq!(live.len(), frozen.len());
+            for (key, entries) in live {
+                let (old_key, old_entries) = frozen.get_key_value::<str>(key).unwrap();
+                assert_eq!(key, old_key);
+                assert!(
+                    std::ptr::eq(key.as_ptr(), old_key.as_ptr()),
+                    "key bytes: {key}"
+                );
+                assert!(
+                    std::ptr::eq(entries.as_ptr(), old_entries.as_ptr()),
+                    "bucket: {key}"
+                );
+            }
+        }
+        assert!(matches!(
+            snapshot.lookup_by_name("before"),
+            LookupEntries::All(_)
+        ));
+        assert!(std::ptr::eq(
+            &idx.lookup_by_name("before")[0],
+            &snapshot.lookup_by_name("before")[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &symbol,
+            &snapshot.lookup_by_name("before")[0].sym
+        ));
+        assert!(Arc::ptr_eq(&idx.origins.files, &snapshot.origins.files));
+        assert!(Arc::ptr_eq(&idx.contributions, &snapshot.contributions));
+        assert!(Arc::ptr_eq(&idx.jvm_sources, &snapshot.jvm_sources));
 
-        idx.replace_file("a.kt", vec![member("after", "Box")], Tier::Volatile);
+        idx.replace_file(
+            "a.kt",
+            vec![
+                typ("Box", &["NextBase"]),
+                member("after", "Box"),
+                extension("afterExt", "Box"),
+            ],
+            Tier::Volatile,
+        );
+        jvm.input_hash = 2;
+        idx.replace_jvm_source("a.kt", Some(jvm), Tier::Volatile);
         idx.replace_file_refs(
             "a.kt",
             vec![Usage {
@@ -1992,12 +2096,80 @@ mod tests {
         );
 
         assert_eq!(snapshot.members_of("Box")[0].sym.name, "before");
+        assert_eq!(snapshot.extensions_for("Box")[0].sym.name, "fetch");
         assert!(snapshot.lookup_by_name("after").is_empty());
-
-        assert_eq!(idx.members_of("Box")[0].sym.name, "after");
+        assert!(snapshot.lookup_by_name("afterExt").is_empty());
+        assert_eq!(idx.members_of("Box")[0].sym.name, "keep");
+        assert_eq!(idx.members_of("Box")[1].sym.name, "after");
+        assert_eq!(idx.extensions_for("Box")[0].sym.name, "keepExt");
+        assert_eq!(idx.extensions_for("Box")[1].sym.name, "afterExt");
         assert!(idx.lookup_by_name("before").is_empty());
+        assert!(idx.lookup_by_name("fetch").is_empty());
         assert!(idx.lookup_refs("before").is_empty());
         assert_eq!(idx.lookup_refs("after").len(), 1);
+        for (live, frozen, key) in [
+            (&idx.by_name, &snapshot.by_name, "Box"),
+            (
+                &idx.members_by_container,
+                &snapshot.members_by_container,
+                "Box",
+            ),
+            (&idx.ext_by_receiver, &snapshot.ext_by_receiver, "Box"),
+        ] {
+            let (key, entries) = live.get_key_value(key).unwrap();
+            let (old_key, old_entries) = frozen.get_key_value::<str>(key).unwrap();
+            assert!(std::ptr::eq(key.as_ptr(), old_key.as_ptr()));
+            assert!(!std::ptr::eq(entries.as_ptr(), old_entries.as_ptr()));
+        }
+        for (live, frozen, key) in [
+            (&idx.by_name, &snapshot.by_name, "stay"),
+            (
+                &idx.members_by_container,
+                &snapshot.members_by_container,
+                "Other",
+            ),
+            (&idx.ext_by_receiver, &snapshot.ext_by_receiver, "Other"),
+        ] {
+            assert!(std::ptr::eq(
+                live.get(key).unwrap().as_ptr(),
+                frozen.get(key).unwrap().as_ptr()
+            ));
+        }
+        assert!(Arc::ptr_eq(
+            &idx.lookup_by_name("stay")[0].sym,
+            &snapshot.lookup_by_name("stay")[0].sym
+        ));
+        assert_eq!(idx.file_origin("a.kt"), Some(&owner));
+        assert_eq!(snapshot.origins.file_origin("a.kt"), Some(&owner));
+        assert_eq!(
+            ScopedIndex::new(&snapshot, "a.kt").supertypes_of("Box"),
+            vec!["Base".to_string()]
+        );
+        assert_eq!(
+            idx.scoped_for_file("a.kt").supertypes_of("Box"),
+            vec!["NextBase".to_string()]
+        );
+        assert_eq!(snapshot.jvm_sources("AKt")[0].revision, revision);
+        assert_eq!(cloned.jvm_sources("AKt")[0].revision, revision);
+        assert!(idx.jvm_source_for_file("a.kt").unwrap().revision > revision);
+
+        idx.remove_file("a.kt");
+        assert!(idx.lookup_by_name("after").is_empty());
+        assert!(idx.lookup_by_name("afterExt").is_empty());
+        assert!(idx.lookup_refs("after").is_empty());
+        assert!(idx.file_origin("a.kt").is_none());
+        assert!(idx.jvm_source_for_file("a.kt").is_none());
+        assert_eq!(idx.members_of("Box")[0].path.as_ref(), "b.kt");
+        assert_eq!(idx.extensions_for("Box")[0].path.as_ref(), "b.kt");
+        assert_eq!(snapshot.origins.file_origin("a.kt"), Some(&owner));
+        assert_eq!(snapshot.jvm_sources("AKt")[0].revision, revision);
+        assert_eq!(snapshot.lookup_by_name("before")[0].path.as_ref(), "a.kt");
+        idx.remove_file("b.kt");
+        assert!(idx.by_name.is_empty());
+        assert!(idx.members_by_container.is_empty());
+        assert!(idx.ext_by_receiver.is_empty());
+        assert_eq!(snapshot.members_of("Box").len(), 2);
+        assert_eq!(cloned.extensions_for("Box").len(), 2);
     }
 
     #[test]
