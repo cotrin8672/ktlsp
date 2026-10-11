@@ -41,7 +41,7 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentyfifth-fixed-3 passes 1,127 tests / 4 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentyfifth-fixed-3/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentysixth-bench-fixed-1 passes 1,130 tests / 4 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentysixth-bench-fixed-1/root-audit.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Twentyfifth-fixed-3 passes library source lifecycle 13/13 and semantic 23/23. Latest Java replay is twentyfourth: 191/196 with the same five diagnostic failures | Partial; current library/semantic regression checks verified, diagnostic coverage still failing | `ktlsp-native-compile-twentyfifth-editor-20261011/final-3/root-audit.json`; Java evidence remains `ktlsp-compiled-foundation-twentyfourth-editor-20261011/retry-1/`. Compiler producer is not connected. Semantic shutdown is clean but 4.192 seconds exceeds the 2-second budget. Actual server/client RSS is unmeasured in this replay |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -1699,10 +1699,17 @@ reuse, has no real positive control for this guard yet. A persistent descendant
 could force cleanup and conservatively leave `executed=false`. Unix keeps its legacy
 wrapper-only process ownership and has no native proof here. The native compiler
 producer and notification backend remain unconnected; transformed-API editor
-improvement and access-time-feedback improvement remain zero. A Temp notification
-candidate separately passes 13 Windows tests (two pure, five synthetic, five native
-API and one public layout/trait check), plus feature compilation checks. That is
-prerequisite evidence only; consumer retraction and real kernel overflow are unproved.
+improvement and access-time-feedback improvement remain zero. The first Temp
+notification candidate passes 13 Windows tests and feature compilation checks.
+Its supplemental snapshot passes 14 default tests (two pure, five synthetic, six
+native API and one public layout/trait check). One separate, explicitly selected
+kernel-overflow test passes on its only attempt: 2,048 writes produce one native
+Rescan, zero native errors and no expired callback barrier. Both supplemental
+runs preserve all 336 guarded files; every observed owned process exits and all
+retained handles close. Evidence is
+`ktlsp-compiler-producer-20261011/root-1/notify-runtime-audit.json`.
+These are standalone prerequisite checks. Consumer retraction and product
+access-time-feedback behavior remain unproved; the watcher is still unconnected.
 
 Next reproducible command: `rtk proxy cargo test --locked -p ktlsp --lib compile:: -- --nocapture --test-threads=1`
 with the recorded Rust homes/toolchain and a disposable `KTLSP_CACHE_DIR`. Then run
@@ -1711,6 +1718,43 @@ invalidation and connect only fresh successful compiler facts. Missing prerequis
 are an isolated default-daemon control fixture and the verified native watcher/host
 admission path. The original twelve transformed-API failures and six-project IDEA,
 latency and memory acceptance remain open.
+
+### Twenty-sixth checkpoint: reject empty and interrupted benchmark successes
+
+The diagnostics benchmark could report successful recovery when its backend returned
+an unexecuted empty outcome. It also accepted matching empty oracle results, and
+partial error output could pass injection without completed execution. The shared
+probe-error check now requires execution. Recovery additionally requires a genuine
+executed error during setup and an executed clean result; both oracle arms must
+establish the injected error before their diagnostics can pass comparison. Warmup
+remains discarded and the report schema is unchanged.
+
+Tests-only reproduction fails four assertions with native exit 101: 28 pass and
+four fail, without a compilation failure. The corrected focused suite passes all
+32 tests, including five recovery setup/result combinations and the public oracle
+route on a non-Gradle directory. Evidence is `ktlsp-bench-validity-20261011/{red,green}.{out,json}`.
+
+`twentysixth-bench-fixed-1` passes 1,130 workspace tests, zero failed and four
+ignored across 40 suites; formatting and release builds succeed. All 312 guarded
+inputs match before/after tests and release. The only change within those inputs
+since final3 is `crates/ktlsp/src/bin/bench.rs`. The server binary is byte-identical
+to final3, SHA-256 `8b0330d574b71acb8df1b374501bbd61fc64105058ea406e3bf4be00de96c9e7`;
+its existing library 13/13 and semantic 23/23 evidence remains the editor check.
+No fresh editor run or new editor acceptance is claimed for this measurement-only
+change. The corrected bench SHA-256 is
+`ae52924a4e6fc58032d10acea341b88f7f98abc81f6662b6746e265f9d3f627e`.
+Evidence is `ktlsp-goal-20261010/twentysixth-bench-fixed-1/root-audit.json`.
+
+Older benchmark success alone does not prove `executed=true`; rerun affected
+controls using the corrected binary. Native generated-API admission is still
+unconnected. Source review also found a pending producer must reject observed
+read inputs outside the watch coverage actually armed before its build; later
+watch extension cannot prove that an input avoided A-to-B-to-A changes during
+compilation. This is a static finding, not an executed exploit or a product fix.
+Next: finish that guard and its focused tests, then invoke a fresh Java-only Lombok
+positive through the existing corpus harness and current model. The default Kotlin
+daemon control, mixed upstream-output reads and original twelve transformed-API
+editing failures remain open.
 
 ### Current slice: requires-only compatibility artifacts
 

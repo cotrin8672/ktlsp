@@ -171,11 +171,13 @@ impl Drop for Probe {
     }
 }
 
+// Interrupted output cannot establish a successful error-injection oracle.
 fn has_probe_error(outcome: &CompileOutcome, probe_name: &str) -> bool {
-    outcome
-        .diagnostics
-        .iter()
-        .any(|d| d.severity == Severity::Error && d.path.contains(probe_name))
+    outcome.executed
+        && outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.path.contains(probe_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -304,8 +306,8 @@ fn run_inject(
 }
 
 /// recover: from a broken state (untimed setup), time {write the fix -> compile returns an outcome
-/// with the probe error gone}. A non-executed (UP-TO-DATE) run would leave the error present and
-/// be counted as a failure, so unique-per-iteration content is what keeps this honest.
+/// with the probe error gone}. Both compiles must execute, and setup must report the probe error;
+/// otherwise absent diagnostics could be an interrupted backend rather than a successful fix.
 fn run_recover(
     backend: &dyn CompileBackend,
     root: &Path,
@@ -316,12 +318,15 @@ fn run_recover(
     let mut failures = 0;
     for i in 0..n {
         probe.write_broken(i)?;
-        let _ = backend.compile(root, &[probe.path.clone()]);
+        let setup = backend.compile(root, &[probe.path.clone()]);
         probe.write_clean(i)?;
         let start = Instant::now();
         let outcome = backend.compile(root, &[probe.path.clone()]);
         durations.push(start.elapsed());
-        if has_probe_error(&outcome, PROBE_FILE) {
+        if !has_probe_error(&setup, PROBE_FILE)
+            || !outcome.executed
+            || has_probe_error(&outcome, PROBE_FILE)
+        {
             failures += 1;
         }
     }
@@ -541,7 +546,11 @@ fn cmd_oracle(args: &Args) -> anyhow::Result<ExitCode> {
         .collect();
 
     let diff = diff_diags(&base, &cand);
-    let ok = diff.missing.is_empty() && diff.extra.is_empty() && diff.mislocated.is_empty();
+    let ok = has_probe_error(&base_out, PROBE_FILE)
+        && has_probe_error(&cand_out, PROBE_FILE)
+        && diff.missing.is_empty()
+        && diff.extra.is_empty()
+        && diff.mislocated.is_empty();
 
     let report = OracleReport {
         root: root.display().to_string(),
@@ -1102,6 +1111,12 @@ mod tests {
         };
         assert!(has_probe_error(&err_on_probe, PROBE_FILE));
 
+        let incomplete_error = CompileOutcome {
+            executed: false,
+            ..err_on_probe.clone()
+        };
+        assert!(!has_probe_error(&incomplete_error, PROBE_FILE));
+
         let warning = CompileOutcome {
             diagnostics: vec![diag(PROBE_FILE, 1, 1, Severity::Warning, "x")],
             executed: true,
@@ -1163,6 +1178,100 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_requires_executed_error_setup_and_executed_clean_result() {
+        struct ScriptedBackend(Mutex<std::collections::VecDeque<CompileOutcome>>);
+        impl CompileBackend for ScriptedBackend {
+            fn name(&self) -> &str {
+                "scripted"
+            }
+            fn compile(&self, _root: &Path, _changed: &[PathBuf]) -> CompileOutcome {
+                self.0.lock().unwrap().pop_front().unwrap()
+            }
+        }
+        let error = CompileOutcome {
+            diagnostics: vec![diag(
+                PROBE_FILE,
+                3,
+                16,
+                Severity::Error,
+                "Unresolved reference",
+            )],
+            executed: true,
+        };
+        let clean = CompileOutcome {
+            diagnostics: Vec::new(),
+            executed: true,
+        };
+        let incomplete_error = CompileOutcome {
+            executed: false,
+            ..error.clone()
+        };
+        for (tag, setup, recovery, failures) in [
+            ("valid", error.clone(), clean.clone(), 0),
+            ("no-error-setup", clean.clone(), clean.clone(), 1),
+            ("incomplete-setup", incomplete_error, clean, 1),
+            (
+                "incomplete-recovery",
+                error.clone(),
+                CompileOutcome::default(),
+                1,
+            ),
+            ("error-remains", error.clone(), error, 1),
+        ] {
+            let dir = tmp(tag);
+            let backend = ScriptedBackend(Mutex::new([setup, recovery].into()));
+            {
+                let probe = Probe::create(&dir).unwrap();
+                let result = run_recover(&backend, &dir, &probe, 1).unwrap();
+                assert_eq!(result.count, 1, "{tag}");
+                assert_eq!(result.failures, failures, "{tag}");
+                assert!(backend.0.lock().unwrap().is_empty(), "{tag}");
+            }
+            assert!(!dir.join(PROBE_FILE).exists(), "{tag}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn inject_rejects_error_from_nonexecuted_backend() {
+        struct InterruptedBackend;
+        impl CompileBackend for InterruptedBackend {
+            fn name(&self) -> &str {
+                "interrupted"
+            }
+            fn compile(&self, root: &Path, changed: &[PathBuf]) -> CompileOutcome {
+                let mut result = FakeBackend {
+                    name: "fake".into(),
+                }
+                .compile(root, changed);
+                result.executed = false;
+                result
+            }
+        }
+        let dir = tmp("inject-interrupted");
+        {
+            let probe = Probe::create(&dir).unwrap();
+            let result = run_inject(&InterruptedBackend, &dir, &probe, 2).unwrap();
+            assert_eq!(result.count, 2);
+            assert_eq!(result.failures, 2);
+        }
+        assert!(!dir.join(PROBE_FILE).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oracle_rejects_identical_nonexecuted_empty_outcomes() {
+        let dir = tmp("oracle-empty");
+        let path = dir.to_str().unwrap();
+        let parsed = args(&["--root", path, "--probe-dir", path, "--json"]).unwrap();
+        // The real gradle-cli backend returns the default outcome for a non-Gradle directory.
+        // No native Gradle process starts; the public oracle route must still reject it.
+        assert_eq!(cmd_oracle(&parsed).unwrap(), ExitCode::FAILURE);
+        assert!(!dir.join(PROBE_FILE).exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- oracle diff classification ---
