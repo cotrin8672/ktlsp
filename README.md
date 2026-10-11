@@ -196,6 +196,9 @@ classify unavailable requests as unmeasured. An observation deadline is not a sp
 Edited diagnostic probes record the outbound version and source hash before judging the
 first target notification. A versionless notification has an explicit correlation assumption;
 neither it nor a first empty push proves that asynchronous compiler diagnostics are final.
+The Gradle reload probe also checks captured Kotlin source/library/JDK inputs. The
+project model records the selected compiler runtime and launch policy separately;
+captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
 and KMP navigation. Imported extension aliases also cover typed return chains with
 same-named decoys, incomplete completion, unsaved import removal/rebinding, references

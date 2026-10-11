@@ -58,7 +58,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current typed-extension/query slice passes 1,272 / 0 failed / 4 ignored; formatting/release native 0; focused generic interoperability 43/43 | Current Rust, formatting and release verified | Checkpoint 39: `ktlsp-retrofit-tag-reduction-20261012-1/first-native-repair-7/`; Java wildcards, where/F-bounds and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current selected-compiler recipe slice passes 1,273 / 0 failed / 4 ignored; formatting/release native 0; classpath 37/37. Prior generic interoperability 43/43 | Current Rust, formatting and release verified | Checkpoints 39/40; Java wildcards, where/F-bounds, unsaved Kotlin compiler diagnostics and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current basic 9/9, features 78 matched / 2 unmet, library 13/13, Java 194 matched / 5 unmet, semantic 107 passing assertions. Saved Java publication probe previously passed 99/99 | Partial; same seven ordinary expectations remain open | Checkpoints 38/39 distinguish semantic RPCs, setup checks, versionless diagnostic correlation and operational shutdown. `native-shape-editors/results.json`; checkpoint 36 measures owned Moshi server working sets, editor memory remains unmeasured |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -72,7 +72,7 @@ a useful known receiver in the same edited state.
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Tenth-fixed-2 applies the complete six-site override family, preserves all five expected buffers and passes actual Java/Kotlin compilation plus 33 bytecode assertions. JVM facade exported-alias/authored renames and external consumer applied renames also pass | Focused fixtures verified; wider corpus and inherited implementation edge pending | `ktlsp-goal-20261010/tenth2-java-rename-compiler-1/`, `retrofit-jvm-editor/portable-release-tenth2-1/artifacts/` and `ktlsp-shadow-tenth-fixed-2-20261011/editor/`. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Current native automatic-watching pair improves 74/76 to 75/76 with unchanged expectations: Java now diagnoses the deleted v1 member after switching to v2. Four real builds, completion, exact definitions, dirty buffers and clean shutdown pass | Java obsolete-member repair verified; Kotlin obsolete-member diagnostic remains failing | Checkpoint 30: `ktlsp-java-binary-absence-20261011-1/native-{before,after}/artifacts/`. Actual JDK 17 sources, model v5, native watches and zero explicit notifications; wider compiler-transforming cases remain |
-| Kotlin compiler inputs | Capture the task's actual source selection, ordered libraries and selected JDK across refresh | Three Gradle/KGP generations retain these inputs and opaque plugin arguments. Real Neovim's ten new metadata checks improve 0/10 to 10/10; the original editor checks remain 75/76 | Configured-input capture verified; no new Kotlin diagnostic claim | Checkpoint 31: `ktlsp-kotlin-compiler-inputs-20261011-1/slice-evidence.json`; effective CLI overrides, transformations and extension closure remain separate |
+| Kotlin compiler inputs | Capture the task's actual source selection, ordered libraries, compiler runtime and selected JDK across refresh | Three Gradle/KGP generations retain source/library inputs and opaque plugin arguments. Selected 1.9.23/2.4.0 runtime recipes match independent same-project probes, including exact ordered 7/14 runtime paths and host/toolchain policy. Current live editor retains 85/86 checks | Configured-input capture verified; no new Kotlin diagnostic claim | Checkpoints 31/40; effective CLI overrides, transformed/generated APIs and extension closure remain separate |
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current path-cache saved Java/Lombok probe retains 99/99: first getter/typed chain, four observed native builds, config/dirty retraction. Earlier KAPT/KSP 102/114 retains twelve stale/removed diagnostics; original mixed twelve editing cases remain OPEN | Partial; narrow saved Java publication verified, closure/mixed/unsaved useful completion unresolved | `ktlsp-path-cache-slice-20261011-1/native-java-1/editor-root-1/artifacts/compiled-java-results.json`; compilerClosureComplete=false throughout. Source-less navigation stays unavailable; no producer-absence guard is relaxed |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Shared mixed fixture: adapted IntelliJ LSP 38/38 pass and fixed ktlsp 36/36 pass, including strict first responses after change delivery. Earlier ktlsp had seven semantic failures | Shared fixture verified | IDEA has two additional import/readiness checks. Windows URI/version adapter is explicit, vanilla plugin has an applied-rename failure; actual corpus parity remains pending |
@@ -2504,6 +2504,53 @@ timing samples and unchanged-source receipts are retained there. Next implement 
 smallest shared Java projection constraint slice, replay the actual Retrofit hook,
 and verify selected-compiler diagnostics for unsaved Kotlin through an accepted-store
 completion barrier. The six-project goal remains in progress.
+
+### Fortieth checkpoint: selected Kotlin compiler runtime recipes
+
+Gradle metadata now captures the task's actual ordered compiler runtime separately
+from its target-library classpath, optional tools JAR, effective target SDK, original
+toolchain SDK, Gradle host JDK, daemon/BTA policy and opaque daemon JVM arguments.
+The version comes from the selected runtime's isolated class loader, which also
+verifies the JVM compiler entrypoint; the KGP plugin version is not substituted.
+Capture is lazy inside the owner project's dump task action. A failed/incomplete
+recipe retains source ownership and reports incomplete compiler metadata.
+
+Project model version 7 invalidates earlier cached snapshots. The importer disables
+Gradle configuration caching until replayed provider values are independently proved
+fresh for compiler recipes and source membership. The existing live metadata probe
+expects this current version; none of its source, classpath or toolchain expectations
+is relaxed. This configured recipe does not prove that a daemon or build executed.
+
+Actual candidate-script controls and the embedded release importer both capture
+Kotlin 1.9.23 and 2.4.0. Recipes match independent probes in the same project, including
+the exact ordered seven/fourteen runtime paths. The first uses Gradle JDK 17 with
+target toolchain 8 and DAEMON/BTA-disabled policy; the second uses JDK 17 and
+IN_PROCESS/BTA-enabled policy. Independent launches of the selected runtime report
+the captured version. Runtime path order is preserved; it is not sorted or inferred
+from dependency filenames.
+
+Formatting, **37 classpath tests**, the full **1,273 passing Rust tests (four ignored)**
+and release build pass. The settled first-response tag reduction retains **9/13 RPC
+matches**, with its four known Java wildcard mismatches and no unanswered requests.
+The automatic-watch Gradle lifecycle retains **85/86 original checks**, including all
+ten metadata checks, four actual builds, dependency addition/version switch/removal,
+generated sources, preserved unsaved buffers and clean shutdown. Its old Kotlin
+obsolete-member diagnostic remains unmet; the compiler worker is still a separate
+unmerged candidate.
+
+Two initial observation mistakes are retained in the artifacts: the first tag run
+omitted the existing indexing barrier and allowed repeated requests; it is not the
+matched first-response comparison. The first 2.4.0 recipe comparison used another
+disposable project's local Maven paths. Rechecking the same project matches exactly;
+paths are never normalized away to manufacture equality.
+
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/`
+(`candidate-owner-native/`, `native-embedded-recipe-1/`, `native-importer-1/` and
+`native-importer-controls-2/`). Embedded release SHA256:
+`b1adf7d0bc5a64f4b405c5fdcf161a37e8fea43ad33b3e3f2626decd31ae165e`.
+Next verify the private unsaved-source compiler overlay, accepted-store generation
+correlation and cancellation on actual 1.9.23/2.4.0, without replacing the original
+missing-diagnostic expectation or declaring producer closure.
 
 ### Current slice: requires-only compatibility artifacts
 

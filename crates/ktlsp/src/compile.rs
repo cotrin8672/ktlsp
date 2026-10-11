@@ -2755,6 +2755,7 @@ pub(crate) fn observed_test_request(root: &Path) -> std::sync::Arc<ObservedCompi
         arguments: Vec::new(),
         annotation_processor_path: Vec::new(),
         java_home: None,
+        kotlin_compiler: None,
         options: Default::default(),
         source_files: vec![root.join("src/Person.java")],
         classpath: Vec::new(),

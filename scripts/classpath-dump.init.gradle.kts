@@ -1,4 +1,5 @@
 import java.util.ArrayDeque
+import java.net.URLClassLoader
 import groovy.json.JsonOutput
 import org.gradle.api.Task
 import org.gradle.api.Action
@@ -29,6 +30,58 @@ object KtlspCompilerConfiguration {
             ?: error("Compiler task does not expose $getter")
         val value = method.invoke(bean)
         return if (value is Provider<*>) value.orNull else value
+    }
+
+    private fun kotlinCompilerRecipe(task: Task, toolchain: Any, toolchainJavaHome: java.io.File): Map<String, Any?> {
+        // This is KGP's actual ordered compiler runtime input, separate from target libraries.
+        val compilerClasspath = (read(task, "getDefaultCompilerClasspath\$kotlin_gradle_plugin_common") as? FileCollection)
+            ?.toList() ?: error("Kotlin compiler runtime classpath is unavailable")
+        check(compilerClasspath.isNotEmpty()) { "Kotlin compiler runtime classpath is empty" }
+        check(compilerClasspath.all { it.isAbsolute }) { "Kotlin compiler runtime paths must be absolute" }
+        val tools = read(toolchain, "getCurrentJvmJdkToolsJar\$kotlin_gradle_plugin_common")
+        check(tools == null || tools is java.io.File) { "Unsupported Kotlin compiler tools JAR value" }
+        val toolsJar = tools as? java.io.File
+        check(toolsJar == null || toolsJar.isAbsolute) { "Kotlin compiler tools JAR path must be absolute" }
+        val gradleJvm = read(toolchain, "getGradleJvm\$kotlin_gradle_plugin_common")
+            ?: error("Kotlin compiler Gradle JVM is unavailable")
+        val gradleJavaHome = read(gradleJvm, "getJavaHome") as? java.io.File
+            ?: error("Kotlin compiler Gradle JDK home is unavailable")
+        check(gradleJavaHome.isAbsolute) { "Kotlin compiler Gradle JDK home must be absolute" }
+        val runViaBuildToolsApi = read(task, "getRunViaBuildToolsApi\$kotlin_gradle_plugin_common") as? Boolean
+            ?: error("Kotlin compiler Build Tools API policy is unavailable")
+        val executionStrategy = (read(task, "getCompilerExecutionStrategy") as? Enum<*>)?.name
+            ?: error("Kotlin compiler execution strategy is unavailable")
+        check(executionStrategy in setOf("DAEMON", "IN_PROCESS", "OUT_OF_PROCESS")) {
+            "Unsupported Kotlin compiler execution strategy: $executionStrategy"
+        }
+        val daemonArguments = read(task, "getNormalizedKotlinDaemonJvmArguments") as? List<*>
+            ?: error("Kotlin compiler daemon JVM arguments are unavailable")
+        check(daemonArguments.all { it is String }) { "Unsupported Kotlin compiler daemon JVM argument value" }
+        val compilerVersion = try {
+            // No parent loader: the KGP plugin version must not stand in for the selected compiler.
+            URLClassLoader((compilerClasspath + listOfNotNull(toolsJar)).map { it.toURI().toURL() }.toTypedArray(), null).use { loader ->
+                val versionClass = Class.forName("org.jetbrains.kotlin.config.KotlinCompilerVersion", true, loader)
+                val version = versionClass.getMethod("getVersion").invoke(null) as? String
+                    ?: error("Selected Kotlin compiler version is unavailable")
+                check(version.isNotBlank() && version != "@snapshot@" && version != "<unknown>") {
+                    "Selected Kotlin compiler version is unavailable: $version"
+                }
+                Class.forName("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", false, loader)
+                version
+            }
+        } catch (failure: LinkageError) {
+            throw IllegalStateException("Selected Kotlin compiler runtime cannot be loaded", failure)
+        }
+        return linkedMapOf(
+            "default_classpath" to compilerClasspath.map { it.absolutePath },
+            "current_jvm_tools_jar" to toolsJar?.absolutePath,
+            "compiler_version" to compilerVersion,
+            "gradle_java_home" to gradleJavaHome.absolutePath,
+            "toolchain_java_home" to toolchainJavaHome.absolutePath,
+            "run_via_build_tools_api" to runViaBuildToolsApi,
+            "execution_strategy" to executionStrategy,
+            "normalized_daemon_jvm_arguments" to daemonArguments.toList(),
+        )
     }
 
     fun dump(task: Task, language: String): String {
@@ -106,6 +159,8 @@ object KtlspCompilerConfiguration {
                 val explicitHome = explicitHomes.singleOrNull()?.let { java.io.File(it) }
                 check(explicitHome == null || explicitHome.isAbsolute) { "Kotlin compiler JDK argument must be absolute" }
                 record["java_home"] = if ("-no-jdk" in strings) null else (explicitHome ?: javaHome).absolutePath
+                // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
+                record["kotlin_compiler"] = kotlinCompilerRecipe(task, toolchain, javaHome)
             } else {
                 val processors = read(task, "getKaptClasspath") as? FileCollection
                     ?: error("Annotation processor classpath is unavailable")
@@ -260,12 +315,12 @@ class KtlspDumpClasspathAction(
 //
 // UNRESOLVED lines report what the lenient view dropped, so silent under-indexing is observable.
 //
-// Configuration-cache compatibility: all `Project` state (path, projectDir, the
-// `compileClasspath` FileCollection, and its ResolutionResult root Provider) is captured at
-// configuration time as a CC-supported value. The `doLast` action never calls `Task.getProject()`
-// or touches a `Configuration` object. Watching the configuration collection also handles plugins
-// that create `compileClasspath` from a later `afterEvaluate` callback. Modules without a
-// `compileClasspath` configuration skip task registration entirely.
+// Metadata is resolved lazily inside each owner project's dump task action; resolving another
+// project's compiler configurations eagerly can violate Gradle's owner-lock requirement. The importer
+// disables configuration caching until cached provider values are proved to refresh compiler recipes
+// and source membership. Watching the configuration collection also handles plugins that create
+// `compileClasspath` from a later `afterEvaluate` callback. Modules without that configuration skip
+// task registration entirely.
 allprojects {
     val projectPath = project.path
     val projectDirPath = project.projectDir.absolutePath

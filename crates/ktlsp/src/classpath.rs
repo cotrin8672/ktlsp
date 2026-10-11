@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 6;
+const MODEL_VERSION: u32 = 7;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +60,32 @@ pub enum CompilerLanguage {
     Kotlin,
 }
 
+/// Gradle's configured Kotlin/JVM launch policy, not proof of an executed compiler process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum KotlinCompilerExecutionStrategy {
+    Daemon,
+    InProcess,
+    OutOfProcess,
+}
+
+/// Selected compiler inputs captured from the task, separate from the target's library classpath.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KotlinCompilerRecipe {
+    /// Exact task defaultCompilerClasspath order; append current_jvm_tools_jar once when launching.
+    pub default_classpath: Vec<PathBuf>,
+    pub current_jvm_tools_jar: Option<PathBuf>,
+    /// Read from this compiler runtime's KotlinCompilerVersion, independently of the KGP version.
+    pub compiler_version: String,
+    /// Gradle's host JVM; this does not certify the JVM of an already-running Kotlin daemon.
+    pub gradle_java_home: PathBuf,
+    /// Task toolchain before an explicit -jdk-home or -no-jdk changes the effective target SDK.
+    pub toolchain_java_home: PathBuf,
+    pub run_via_build_tools_api: bool,
+    pub execution_strategy: KotlinCompilerExecutionStrategy,
+    pub normalized_daemon_jvm_arguments: Vec<String>,
+}
+
 /// Configured compiler inputs, not proof that a build produced current class files.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerTask {
@@ -76,7 +102,10 @@ pub struct CompilerTask {
     pub declared_input_files: Vec<PathBuf>,
     #[serde(default)]
     pub declared_output_roots: Vec<PathBuf>,
+    /// Effective target SDK for Kotlin, including -jdk-home and -no-jdk overrides.
     pub java_home: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kotlin_compiler: Option<KotlinCompilerRecipe>,
     pub options: BTreeMap<String, serde_json::Value>,
     pub output_roots: Vec<PathBuf>,
     pub complete: bool,
@@ -1079,6 +1108,8 @@ fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<Module
         .arg(&script)
         .arg(task)
         .arg("-q")
+        // Cached provider values must not replay stale compiler recipes or source membership.
+        .arg("--no-configuration-cache")
         .arg("--console=plain");
     if offline {
         command.arg("--offline");
@@ -1400,6 +1431,19 @@ fn coordinate_from_gradle_cache_path(path: &Path) -> Option<Coordinate> {
 
 #[cfg(test)]
 mod tests {
+    fn selected_kotlin_recipe() -> serde_json::Value {
+        serde_json::json!({
+            "default_classpath": ["/compiler/z-runtime.jar", "/compiler/a-runtime.jar"],
+            "current_jvm_tools_jar": null,
+            "compiler_version": "2.4.0",
+            "gradle_java_home": "/jdks/host-17",
+            "toolchain_java_home": "/jdks/toolchain-8",
+            "run_via_build_tools_api": true,
+            "execution_strategy": "IN_PROCESS",
+            "normalized_daemon_jvm_arguments": ["-Xmx768m", "-Dopaque=one\ttwo\n三"]
+        })
+    }
+
     fn plain_java_configuration() -> serde_json::Value {
         serde_json::json!({
             "task": ":app:compileJava", "language": "java",
@@ -1603,10 +1647,11 @@ mod tests {
 
     #[test]
     fn compiler_configuration_preserves_task_identity_and_opaque_options() {
-        let compiler = serde_json::json!({
+        let mut compiler = serde_json::json!({
             "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
-            "arguments": ["-Xplugin=C:\\plugins\\serializer.jar", "-P", "annotation=one\ttwo\n三"],
-            "annotation_processor_path": [], "java_home": null,
+            "arguments": ["-Xplugin=C:\\plugins\\serializer.jar", "-P", "annotation=one\ttwo\n三", "-jdk-home", "/jdks/explicit-21"],
+            "annotation_processor_path": [], "java_home": "/jdks/explicit-21",
+            "kotlin_compiler": selected_kotlin_recipe(),
             "source_files": ["/app/src/First.kt", "/app/src/Second.kt"],
             "classpath": ["/app/first.jar", "/app/second.jar"],
             "declared_input_files": ["/app/src/First.kt", "/app/first.jar"],
@@ -1614,12 +1659,62 @@ mod tests {
             "options": {"jvmTarget": "17"}, "output_roots": ["/app/classes/kotlin"],
             "complete": true, "problem": null
         });
-        let dump = format!(
-            "PROJECT\t:app\t/app\nSOURCESET\tmain\nCOMPILER\tmain\t{compiler}\nEND\t:app\n"
-        );
-        let modules = parse_dump(&dump);
-        let value = serde_json::to_value(&modules[0]).unwrap();
-        assert_eq!(value["source_sets"][0]["compiler_tasks"][0], compiler);
+        let mut legacy_recipe = selected_kotlin_recipe();
+        legacy_recipe["current_jvm_tools_jar"] = serde_json::json!("/jdks/host-8/lib/tools.jar");
+        legacy_recipe["compiler_version"] = serde_json::json!("1.9.23");
+        legacy_recipe["gradle_java_home"] = serde_json::json!("/jdks/host-8");
+        legacy_recipe["run_via_build_tools_api"] = serde_json::json!(false);
+        legacy_recipe["execution_strategy"] = serde_json::json!("DAEMON");
+        for recipe in [selected_kotlin_recipe(), legacy_recipe] {
+            compiler["kotlin_compiler"] = recipe;
+            let dump = format!(
+                "PROJECT\t:app\t/app\nSOURCESET\tmain\nCOMPILER\tmain\t{compiler}\nEND\t:app\n"
+            );
+            let modules = parse_dump_reader(dump.as_bytes(), true).unwrap();
+            let value = serde_json::to_value(&modules[0]).unwrap();
+            assert_eq!(value["source_sets"][0]["compiler_tasks"][0], compiler);
+        }
+    }
+
+    #[test]
+    fn malformed_kotlin_compiler_recipe_retains_source_ownership() {
+        for (field, replacement) in [
+            ("default_classpath", None),
+            (
+                "execution_strategy",
+                Some(serde_json::json!("FUTURE_STRATEGY")),
+            ),
+            (
+                "normalized_daemon_jvm_arguments",
+                Some(serde_json::json!([19])),
+            ),
+        ] {
+            let mut recipe = selected_kotlin_recipe();
+            if let Some(value) = replacement {
+                recipe[field] = value;
+            } else {
+                recipe.as_object_mut().unwrap().remove(field);
+            }
+            let compiler = serde_json::json!({
+                "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
+                "arguments": [], "annotation_processor_path": [], "java_home": null,
+                "kotlin_compiler": recipe, "options": {}, "output_roots": [],
+                "complete": true, "problem": null
+            });
+            let dump = format!(
+                "PROJECT\t:app\t/repo/app\nSOURCE\tmain\t/repo/app/src\nCOMPILER\tmain\t{compiler}\nSCP\tmain\t/repo/dependency.jar\nEND\t:app\n"
+            );
+            let modules = parse_dump_reader(dump.as_bytes(), true).unwrap();
+            let source = &modules[0].source_sets[0];
+            assert!(source.compiler_metadata_incomplete, "{field}");
+            assert!(source.compiler_tasks.is_empty(), "{field}");
+            assert_eq!(source.source_roots, [PathBuf::from("/repo/app/src")]);
+            assert_eq!(source.entries, [PathBuf::from("/repo/dependency.jar")]);
+            let model = ProjectSnapshot::new(modules);
+            assert!(model
+                .file_origin(Path::new("/repo/app/src/New.kt"))
+                .is_some());
+        }
     }
 
     #[test]
@@ -2064,6 +2159,7 @@ dependencies {
             "source_files": ["/app/Use.kt", "/app/Main.java", "/app/Script.kts"],
             "classpath": ["/app/z-first.jar", "/app/a-second.jar"],
             "java_home": "/jdks/selected-21", "options": {"jvmTarget": "17"}, "output_roots": [],
+            "kotlin_compiler": selected_kotlin_recipe(),
             "complete": false, "problem": "opaque producer"
         });
         let modules = parse_dump(&format!(
@@ -2090,13 +2186,15 @@ dependencies {
         assert_eq!(loaded.mtimes, model.mtimes);
         assert!(snapshot(&root).is_none(), "loading must remain unpublished");
 
+        let mut legacy_modules = model.modules.clone();
+        legacy_modules[0].source_sets[0].compiler_tasks[0].kotlin_compiler = None;
         for invalid in [
             original[..original.len() - 1].to_vec(),
             [original.as_slice(), b" trailing"].concat(),
             serde_json::to_vec(&CacheEntry {
-                model_version: 5,
+                model_version: 6,
                 mtimes: model.mtimes.clone(),
-                modules: model.modules.clone(),
+                modules: legacy_modules,
             })
             .unwrap(),
         ] {
