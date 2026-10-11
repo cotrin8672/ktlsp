@@ -1,6 +1,8 @@
 -- Disposable compiler-plugin golden for the existing corpus and popup probes.
--- nvim -l dev/compiler_plugin_project.lua <new-external-directory>
+-- nvim -l dev/compiler_plugin_project.lua <new-external-directory> [--java-only]
 local root = vim.fs.abspath(assert(arg[1], 'missing new fixture directory'))
+local java_only = arg[2] == '--java-only'
+assert(arg[2] == nil or java_only, 'unknown compiler fixture option: ' .. tostring(arg[2]))
 local repo = vim.fs.dirname(vim.fs.dirname(debug.getinfo(1, 'S').source:gsub('^@', '')))
 assert(vim.fn.isdirectory(root) == 0, 'compiler fixture destination must be new')
 local function write(path, text)
@@ -13,7 +15,54 @@ for _, file in ipairs({ 'gradlew', 'gradlew.bat', 'gradle/wrapper/gradle-wrapper
   assert(vim.uv.fs_copyfile(repo .. '/dev/gradle-wrapper-template/' .. file, root .. '/' .. file))
 end
 if vim.fn.has('win32') == 0 then assert(vim.uv.fs_chmod(root .. '/gradlew', 493)) end
-local files = {
+local files = java_only and {
+  ['lombok.config'] = [[config.stopBubbling = true
+]],
+  ['settings.gradle.kts'] = [[rootProject.name = "ktlsp-java-lombok-clean-receipt"
+// This disposable fixture uses the installed distribution and existing dependency cache only.
+gradle.startParameter.isOffline = true
+]],
+  ['gradle.properties'] = [[org.gradle.jvmargs=-Xmx384m -Dfile.encoding=UTF-8
+org.gradle.daemon=false
+org.gradle.parallel=false
+org.gradle.workers.max=1
+org.gradle.configuration-cache=false
+org.gradle.vfs.watch=false
+org.gradle.java.installations.auto-detect=false
+org.gradle.java.installations.auto-download=false
+org.gradle.java.installations.fromEnv=JAVA_HOME
+]],
+  ['build.gradle.kts'] = [[plugins { java }
+repositories { mavenCentral() }
+dependencies {
+    compileOnly("org.projectlombok:lombok:1.18.32")
+    annotationProcessor("org.projectlombok:lombok:1.18.32")
+}
+java { toolchain { languageVersion.set(JavaLanguageVersion.of(17)) } }
+tasks.withType<JavaCompile>().configureEach {
+    options.release.set(17)
+    options.encoding = "UTF-8"
+}
+]],
+  ['src/main/java/producerfixture/Person.java'] = [[package producerfixture;
+
+import lombok.Getter;
+
+public final class Person {
+    @Getter private final String name = "generated";
+
+    public String authored() { return name; }
+}
+]],
+  ['src/main/java/producerfixture/Consumer.java'] = [[package producerfixture;
+
+public final class Consumer {
+    public String read(Person person) { return person.getName(); }
+    public int length(Person person) { return person.getName().length(); }
+    public String control(Person person) { return person.authored(); }
+}
+]],
+} or {
   ['settings.gradle.kts'] = [[pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }
 rootProject.name = "ktlsp-compiler-plugin-oracle"
 ]],

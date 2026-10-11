@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod classpath;
 pub mod commands;
 pub mod compile;
+mod compiled_watch;
 pub mod complete;
 pub mod daemon;
 pub mod deps;

@@ -1,0 +1,18 @@
+{
+  "build_tool": "gradle",
+  "probes": [
+    {
+      "id": "authored-java-control-before-observed-compile",
+      "source": "src/main/java/producerfixture/Consumer.java",
+      "source_sha256": "49447b984eec4e4dceeebb3faff05ef6e70c36dcf946b15090e5752adebe6e17",
+      "anchor": "public String control(Person person) { return person.authored(); }",
+      "token": "authored",
+      "completion_prefix": "au",
+      "completion_token": "authored",
+      "target_file": "src/main/java/producerfixture/Person.java",
+      "target_sha256": "64f362dc14b95fe8e242df4b9014e53880118eb39b1271439f5d7d3edb30b2ab",
+      "target_anchor": "public String authored() { return name; }",
+      "target_token": "authored"
+    }
+  ]
+}

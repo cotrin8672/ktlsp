@@ -82,8 +82,26 @@ pub fn parse_output(output: &str, task: &str) -> CompileOutcome {
 /// Blocking (process IO); the caller runs it under `spawn_blocking`. On Windows, a retained Job
 /// owns the tree before it can execute. OS cleanup failures quarantine this worker.
 pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
+    run_gradle_compile_native(root, task, &[], None).outcome
+}
+
+#[derive(Default)]
+struct NativeCompile {
+    outcome: CompileOutcome,
+    successful: bool,
+}
+
+fn run_gradle_compile_native(
+    root: &Path,
+    task: &str,
+    extra: &[String],
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> NativeCompile {
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return NativeCompile::default();
+    }
     if !crate::deps::is_gradle_project(root) {
-        return CompileOutcome::default();
+        return NativeCompile::default();
     }
     let program = match resolve_gradle(root) {
         Some(p) => p,
@@ -92,7 +110,7 @@ pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
                 "no gradle wrapper or `gradle` on PATH for {}",
                 root.display()
             );
-            return CompileOutcome::default();
+            return NativeCompile::default();
         }
     };
     tracing::info!(
@@ -107,6 +125,7 @@ pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
         .arg("--console=plain")
         .arg("--continue")
         .arg("--no-daemon")
+        .args(extra)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -114,7 +133,7 @@ pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
 
     #[cfg(windows)]
     let result = OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)
-        .map(|owned| owned.wait(COMPILE_TIMEOUT, None));
+        .map(|owned| owned.wait(COMPILE_TIMEOUT, cancelled));
     #[cfg(not(windows))]
     let result = (|| -> std::io::Result<_> {
         // shortcut: Unix still owns only the wrapper, not an escaped inherited pipe writer.
@@ -152,7 +171,7 @@ pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(%error, "failed to run owned gradle compile");
-            return CompileOutcome::default();
+            return NativeCompile::default();
         }
     };
     text.push('\n');
@@ -179,7 +198,11 @@ pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
             root.display()
         );
     }
-    outcome
+    NativeCompile {
+        outcome,
+        // The legacy Unix public runner still returns diagnostics; it cannot mint a receipt.
+        successful: cfg!(windows) && status.success() && !interrupted && complete,
+    }
 }
 
 fn parse_completed_output(
@@ -609,8 +632,12 @@ fn compile_task_status<'a>(line: &'a str, task: &str) -> Option<&'a str> {
         Some((p, s)) => (p, s.trim()),
         None => (rest, ""),
     };
-    let last_segment = task_path.rsplit(':').next()?;
-    (last_segment == task).then_some(status)
+    let matches = if task.starts_with(':') {
+        task_path == task
+    } else {
+        task_path.rsplit(':').next()? == task
+    };
+    matches.then_some(status)
 }
 
 /// A gradle task with no status suffix executed; the named statuses mean it was skipped.
@@ -1394,5 +1421,1463 @@ mod completed_output_tests {
             .join()
             .unwrap();
         assert_eq!(read, ("kept".into(), false));
+    }
+}
+
+// Private observed-build path. CompileOutcome and the sidecar wire request are unchanged.
+pub(crate) struct CompileOwner {
+    pub definition: crate::symbol::Def,
+    pub qualified_name: String,
+    pub origin_id: String,
+}
+
+pub(crate) struct ObservedCompileRequest {
+    pub root: PathBuf,
+    pub project_dir: PathBuf,
+    pub scope: crate::project_model::ProjectScope,
+    pub source_set: String,
+    pub task: crate::classpath::CompilerTask,
+    pub compiler_tasks: Vec<crate::classpath::CompilerTask>,
+    pub project_path: String,
+    pub source_roots: Vec<String>,
+    pub classpath: Vec<String>,
+    pub cache_dir: PathBuf,
+    pub owners: Vec<CompileOwner>,
+    pub nonce: String,
+    pub invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(crate) struct CompiledOwnerInput {
+    pub file: String,
+    pub class_file: PathBuf,
+    pub class_file_bytes: u64,
+    pub text: std::sync::Arc<str>,
+    pub tree: tree_sitter::Tree,
+    pub class: std::sync::Arc<ktcore::classfile::ClassFileFacts>,
+}
+
+/// An observed positive snapshot, not a certificate of arbitrary AP dependency closure. Only
+/// run_observed_compile constructs it after native/task/input/output verification. Never persist
+/// it as a disk cache or promote compiler_producers_complete from its existence.
+pub(crate) struct SuccessfulCompileReceipt {
+    pub request: std::sync::Arc<ObservedCompileRequest>,
+    inputs: Vec<serde_json::Value>,
+    outputs: Vec<serde_json::Value>,
+    environment_sha256: String,
+}
+
+pub(crate) struct ObservedCompileResult {
+    pub outcome: CompileOutcome,
+    pub receipt: Option<std::sync::Arc<SuccessfulCompileReceipt>>,
+    pub owners: Vec<CompiledOwnerInput>,
+    pub reason: String,
+}
+
+impl ObservedCompileRequest {
+    pub fn check_live(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        anyhow::ensure!(
+            !self.invalid.load(Ordering::Acquire),
+            "compiler-input-invalidated"
+        );
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "compiler-job-cancelled"
+        );
+        Ok(())
+    }
+
+    pub fn is_known_output(&self, key: &str) -> bool {
+        // Only role-checked outputs can be deferred. Inputs remain inputs inside build/.
+        self.validate_roles().is_ok()
+            && self
+                .compiler_tasks
+                .iter()
+                .flat_map(|task| &task.declared_output_roots)
+                .any(|root| path_under(key, &crate::paths::file_key(root)))
+    }
+
+    pub fn validate_roles(&self) -> anyhow::Result<()> {
+        use crate::classpath::CompilerLanguage;
+        anyhow::ensure!(
+            self.task.language == CompilerLanguage::Java
+                && self.task.complete
+                && !self.task.source_files.is_empty()
+                && !self.task.output_roots.is_empty()
+                && !self.task.declared_output_roots.is_empty(),
+            "selected Java input/output metadata unavailable"
+        );
+        let mut tasks = std::collections::BTreeSet::new();
+        for task in &self.compiler_tasks {
+            anyhow::ensure!(
+                task.complete && task.problem.is_none() && tasks.insert(&task.task),
+                "ambiguous compiler task metadata"
+            );
+        }
+        anyhow::ensure!(
+            self.compiler_tasks
+                .iter()
+                .filter(|task| **task == self.task)
+                .count()
+                == 1,
+            "selected compiler task metadata mismatch"
+        );
+        anyhow::ensure!(
+            self.compiler_tasks.iter().all(|task| task
+                .source_files
+                .iter()
+                .chain(&task.classpath)
+                .chain(&task.declared_input_files)
+                .chain(&task.declared_output_roots)
+                .chain(&task.annotation_processor_path)
+                .chain(&task.output_roots)
+                .all(|path| path.is_absolute())),
+            "relative compiler resource path"
+        );
+        anyhow::ensure!(
+            self.source_roots
+                .iter()
+                .chain(&self.classpath)
+                .all(|path| Path::new(path).is_absolute())
+                && self.compiler_tasks.iter().all(|task| task
+                    .java_home
+                    .as_ref()
+                    .is_none_or(|home| home.is_absolute())
+                    && task
+                        .arguments
+                        .iter()
+                        .filter_map(|argument| argument.strip_prefix("-Xplugin="))
+                        .flat_map(|plugins| plugins.split(','))
+                        .all(|path| Path::new(path).is_absolute())),
+            "relative configured compiler resource path"
+        );
+        let own_outputs: Vec<_> = self
+            .task
+            .declared_output_roots
+            .iter()
+            .map(|p| crate::paths::file_key(p))
+            .collect();
+        let overlaps = |path: &Path| {
+            let key = crate::paths::file_key(path);
+            own_outputs.iter().any(|output| paths_overlap(&key, output))
+        };
+        for output in &self.task.output_roots {
+            let key = crate::paths::file_key(output);
+            anyhow::ensure!(
+                own_outputs.iter().any(|root| path_under(&key, root)),
+                "class destination is not a declared task output"
+            );
+        }
+        let processor_inputs = || {
+            self.compiler_tasks
+                .iter()
+                .flat_map(|task| task.annotation_processor_path.iter().cloned())
+                .chain(
+                    self.compiler_tasks
+                        .iter()
+                        .flat_map(|task| task.arguments.iter())
+                        .filter_map(|argument| argument.strip_prefix("-Xplugin="))
+                        .flat_map(|plugins| plugins.split(',').map(PathBuf::from)),
+                )
+        };
+        for input in self
+            .task
+            .source_files
+            .iter()
+            .cloned()
+            .chain(self.task.classpath.iter().cloned())
+            .chain(
+                self.compiler_tasks
+                    .iter()
+                    .flat_map(|task| task.declared_input_files.iter().cloned()),
+            )
+            .chain(processor_inputs())
+        {
+            anyhow::ensure!(
+                !overlaps(&input),
+                "compiler input overlaps selected own output"
+            );
+        }
+        // shortcut: reject reads of deferred outputs; admit them after phase-aware read/ABA proof.
+        // Endpoint hashes cannot detect a binary A->B->A during a selected action. Registered
+        // source roots remain coverage only; actual modeled read roles must stay native-protected.
+        for input in self
+            .compiler_tasks
+            .iter()
+            .flat_map(|task| {
+                task.source_files
+                    .iter()
+                    .chain(&task.classpath)
+                    .chain(&task.declared_input_files)
+                    .cloned()
+            })
+            .chain(processor_inputs())
+        {
+            let key = crate::paths::file_key(&input);
+            anyhow::ensure!(
+                !self
+                    .compiler_tasks
+                    .iter()
+                    .flat_map(|task| &task.declared_output_roots)
+                    .any(|output| paths_overlap(&key, &crate::paths::file_key(output))),
+                "compiler input overlaps deferred output without temporal read proof"
+            );
+        }
+        for (i, task) in self.compiler_tasks.iter().enumerate() {
+            for other in &self.compiler_tasks[i + 1..] {
+                anyhow::ensure!(
+                    !task.declared_output_roots.iter().any(|a| other
+                        .declared_output_roots
+                        .iter()
+                        .any(|b| paths_overlap(
+                            &crate::paths::file_key(a),
+                            &crate::paths::file_key(b)
+                        ))),
+                    "ambiguous compiler output ownership"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn planned_reads(&self) -> Vec<PathBuf> {
+        let mut paths: std::collections::BTreeSet<_> = self
+            .source_roots
+            .iter()
+            .filter(|root| !self.is_known_output(root))
+            .map(PathBuf::from)
+            .collect();
+        for directory in [&self.root, &self.project_dir] {
+            for name in [
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradle.properties",
+                "gradlew",
+                "gradlew.bat",
+                "gradle/wrapper/gradle-wrapper.properties",
+                "gradle/wrapper/gradle-wrapper.jar",
+                "gradle/libs.versions.toml",
+            ] {
+                paths.insert(directory.join(name));
+            }
+        }
+        if let Some(home) = std::env::var_os("GRADLE_USER_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".gradle")))
+        {
+            paths.extend([
+                home.join("gradle.properties"),
+                home.join("init.gradle"),
+                home.join("init.gradle.kts"),
+                home.join("init.d"),
+            ]);
+        }
+        for task in &self.compiler_tasks {
+            paths.extend(task.annotation_processor_path.iter().cloned());
+            for input in &task.declared_input_files {
+                let key = crate::paths::file_key(input);
+                if !self.is_known_output(&key) {
+                    paths.insert(input.clone());
+                }
+            }
+            for argument in &task.arguments {
+                if let Some(plugins) = argument.strip_prefix("-Xplugin=") {
+                    paths.extend(plugins.split(',').map(PathBuf::from));
+                }
+            }
+            if let Some(home) = &task.java_home {
+                for name in [
+                    "release",
+                    "bin/java",
+                    "bin/java.exe",
+                    "bin/javac",
+                    "bin/javac.exe",
+                    "lib/modules",
+                ] {
+                    paths.insert(home.join(name));
+                }
+            }
+        }
+        for entry in &self.classpath {
+            if !self.is_known_output(entry) {
+                paths.insert(PathBuf::from(entry));
+            }
+        }
+        for owner in &self.owners {
+            let mut directory = Path::new(&owner.definition.file).parent();
+            while let Some(parent) = directory {
+                paths.insert(parent.join("lombok.config"));
+                directory = parent.parent();
+            }
+        }
+        paths.into_iter().collect()
+    }
+
+    pub fn initial_watch_paths(&self) -> Vec<String> {
+        let mut paths: Vec<_> = self
+            .planned_reads()
+            .iter()
+            .map(|p| crate::paths::file_key(p))
+            .collect();
+        paths.extend(
+            self.compiler_tasks
+                .iter()
+                .flat_map(|task| &task.declared_output_roots)
+                .map(|p| crate::paths::file_key(p)),
+        );
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    pub fn is_declared_directory(&self, key: &str) -> bool {
+        self.source_roots.iter().any(|root| root == key)
+            || self
+                .compiler_tasks
+                .iter()
+                .flat_map(|task| &task.output_roots)
+                .any(|root| crate::paths::file_key(root) == key)
+    }
+
+    pub fn observes_path(&self, key: &str) -> bool {
+        self.initial_watch_paths()
+            .iter()
+            .any(|path| path_under(key, path))
+    }
+}
+
+impl SuccessfulCompileReceipt {
+    pub fn observes_path(&self, key: &str) -> bool {
+        self.request.observes_path(key)
+            || self.inputs.iter().chain(&self.outputs).any(|record| {
+                record["path"]
+                    .as_str()
+                    .is_some_and(|path| path_under(key, path))
+            })
+    }
+
+    pub fn covers_output(&self, key: &str) -> bool {
+        self.outputs.iter().any(|record| {
+            record["path"]
+                .as_str()
+                .is_some_and(|path| path_under(key, path))
+        })
+    }
+
+    pub fn source_matches(&self, key: &str, text: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let sha = format!("{:x}", Sha256::digest(text.as_bytes()));
+        self.inputs
+            .iter()
+            .flat_map(|record| {
+                std::iter::once(record).chain(record["entries"].as_array().into_iter().flatten())
+            })
+            .any(|record| {
+                record["path"].as_str() == Some(key)
+                    && record["sha256"].as_str() == Some(sha.as_str())
+            })
+    }
+
+    pub fn verify_current(&self) -> anyhow::Result<()> {
+        self.request.check_live()?;
+        anyhow::ensure!(
+            environment_hash() == self.environment_sha256,
+            "compiler environment changed"
+        );
+        for input in self.inputs.iter().chain(&self.outputs) {
+            let path = input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("receipt inventory has no path"))?;
+            anyhow::ensure!(
+                inventory(Path::new(path))? == *input,
+                "receipt input/output changed: {path}"
+            );
+        }
+        self.request.check_live()?;
+        Ok(())
+    }
+
+    /// Bind the exact decoded bytes to the selected Java task's captured file, not a
+    /// later disk hash or an upstream class with the same internal name.
+    pub(crate) fn verify_compiled_output(
+        &self,
+        class_file: &Path,
+        byte_len: u64,
+        class: &ktcore::classfile::ClassFileFacts,
+    ) -> anyhow::Result<()> {
+        self.request.check_live()?;
+        anyhow::ensure!(
+            byte_len <= ktcore::classfile::MAX_CLASS_FILE_BYTES as u64,
+            "compiled output byte cap exceeded"
+        );
+        let ktcore::jvm::InputIdentity::Binary { content_sha256 } = &class.identity.input else {
+            anyhow::bail!("compiled output has no binary byte identity");
+        };
+        let normalized = |path: &Path| -> anyhow::Result<String> {
+            anyhow::ensure!(path.is_absolute(), "compiled output path is relative");
+            let value = crate::paths::file_key(&std::path::absolute(path)?);
+            Ok(if cfg!(windows) {
+                value.to_lowercase()
+            } else {
+                value
+            })
+        };
+        let file_key = normalized(class_file)?;
+        let relative = format!("{}.class", class.identity.internal_name);
+        let mut selected = false;
+        for root in &self.request.task.output_roots {
+            if path_under(&file_key, &normalized(root)?)
+                && normalized(&root.join(&relative))? == file_key
+            {
+                selected = true;
+            }
+        }
+        anyhow::ensure!(
+            selected,
+            "compiled output is not the exact selected Java owner path"
+        );
+        let sha: String = content_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut found = false;
+        for record in self.outputs.iter().flat_map(|record| {
+            std::iter::once(record).chain(record["entries"].as_array().into_iter().flatten())
+        }) {
+            let Some(path) = record["path"].as_str() else {
+                continue;
+            };
+            if normalized(Path::new(path))? != file_key {
+                continue;
+            }
+            anyhow::ensure!(
+                record["kind"].as_str() == Some("file")
+                    && record["bytes"].as_u64() == Some(byte_len)
+                    && record["sha256"].as_str() == Some(sha.as_str()),
+                "compiled output bytes differ from the successful selected-task receipt"
+            );
+            // Identical duplicate inventories are harmless; any conflicting one rejects above.
+            found = true;
+        }
+        anyhow::ensure!(
+            found,
+            "compiled output file missing from the selected-task receipt"
+        );
+        self.request.check_live()
+    }
+
+    pub fn watch_paths(&self) -> Vec<String> {
+        let mut paths = self.request.initial_watch_paths();
+        paths.extend(self.inputs.iter().chain(&self.outputs).filter_map(|value| {
+            value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }));
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+pub(crate) fn run_observed_compile(
+    request: std::sync::Arc<ObservedCompileRequest>,
+    prearmed: &crate::compiled_watch::WatchPlan,
+) -> ObservedCompileResult {
+    let mut outcome = CompileOutcome::default();
+    let result = (|| -> anyhow::Result<_> {
+        use serde_json::Value;
+        use std::sync::Arc;
+        request.check_live()?;
+        request.validate_roles()?;
+        // shortcut: native tree completion is verified on Windows; admit other hosts after equivalent native tests.
+        anyhow::ensure!(
+            cfg!(windows),
+            "native tree completion proof unavailable on this host"
+        );
+        let directory = request.cache_dir.clone();
+        // Never consume an earlier invocation's observer files or a partial stale output receipt.
+        std::fs::create_dir_all(
+            directory
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("missing cache parent"))?,
+        )?;
+        std::fs::create_dir(&directory)?;
+        let events_directory = directory.join("events");
+        std::fs::create_dir(&events_directory)?;
+        let script = directory.join("observer.init.gradle.kts");
+        std::fs::write(
+            &script,
+            include_bytes!("../../../scripts/classpath-dump.init.gradle.kts"),
+        )?;
+        let planned_reads = request.planned_reads();
+        anyhow::ensure!(planned_reads.len() <= 4096, "host input path cap exceeded");
+        let mut before = Vec::new();
+        let mut inventory_budget = MAX_RECEIPT_INVENTORY_ENTRIES;
+        for path in &planned_reads {
+            let record = inventory(path)?;
+            let records = 1 + record["entries"].as_array().map_or(0, Vec::len);
+            inventory_budget = inventory_budget
+                .checked_sub(records)
+                .ok_or_else(|| anyhow::anyhow!("aggregate host inventory cap exceeded"))?;
+            before.push(record);
+        }
+        let environment_sha256 = environment_hash();
+        let extra = vec![
+            "--rerun-tasks".to_string(),
+            "--no-build-cache".into(),
+            "--no-configuration-cache".into(),
+            "--max-workers=1".into(),
+            "--init-script".into(),
+            script.to_string_lossy().into_owned(),
+            format!("-Dktlsp.observer.dir={}", events_directory.display()),
+            format!("-Dktlsp.observer.root={}", request.root.display()),
+            format!("-Dktlsp.observer.task={}", request.task.task),
+            format!("-Dktlsp.observer.nonce={}", request.nonce),
+        ];
+        let native = run_gradle_compile_native(
+            &request.root,
+            &request.task.task,
+            &extra,
+            Some(&request.cancelled),
+        );
+        outcome = native.outcome;
+        anyhow::ensure!(
+            native.successful,
+            "native compile failed, timed out or logs were incomplete"
+        );
+        let mut files = Vec::new();
+        for file in std::fs::read_dir(&events_directory)? {
+            anyhow::ensure!(files.len() < 4096, "observer event cap exceeded");
+            files.push(file?);
+        }
+        files.sort_by_key(|file| file.file_name());
+        let mut events = Vec::new();
+        let mut bytes_total = 0;
+        for file in files {
+            anyhow::ensure!(
+                file.metadata()?.len() <= 16 * 1024 * 1024,
+                "observer event byte cap exceeded"
+            );
+            let mut bytes = Vec::new();
+            std::fs::File::open(file.path())?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() <= 16 * 1024 * 1024,
+                "observer event byte cap exceeded"
+            );
+            bytes_total += bytes.len();
+            anyhow::ensure!(
+                bytes_total <= 64 * 1024 * 1024,
+                "observer byte cap exceeded"
+            );
+            let event: Value = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                event["nonce"].as_str() == Some(request.nonce.as_str())
+                    && event["sequence"].as_u64() == Some(events.len() as u64),
+                "foreign/gapped observer event"
+            );
+            events.push(event);
+        }
+        let one = |name: &str| -> anyhow::Result<&Value> {
+            let matched: Vec<_> = events
+                .iter()
+                .filter(|event| event["event"] == name)
+                .collect();
+            anyhow::ensure!(matched.len() == 1, "missing/duplicate {name}");
+            Ok(matched[0])
+        };
+        let graph = one("graph")?;
+        let start = one("selected-action-start")?;
+        let action_end = one("selected-action-end")?;
+        let finished = one("build-finished")?;
+        let selected_ends: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["event"] == "task-end"
+                    && event["task"].as_str() == Some(request.task.task.as_str())
+            })
+            .collect();
+        anyhow::ensure!(
+            selected_ends.len() == 1,
+            "missing/duplicate selected task end"
+        );
+        let end = selected_ends[0];
+        anyhow::ensure!(
+            graph["selected_task"] == request.task.task
+                && graph["project"] == request.project_path
+                && graph["source_set"] == request.source_set
+                && graph["root"]
+                    .as_str()
+                    .is_some_and(|root| crate::paths::file_key(Path::new(root))
+                        == crate::paths::file_key(&request.root))
+                && graph["project_dir"]
+                    .as_str()
+                    .is_some_and(|path| crate::paths::file_key(Path::new(path))
+                        == crate::paths::file_key(&request.project_dir)),
+            "observed task/module/build/source-set mismatch"
+        );
+        anyhow::ensure!(
+            successful_task_state(&end["state"])
+                && successful_task_state(&finished["selected_state"])
+                && finished["failure"].is_null()
+                && finished["selected_started"] == true,
+            "selected task/whole invocation did not succeed"
+        );
+        anyhow::ensure!(
+            start["sequence"].as_u64() < action_end["sequence"].as_u64()
+                && action_end["sequence"].as_u64() < end["sequence"].as_u64()
+                && end["sequence"].as_u64() < finished["sequence"].as_u64(),
+            "invalid observer action order"
+        );
+        anyhow::ensure!(
+            start["inputs"] == end["inputs_after"],
+            "selected task inputs changed during action"
+        );
+        let inputs = &start["inputs"];
+        let configuration: crate::classpath::CompilerTask =
+            serde_json::from_value(inputs["configuration"].clone())?;
+        anyhow::ensure!(
+            configuration == request.task && configuration.complete,
+            "selected configured task changed"
+        );
+        let configurations: Vec<crate::classpath::CompilerTask> =
+            serde_json::from_value(inputs["compiler_configurations"].clone())?;
+        anyhow::ensure!(
+            !configurations.is_empty()
+                && configurations.iter().all(|task| task.complete
+                    && request
+                        .compiler_tasks
+                        .iter()
+                        .any(|expected| expected == task)),
+            "unknown upstream compiler task/options"
+        );
+        for compiler in &configurations {
+            if compiler.task == request.task.task {
+                continue;
+            }
+            let ends: Vec<_> = events
+                .iter()
+                .filter(|event| event["event"] == "task-end" && event["task"] == compiler.task)
+                .collect();
+            anyhow::ensure!(
+                ends.len() == 1
+                    && ends[0]["state"]["failure"].is_null()
+                    && ends[0]["sequence"].as_u64() < start["sequence"].as_u64(),
+                "upstream compiler did not finish before Java action"
+            );
+        }
+        for prior in &before {
+            let path = prior["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid host input"))?;
+            anyhow::ensure!(
+                inventory(Path::new(path))? == *prior,
+                "host source/config/AP/toolchain input changed"
+            );
+        }
+        anyhow::ensure!(
+            environment_sha256 == environment_hash(),
+            "compiler environment changed"
+        );
+        // Validate categories before deduplication can erase a read/write overlap.
+        validate_observed_roles(&request, inputs)?;
+        validate_prearmed_inputs(prearmed, inputs)?;
+        let mut reads: std::collections::BTreeMap<String, Value> = before
+            .into_iter()
+            .map(|value| (value["path"].as_str().unwrap().to_string(), value))
+            .collect();
+        for field in OBSERVED_INPUT_FIELDS {
+            let records = inputs[field]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("missing readset {field}"))?;
+            for record in records {
+                let path = record["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid readset path"))?;
+                anyhow::ensure!(
+                    inventory(Path::new(path))? == *record,
+                    "observed execution-boundary input changed"
+                );
+                if let Some(prior) = reads.insert(path.to_string(), record.clone()) {
+                    anyhow::ensure!(prior == *record, "conflicting input stamps");
+                }
+            }
+        }
+        // Upstream compiler execution-boundary inputs belong to the same receipt. Do not confuse
+        // unchanged Java owner's text with unchanged Kotlin output or AP/compiler configuration.
+        for compiler in &configurations {
+            let starts: Vec<_> = events
+                .iter()
+                .filter(|event| event["event"] == "task-start" && event["task"] == compiler.task)
+                .collect();
+            anyhow::ensure!(
+                starts.len() == 1 && starts[0]["configuration"] == serde_json::to_value(compiler)?,
+                "upstream compiler input boundary missing"
+            );
+            for record in starts[0]["declared_inputs"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("missing upstream inputs"))?
+            {
+                ensure_prearmed_read(prearmed, record)?;
+                let path = record["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid upstream input"))?;
+                // An upstream compiler may consume an earlier task's output. A value that changed
+                // later cannot be silently replaced by the final inventory and still be certified.
+                anyhow::ensure!(
+                    inventory(Path::new(path))? == *record,
+                    "upstream compiler input changed"
+                );
+                if let Some(prior) = reads.insert(path.to_string(), record.clone()) {
+                    anyhow::ensure!(prior == *record, "conflicting upstream input stamps");
+                }
+            }
+        }
+        anyhow::ensure!(
+            action_end["outputs"] == end["outputs"]
+                && end["outputs"] == finished["selected_outputs"],
+            "selected outputs changed before build completion"
+        );
+        let mut outputs = finished["selected_outputs"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing outputs"))?
+            .clone();
+        for compiler in &configurations {
+            if compiler.task == request.task.task {
+                continue;
+            }
+            let end = events
+                .iter()
+                .find(|event| event["event"] == "task-end" && event["task"] == compiler.task)
+                .ok_or_else(|| anyhow::anyhow!("missing upstream output boundary"))?;
+            outputs.extend(
+                end["outputs"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("missing upstream outputs"))?
+                    .clone(),
+            );
+        }
+        let receipt = Arc::new(SuccessfulCompileReceipt {
+            request: request.clone(),
+            inputs: reads.into_values().collect(),
+            outputs,
+            environment_sha256,
+        });
+        receipt.verify_current()?;
+        // Decode only actual selected Java task output roots. Kotlin upstream classes do not count
+        // as evidence of a selected Java member, even if build/classes as a whole is non-empty.
+        let java_sources: std::collections::BTreeSet<_> = inputs["java_task_sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value["path"].as_str())
+            .map(|path| crate::paths::file_key(Path::new(path)))
+            .collect();
+        let mut owners = Vec::new();
+        let mut parser = crate::java::JavaParser::new();
+        for owner in &request.owners {
+            if !java_sources.contains(&owner.definition.file) {
+                continue;
+            }
+            let internal_name = owner.qualified_name.replace('.', "/");
+            let relative = PathBuf::from(format!("{internal_name}.class"));
+            let classes: Vec<_> = request
+                .task
+                .output_roots
+                .iter()
+                .map(|root| root.join(&relative))
+                .filter(|file| file.is_file())
+                .collect();
+            if classes.len() != 1 {
+                continue;
+            }
+            let limit = ktcore::classfile::MAX_CLASS_FILE_BYTES as u64;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&classes[0])?
+                .take(limit + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() as u64 <= limit, "classfile byte cap exceeded");
+            let class = Arc::new(ktcore::classfile::decode(&owner.origin_id, &bytes)?);
+            receipt.verify_compiled_output(&classes[0], bytes.len() as u64, &class)?;
+            anyhow::ensure!(
+                class.identity.internal_name == internal_name,
+                "compiled owner mismatch"
+            );
+            if !class.methods.iter().any(|method| {
+                method.descriptor.as_ref() == "()Ljava/lang/String;"
+                    && method.access_flags & 0x0001 != 0
+                    && method.access_flags & (0x0008 | 0x0040 | 0x1000) == 0
+            }) {
+                continue;
+            }
+            let text: Arc<str> = Arc::from(std::fs::read_to_string(&owner.definition.file)?);
+            let tree = parser.parse(&text);
+            anyhow::ensure!(
+                !tree.root_node().has_error(),
+                "owner source parse is incomplete"
+            );
+            owners.push(CompiledOwnerInput {
+                file: owner.definition.file.clone(),
+                class_file: classes[0].clone(),
+                class_file_bytes: bytes.len() as u64,
+                text,
+                tree,
+                class,
+            });
+        }
+        receipt.verify_current()?;
+        anyhow::ensure!(!owners.is_empty(), "no supported compiled owner");
+        Ok((receipt, owners))
+    })();
+    match result {
+        Ok((receipt, owners)) => ObservedCompileResult {
+            outcome,
+            receipt: Some(receipt),
+            owners,
+            reason: "observed-success".into(),
+        },
+        Err(error) => ObservedCompileResult {
+            outcome,
+            receipt: None,
+            owners: Vec::new(),
+            reason: error.to_string(),
+        },
+    }
+}
+
+const OBSERVED_INPUT_FIELDS: [&str; 9] = [
+    "module_sources",
+    "java_task_sources",
+    "ordered_classpath",
+    "annotation_processor_path",
+    "plugin_artifacts",
+    "declared_task_input_files",
+    "build_configuration_files",
+    "ancestor_lombok_configs",
+    "compiler_runtime_files",
+];
+
+fn validate_observed_roles(
+    request: &ObservedCompileRequest,
+    inputs: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let outputs: Vec<_> = request
+        .compiler_tasks
+        .iter()
+        .flat_map(|task| &task.declared_output_roots)
+        .map(|p| crate::paths::file_key(p))
+        .collect();
+    for field in OBSERVED_INPUT_FIELDS {
+        let records = inputs[field]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing input role {field}"))?;
+        for record in records {
+            let path = record["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid input role path"))?;
+            anyhow::ensure!(
+                Path::new(path).is_absolute(),
+                "relative observed input path"
+            );
+            let key = crate::paths::file_key(Path::new(path));
+            anyhow::ensure!(
+                !outputs.iter().any(|root| paths_overlap(&key, root)),
+                "observed {field} input overlaps deferred output without temporal read proof"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_prearmed_inputs(
+    plan: &crate::compiled_watch::WatchPlan,
+    inputs: &serde_json::Value,
+) -> anyhow::Result<()> {
+    for field in OBSERVED_INPUT_FIELDS {
+        for record in inputs[field]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing readset {field}"))?
+        {
+            ensure_prearmed_read(plan, record)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_prearmed_read(
+    plan: &crate::compiled_watch::WatchPlan,
+    record: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let path = record["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid readset path"))?;
+    let kind = record["kind"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid readset kind"))?;
+    anyhow::ensure!(
+        Path::new(path).is_absolute() && matches!(kind, "file" | "directory" | "absent"),
+        "unsupported observed read record"
+    );
+    // Extending watches after a build cannot establish what changed during its action.
+    anyhow::ensure!(
+        plan.covers_read(path, kind == "directory"),
+        "observed input lacked prearmed read coverage: {path}"
+    );
+    Ok(())
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let a =
+            crate::paths::file_key(&std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a)))
+                .to_lowercase();
+        let b =
+            crate::paths::file_key(&std::path::absolute(b).unwrap_or_else(|_| PathBuf::from(b)))
+                .to_lowercase();
+        return path_under(&a, &b) || path_under(&b, &a);
+    }
+    #[cfg(not(windows))]
+    {
+        path_under(a, b) || path_under(b, a)
+    }
+}
+
+fn successful_task_state(state: &serde_json::Value) -> bool {
+    state["executed"] == true
+        && state["did_work"] == true
+        && state["failure"].is_null()
+        && state["skipped"] == false
+        && state["up_to_date"] == false
+        && state["no_source"] == false
+}
+
+pub(crate) fn path_under(key: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    key == root
+        || key
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn environment_hash() -> String {
+    use sha2::{Digest, Sha256};
+    // Hash values rather than retaining/logging potentially sensitive environment strings.
+    let variables: std::collections::BTreeMap<_, _> = std::env::vars_os()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&variables).unwrap_or_default())
+    )
+}
+
+const MAX_RECEIPT_INVENTORY_ENTRIES: usize = 20_000;
+
+fn inventory(path: &Path) -> anyhow::Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let key = crate::paths::file_key(path);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::json!({"path":key,"kind":"absent"}))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "unsupported input symlink"
+    );
+    if metadata.is_file() {
+        let mut hash = Sha256::new();
+        let mut file = std::fs::File::open(path)?;
+        let mut buffer = [0; 65536];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        return Ok(
+            serde_json::json!({"path":key,"kind":"file","bytes":metadata.len(),"sha256":format!("{:x}",hash.finalize())}),
+        );
+    }
+    anyhow::ensure!(metadata.is_dir(), "unsupported non-regular input");
+    let mut entries = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry?;
+        anyhow::ensure!(
+            !entry.file_type().is_symlink(),
+            "unsupported directory symlink"
+        );
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        anyhow::ensure!(
+            entries.len() < MAX_RECEIPT_INVENTORY_ENTRIES,
+            "receipt inventory cap exceeded"
+        );
+        entries.insert(
+            crate::paths::file_key(entry.path()),
+            inventory(entry.path())?,
+        );
+    }
+    Ok(
+        serde_json::json!({"path":key,"kind":"directory","entries":entries.into_values().collect::<Vec<_>>()}),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn observed_test_request(root: &Path) -> std::sync::Arc<ObservedCompileRequest> {
+    // Lifecycle fixtures only; this cannot mint a production receipt or generated source Def.
+    use std::sync::{atomic::AtomicBool, Arc};
+    let task = crate::classpath::CompilerTask {
+        task: ":compileJava".into(),
+        language: crate::classpath::CompilerLanguage::Java,
+        task_type: "org.gradle.api.tasks.compile.JavaCompile".into(),
+        arguments: Vec::new(),
+        annotation_processor_path: Vec::new(),
+        java_home: None,
+        options: Default::default(),
+        source_files: vec![root.join("src/Person.java")],
+        classpath: Vec::new(),
+        declared_input_files: vec![root.join("src/Person.java")],
+        declared_output_roots: vec![root.join("build/classes/java/main")],
+        output_roots: vec![root.join("build/classes/java/main")],
+        complete: true,
+        problem: None,
+    };
+    Arc::new(ObservedCompileRequest {
+        root: root.into(),
+        project_dir: root.into(),
+        scope: crate::project_model::ProjectScope {
+            module: ":".into(),
+            source_set: "main".into(),
+        },
+        source_set: "main".into(),
+        task: task.clone(),
+        compiler_tasks: vec![task],
+        project_path: ":".into(),
+        source_roots: vec![crate::paths::file_key(&root.join("src"))],
+        classpath: Vec::new(),
+        cache_dir: root.join("unused-test-cache"),
+        owners: Vec::new(),
+        nonce: "lifecycle-fixture-only".into(),
+        invalid: Arc::new(AtomicBool::new(false)),
+        cancelled: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn observed_test_receipt(
+    request: std::sync::Arc<ObservedCompileRequest>,
+) -> std::sync::Arc<SuccessfulCompileReceipt> {
+    // Empty lifecycle state, never positive classfile admission or a Gradle-success oracle.
+    std::sync::Arc::new(SuccessfulCompileReceipt {
+        request,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        environment_sha256: environment_hash(),
+    })
+}
+
+#[cfg(test)]
+mod observed_role_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn fixture_request() -> Arc<ObservedCompileRequest> {
+        observed_test_request(&std::env::temp_dir().join("ktlsp-observed-role-only"))
+    }
+
+    fn sync_selected(request: &mut ObservedCompileRequest) {
+        request.compiler_tasks[0] = request.task.clone();
+    }
+
+    #[test]
+    fn qualified_task_status_requires_the_selected_module() {
+        assert!(parse_output("> Task :app:compileJava\n", ":app:compileJava").executed);
+        assert!(!parse_output("> Task :other:compileJava\n", ":app:compileJava").executed);
+        assert!(!parse_output("> Task :app:compileJava UP-TO-DATE\n", ":app:compileJava").executed);
+        assert!(
+            parse_output("> Task :app:compileJava\n", "compileJava").executed,
+            "legacy unqualified task names retain their behavior"
+        );
+    }
+
+    #[test]
+    fn registered_generated_root_is_coverage_but_actual_read_overlap_is_rejected() {
+        let mut owned = fixture_request();
+        let request = Arc::get_mut(&mut owned).unwrap();
+        let output = request.root.join("build/generated/annotationProcessor");
+        request.source_roots.push(crate::paths::file_key(&output));
+        request.task.declared_output_roots.push(output.clone());
+        sync_selected(request);
+        assert!(
+            request.validate_roles().is_ok(),
+            "registration alone does not prove a read"
+        );
+        assert!(request.is_known_output(&crate::paths::file_key(&output.join("Generated.java"))));
+        assert!(!request.planned_reads().contains(&output));
+
+        for role in ["source", "classpath", "declared-input", "AP", "plugin"] {
+            let mut owned = fixture_request();
+            let candidate = Arc::get_mut(&mut owned).unwrap();
+            let input = candidate.task.output_roots[0].join("read-again.jar");
+            match role {
+                "source" => candidate.task.source_files.push(input),
+                "classpath" => candidate.task.classpath.push(input),
+                "declared-input" => candidate.task.declared_input_files.push(input),
+                "AP" => candidate.task.annotation_processor_path.push(input),
+                "plugin" => candidate
+                    .task
+                    .arguments
+                    .push(format!("-Xplugin={}", input.display())),
+                _ => unreachable!(),
+            }
+            sync_selected(candidate);
+            assert!(
+                candidate.validate_roles().is_err(),
+                "{role} was lost before role validation"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_owner_is_distinct_but_ambiguous_or_missing_metadata_never_proves_roles() {
+        let mut owned = fixture_request();
+        let candidate = Arc::get_mut(&mut owned).unwrap();
+        let mut upstream = candidate.task.clone();
+        upstream.task = ":compileKotlin".into();
+        upstream.language = crate::classpath::CompilerLanguage::Kotlin;
+        upstream.source_files = vec![candidate.root.join("src/Upstream.kt")];
+        upstream.declared_input_files = upstream.source_files.clone();
+        upstream.output_roots = vec![candidate.root.join("build/classes/kotlin/main")];
+        upstream.declared_output_roots = upstream.output_roots.clone();
+        candidate.task.classpath = vec![candidate.root.join("dependencies/external.jar")];
+        sync_selected(candidate);
+        candidate.compiler_tasks.push(upstream);
+        assert!(
+            candidate.validate_roles().is_ok(),
+            "distinct output ownership alone is supported"
+        );
+        candidate.task.classpath = candidate.compiler_tasks[1].output_roots.clone();
+        sync_selected(candidate);
+        assert!(candidate.validate_roles().is_err(),
+            "legitimate upstream Java classpath remains an OPEN useful-API gap until temporal read proof");
+        candidate.task.classpath.clear();
+        candidate.task.annotation_processor_path = candidate.compiler_tasks[1].output_roots.clone();
+        sync_selected(candidate);
+        assert!(
+            candidate.validate_roles().is_err(),
+            "an AP input cannot be hidden by output delegation"
+        );
+        candidate.task.annotation_processor_path.clear();
+        sync_selected(candidate);
+        candidate.compiler_tasks[1]
+            .declared_output_roots
+            .push(candidate.task.output_roots[0].clone());
+        assert!(
+            candidate.validate_roles().is_err(),
+            "two output owners must not be merged"
+        );
+
+        for missing in [
+            "source",
+            "class-destination",
+            "declared-output",
+            "relative-input",
+        ] {
+            let mut owned = fixture_request();
+            let candidate = Arc::get_mut(&mut owned).unwrap();
+            match missing {
+                "source" => candidate.task.source_files.clear(),
+                "class-destination" => candidate.task.output_roots.clear(),
+                "declared-output" => candidate.task.declared_output_roots.clear(),
+                "relative-input" => candidate
+                    .task
+                    .declared_input_files
+                    .push(PathBuf::from("relative.jar")),
+                _ => unreachable!(),
+            }
+            sync_selected(candidate);
+            assert!(
+                candidate.validate_roles().is_err(),
+                "complete=true cannot prove {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_upstream_binary_a_b_a_cannot_be_certified_by_endpoint_stamps() {
+        use sha2::Digest;
+        let mut owned = fixture_request();
+        let request = Arc::get_mut(&mut owned).unwrap();
+        let mut upstream = request.task.clone();
+        upstream.task = ":compileKotlin".into();
+        upstream.language = crate::classpath::CompilerLanguage::Kotlin;
+        upstream.output_roots = vec![request.root.join("build/classes/kotlin/main")];
+        upstream.declared_output_roots = upstream.output_roots.clone();
+        let binary = upstream.output_roots[0].join("Upstream.class");
+        request.compiler_tasks.push(upstream);
+        // Model roles have no overlap here: the actual receipt reveals an additional read.
+        assert!(request.validate_roles().is_ok());
+        let mut inputs = serde_json::Value::Object(
+            OBSERVED_INPUT_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), serde_json::json!([])))
+                .collect(),
+        );
+        inputs["ordered_classpath"] = serde_json::json!([{
+            "path": crate::paths::file_key(&binary), "kind": "file", "bytes":1,
+            "sha256":format!("{:x}", sha2::Sha256::digest(b"A"))
+        }]);
+        let identical_endpoints = inputs.clone();
+        assert_eq!(
+            inputs, identical_endpoints,
+            "equal endpoints say nothing about an intermediate B"
+        );
+        assert!(
+            validate_observed_roles(request, &inputs).is_err(),
+            "a deferred binary read must not be admitted even with equal endpoint stamps"
+        );
+    }
+
+    #[test]
+    fn selected_and_upstream_reads_cannot_acquire_coverage_after_the_action() {
+        let request = fixture_request();
+        let plan =
+            crate::compiled_watch::WatchPlan::build(&request, &request.initial_watch_paths())
+                .unwrap();
+        let source = crate::paths::file_key(&request.task.source_files[0]);
+        let config = crate::paths::file_key(&request.root.join("gradle.properties"));
+        let external_config = crate::paths::file_key(
+            &request
+                .root
+                .parent()
+                .unwrap()
+                .join("unplanned-source-parent/lombok.config"),
+        );
+        let known =
+            serde_json::json!({"path":source,"kind":"file","sha256":"same-at-both-endpoints"});
+        let negative = serde_json::json!({"path":config,"kind":"absent"});
+        let unprotected = serde_json::json!({"path":external_config,"kind":"absent"});
+        for field in OBSERVED_INPUT_FIELDS {
+            let mut inputs = serde_json::json!({});
+            for other in OBSERVED_INPUT_FIELDS {
+                inputs[other] = serde_json::json!([]);
+            }
+            inputs[field] = serde_json::json!([known.clone(), negative.clone()]);
+            assert!(
+                validate_prearmed_inputs(&plan, &inputs).is_ok(),
+                "{field} has initial source/negative coverage"
+            );
+            inputs[field] = serde_json::json!([unprotected.clone()]);
+            assert!(
+                validate_prearmed_inputs(&plan, &inputs).is_err(),
+                "{field} cannot certify A->B->A solely from matching endpoint/late watches"
+            );
+        }
+        // Upstream task-start.declared_inputs use the same rule; a parent guard is not an
+        // arbitrary sibling read watch, even when a final inventory reports absence again.
+        assert!(ensure_prearmed_read(&plan, &known).is_ok());
+        assert!(ensure_prearmed_read(&plan, &unprotected).is_err());
+        let later = crate::compiled_watch::WatchPlan::build(&request, &[external_config]).unwrap();
+        assert!(ensure_prearmed_read(&later, &unprotected).is_ok());
+        assert!(
+            ensure_prearmed_read(&plan, &unprotected).is_err(),
+            "a late plan does not change the actual initial plan"
+        );
+    }
+
+    #[test]
+    fn observed_input_categories_are_checked_before_path_deduplication() {
+        let request = fixture_request();
+        let empty = serde_json::Value::Object(
+            OBSERVED_INPUT_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), serde_json::json!([])))
+                .collect(),
+        );
+        assert!(validate_observed_roles(&request, &empty).is_ok());
+        for field in OBSERVED_INPUT_FIELDS {
+            let mut inputs = empty.clone();
+            inputs[field] = serde_json::json!([{
+                "path": crate::paths::file_key(&request.task.output_roots[0].join("collision.class")),
+                "kind": "absent"
+            }]);
+            assert!(
+                validate_observed_roles(&request, &inputs).is_err(),
+                "{field}"
+            );
+        }
+        assert!(validate_observed_roles(&request, &serde_json::json!({})).is_err());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observed_test_receipt_with_source(
+    request: std::sync::Arc<ObservedCompileRequest>,
+    key: &str,
+    text: &str,
+    class_file: &Path,
+    class_bytes: &[u8],
+) -> std::sync::Arc<SuccessfulCompileReceipt> {
+    // Host invalidation fixture only: deliberately no native/task/freshness proof. The private
+    // production receipt constructor remains exclusively in run_observed_compile.
+    use sha2::{Digest, Sha256};
+    std::sync::Arc::new(SuccessfulCompileReceipt {
+        request,
+        inputs: vec![
+            serde_json::json!({"path":key,"kind":"file","bytes":text.len(),
+            "sha256":format!("{:x}", Sha256::digest(text.as_bytes()))}),
+        ],
+        outputs: vec![
+            serde_json::json!({"path":crate::paths::file_key(class_file),"kind":"file",
+            "bytes":class_bytes.len(),"sha256":format!("{:x}",Sha256::digest(class_bytes))}),
+        ],
+        environment_sha256: environment_hash(),
+    })
+}
+
+#[cfg(test)]
+mod compiled_output_binding_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    const CLASS: &[u8] =
+        include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+
+    fn fixture() -> (
+        Arc<SuccessfulCompileReceipt>,
+        PathBuf,
+        ktcore::classfile::ClassFileFacts,
+    ) {
+        let request =
+            observed_test_request(&std::env::temp_dir().join("ktlsp-output-binding-only"));
+        let path = request.task.output_roots[0].join("pluginfixture/Person.class");
+        let receipt = observed_test_receipt_with_source(request, "unused-source", "", &path, CLASS);
+        (
+            receipt,
+            path,
+            ktcore::classfile::decode("fixture-origin", CLASS).unwrap(),
+        )
+    }
+
+    #[test]
+    fn different_decoded_bytes_cannot_use_an_unchanged_output_receipt() {
+        let (receipt, path, original) = fixture();
+        assert!(receipt
+            .verify_compiled_output(&path, CLASS.len() as u64, &original)
+            .is_ok());
+        // Constant-pool-only mutation is a distinct decodable class with the same owner;
+        // it models the B bytes retained between A endpoint inventories, not a compiler run.
+        let mut different = CLASS.to_vec();
+        let offset = different
+            .windows(7)
+            .position(|value| value == b"getName")
+            .unwrap();
+        different[offset..offset + 7].copy_from_slice(b"getElse");
+        let different = ktcore::classfile::decode("fixture-origin", &different).unwrap();
+        assert_eq!(
+            original.identity.internal_name,
+            different.identity.internal_name
+        );
+        assert_ne!(original.identity.input, different.identity.input);
+        assert!(receipt
+            .verify_compiled_output(&path, CLASS.len() as u64, &different)
+            .is_err());
+    }
+
+    #[test]
+    fn output_binding_requires_selected_exact_path_and_complete_consistent_file_stamp() {
+        let (receipt, path, class) = fixture();
+        let upstream = receipt
+            .request
+            .root
+            .join("build/classes/kotlin/main/pluginfixture/Person.class");
+        assert!(receipt
+            .verify_compiled_output(&upstream, CLASS.len() as u64, &class)
+            .is_err());
+        let wrong_name = path.with_file_name("Other.class");
+        assert!(receipt
+            .verify_compiled_output(&wrong_name, CLASS.len() as u64, &class)
+            .is_err());
+        assert!(receipt
+            .verify_compiled_output(
+                &path,
+                ktcore::classfile::MAX_CLASS_FILE_BYTES as u64 + 1,
+                &class
+            )
+            .is_err());
+        let file = receipt.outputs[0].clone();
+        for change in [
+            "missing",
+            "upstream-only",
+            "kind",
+            "length",
+            "hash",
+            "conflict",
+        ] {
+            let mut outputs = vec![file.clone()];
+            match change {
+                "missing" => outputs.clear(),
+                "upstream-only" => {
+                    outputs[0]["path"] = serde_json::json!(crate::paths::file_key(&upstream))
+                }
+                "kind" => outputs[0]["kind"] = serde_json::json!("absent"),
+                "length" => outputs[0]["bytes"] = serde_json::json!(CLASS.len() + 1),
+                "hash" => outputs[0]["sha256"] = serde_json::json!("00".repeat(32)),
+                "conflict" => {
+                    let mut other = file.clone();
+                    other["sha256"] = serde_json::json!("00".repeat(32));
+                    outputs.push(other);
+                }
+                _ => unreachable!(),
+            }
+            let candidate = SuccessfulCompileReceipt {
+                request: receipt.request.clone(),
+                inputs: Vec::new(),
+                outputs,
+                environment_sha256: environment_hash(),
+            };
+            assert!(
+                candidate
+                    .verify_compiled_output(&path, CLASS.len() as u64, &class)
+                    .is_err(),
+                "{change}"
+            );
+        }
+        let mut positive = SuccessfulCompileReceipt {
+            request: receipt.request.clone(),
+            inputs: Vec::new(),
+            outputs: vec![
+                serde_json::json!({"path":crate::paths::file_key(&receipt.request.task.output_roots[0]),
+                "kind":"directory","entries":[file.clone()]}),
+            ],
+            environment_sha256: environment_hash(),
+        };
+        assert!(positive
+            .verify_compiled_output(&path, CLASS.len() as u64, &class)
+            .is_ok());
+        positive.outputs.push(file);
+        assert!(
+            positive
+                .verify_compiled_output(&path, CLASS.len() as u64, &class)
+                .is_ok(),
+            "identical stamp duplicates"
+        );
     }
 }

@@ -31,3 +31,4 @@ parking_lot = "0.12"
 
 [patch.crates-io]
 ls-types = { path = "vendor/ls-types" }
+notify = { path = "vendor/notify" }

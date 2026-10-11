@@ -2,6 +2,8 @@
 
 use serde::Serialize;
 
+pub const COMPILE: &str = "ktlsp.compile";
+
 pub const REINDEX: &str = "ktlsp.reindex";
 pub const TRACE_PATH: &str = "ktlsp.tracePath";
 pub const EXPLAIN_RESOLUTION: &str = "ktlsp.explainResolution";
@@ -11,6 +13,7 @@ pub const DUMP_SYMBOL: &str = "ktlsp.dumpSymbol";
 pub fn all() -> Vec<String> {
     vec![
         REINDEX.to_string(),
+        COMPILE.to_string(),
         TRACE_PATH.to_string(),
         EXPLAIN_RESOLUTION.to_string(),
         EXPLAIN_COMPLETION.to_string(),

@@ -14,7 +14,10 @@ pub use ktcore::extensions::AnalysisProvider;
 #[derive(Default)]
 pub(crate) struct AnalysisExtensions {
     providers: BTreeMap<String, Arc<dyn AnalysisProvider>>,
-    inputs: BTreeMap<String, (Arc<str>, Tree)>,
+    inputs: BTreeMap<String, SourceInput>,
+    retain_all_sources: bool,
+    compiled_enabled: bool,
+    compiled_receipt: Option<Arc<crate::compile::SuccessfulCompileReceipt>>,
     store: ExtensionStore,
     changed: BTreeSet<String>,
     suspended: bool,
@@ -24,7 +27,14 @@ pub(crate) struct AnalysisExtensions {
 
 impl AnalysisExtensions {
     pub fn new(providers: Vec<Arc<dyn AnalysisProvider>>) -> Self {
-        let mut result = Self::default();
+        let retain_all_sources = !providers.is_empty();
+        let mut providers = providers;
+        providers.push(Arc::new(CompiledJavaProvider));
+        let mut result = Self {
+            retain_all_sources,
+            compiled_enabled: true,
+            ..Self::default()
+        };
         for provider in providers {
             let id = provider.id().to_string();
             assert!(
@@ -38,7 +48,7 @@ impl AnalysisExtensions {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
+        !self.retain_all_sources && self.compiled_receipt.is_none()
     }
 
     pub fn configure(
@@ -50,6 +60,10 @@ impl AnalysisExtensions {
     ) -> bool {
         if !self.providers.contains_key(id) {
             return false;
+        }
+        if id == COMPILED_JAVA_PROVIDER {
+            self.clear_compiled();
+            self.compiled_enabled = enabled;
         }
         self.changed.extend(
             self.store
@@ -70,14 +84,39 @@ impl AnalysisExtensions {
         if self.is_empty() || sources.is_empty() {
             return;
         }
+        if self.compiled_receipt.as_ref().is_some_and(|receipt| {
+            sources.iter().any(|(key, text, _)| {
+                receipt.observes_path(key) && !receipt.source_matches(key, text)
+            })
+        }) {
+            if let Some(receipt) = &self.compiled_receipt {
+                receipt
+                    .request
+                    .invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.clear_compiled();
+        }
         let namespace = self.store.namespace_revision();
         let keys: Vec<_> = sources.iter().map(|(key, _, _)| key.clone()).collect();
         for (key, text, tree) in sources {
             self.changed.insert(key.clone());
-            self.inputs.insert(key, (text, tree));
+            // A host source replacement cannot transfer a prior build's binary authority.
+            let compiled = self
+                .inputs
+                .remove(&key)
+                .and_then(|input| (input.text == text).then_some(input.compiled).flatten());
+            self.inputs.insert(
+                key,
+                SourceInput {
+                    text,
+                    tree,
+                    compiled,
+                },
+            );
         }
         for key in keys {
-            self.normalize(index, &key);
+            let _ = self.normalize(index, &key);
         }
         // Type visibility changes can change an otherwise untouched source signature.
         if self.store.namespace_revision() != namespace {
@@ -87,6 +126,19 @@ impl AnalysisExtensions {
     }
 
     pub fn remove_source(&mut self, index: &dyn InferenceIndex, key: &str) {
+        if self
+            .compiled_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.observes_path(key))
+        {
+            if let Some(receipt) = &self.compiled_receipt {
+                receipt
+                    .request
+                    .invalid
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.clear_compiled();
+        }
         self.inputs.remove(key);
         let namespace = self.store.namespace_revision();
         self.store.remove_source(key);
@@ -103,6 +155,7 @@ impl AnalysisExtensions {
         }
         self.mark_published();
         self.suspended = true;
+        self.clear_compiled();
         self.store.invalidate_model();
     }
 
@@ -111,6 +164,7 @@ impl AnalysisExtensions {
             return;
         }
         self.mark_published();
+        self.clear_compiled();
         self.store.invalidate_model();
         self.normalize_all(index);
         self.evaluate(index);
@@ -119,6 +173,7 @@ impl AnalysisExtensions {
     pub fn mark_index_changed(&mut self) {
         if !self.is_empty() && !self.pending_index {
             self.mark_published();
+            self.clear_compiled();
             self.store.invalidate_model();
             self.pending_index = true;
         }
@@ -173,22 +228,28 @@ impl AnalysisExtensions {
         );
     }
 
-    fn normalize(&mut self, index: &dyn InferenceIndex, key: &str) {
-        let Some((text, tree)) = self.inputs.get(key) else {
-            return;
+    fn normalize(&mut self, index: &dyn InferenceIndex, key: &str) -> Result<(), String> {
+        let Some(input) = self.inputs.get(key) else {
+            return Ok(());
         };
-        let facts = crate::language::extension_source_facts(index, key, tree, text);
+        let facts = crate::language::extension_source_facts(index, key, &input.tree, &input.text);
         if let Err(error) = self.store.replace_source_declarations(
             index,
             key,
-            text.clone(),
+            input.text.clone(),
             Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]),
             facts,
         ) {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
             self.store.remove_source(key);
             tracing::warn!(file = key, ?error, "invalid normalized extension source");
+            return Err(format!("invalid normalized extension source: {error:?}"));
         }
+        let result = self.attach_compiled(index, key);
+        if let Err(error) = &result {
+            tracing::warn!(file = key, %error, "invalid compiled source owner");
+        }
+        result
     }
 
     fn normalize_all(&mut self, index: &dyn InferenceIndex) {
@@ -196,7 +257,7 @@ impl AnalysisExtensions {
             return;
         }
         for key in self.inputs.keys().cloned().collect::<Vec<_>>() {
-            self.normalize(index, &key);
+            let _ = self.normalize(index, &key);
         }
     }
 
@@ -205,6 +266,14 @@ impl AnalysisExtensions {
             return;
         }
         for (provider, owner) in self.store.take_dirty() {
+            if provider == COMPILED_JAVA_PROVIDER
+                && !self
+                    .inputs
+                    .get(&owner)
+                    .is_some_and(|input| input.compiled.is_some())
+            {
+                continue;
+            }
             let Some(provider) = self.providers.get(&provider) else {
                 continue;
             };
@@ -232,5 +301,191 @@ impl AnalysisExtensions {
             }
             self.changed.insert(owner);
         }
+    }
+}
+
+pub(crate) const COMPILED_JAVA_PROVIDER: &str = "ktlsp.compiled-java";
+
+struct CompiledJavaProvider;
+
+impl AnalysisProvider for CompiledJavaProvider {
+    fn id(&self) -> &str {
+        COMPILED_JAVA_PROVIDER
+    }
+
+    fn analyze(
+        &self,
+        read: &mut ktcore::extensions::ReadSession<'_>,
+    ) -> Result<(), ktcore::extensions::ContractError> {
+        for declaration in read.declarations().to_vec() {
+            if declaration.owner.is_some() || declaration.member.is_some() {
+                continue;
+            }
+            let def = &declaration.definition;
+            let Some(name) = read.source().get(def.start_byte..def.end_byte) else {
+                continue;
+            };
+            let ty = ktcore::types::TypeRef::simple(name);
+            let Knowledge::Found(owner) = read.resolve_type_ref(&ty) else {
+                continue;
+            };
+            if owner.definition() != def {
+                continue;
+            }
+            let Knowledge::Found(class) = read.compiled_class(&owner)? else {
+                continue;
+            };
+            for method in read.compiled_methods(&class)? {
+                // The shared core validates language surface and descriptor; this provider cannot
+                // create a signature, source position or a framework-specific completion item.
+                let _ = read.admit_java_method(&method)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct SourceInput {
+    text: Arc<str>,
+    tree: Tree,
+    compiled: Option<Arc<ktcore::classfile::ClassFileFacts>>,
+}
+
+impl AnalysisExtensions {
+    /// Called before Arc/tree copies. The builtin retains only accepted compiled source owners;
+    /// explicitly registered external providers retain the same source inputs as before.
+    pub fn needs_source(&self, key: &str) -> bool {
+        self.retain_all_sources || self.inputs.contains_key(key)
+    }
+
+    pub fn compiled_enabled(&self) -> bool {
+        self.compiled_enabled
+    }
+
+    pub fn compiled_receipt(&self) -> Option<&Arc<crate::compile::SuccessfulCompileReceipt>> {
+        self.compiled_receipt.as_ref()
+    }
+
+    pub fn invalidate_compiled(&mut self, index: &dyn InferenceIndex) {
+        if self.clear_compiled() {
+            self.evaluate(index);
+        }
+    }
+
+    fn clear_compiled(&mut self) -> bool {
+        if self.compiled_receipt.take().is_none() {
+            return false;
+        }
+        self.store.clear_compiled_inputs();
+        let compiled_keys: Vec<_> = self
+            .inputs
+            .iter_mut()
+            .filter_map(|(key, input)| input.compiled.take().map(|_| key.clone()))
+            .collect();
+        for key in compiled_keys {
+            self.changed.insert(key.clone());
+            if !self.retain_all_sources {
+                self.inputs.remove(&key);
+                self.store.remove_source(&key);
+            }
+        }
+        true
+    }
+
+    pub fn accept_compiled(
+        &mut self,
+        index: &dyn InferenceIndex,
+        receipt: Arc<crate::compile::SuccessfulCompileReceipt>,
+        owners: Vec<crate::compile::CompiledOwnerInput>,
+    ) -> Result<(), String> {
+        if !self.compiled_enabled || self.suspended {
+            return Err("provider-disabled-or-suspended".into());
+        }
+        receipt
+            .request
+            .check_live()
+            .map_err(|error| error.to_string())?;
+        self.invalidate_compiled(index);
+        self.compiled_receipt = Some(receipt);
+        for owner in owners {
+            let receipt = self.compiled_receipt.as_ref().unwrap();
+            if let Err(error) = receipt.verify_compiled_output(
+                &owner.class_file,
+                owner.class_file_bytes,
+                &owner.class,
+            ) {
+                self.invalidate_compiled(index);
+                return Err(error.to_string());
+            }
+            let expected = receipt
+                .request
+                .owners
+                .iter()
+                .find(|expected| expected.definition.file == owner.file);
+            let valid = expected.is_some_and(|expected| {
+                owner.class.identity.origin_id == expected.origin_id
+                    && owner.class.identity.internal_name
+                        == expected.qualified_name.replace('.', "/")
+                    && receipt.source_matches(&owner.file, &owner.text)
+            });
+            if !valid {
+                self.invalidate_compiled(index);
+                return Err("compiled-owner-or-source-mismatch".into());
+            }
+            self.changed.insert(owner.file.clone());
+            self.inputs.insert(
+                owner.file,
+                SourceInput {
+                    text: owner.text,
+                    tree: owner.tree,
+                    compiled: Some(owner.class),
+                },
+            );
+        }
+        // No intermediate publication: failure removes the whole attempted compiled set. Other
+        // providers keep their independent validated contributions and configuration.
+        let result = (|| {
+            for key in self
+                .inputs
+                .iter()
+                .filter(|(_, input)| input.compiled.is_some())
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+            {
+                self.normalize(index, &key)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.invalidate_compiled(index);
+        }
+        self.evaluate(index);
+        result
+    }
+
+    fn attach_compiled(&mut self, index: &dyn InferenceIndex, key: &str) -> Result<(), String> {
+        let Some(class) = self
+            .inputs
+            .get(key)
+            .and_then(|input| input.compiled.clone())
+        else {
+            return Ok(());
+        };
+        let mut read = self
+            .store
+            .begin(index, COMPILED_JAVA_PROVIDER, key)
+            .map_err(|error| format!("{error:?}"))?;
+        let qualified = class.identity.internal_name.replace('/', ".");
+        let resolved = read.resolve_type(&qualified);
+        let pending = read.finish();
+        self.store
+            .commit(pending)
+            .map_err(|error| format!("{error:?}"))?;
+        let Knowledge::Found(owner) = resolved else {
+            return Err("current-source-owner-unknown".into());
+        };
+        self.store
+            .replace_compiled_input(index, &owner, Some(class))
+            .map_err(|error| format!("{error:?}"))
     }
 }

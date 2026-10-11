@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 4;
+const MODEL_VERSION: u32 = 5;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,14 @@ pub struct CompilerTask {
     pub task_type: String,
     pub arguments: Vec<String>,
     pub annotation_processor_path: Vec<PathBuf>,
+    #[serde(default)]
+    pub source_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub classpath: Vec<PathBuf>,
+    #[serde(default)]
+    pub declared_input_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub declared_output_roots: Vec<PathBuf>,
     pub java_home: Option<PathBuf>,
     pub options: BTreeMap<String, serde_json::Value>,
     pub output_roots: Vec<PathBuf>,
@@ -1284,6 +1292,10 @@ mod tests {
             "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
             "arguments": ["-Xplugin=C:\\plugins\\serializer.jar", "-P", "annotation=one\ttwo\n三"],
             "annotation_processor_path": [], "java_home": null,
+            "source_files": ["/app/src/First.kt", "/app/src/Second.kt"],
+            "classpath": ["/app/first.jar", "/app/second.jar"],
+            "declared_input_files": ["/app/src/First.kt", "/app/first.jar"],
+            "declared_output_roots": ["/app/classes/kotlin", "/app/task-state.bin"],
             "options": {"jvmTarget": "17"}, "output_roots": ["/app/classes/kotlin"],
             "complete": true, "problem": null
         });
@@ -1533,8 +1545,13 @@ dependencies {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("classpath.json");
-        let original = br#"{"model_version":4,"mtimes":{},"modules":[]}"#;
-        std::fs::write(&path, original).unwrap();
+        let original = serde_json::to_vec(&CacheEntry {
+            model_version: MODEL_VERSION,
+            mtimes: BTreeMap::new(),
+            modules: Vec::new(),
+        })
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
         let reached_disk = std::cell::Cell::new(false);
         write_cache_entry(
             &path,
@@ -1545,7 +1562,7 @@ dependencies {
         );
 
         assert_eq!(std::fs::read(&path).unwrap(), original);
-        let stored: CacheEntry = serde_json::from_slice(original).unwrap();
+        let stored: CacheEntry = serde_json::from_slice(&original).unwrap();
         assert_eq!(stored.model_version, MODEL_VERSION);
         assert!(std::fs::read_dir(&root)
             .unwrap()

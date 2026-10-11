@@ -35,11 +35,19 @@ object KtlspCompilerConfiguration {
         val record = linkedMapOf<String, Any?>(
             "task" to task.path, "language" to language, "task_type" to task.javaClass.name,
             "arguments" to emptyList<String>(), "annotation_processor_path" to emptyList<String>(),
+            "source_files" to emptyList<String>(), "classpath" to emptyList<String>(),
+            "declared_input_files" to emptyList<String>(), "declared_output_roots" to emptyList<String>(),
             "java_home" to null, "options" to emptyMap<String, Any?>(),
             "output_roots" to emptyList<String>(), "complete" to false, "problem" to null,
         )
         try {
+            // Keep read and write roles separate; a configured path is not an execution receipt.
+            record["declared_input_files"] = task.inputs.files.files.map { it.absolutePath }.sorted()
+            record["declared_output_roots"] = task.outputs.files.files.map { it.absolutePath }.sorted()
             if (task is JavaCompile) {
+                record["source_files"] = task.source.files.map { it.absolutePath }.sorted()
+                record["classpath"] = task.classpath.files.map { it.absolutePath }
+
                 val options = task.options
                 record["arguments"] = options.allCompilerArgs.toList()
                 record["annotation_processor_path"] = options.annotationProcessorPath?.files
@@ -331,4 +339,222 @@ allprojects {
             ))
         }
     }
+}
+
+// Selected JavaCompile observation is opt-in and requires --no-configuration-cache.
+// Configured compiler tasks alone do not certify successful or fresh outputs.
+object KtlspSelectedTaskObserver {
+    private var sequence = 0
+    lateinit var directory: java.io.File
+    lateinit var nonce: String
+
+    fun path(file: java.io.File): String = file.toPath().toAbsolutePath().normalize().toString().replace('\\', '/')
+
+    fun sha(file: java.io.File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(65536)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+
+    fun file(file: java.io.File): Map<String, Any?> {
+        val location = file.toPath()
+        check(!java.nio.file.Files.isSymbolicLink(location)) { "Unsupported symbolic link: $location" }
+        if (!java.nio.file.Files.exists(location, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            return linkedMapOf("path" to path(file), "kind" to "absent")
+        }
+        check(java.nio.file.Files.isRegularFile(location, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            "Unsupported non-regular file: $location"
+        }
+        return linkedMapOf("path" to path(file), "kind" to "file", "bytes" to file.length(), "sha256" to sha(file))
+    }
+
+    fun inventory(root: java.io.File): Map<String, Any?> {
+        if (!root.exists() || root.isFile) return file(root)
+        check(!java.nio.file.Files.isSymbolicLink(root.toPath())) { "Unsupported directory link: $root" }
+        val entries = mutableListOf<Map<String, Any?>>()
+        java.nio.file.Files.walk(root.toPath()).use { stream ->
+            val iterator = stream.iterator()
+            while (iterator.hasNext()) {
+                val current = iterator.next()
+                check(!java.nio.file.Files.isSymbolicLink(current)) { "Unsupported link: $current" }
+                if (java.nio.file.Files.isDirectory(current, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue
+                check(entries.size < 20000) { "Inventory cap exceeded: $root" }
+                entries.add(file(current.toFile()))
+            }
+        }
+        entries.sortBy { it["path"].toString() }
+        return linkedMapOf("path" to path(root), "kind" to "directory", "entries" to entries)
+    }
+
+    fun inventory(roots: Collection<java.io.File>): List<Map<String, Any?>> = roots.map { inventory(it) }
+
+    fun ancestorConfigs(sources: Collection<java.io.File>): List<Map<String, Any?>> {
+        val locations = linkedSetOf<java.io.File>()
+        sources.filter { it.extension == "java" }.forEach { source ->
+            var parent: java.io.File? = source.absoluteFile.parentFile
+            while (parent != null) {
+                locations.add(java.io.File(parent, "lombok.config"))
+                parent = parent.parentFile
+            }
+        }
+        return locations.sortedBy { path(it) }.map { file(it) }
+    }
+
+    fun compiler(task: Task): Boolean = task is JavaCompile || task.javaClass.methods.any {
+        it.name == "getSerializedCompilerArguments" && it.parameterCount == 0
+    }
+
+    fun configuration(task: Task): Map<*, *> = groovy.json.JsonSlurper().parseText(
+        KtlspCompilerConfiguration.dump(task, if (task is JavaCompile) "java" else "kotlin")
+    ) as Map<*, *>
+
+    fun pluginFiles(configurations: List<Map<*, *>>): List<Map<String, Any?>> {
+        val paths = configurations.flatMap { configuration ->
+            (configuration["arguments"] as? List<*>)?.filterIsInstance<String>()?.flatMap { argument ->
+                if (argument.startsWith("-Xplugin=")) argument.removePrefix("-Xplugin=").split(',') else emptyList()
+            } ?: emptyList()
+        }.distinct()
+        return paths.map { file(java.io.File(it)) }
+    }
+
+    fun javaInputs(task: JavaCompile, sourceSet: org.gradle.api.tasks.SourceSet,
+                   compilerTasks: List<Task>, buildFiles: List<java.io.File>): Map<String, Any?> {
+        val kotlinExtension = sourceSet.extensions.findByName("kotlin")
+        val kotlinDirectories = when (kotlinExtension) {
+            is SourceDirectorySet -> kotlinExtension
+            null -> null
+            else -> kotlinExtension.javaClass.methods.firstOrNull {
+                it.name == "getKotlin" && it.parameterCount == 0 &&
+                    SourceDirectorySet::class.java.isAssignableFrom(it.returnType)
+            }?.invoke(kotlinExtension) as? SourceDirectorySet
+        }
+        val sources = (sourceSet.allJava.files + (kotlinDirectories?.files ?: emptySet()) + task.source.files)
+            .sortedBy { path(it) }
+        val configurations = compilerTasks.map { configuration(it) }
+        val homes = configurations.mapNotNull { it["java_home"] as? String }.toMutableSet()
+        homes.add(System.getProperty("java.home"))
+        val runtimeFiles = homes.sorted().flatMap { home ->
+            listOf("release", "bin/java", "bin/java.exe", "bin/javac", "bin/javac.exe", "lib/modules")
+                .map { file(java.io.File(home, it)) }
+        }
+        return linkedMapOf(
+            "configuration" to configuration(task),
+            "compiler_configurations" to configurations,
+            "compiler_runtime_files" to runtimeFiles,
+            "module_sources" to sources.map { file(it) },
+            "java_task_sources" to task.source.files.sortedBy { path(it) }.map { file(it) },
+            "ordered_classpath" to inventory(task.classpath.files.toList()),
+            "annotation_processor_path" to inventory(task.options.annotationProcessorPath?.files?.toList() ?: emptyList()),
+            "plugin_artifacts" to pluginFiles(configurations),
+            "declared_task_input_files" to inventory(task.inputs.files.files.sortedBy { path(it) }),
+            "build_configuration_files" to buildFiles.map { file(it) },
+            "ancestor_lombok_configs" to ancestorConfigs(sources),
+            "gradle_java_home" to System.getProperty("java.home"),
+            "gradle_java_version" to System.getProperty("java.version"),
+        )
+    }
+
+    fun state(state: org.gradle.api.tasks.TaskState): Map<String, Any?> = linkedMapOf(
+        "executed" to state.executed, "failure" to state.failure?.toString(),
+        "skipped" to state.skipped, "skip_message" to state.skipMessage,
+        "up_to_date" to state.upToDate, "no_source" to state.noSource, "did_work" to state.didWork,
+    )
+
+    @Synchronized fun event(name: String, values: Map<String, Any?>) {
+        val record = linkedMapOf<String, Any?>("nonce" to nonce, "sequence" to sequence,
+            "event" to name, "nano_time" to System.nanoTime(), "utc" to java.time.Instant.now().toString())
+        record.putAll(values)
+        val target = java.io.File(directory, "%04d-%s.json".format(sequence++, name))
+        java.nio.file.Files.write(target.toPath(), JsonOutput.toJson(record).toByteArray(Charsets.UTF_8),
+            java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE)
+    }
+}
+
+val ktlspObserverDirectory = System.getProperty("ktlsp.observer.dir")
+val ktlspObserverRoot = System.getProperty("ktlsp.observer.root")
+val ktlspObserverTask = System.getProperty("ktlsp.observer.task")
+val ktlspObserverNonce = System.getProperty("ktlsp.observer.nonce")
+if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserverTask != null && ktlspObserverNonce != null) {
+    gradle.taskGraph.whenReady(object : Action<org.gradle.api.execution.TaskExecutionGraph> {
+        override fun execute(graph: org.gradle.api.execution.TaskExecutionGraph) {
+            if (gradle.rootProject.rootDir.canonicalFile != java.io.File(ktlspObserverRoot).canonicalFile) return
+            val observer = KtlspSelectedTaskObserver
+            observer.directory = java.io.File(ktlspObserverDirectory)
+            observer.nonce = ktlspObserverNonce
+            check(observer.directory.isDirectory) { "Observer directory must be created by the controller" }
+            val selected = graph.allTasks.single { it.path == ktlspObserverTask }
+            check(selected is JavaCompile) { "Selected task is not a JavaCompile" }
+            val sourceSet = selected.project.extensions.getByType(SourceSetContainer::class.java).single {
+                it.compileJavaTaskName == selected.name
+            }
+            val pending = java.util.ArrayDeque<Task>()
+            val dependencies = linkedSetOf<Task>()
+            pending.add(selected)
+            while (!pending.isEmpty()) {
+                val current = pending.removeFirst()
+                current.taskDependencies.getDependencies(current).forEach { dependency ->
+                    if (dependencies.add(dependency)) pending.add(dependency)
+                }
+            }
+            val compilerTasks = graph.allTasks.filter { (it == selected || it in dependencies) && observer.compiler(it) }
+            val buildFiles = listOf("build.gradle.kts", "settings.gradle.kts", "gradle.properties", "gradlew",
+                "gradlew.bat", "gradle/wrapper/gradle-wrapper.properties", "gradle/wrapper/gradle-wrapper.jar")
+                .map { java.io.File(selected.project.rootDir, it) }
+            observer.event("graph", linkedMapOf(
+                "root" to observer.path(gradle.rootProject.rootDir), "project" to selected.project.path,
+                "project_dir" to observer.path(selected.project.projectDir), "source_set" to sourceSet.name,
+                "selected_task" to selected.path, "selected_task_class" to selected.javaClass.name,
+                "gradle_version" to gradle.gradleVersion,
+                "gradle_home" to gradle.gradleHomeDir?.let { observer.path(it) },
+                "gradle_user_home" to observer.path(gradle.gradleUserHomeDir),
+                "init_scripts" to gradle.startParameter.initScripts.map { observer.file(it) },
+                "compiler_configurations" to compilerTasks.map { observer.configuration(it) },
+            ))
+            var selectedStarted = false
+            selected.doFirst(object : Action<Task> {
+                override fun execute(task: Task) {
+                    selectedStarted = true
+                    observer.event("selected-action-start", linkedMapOf("task" to selected.path,
+                        "inputs" to observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles),
+                        "outputs_before" to observer.inventory(selected.outputs.files.files.toList())))
+                }
+            })
+            selected.doLast(object : Action<Task> {
+                override fun execute(task: Task) {
+                    observer.event("selected-action-end", linkedMapOf("task" to selected.path,
+                        "outputs" to observer.inventory(selected.outputs.files.files.toList())))
+                }
+            })
+            graph.addTaskExecutionListener(object : org.gradle.api.execution.TaskExecutionListener {
+                override fun beforeExecute(task: Task) {
+                    val record = linkedMapOf<String, Any?>("task" to task.path, "type" to task.javaClass.name)
+                    if (task in compilerTasks) {
+                        record["configuration"] = observer.configuration(task)
+                        record["declared_inputs"] = observer.inventory(task.inputs.files.files.sortedBy { observer.path(it) })
+                    }
+                    observer.event("task-start", record)
+                }
+                override fun afterExecute(task: Task, state: org.gradle.api.tasks.TaskState) {
+                    val record = linkedMapOf<String, Any?>("task" to task.path, "state" to observer.state(state))
+                    if (task in compilerTasks) record["outputs"] = observer.inventory(task.outputs.files.files.toList())
+                    if (task == selected && selectedStarted) record["inputs_after"] = observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles)
+                    observer.event("task-end", record)
+                }
+            })
+            gradle.buildFinished(object : Action<org.gradle.BuildResult> {
+                override fun execute(result: org.gradle.BuildResult) {
+                    observer.event("build-finished", linkedMapOf("failure" to result.failure?.toString(),
+                        "selected_started" to selectedStarted, "selected_state" to observer.state(selected.state),
+                        "selected_outputs" to observer.inventory(selected.outputs.files.files.toList())))
+                }
+            })
+        }
+    })
 }

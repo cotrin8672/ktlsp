@@ -90,6 +90,7 @@ pub struct Workspace {
     project_refresh_pending: bool,
     analysis_extensions: crate::analysis_extensions::AnalysisExtensions,
     annotated_type_owners: HashMap<String, BTreeSet<Def>>,
+    observed_compile: Option<ObservedCompileTicket>,
 }
 
 impl Default for Workspace {
@@ -124,6 +125,7 @@ impl Workspace {
             project_refresh_pending: false,
             analysis_extensions: crate::analysis_extensions::AnalysisExtensions::new(providers),
             annotated_type_owners: HashMap::new(),
+            observed_compile: None,
         }
     }
 
@@ -164,6 +166,7 @@ impl Workspace {
     }
 
     pub fn begin_analysis_generation(&mut self) -> u64 {
+        self.invalidate_observed_compile();
         self.analysis_generation = self.analysis_generation.wrapping_add(1);
         self.completeness.project_scan_complete = false;
         self.completeness.library_index_complete = false;
@@ -208,6 +211,7 @@ impl Workspace {
     }
 
     pub fn set_project_model(&mut self, model: Arc<crate::classpath::ProjectSnapshot>) {
+        self.invalidate_observed_compile();
         self.index.replace_scope_visibilities(
             model.scope_visibilities(&self.global_origins.iter().cloned().collect::<Vec<_>>()),
         );
@@ -282,6 +286,7 @@ impl Workspace {
     }
 
     pub(crate) fn apply_model_sources(&mut self, update: ModelSourceUpdate) -> usize {
+        self.invalidate_observed_compile();
         self.project_refresh_pending = false;
         self.remove_obsolete_project_files(&update.current);
         self.source_stamps
@@ -318,7 +323,7 @@ impl Workspace {
             self.index.replace_file_refs(&batch.key, batch.usages);
             self.salsa.forget(&batch.key);
             self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
-            if !self.analysis_extensions.is_empty() {
+            if self.analysis_extensions.needs_source(&batch.key) {
                 extension_sources.push((batch.key, batch.source.0, batch.source.1));
             }
         }
@@ -443,6 +448,7 @@ impl Workspace {
             }
         }
         if metadata_changed {
+            self.invalidate_observed_compile();
             self.analysis_extensions.mark_index_changed();
         }
         if self.index_dependency_file(&batch.file, batch.symbols) {
@@ -468,6 +474,7 @@ impl Workspace {
         if self.open_docs.contains_key(key) {
             return false;
         }
+        self.invalidate_observed_compile();
         self.analysis_extensions.mark_index_changed();
         self.index.replace_file(key, symbols, Tier::Durable);
         true
@@ -477,6 +484,7 @@ impl Workspace {
         if self.open_docs.contains_key(key) {
             return;
         }
+        self.invalidate_observed_compile();
         self.index.remove_file(key);
         self.analysis_extensions.remove_source(&self.index, key);
         self.analysis_extensions.mark_index_changed();
@@ -509,6 +517,7 @@ impl Workspace {
         enabled: bool,
         configuration: Arc<str>,
     ) -> bool {
+        self.invalidate_observed_compile();
         let revision = self.analysis_extensions.revision();
         let registered =
             self.analysis_extensions
@@ -523,11 +532,13 @@ impl Workspace {
         self.analysis_extensions.take_changed()
     }
 
-    fn replace_extension_source(&mut self, key: &str, text: Arc<str>, tree: Tree) {
-        self.record_annotated_owners(key, &text, &tree);
-        if !self.analysis_extensions.is_empty() {
-            self.analysis_extensions
-                .replace_sources(&self.index, vec![(key.into(), text, tree)]);
+    fn replace_extension_source(&mut self, key: &str, text: &str, tree: &Tree) {
+        self.record_annotated_owners(key, text, tree);
+        if self.analysis_extensions.needs_source(key) {
+            self.analysis_extensions.replace_sources(
+                &self.index,
+                vec![(key.into(), Arc::from(text), tree.clone())],
+            );
             if self.analysis_extensions.publish(&mut self.index) {
                 self.index_revision = self.index_revision.wrapping_add(1).max(1);
             }
@@ -560,7 +571,7 @@ impl Workspace {
     fn index_from_tree(&mut self, key: &str, text: &str, tree: &Tree) {
         let facts = language::file_facts(SourceLanguage::for_key(key), tree, text);
         self.apply_file_facts(key, facts);
-        self.replace_extension_source(key, Arc::from(text), tree.clone());
+        self.replace_extension_source(key, text, tree);
     }
 
     fn apply_file_facts(&mut self, key: &str, facts: language::FileFacts) {
@@ -582,25 +593,28 @@ impl Workspace {
     /// Parse `text` from scratch and (re)index the file. Used for non-open files (scan/close),
     /// where there is no cached tree to reuse.
     pub fn reindex(&mut self, key: &str, text: &str) {
+        self.observe_compiled_source(key, Some(text), false);
         let facts = self.salsa.file_facts(key, text, Durability::LOW);
         self.apply_file_facts(key, facts);
         let tree = self.salsa.parsed_tree(key, text, Durability::LOW);
-        self.replace_extension_source(key, Arc::from(text), tree);
+        self.replace_extension_source(key, text, &tree);
     }
 
     /// `textDocument/didOpen`.
     pub fn open(&mut self, key: impl Into<String>, text: String) {
         let key = key.into();
+        self.observe_compiled_source(&key, Some(&text), false);
         let tree = self.salsa.parsed_tree(&key, &text, Durability::LOW);
         let facts = self.salsa.file_facts(&key, &text, Durability::LOW);
         self.apply_file_facts(&key, facts);
-        self.replace_extension_source(&key, Arc::from(text.as_str()), tree.clone());
+        self.replace_extension_source(&key, &text, &tree);
         self.open_docs.insert(key, DocState { text, tree });
     }
 
     /// `textDocument/didChange` (FULL sync: `text` is the whole new document). Reparses
     /// incrementally by diffing against the cached buffer, then re-indexes from the new tree.
     pub fn change(&mut self, key: &str, text: String) {
+        self.observe_compiled_source(key, Some(&text), true);
         let tree = match self.open_docs.remove(key) {
             Some(mut old) => {
                 let edit = compute_edit(&old.text, &text);
@@ -617,6 +631,8 @@ impl Workspace {
 
     /// `textDocument/didClose`: drop the dirty buffer; re-sync the index from disk (or drop it).
     pub fn close(&mut self, key: &str) {
+        let disk = std::fs::read_to_string(key).ok();
+        self.observe_compiled_source(key, disk.as_deref(), false);
         self.open_docs.remove(key);
         let inactive_dependency = self.index.file_origin(key).is_some_and(|origin| {
             is_dependency_origin(&origin.origin_id)
@@ -639,7 +655,7 @@ impl Workspace {
             self.recompute_project_completeness();
             return;
         }
-        match self.doc_text(key) {
+        match disk.or_else(|| self.doc_text(key)) {
             Some(text) => self.reindex(key, &text),
             None => {
                 self.index.remove_file(key);
@@ -665,6 +681,7 @@ impl Workspace {
     /// generated source roots and any files currently open (their dirty buffers are authoritative).
     /// Returns the count indexed.
     pub fn scan(&mut self, root: &Path) -> usize {
+        self.invalidate_observed_compile();
         self.project_refresh_pending = false;
         let open_keys = self
             .open_docs
@@ -715,7 +732,7 @@ impl Workspace {
                 .replace_jvm_source(&batch.key, batch.jvm, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
             self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
-            if !self.analysis_extensions.is_empty() {
+            if self.analysis_extensions.needs_source(&batch.key) {
                 extension_sources.push((batch.key, batch.source.0, batch.source.1));
             }
         }
@@ -748,6 +765,7 @@ impl Workspace {
     /// current text of `key`). Open buffers use their cached tree (no parse on the hot path);
     /// a non-open file is read from disk and parsed once.
     pub fn goto_definition(&mut self, key: &str, offset: usize) -> Vec<Def> {
+        self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
             let defs = language::goto_definition(
                 &self.index.scoped_for_file(key),
@@ -905,6 +923,7 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<semantic_query::ResolvedSymbolQuery> {
+        self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
             return semantic_query::resolved_symbol_query(
                 &self.index.scoped_for_file(key),
@@ -931,6 +950,7 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<semantic_query::CompletionQuery> {
+        self.refresh_compiled_freshness();
         if is_java_path(key) {
             return self
                 .completion_query(key, offset)
@@ -951,6 +971,7 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<semantic_query::CompletionQuery> {
+        self.refresh_compiled_freshness();
         if is_java_path(key) {
             if let Some(doc) = self.open_docs.get(key) {
                 return java::completion_query(
@@ -1175,6 +1196,7 @@ impl Workspace {
     /// The indexed symbol resolved at `offset`, for hover and future symbol-aware features. Local
     /// declarations are intentionally omitted for now because they are not in the cross-file index.
     pub fn symbol_at(&mut self, key: &str, offset: usize) -> Option<SymbolSummary> {
+        self.refresh_compiled_freshness();
         self.resolved_symbol_query(key, offset)?.symbol_summary()
     }
 
@@ -1262,6 +1284,7 @@ impl Workspace {
         start_byte: usize,
         end_byte: usize,
     ) -> Vec<crate::hints::InlayHint> {
+        self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
             return language::inlay_hints(
                 SourceLanguage::for_key(key),
@@ -1292,6 +1315,7 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<crate::rename::PreparedRename> {
+        self.refresh_compiled_freshness();
         if let Some(subject) = self.extension_rename_subject(key, offset) {
             let range = self.extension_rename_range_at(key, offset, &subject)?;
             let text = self.doc_text(key)?;
@@ -1349,6 +1373,7 @@ impl Workspace {
         offset: usize,
         new_name: &str,
     ) -> Option<Vec<crate::edit::TextEdit>> {
+        self.refresh_compiled_freshness();
         if !language::is_valid_identifier(SourceLanguage::for_key(key), new_name) {
             return None;
         }
@@ -2068,6 +2093,7 @@ impl Workspace {
     }
 
     pub fn type_definition(&mut self, key: &str, offset: usize) -> Vec<Def> {
+        self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
             return language::type_definition(
                 SourceLanguage::for_key(key),
@@ -2157,6 +2183,7 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<crate::signature::SignatureHelp> {
+        self.refresh_compiled_freshness();
         let parsed;
         let (doc_text, tree): (&str, &Tree) = if let Some(doc) = self.open_docs.get(key) {
             (&doc.text, &doc.tree)
@@ -2202,6 +2229,7 @@ impl Workspace {
     /// over the cached tree for an open buffer (or a one-off parse from disk). Byte-range based; the
     /// LSP layer converts to positions and severities.
     pub fn diagnostics(&mut self, key: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        self.refresh_compiled_freshness();
         let mut extra = self
             .analysis_extensions
             .sets()
@@ -2453,6 +2481,7 @@ impl Workspace {
     /// Goto-grade precision: every candidate usage of the name is re-resolved and kept only if it
     /// resolves to the same definition as the cursor. Optionally includes the declaration site.
     pub fn references(&mut self, key: &str, offset: usize, include_declaration: bool) -> Vec<Def> {
+        self.refresh_compiled_freshness();
         let start = std::time::Instant::now();
         let target = match self.goto_definition(key, offset).into_iter().next() {
             Some(d) => d,
@@ -4110,5 +4139,933 @@ mod tests {
         assert!(second_defs[0].start_byte < second.find("main").unwrap());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+struct ObservedCompileTicket {
+    request: Arc<crate::compile::ObservedCompileRequest>,
+    model: Arc<crate::classpath::ProjectSnapshot>,
+    generation: u64,
+    revision: u64,
+    deferred_outputs: BTreeSet<String>,
+    valid: bool,
+}
+
+impl Workspace {
+    pub(crate) fn invalidate_observed_compile(&mut self) {
+        if let Some(receipt) = self.analysis_extensions.compiled_receipt() {
+            receipt
+                .request
+                .invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(ticket) = &mut self.observed_compile {
+            ticket.valid = false;
+            ticket
+                .request
+                .invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.analysis_extensions.invalidate_compiled(&self.index);
+        if self.analysis_extensions.publish(&mut self.index) {
+            self.index_revision = self.index_revision.wrapping_add(1).max(1);
+        }
+    }
+
+    // Source-set ownership for dirty edits is wider than the selected task's read closure.
+    // Model replacement already invalidates both active tickets and accepted receipts.
+    fn compiled_module_source(
+        &self,
+        key: &str,
+        request: &crate::compile::ObservedCompileRequest,
+    ) -> bool {
+        self.project_model
+            .as_ref()
+            .and_then(|model| model.file_origin(Path::new(key)))
+            .and_then(|origin| origin.project_scope)
+            .is_some_and(|scope| scope.module == request.scope.module)
+    }
+
+    /// `true` only defers a known output event inside this exact active compile. Inputs,
+    /// configuration, AP/ancestor/dependency files invalidate before any source-retention filter.
+    pub(crate) fn observe_compiled_resource(&mut self, key: &str) -> bool {
+        let module_source = self
+            .observed_compile
+            .as_ref()
+            .is_some_and(|ticket| self.compiled_module_source(key, &ticket.request));
+        if let Some(ticket) = &mut self.observed_compile {
+            if ticket.valid && ticket.request.is_known_output(key) {
+                ticket.deferred_outputs.insert(key.into());
+                return true;
+            }
+            if module_source || ticket.request.observes_path(key) {
+                tracing::debug!(
+                    path = key,
+                    "compiler receipt input changed through client watch"
+                );
+                self.invalidate_observed_compile();
+            }
+        }
+        if self
+            .analysis_extensions
+            .compiled_receipt()
+            .is_some_and(|receipt| {
+                self.compiled_module_source(key, &receipt.request) || receipt.observes_path(key)
+            })
+        {
+            // A late self-output notification is conservative invalidation, never a grace period.
+            tracing::debug!(
+                path = key,
+                "published compiler receipt resource changed through client watch"
+            );
+            self.invalidate_observed_compile();
+        }
+        false
+    }
+
+    fn observe_compiled_source(&mut self, key: &str, text: Option<&str>, force: bool) {
+        if self.observed_compile.as_ref().is_some_and(|ticket| {
+            self.compiled_module_source(key, &ticket.request) || ticket.request.observes_path(key)
+        }) || self
+            .analysis_extensions
+            .compiled_receipt()
+            .is_some_and(|receipt| {
+                (self.compiled_module_source(key, &receipt.request) || receipt.observes_path(key))
+                    && (force || text.is_none_or(|text| !receipt.source_matches(key, text)))
+            })
+        {
+            tracing::debug!(path = key, force, "compiler receipt source changed");
+            self.invalidate_observed_compile();
+        }
+    }
+
+    pub(crate) fn begin_observed_compile(
+        &mut self,
+        root: &Path,
+        key: &str,
+    ) -> Result<
+        (
+            Arc<crate::compile::ObservedCompileRequest>,
+            Arc<crate::classpath::ProjectSnapshot>,
+        ),
+        &'static str,
+    > {
+        use crate::classpath::CompilerLanguage;
+        if !cfg!(windows) {
+            return Err("native-tree-proof-unavailable");
+        }
+        if self.observed_compile.is_some() {
+            return Err("compile-already-running");
+        }
+        if !self.analysis_extensions.compiled_enabled() {
+            return Err("provider-disabled");
+        }
+        if self.project_refresh_pending {
+            return Err("project-model-pending");
+        }
+        let model = self.project_model.clone().ok_or("project-model-unknown")?;
+        let (module, source) = model.owner_for_key(key).ok_or("source-owner-unknown")?;
+        let source = source.ok_or("source-set-unknown")?;
+        // The command runs the current build's actual model task, never a fixture task name.
+        if module.build != ":" && module.build != format!("legacy:{}", crate::paths::file_key(root))
+        {
+            return Err("included-build-selection-unknown");
+        }
+        if source.compiler_metadata_incomplete || source.classpath_incomplete {
+            return Err("compiler-model-incomplete");
+        }
+        let java: Vec<_> = source
+            .compiler_tasks
+            .iter()
+            .filter(|task| task.language == CompilerLanguage::Java && task.complete)
+            .collect();
+        let [task] = java.as_slice() else {
+            return Err("selected-java-task-unknown");
+        };
+        let scope = model
+            .file_origin(Path::new(key))
+            .and_then(|origin| origin.project_scope)
+            .ok_or("source-scope-unknown")?;
+        let roots: Vec<_> = module
+            .source_sets
+            .iter()
+            .flat_map(|source| &source.source_roots)
+            .map(|root| crate::paths::file_key(root))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if self.open_docs.iter().any(|(key, doc)| {
+            roots
+                .iter()
+                .any(|root| crate::compile::path_under(key, root))
+                && std::fs::read_to_string(key).ok().as_deref() != Some(doc.text.as_str())
+        }) {
+            return Err("unsaved-module-source");
+        }
+        let mut owners = Vec::new();
+        for key in self
+            .project_file_meta
+            .keys()
+            .chain(self.open_docs.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            if !key.ends_with(".java")
+                || !source
+                    .source_roots
+                    .iter()
+                    .any(|root| crate::compile::path_under(key, &crate::paths::file_key(root)))
+            {
+                continue;
+            }
+            let entries = self.index.entries_for_file(key);
+            let types: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.sym.kind.is_type_like())
+                .collect();
+            let [owner] = types.as_slice() else {
+                continue;
+            };
+            if owner.sym.kind != SymbolKind::Class
+                || owner.sym.container.is_some()
+                || !owner.sym.type_params.is_empty()
+            {
+                continue;
+            }
+            let Some(origin) = self
+                .index
+                .file_origin(key)
+                .filter(|origin| origin.project_scope.as_ref() == Some(&scope))
+            else {
+                continue;
+            };
+            owners.push(crate::compile::CompileOwner {
+                definition: Def {
+                    file: key.clone(),
+                    start_byte: owner.sym.start_byte,
+                    end_byte: owner.sym.end_byte,
+                },
+                qualified_name: if owner.sym.package.is_empty() {
+                    owner.sym.name.clone()
+                } else {
+                    format!("{}.{}", owner.sym.package, owner.sym.name)
+                },
+                origin_id: origin.origin_id.clone(),
+            });
+        }
+        if owners.is_empty() {
+            return Err("supported-authored-owner-unknown");
+        }
+        self.invalidate_observed_compile();
+        let nonce = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            self.index_revision,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "clock-unknown")?
+                .as_nanos()
+        );
+        let request = Arc::new(crate::compile::ObservedCompileRequest {
+            root: root.to_path_buf(),
+            project_dir: module.project_dir.clone(),
+            scope,
+            source_set: source.name.clone(),
+            task: (**task).clone(),
+            compiler_tasks: source.compiler_tasks.clone(),
+            project_path: module.module.clone(),
+            // Registered roots of other source sets are dirty-edit coverage, not reads of
+            // this selected compiler task (notably their absent generated output directories).
+            source_roots: source
+                .source_roots
+                .iter()
+                .map(|root| crate::paths::file_key(root))
+                .collect(),
+            classpath: source
+                .entries
+                .iter()
+                .map(|path| crate::paths::file_key(path))
+                .collect(),
+            cache_dir: crate::deps::cache_home()
+                .join("observed-compile")
+                .join(&nonce),
+            owners,
+            nonce,
+            invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        request
+            .validate_roles()
+            .map_err(|_| "compiler-input-output-overlap-or-unknown")?;
+        self.observed_compile = Some(ObservedCompileTicket {
+            request: request.clone(),
+            model: model.clone(),
+            generation: self.analysis_generation,
+            revision: self.index_revision,
+            deferred_outputs: BTreeSet::new(),
+            valid: true,
+        });
+        Ok((request, model))
+    }
+
+    pub(crate) fn finish_observed_compile(
+        &mut self,
+        request: &Arc<crate::compile::ObservedCompileRequest>,
+        result: crate::compile::ObservedCompileResult,
+    ) -> (&'static str, usize) {
+        let Some(ticket) = &self.observed_compile else {
+            return ("stale-inputs", 0);
+        };
+        if !Arc::ptr_eq(&ticket.request, request) {
+            return ("foreign-compile", 0);
+        }
+        if !ticket.valid
+            || request.check_live().is_err()
+            || ticket.generation != self.analysis_generation
+            || ticket.revision != self.index_revision
+            || !self
+                .project_model
+                .as_ref()
+                .is_some_and(|model| Arc::ptr_eq(&ticket.model, model))
+        {
+            self.observed_compile = None;
+            return ("stale-inputs", 0);
+        }
+        let deferred = ticket.deferred_outputs.len();
+        if let Some(receipt) = &result.receipt {
+            if !ticket
+                .deferred_outputs
+                .iter()
+                .all(|key| receipt.covers_output(key))
+            {
+                self.invalidate_observed_compile();
+                self.observed_compile = None;
+                return ("unverified-deferred-output", deferred);
+            }
+        }
+        self.observed_compile = None;
+        let Some(receipt) = result.receipt else {
+            return ("compile-unverified", deferred);
+        };
+        let status = if self
+            .analysis_extensions
+            .accept_compiled(&self.index, receipt, result.owners)
+            .is_ok()
+        {
+            "observed-success"
+        } else {
+            "source-owner-unknown"
+        };
+        self.bump_index_revision();
+        (status, deferred)
+    }
+
+    pub(crate) fn invalidate_owned_compile(
+        &mut self,
+        request: &Arc<crate::compile::ObservedCompileRequest>,
+    ) -> bool {
+        let owned = self
+            .observed_compile
+            .as_ref()
+            .is_some_and(|ticket| Arc::ptr_eq(&ticket.request, request))
+            || self
+                .analysis_extensions
+                .compiled_receipt()
+                .is_some_and(|receipt| Arc::ptr_eq(&receipt.request, request));
+        if owned {
+            self.invalidate_observed_compile();
+        }
+        owned
+    }
+
+    fn refresh_compiled_freshness(&mut self) {
+        let invalid = self
+            .analysis_extensions
+            .compiled_receipt()
+            .is_some_and(|receipt| receipt.request.check_live().is_err())
+            || self
+                .observed_compile
+                .as_ref()
+                .is_some_and(|ticket| ticket.request.check_live().is_err());
+        if invalid {
+            self.invalidate_observed_compile();
+        }
+    }
+
+    pub(crate) fn stop_observed_compile(&mut self) {
+        if let Some(ticket) = &self.observed_compile {
+            ticket
+                .request
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.invalidate_observed_compile();
+    }
+
+    pub(crate) fn cancel_observed_compile(
+        &mut self,
+        request: &Arc<crate::compile::ObservedCompileRequest>,
+    ) {
+        if self
+            .observed_compile
+            .as_ref()
+            .is_some_and(|ticket| Arc::ptr_eq(&ticket.request, request))
+        {
+            self.observed_compile = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod observed_compile_lifecycle_tests {
+    use super::*;
+    use crate::compile::{observed_test_receipt, observed_test_request, ObservedCompileResult};
+    use std::sync::atomic::Ordering;
+
+    fn ticket(ws: &mut Workspace, request: Arc<crate::compile::ObservedCompileRequest>) {
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(Vec::new()));
+        ws.project_model = Some(model.clone());
+        ws.observed_compile = Some(ObservedCompileTicket {
+            request,
+            model,
+            generation: ws.analysis_generation,
+            revision: ws.index_revision,
+            deferred_outputs: BTreeSet::new(),
+            valid: true,
+        });
+    }
+
+    fn failed(
+        receipt: Option<Arc<crate::compile::SuccessfulCompileReceipt>>,
+    ) -> ObservedCompileResult {
+        ObservedCompileResult {
+            outcome: Default::default(),
+            receipt,
+            owners: Vec::new(),
+            reason: "lifecycle-fixture-only".into(),
+        }
+    }
+
+    // Synthetic host lifecycle controls; these do not certify native Gradle success.
+    fn selected_and_test_model(
+        root: &Path,
+        task: &crate::classpath::CompilerTask,
+    ) -> Arc<crate::classpath::ProjectSnapshot> {
+        use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+        let main = SourceSetClasspath {
+            name: "main".into(),
+            source_roots: vec![root.join("src")],
+            compiler_tasks: vec![task.clone()],
+            ..Default::default()
+        };
+        let test = SourceSetClasspath {
+            name: "test".into(),
+            source_roots: vec![
+                root.join("test"),
+                root.join("build/generated/sources/annotationProcessor/java/test"),
+                root.with_extension("external-test"),
+            ],
+            ..Default::default()
+        };
+        let module =
+            |directory: std::path::PathBuf, build: &str, name: &str, source_sets| ModuleClasspath {
+                module: name.into(),
+                project_dir: directory,
+                build: build.into(),
+                source_sets,
+                entries: Vec::new(),
+                unresolved: Vec::new(),
+            };
+        Arc::new(ProjectSnapshot::new(vec![
+            module(root.into(), ":", ":", vec![main, test]),
+            module(
+                root.join("foreign"),
+                ":",
+                ":foreign",
+                vec![SourceSetClasspath {
+                    name: "main".into(),
+                    source_roots: vec![root.join("foreign/src")],
+                    ..Default::default()
+                }],
+            ),
+            module(
+                root.join("included"),
+                ":included",
+                ":",
+                vec![SourceSetClasspath {
+                    name: "main".into(),
+                    source_roots: vec![root.join("included/src")],
+                    ..Default::default()
+                }],
+            ),
+        ]))
+    }
+
+    fn module_request(
+        root: &Path,
+    ) -> (
+        Arc<crate::compile::ObservedCompileRequest>,
+        Arc<crate::classpath::ProjectSnapshot>,
+    ) {
+        let mut request = observed_test_request(root);
+        let model = selected_and_test_model(root, &request.task);
+        Arc::get_mut(&mut request).unwrap().scope = model
+            .file_origin(&root.join("src/Person.java"))
+            .unwrap()
+            .project_scope
+            .unwrap();
+        (request, model)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selected_compile_reads_exclude_unrelated_absent_test_generated_root() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-selected-roots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let owner = crate::paths::file_key(&root.join("src/Person.java"));
+        let text = "public class Person { public String authored() { return \"name\"; } }";
+        std::fs::write(&owner, text).unwrap();
+        let request = observed_test_request(&root);
+        let model = selected_and_test_model(&root, &request.task);
+        let mut ws = Workspace::new();
+        ws.set_project_model(model);
+        ws.open(owner.clone(), text.into());
+        let (request, _) = ws.begin_observed_compile(&root, &owner).unwrap();
+        assert_eq!(
+            request.source_roots,
+            vec![crate::paths::file_key(&root.join("src"))]
+        );
+        let excluded = crate::paths::file_key(
+            &root.join("build/generated/sources/annotationProcessor/java/test"),
+        );
+        assert!(!request.initial_watch_paths().contains(&excluded));
+        let plan =
+            crate::compiled_watch::WatchPlan::build(&request, &request.initial_watch_paths())
+                .unwrap();
+        assert!(
+            !plan.covers_read(&excluded, true),
+            "test registration is not selected task read coverage"
+        );
+        assert!(
+            !plan.covers_read(&format!("{excluded}/Surprise.java"), false),
+            "a later unexpected upstream/test read must remain uncovered and reject"
+        );
+        ws.cancel_observed_compile(&request);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_main_test_and_external_source_aba_latch_without_foreign_module_aliasing() {
+        let root = std::env::temp_dir().join("ktlsp-module-source-aba-pending");
+        for (path, same_module) in [
+            (root.join("src/Consumer.java"), true),
+            (root.join("test/TestConsumer.java"), true),
+            (
+                root.with_extension("external-test")
+                    .join("ExternalTest.java"),
+                true,
+            ),
+            (root.join("foreign/src/Foreign.java"), false),
+            (root.join("included/src/Included.java"), false),
+        ] {
+            let (request, model) = module_request(&root);
+            let mut ws = Workspace::new();
+            ws.set_project_model(model.clone());
+            let key = crate::paths::file_key(&path);
+            ws.open(key.clone(), "class Consumer {}".into());
+            assert!(!ws.analysis_extensions.needs_source(&key));
+            ws.observed_compile = Some(ObservedCompileTicket {
+                request: request.clone(),
+                model,
+                generation: ws.analysis_generation,
+                revision: ws.index_revision,
+                deferred_outputs: BTreeSet::new(),
+                valid: true,
+            });
+            ws.change(&key, "class Consumer { broken }".into());
+            ws.change(&key, "class Consumer {}".into());
+            assert_eq!(
+                request.invalid.load(Ordering::Acquire),
+                same_module,
+                "{key}"
+            );
+            if same_module {
+                assert!(!ws.observed_compile.as_ref().unwrap().valid);
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_same_module_client_source_changes_retract_and_stay_invalid_after_aba() {
+        let root = std::env::temp_dir().join("ktlsp-module-source-aba-accepted");
+        for (path, same_module) in [
+            (root.join("src/Consumer.java"), true),
+            (root.join("test/TestConsumer.java"), true),
+            (
+                root.with_extension("external-test")
+                    .join("ExternalTest.java"),
+                true,
+            ),
+            (root.join("foreign/src/Foreign.java"), false),
+            (root.join("included/src/Included.java"), false),
+        ] {
+            let (request, model) = module_request(&root);
+            let mut ws = Workspace::new();
+            ws.set_project_model(model);
+            ws.analysis_extensions
+                .accept_compiled(
+                    &ws.index,
+                    observed_test_receipt(request.clone()),
+                    Vec::new(),
+                )
+                .unwrap();
+            let key = crate::paths::file_key(&path);
+            assert!(!ws.observe_compiled_resource(&key));
+            assert!(!ws.observe_compiled_resource(&key));
+            assert_eq!(
+                request.invalid.load(Ordering::Acquire),
+                same_module,
+                "{key}"
+            );
+            assert_eq!(
+                ws.analysis_extensions.compiled_receipt().is_none(),
+                same_module,
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_and_unverified_deferred_outcomes_retire_the_ticket() {
+        let root = std::env::temp_dir().join("ktlsp-observed-ticket-lifecycle");
+        let request = observed_test_request(&root);
+        let mut ws = Workspace::new();
+        ticket(&mut ws, request.clone());
+        assert_eq!(
+            ws.finish_observed_compile(&request, failed(None)).0,
+            "compile-unverified"
+        );
+        assert!(ws.observed_compile.is_none());
+        ticket(&mut ws, request.clone());
+        ws.observed_compile
+            .as_mut()
+            .unwrap()
+            .deferred_outputs
+            .insert(crate::paths::file_key(&root.join("build/other")));
+        assert_eq!(
+            ws.finish_observed_compile(
+                &request,
+                failed(Some(observed_test_receipt(request.clone())))
+            )
+            .0,
+            "unverified-deferred-output"
+        );
+        assert!(request.invalid.load(Ordering::Acquire));
+        assert!(ws.observed_compile.is_none());
+    }
+
+    #[test]
+    fn dirty_nonretained_consumer_a_b_a_rejects_pending_publication() {
+        let root = std::env::temp_dir().join("ktlsp-observed-dirty-consumer");
+        let consumer = crate::paths::file_key(&root.join("src/Consumer.java"));
+        let mut ws = Workspace::new();
+        ws.open(consumer.clone(), "class Consumer {}".into());
+        assert!(!ws.analysis_extensions.needs_source(&consumer));
+        let request = observed_test_request(&root);
+        ticket(&mut ws, request.clone());
+        ws.change(&consumer, "class Consumer { broken }".into());
+        ws.change(&consumer, "class Consumer {}".into());
+        assert!(request.invalid.load(Ordering::Acquire));
+        assert_eq!(
+            ws.finish_observed_compile(&request, failed(None)).0,
+            "stale-inputs"
+        );
+        assert!(ws.observed_compile.is_none());
+    }
+
+    #[test]
+    fn old_callback_and_retire_do_not_touch_a_new_owner() {
+        let root = std::env::temp_dir().join("ktlsp-observed-owner");
+        let old = observed_test_request(&root);
+        let current = observed_test_request(&root);
+        let mut ws = Workspace::new();
+        ticket(&mut ws, current.clone());
+        assert!(!ws.invalidate_owned_compile(&old));
+        ws.cancel_observed_compile(&old);
+        assert!(Arc::ptr_eq(
+            &ws.observed_compile.as_ref().unwrap().request,
+            &current
+        ));
+        assert!(ws.observed_compile.as_ref().unwrap().valid);
+        assert!(!current.invalid.load(Ordering::Acquire));
+        assert!(ws.invalidate_owned_compile(&current));
+        assert!(!ws.observed_compile.as_ref().unwrap().valid);
+    }
+
+    #[test]
+    fn model_generation_or_index_replacement_rejects_the_old_publication() {
+        let root = std::env::temp_dir().join("ktlsp-observed-publication-cas");
+        for replacement in ["model-arc", "generation", "index-revision"] {
+            let request = observed_test_request(&root);
+            let mut ws = Workspace::new();
+            ticket(&mut ws, request.clone());
+            match replacement {
+                "model-arc" => {
+                    ws.project_model =
+                        Some(Arc::new(crate::classpath::ProjectSnapshot::new(Vec::new())))
+                }
+                "generation" => ws.analysis_generation = ws.analysis_generation.wrapping_add(1),
+                "index-revision" => ws.index_revision = ws.index_revision.wrapping_add(1),
+                _ => unreachable!(),
+            }
+            // A test-only host receipt exercises publication CAS, not native success.
+            let result = failed(Some(observed_test_receipt(request.clone())));
+            assert_eq!(
+                ws.finish_observed_compile(&request, result).0,
+                "stale-inputs",
+                "{replacement}"
+            );
+            assert!(ws.observed_compile.is_none());
+            assert!(ws.analysis_extensions.compiled_receipt().is_none());
+        }
+    }
+
+    // This is a host-publication/invalidation control, not a successful compiler invocation.
+    // Person.class is the existing independently compiled fixture; the receipt is test-only.
+    fn getter_owner_fixture() -> (
+        Workspace,
+        Arc<crate::compile::ObservedCompileRequest>,
+        String,
+        crate::compile::CompiledOwnerInput,
+    ) {
+        use crate::project_model::{FileOrigin, ScopeVisibility, SourceRepresentation};
+        const SOURCE: &str =
+            include_str!("../../ktcore/tests/fixtures/classfile/sources/pluginfixture/Person.java");
+        const CLASS: &[u8] =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let root = std::env::temp_dir().join("ktlsp-admitted-getter-lifecycle");
+        let key = crate::paths::file_key(&root.join("src/Person.java"));
+        let mut request = observed_test_request(&root);
+        let mut ws = Workspace::new();
+        ws.open(key.clone(), SOURCE.into());
+        let input = Arc::get_mut(&mut request).unwrap();
+        input
+            .task
+            .declared_input_files
+            .push(root.join("ap/options.json"));
+        input.compiler_tasks[0] = input.task.clone();
+        let owner = ws
+            .index
+            .entries_for_file(&key)
+            .into_iter()
+            .find(|entry| entry.sym.kind == SymbolKind::Class && entry.sym.name == "Person")
+            .unwrap();
+        input.owners.push(crate::compile::CompileOwner {
+            definition: Def {
+                file: key.clone(),
+                start_byte: owner.sym.start_byte,
+                end_byte: owner.sym.end_byte,
+            },
+            qualified_name: "pluginfixture.Person".into(),
+            origin_id: "lifecycle-owner".into(),
+        });
+        ws.index.set_file_origin(
+            &key,
+            FileOrigin {
+                origin_id: "lifecycle-owner".into(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(input.scope.clone()),
+            },
+        );
+        ws.index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope: input.scope.clone(),
+            ordered_origins: vec!["lifecycle-owner".into()],
+        }]);
+        let owner = crate::compile::CompiledOwnerInput {
+            file: key.clone(),
+            text: Arc::from(SOURCE),
+            tree: crate::java::JavaParser::new().parse(SOURCE),
+            class_file: input.task.output_roots[0].join("pluginfixture/Person.class"),
+            class_file_bytes: CLASS.len() as u64,
+            class: Arc::new(ktcore::classfile::decode("lifecycle-owner", CLASS).unwrap()),
+        };
+        (ws, request, key, owner)
+    }
+
+    fn admitted_getter_fixture() -> (
+        Workspace,
+        Arc<crate::compile::ObservedCompileRequest>,
+        String,
+    ) {
+        const CLASS: &[u8] =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let (mut ws, request, key, owner) = getter_owner_fixture();
+        let receipt = crate::compile::observed_test_receipt_with_source(
+            request.clone(),
+            &key,
+            &owner.text,
+            &owner.class_file,
+            CLASS,
+        );
+        ws.analysis_extensions
+            .accept_compiled(&ws.index, receipt, vec![owner])
+            .unwrap();
+        ws.bump_index_revision();
+        (ws, request, key)
+    }
+
+    #[test]
+    fn admission_rechecks_class_bytes_against_the_selected_successful_output() {
+        const CLASS: &[u8] =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let (mut ws, request, key, mut owner) = getter_owner_fixture();
+        let receipt = crate::compile::observed_test_receipt_with_source(
+            request,
+            &key,
+            &owner.text,
+            &owner.class_file,
+            CLASS,
+        );
+        let mut different = CLASS.to_vec();
+        let offset = different
+            .windows(7)
+            .position(|value| value == b"getName")
+            .unwrap();
+        different[offset..offset + 7].copy_from_slice(b"getElse");
+        owner.class = Arc::new(ktcore::classfile::decode("lifecycle-owner", &different).unwrap());
+        assert!(ws
+            .analysis_extensions
+            .accept_compiled(&ws.index, receipt, vec![owner])
+            .is_err());
+        assert!(ws.analysis_extensions.compiled_receipt().is_none());
+        let scoped = ws.index.scoped_for_file(&key);
+        for name in ["getName", "getElse"] {
+            assert!(
+                ktcore::jvm::member_candidates(
+                    &scoped,
+                    &ktcore::types::Type::class("Person", Some("pluginfixture".into())),
+                    name
+                )
+                .is_empty(),
+                "rejected output contributed {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_retracts_invalid_compiled_members_before_any_other_query() {
+        let (mut ws, request, key) = admitted_getter_fixture();
+        let count = |ws: &Workspace| {
+            ktcore::jvm::member_candidates(
+                &ws.index.scoped_for_file(&key),
+                &ktcore::types::Type::class("Person", Some("pluginfixture".into())),
+                "getName",
+            )
+            .len()
+        };
+        assert_eq!(count(&ws), 1);
+        let _ = ws.take_extension_diagnostic_changes();
+        request.invalid.store(true, Ordering::Release);
+        let _ = ws.diagnostics(&key);
+        assert!(ws.analysis_extensions.compiled_receipt().is_none());
+        assert_eq!(count(&ws), 0);
+        assert!(ws.take_extension_diagnostic_changes().contains(&key));
+    }
+
+    #[test]
+    fn source_config_binary_aba_and_error_latch_retract_the_actual_admitted_getter() {
+        const SOURCE: &str =
+            include_str!("../../ktcore/tests/fixtures/classfile/sources/pluginfixture/Person.java");
+        for mutation in ["source-aba", "config-aba", "binary-aba", "callback-error"] {
+            let (mut ws, request, key) = admitted_getter_fixture();
+            let count = |ws: &Workspace| {
+                let scoped = ws.index.scoped_for_file(&key);
+                let entries = ktcore::jvm::member_candidates(
+                    &scoped,
+                    &ktcore::types::Type::class("Person", Some("pluginfixture".into())),
+                    "getName",
+                );
+                for entry in &entries {
+                    assert!(entry.definition().is_none(), "no invented source target");
+                }
+                entries.len()
+            };
+            assert_eq!(
+                count(&ws),
+                1,
+                "independently compiled getter was admitted before {mutation}"
+            );
+            let _ = ws.take_extension_diagnostic_changes();
+            match mutation {
+                "source-aba" => {
+                    ws.change(&key, format!("{SOURCE}\n// edited"));
+                    ws.change(&key, SOURCE.into());
+                }
+                "config-aba" => {
+                    let config = crate::paths::file_key(&request.root.join("ap/options.json"));
+                    assert!(!ws.observe_compiled_resource(&config));
+                    assert!(!ws.observe_compiled_resource(&config));
+                }
+                "binary-aba" => {
+                    let binary = crate::paths::file_key(
+                        &request.task.output_roots[0].join("pluginfixture/Person.class"),
+                    );
+                    assert!(!ws.observe_compiled_resource(&binary));
+                    assert!(!ws.observe_compiled_resource(&binary));
+                }
+                "callback-error" => {
+                    request.invalid.store(true, Ordering::Release);
+                    ws.refresh_compiled_freshness();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                request.invalid.load(Ordering::Acquire),
+                "ABA cannot restore the receipt"
+            );
+            assert!(ws.analysis_extensions.compiled_receipt().is_none());
+            assert_eq!(count(&ws), 0, "stale callable survived {mutation}");
+            assert!(
+                ws.take_extension_diagnostic_changes().contains(&key),
+                "affected diagnostics must be queued"
+            );
+        }
+    }
+
+    #[test]
+    fn late_output_and_callback_latch_invalidate_an_accepted_owner() {
+        let root = std::env::temp_dir().join("ktlsp-observed-late-output");
+        let request = observed_test_request(&root);
+        let mut ws = Workspace::new();
+        ws.analysis_extensions
+            .accept_compiled(
+                &ws.index,
+                observed_test_receipt(request.clone()),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(ws.analysis_extensions.compiled_receipt().is_some());
+        assert!(!ws.observe_compiled_resource(&crate::paths::file_key(
+            &root.join("build/classes/java/main/Member.class")
+        )));
+        assert!(ws.analysis_extensions.compiled_receipt().is_none());
+        let request = observed_test_request(&root);
+        ws.analysis_extensions
+            .accept_compiled(
+                &ws.index,
+                observed_test_receipt(request.clone()),
+                Vec::new(),
+            )
+            .unwrap();
+        request.invalid.store(true, Ordering::Release);
+        // Same pre-feature check used by ordinary completion/hover/diagnostics, no per-key rehash.
+        ws.refresh_compiled_freshness();
+        assert!(ws.analysis_extensions.compiled_receipt().is_none());
     }
 }

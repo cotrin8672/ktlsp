@@ -49,6 +49,7 @@ sha2.workspace = true
 salsa.workspace = true
 zstd.workspace = true
 parking_lot.workspace = true
+notify = "=8.2.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [

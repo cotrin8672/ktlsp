@@ -45,7 +45,16 @@ struct WatchState {
     dynamic: bool,
     relative: bool,
     registration: Option<String>,
+    registered_options: Option<serde_json::Value>,
     sequence: u64,
+}
+
+impl WatchState {
+    fn acknowledges(&self, expected_options: &serde_json::Value) -> bool {
+        self.dynamic
+            && self.registration.is_some()
+            && self.registered_options.as_ref() == Some(expected_options)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +81,8 @@ pub struct Backend {
     formatter: Mutex<Option<FormatterConfig>>,
     refresh: Arc<Mutex<RefreshState>>,
     watches: Arc<Mutex<WatchState>>,
+    compile_workers: Arc<tokio::sync::Semaphore>,
+    compile_watch: CompilerWatchSlot,
 }
 
 impl Backend {
@@ -95,6 +106,8 @@ impl Backend {
             formatter: Mutex::new(None),
             refresh: Arc::new(Mutex::new(RefreshState::default())),
             watches: Arc::new(Mutex::new(WatchState::default())),
+            compile_workers: Arc::new(tokio::sync::Semaphore::new(1)),
+            compile_watch: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -170,23 +183,16 @@ impl Backend {
     }
 
     fn schedule_one_diagnostic(&self, key: String) {
-        let version = {
-            let mut versions = self.doc_versions.lock();
-            let n = versions.entry(key.clone()).or_insert(0);
-            *n += 1;
-            *n
-        };
-        let ws = self.ws.clone();
-        let client = self.client.clone();
-        let versions = self.doc_versions.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(DIAGNOSTIC_DEBOUNCE).await;
-            // Superseded by a newer edit? Discard.
-            if versions.lock().get(&key).copied() != Some(version) {
-                return;
-            }
-            publish_diagnostics(&ws, &client, &key).await;
-        });
+        let invalid = self
+            .compile_watch
+            .lock()
+            .as_ref()
+            .filter(|watch| watch.owner.check_live().is_err())
+            .map(|watch| watch.owner.clone());
+        if let Some(owner) = invalid {
+            close_owned_compile_watch(&self.compile_watch, &owner);
+        }
+        schedule_owned_diagnostic(&self.ws, &self.client, &self.doc_versions, key);
     }
 
     fn seed_jdk_imports_for_open_java(&self, key: String, text: String) {
@@ -1369,18 +1375,23 @@ async fn register_project_watches(
     let options = DidChangeWatchedFilesRegistrationOptions {
         watchers: project_watchers(root, model, relative),
     };
+    let options = serde_json::to_value(options).unwrap();
     let result = client
         .register_capability(vec![Registration {
             id: registration.clone(),
             method: "workspace/didChangeWatchedFiles".to_string(),
-            register_options: Some(serde_json::to_value(options).unwrap()),
+            register_options: Some(options.clone()),
         }])
         .await;
     if let Err(error) = result {
         tracing::warn!(%error, "client rejected Gradle file watches; explicit watched-file notifications remain supported");
         return;
     }
-    let previous = state.lock().registration.replace(registration);
+    let previous = {
+        let mut state = state.lock();
+        state.registered_options = Some(options);
+        state.registration.replace(registration)
+    };
     if let Some(previous) = previous {
         let _ = client
             .unregister_capability(vec![Unregistration {
@@ -1807,6 +1818,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        self.close_compiler_jobs();
         Ok(())
     }
 
@@ -1863,19 +1875,34 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
-        let force = project_changes(
+        let changes = {
+            let mut ws = self.ws.lock();
             params
                 .changes
                 .iter()
                 .filter_map(|change| uri_to_key(&change.uri))
-                .map(|key| project_change(&root, model.as_deref(), &key)),
-        );
+                .filter(|key| !ws.observe_compiled_resource(key))
+                .map(|key| {
+                    let change = project_change(&root, model.as_deref(), &key);
+                    if change.is_some() {
+                        tracing::debug!(path = key, force = ?change, "project refresh requested by client watch");
+                    }
+                    change
+                })
+                .collect::<Vec<_>>()
+        };
+        let changed = self.ws.lock().take_extension_diagnostic_changes();
+        for key in changed {
+            self.schedule_one_diagnostic(key);
+        }
+        let force = project_changes(changes.into_iter());
         if let Some(force) = force {
             self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
         }
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        self.ws.lock().invalidate_observed_compile();
         let options = Some(params.settings);
         configure_analysis_providers(&mut self.ws.lock(), &options);
         let changed = self.ws.lock().take_extension_diagnostic_changes();
@@ -2432,6 +2459,9 @@ impl LanguageServer for Backend {
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
         match params.command.as_str() {
+            crate::commands::COMPILE => {
+                Ok(Some(self.execute_observed_compile(&params.arguments).await))
+            }
             crate::commands::TRACE_PATH => Ok(crate::trace::log_path()
                 .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))),
             crate::commands::REINDEX => {
@@ -5245,5 +5275,354 @@ mod tests {
             !launched,
             "an editor request re-resolved changed Gradle metadata"
         );
+    }
+}
+
+fn schedule_owned_diagnostic(
+    ws: &Arc<Mutex<Workspace>>,
+    client: &Client,
+    versions: &Arc<Mutex<HashMap<String, u64>>>,
+    key: String,
+) {
+    let version = {
+        let mut versions = versions.lock();
+        let n = versions.entry(key.clone()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let ws = ws.clone();
+    let client = client.clone();
+    let versions = versions.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(DIAGNOSTIC_DEBOUNCE).await;
+        if versions.lock().get(&key).copied() != Some(version) {
+            return;
+        }
+        publish_diagnostics(&ws, &client, &key).await;
+    });
+}
+
+type CompilerWatchSlot = Arc<Mutex<Option<Arc<crate::compiled_watch::NativeCompileWatch>>>>;
+
+fn close_owned_compile_watch(
+    slot: &CompilerWatchSlot,
+    request: &Arc<crate::compile::ObservedCompileRequest>,
+) {
+    let removed = {
+        let mut guard = slot.lock();
+        if guard
+            .as_ref()
+            .is_some_and(|watch| Arc::ptr_eq(&watch.owner, request))
+        {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(watch) = removed {
+        watch.close();
+    }
+}
+
+struct ObservedWorkerLease {
+    request: Arc<crate::compile::ObservedCompileRequest>,
+    workspace: std::sync::Weak<Mutex<Workspace>>,
+    watches: std::sync::Weak<Mutex<Option<Arc<crate::compiled_watch::NativeCompileWatch>>>>,
+    keep_watch: bool,
+    // Owned by the blocking job, never by the cancellable LSP future.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for ObservedWorkerLease {
+    fn drop(&mut self) {
+        if let Some(ws) = self.workspace.upgrade() {
+            ws.lock().cancel_observed_compile(&self.request);
+        }
+        if !self.keep_watch || self.request.check_live().is_err() {
+            if let Some(slot) = self.watches.upgrade() {
+                close_owned_compile_watch(&slot, &self.request);
+            }
+        }
+        // The permit is released only after ticket retirement and watch cleanup above.
+    }
+}
+
+struct CancelObservedRequest {
+    request: Arc<crate::compile::ObservedCompileRequest>,
+    armed: bool,
+    wake: tokio::sync::mpsc::Sender<()>,
+}
+
+impl Drop for CancelObservedRequest {
+    fn drop(&mut self) {
+        if self.armed {
+            self.request
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.request
+                .invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _ = self.wake.try_send(());
+        }
+    }
+}
+
+fn run_owned_compile(
+    mut lease: ObservedWorkerLease,
+    slot: CompilerWatchSlot,
+    wake: tokio::sync::mpsc::Sender<()>,
+) -> serde_json::Value {
+    use crate::compiled_watch::{NativeCompileWatch, WatchPlan};
+    let request = lease.request.clone();
+    let result = (|| -> anyhow::Result<serde_json::Value> {
+        request.check_live()?;
+        // begin_observed_compile already retracted the previous owner's facts. Release its
+        // native coverage even when arming the new owner later fails; keep joins on this worker.
+        let previous = slot.lock().take();
+        if let Some(previous) = previous {
+            previous.close();
+        }
+        request.check_live()?;
+        let initial = WatchPlan::build(&request, &request.initial_watch_paths())?;
+        let watch = NativeCompileWatch::new(request.clone(), initial.clone(), wake)?;
+        let previous = slot.lock().replace(watch.clone());
+        if let Some(previous) = previous {
+            previous.close();
+        }
+        request.check_live()?;
+        // The same blocking job owns native exit, final watches, read verification, publication
+        // and retirement. Cancellation of the awaiting future cannot release this lease.
+        let mut result = crate::compile::run_observed_compile(request.clone(), &initial);
+        if let Some(receipt) = result.receipt.clone() {
+            let verified = (|| -> anyhow::Result<()> {
+                request.check_live()?;
+                // Receipt reads already passed the initial-plan check. This extension keeps
+                // future output/input coverage; it cannot certify an earlier unobserved read.
+                watch.extend(WatchPlan::build(&request, &receipt.watch_paths())?)?;
+                receipt.verify_current()?;
+                request.check_live()
+            })();
+            if let Err(error) = verified {
+                result.receipt = None;
+                result.owners.clear();
+                result.reason = error.to_string();
+            }
+        }
+        let reason = result.reason.clone();
+        let executed = result.outcome.executed;
+        let diagnostic_count = result.outcome.diagnostics.len();
+        let ws = lease
+            .workspace
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("backend-closed"))?;
+        let (status, deferred) = ws.lock().finish_observed_compile(&request, result);
+        lease.keep_watch = status == "observed-success" && request.check_live().is_ok();
+        Ok(
+            serde_json::json!({"status":status,"reason":reason,"task":request.task.task,
+            "executed":executed,"diagnostics":diagnostic_count,"deferredOutputs":deferred,
+            "compilerClosureComplete":false}),
+        )
+    })();
+    result.unwrap_or_else(|error| {
+        serde_json::json!({"status":"compile-unverified","reason":error.to_string(),
+        "compilerClosureComplete":false})
+    })
+}
+
+impl Backend {
+    fn close_compiler_jobs(&self) {
+        self.compile_workers.close();
+        self.ws.lock().stop_observed_compile();
+        let watch = self.compile_watch.lock().take();
+        if let Some(watch) = watch {
+            watch.close();
+        }
+    }
+
+    async fn execute_observed_compile(&self, arguments: &[serde_json::Value]) -> serde_json::Value {
+        let Some(uri) = arguments
+            .first()
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("uri").and_then(serde_json::Value::as_str))
+            })
+            .and_then(|uri| uri.parse::<Uri>().ok())
+        else {
+            return serde_json::json!({"status":"invalid-arguments"});
+        };
+        let Some(key) = uri_to_key(&uri) else {
+            return serde_json::json!({"status":"invalid-uri"});
+        };
+        let Some(root) = self.root.lock().clone() else {
+            return serde_json::json!({"status":"no-root"});
+        };
+        let project_watch_ready = {
+            let state = self.watches.lock();
+            state.dynamic && state.registration.is_some() && state.registered_options.is_some()
+        };
+        if !project_watch_ready {
+            return serde_json::json!({"status":"project-freshness-watch-unavailable"});
+        }
+        let permit = match self.compile_workers.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return serde_json::json!({"status":"compile-already-running-or-closed"}),
+        };
+        let (request, model) = match self.ws.lock().begin_observed_compile(&root, &key) {
+            Ok(request) => request,
+            Err(reason) => return serde_json::json!({"status":reason}),
+        };
+        let expected_options = {
+            let state = self.watches.lock();
+            serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: project_watchers(&root, Some(&model), state.relative),
+            })
+            .unwrap()
+        };
+        if !self.watches.lock().acknowledges(&expected_options) {
+            self.ws.lock().cancel_observed_compile(&request);
+            return serde_json::json!({"status":"current-project-watch-ack-unavailable"});
+        }
+        let lease = ObservedWorkerLease {
+            request: request.clone(),
+            workspace: Arc::downgrade(&self.ws),
+            watches: Arc::downgrade(&self.compile_watch),
+            keep_watch: false,
+            _permit: permit,
+        };
+        let (wake, mut events) = tokio::sync::mpsc::channel(1);
+        let mut cancellation = CancelObservedRequest {
+            request: request.clone(),
+            armed: true,
+            wake: wake.clone(),
+        };
+        let weak_ws = Arc::downgrade(&self.ws);
+        let weak_slot = Arc::downgrade(&self.compile_watch);
+        let owner = request.clone();
+        let client = self.client.clone();
+        let versions = self.doc_versions.clone();
+        tokio::spawn(async move {
+            if events.recv().await.is_some() {
+                if let Some(ws) = weak_ws.upgrade() {
+                    let changed = {
+                        let mut ws = ws.lock();
+                        if ws.invalidate_owned_compile(&owner) {
+                            ws.take_extension_diagnostic_changes()
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    for key in changed {
+                        schedule_owned_diagnostic(&ws, &client, &versions, key);
+                    }
+                }
+                // Never close/join notify under Workspace's mutex or in the notify callback.
+                if let Some(slot) = weak_slot.upgrade() {
+                    close_owned_compile_watch(&slot, &owner);
+                }
+            }
+        });
+        let slot = self.compile_watch.clone();
+        let result =
+            tokio::task::spawn_blocking(move || run_owned_compile(lease, slot, wake)).await;
+        cancellation.armed = false;
+        let changed = self.ws.lock().take_extension_diagnostic_changes();
+        for key in changed {
+            self.schedule_one_diagnostic(key);
+        }
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                serde_json::json!({"status":"compile-worker-failed","reason":error.to_string()})
+            }
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.close_compiler_jobs();
+    }
+}
+
+#[cfg(test)]
+mod observed_worker_lease_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn canceled_lsp_future_keeps_native_worker_busy_until_its_exit() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let ws = Arc::new(Mutex::new(Workspace::new()));
+        let slot: CompilerWatchSlot = Arc::new(Mutex::new(None));
+        let request = crate::compile::observed_test_request(
+            &std::env::temp_dir().join("ktlsp-worker-lease-test"),
+        );
+        let lease = ObservedWorkerLease {
+            request: request.clone(),
+            workspace: Arc::downgrade(&ws),
+            watches: Arc::downgrade(&slot),
+            keep_watch: false,
+            _permit: semaphore.clone().try_acquire_owned().unwrap(),
+        };
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = finishing.recv();
+            drop(lease);
+        });
+        ready.await.unwrap();
+        assert!(
+            semaphore.clone().try_acquire_owned().is_err(),
+            "concurrent second request must be rejected"
+        );
+        let response = tokio::spawn(async move {
+            let _ = worker.await;
+        });
+        let (wake, _events) = tokio::sync::mpsc::channel(1);
+        let cancellation = CancelObservedRequest {
+            request: request.clone(),
+            armed: true,
+            wake,
+        };
+        response.abort();
+        let _ = response.await;
+        drop(cancellation);
+        assert!(request.cancelled.load(Ordering::Acquire));
+        assert!(request.invalid.load(Ordering::Acquire));
+        assert!(
+            semaphore.clone().try_acquire_owned().is_err(),
+            "future cancel is not native exit"
+        );
+        finish.send(()).unwrap();
+        let permit =
+            tokio::time::timeout(Duration::from_secs(5), semaphore.clone().acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod compiled_watch_ack_tests {
+    use super::*;
+
+    #[test]
+    fn initial_or_previous_watch_ack_cannot_prove_current_model_coverage() {
+        let old = serde_json::json!({"watchers":[{"globPattern":"/repo/**/*.jar"}]});
+        let current = serde_json::json!({"watchers":[{"globPattern":"/repo/**/*"}]});
+        let mut state = WatchState::default();
+        state.dynamic = true;
+        state.registration = Some("old-ack".into());
+        state.registered_options = Some(old.clone());
+        assert!(state.acknowledges(&old));
+        assert!(!state.acknowledges(&current));
+        state.registered_options = Some(current.clone());
+        assert!(state.acknowledges(&current));
+        state.registration = None;
+        assert!(!state.acknowledges(&current));
     }
 }

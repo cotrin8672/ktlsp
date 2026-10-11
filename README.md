@@ -296,6 +296,34 @@ Set `KTLSP_UI_CASES` to an absolute UI manifest path to run the existing native 
 accepted-text probe after corpus requests; `compiler-plugins-ui.json` checks Kotlin's generated
 getter property. See [the fixture instructions](dev/corpus/README.md) for pins and remaining checks.
 
+The saved Java-only observed-build probe uses the same corpus client and a fresh Gradle
+8.10.2/Lombok 1.18.32 fixture. Run from Git Bash with native Windows Neovim on `PATH`,
+JDK 17 selected by `JAVA_HOME`, cached dependencies and an accepted release server:
+
+```sh
+export JAVA_HOME="C:/path/to/jdk-17"
+accepted_ktlsp="C:/path/to/accepted/ktlsp.exe"
+fixture_parent="$(mktemp -d)"
+fixture="$fixture_parent/project"
+rtk proxy nvim -l dev/compiler_plugin_project.lua "$fixture" --java-only
+KTLSP_CORPUS_WAIT_INDEX=1 \
+KTLSP_CORPUS_READY_TIMEOUT_MS=180000 \
+KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_observed_java.lua" \
+rtk proxy bash -o igncr dev/ktlsp-harness.sh corpus \
+  --root "$fixture" --file "$PWD/dev/corpus/observed-java.json" \
+  --release --no-build --bin "$accepted_ktlsp" --run-dir "$fixture_parent/run"
+```
+
+The saved Java-only regression passes 99 checks in checkpoint 27. It requires a real
+selected `:compileJava` execution before the first generated
+`getName` completion, then checks String inference, configuration changes, dirty-buffer
+retraction and fresh rebuilds. Source-less navigation and rename remain unavailable;
+compiler-producer closure remains unknown. `lombok.config` stops ancestor configuration
+from affecting the fixture. The default mixed fixture and its twelve generated-API
+completion gaps remain separate, as does useful generated completion during unsaved edits.
+This run verifies correctness; latency/RSS and complete process-tree observations need
+separate measurements. See [the acceptance record](docs/fork-acceptance.md).
+
 `dev/processor_project.lua` creates a separate, compiler-verified KAPT/KSP fixture for the same
 `corpus` route. Its `processor-generated.json` manifest checks actual generated Java/Kotlin
 declarations, incomplete member completion and paired known/unknown receivers in both languages.
