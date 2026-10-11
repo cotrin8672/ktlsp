@@ -953,7 +953,7 @@ A1.json,B1.json,B2.json,A2.json,corpus-A-cache-delta.json,guards-corpus-B.json}`
 and `shutdown-client-checks.json`. Existing watcher repair prevents the separate
 63 GB client allocation failure; it does not solve this server footprint.
 
-The next allocation hypothesis is confirmed structurally, not yet repaired:
+That baseline exposed a separate allocation problem:
 bincode preserves type-context values but reconstructs a separate candidate
 `Arc` per `TypeRef`. Three immutable cache copies (Guava, Gradle profiler and
 Kotlin stdlib) contain 67,573 duplicate candidate allocations within files.
@@ -962,9 +962,99 @@ candidate lists summed per file. These are archive populations, not final select
 index retention or RSS. Native Rust 1.98.1 layout measurements find
 `IndexedSymbol` at 696 bytes and `TypeRef` at 112 bytes; slot sizes alone do not
 prove allocation savings. Evidence: `ktlsp-warm-sharing-20261011/baseline-receipt.json`.
-The planned first change restores only identical ordered candidate-list sharing
-after accepted cache loads, preserving source identity, type values and cache
-bytes. Inline optional type slots and decode-buffer peaks remain separate work.
+The following checkpoint restores identical ordered candidate-list sharing
+after accepted cache loads. Inline optional type slots and decode-buffer peaks
+remain separate work.
+
+### Thirteenth checkpoint: cache sharing and bounded notification lookup
+
+Accepted library caches now restore file-local sharing of identical, ordered
+type-context candidate lists. The same core helper handles nested arguments,
+all indexed type fields and JVM projection facts in both the LSP per-archive
+loader and ktcheck's aggregate loader. Explicit-import lists, order, duplicates,
+qualifiers, nullable types and container contexts retain their original values.
+The pool is dropped after each file; no global interner or new dependency is
+introduced. Cache versions remain unchanged because full serialized bytes are
+identical. Actual old-loader regressions fail before the fix and pass afterward.
+Focused checks pass: core 1, dependencies 38 and CLI 13.
+
+On the same immutable Guava, profiler and Kotlin stdlib cache copies, the actual
+helper eliminates all 67,573 duplicate candidate allocations counted within
+files. The stdlib candidate vector/string payload capacity falls from 9,362,886
+to 123,845 bytes. This excludes Arc headers, allocator metadata and other data;
+it is an archive population, not the authoritative selected index or process
+memory. Restoration happens after decoding and therefore cannot eliminate the
+earlier deserialization allocation peak. Evidence is
+`ktlsp-warm-sharing-20261011/{baseline-receipt.json,candidate-receipt.json}`.
+
+Project ownership lookup also stops scanning every registered root for each
+file or notification. A shared ancestor walk probes ordered maps by path depth,
+preserving longest-root, source-over-module, first-owner, canonical-alias and
+exact-artifact rules. Dependency keys are prepared once per project snapshot;
+notification reduction stops after the first forced refresh. It does no new
+per-event filesystem or Gradle work. Focused classpath 29 and LSP 26 checks pass.
+Canonical-host UNC file URIs remain a separate known gap: the existing vendored
+URI conversion loses their authority before ownership classification. Native
+UNC boundary tests do not establish support for that URI form.
+
+Thirteenth-fixed-1 passes formatting and all 1,049 workspace tests, with three
+ignored tests, then builds both release binaries. All 307 compiled/harness inputs
+are identical before tests and after release. Server SHA-256 is
+`18b0a822071e85fa2cfd25512b1305c331e53b788de3ae57edc4bf4231584095`.
+The checkpoint receipt is `ktlsp-goal-20261010/thirteenth-fixed-1/result.json`.
+
+A new exclusive ABBA comparison uses twelfth-fixed-2 (A) and thirteenth-fixed-1
+(B), the same existing 933-file warm cache, 293 source archives and guarded
+Gradle model. There is no new warmup, cache copy or concurrent heavy workload.
+Each RSS observation again covers ten seconds after indexing, with 101 samples.
+
+| Run | Project index s | Library index s | Steady RSS MB | Lifetime peak commit MB | Shutdown s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1 | 6.812 | 9.547 | 3,703.988 | 3,927.740 | 9.500 |
+| B1 | 5.500 | 8.125 | 3,431.354 | 3,648.434 | 8.063 |
+| B2 | 5.281 | 7.922 | 3,427.787 | 3,646.968 | 8.109 |
+| A2 | 6.000 | 8.593 | 3,701.977 | 3,927.249 | 9.625 |
+
+Median steady RSS is 3,702,982,656 bytes for A and 3,429,570,560 for B: an
+observed reduction of 273,412,096 bytes (7.38%). Library readiness medians are
+9.070 and 8.0235 seconds, and shutdown medians are 9.5625 and 8.086 seconds.
+This is a whole-candidate comparison: sharing and owner lookup changed together.
+Two runs per arm, uncontrolled OS page cache and unmeasured CPU do not establish
+a general speedup, p95, isolated cause or accepted performance budget. Shutdown
+still takes seconds. RSS and lifetime commit counters describe different scopes.
+
+All runs retain exactly 60,746 library files and 1,245,317 symbols, with the same
+11,327 closed project files in server-only runs. Three failed and twenty-six
+missing source inputs keep coverage and steady-state acceptance **FAIL**.
+Correctness-only Neovim companions pass all six exact first semantic requests
+without retries; their two open buffers explain the 11,325 closed-file count.
+All six servers acknowledge shutdown once, receive one exit and return native
+zero without forced termination. All cache, source, archive and model guards
+pass, and all verified owned processes exit. Evidence is
+`ktlsp-warm-sharing-pair-20261011/{final-receipt.json,ABBA-statistics.json}`.
+The existing Neovim library replay passes 13/13. Same-client Gradle refresh
+replays pass 70/72 with explicit standard watched-file notifications and 73/76
+with Neovim's automatic watcher. All eight offline builds exit zero. Dependency
+addition, version update, removal, standard/custom generated roots and preserved
+unsaved cross-language members pass without changing their expectations.
+Both modes still miss the two expected stale-member diagnostics after updating
+the dependency. Each mode also has two query points where the first response
+is empty and a later polled response becomes useful; eventual success is not
+first-response freshness.
+
+The explicit replay observes one shutdown acknowledgement, one exit and native
+zero without termination. The automatic replay receives the acknowledgement
+and sends exit, but does not observe the native exit within its existing ten
+seconds; its timeout/force request remains a third failure. No terminate call
+is recorded, and the process is gone in the final owned-process inventory.
+The cause of this close failure is not established: these are correctness runs
+with concurrent compiler/IDEA work, not matched shutdown performance samples.
+The old library route does not observe protocol shutdown, so its wrapper's zero
+exit is not a server clean-exit proof. All 307 source inputs, binaries and
+controllers remain unchanged. Evidence is
+`ktlsp-semantic-gaps-20261010/thirteenth-replay-preparation-1/{final-receipt.json,
+first-responses.json}` and the three `thirteenth-*` Gradle harness directories.
+IDEA parity, compiler-producer freshness and full source coverage remain open.
 
 ### Current slice: requires-only compatibility artifacts
 

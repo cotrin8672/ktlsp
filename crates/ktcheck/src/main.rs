@@ -610,7 +610,13 @@ fn load_durable_library_symbols_cached(roots: &[PathBuf], scans: &[ScannedFile])
     let path = cache_dir.join(format!("{key}.zst"));
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(decoded) = zstd::stream::decode_all(&bytes[..]) {
-            if let Ok(cached) = bincode::deserialize::<DurableLoad>(&decoded) {
+            if let Ok(mut cached) = bincode::deserialize::<DurableLoad>(&decoded) {
+                for file in &mut cached.files {
+                    ktcore::symbol::reshare_file_type_contexts(
+                        &mut file.symbols,
+                        file.jvm.as_mut(),
+                    );
+                }
                 return cached;
             }
         }
@@ -1714,6 +1720,73 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_cache_hit_restores_type_context_sharing() {
+        use std::sync::Arc;
+
+        let root =
+            std::env::temp_dir().join(format!("ktcheck-warm-type-contexts-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("Library.kt");
+        std::fs::write(
+            &source,
+            "package lib\nimport elsewhere.*\nclass Payload\nsuspend fun first(value: Payload): Payload = TODO()\nsuspend fun second(value: Payload): Payload = TODO()\n",
+        ).unwrap();
+        let scan = scan_files(vec![source]).pop().unwrap();
+        let durable = DurableLoad {
+            files: vec![DurableSymbols {
+                file: scan.path.to_string_lossy().into_owned(),
+                symbols: scan.symbols,
+                jvm: scan.jvm,
+            }],
+            library_index_complete: true,
+            jdk_index_complete: false,
+        };
+        let wire = bincode::serialize(&durable).unwrap();
+        let raw: DurableLoad = bincode::deserialize(&wire).unwrap();
+        let first = raw.files[0]
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "first")
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &first.return_type.as_ref().unwrap().package_candidates,
+            &first.params[0].package_candidates,
+        ));
+        let roots = [root.clone()];
+        let cache_dir = durable_cache_dir(&roots);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache = cache_dir.join(format!("{}.zst", durable_cache_key(&roots, &[])));
+        std::fs::write(&cache, zstd::stream::encode_all(&wire[..], 1).unwrap()).unwrap();
+
+        let loaded = load_durable_library_symbols_cached(&roots, &[]);
+        assert_eq!(bincode::serialize(&loaded).unwrap(), wire);
+        let first = loaded.files[0]
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "first")
+            .unwrap();
+        let second = loaded.files[0]
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "second")
+            .unwrap();
+        let candidates = &first.return_type.as_ref().unwrap().package_candidates;
+        assert!(Arc::ptr_eq(candidates, &first.params[0].package_candidates));
+        assert!(Arc::ptr_eq(
+            candidates,
+            &second.return_type.as_ref().unwrap().package_candidates
+        ));
+        assert!(Arc::ptr_eq(
+            candidates,
+            &loaded.files[0].jvm.as_ref().unwrap().callables[0].params[0].package_candidates
+        ));
+        assert!(loaded.library_index_complete);
+        assert!(!loaded.jdk_index_complete);
+        std::fs::remove_dir_all(cache_dir).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

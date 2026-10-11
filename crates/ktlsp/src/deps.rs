@@ -727,6 +727,9 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
     if source_dir.join(SOURCE_JAR_MARKER).is_file()
         || cached.iter().all(|fs| Path::new(&fs.file).exists())
     {
+        for batch in &mut cached {
+            ktcore::symbol::reshare_file_type_contexts(&mut batch.symbols, batch.jvm.as_mut());
+        }
         Some(cached)
     } else {
         tracing::warn!(
@@ -2322,6 +2325,82 @@ public interface ExecutorService {
             assert_dependency_buffer_lifecycle(batch, &source, original);
         }
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn warm_symcache_restores_type_context_sharing_without_changing_values() {
+        use std::sync::Arc;
+
+        fn contexts(symbols: &[IndexedSymbol]) -> [&Arc<Vec<String>>; 3] {
+            let first = symbols
+                .iter()
+                .find(|symbol| symbol.name == "first")
+                .unwrap();
+            let second = symbols
+                .iter()
+                .find(|symbol| symbol.name == "second")
+                .unwrap();
+            [
+                &first.return_type.as_ref().unwrap().package_candidates,
+                &first.params[0].package_candidates,
+                &second.return_type.as_ref().unwrap().package_candidates,
+            ]
+        }
+
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_cached_type_contexts_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for (name, text) in [
+            (
+                "Helper.java",
+                "package lib; import elsewhere.*; import api.Imported; public class Helper { public Payload first(Payload value) { return null; } public Payload second(Payload value) { return null; } public Imported third(Imported value) { return null; } }",
+            ),
+            (
+                "Library.kt",
+                "package lib\nimport elsewhere.*\nimport api.Imported\nclass Payload\nsuspend fun first(value: Payload): Payload = TODO()\nsuspend fun second(value: Payload): Payload = TODO()\nsuspend fun third(value: Imported): Imported = TODO()\n",
+            ),
+        ] {
+            let source = tmp.join(name);
+            fs::write(&source, text).unwrap();
+            let cold = parse_source_file(&source, text, &mut kotlin, &mut java).unwrap();
+            let pointers = contexts(&cold.symbols);
+            assert!(pointers[1..].iter().all(|other| Arc::ptr_eq(pointers[0], other)));
+
+            let wire = bincode::serialize(&vec![cold]).unwrap();
+            let raw: Vec<FileSymbols> = bincode::deserialize(&wire).unwrap();
+            let pointers = contexts(&raw[0].symbols);
+            assert!(!Arc::ptr_eq(pointers[0], pointers[1]));
+            let cache = source.with_extension("zst");
+            fs::write(&cache, zstd::stream::encode_all(&wire[..], 1).unwrap()).unwrap();
+            let loaded = symcache_load_file(&cache, &tmp).unwrap();
+            assert_eq!(bincode::serialize(&loaded).unwrap(), wire);
+            let pointers = contexts(&loaded[0].symbols);
+            assert!(
+                pointers[1..].iter().all(|other| Arc::ptr_eq(pointers[0], other)),
+                "accepted {name} cache must retain cold declaration-context sharing"
+            );
+            let imported = loaded[0].symbols.iter().find(|symbol| symbol.name == "third").unwrap();
+            let imported_context = &imported.return_type.as_ref().unwrap().package_candidates;
+            assert_eq!(imported_context.as_ref(), &["api"]);
+            assert!(!Arc::ptr_eq(pointers[0], imported_context));
+            if let Some(jvm) = &loaded[0].jvm {
+                assert_eq!(jvm.callables.len(), 3);
+                assert!(Arc::ptr_eq(pointers[0], &jvm.callables[0].params[0].package_candidates));
+                let result = &jvm.callables[0].return_type;
+                assert_eq!(result.name, "Object");
+                assert_eq!(result.qualification.as_deref(), Some("java.lang"));
+                assert!(Arc::ptr_eq(pointers[0], &result.package_candidates));
+                let continuation = jvm.callables[0].params.last().unwrap();
+                assert_eq!(continuation.qualification.as_deref(), Some("kotlin.coroutines"));
+                assert!(Arc::ptr_eq(pointers[0], &continuation.args[0].package_candidates));
+            }
+            fs::remove_file(source).unwrap();
+            assert!(symcache_load_file(&cache, &tmp).is_none());
+            assert_eq!(bincode::serialize(&raw).unwrap(), wire);
+        }
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

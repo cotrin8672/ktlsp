@@ -110,49 +110,71 @@ pub struct ModuleClasspath {
     pub unresolved: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct OutputOwners {
+    source_sets: Vec<(usize, usize)>,
+    output_root: bool,
+    exact_root: bool,
+}
+
 /// A shared immutable Gradle model. Ownership queries do no filesystem or Gradle work.
 #[derive(Debug)]
 pub struct ProjectSnapshot {
     pub modules: Vec<ModuleClasspath>,
-    owners: Vec<(String, usize, Option<usize>)>,
-    output_owners: BTreeMap<String, Vec<(usize, usize)>>,
+    owners: BTreeMap<String, (usize, Option<usize>)>,
+    output_owners: BTreeMap<String, OutputOwners>,
     file_origins: BTreeMap<String, String>,
+    local_source_keys: std::collections::BTreeSet<String>,
     mtimes: BTreeMap<String, u128>,
     visibilities: Vec<ScopeVisibility>,
 }
 
 impl ProjectSnapshot {
     pub fn new(modules: Vec<ModuleClasspath>) -> Self {
-        let mut owners = Vec::new();
-        let mut output_owners: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+        let mut owners = BTreeMap::new();
+        let mut output_owners: BTreeMap<String, OutputOwners> = BTreeMap::new();
         for (module_idx, module) in modules.iter().enumerate() {
-            owners.push((path_key(&module.project_dir), module_idx, None));
+            owners
+                .entry(path_key(&module.project_dir))
+                .or_insert((module_idx, None));
             for (source_idx, source) in module.source_sets.iter().enumerate() {
-                for path in source.output_roots.iter().chain(&source.provided_artifacts) {
-                    output_owners
-                        .entry(path_key(path))
-                        .or_default()
-                        .push((module_idx, source_idx));
+                for (path, is_output) in source
+                    .output_roots
+                    .iter()
+                    .map(|path| (path, true))
+                    .chain(source.provided_artifacts.iter().map(|path| (path, false)))
+                {
+                    let raw_key = crate::paths::file_key(path);
+                    let output = output_owners
+                        .entry(raw_key.trim_end_matches('/').to_string())
+                        .or_default();
+                    output.source_sets.push((module_idx, source_idx));
+                    if is_output {
+                        output.output_root = true;
+                        // Preserve the current exact-match behavior of trailing-slash roots.
+                        output.exact_root |= !raw_key.ends_with('/');
+                    }
                 }
                 for root in &source.source_roots {
-                    owners.push((path_key(root), module_idx, Some(source_idx)));
-                    if let Ok(canonical) = root.canonicalize() {
-                        owners.push((path_key(&canonical), module_idx, Some(source_idx)));
+                    for key in std::iter::once(path_key(root)).chain(
+                        root.canonicalize()
+                            .ok()
+                            .map(|canonical| path_key(&canonical)),
+                    ) {
+                        let owner = owners.entry(key).or_insert((module_idx, Some(source_idx)));
+                        if owner.1.is_none() {
+                            *owner = (module_idx, Some(source_idx));
+                        }
                     }
                 }
             }
         }
-        owners.sort_by(|a, b| {
-            b.0.len()
-                .cmp(&a.0.len())
-                .then(b.2.is_some().cmp(&a.2.is_some()))
-        });
-        owners.dedup();
         let mut model = Self {
             modules,
             owners,
             output_owners,
             file_origins: BTreeMap::new(),
+            local_source_keys: std::collections::BTreeSet::new(),
             mtimes: BTreeMap::new(),
             visibilities: Vec::new(),
         };
@@ -196,6 +218,12 @@ impl ProjectSnapshot {
                 })
             })
             .collect();
+        model.local_source_keys = model
+            .local_jars()
+            .iter()
+            .filter_map(|jar| adjacent_sources_jar(jar))
+            .map(|path| crate::paths::file_key(&path))
+            .collect();
         model
     }
 
@@ -203,15 +231,31 @@ impl ProjectSnapshot {
         &self,
         file: &Path,
     ) -> Option<(&ModuleClasspath, Option<&SourceSetClasspath>)> {
-        let key = path_key(file);
-        let (_, module, source) = self.owners.iter().find(|(root, _, _)| {
-            key == *root
-                || key
-                    .strip_prefix(root)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })?;
+        self.owner_for_key(&path_key(file))
+    }
+
+    pub(crate) fn owner_for_key(
+        &self,
+        key: &str,
+    ) -> Option<(&ModuleClasspath, Option<&SourceSetClasspath>)> {
+        let (module, source) =
+            find_ancestor(key.trim_end_matches('/'), |root| self.owners.get(root))?;
         let module = &self.modules[*module];
         Some((module, source.map(|idx| &module.source_sets[idx])))
+    }
+
+    pub(crate) fn is_output_key(&self, key: &str) -> bool {
+        find_ancestor(key, |root| {
+            self.output_owners.get(root).filter(|output| {
+                output.output_root && (output.exact_root || root.len() < key.len())
+            })
+        })
+        .is_some()
+    }
+
+    pub(crate) fn has_dependency_key(&self, key: &str) -> bool {
+        self.file_origins.contains_key(key.trim_end_matches('/'))
+            || self.local_source_keys.contains(key)
     }
 
     pub fn file_origin(&self, file: &Path) -> Option<FileOrigin> {
@@ -247,7 +291,12 @@ impl ProjectSnapshot {
         }
         let key = path_key(entry);
         let mut origins = Vec::new();
-        for &(module_idx, source_idx) in self.output_owners.get(&key).into_iter().flatten() {
+        for &(module_idx, source_idx) in self
+            .output_owners
+            .get(&key)
+            .into_iter()
+            .flat_map(|output| &output.source_sets)
+        {
             let module = &self.modules[module_idx];
             if let Some(ComponentId::Project { build, project }) = component {
                 if module.build != *build || module.module != *project {
@@ -422,6 +471,15 @@ fn file_revision(path: &Path) -> String {
 
 pub fn jdk_origin_id(path: &Path) -> String {
     format!("jdk:{}", path_key(path))
+}
+
+fn find_ancestor<T>(mut key: &str, mut lookup: impl FnMut(&str) -> Option<T>) -> Option<T> {
+    loop {
+        if let Some(value) = lookup(key) {
+            return Some(value);
+        }
+        key = &key[..key.rfind('/')?];
+    }
 }
 
 fn path_key(path: &Path) -> String {
@@ -1690,6 +1748,133 @@ CP\t/repo/unsupported/library.jar\nEND\t:unsupported\n",
         assert_eq!(
             model.local_jars(),
             vec![PathBuf::from("/repo/libs/local.jar")]
+        );
+    }
+
+    #[test]
+    fn ancestor_lookup_work_is_bounded_by_path_depth_not_root_count() {
+        use std::cell::Cell;
+        for count in [8, 5063, 10_000] {
+            let mut roots: BTreeMap<String, usize> = (0..count)
+                .map(|n| (format!("/workspace/sources/module-{n}/src"), n))
+                .collect();
+            let key = "/workspace/docs/edit.txt";
+            let probes = Cell::new(0);
+            assert_eq!(
+                find_ancestor(key, |ancestor| {
+                    probes.set(probes.get() + 1);
+                    roots.get(ancestor).copied()
+                }),
+                None
+            );
+            assert_eq!(
+                probes.get(),
+                key.bytes().filter(|byte| *byte == b'/').count() + 1
+            );
+            roots.insert("/workspace/docs".to_string(), count);
+            probes.set(0);
+            assert_eq!(
+                find_ancestor(key, |ancestor| {
+                    probes.set(probes.get() + 1);
+                    roots.get(ancestor).copied()
+                }),
+                Some(count)
+            );
+            assert_eq!(probes.get(), 2);
+        }
+    }
+
+    #[test]
+    fn normalized_owner_lookup_preserves_longest_source_and_first_owner_rules() {
+        let model = ProjectSnapshot::new(parse_dump(
+            "PROJECT\t:module\t/scope/shared\nEND\t:module\n\
+             PROJECT\t:first\t/owner/first\nSOURCE\tmain\t/scope/shared\nEND\t:first\n\
+             PROJECT\t:second\t/owner/second\nSOURCE\ttest\t/scope/shared\nEND\t:second\n\
+             PROJECT\t:deep\t/scope/shared/deep\nEND\t:deep\n\
+             PROJECT\t:first-module\t/scope/duplicates\nEND\t:first-module\n\
+             PROJECT\t:second-module\t/scope/duplicates\nEND\t:second-module\n",
+        ));
+        let (module, source) = model.owner_for_key("/scope/shared/Unsaved.kt").unwrap();
+        assert_eq!(module.module, ":first");
+        assert_eq!(source.unwrap().name, "main");
+        let (module, source) = model
+            .owner_for_key("/scope/shared/deep/Unregistered.kt")
+            .unwrap();
+        assert_eq!(module.module, ":deep");
+        assert!(
+            source.is_none(),
+            "a longer module root still wins over a shorter source root"
+        );
+        let (module, source) = model.owner_for_key("/scope/duplicates/Main.kt").unwrap();
+        assert_eq!(module.module, ":first-module");
+        assert!(source.is_none());
+        assert!(model
+            .owner_for_key("/scope/shared-other/Unrelated.kt")
+            .is_none());
+    }
+
+    #[test]
+    fn registered_source_root_keeps_its_actual_canonical_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_snapshot_source_alias_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("alias")).unwrap();
+        std::fs::create_dir_all(root.join("sources")).unwrap();
+        let registered = root.join("alias/../sources");
+        let canonical = registered.canonicalize().unwrap();
+        let model = ProjectSnapshot::new(parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nEND\t:app\n",
+            root.display(),
+            registered.display()
+        )));
+        for path in [registered.join("Unsaved.kt"), canonical.join("Unsaved.kt")] {
+            let (module, source) = model.owner_for(&path).unwrap();
+            assert_eq!(module.module, ":app");
+            assert_eq!(source.unwrap().name, "main");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provided_artifact_prefixes_do_not_become_output_directories() {
+        let model = ProjectSnapshot::new(parse_dump(
+            "PROJECT\t:app\t/workspace\nSOURCE\tmain\t/workspace/src\n\
+             OUTPUT\tmain\t/external/classes\nSCP\tmain\t/external/export/api.jar\nEND\t:app\n\
+             PROJECT\t:lib\t/library\nPROVIDES\tmain\t/external/export/api.jar\nEND\t:lib\n",
+        ));
+        assert!(model.is_output_key("/external/classes/New.class"));
+        assert!(!model.is_output_key("/external/classes-other/Unrelated.class"));
+        assert!(!model.is_output_key("/external/export/api.jar/Invented.class"));
+        assert!(model.has_dependency_key("/external/export/api.jar"));
+        assert!(!model.has_dependency_key("/external/export/api.jar/Invented.class"));
+        assert!(!model.has_dependency_key("/external/export/api-other.jar"));
+    }
+
+    #[test]
+    fn selected_local_source_keys_are_frozen_without_existence_checks_or_gav_guessing() {
+        let model = ProjectSnapshot::new(parse_dump(
+            "PROJECT\t:app\t/workspace\nSOURCE\tmain\t/workspace/src\n\
+             SCP\tmain\t/external/local.jar\nSCP\tmain\t/external/maven.jar\n\
+             ARTIFACT\tmain\t/external/maven.jar\tMODULE\tvendor\tapi\t1\n\
+             SCP\ttest\t/external/cross-known.jar\n\
+             ARTIFACT\tmain\t/external/cross-known.jar\tMODULE\tvendor\tother\t1\nEND\t:app\n\
+             PROJECT\t:unsupported\t/unsupported\nCP\t/external/unsupported.jar\nEND\t:unsupported\n",
+        ));
+        assert!(model.has_dependency_key("/external/local.jar"));
+        assert!(model.has_dependency_key("/external/local-sources.jar"));
+        assert!(model.has_dependency_key("/external/maven.jar"));
+        assert!(!model.has_dependency_key("/external/maven-sources.jar"));
+        assert!(!model.has_dependency_key("/external/cross-known-sources.jar"));
+        assert!(!model.has_dependency_key("/external/unsupported-sources.jar"));
+        assert!(!model.has_dependency_key("/external/local-other-sources.jar"));
+        let replacement = ProjectSnapshot::new(parse_dump(
+            "PROJECT\t:app\t/workspace\nSOURCE\tmain\t/workspace/src\nEND\t:app\n",
+        ));
+        assert!(!replacement.has_dependency_key("/external/local-sources.jar"));
+        assert!(
+            model.has_dependency_key("/external/local-sources.jar"),
+            "old Arc view is immutable"
         );
     }
 

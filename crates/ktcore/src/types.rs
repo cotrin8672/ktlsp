@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// `package_candidates` is shared, not owned per `TypeRef`: for a given declaration file the
-/// candidate list (package + wildcard imports + default imports) is identical across every
-/// unresolved reference, so `TypeScope` builds it once and clones the `Arc`. The serde shim
+/// ordinary candidate list (package + wildcard imports + default imports) is shared across
+/// unresolved references. Explicit imports and synthetic types may have different lists. The serde shim
 /// keeps the bincode symcache wire format identical to the previous `Vec<String>` encoding.
 mod arc_candidates {
     use super::Arc;

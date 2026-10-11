@@ -1410,26 +1410,13 @@ fn project_change(
         return Some(true);
     }
     if let Some(model) = model {
-        if model
-            .modules
-            .iter()
-            .flat_map(|module| &module.source_sets)
-            .flat_map(|source| &source.output_roots)
-            .any(|output| path_is_under(key, &crate::paths::file_key(output)))
-        {
+        if model.is_output_key(key) || model.has_dependency_key(key) {
             return Some(true);
         }
-        if model.artifact_origin(file).is_some()
-            || (name.ends_with("-sources.jar")
-                && model.local_jars().iter().any(|jar| {
-                    classpath::adjacent_sources_jar(jar)
-                        .is_some_and(|sources| crate::paths::file_key(&sources) == key)
-                }))
-        {
-            return Some(true);
-        }
-        if model.file_origin(file).is_some()
-            && crate::language::SourceLanguage::for_project_path(file).is_some()
+        if crate::language::SourceLanguage::for_project_path(file).is_some()
+            && model
+                .owner_for_key(key)
+                .is_some_and(|(_, source)| source.is_some())
         {
             return Some(false);
         }
@@ -1438,6 +1425,17 @@ fn project_change(
         return Some(true);
     }
     None
+}
+
+fn project_changes(changes: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut relevant = None;
+    for force in changes.flatten() {
+        relevant = Some(force);
+        if force {
+            break;
+        }
+    }
+    relevant
 }
 
 fn path_is_under(key: &str, root: &str) -> bool {
@@ -1865,12 +1863,13 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
-        let force = params
-            .changes
-            .iter()
-            .filter_map(|change| uri_to_key(&change.uri))
-            .filter_map(|key| project_change(&root, model.as_deref(), &key))
-            .reduce(|left, right| left || right);
+        let force = project_changes(
+            params
+                .changes
+                .iter()
+                .filter_map(|change| uri_to_key(&change.uri))
+                .map(|key| project_change(&root, model.as_deref(), &key)),
+        );
         if let Some(force) = force {
             self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
         }
@@ -3725,6 +3724,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn notification_batch_stops_classifying_after_first_forced_refresh() {
+        use std::cell::Cell;
+        let cases: &[(&[Option<bool>], Option<bool>, usize)] = &[
+            (&[], None, 0),
+            (&[None, None], None, 2),
+            (&[None, Some(false), None, Some(false)], Some(false), 4),
+            (&[Some(false), None, Some(true), Some(false)], Some(true), 3),
+            (&[Some(true), None, Some(false)], Some(true), 1),
+        ];
+        let observed: Vec<_> = cases
+            .iter()
+            .map(|(changes, _, _)| {
+                let classified = Cell::new(0);
+                let force = project_changes(changes.iter().copied().inspect(|_| {
+                    classified.set(classified.get() + 1);
+                }));
+                (force, classified.get())
+            })
+            .collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(_, force, classified)| (*force, *classified))
+            .collect();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
     fn source_io_local_metadata_without_sources_stays_incomplete() {
         use std::io::Write;
         let root = std::env::temp_dir().join(format!(
@@ -4451,6 +4477,149 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalized_output_lookup_preserves_windows_trailing_root_boundaries() {
+        for (raw_root, raw_file, expected) in [
+            (r"C:\work\classes", r"c:\work\classes", true),
+            (r"C:\work\classes", r"C:\work\classes\Entry.class", true),
+            (
+                r"C:\work\classes",
+                r"C:\work\classes-other\Entry.class",
+                false,
+            ),
+            (r"C:\work\classes\", r"C:\work\classes", false),
+            (r"C:\work\classes\", r"C:\work\classes\", true),
+            (r"C:\work\classes\", r"C:\work\classes\Entry.class", true),
+            ("C:/work/classes//", "C:/work/classes", false),
+            ("C:/work/classes//", "C:/work/classes/", true),
+            (r"\\?\C:\work\classes\", r"C:\work\classes", false),
+            (
+                r"\\?\C:\work\classes",
+                r"\\?\C:\work\classes\Entry.class",
+                true,
+            ),
+            (r"\\server\share\classes", r"\\server\share\classes", true),
+            (r"\\server\share\classes\", r"\\server\share\classes", false),
+            (r"\\server\share\classes\", r"\\server\share\classes\", true),
+            (
+                r"\\server\share\classes\",
+                r"\\server\share\classes\Entry.class",
+                true,
+            ),
+            (
+                r"\\?\UNC\server\share\classes\",
+                r"\\server\share\classes",
+                false,
+            ),
+            (
+                r"\\?\UNC\server\share\classes",
+                "//server/share/classes/Entry.class",
+                true,
+            ),
+            (
+                r"\\server\share\classes",
+                r"\\server\share\classes-other\Entry.class",
+                false,
+            ),
+            (r"C:\", r"C:\", true),
+            (r"C:\", "C:", false),
+            (r"C:\", r"C:\Entry.class", true),
+            (r"\\server\share\", r"\\server\share", false),
+            (r"\\server\share\", r"\\server\share\", true),
+            (r"\\server\share\", r"\\server\share\Entry.class", true),
+            (r"C:\", "", false),
+            (r"c:\", r"C:\Entry.class", true),
+        ] {
+            let root = crate::paths::file_key(Path::new(raw_root));
+            let key = crate::paths::file_key(Path::new(raw_file));
+            let legacy = path_is_under(&key, &root);
+            assert_eq!(legacy, expected, "legacy {raw_root:?} -> {raw_file:?}");
+            let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+                "PROJECT\t:app\tC:/workspace\nOUTPUT\tmain\t{raw_root}\nEND\t:app\n"
+            )));
+            assert_eq!(
+                model.is_output_key(&key),
+                legacy,
+                "indexed {raw_root:?} -> {raw_file:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn output_lookup_preserves_existing_windows_uri_conversion_boundaries() {
+        for (raw_root, file_uri, expected) in [
+            (
+                r"c:\work\classes",
+                "file:///C:/work/classes/Entry.class",
+                true,
+            ),
+            (r"\\?\C:\work\classes\", "file:///c:/work/classes", false),
+            (
+                r"\\?\C:\work\classes\",
+                "file:///c:/work/classes/Entry.class",
+                true,
+            ),
+            (
+                r"\\?\UNC\server\share\classes\",
+                "file://server/share/classes/Entry.class",
+                // The vendored URI adapter does not currently produce a UNC key for an
+                // authority host. Preserve that boundary here; this is not UNC URI support.
+                false,
+            ),
+        ] {
+            let uri: Uri = file_uri.parse().unwrap();
+            let key = uri_to_key(&uri).unwrap();
+            let root = crate::paths::file_key(Path::new(raw_root));
+            let legacy = path_is_under(&key, &root);
+            if file_uri == "file://server/share/classes/Entry.class" {
+                eprintln!("existing authority-host URI boundary: {file_uri} -> {key:?}");
+            }
+            assert_eq!(legacy, expected, "{file_uri}");
+            let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+                "PROJECT\t:app\tC:/workspace\nOUTPUT\tmain\t{raw_root}\nEND\t:app\n"
+            )));
+            assert_eq!(model.is_output_key(&key), legacy, "{file_uri}");
+        }
+    }
+
+    #[test]
+    fn output_root_lookup_retains_root_slashes_and_combined_provenance() {
+        for (root, key, expected) in [
+            ("/", "/", true),
+            ("/", "/Entry.class", true),
+            ("/", "", false),
+            ("/", "relative", false),
+            ("/classes/", "/classes", false),
+            ("/classes/", "/classes/", true),
+            ("/classes/", "/classes/Entry.class", true),
+            ("/classes", "/classes", true),
+            ("/classes//", "/classes/", true),
+            ("/classes/", "/classes-other/Entry.class", false),
+        ] {
+            let legacy = path_is_under(key, root);
+            assert_eq!(legacy, expected);
+            let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+                "PROJECT\t:app\t/workspace\nOUTPUT\tmain\t{root}\nEND\t:app\n"
+            )));
+            assert_eq!(model.is_output_key(key), legacy, "{root:?} -> {key:?}");
+        }
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(
+            "PROJECT\t:app\t/workspace\nOUTPUT\tmain\t/classes/\nOUTPUT\ttest\t/classes\n\
+             PROVIDES\tmain\t/classes/api.jar\nPROVIDES\tmain\t/provided.jar\nEND\t:app\n",
+        ));
+        assert!(
+            model.is_output_key("/classes"),
+            "non-trailing duplicate permits exact root"
+        );
+        assert!(
+            model.is_output_key("/classes/api.jar/Nested.class"),
+            "provided-only deepest key cannot hide a genuine output ancestor"
+        );
+        assert!(!model.is_output_key("/provided.jar/Nested.class"));
     }
 
     #[test]
