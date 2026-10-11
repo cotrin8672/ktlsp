@@ -2000,3 +2000,85 @@ fn intrinsic_string_literal_keeps_available_jvm_string_members() {
     let selected = labels(&mut ws, CALLABLE_FILE, "\"text\".sub");
     assert!(selected.contains("substring"), "{selected:?}");
 }
+
+#[test]
+fn receiver_storage_preserves_inline_symbol_cache_wire() {
+    use ktlsp::symbol::IndexedSymbol;
+    use ktlsp::types::TypeRef;
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+
+    // This is the previous persisted layout, including both inline receiver slots.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct InlineSymbol {
+        name: String,
+        kind: SymbolKind,
+        package: String,
+        container: Option<String>,
+        start_byte: usize,
+        end_byte: usize,
+        documentation: Option<String>,
+        supertypes: Vec<String>,
+        supertype_refs: Vec<TypeRef>,
+        ext_receiver: Option<String>,
+        arity: Option<u8>,
+        min_arity: Option<u8>,
+        has_vararg: bool,
+        trailing_lambda_min_arity: Option<u8>,
+        last_parameter_min_arity: Option<u8>,
+        trailing_lambda_receiver_type: Option<TypeRef>,
+        function_type_receiver: Option<TypeRef>,
+        return_type: Option<TypeRef>,
+        value_type: Option<TypeRef>,
+        params: Vec<TypeRef>,
+        type_params: Vec<String>,
+    }
+
+    let empty = IndexedSymbol::new("Empty", SymbolKind::Class, "api", None, 0, 5);
+    let mut rich = IndexedSymbol::new(
+        "handler",
+        SymbolKind::Function,
+        "api",
+        Some("Owner".into()),
+        12,
+        19,
+    );
+    let mut receiver = TypeRef::simple("Receiver");
+    receiver.qualification = Some("other".into());
+    receiver.nullable = true;
+    receiver.package_candidates = Arc::new(vec!["api".into(), "wildcard".into(), "api".into()]);
+    receiver.container_candidates = vec!["Outer".into()];
+    receiver.args = vec![TypeRef::simple("Payload")];
+    rich.documentation = Some("receiver metadata".into());
+    rich.supertypes = vec!["Base".into()];
+    rich.supertype_refs = vec![receiver.clone()];
+    rich.ext_receiver = Some("Owner".into());
+    rich.arity = Some(3);
+    rich.min_arity = Some(1);
+    rich.has_vararg = true;
+    rich.trailing_lambda_min_arity = Some(0);
+    rich.last_parameter_min_arity = Some(1);
+    rich.trailing_lambda_receiver_type = Some(Box::new(receiver.clone()));
+    rich.function_type_receiver = Some(Box::new(receiver.clone()));
+    rich.return_type = Some(receiver.clone());
+    rich.value_type = Some(receiver.clone());
+    rich.params = vec![receiver];
+    rich.type_params = vec!["Payload".into()];
+
+    for symbol in [empty, rich] {
+        let value = serde_json::to_value(&symbol).unwrap();
+        let old: InlineSymbol = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&old).unwrap(), value);
+        let old_bytes = bincode::serialize(&old).unwrap();
+        let current_bytes = bincode::serialize(&symbol).unwrap();
+        assert_eq!(old_bytes, current_bytes);
+        assert_eq!(
+            bincode::deserialize::<InlineSymbol>(&current_bytes).unwrap(),
+            old
+        );
+        assert_eq!(
+            bincode::deserialize::<IndexedSymbol>(&old_bytes).unwrap(),
+            symbol
+        );
+    }
+}

@@ -293,7 +293,8 @@ fn push_function(
         has_vararg: shape.has_vararg,
         trailing_lambda_min_arity: shape.trailing_lambda_min_arity,
         last_parameter_min_arity: shape.last_parameter_min_arity,
-        trailing_lambda_receiver_type: trailing_lambda_receiver_type_of(decl, src, scope),
+        trailing_lambda_receiver_type: trailing_lambda_receiver_type_of(decl, src, scope)
+            .map(Box::new),
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
         type_params: type_params_of(decl, src),
@@ -449,7 +450,7 @@ fn push_type_alias(
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
         type_params: type_params_of(decl, src),
-        function_type_receiver,
+        function_type_receiver: function_type_receiver.map(Box::new),
         ..IndexedSymbol::new(
             node_text(name_node, src),
             SymbolKind::TypeAlias,

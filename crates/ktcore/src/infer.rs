@@ -1858,7 +1858,7 @@ pub fn trailing_lambda_receiver_ref(
     entry: &Entry,
     ctx: &FileCtx,
 ) -> Option<TypeRef> {
-    if let Some(receiver) = &entry.sym.trailing_lambda_receiver_type {
+    if let Some(receiver) = entry.sym.trailing_lambda_receiver_type.as_deref() {
         return Some(receiver.clone());
     }
     let parameter_type = entry.sym.params.last()?;
@@ -1881,8 +1881,8 @@ pub fn trailing_lambda_receiver_ref(
     if !aliases.iter().all(|candidate| {
         candidate.sym.type_params == first.sym.type_params
             && opt_type_ref_same_shape(
-                candidate.sym.function_type_receiver.as_ref(),
-                first.sym.function_type_receiver.as_ref(),
+                candidate.sym.function_type_receiver.as_deref(),
+                first.sym.function_type_receiver.as_deref(),
             )
     }) {
         return None;
@@ -1897,7 +1897,7 @@ pub fn trailing_lambda_receiver_ref(
         .map(String::as_str)
         .zip(parameter_type.args.iter())
         .collect();
-    substitute_alias_type_ref(first.sym.function_type_receiver.as_ref()?, &bindings)
+    substitute_alias_type_ref(first.sym.function_type_receiver.as_deref()?, &bindings)
 }
 
 /// Minimum accepted argument count for a syntactic trailing-lambda call after proving the final

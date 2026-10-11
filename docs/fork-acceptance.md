@@ -330,6 +330,16 @@ they are **unverified targets**, not measured results or a claim of IDEA parity:
 - Report steady-state working set/RSS and peak memory separately; set a concrete
   memory budget after baseline project sizes and host capacity are recorded.
 
+After the native 64 GiB host baseline and the selected Gradle scope of about
+1.25 million symbols, use these initial resource targets for subsequent
+acceptance runs: server steady RSS <= 3 GiB and lifetime peak commit <= 4 GiB per
+corpus root; native Neovim lifetime peak commit <= 128 MiB, including watch
+registration; normal shutdown <= 2 s after the null acknowledgement and exit
+notification. These are UX targets, separate from the larger abort guards below.
+They are recorded after the fourteenth descriptive comparison and do not turn
+that comparison into an accepted memory or shutdown result. Missing semantics,
+incomplete indexing or a forced exit still fail acceptance.
+
 An isolated Gradle follow-up exposed a client-memory scaling failure: 8,796 watch
 patterns took about 88 seconds to register, with Neovim lifetime peak commit
 63,475,847,168 bytes and ktlsp peak commit 5,982,179,328 bytes. This was the ktlsp
@@ -1055,6 +1065,112 @@ controllers remain unchanged. Evidence is
 `ktlsp-semantic-gaps-20261010/thirteenth-replay-preparation-1/{final-receipt.json,
 first-responses.json}` and the three `thirteenth-*` Gradle harness directories.
 IDEA parity, compiler-producer freshness and full source coverage remain open.
+
+### Fourteenth checkpoint: specialized receiver storage
+
+The three immutable archive samples contain 28,071 symbols in 1,146 files.
+Only 44 symbols have a trailing-lambda receiver type, all in the Kotlin stdlib;
+none has a receiver-function typealias slot. These sample counts do not establish
+occupancy in the final selected live index. They justify first moving just these
+two specialized optional fields out of line, retaining ordinary return/value and
+parameter type storage and the existing inference and summary APIs.
+
+Both fields now use `Option<Box<TypeRef>>`. On the actual Windows Rust 1.98.1
+release, `IndexedSymbol` measures 488 bytes instead of 696; each optional boxed
+slot is 8 bytes instead of the 112-byte inline optional type. A present receiver
+requires its own allocation, so the object-size reduction is not a process-memory
+measurement. The four producers/readers and cache-sharing traversal are updated.
+Direct external writers of these public indexed fields must wrap their values in
+`Box::new`; `TypeRef` itself and provider-visible member signatures are unchanged.
+
+An explicit previous-layout fixture covers empty and rich populated symbols,
+including generics, nullable and qualified types, ordered/duplicate candidates
+and both receiver slots. It proves identical JSON and bincode bytes and decoding
+in both directions. The new native counter also reads and reserializes all three
+actual previous-release cache copies byte-for-byte, preserving their counts.
+Cache schema versions remain unchanged. Evidence is
+`ktlsp-receiver-slot-occupancy-20261011/receipt.json` and
+`ktlsp-receiver-slot-fourteenth-20261011/receipt.json`.
+
+Fourteenth-fixed-1 passes formatting, all 1,050 workspace tests with three
+ignored, and both release builds. All 307 compiled/harness inputs remain unchanged
+through verification. Server SHA-256 is
+`f9c780b86d6506af2c94046eeb7b98e81ac6b1f7fd3a7f7908c6e1dc106d5611`.
+The checkpoint receipt is `ktlsp-goal-20261010/fourteenth-fixed-1/result.json`.
+The separate extension consumer builds offline and passes all 140 editor
+assertions, including 29 first-response requests, 19 notification barriers and
+four applied and inspected renames. It shuts down with one null acknowledgement,
+one exit notification and native exit 0, without forced termination. Product,
+consumer and fixture guards remain unchanged. Evidence is
+`ktlsp-shadow-fourteenth-replay-20261011/final-editor-proof.json`.
+
+The unchanged semantic harness passes all 18 assertions, covering alias-backed
+implicit receivers, scope/result chains and KMP narrowing. Its existing
+`client:stop(true)` finalizer yields server code 1/signal 15 despite wrapper exit
+0; clean shutdown is therefore unproved on this route. Both replays leave no
+owned processes. Evidence is
+`ktlsp-semantic-fourteenth-replay-20261011/semantic-final-receipt.json`.
+The exclusive matched warm-cache ABBA comparison uses unchanged thirteenth-fixed-1
+(A) and fourteenth-fixed-1 (B), the same 933 cache files, 293 source archives,
+55,170,313-byte Gradle model and 307 product/harness inputs. No cold run, fresh
+warmup or cache copy is introduced. Observed values are:
+
+| Run | Steady RSS bytes | Lifetime peak commit bytes | Library readiness ms | Shutdown ms / outcome | RSS samples |
+| --- | ---: | ---: | ---: | --- | ---: |
+| A1 | 3,429,761,024 | 3,649,335,296 | 8,922 | 7,843 / native 0 | 101 |
+| B1 | 2,851,864,576 | 3,049,566,208 | 8,438 | 6,031 / native 0 | 101 |
+| B2 | 2,850,316,288 | 3,047,612,416 | 8,156 | 6,047 / native 0 | 101 |
+| A2 | 3,418,877,952 | 3,637,071,872 | 8,297 | 15,297 / forced timeout, native 1 | 100 |
+
+The descriptive RSS medians are 3,424,319,488 and 2,851,090,432 bytes: an observed
+reduction of 573,229,056 bytes (16.7399%). Each window is ten seconds. A2 misses
+the expected 101st sample and fails the unchanged 15-second normal-exit wait
+after a null shutdown acknowledgement and exit notification; no retry or timeout
+change hides either failure. Its shutdown duration cannot estimate successful
+shutdown speed. CPU is unmeasured and n=2 per arm cannot establish p95 or general
+latency acceptance.
+
+The two existing-corpus companions pass all six exact semantic requests on their
+first attempts and both shut down normally. Five of six server runs exit native
+0; all verified owned processes are gone and every binary, helper, cache, model
+and source guard passes. All runs retain three failed dependencies and 26 missing
+sources, so complete indexing, accepted steady state, performance and IDEA parity
+remain false. Evidence is
+`ktlsp-receiver-storage-pair-20261011/{final-receipt.json,ABBA-statistics.json}`.
+This storage change does not close the existing Gradle diagnostics, producer
+freshness, source-coverage or CEM `super.` completion gaps.
+
+### CEM blank-super oracle: inspect the accepted code
+
+Expected behavior is a legal direct-super call after accepting completion in
+`EnchantableDrillBlockEntity.getBreakSpeed`. ktlsp currently returns no useful
+blank-`super.` completion. The native IDEA LSP 263.6379.0 popup returns 172 items
+on its first request, including `breakSpeed (from getBreakSpeed())`. Its empty
+text edit defers insertion to `jetbrains.kotlin.completion.apply`; the label alone
+does not establish what accepting the item does.
+
+An additive native-Neovim acceptance probe selects that actual item, captures
+completion resolve, the deferred command and `workspace/applyEdit`, and retains
+the complete resulting buffer. IDEA inserts `return super.breakSpeed`, failing
+the compiler-legal method-call expectation. The original strict method-label
+failure is retained. The user's source files are unchanged.
+
+The captured full buffer is compiled verbatim with CEM's selected 101 classpath
+binaries, 156 guarded project output files, Kotlin 2.4.0, JDK/target 21 and the
+actual task's scripting plugin paths. It fails with the sole diagnostic
+`unresolved reference 'breakSpeed'` at line 34. A separate control replacing only
+that line with `return super.getBreakSpeed()` compiles; javap proves an
+`invokespecial DrillBlockEntity.getBreakSpeed:()F` call. All 1,061 guarded inputs
+remain unchanged. Evidence is
+`ktlsp-cem-blank-super-20261011/{deferred-final-proof.json,
+real-cem-accepted-results.json}`.
+
+This is a failure for this CEM context, not a general prohibition on Java getter
+properties through `super`: separate public/protected Java controls compile and
+run successfully. No game launch or producer-closure claim follows. The next
+shared-layer fix must select legal members per direct-super candidate, preserve
+override/hiding and generic substitution, and distinguish abstract, static and
+inaccessible members before treating multiple providers as ambiguous.
 
 ### Current slice: requires-only compatibility artifacts
 

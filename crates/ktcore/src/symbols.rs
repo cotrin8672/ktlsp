@@ -40,7 +40,11 @@ impl SymbolSummary {
             supertypes: entry.sym.supertypes.clone(),
             ext_receiver: entry.sym.ext_receiver.clone(),
             arity: entry.sym.arity,
-            trailing_lambda_receiver_type: entry.sym.trailing_lambda_receiver_type.clone(),
+            trailing_lambda_receiver_type: entry
+                .sym
+                .trailing_lambda_receiver_type
+                .as_deref()
+                .cloned(),
             return_type: entry.sym.return_type.clone(),
             value_type: entry.sym.value_type.clone(),
             params: entry.sym.params.clone(),

@@ -71,12 +71,13 @@ pub struct IndexedSymbol {
     /// defaulted parameters. Used only after inference proves that final parameter is callable.
     #[serde(default)]
     pub last_parameter_min_arity: Option<u8>,
+    /// Keep specialized receiver facts out of line so absent slots cost only a pointer.
     #[serde(default)]
-    pub trailing_lambda_receiver_type: Option<TypeRef>,
+    pub trailing_lambda_receiver_type: Option<Box<TypeRef>>,
     /// Receiver type of a type alias whose target is a receiver function type, for example
     /// `typealias Handler = suspend RoutingContext.() -> Unit`.
     #[serde(default)]
-    pub function_type_receiver: Option<TypeRef>,
+    pub function_type_receiver: Option<Box<TypeRef>>,
     #[serde(default)]
     pub return_type: Option<TypeRef>,
     #[serde(default)]
@@ -148,8 +149,8 @@ pub fn reshare_file_type_contexts(
         for ty in symbol
             .supertype_refs
             .iter_mut()
-            .chain(symbol.trailing_lambda_receiver_type.iter_mut())
-            .chain(symbol.function_type_receiver.iter_mut())
+            .chain(symbol.trailing_lambda_receiver_type.as_deref_mut())
+            .chain(symbol.function_type_receiver.as_deref_mut())
             .chain(symbol.return_type.iter_mut())
             .chain(symbol.value_type.iter_mut())
             .chain(symbol.params.iter_mut())
@@ -200,8 +201,8 @@ mod tests {
         let mut parent = ty();
         parent.args.push(ty());
         symbol.supertype_refs = vec![parent];
-        symbol.trailing_lambda_receiver_type = Some(ty());
-        symbol.function_type_receiver = Some(ty());
+        symbol.trailing_lambda_receiver_type = Some(Box::new(ty()));
+        symbol.function_type_receiver = Some(Box::new(ty()));
         symbol.return_type = Some(TypeRef {
             name: "Qualified".into(),
             qualification: Some("other".into()),
@@ -245,8 +246,8 @@ mod tests {
         let shared = Arc::clone(&symbol.supertype_refs[0].package_candidates);
         for ty in [
             &symbol.supertype_refs[0].args[0],
-            symbol.trailing_lambda_receiver_type.as_ref().unwrap(),
-            symbol.function_type_receiver.as_ref().unwrap(),
+            symbol.trailing_lambda_receiver_type.as_deref().unwrap(),
+            symbol.function_type_receiver.as_deref().unwrap(),
             symbol.return_type.as_ref().unwrap(),
             symbol.value_type.as_ref().unwrap(),
             &symbol.params[0],
