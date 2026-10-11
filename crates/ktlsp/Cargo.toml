@@ -50,5 +50,11 @@ salsa.workspace = true
 zstd.workspace = true
 parking_lot.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
+    "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp",
+] }
+
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.15", default-features = false, features = ["flamegraph"] }

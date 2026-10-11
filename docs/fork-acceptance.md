@@ -41,8 +41,8 @@ command, an advertised capability or an empty successful RPC is not a semantic p
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentyfourth-fixed-1 passes 1,119 tests / 3 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentyfourth-fixed-1/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Twentyfourth release Java passes 191/196 with the same five diagnostic failures; semantic passes all 23 checks. Eighteenth library source lifecycle passes 13/13 | Partial; current ordinary Java/semantic regression checks verified, diagnostic coverage still failing | `ktlsp-compiled-foundation-twentyfourth-editor-20261011/retry-1/` and `ktlsp-library-eighteenth-replay-20261011/receipt.json`. Compiler producer is not connected. Semantic shutdown is clean but 4.439 seconds exceeds the 2-second budget. Legacy forced Java shutdown is not graceful-shutdown proof |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Initial baseline failed four portability cases and stopped early. Twentyfifth-fixed-3 passes 1,127 tests / 4 ignored across 40 suites, native exit 0; all 312 inputs match before/after tests and release build | Current Rust, formatting and release verified | `ktlsp-goal-20261010/twentyfifth-fixed-3/result.json`; input guards include 31 class/JAR test fixtures and four Gradle wrapper JARs |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Twentyfifth-fixed-3 passes library source lifecycle 13/13 and semantic 23/23. Latest Java replay is twentyfourth: 191/196 with the same five diagnostic failures | Partial; current library/semantic regression checks verified, diagnostic coverage still failing | `ktlsp-native-compile-twentyfifth-editor-20261011/final-3/root-audit.json`; Java evidence remains `ktlsp-compiled-foundation-twentyfourth-editor-20261011/retry-1/`. Compiler producer is not connected. Semantic shutdown is clean but 4.192 seconds exceeds the 2-second budget. Actual server/client RSS is unmeasured in this replay |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain harness exit 1 | Partial; queried semantics and accepted code verified, input coverage failing | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, missing-source behavior and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -1630,6 +1630,87 @@ retain declared-task-input/output categories before flattening, reject overlappi
 or unproved processor ownership, then connect only successful fresh compiled inputs.
 The held native process and notification drafts must be compiled and exercised
 before use. Resume the real-project and compiler-plugin editor failures afterward.
+
+### Twenty-fifth checkpoint: owned Windows Gradle execution
+
+Windows Gradle launches now assign their suspended root to a retained, non-inheritable
+Job before resuming its verified primary thread. The same blocking worker retains
+the exact root, Job and both output readers until root termination, zero assigned
+live processes, EOF and reader joins are verified. Timeout, cancellation, unwind
+and failed setup clean up that owned tree. No existing Java process is adopted or
+terminated. OS termination/query/EOF failures keep the worker quarantined rather
+than releasing ownership or claiming bounded shutdown.
+
+The public compiler runner and actual Gradle classpath discovery share this guard.
+They use `--no-daemon`; a successful wrapper has a two-second natural descendant
+shutdown grace within the execution deadline. Forced cleanup and truncated/read-error
+output preserve parsed diagnostics but cannot clear previous compiler errors or
+publish a partial project model. This does not certify a compiler read closure,
+successful transformed API, or reuse of an existing external compiler daemon.
+
+A real fake-wrapper regression fails before the repair: a successful root leaves
+a silent descendant holding inherited pipes, return takes 20.0508 seconds and
+`executed=true`. After repair the same public path returns in approximately 2.23
+seconds, the retained descendant handle is terminal, its warning is preserved and
+`executed=false`. This is a process-lifecycle regression measurement, not completion
+latency. Other native controls cover normal/error exits, a natural daemon tail,
+timeout/cancellation, both noisy streams, unwind and failure before resume.
+
+Independent review caught a second regression before commit. The accepted
+55,170,313-byte, 194-module/1,176-source-set Gradle model requires at least
+45,259,017 protocol bytes for CP, SCP and ARTIFACT records alone. Reusing the
+compiler's ten-MiB capture budget would reject a valid cold dump. Classpath stdout
+therefore has a separate 64-MiB bound; compiler output and classpath stderr retain
+ten MiB per stream. Readers continue draining after the bound and reject truncation.
+Valid UTF-8 capture is parsed without copying through another raw-output buffer.
+The frozen model is `ktlsp-server-memory-pair-20261011/cache/classpath/8460759510824a32.json`,
+SHA-256 `e3ab7b955006e1b4871c747b734ed3f1b2642dd56472d613005689bc00b63da4`.
+
+A new actual fake-wrapper/model-loader regression fails at runtime with the old
+capture budget. After repair it accepts every record and the late second module
+in an eleven-MiB dump, while a dump over 64 MiB remains an error. Two subsequent
+fixture corrections are retained separately: the Rust test runner prefixes the
+first line, requiring a newline before PROJECT; parsed CP entries preserve
+duplicates, so the expected record count is 11,038. Neither correction is a new
+product defect. Fitting the entire real 194-module dump under 64 MiB still needs an
+actual cold/forced replay; the recorded size is a lower bound.
+
+Final `twentyfifth-fixed-3` passes 1,127 Rust tests, zero failed, four ignored across
+40 suites; formatting and the release build succeed. All 312 guarded inputs match
+before/after tests, release and editor replay. Its server SHA-256 is
+`8b0330d574b71acb8df1b374501bbd61fc64105058ea406e3bf4be00de96c9e7`.
+The unchanged Neovim library route passes 13/13 and creates a fresh model-v4 cache
+with both dependencies and zero unresolved entries. Semantic passes 23/23, records
+one acknowledged shutdown, one exit and actual server exit zero without forced
+termination. Shutdown takes 4.192 seconds, still failing the two-second budget.
+Both editor receipts preserve 633 guards. MSYS ancestry again observes wrapper
+handles only, so actual server/client RSS and complete native process ownership
+are unmeasured in these editor runs. The private Job tests supply their own exact
+retained-handle proofs; they do not repair this monitor limitation.
+
+Evidence: `ktlsp-native-compile-ownership-20261011/root-1/`,
+`ktlsp-goal-20261010/twentyfifth-fixed-3/` and
+`ktlsp-native-compile-twentyfifth-editor-20261011/final-3/root-audit.json`.
+The first twentyfifth checkpoint (1,126 tests) is preserved; fixed-2 was prepared
+but never launched. Final3 has corrected base-revision metadata.
+
+The ordinary default Kotlin compiler-daemon strategy, including preexisting-daemon
+reuse, has no real positive control for this guard yet. A persistent descendant
+could force cleanup and conservatively leave `executed=false`. Unix keeps its legacy
+wrapper-only process ownership and has no native proof here. The native compiler
+producer and notification backend remain unconnected; transformed-API editor
+improvement and access-time-feedback improvement remain zero. A Temp notification
+candidate separately passes 13 Windows tests (two pure, five synthetic, five native
+API and one public layout/trait check), plus feature compilation checks. That is
+prerequisite evidence only; consumer retraction and real kernel overflow are unproved.
+
+Next reproducible command: `rtk proxy cargo test --locked -p ktlsp --lib compile:: -- --nocapture --test-threads=1`
+with the recorded Rust homes/toolchain and a disposable `KTLSP_CACHE_DIR`. Then run
+real Gradle positive/default-daemon controls, close conservative source/config/binary
+invalidation and connect only fresh successful compiler facts. Missing prerequisites
+are an isolated default-daemon control fixture and the verified native watcher/host
+admission path. The original twelve transformed-API failures and six-project IDEA,
+latency and memory acceptance remain open.
 
 ### Current slice: requires-only compatibility artifacts
 

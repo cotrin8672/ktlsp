@@ -688,8 +688,8 @@ dependencies = [
  "bincode",
  "ktcore",
  "parking_lot",
- "quick-xml",
  "pprof",
+ "quick-xml",
  "salsa",
  "serde",
  "serde_json",
@@ -704,6 +704,7 @@ dependencies = [
  "tree-sitter-kotlin-ng",
  "ureq",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip",
  "zstd",
 ]

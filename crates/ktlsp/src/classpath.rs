@@ -941,6 +941,10 @@ fn log_unresolved(modules: &[ModuleClasspath]) {
     );
 }
 
+#[cfg(windows)]
+// The accepted 194-module Gradle model needs over 43 MiB just for classpath/artifact records.
+pub(crate) const MAX_DUMP_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Run the init script via the project's gradle wrapper and parse the dump. Inherits the parent's
 /// environment (so repo-specific flags like SKIP_* are honored when ktlsp is launched with them).
 /// `offline` passes `--offline`: resolution then depends only on the local Gradle cache, which is
@@ -975,16 +979,29 @@ fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<Module
     if offline {
         command.arg("--offline");
     }
+    #[cfg(windows)]
+    let (status, stdout, stderr) = {
+        command.arg("--no-daemon");
+        let (status, interrupted, stdout, stdout_complete, stderr, stderr_complete) =
+            crate::compile::OwnedNativeCompile::spawn(&mut command, MAX_DUMP_OUTPUT_BYTES)?
+                .wait(crate::compile::COMPILE_TIMEOUT, None);
+        if interrupted || !stdout_complete || !stderr_complete {
+            anyhow::bail!("gradle classpath dump interrupted or incomplete:\n{stderr}");
+        }
+        (status, stdout, stderr)
+    };
+    #[cfg(not(windows))]
     let output = command.output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "gradle classpath dump failed ({}):\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    #[cfg(not(windows))]
+    let (status, stdout, stderr) = (
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    if !status.success() {
+        anyhow::bail!("gradle classpath dump failed ({}):\n{}", status, stderr);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let modules = parse_dump(&text);
+    let modules = parse_dump(&stdout);
     if modules.is_empty() {
         anyhow::bail!(
             "classpath dump produced no modules (is this a gradle project with compileClasspath?)"
