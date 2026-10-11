@@ -1215,24 +1215,33 @@ impl Workspace {
     /// Project/library symbols matching `query`, capped and ordered for workspace/symbol.
     pub fn workspace_symbols(&self, query: &str) -> Vec<SymbolSummary> {
         const CAP: usize = 200;
-        let mut out: Vec<SymbolSummary> = self
+        let query = query.to_lowercase();
+        let mut out: Vec<_> = self
             .index
-            .all_entries()
-            .iter()
-            .map(SymbolSummary::from_entry)
-            .filter(|s| s.matches_query(query))
+            .entries_with_prefix("", false)
+            .filter(|entry| {
+                crate::symbols::matches_lowercase_query(
+                    &entry.sym.name,
+                    &entry.sym.package,
+                    entry.sym.container.as_deref(),
+                    &query,
+                )
+            })
             .collect();
         out.sort_by(|a, b| {
             tier_rank(a.tier)
                 .cmp(&tier_rank(b.tier))
-                .then(a.name.len().cmp(&b.name.len()))
-                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                .then(a.package.cmp(&b.package))
-                .then(a.file.cmp(&b.file))
-                .then(a.start_byte.cmp(&b.start_byte))
+                .then(a.sym.name.len().cmp(&b.sym.name.len()))
+                .then(a.sym.name.to_lowercase().cmp(&b.sym.name.to_lowercase()))
+                .then(a.sym.package.cmp(&b.sym.package))
+                .then(a.path.cmp(&b.path))
+                .then(a.sym.start_byte.cmp(&b.sym.start_byte))
+                // Preserve the former all_entries order when the feature's ranking ties.
+                .then(a.sym.end_byte.cmp(&b.sym.end_byte))
+                .then(a.sym.name.cmp(&b.sym.name))
         });
         out.truncate(CAP);
-        out
+        out.into_iter().map(SymbolSummary::from_entry).collect()
     }
 
     /// Same-file highlights for the exact symbol at `offset`, using goto-grade reference filtering.
@@ -3272,6 +3281,285 @@ fn is_generated_source_file(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_symbols_preserve_payload_duplicates_and_stable_tier_order() {
+        use crate::types::TypeRef;
+
+        let mut first = IndexedSymbol::new(
+            "Helper",
+            SymbolKind::Function,
+            "app",
+            Some("Owner".into()),
+            20,
+            26,
+        );
+        let mut list = TypeRef::simple("List");
+        list.args.push(TypeRef::simple("T"));
+        first.documentation = Some("first overload".into());
+        first.ext_receiver = Some("Scope".into());
+        first.arity = Some(2);
+        first.trailing_lambda_receiver_type = Some(Box::new(TypeRef::simple("Scope")));
+        first.return_type = Some(TypeRef::simple("T"));
+        first.params = vec![list.clone(), TypeRef::simple("Function1")];
+        first.type_params = vec!["T".into()];
+        let mut duplicate = first.clone();
+        duplicate.documentation = Some("duplicate".into());
+        let mut lower = first.clone();
+        lower.name = "helper".into();
+        lower.documentation = Some("lowercase".into());
+        let mut later = first.clone();
+        later.end_byte = 29;
+        later.documentation = Some("later range".into());
+
+        let mut ws = Workspace::new();
+        ws.index.replace_file(
+            "mem:///Same.kt",
+            vec![later, lower, first, duplicate],
+            Tier::Volatile,
+        );
+        ws.index.replace_file(
+            "mem:///Long.kt",
+            vec![IndexedSymbol::new(
+                "HelpLong",
+                SymbolKind::Class,
+                "app",
+                None,
+                10,
+                18,
+            )],
+            Tier::Volatile,
+        );
+        ws.index.replace_file(
+            "lib:///Short.kt",
+            vec![IndexedSymbol::new(
+                "Help",
+                SymbolKind::Class,
+                "lib",
+                None,
+                0,
+                4,
+            )],
+            Tier::Durable,
+        );
+
+        let symbols = ws.workspace_symbols("HELP");
+        let ordered = symbols
+            .iter()
+            .map(|s| {
+                (
+                    s.file.as_str(),
+                    s.name.as_str(),
+                    s.end_byte,
+                    s.documentation.as_deref(),
+                    s.tier,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec![
+                (
+                    "mem:///Same.kt",
+                    "Helper",
+                    26,
+                    Some("first overload"),
+                    Tier::Volatile
+                ),
+                (
+                    "mem:///Same.kt",
+                    "Helper",
+                    26,
+                    Some("duplicate"),
+                    Tier::Volatile
+                ),
+                (
+                    "mem:///Same.kt",
+                    "helper",
+                    26,
+                    Some("lowercase"),
+                    Tier::Volatile
+                ),
+                (
+                    "mem:///Same.kt",
+                    "Helper",
+                    29,
+                    Some("later range"),
+                    Tier::Volatile
+                ),
+                ("mem:///Long.kt", "HelpLong", 18, None, Tier::Volatile),
+                ("lib:///Short.kt", "Help", 4, None, Tier::Durable),
+            ]
+        );
+        assert_eq!(
+            symbols[0],
+            SymbolSummary {
+                file: "mem:///Same.kt".into(),
+                name: "Helper".into(),
+                kind: SymbolKind::Function,
+                package: "app".into(),
+                container: Some("Owner".into()),
+                start_byte: 20,
+                end_byte: 26,
+                documentation: Some("first overload".into()),
+                tier: Tier::Volatile,
+                supertypes: vec![],
+                ext_receiver: Some("Scope".into()),
+                arity: Some(2),
+                trailing_lambda_receiver_type: Some(TypeRef::simple("Scope")),
+                return_type: Some(TypeRef::simple("T")),
+                value_type: None,
+                params: vec![list, TypeRef::simple("Function1")],
+                type_params: vec!["T".into()],
+            }
+        );
+        let before = ws.workspace_symbols("HELP");
+        let same_file = ws
+            .index
+            .entries_for_file("mem:///Same.kt")
+            .into_iter()
+            .map(|entry| (*entry.sym).clone())
+            .collect();
+        ws.index.remove_file("mem:///Same.kt");
+        ws.index
+            .replace_file("mem:///Same.kt", same_file, Tier::Volatile);
+        assert_eq!(ws.workspace_symbols("HELP"), before);
+    }
+
+    #[test]
+    fn workspace_symbols_cap_after_filter_and_rank_including_empty_query() {
+        let mut ws = Workspace::new();
+        let symbols = (0..205)
+            .map(|i| {
+                let start = (204 - i) * 10;
+                let mut symbol = IndexedSymbol::new(
+                    format!("Hit{i:03}"),
+                    SymbolKind::Function,
+                    "app",
+                    None,
+                    start,
+                    start + 6,
+                );
+                symbol.documentation = Some(format!("payload {i}"));
+                symbol
+            })
+            .collect();
+        ws.index
+            .replace_file("mem:///Bulk.kt", symbols, Tier::Volatile);
+        ws.index.replace_file(
+            "lib:///Bulk.kt",
+            vec![IndexedSymbol::new(
+                "Hit000",
+                SymbolKind::Function,
+                "lib",
+                None,
+                0,
+                6,
+            )],
+            Tier::Durable,
+        );
+
+        let symbols = ws.workspace_symbols("");
+        assert_eq!(symbols.len(), 200);
+        let payloads = symbols
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.documentation.clone(),
+                    s.start_byte,
+                    s.tier,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..200)
+            .map(|i| {
+                (
+                    format!("Hit{i:03}"),
+                    Some(format!("payload {i}")),
+                    (204 - i) * 10,
+                    Tier::Volatile,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(payloads, expected);
+        let selective = ws.workspace_symbols("HiT000");
+        assert_eq!(
+            selective
+                .iter()
+                .map(|s| (s.file.as_str(), s.tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("mem:///Bulk.kt", Tier::Volatile),
+                ("lib:///Bulk.kt", Tier::Durable),
+            ]
+        );
+        assert!(ws.workspace_symbols("MissingSymbol").is_empty());
+    }
+
+    #[test]
+    fn workspace_symbols_match_unicode_and_joined_package_container() {
+        let key = "mem:///Unicode.kt";
+        let mut ws = Workspace::new();
+        ws.index.replace_file(
+            key,
+            [
+                ("İSTANBUL", "möd.api", Some("Ångström")),
+                ("Straße", "", None),
+                ("Plain", "möd.api", None),
+                ("RootMember", "", Some("Owner")),
+                ("Rootless", "", None),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, package, container))| {
+                IndexedSymbol::new(
+                    name,
+                    SymbolKind::Class,
+                    package,
+                    container.map(str::to_owned),
+                    i * 20,
+                    i * 20 + name.len(),
+                )
+            })
+            .collect(),
+            Tier::Volatile,
+        );
+        let cases: &[(&str, &[&str])] = &[
+            ("İST", &["İSTANBUL"]),
+            ("i\u{307}st", &["İSTANBUL"]),
+            ("istanbul", &[]),
+            ("MÖD.API.ÅNG", &["İSTANBUL"]),
+            ("api.Å", &["İSTANBUL"]),
+            ("apiÅ", &[]),
+            ("möd.api", &["Plain", "İSTANBUL"]),
+            ("möd.api.", &["İSTANBUL"]),
+            ("OWNER", &["RootMember"]),
+            ("STRAßE", &["Straße"]),
+            ("STRASSE", &[]),
+            (
+                "",
+                &["Plain", "Straße", "Rootless", "İSTANBUL", "RootMember"],
+            ),
+        ];
+        let summaries = ws.document_symbols(key);
+        for &(query, expected) in cases {
+            let actual = ws.workspace_symbols(query);
+            assert_eq!(
+                actual.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                expected,
+                "{query}"
+            );
+            for summary in &summaries {
+                assert_eq!(
+                    summary.matches_query(query),
+                    expected.contains(&summary.name.as_str()),
+                    "{}: {query}",
+                    summary.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn annotation_owner_metadata_survives_close_and_cleans_up_deleted_and_reopened_sources() {

@@ -53,24 +53,16 @@ impl SymbolSummary {
     }
 
     pub fn detail(&self) -> Option<String> {
-        let mut parts = Vec::new();
-        if !self.package.is_empty() {
-            parts.push(self.package.clone());
-        }
-        if let Some(container) = &self.container {
-            parts.push(container.clone());
-        }
-        (!parts.is_empty()).then(|| parts.join("."))
+        symbol_detail(&self.package, self.container.as_deref())
     }
 
     pub fn matches_query(&self, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        self.name.to_lowercase().contains(&query.to_lowercase())
-            || self
-                .detail()
-                .is_some_and(|d| d.to_lowercase().contains(&query.to_lowercase()))
+        matches_lowercase_query(
+            &self.name,
+            &self.package,
+            self.container.as_deref(),
+            &query.to_lowercase(),
+        )
     }
 
     pub fn hover_markdown(&self) -> String {
@@ -123,6 +115,28 @@ impl SymbolSummary {
             }
         }
         label
+    }
+}
+
+/// Match symbol fields against a query already normalized with `str::to_lowercase`.
+pub fn matches_lowercase_query(
+    name: &str,
+    package: &str,
+    container: Option<&str>,
+    query: &str,
+) -> bool {
+    query.is_empty()
+        || name.to_lowercase().contains(query)
+        || symbol_detail(package, container)
+            .is_some_and(|detail| detail.to_lowercase().contains(query))
+}
+
+fn symbol_detail(package: &str, container: Option<&str>) -> Option<String> {
+    match (package, container) {
+        ("", None) => None,
+        ("", Some(container)) => Some(container.to_string()),
+        (package, None) => Some(package.to_string()),
+        (package, Some(container)) => Some(format!("{package}.{container}")),
     }
 }
 

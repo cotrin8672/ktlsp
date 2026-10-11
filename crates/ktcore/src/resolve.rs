@@ -506,12 +506,12 @@ fn member_name_status_a(
     if ctx.local_extensions.is_some() {
         let pool = members::candidates_at(index, &recv_ty, name, ctx, usage.start_byte());
         if !pool.members.is_empty()
-            || !pool.extensions.is_empty()
+            || pool.known_extensions().next().is_some()
             || pool.known_local_extensions().next().is_some()
         {
             return ResolutionStatus::Found(());
         }
-        if pool.has_local_extensions() {
+        if pool.has_local_extensions() || pool.has_uncertain_receivers() {
             return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
         }
     }
@@ -529,8 +529,11 @@ pub fn member_name_status_for_receiver(
     ctx: &infer::FileCtx,
 ) -> ResolutionStatus<()> {
     let candidates = members::candidates(index, recv_ty, name, ctx);
-    if !candidates.members.is_empty() || !candidates.extensions.is_empty() {
+    if !candidates.members.is_empty() || candidates.known_extensions().next().is_some() {
         return ResolutionStatus::Found(());
+    }
+    if candidates.has_uncertain_receivers() {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
     }
     if !index.scope_is_complete() {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::QueryScopeIncomplete]);
@@ -1291,9 +1294,8 @@ fn goto_authored_node_with_ctx(
     if let Some(defs) =
         resolve_implicit_receiver_member_with_ctx_a(index, ident, ancestors, name, src, ctx)
     {
-        if !defs.is_empty() {
-            return defs;
-        }
+        // An uncertain implicit receiver is not permission to select unrelated global homonyms.
+        return defs;
     }
     if let Some(defs) = resolve_nested_type_in(index, src, ident, parent, ctx) {
         if !defs.is_empty() {

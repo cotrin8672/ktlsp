@@ -123,6 +123,16 @@ impl SymbolKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionReceiverFacts {
+    pub ty: TypeRef,
+    /// Inline upper bounds retain the declaring file's type identities.
+    #[serde(default)]
+    pub upper_bounds: Vec<(String, TypeRef)>,
+    /// Unmodeled constraints, including where clauses and projected receiver templates.
+    pub has_type_constraints: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedSymbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -139,6 +149,9 @@ pub struct IndexedSymbol {
     pub supertype_refs: Vec<TypeRef>,
     #[serde(default)]
     pub ext_receiver: Option<String>,
+    /// The declaration-scoped receiver template; keep absent facts out of line.
+    #[serde(default)]
+    pub extension_receiver: Option<Box<ExtensionReceiverFacts>>,
     #[serde(default)]
     pub arity: Option<u8>,
     #[serde(default)]
@@ -190,6 +203,7 @@ impl IndexedSymbol {
             supertypes: Vec::new(),
             supertype_refs: Vec::new(),
             ext_receiver: None,
+            extension_receiver: None,
             arity: None,
             min_arity: None,
             has_vararg: false,
@@ -229,6 +243,12 @@ pub fn reshare_file_type_contexts(
 
     let mut pool = HashSet::new();
     for symbol in symbols {
+        if let Some(receiver) = symbol.extension_receiver.as_deref_mut() {
+            visit(&mut receiver.ty, &mut pool);
+            for (_, bound) in &mut receiver.upper_bounds {
+                visit(bound, &mut pool);
+            }
+        }
         for ty in symbol
             .supertype_refs
             .iter_mut()
@@ -283,7 +303,12 @@ mod tests {
         let mut symbol = IndexedSymbol::new("method", SymbolKind::Function, "lib", None, 1, 2);
         let mut parent = ty();
         parent.args.push(ty());
-        symbol.supertype_refs = vec![parent];
+        symbol.supertype_refs = vec![parent.clone()];
+        symbol.extension_receiver = Some(Box::new(ExtensionReceiverFacts {
+            ty: ty(),
+            upper_bounds: vec![("T".into(), parent)],
+            has_type_constraints: false,
+        }));
         symbol.trailing_lambda_receiver_type = Some(Box::new(ty()));
         symbol.function_type_receiver = Some(Box::new(ty()));
         symbol.return_type = Some(TypeRef {
@@ -329,6 +354,11 @@ mod tests {
         let shared = Arc::clone(&symbol.supertype_refs[0].package_candidates);
         for ty in [
             &symbol.supertype_refs[0].args[0],
+            &symbol.extension_receiver.as_deref().unwrap().ty,
+            &symbol.extension_receiver.as_deref().unwrap().upper_bounds[0].1,
+            &symbol.extension_receiver.as_deref().unwrap().upper_bounds[0]
+                .1
+                .args[0],
             symbol.trailing_lambda_receiver_type.as_deref().unwrap(),
             symbol.function_type_receiver.as_deref().unwrap(),
             symbol.return_type.as_ref().unwrap(),

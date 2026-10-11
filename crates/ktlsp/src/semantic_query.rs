@@ -1057,6 +1057,11 @@ fn member_candidates(
             push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
         }
         for entry in extensions {
+            if ktcore::members::extension_receiver_applicability(inference_index, ty, entry)
+                != ktcore::members::Applicability::Applicable
+            {
+                continue;
+            }
             let mut visible = false;
             for name in resolve::visible_extension_names(entry, &ctx.imports, &ctx.package) {
                 visible = true;
@@ -1084,6 +1089,11 @@ fn member_candidates(
             for entry in
                 resolve::generic_receiver_extensions(index, alias, &ctx.imports, &ctx.package)
             {
+                if ktcore::members::extension_receiver_applicability(inference_index, ty, entry)
+                    != ktcore::members::Applicability::Applicable
+                {
+                    continue;
+                }
                 push_member_candidate(&mut out, &mut seen, entry, alias, prefix, None);
             }
         }
@@ -1530,6 +1540,7 @@ mod tests {
                 supertypes: Vec::new(),
                 supertype_refs: Vec::new(),
                 ext_receiver: Some("Dog".into()),
+                extension_receiver: None,
                 arity: Some(1),
                 min_arity: Some(1),
                 has_vararg: false,

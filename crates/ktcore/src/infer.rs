@@ -236,9 +236,112 @@ fn infer_depth_with<R: ChildInfer>(
             None => Type::Unknown,
         },
         "call_expression" => infer_call(index, node, src, ctx, depth, child_infer),
+        "callable_reference" => infer_class_literal(index, node, src, ctx),
+        "navigation_expression" if has_child_token(node, "::") => {
+            infer_class_literal(index, node, src, ctx)
+        }
         "navigation_expression" => infer_navigation(index, node, src, ctx, depth, child_infer),
         _ => Type::Unknown,
     }
+}
+
+fn infer_class_literal(index: &dyn InferenceIndex, node: Node, src: &str, ctx: &FileCtx) -> Type {
+    if node.has_error() || !has_child_token(node, "::") {
+        return Type::Unknown;
+    }
+    let class_keyword = match node.kind() {
+        "callable_reference" => has_child_token(node, "class"),
+        // The pinned grammar prefers navigation_expression over callable_reference here.
+        "navigation_expression" => node.named_child(1).is_some_and(|selector| {
+            selector.kind() == "identifier" && node_text(selector, src) == "class"
+        }),
+        _ => false,
+    };
+    if !class_keyword {
+        return Type::Unknown;
+    }
+    let Some(receiver) = node.named_child(0) else {
+        return Type::Unknown;
+    };
+    let scope = crate::indexer::TypeScope::with_default_imports(
+        &ctx.package,
+        ctx.imports.clone(),
+        crate::defaults::DEFAULT_IMPORT_PACKAGES,
+    );
+    let Some((first, reference)) = named_class_literal_receiver(receiver, src, &scope) else {
+        return Type::Unknown;
+    };
+    if let Some((_, kind)) = resolve::local_decl(first, node_text(first, src), UseKind::Value, src)
+    {
+        if matches!(
+            kind,
+            SymbolKind::Parameter
+                | SymbolKind::LocalVariable
+                | SymbolKind::Property
+                | SymbolKind::TypeParameter
+        ) {
+            // Bound expression and reified type-parameter literals need their own type semantics.
+            return Type::Unknown;
+        }
+    }
+    let target = resolve_type_ref(index, &reference, ctx, 0);
+    let Some(declaration) = type_declaration_shape(index, &target) else {
+        return Type::Unknown;
+    };
+    if !matches!(
+        declaration.sym.kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Object | SymbolKind::EnumClass
+    ) {
+        return Type::Unknown;
+    }
+    if !declaration.sym.type_params.is_empty() {
+        // Generic named literals need star-projection semantics, not an invented raw argument list.
+        return Type::Unknown;
+    }
+    Type::Class {
+        name: "KClass".into(),
+        package: Some("kotlin.reflect".into()),
+        container: None,
+        nullable: false,
+        args: vec![target],
+    }
+}
+
+fn named_class_literal_receiver<'t>(
+    mut receiver: Node<'t>,
+    src: &str,
+    scope: &crate::indexer::TypeScope,
+) -> Option<(Node<'t>, TypeRef)> {
+    if receiver.kind() == "user_type" {
+        if child_of_kind(receiver, "type_arguments").is_some() {
+            return None;
+        }
+        return Some((
+            first_ident(receiver)?,
+            crate::indexer::type_ref_from(receiver, src, Some(scope))?,
+        ));
+    }
+    let mut names = Vec::new();
+    while receiver.kind() == "navigation_expression" {
+        if !has_child_token(receiver, ".") || receiver.named_child_count() != 2 {
+            return None;
+        }
+        let selector = receiver.named_child(1)?;
+        if selector.kind() != "identifier" {
+            return None;
+        }
+        names.push(node_text(selector, src));
+        receiver = receiver.named_child(0)?;
+    }
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    names.push(node_text(receiver, src));
+    names.reverse();
+    Some((
+        receiver,
+        scope.type_ref(&names.join("."), false, Vec::new()),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2005,18 +2108,32 @@ fn resolve_trailing_lambda_receiver_candidate(
     depth: usize,
 ) -> Option<Type> {
     let tset: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
-    let mut subst: HashMap<String, Type> = HashMap::new();
+    let mut subst = match recv_ty {
+        Some(receiver) if entry.sym.extension_receiver.is_some() => {
+            receiver_type_bindings(index, receiver, entry)?
+        }
+        _ => HashMap::new(),
+    };
     for (i, p) in entry.sym.params.iter().enumerate() {
         if let Some(a) = arg_types.get(i) {
-            solve::unify_into(p, a, &tset, &mut subst);
+            let mut argument_bindings = HashMap::new();
+            solve::unify_into(p, a, &tset, &mut argument_bindings);
+            merge_type_bindings(&mut subst, argument_bindings);
         }
     }
-    if let (Some(recv_name), Some(actual_recv)) = (entry.sym.ext_receiver.as_deref(), recv_ty) {
+    if let (None, Some(recv_name), Some(actual_recv)) = (
+        entry.sym.extension_receiver.as_ref(),
+        entry.sym.ext_receiver.as_deref(),
+        recv_ty,
+    ) {
         if tset.contains(recv_name) {
             subst
                 .entry(recv_name.to_string())
                 .or_insert_with(|| actual_recv.clone());
         }
+    }
+    if !extension_bounds_hold(index, entry, &subst) {
+        return None;
     }
     // Only reject when the receiver HEAD is itself an unbound type parameter (the class to look
     // up is unknown). Unbound type-parameter ARGUMENTS resolve to `Unknown` (sound — never a
@@ -2396,10 +2513,17 @@ fn resolve_member_type_with_subst(
     child_infer: &mut impl ChildInfer,
 ) -> Type {
     let tparams = member_type_parameters(index, entry);
+    if tparams.is_empty() && entry.sym.extension_receiver.is_none() {
+        return resolve_type_ref(index, tr, ctx, depth + 1);
+    }
+    let receiver_bindings = receiver_type_bindings(index, recv_ty, entry);
+    if entry.sym.extension_receiver.is_some() && receiver_bindings.is_none() {
+        return Type::Unknown;
+    }
     if tparams.is_empty() {
         return resolve_type_ref(index, tr, ctx, depth + 1);
     }
-    let mut subst = receiver_type_bindings(index, recv_ty, entry).unwrap_or_default();
+    let mut subst = receiver_bindings.unwrap_or_default();
     if let Some(call) = call {
         // Only method/extension variables are inferred from arguments. Owning-class variables
         // retain their receiver bindings, including Unknown for an incomplete/raw receiver.
@@ -2411,17 +2535,7 @@ fn resolve_member_type_with_subst(
         for (formal, actual) in entry.sym.params.iter().zip(arguments.types) {
             let mut argument_bindings = HashMap::new();
             solve::unify_into(formal, &actual, &method_params, &mut argument_bindings);
-            for (parameter, actual) in argument_bindings {
-                subst
-                    .entry(parameter)
-                    .and_modify(|bound| {
-                        if *bound != actual {
-                            // shortcut: conflicting constraints stay Unknown; replace when join inference is available.
-                            *bound = Type::Unknown;
-                        }
-                    })
-                    .or_insert(actual);
-            }
+            merge_type_bindings(&mut subst, argument_bindings);
         }
         bind_lambda_return_type(
             index,
@@ -2436,6 +2550,9 @@ fn resolve_member_type_with_subst(
             child_infer,
         );
     }
+    if !extension_bounds_hold(index, entry, &subst) {
+        return Type::Unknown;
+    }
     resolve_with_subst(index, tr, ctx, &tparams, &subst, depth + 1)
 }
 
@@ -2449,11 +2566,32 @@ pub fn declared_member_type(
     ctx: &FileCtx,
 ) -> Type {
     let tparams = member_type_parameters(index, entry);
+    if tparams.is_empty() && entry.sym.extension_receiver.is_none() {
+        return resolve_type_ref(index, tr, ctx, 0);
+    }
+    let receiver_bindings = receiver_type_bindings(index, recv_ty, entry);
+    if entry.sym.extension_receiver.is_some() && receiver_bindings.is_none() {
+        return Type::Unknown;
+    }
     if tparams.is_empty() {
         return resolve_type_ref(index, tr, ctx, 0);
     }
-    let subst = receiver_type_bindings(index, recv_ty, entry).unwrap_or_default();
+    let subst = receiver_bindings.unwrap_or_default();
     resolve_with_subst(index, tr, ctx, &tparams, &subst, 0)
+}
+
+fn merge_type_bindings(subst: &mut HashMap<String, Type>, bindings: HashMap<String, Type>) {
+    for (parameter, actual) in bindings {
+        subst
+            .entry(parameter)
+            .and_modify(|bound| {
+                if *bound != actual {
+                    // shortcut: conflicting constraints stay Unknown until join inference is available.
+                    *bound = Type::Unknown;
+                }
+            })
+            .or_insert(actual);
+    }
 }
 
 fn member_type_parameters(index: &dyn InferenceIndex, entry: &Entry) -> HashSet<String> {
@@ -2621,6 +2759,76 @@ pub(crate) fn receiver_type_bindings(
     recv_ty: &Type,
     entry: &Entry,
 ) -> Option<HashMap<String, Type>> {
+    if let Some(receiver) = entry.sym.extension_receiver.as_deref() {
+        if receiver.has_type_constraints || !type_head_is_known(index, recv_ty) {
+            return None;
+        }
+        // Each variable records whether its explicit upper bound proves it non-null.
+        let mut params: HashMap<_, _> = entry
+            .sym
+            .type_params
+            .iter()
+            .cloned()
+            .map(|name| (name, false))
+            .collect();
+        let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+        for (parameter, bound) in &receiver.upper_bounds {
+            let resolved = resolve_type_ref(index, bound, &ctx, 0);
+            if !resolved.is_nullable()
+                && receiver_arguments_known(index, &resolved, 0)
+                && !receiver_bound_mentions_parameter(bound, &entry.sym.type_params, 0)
+            {
+                if let Some(non_null) = params.get_mut(parameter) {
+                    *non_null = true;
+                }
+            }
+        }
+        let bind = |actual: &Type| {
+            let mut bindings = HashMap::new();
+            if !bind_receiver_template(index, &receiver.ty, actual, &ctx, &params, &mut bindings, 0)
+            {
+                return None;
+            }
+            extension_bounds_hold(index, entry, &bindings).then_some(bindings)
+        };
+        if receiver.ty.qualification.is_none() && params.contains_key(&receiver.ty.name) {
+            return bind(recv_ty);
+        }
+        let formal = resolve_type_ref(index, &receiver.ty, &ctx, 0);
+        if !type_head_is_known(index, &formal) || (recv_ty.is_nullable() && !formal.is_nullable()) {
+            return None;
+        }
+        let same_head = |actual: &Type| {
+            actual.name() == formal.name()
+                && actual.package() == formal.package()
+                && actual.container() == formal.container()
+        };
+        // A direct match needs no assumptions about unrelated, possibly unavailable ancestors.
+        if same_head(recv_ty) {
+            return bind(recv_ty);
+        }
+        let mut result = None;
+        let mut incomplete = false;
+        let walked = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
+            incomplete |= !type_head_is_known(index, current);
+            if same_head(current) {
+                let Some(bindings) = bind(current) else {
+                    return ControlFlow::Break(());
+                };
+                match &result {
+                    Some(previous) if previous != &bindings => return ControlFlow::Break(()),
+                    None => result = Some(bindings),
+                    _ => {}
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        return if walked.is_break() || incomplete {
+            None
+        } else {
+            result
+        };
+    }
     if let Some(recv) = entry.sym.ext_receiver.as_deref() {
         if entry.sym.type_params.iter().any(|tp| tp == recv) {
             let mut subst = HashMap::new();
@@ -2634,7 +2842,7 @@ pub(crate) fn receiver_type_bindings(
             if receiver_root_key(index, current).as_deref() == Some(container)
                 && current.package().is_none_or(|pkg| pkg == entry.sym.package)
             {
-                let Some(declaration) = type_declaration(index, current) else {
+                let Some(declaration) = type_declaration_shape(index, current) else {
                     return ControlFlow::Break(());
                 };
                 if declaration.sym.type_params.len() != current.args().len() {
@@ -2662,18 +2870,207 @@ pub(crate) fn receiver_type_bindings(
         }
         return result;
     }
-    let type_params = receiver_type_params(index, recv_ty, entry)?;
-    if type_params.len() != recv_ty.args().len() {
-        return None;
-    }
-    Some(
-        type_params
-            .into_iter()
-            .zip(recv_ty.args().iter().cloned())
-            .collect(),
-    )
+    None
 }
 
+/// Receiver matching may leave a function's own variables unbound. Check their known bindings
+/// again after value arguments have been unified; unbound variables still substitute to Unknown.
+fn extension_bounds_hold(
+    index: &dyn InferenceIndex,
+    entry: &Entry,
+    bindings: &HashMap<String, Type>,
+) -> bool {
+    let Some(receiver) = entry.sym.extension_receiver.as_deref() else {
+        return true;
+    };
+    if receiver.has_type_constraints {
+        return false;
+    }
+    let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+    receiver.upper_bounds.iter().all(|(parameter, bound)| {
+        // F-bounds and relationships between variables still require a constraint solver.
+        if receiver_bound_mentions_parameter(bound, &entry.sym.type_params, 0) {
+            return false;
+        }
+        let bound = resolve_type_ref(index, bound, &ctx, 0);
+        if !receiver_arguments_known(index, &bound, 0) {
+            return false;
+        }
+        let Some(actual) = bindings
+            .get(parameter)
+            .filter(|actual| actual.name().is_some())
+        else {
+            // A function's own T may come from its value arguments, independently of the receiver.
+            // An unbound property variable cannot establish an applicable receiver.
+            return entry.sym.kind == SymbolKind::Function;
+        };
+        receiver_satisfies_upper_bound(index, actual, &bound)
+    })
+}
+
+fn receiver_bound_mentions_parameter(bound: &TypeRef, params: &[String], depth: usize) -> bool {
+    depth > MAX_DEPTH
+        || (bound.qualification.is_none() && params.contains(&bound.name))
+        || bound
+            .args
+            .iter()
+            .any(|arg| receiver_bound_mentions_parameter(arg, params, depth + 1))
+}
+
+/// Prove a nominal upper bound without gradual compatibility or name-only subtype guesses.
+/// Instantiated arguments remain exact; incomplete or conflicting inheritance paths stay unknown.
+fn receiver_satisfies_upper_bound(index: &dyn InferenceIndex, actual: &Type, bound: &Type) -> bool {
+    if !receiver_arguments_known(index, actual, 0)
+        || !receiver_arguments_known(index, bound, 0)
+        || (actual.is_nullable() && !bound.is_nullable())
+    {
+        return false;
+    }
+    // Every known Kotlin/JVM type satisfies canonical Any once nullability has been checked.
+    // A user type also named Any retains its ordinary nominal identity.
+    if bound.name() == Some("Any")
+        && bound.package() == Some("kotlin")
+        && bound.container().is_none()
+        && bound.args().is_empty()
+    {
+        return true;
+    }
+    let same_head = |current: &Type| {
+        current.name() == bound.name()
+            && current.package() == bound.package()
+            && current.container() == bound.container()
+    };
+    if same_head(actual) {
+        return actual.args() == bound.args();
+    }
+    let mut found = false;
+    let mut incomplete = false;
+    let walked = walk_supertypes(index, actual, SUPERTYPE_CAP, |current| {
+        incomplete |= !receiver_arguments_known(index, current, 0);
+        if same_head(current) {
+            if current.args() != bound.args() {
+                return ControlFlow::Break(());
+            }
+            found = true;
+        }
+        ControlFlow::Continue(())
+    });
+    found && !incomplete && !walked.is_break()
+}
+
+/// Exact receiver-template matching, separate from gradual argument compatibility. Positions come
+/// from the declaration, and nominal heads must retain package and containing-type identity.
+fn bind_receiver_template(
+    index: &dyn InferenceIndex,
+    formal: &TypeRef,
+    actual: &Type,
+    ctx: &FileCtx,
+    params: &HashMap<String, bool>,
+    bindings: &mut HashMap<String, Type>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_DEPTH || formal.name.is_empty() || !type_head_is_known(index, actual) {
+        return false;
+    }
+    if formal.qualification.is_none() && params.contains_key(&formal.name) {
+        // T? determines T only when an explicit non-null upper bound removes the ambiguity.
+        // Inside invariant argument slots, a non-null actual cannot equal the nullable template.
+        if formal.nullable && (!params[&formal.name] || (depth > 0 && !actual.is_nullable())) {
+            return false;
+        }
+        let non_nullable = formal.nullable.then(|| actual.clone().into_non_null());
+        let actual = non_nullable.as_ref().unwrap_or(actual);
+        if !formal.args.is_empty() || !receiver_arguments_known(index, actual, depth) {
+            return false;
+        }
+        return match bindings.get(&formal.name) {
+            Some(previous) => previous == actual,
+            None => {
+                bindings.insert(formal.name.clone(), actual.clone());
+                true
+            }
+        };
+    }
+    if !receiver_shape_is_known(index, actual) {
+        return false;
+    }
+    let Some((package, container)) = type_ref_identity(index, formal, ctx) else {
+        return false;
+    };
+    if actual.name() != Some(formal.name.as_str())
+        || actual.package() != package.as_deref()
+        || actual.container() != container.as_deref()
+        || (actual.is_nullable() && !formal.nullable)
+        || (depth > 0 && actual.is_nullable() != formal.nullable)
+        || actual.args().len() != formal.args.len()
+    {
+        return false;
+    }
+    formal
+        .args
+        .iter()
+        .zip(actual.args())
+        .all(|(formal, actual)| {
+            bind_receiver_template(index, formal, actual, ctx, params, bindings, depth + 1)
+        })
+}
+
+fn receiver_arguments_known(index: &dyn InferenceIndex, actual: &Type, depth: usize) -> bool {
+    depth <= MAX_DEPTH
+        && type_head_is_known(index, actual)
+        && receiver_shape_is_known(index, actual)
+        && actual
+            .args()
+            .iter()
+            .all(|argument| receiver_arguments_known(index, argument, depth + 1))
+}
+
+// Callers already prove the nominal head; this checks its declaration shape and argument count.
+fn receiver_shape_is_known(index: &dyn InferenceIndex, actual: &Type) -> bool {
+    if let Some(declaration) = type_declaration_shape(index, actual) {
+        return declaration.sym.type_params.len() == actual.args().len();
+    }
+    // A missing fundamental type needs no source declaration. Conflicting declarations are not
+    // missing: they must never fall through to the zero-argument builtin rule.
+    actual.container().is_none()
+        && actual.args().is_empty()
+        && actual.name().is_some_and(|name| {
+            crate::defaults::is_builtin_type(primitive_type_name(name))
+                && actual
+                    .package()
+                    .is_none_or(|package| package == "kotlin" || package == "java.lang")
+                && !index.lookup_type(name).iter().any(|entry| {
+                    actual.package().is_none_or(|pkg| pkg == entry.sym.package)
+                        && actual.container() == entry.sym.container.as_deref()
+                })
+        })
+}
+
+/// Exact argument positions need only an agreed nominal shape. For example, a library can contain
+/// both expect and actual declarations with the same parameters but different parent lists.
+fn type_declaration_shape<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a Entry> {
+    let mut result: Option<&Entry> = None;
+    for entry in index.lookup_type(ty.name()?) {
+        if ty.package().is_some_and(|pkg| pkg != entry.sym.package)
+            || ty.container() != entry.sym.container.as_deref()
+        {
+            continue;
+        }
+        if let Some(previous) = result {
+            if previous.sym.package != entry.sym.package
+                || previous.sym.kind != entry.sym.kind
+                || previous.sym.type_params != entry.sym.type_params
+            {
+                return None;
+            }
+        }
+        result = Some(entry);
+    }
+    result
+}
+
+/// Parent traversal additionally requires all declarations of the nominal identity to agree on
+/// their instantiated hierarchy; shape agreement alone cannot prove a subtype relationship.
 fn type_declaration<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a Entry> {
     let mut result: Option<&Entry> = None;
     for entry in index.lookup_type(ty.name()?) {
@@ -2684,6 +3081,7 @@ fn type_declaration<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a 
         }
         if let Some(previous) = result {
             if previous.sym.package != entry.sym.package
+                || previous.sym.kind != entry.sym.kind
                 || previous.sym.type_params != entry.sym.type_params
                 || previous.sym.supertype_refs != entry.sym.supertype_refs
                 || previous.sym.supertypes != entry.sym.supertypes
@@ -2854,24 +3252,6 @@ fn lambda_tail_expr(lambda: Node) -> Option<Node> {
     }
 }
 
-fn receiver_type_params(
-    index: &dyn InferenceIndex,
-    recv_ty: &Type,
-    entry: &Entry,
-) -> Option<Vec<String>> {
-    if let Some(container) = entry.sym.container.as_deref() {
-        return named_type_params(index, container, &entry.sym.package);
-    }
-    let recv = entry.sym.ext_receiver.as_deref()?;
-    if entry.sym.type_params.iter().any(|tp| tp == recv) {
-        return Some(vec![recv.to_string()]);
-    }
-    if !recv_ty.args().is_empty() && entry.sym.type_params.len() >= recv_ty.args().len() {
-        return Some(entry.sym.type_params[..recv_ty.args().len()].to_vec());
-    }
-    named_type_params(index, recv, &entry.sym.package)
-}
-
 fn named_type_params(
     index: &dyn InferenceIndex,
     name: &str,
@@ -2881,7 +3261,7 @@ fn named_type_params(
         Some((container, simple)) => (Some(container.to_string()), simple),
         None => (None, name),
     };
-    type_declaration(
+    type_declaration_shape(
         index,
         &Type::Class {
             name: simple.to_string(),

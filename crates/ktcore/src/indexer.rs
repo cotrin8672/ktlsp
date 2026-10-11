@@ -16,7 +16,9 @@ use crate::index::{Entry, Tier, Usage};
 use crate::parser::{
     child_of_kind, class_kind, first_ident, imports_of, name_field, node_text, Import,
 };
-use crate::symbol::{IndexedSymbol, MemberImplementation, SourceMemberFlags, SymbolKind};
+use crate::symbol::{
+    ExtensionReceiverFacts, IndexedSymbol, MemberImplementation, SourceMemberFlags, SymbolKind,
+};
 use crate::types::TypeRef;
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
@@ -68,30 +70,11 @@ pub fn local_extensions(
                     .filter(|parent| matches!(parent.kind(), "block" | "lambda_literal")),
                 name_field(node),
             ) {
-                let mut cursor = node.walk();
-                let receiver = node
-                    .named_children(&mut cursor)
-                    .take_while(|child| *child != name)
-                    .find_map(|child| type_ref_from(child, src, Some(&scope)));
-                if let Some(receiver) = receiver {
-                    let has_type_constraints = child_of_kind(node, "type_constraints").is_some()
-                        || child_of_kind(node, "type_parameters").is_some_and(|parameters| {
-                            let mut cursor = parameters.walk();
-                            let bounded = parameters
-                                .named_children(&mut cursor)
-                                .any(|parameter| has_child_token(parameter, ":"));
-                            bounded
-                        });
-                    let symbol = function_symbol(
-                        node,
-                        name,
-                        src,
-                        package,
-                        None,
-                        Some(&receiver.name),
-                        None,
-                        &scope,
-                    );
+                if let Some(facts) = extension_receiver(node, src, &scope) {
+                    let receiver = facts.ty.clone();
+                    let has_type_constraints = facts.has_type_constraints;
+                    let symbol =
+                        function_symbol(node, name, src, package, None, Some(facts), None, &scope);
                     out.push(LocalExtension {
                         entry: Entry {
                             path: Arc::clone(&path),
@@ -159,6 +142,23 @@ impl TypeScope {
             args,
             Arc::clone(&self.package_candidates),
         )
+    }
+
+    fn without_shadowed_imports(&self, type_params: &[String]) -> Option<Self> {
+        let shadowed = |import: &Import| {
+            import
+                .local_name()
+                .is_some_and(|name| type_params.iter().any(|param| param == name))
+        };
+        self.imports.iter().any(shadowed).then(|| Self {
+            imports: self
+                .imports
+                .iter()
+                .filter(|import| !shadowed(import))
+                .cloned()
+                .collect(),
+            package_candidates: Arc::clone(&self.package_candidates),
+        })
     }
 }
 
@@ -275,13 +275,16 @@ fn push_property_names(
     src: &str,
     package: &str,
     container: Option<&str>,
-    ext_receiver: Option<&str>,
+    ext_receiver: Option<Box<ExtensionReceiverFacts>>,
     documentation: Option<&str>,
     scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
 ) {
     let start = out.len();
     let flags = source_member_flags(decl, src, false);
+    let type_params = type_params_of(decl, src);
+    let declaration_scope = scope.without_shadowed_imports(&type_params);
+    let scope = declaration_scope.as_ref().unwrap_or(scope);
     let mut cursor = decl.walk();
     for child in decl.named_children(&mut cursor) {
         match child.kind() {
@@ -295,7 +298,9 @@ fn push_property_names(
                         SymbolKind::Property,
                         package,
                         container,
-                        ext_receiver,
+                        ext_receiver
+                            .as_ref()
+                            .map(|receiver| receiver.ty.name.as_str()),
                         documentation,
                         vt,
                     );
@@ -314,7 +319,9 @@ fn push_property_names(
                                 SymbolKind::Property,
                                 package,
                                 container,
-                                ext_receiver,
+                                ext_receiver
+                                    .as_ref()
+                                    .map(|receiver| receiver.ty.name.as_str()),
                                 documentation,
                                 vt,
                             );
@@ -327,6 +334,8 @@ fn push_property_names(
     }
     for symbol in &mut out[start..] {
         symbol.source_member = flags;
+        symbol.type_params = type_params.clone();
+        symbol.extension_receiver = ext_receiver.clone();
     }
 }
 
@@ -585,7 +594,7 @@ fn push_function(
     src: &str,
     package: &str,
     container: Option<&str>,
-    ext_receiver: Option<&str>,
+    ext_receiver: Option<Box<ExtensionReceiverFacts>>,
     documentation: Option<&str>,
     scope: &TypeScope,
 ) {
@@ -607,14 +616,20 @@ fn function_symbol(
     src: &str,
     package: &str,
     container: Option<&str>,
-    ext_receiver: Option<&str>,
+    ext_receiver: Option<Box<ExtensionReceiverFacts>>,
     documentation: Option<&str>,
     scope: &TypeScope,
 ) -> IndexedSymbol {
     let shape = function_shape(decl);
+    let type_params = type_params_of(decl, src);
+    let declaration_scope = scope.without_shadowed_imports(&type_params);
+    let scope = declaration_scope.as_ref().unwrap_or(scope);
     IndexedSymbol {
         source_member: source_member_flags(decl, src, false),
-        ext_receiver: ext_receiver.map(str::to_string),
+        ext_receiver: ext_receiver
+            .as_ref()
+            .map(|receiver| receiver.ty.name.clone()),
+        extension_receiver: ext_receiver,
         documentation: documentation.map(str::to_string),
         arity: Some(shape.arity),
         min_arity: Some(shape.min_arity),
@@ -625,7 +640,7 @@ fn function_symbol(
             .map(Box::new),
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
-        type_params: type_params_of(decl, src),
+        type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
             SymbolKind::Function,
@@ -879,29 +894,51 @@ fn supertypes_of(decl: Node, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
     out
 }
 
-/// For a `function_declaration` / `property_declaration`, the simple name of an extension receiver:
-/// a `user_type`/`nullable_type` appearing BEFORE the boundary node (the `name:` field for
-/// functions, the `variable_declaration` for properties). `?`-stripped. `None` for plain
-/// declarations (whose `user_type`s only appear after the boundary). Verified via `examples/dump`:
-/// `fun Dog.fetch()` has `user_type(Dog)` before `name:`; `val x by lazy{}` has no `user_type`
-/// before its `variable_declaration` (the delegate is a `property_delegate`, not a receiver).
-fn extension_receiver(decl: Node, src: &str) -> Option<String> {
+/// The receiver before the declaration's name/variable boundary, including its declared arguments
+/// and visibility. Its simple head is only an index key, never a generic substitution template.
+fn extension_receiver(
+    decl: Node,
+    src: &str,
+    scope: &TypeScope,
+) -> Option<Box<ExtensionReceiverFacts>> {
+    let type_params = type_params_of(decl, src);
+    let declaration_scope = scope.without_shadowed_imports(&type_params);
+    let scope = declaration_scope.as_ref().unwrap_or(scope);
     let mut cursor = decl.walk();
     for child in decl.named_children(&mut cursor) {
-        match child.kind() {
-            // Boundary: anything at/after this is not an extension receiver.
-            "variable_declaration" => return None,
-            "user_type" => return first_ident(child).map(|id| node_text(id, src).to_string()),
-            "nullable_type" => {
-                return find_descendant(child, "user_type")
-                    .and_then(first_ident)
-                    .map(|id| node_text(id, src).to_string())
-            }
-            _ => {}
-        }
-        // For functions the boundary is the `name:` field; once we reach it, stop.
-        if name_field(decl) == Some(child) {
+        if child.kind() == "variable_declaration" || name_field(decl) == Some(child) {
             return None;
+        }
+        if let Some(ty) = type_ref_from(child, src, Some(scope)) {
+            let mut upper_bounds = Vec::new();
+            let mut has_type_constraints = child_of_kind(decl, "type_constraints").is_some()
+                || find_descendant(child, "variance_modifier").is_some();
+            if let Some(parameters) = child_of_kind(decl, "type_parameters") {
+                let mut cursor = parameters.walk();
+                for parameter in parameters.named_children(&mut cursor) {
+                    if parameter.kind() != "type_parameter" || !has_child_token(parameter, ":") {
+                        continue;
+                    }
+                    let mut cursor = parameter.walk();
+                    let bound = parameter.named_children(&mut cursor).find_map(|node| {
+                        type_ref_from(node, src, Some(scope)).map(|ty| (node, ty))
+                    });
+                    match (first_ident(parameter), bound) {
+                        (Some(name), Some((node, bound))) => {
+                            has_type_constraints |= parameter.has_error()
+                                || !matches!(node.kind(), "user_type" | "nullable_type")
+                                || find_descendant(node, "variance_modifier").is_some();
+                            upper_bounds.push((node_text(name, src).to_string(), bound));
+                        }
+                        _ => has_type_constraints = true,
+                    }
+                }
+            }
+            return Some(Box::new(ExtensionReceiverFacts {
+                ty,
+                upper_bounds,
+                has_type_constraints,
+            }));
         }
     }
     None
@@ -1038,6 +1075,11 @@ fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> 
         if proj.kind() != "type_projection" {
             continue;
         }
+        if child_of_kind(proj, "variance_modifier").is_some() {
+            // Keep the slot unknown until use-site variance is represented; `out T` is not `T`.
+            out.push(TypeRef::default());
+            continue;
+        }
         let mut c2 = proj.walk();
         let argument = proj
             .named_children(&mut c2)
@@ -1049,8 +1091,8 @@ fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> 
 
 /// A `function_declaration`'s declared RETURN type: the `user_type`/`nullable_type` child that
 /// appears AFTER the `function_value_parameters` boundary (an extension's receiver is BEFORE
-/// `name:`; a parameter's own type lives inside `function_value_parameters`). `None` when there is
-/// no explicit return annotation. Verified via `examples/dump`:
+/// `name:`; a parameter's own type lives inside `function_value_parameters`). `None` when the
+/// return type cannot be established here. Verified via `examples/dump`:
 /// `fun method(a: Int): Widget` -> `... function_value_parameters, user_type «Widget», function_body`.
 fn return_type_of(decl: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
     let mut cursor = decl.walk();
@@ -1062,11 +1104,20 @@ fn return_type_of(decl: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
         }
         if after_params {
             match child.kind() {
-                "user_type" | "nullable_type" | "function_type" => {
+                "user_type" | "nullable_type" | "function_type" | "parenthesized_type" => {
                     return type_ref_from(child, src, Some(scope))
                 }
-                // No explicit annotation: best-effort single-expression-body inference (Stage 6).
-                "function_body" => return expr_body_type(child, src, scope),
+                "function_body" => {
+                    // A block-bodied Kotlin function without an annotation always returns kotlin.Unit,
+                    // even when an imported or local declaration shadows the name Unit.
+                    if !has_child_token(decl, ":") && child_of_kind(child, "block").is_some() {
+                        return Some(TypeRef {
+                            qualification: Some("kotlin".into()),
+                            ..TypeRef::simple("Unit")
+                        });
+                    }
+                    return expr_body_type(child, src, scope);
+                }
                 _ => {}
             }
         }
@@ -1204,6 +1255,7 @@ fn push_synthetic_member(
         supertypes: Vec::new(),
         supertype_refs: Vec::new(),
         ext_receiver: None,
+        extension_receiver: None,
         arity,
         min_arity: arity,
         has_vararg: false,
@@ -1492,7 +1544,7 @@ fn walk(
                     // (`container.is_none()`); a member function's leading `user_type` would be a
                     // different shape, but `extension_receiver` keys off the `name:` boundary so it
                     // is correct either way. We record it unconditionally.
-                    let recv = extension_receiver(child, src);
+                    let recv = extension_receiver(child, src, scope);
                     let documentation = pending_kdoc.take();
                     push_function(
                         out,
@@ -1501,7 +1553,7 @@ fn walk(
                         src,
                         package,
                         container,
-                        recv.as_deref(),
+                        recv,
                         documentation.as_deref(),
                         scope,
                     );
@@ -1509,14 +1561,14 @@ fn walk(
                 // Do NOT recurse into the body: it only contains locals.
             }
             "property_declaration" => {
-                let recv = extension_receiver(child, src);
+                let recv = extension_receiver(child, src, scope);
                 let documentation = pending_kdoc.take();
                 push_property_names(
                     child,
                     src,
                     package,
                     container,
-                    recv.as_deref(),
+                    recv,
                     documentation.as_deref(),
                     scope,
                     out,

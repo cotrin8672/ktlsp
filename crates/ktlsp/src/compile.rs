@@ -1064,6 +1064,9 @@ mod native_compile_ownership_tests {
         PROCESS_SYNCHRONIZE,
     };
 
+    // Job termination is asynchronous; verify the retained descendant handle actually signals.
+    const PROCESS_EXIT_WAIT_MS: u32 = 5000;
+
     fn fixture_command(directory: &Path, mode: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -1288,7 +1291,7 @@ mod native_compile_ownership_tests {
             started.elapsed()
         );
         assert_eq!(
-            unsafe { WaitForSingleObject(leaf.as_raw_handle(), 0) },
+            unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
             WAIT_OBJECT_0
         );
         assert_eq!(outcome.diagnostics.len(), 1);
@@ -1386,7 +1389,7 @@ mod native_compile_ownership_tests {
             }
             if let Some(leaf) = leaf {
                 assert_eq!(
-                    unsafe { WaitForSingleObject(leaf.as_raw_handle(), 0) },
+                    unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
                     WAIT_OBJECT_0
                 );
             }
@@ -1419,7 +1422,7 @@ mod native_compile_ownership_tests {
                 "{mode}: silent pipe holder stranded join"
             );
             assert_eq!(
-                unsafe { WaitForSingleObject(leaf.as_raw_handle(), 0) },
+                unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
                 WAIT_OBJECT_0,
                 "{mode}"
             );
@@ -1465,7 +1468,7 @@ mod native_compile_ownership_tests {
         }));
         assert!(caught.is_err());
         assert_eq!(
-            unsafe { WaitForSingleObject(leaf.as_raw_handle(), 0) },
+            unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
             WAIT_OBJECT_0
         );
     }

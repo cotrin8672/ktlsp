@@ -599,10 +599,9 @@ fn record_annotation_surfaces(scans: &[ScannedFile], index: &Index, facts: &mut 
     }
 }
 
-// Java symbol extraction now includes record accessors and richer inheritance facts, so caches
-// produced before those facts existed cannot safely drive overload diagnostics.
+// IndexedSymbol's positional encoding now includes structured extension receivers and bounds.
 const DURABLE_CACHE_VERSION: &[u8] =
-    b"ktcheck-durable-v12-source-member-availability-encoding-policy";
+    b"ktcheck-durable-v13-source-generic-extension-receivers-bounds";
 const MAX_DURABLE_SNAPSHOTS_PER_ROOT: usize = 2;
 
 fn load_durable_library_symbols_cached(roots: &[PathBuf], scans: &[ScannedFile]) -> DurableLoad {
@@ -1733,7 +1732,7 @@ mod tests {
         let source = root.join("Library.kt");
         std::fs::write(
             &source,
-            "package lib\nimport elsewhere.*\nclass Payload\nsuspend fun first(value: Payload): Payload = TODO()\nsuspend fun second(value: Payload): Payload = TODO()\n",
+            "package lib\nimport elsewhere.*\nclass Payload\nsuspend fun <T: Payload> T.first(value: Payload): Payload = TODO()\nsuspend fun second(value: Payload): Payload = TODO()\n",
         ).unwrap();
         let scan = scan_files(vec![source]).pop().unwrap();
         let durable = DurableLoad {
@@ -1776,6 +1775,15 @@ mod tests {
             .unwrap();
         let candidates = &first.return_type.as_ref().unwrap().package_candidates;
         assert!(Arc::ptr_eq(candidates, &first.params[0].package_candidates));
+        let receiver = first.extension_receiver.as_deref().unwrap();
+        assert_eq!(receiver.ty.name, "T");
+        assert_eq!(receiver.upper_bounds[0].0, "T");
+        assert_eq!(receiver.upper_bounds[0].1.name, "Payload");
+        assert!(Arc::ptr_eq(candidates, &receiver.ty.package_candidates));
+        assert!(Arc::ptr_eq(
+            candidates,
+            &receiver.upper_bounds[0].1.package_candidates
+        ));
         assert!(Arc::ptr_eq(
             candidates,
             &second.return_type.as_ref().unwrap().package_candidates

@@ -315,7 +315,11 @@ fn matching_candidates_at<'a>(
         {
             continue;
         }
-        let applicability = local_receiver_applicability(index, receiver, local, ctx);
+        let mut applicability = local_receiver_applicability(index, receiver, local, ctx);
+        if applicability != Applicability::Rejected && local.entry.sym.extension_receiver.is_some()
+        {
+            applicability = extension_receiver_applicability(index, receiver, &local.entry);
+        }
         if applicability == Applicability::Rejected {
             continue;
         }
@@ -342,7 +346,7 @@ fn local_receiver_applicability(
     ctx: &FileCtx,
 ) -> Applicability {
     if local.has_type_constraints {
-        // shortcut: local type-parameter bounds are unknown until constraint applicability is modeled.
+        // shortcut: where clauses and projected receiver constraints remain unmodeled.
         return Applicability::Unknown;
     }
     if local.receiver.qualification.is_none()
@@ -385,6 +389,22 @@ fn local_receiver_applicability(
         Applicability::Unknown
     } else {
         Applicability::Rejected
+    }
+}
+
+/// Structured receiver proof shared by inference, navigation and editor completion. A failed exact
+/// template match cannot prove rejection while declaration-site variance remains unmodeled.
+pub fn extension_receiver_applicability(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+) -> Applicability {
+    if entry.sym.extension_receiver.is_none()
+        || infer::receiver_type_bindings(index, receiver, entry).is_some()
+    {
+        Applicability::Applicable
+    } else {
+        Applicability::Unknown
     }
 }
 
@@ -449,11 +469,24 @@ fn collect_candidates<'a>(
                 && a.sym.end_byte == b.sym.end_byte
         });
     }
+    let uncertain_receivers = extensions
+        .iter()
+        .filter(|entry| {
+            extension_receiver_applicability(index, receiver, entry) == Applicability::Unknown
+        })
+        .map(|entry| {
+            (
+                entry.path.as_ref(),
+                entry.sym.start_byte,
+                entry.sym.end_byte,
+            )
+        })
+        .collect();
     Candidates {
         members,
         extensions,
         local_scopes: Vec::new(),
-        uncertain_receivers: BTreeSet::new(),
+        uncertain_receivers,
         hierarchy_complete,
     }
 }
@@ -769,6 +802,17 @@ fn owner_inheritance(
 }
 
 impl<'a> Candidates<'a> {
+    pub fn known_extensions(&self) -> impl Iterator<Item = &'a Entry> + '_ {
+        self.extensions
+            .iter()
+            .copied()
+            .filter(|entry| self.receiver_is_known(entry))
+    }
+
+    pub fn has_uncertain_receivers(&self) -> bool {
+        !self.uncertain_receivers.is_empty()
+    }
+
     pub fn has_local_extensions(&self) -> bool {
         !self.local_scopes.is_empty()
     }
@@ -921,7 +965,9 @@ pub(crate) fn function_applicability(
     ctx: &FileCtx,
     mode: CallMode,
 ) -> Applicability {
-    let mut uncertain = args.count.is_none() || args.trailing_lambda;
+    let mut uncertain = args.count.is_none()
+        || args.trailing_lambda
+        || extension_receiver_applicability(index, receiver, entry) == Applicability::Unknown;
     if let Some(count) = args.count {
         let min = if args.trailing_lambda {
             infer::trailing_lambda_min_arity(index, entry, ctx).or(entry.sym.min_arity)

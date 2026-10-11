@@ -2003,12 +2003,12 @@ fn intrinsic_string_literal_keeps_available_jvm_string_members() {
 
 #[test]
 fn receiver_storage_preserves_inline_symbol_cache_wire() {
-    use ktlsp::symbol::IndexedSymbol;
+    use ktlsp::symbol::{ExtensionReceiverFacts, IndexedSymbol};
     use ktlsp::types::TypeRef;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
-    // The previous21 fields preserve their values/order; the new method flags change the wire.
+    // Current cache schema: boxed receivers encode like inline options, followed by source flags.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct InlineSymbol {
         name: String,
@@ -2021,6 +2021,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         supertypes: Vec<String>,
         supertype_refs: Vec<TypeRef>,
         ext_receiver: Option<String>,
+        extension_receiver: Option<ExtensionReceiverFacts>,
         arity: Option<u8>,
         min_arity: Option<u8>,
         has_vararg: bool,
@@ -2053,6 +2054,11 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     rich.supertypes = vec!["Base".into()];
     rich.supertype_refs = vec![receiver.clone()];
     rich.ext_receiver = Some("Owner".into());
+    rich.extension_receiver = Some(Box::new(ExtensionReceiverFacts {
+        ty: receiver.clone(),
+        upper_bounds: vec![("Payload".into(), receiver.clone())],
+        has_type_constraints: true,
+    }));
     rich.arity = Some(3);
     rich.min_arity = Some(1);
     rich.has_vararg = true;
@@ -2075,12 +2081,12 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     for symbol in [empty, rich] {
         let mut value = serde_json::to_value(&symbol).unwrap();
         value.as_object_mut().unwrap().remove("source_member");
-        let old: InlineSymbol = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&old).unwrap(), value);
-        let old_bytes = bincode::serialize(&old).unwrap();
+        let inline: InlineSymbol = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&inline).unwrap(), value);
+        let inline_bytes = bincode::serialize(&inline).unwrap();
         let current_bytes = bincode::serialize(&symbol).unwrap();
-        assert_eq!(old_bytes, current_bytes[..old_bytes.len()]);
-        assert_eq!(current_bytes.len(), old_bytes.len() + 1);
+        assert_eq!(inline_bytes, current_bytes[..inline_bytes.len()]);
+        assert_eq!(current_bytes.len(), inline_bytes.len() + 1);
         assert_eq!(
             bincode::deserialize::<IndexedSymbol>(&current_bytes).unwrap(),
             symbol

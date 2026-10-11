@@ -1509,7 +1509,6 @@ fn local_extension_unsaved_replacement_updates_chain_without_global_publication(
 fn local_extension_unproved_receiver_never_becomes_a_known_target_or_type() {
     for declaration in [
         "fun Missing.oldApi(): Payload = Payload()",
-        "fun <T : Any> T.oldApi(): Payload = Payload()",
         "fun <T> T.oldApi(): Payload where T : Missing = Payload()",
     ] {
         let mut ws = Workspace::new();
@@ -1532,6 +1531,30 @@ fn local_extension_unproved_receiver_never_becomes_a_known_target_or_type() {
         );
         assert!(labels(&mut ws, "Local.kt", "v.new").contains("newApi"));
     }
+}
+
+#[test]
+fn local_extension_any_upper_bound_resolves_known_non_null_receiver() {
+    let mut ws = Workspace::new();
+    let source = "package app\nclass Versioned {\n    fun newApi(): Int = 2\n}\nclass Payload {\n    fun payloadOnly(): Int = 7\n}\nfun use(v: Versioned) {\n    fun <T : Any> T.oldApi(): Payload = Payload()\n    v.oldApi().payloadOnly()\n    v.newApi()\n}\n";
+    let start = source.find("T.oldApi").unwrap() + 2;
+    ws.open("Local.kt", source.to_string());
+    assert_eq!(
+        infer_expression(&ws, "Local.kt", "v.oldApi()"),
+        Type::class("Payload", Some("app".to_string()))
+    );
+    assert!(labels(&mut ws, "Local.kt", "v.old").contains("oldApi"));
+    assert!(labels(&mut ws, "Local.kt", "v.oldApi().pay").contains("payloadOnly"));
+    assert_eq!(
+        goto(&mut ws, "Local.kt", "v.oldApi()", "oldApi"),
+        [Def {
+            file: "Local.kt".to_string(),
+            start_byte: start,
+            end_byte: start + "oldApi".len()
+        }]
+    );
+    assert!(labels(&mut ws, "Local.kt", "v.new").contains("newApi"));
+    assert!(ws.index.lookup_by_name("oldApi").is_empty());
 }
 
 #[test]

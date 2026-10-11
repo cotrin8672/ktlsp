@@ -206,6 +206,10 @@ server exit are recorded separately in `semantic-shutdown.json`.
 Function-local extensions cover lexical and sibling scopes, typed result chains,
 incomplete completion, and unsaved declaration rename/removal/return-type changes in
 `semantic-local-extension.json`; every query consumes its first response.
+Shared generic interoperability tests also cover parameterized extension receivers,
+inline nominal bounds, class literals and real-stdlib expect/actual declaration shapes.
+Java projected arguments and Kotlin where/F-bounds remain coverage gaps; see the current
+[acceptance record](docs/fork-acceptance.md) for real-library results and measurements.
 Use `corpus` with a completion UI case for real-project blank `super.` acceptance;
 retain the applied buffer and verify it with that project's compiler and plugins.
 
