@@ -351,6 +351,8 @@ the default is an explicit standard-notification control.
 The probe honors `KTLSP_JDK_SRC`. Set it to the Java compile toolchain's `lib/src.zip`
 to check Java's obsolete dependency-member diagnostics against selected classfiles and
 their actual JDK ancestors; the default tiny JDK fixture covers ordinary reload behavior.
+It also checks the Kotlin task's Java/Kotlin source inputs, configured library classpath
+and selected JDK before and after the dependency version changes, saving the raw model.
 The Kotlin obsolete-member assertion remains a separate unresolved case.
 
 `KTLSP_PROCESSOR_RELOAD=1 dev/ktlsp-harness.sh gradle-live` creates the real KAPT/KSP fixture

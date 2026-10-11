@@ -73,9 +73,39 @@ object KtlspCompilerConfiguration {
                     ?: error("Kotlin compiler arguments are unavailable")
                 check(arguments.all { it is String }) { "Unsupported Kotlin compiler argument value" }
                 record["arguments"] = arguments.toList()
+                // Serialized arguments omit these configured task inputs.
+                record["source_files"] = listOf(
+                    "getSources", "getJavaSources", "getScriptSources\$kotlin_gradle_plugin_common",
+                ).flatMap { getter ->
+                    (read(task, getter) as? FileCollection)?.files
+                        ?: error("Kotlin compiler sources are unavailable: $getter")
+                }.map { it.absolutePath }.distinct().sorted()
+                record["classpath"] = (read(task, "getLibraries") as? FileCollection)?.files
+                    ?.map { it.absolutePath } ?: error("Kotlin compiler classpath is unavailable")
+                val destination = read(task, "getDestinationDirectory") as? org.gradle.api.file.Directory
+                    ?: error("Kotlin compiler destination is unavailable")
+                record["output_roots"] = listOf(destination.asFile.absolutePath)
+                // shortcut: KGP's selected JDK uses an internal ABI; verify new layouts before supporting them.
+                val toolchain = read(task, "getKotlinJavaToolchainProvider")
+                    ?: error("Kotlin compiler toolchain is unavailable")
+                val jvm = read(toolchain, "getBuildJvm\$kotlin_gradle_plugin_common")
+                    ?: error("Kotlin compiler JVM is unavailable")
+                val javaHome = read(jvm, "getJavaHome") as? java.io.File
+                    ?: error("Kotlin compiler JDK home is unavailable")
+                check(javaHome.isAbsolute) { "Kotlin compiler JDK home must be absolute" }
                 val strings = arguments.filterIsInstance<String>()
-                record["output_roots"] = strings.windowed(2).filter { it[0] == "-d" }.map { it[1] }
-                record["java_home"] = strings.windowed(2).firstOrNull { it[0] == "-jdk-home" }?.get(1)
+                val explicitHomes = strings.mapIndexedNotNull { index, argument ->
+                    when {
+                        argument == "-jdk-home" -> strings.getOrNull(index + 1)
+                            ?: error("Kotlin compiler JDK argument is missing its value")
+                        argument.startsWith("-jdk-home=") -> argument.substringAfter('=')
+                        else -> null
+                    }
+                }
+                check(explicitHomes.size <= 1) { "Ambiguous Kotlin compiler JDK arguments" }
+                val explicitHome = explicitHomes.singleOrNull()?.let { java.io.File(it) }
+                check(explicitHome == null || explicitHome.isAbsolute) { "Kotlin compiler JDK argument must be absolute" }
+                record["java_home"] = if ("-no-jdk" in strings) null else (explicitHome ?: javaHome).absolutePath
             } else {
                 val processors = read(task, "getKaptClasspath") as? FileCollection
                     ?: error("Annotation processor classpath is unavailable")

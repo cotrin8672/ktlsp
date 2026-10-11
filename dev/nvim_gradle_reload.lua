@@ -9,7 +9,7 @@ local automatic_watches = vim.env.KTLSP_GRADLE_RELOAD_AUTOWATCH == '1'
 local report = { checks = {}, phases = {}, messages = {}, requests = {}, engine = binary,
   watches = { mode = automatic_watches and 'automatic Neovim' or 'explicit notification control',
     registrations = {}, notifications = {} },
-  established = { Java = {}, Kotlin = {} },
+  established = { Java = {}, Kotlin = {} }, compiler_metadata = {},
   fixture = { gradle = '9.6.1', kotlin = '2.4.0', module = ':app', project_dir = 'modules/editing',
     artifact_semantics = 'compiled Java binary and published source JAR; no member claims from class-name stubs',
     generated_semantics = 'ordinary Gradle task; compiler-plugin generation is a separate acceptance case' } }
@@ -187,6 +187,82 @@ local function wait_for(condition, timeout)
     return condition()
   end, 50)
 end
+-- Read each published model after the existing useful v1/v2 requests, without extra readiness gates.
+local function check_kotlin_metadata(phase, version)
+  local capture = { matches = {}, read_errors = {} }
+  local cache = vim.env.KTLSP_CACHE_DIR
+  local files = cache and vim.fn.globpath(cache .. '/classpath', '*.json', false, true) or {}
+  table.sort(files)
+  for _, path in ipairs(files) do
+    local ok, model = pcall(function()
+      return vim.json.decode(table.concat(vim.fn.readfile(path, 'b'), '\n'))
+    end)
+    if ok and type(model) == 'table' then
+      for _, item in ipairs(model.modules or {}) do
+        if item.module == ':app' and type(item.project_dir) == 'string'
+          and probe.path_key(item.project_dir) == probe.path_key(module) then
+          for _, source_set in ipairs(item.source_sets or {}) do
+            if source_set.name == 'main' then
+              local java_home
+              for _, task in ipairs(source_set.compiler_tasks or {}) do
+                if task.task == ':app:compileJava' and task.language == 'java' and task.complete then
+                  java_home = task.java_home
+                end
+              end
+              for _, task in ipairs(source_set.compiler_tasks or {}) do
+                if task.task == ':app:compileKotlin' and task.language == 'kotlin' then
+                  capture.matches[#capture.matches + 1] = { cache_file = path,
+                    model_version = model.model_version, module = item.module, build = item.build,
+                    project_dir = item.project_dir, source_set = source_set.name, task = task,
+                    java_compile_home = java_home }
+                end
+              end
+            end
+          end
+        end
+      end
+    else
+      capture.read_errors[#capture.read_errors + 1] = { path = path, error = tostring(model) }
+    end
+  end
+  report.compiler_metadata[tostring(phase)] = capture
+  local selected = #capture.matches == 1 and capture.matches[1] or nil
+  local task = selected and selected.task or {}
+  local prefix = 'phase ' .. phase .. ' Kotlin compiler metadata '
+  check(prefix .. 'selects complete model6 :app/main :app:compileKotlin', selected ~= nil
+    and selected.model_version == 6 and task.complete == true, capture)
+
+  local sources, missing = {}, {}
+  for _, path in ipairs(task.source_files or {}) do sources[probe.path_key(path)] = true end
+  for _, path in ipairs({ 'src/main/kotlin/app/Use.kt', 'src/main/kotlin/app/KotlinHelper.kt',
+    'src/main/java/app/Main.java' }) do
+    if not sources[probe.path_key(module .. '/' .. path)] then missing[#missing + 1] = path end
+  end
+  check(prefix .. 'includes actual Kotlin and Java sources', #missing == 0, missing)
+
+  local expected = probe.path_key(root .. '/home/.m2/repository/fixture/reload/versioned/'
+    .. version .. '/versioned-' .. version .. '.jar')
+  local versioned, stdlib, tooling = {}, {}, {}
+  -- Preserve the configured classpath order; serialized arguments omit -classpath for this KGP.
+  for index, path in ipairs(task.classpath or {}) do
+    local name = vim.fs.basename(vim.fs.normalize(path))
+    if name:match('^versioned%-.*%.jar$') then
+      versioned[#versioned + 1] = { index = index, path = path }
+    end
+    if name:match('^kotlin%-stdlib[%w%.%-]*%.jar$') then stdlib[#stdlib + 1] = path end
+    if name:match('^kotlin%-compiler') or name:match('^kotlin%-daemon')
+      or name:match('^kotlin%-gradle%-plugin') or name:match('^kotlin%-build%-tools')
+      or name:match('^kotlin%-scripting%-compiler') then tooling[#tooling + 1] = path end
+  end
+  check(prefix .. 'selects only Versioned ' .. version, #versioned == 1
+    and probe.path_key(versioned[1].path) == expected, versioned)
+  check(prefix .. 'includes stdlib without compiler tooling', #stdlib > 0 and #tooling == 0,
+    { stdlib = stdlib, tooling = tooling })
+  local expected_home = selected and selected.java_compile_home
+  check(prefix .. 'uses the fixture configured Java toolchain', type(task.java_home) == 'string'
+    and type(expected_home) == 'string' and probe.path_key(task.java_home) == probe.path_key(expected_home),
+    { selected = task.java_home, expected_java_compile_home = expected_home })
+end
 local wait_ms = tonumber(vim.env.KTLSP_GRADLE_RELOAD_WAIT_MS) or 60000
 local ready = wait_for(function()
   for _, message in ipairs(report.messages) do
@@ -210,6 +286,7 @@ for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
   check('initial ' .. label .. ' v1 goto exact source declaration', ok, locations)
   report.established[label].oldApi = { completion = useful, goto_definition = ok }
 end
+check_kotlin_metadata(0, '1.0')
 
 -- The dirty helper and two editor probes never go to disk, including during Gradle builds.
 vim.api.nvim_buf_set_lines(helper, 0, -1, false,
@@ -320,6 +397,7 @@ for phase = 1, 3 do
       end
       check('updated ' .. label .. ' stale member has a diagnostic', found, diagnostic)
     end
+    check_kotlin_metadata(2, '2.0')
   else
     report.phases[#report.phases].analysis_updated = wait_for(function()
       return not has(java, 'versioned.newApi()', 'newApi') and not has(java, 'versioned.oldApi()', 'oldApi')

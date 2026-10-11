@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 5;
+const MODEL_VERSION: u32 = 6;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1927,7 +1927,9 @@ dependencies {
         let compiler = serde_json::json!({
             "task": ":app:compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
             "arguments": ["-P", "annotation=one\ttwo\n三"], "annotation_processor_path": [],
-            "java_home": null, "options": {"jvmTarget": "17"}, "output_roots": [],
+            "source_files": ["/app/Use.kt", "/app/Main.java", "/app/Script.kts"],
+            "classpath": ["/app/z-first.jar", "/app/a-second.jar"],
+            "java_home": "/jdks/selected-21", "options": {"jvmTarget": "17"}, "output_roots": [],
             "complete": false, "problem": "opaque producer"
         });
         let modules = parse_dump(&format!(
@@ -1957,6 +1959,12 @@ dependencies {
         for invalid in [
             original[..original.len() - 1].to_vec(),
             [original.as_slice(), b" trailing"].concat(),
+            serde_json::to_vec(&CacheEntry {
+                model_version: 5,
+                mtimes: model.mtimes.clone(),
+                modules: model.modules.clone(),
+            })
+            .unwrap(),
         ] {
             std::fs::write(&cache, invalid).unwrap();
             let calls = std::cell::Cell::new(0);
@@ -1968,7 +1976,7 @@ dependencies {
             assert_eq!(
                 calls.get(),
                 1,
-                "invalid cache must use the existing dump fallback"
+                "invalid or obsolete cache must use the existing dump fallback"
             );
             assert_eq!(loaded.modules, model.modules);
             assert!(snapshot(&root).is_none());
