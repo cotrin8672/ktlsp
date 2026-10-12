@@ -1091,17 +1091,23 @@ struct JavaCallShapeQuery {
 
 #[derive(Default)]
 struct StaticImports {
-    exact: std::collections::BTreeSet<String>,
-    has_wildcard: bool,
+    paths: Vec<String>,
 }
 
 impl StaticImports {
     fn may_resolve(&self, name: &str) -> bool {
-        self.has_wildcard || self.exact.contains(name)
+        self.owners(name).next().is_some()
+    }
+
+    fn owners<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.paths.iter().filter_map(move |path| {
+            let (owner, member) = path.rsplit_once('.')?;
+            (member == name || member == "*").then_some(owner)
+        })
     }
 
     fn is_empty(&self) -> bool {
-        !self.has_wildcard && self.exact.is_empty()
+        self.paths.is_empty()
     }
 }
 
@@ -1769,10 +1775,11 @@ fn static_imports_of(tree: &Tree, src: &str) -> StaticImports {
             continue;
         };
         let path = rest.trim().trim_end_matches(';').trim();
-        if path.ends_with(".*") {
-            out.has_wildcard = true;
-        } else if let Some(name) = path.rsplit('.').next().filter(|name| !name.is_empty()) {
-            out.exact.insert(name.to_string());
+        if path
+            .rsplit_once('.')
+            .is_some_and(|(_, name)| !name.is_empty())
+        {
+            out.paths.push(path.to_string());
         }
     }
     out
@@ -1838,6 +1845,67 @@ pub fn authored_goto_definition(
     goto_definition_with_imports(index, file, src, tree, offset, &package, &imports, None, 0)
 }
 
+fn fallback_method_entry_visibility(
+    index: &dyn InferenceIndex,
+    src: &str,
+    tree: &Tree,
+    usage: Node<'_>,
+    entry: &Entry,
+    static_imports: &StaticImports,
+) -> Option<bool> {
+    let Some(call) = usage.parent().filter(|parent| {
+        parent.kind() == "method_invocation" && parent.child_by_field_name("name") == Some(usage)
+    }) else {
+        return None;
+    };
+    if call.child_by_field_name("object").is_some() || entry.sym.kind != SymbolKind::Function {
+        return Some(false);
+    }
+    let package = package_of(tree, src);
+    let mut ancestor = call.parent();
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) && entry.sym.package == package
+            && name_field(node)
+                .is_some_and(|name| entry.sym.container.as_deref() == Some(node_text(name, src)))
+        {
+            return Some(true);
+        }
+        ancestor = node.parent();
+    }
+    let name = node_text(usage, src);
+    if !static_imports.may_resolve(name) {
+        return Some(false);
+    }
+    let ctx = FileCtx::new(package, inference_imports(tree, src));
+    let scope = type_scope(tree, src);
+    Some(static_imports.owners(name).any(|owner| {
+        let receiver = infer::declared_type(index, &scope.type_ref(owner, false, Vec::new()), &ctx);
+        ktcore::jvm::member_candidates(index, &receiver, name)
+            .iter()
+            .any(|candidate| {
+                let is_static = match candidate {
+                    ktcore::jvm::CallableCandidate::Authored(member) => {
+                        member.sym.source_member.dispatch()
+                            == Some(ktcore::extensions::Dispatch::Static)
+                    }
+                    ktcore::jvm::CallableCandidate::Jvm { facts, .. } => facts.is_static,
+                };
+                is_static
+                    && candidate.definition().is_some_and(|def| {
+                        def.file == entry.path.as_ref()
+                            && def.start_byte == entry.sym.start_byte
+                            && def.end_byte == entry.sym.end_byte
+                    })
+            })
+    }))
+}
+
 fn goto_definition_with_imports(
     index: &dyn InferenceIndex,
     file: &str,
@@ -1889,6 +1957,7 @@ fn goto_definition_with_imports(
         return defs;
     }
     let name = node_text(usage, src);
+    let static_imports = static_imports_of(tree, src);
     let mut candidates: Vec<Def> = Vec::new();
     for entry in index.lookup_by_name(name) {
         let sym = &entry.sym;
@@ -1898,7 +1967,9 @@ fn goto_definition_with_imports(
         if is_type_name_position(usage) && !sym.kind.is_type_like() {
             continue;
         }
-        if is_visible(&package, &imports, sym) {
+        if fallback_method_entry_visibility(index, src, tree, usage, entry, &static_imports)
+            .unwrap_or_else(|| is_visible(&package, &imports, sym))
+        {
             candidates.push(Def {
                 file: entry.path.to_string(),
                 start_byte: sym.start_byte,
@@ -1941,7 +2012,10 @@ fn java_reference_resolves_with_ctx(
         let sym = &entry.sym;
         sym.name == name
             && (!is_type_name_position(usage) || sym.kind.is_type_like())
-            && is_visible_with_facts(&ctx.package, &ctx.imports, &ctx.visibility, sym)
+            && fallback_method_entry_visibility(index, src, tree, usage, entry, &ctx.static_imports)
+                .unwrap_or_else(|| {
+                    is_visible_with_facts(&ctx.package, &ctx.imports, &ctx.visibility, sym)
+                })
     })
 }
 
@@ -3354,7 +3428,7 @@ fn same_file_field_declaration<'a>(src: &str, usage: Node<'a>) -> Option<Node<'a
     None
 }
 
-fn type_of_value_declaration(
+pub(crate) fn type_of_value_declaration(
     index: &dyn InferenceIndex,
     file: &str,
     src: &str,

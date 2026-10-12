@@ -24,6 +24,11 @@ member selector handles direct-super inheritance, visibility and declaration ava
 incomplete hierarchy or competing overload facts remain `Unknown` rather than proving absence.
 This does not establish complete Java overload conversion or Kotlin inference fidelity.
 
+Java inlay hints use the same contextual declaration-type query as completion and type
+navigation. The core Java syntax collector accepts a callback returning normalized `Type`
+facts; the adapter supplies file, scope and unsaved-source context. Label formatting and
+range pruning stay in the core, with language-specific projection syntax.
+
 Analysis providers read normalized semantic facts and publish contributions through
 `ktcore::extensions::ExtensionStore`. The host in `ktlsp::analysis_extensions` invalidates
 contributions after source, model or configuration changes. Completion, diagnostics, navigation,

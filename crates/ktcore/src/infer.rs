@@ -3847,6 +3847,72 @@ mod tests {
     use crate::symbol::{IndexedSymbol, SymbolKind};
 
     #[test]
+    fn java_string_identity_survives_partial_indexes_without_hiding_shadowing_or_ambiguity() {
+        use crate::types::{Type, TypeRef};
+        use std::sync::Arc;
+
+        for (packages, visible, expected) in [
+            (vec![], vec!["app", "java.lang"], Some("java.lang")),
+            (
+                vec!["unrelated"],
+                vec!["app", "java.lang"],
+                Some("java.lang"),
+            ),
+            (
+                vec!["unrelated", "java.lang"],
+                vec!["app", "java.lang"],
+                Some("java.lang"),
+            ),
+            (
+                vec!["app", "java.lang"],
+                vec!["app", "java.lang"],
+                Some("app"),
+            ),
+            (vec!["other"], vec!["app", "other", "java.lang"], None),
+            (
+                vec!["other", "java.lang"],
+                vec!["app", "other", "java.lang"],
+                None,
+            ),
+            (vec!["other", "java.lang"], vec!["other"], Some("other")),
+            (vec!["unrelated"], vec!["missing"], None),
+            (
+                vec!["other"],
+                vec!["app", "other", "kotlin", "java.lang"],
+                Some("other"),
+            ),
+        ] {
+            let mut index = Index::new();
+            for package in &packages {
+                index.replace_file(
+                    package,
+                    vec![IndexedSymbol::new(
+                        "String",
+                        SymbolKind::Class,
+                        *package,
+                        None,
+                        0,
+                        6,
+                    )],
+                    Tier::Volatile,
+                );
+            }
+            let mut reference = TypeRef::simple("String");
+            reference.package_candidates =
+                Arc::new(visible.iter().map(|p| p.to_string()).collect());
+            let ctx = super::FileCtx::new("app".into(), Vec::new());
+            let actual = super::declared_type(&index, &reference, &ctx);
+            let expected = expected.map_or(Type::Unknown, |package| {
+                Type::class("String", Some(package.into()))
+            });
+            assert_eq!(
+                actual, expected,
+                "indexed {packages:?}, visible {visible:?}"
+            );
+        }
+    }
+
+    #[test]
     fn plain_method_variable_result_uses_current_normalized_argument_facts() {
         use crate::members::CallArguments;
         use crate::parser::KotlinParser;
@@ -4302,17 +4368,23 @@ fn resolve_type_ref_container(
 
 fn package_from_decl_candidates(index: &dyn InferenceIndex, tr: &TypeRef) -> Option<String> {
     let candidates = index.lookup_type(&tr.name);
-    if candidates.is_empty() {
+    // Java's implicit String exists before JDK indexing, even when unrelated homonyms arrive first.
+    let java_string = tr.name == "String" && !tr.package_candidates.iter().any(|p| p == "kotlin");
+    if candidates.is_empty() && !java_string {
         return None;
     }
+    let has_type = |package: &str| {
+        java_string && package == "java.lang"
+            || candidates.iter().any(|entry| entry.sym.package == package)
+    };
     let mut pkgs = tr.package_candidates.iter();
     let primary = pkgs.next()?;
-    if candidates.iter().any(|e| &e.sym.package == primary) {
+    if has_type(primary) {
         return Some(primary.clone());
     }
     let mut rest_hits: Vec<String> = Vec::new();
     for pkg in pkgs {
-        if candidates.iter().any(|e| &e.sym.package == pkg) && !rest_hits.iter().any(|p| p == pkg) {
+        if has_type(pkg) && !rest_hits.iter().any(|p| p == pkg) {
             rest_hits.push(pkg.clone());
         }
     }

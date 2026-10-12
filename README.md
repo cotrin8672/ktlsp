@@ -209,6 +209,10 @@ resources and same-file factory initializers require useful `Body.string` comple
 It also checks a cursor before an authored selector suffix and 32 nested generic
 method results with exact Kotlin navigation. Empty results cannot satisfy these cases.
 `java-resource-body.json` records reconstructed outbound edits, first RPCs and restoration.
+The same `java` scenario checks 13 contextual `var` hint types, including numeric suffixes,
+generic arguments, wildcards, overloads and Kotlin producers. Six first-response queries cover
+unsaved producer changes, a visible line, invalid initializers and restoration;
+`java-context-hints.json` records the exact hints and outbound Java/Kotlin source hashes.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
 and KMP navigation. Imported extension aliases also cover typed return chains with
 same-named decoys, incomplete completion, unsaved import removal/rebinding, references

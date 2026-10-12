@@ -596,6 +596,10 @@ public class ResourceUse {
 }
 JAVA
 
+  mkdir -p "$project/hints"
+  cp "$repo/dev/corpus/fixtures/java-inlay-hints/HintUse.java" \
+    "$repo/dev/corpus/fixtures/java-inlay-hints/Hints.kt" "$project/hints/"
+
   mkdir -p "$project/selection"
   cat > "$project/selection/Reader.java" <<'JAVA'
 package selection;

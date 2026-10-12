@@ -5,7 +5,7 @@ use tree_sitter::{Node, Tree};
 use crate::index::InferenceIndex;
 use crate::infer::{self, FileCtx};
 use crate::parser::{child_of_kind, first_ident, name_field, node_text};
-use crate::types::{Type, TypeRef};
+use crate::types::Type;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InlayHintKind {
@@ -56,20 +56,21 @@ pub fn inlay_hints_with_ctx(
     out
 }
 
-pub fn java_inlay_hints(
-    index: &dyn InferenceIndex,
-    tree: &Tree,
+/// Collect Java syntax positions using contextual types supplied by the language adapter.
+pub fn java_inlay_hints<'tree>(
+    tree: &'tree Tree,
     text: &str,
     start_byte: usize,
     end_byte: usize,
+    mut type_of: impl FnMut(Node<'tree>) -> Option<Type>,
 ) -> Vec<InlayHint> {
     let mut out = Vec::new();
     collect_java(
-        index,
         tree.root_node(),
         text,
         start_byte,
         end_byte,
+        &mut type_of,
         &mut out,
     );
     out.sort_by(|a, b| {
@@ -89,6 +90,9 @@ fn collect(
     end_byte: usize,
     out: &mut Vec<InlayHint>,
 ) {
+    if node.end_byte() < start_byte || node.start_byte() > end_byte {
+        return;
+    }
     match node.kind() {
         "property_declaration" => {
             collect_property_hint(index, node, text, ctx, start_byte, end_byte, out);
@@ -105,145 +109,64 @@ fn collect(
     }
 }
 
-fn collect_java(
-    index: &dyn InferenceIndex,
-    node: Node<'_>,
+fn collect_java<'tree>(
+    node: Node<'tree>,
     text: &str,
     start_byte: usize,
     end_byte: usize,
+    type_of: &mut impl FnMut(Node<'tree>) -> Option<Type>,
     out: &mut Vec<InlayHint>,
 ) {
-    if node.kind() == "local_variable_declaration" {
-        collect_java_var_hints(index, node, text, start_byte, end_byte, out);
+    if node.end_byte() < start_byte || node.start_byte() > end_byte {
+        return;
+    }
+    if matches!(node.kind(), "variable_declarator" | "resource") {
+        collect_java_var_hint(node, text, start_byte, end_byte, type_of, out);
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_java(index, child, text, start_byte, end_byte, out);
+        collect_java(child, text, start_byte, end_byte, type_of, out);
     }
 }
 
-fn collect_java_var_hints(
-    index: &dyn InferenceIndex,
-    decl: Node<'_>,
+fn collect_java_var_hint<'tree>(
+    variable: Node<'tree>,
     text: &str,
     start_byte: usize,
     end_byte: usize,
+    type_of: &mut impl FnMut(Node<'tree>) -> Option<Type>,
     out: &mut Vec<InlayHint>,
 ) {
-    let Some(type_node) = decl.child_by_field_name("type") else {
+    let declaration = match variable.kind() {
+        "resource" => variable,
+        "variable_declarator" => match variable.parent() {
+            Some(parent) if parent.kind() == "local_variable_declaration" => parent,
+            _ => return,
+        },
+        _ => return,
+    };
+    let Some(type_node) = declaration.child_by_field_name("type") else {
         return;
     };
     if node_text(type_node, text) != "var" {
         return;
     }
-
-    let mut cursor = decl.walk();
-    for child in decl.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
-        let Some(name) = name_field(child) else {
-            continue;
-        };
-        let position = name.end_byte();
-        if !position_in_range(position, start_byte, end_byte) {
-            continue;
-        }
-        let Some(value) = child.child_by_field_name("value") else {
-            continue;
-        };
-        let Some(label) = infer_java_initializer(index, value, text).and_then(java_type_ref_label)
-        else {
-            continue;
-        };
-        out.push(InlayHint {
-            position_byte: position,
-            label,
-            kind: InlayHintKind::Type,
-        });
+    let Some(name) = name_field(variable) else {
+        return;
+    };
+    let position = name.end_byte();
+    if !position_in_range(position, start_byte, end_byte) {
+        return;
     }
-}
-
-fn infer_java_initializer(
-    index: &dyn InferenceIndex,
-    node: Node<'_>,
-    text: &str,
-) -> Option<TypeRef> {
-    match node.kind() {
-        "string_literal" => Some(TypeRef::simple("String")),
-        "character_literal" => Some(TypeRef::simple("char")),
-        "decimal_integer_literal"
-        | "hex_integer_literal"
-        | "octal_integer_literal"
-        | "binary_integer_literal" => Some(TypeRef::simple("int")),
-        "decimal_floating_point_literal" | "hex_floating_point_literal" => {
-            Some(TypeRef::simple("double"))
-        }
-        "true" | "false" => Some(TypeRef::simple("boolean")),
-        "object_creation_expression" => node
-            .child_by_field_name("type")
-            .and_then(|ty| simple_java_type_ref(ty, text)),
-        "method_invocation" => node
-            .child_by_field_name("name")
-            .and_then(|name| unique_java_return_type(index, node_text(name, text))),
-        _ => None,
-    }
-}
-
-fn simple_java_type_ref(node: Node<'_>, text: &str) -> Option<TypeRef> {
-    let raw = node_text(node, text).trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let without_args = raw.split('<').next().unwrap_or(raw);
-    without_args
-        .rsplit('.')
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(TypeRef::simple)
-}
-
-fn unique_java_return_type(index: &dyn InferenceIndex, name: &str) -> Option<TypeRef> {
-    let mut candidates = index
-        .lookup_by_name(name)
-        .iter()
-        .filter(|entry| entry.sym.kind == crate::symbol::SymbolKind::Function)
-        .filter_map(|entry| entry.sym.return_type.clone())
-        .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| type_ref_name(a).cmp(&type_ref_name(b)));
-    candidates.dedup_by(|a, b| type_ref_name(a) == type_ref_name(b));
-    match candidates.as_slice() {
-        [only] => Some(only.clone()),
-        _ => None,
-    }
-}
-
-fn java_type_ref_label(ty: TypeRef) -> Option<String> {
-    let name = type_ref_name(&ty);
-    (!name.is_empty()).then(|| format!(": {name}"))
-}
-
-fn type_ref_name(ty: &TypeRef) -> String {
-    if ty.name.is_empty() {
-        return String::new();
-    }
-    let mut out = ty.name.clone();
-    if !ty.args.is_empty() {
-        out.push('<');
-        out.push_str(
-            &ty.args
-                .iter()
-                .map(type_ref_name)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        out.push('>');
-    }
-    if ty.nullable {
-        out.push('?');
-    }
-    out
+    let Some(label) = type_of(name).and_then(|ty| type_label(ty, TypeSyntax::Java)) else {
+        return;
+    };
+    out.push(InlayHint {
+        position_byte: position,
+        label,
+        kind: InlayHintKind::Type,
+    });
 }
 
 fn collect_property_hint(
@@ -274,7 +197,7 @@ fn collect_property_hint(
     let Some(expr) = initializer_expression(property, var_decl) else {
         return;
     };
-    let Some(label) = type_label(infer::infer(index, expr, text, ctx)) else {
+    let Some(label) = type_label(infer::infer(index, expr, text, ctx), TypeSyntax::Kotlin) else {
         return;
     };
     out.push(InlayHint {
@@ -312,7 +235,7 @@ fn collect_function_return_hint(
     if expr.kind() == "block" {
         return;
     }
-    let Some(label) = type_label(infer::infer(index, expr, text, ctx)) else {
+    let Some(label) = type_label(infer::infer(index, expr, text, ctx), TypeSyntax::Kotlin) else {
         return;
     };
     out.push(InlayHint {
@@ -357,21 +280,39 @@ fn is_local_property(property: Node<'_>) -> bool {
     false
 }
 
-fn type_label(ty: Type) -> Option<String> {
-    format_type(&ty).map(|name| format!(": {name}"))
+#[derive(Clone, Copy)]
+enum TypeSyntax {
+    Kotlin,
+    Java,
 }
 
-fn format_type(ty: &Type) -> Option<String> {
+fn type_label(ty: Type, syntax: TypeSyntax) -> Option<String> {
+    format_type(&ty, syntax).map(|name| format!(": {name}"))
+}
+
+fn format_type(ty: &Type, syntax: TypeSyntax) -> Option<String> {
     match ty {
         Type::Projected { projection, bound } => {
             let prefix = match projection {
-                crate::types::Projection::Out => "out ",
-                crate::types::Projection::In => "in ",
+                crate::types::Projection::Out => match syntax {
+                    TypeSyntax::Kotlin => "out ",
+                    TypeSyntax::Java => "? extends ",
+                },
+                crate::types::Projection::In => match syntax {
+                    TypeSyntax::Kotlin => "in ",
+                    TypeSyntax::Java => "? super ",
+                },
                 _ => return None,
             };
-            format_type(bound).map(|bound| format!("{prefix}{bound}"))
+            format_type(bound, syntax).map(|bound| format!("{prefix}{bound}"))
         }
-        Type::Star => Some("*".to_string()),
+        Type::Star => Some(
+            match syntax {
+                TypeSyntax::Kotlin => "*",
+                TypeSyntax::Java => "?",
+            }
+            .to_string(),
+        ),
         Type::Unknown => None,
         Type::Class {
             name,
@@ -384,7 +325,10 @@ fn format_type(ty: &Type) -> Option<String> {
             }
             let mut out = name.clone();
             if !args.is_empty() {
-                let formatted_args = args.iter().map(format_type).collect::<Option<Vec<_>>>()?;
+                let formatted_args = args
+                    .iter()
+                    .map(|arg| format_type(arg, syntax))
+                    .collect::<Option<Vec<_>>>()?;
                 out.push('<');
                 out.push_str(&formatted_args.join(", "));
                 out.push('>');

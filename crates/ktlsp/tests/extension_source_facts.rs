@@ -173,12 +173,15 @@ abstract class CaseMixin {
 #[test]
 fn unsupported_or_unresolved_source_never_becomes_a_primitive_or_void_signature() {
     for (file, source, members) in [
-        ("Unknown.java", "package oracle; class Unknown<T> { T generic(T value) { return value; } Missing unknown() { return null; } String unresolved(String s) { return s; } }", vec!["generic", "unknown", "unresolved"]),
+        ("Unknown.java", "package oracle; class Unknown<T> { T generic(T value) { return value; } Missing unknown() { return null; } String unresolved(String s) { return s; } }", vec!["generic", "unknown"]),
         ("Unknown.kt", "package oracle\nclass Int\nclass Unknown<T> {\n fun wrong(value: Int): Int = value\n fun generic(value: T): T = value\n fun unknown(): Missing {}\n fun boxed(value: kotlin.Int?): kotlin.Int? = value\n val generatedGetter: kotlin.Int = 1\n}\n", vec!["wrong", "generic", "unknown", "boxed", "generatedGetter"]),
     ] {
         let facts = facts(file, source);
         for member in members {
             assert!(matches!(named(&facts, source, member).member.as_ref().unwrap().signature, Knowledge::Unknown(_)), "{file}: {member}");
+        }
+        if file == "Unknown.java" {
+            assert_eq!(descriptor(named(&facts, source, "unresolved")), "(Ljava/lang/String;)Ljava/lang/String;");
         }
     }
 }

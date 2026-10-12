@@ -494,7 +494,9 @@ pub fn inlay_hints(
             end_byte,
             &crate::infer::FileCtx::from_tree_in_file(tree, text, file),
         ),
-        SourceLanguage::Java => hints::java_inlay_hints(index, tree, text, start_byte, end_byte),
+        SourceLanguage::Java => hints::java_inlay_hints(tree, text, start_byte, end_byte, |name| {
+            java::type_of_value_declaration(index, file, text, tree, name, 0)
+        }),
     }
 }
 

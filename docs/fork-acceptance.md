@@ -74,12 +74,13 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current dependency-cache restoration slice passes 1,352 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 55; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 213 matched / 5 unmet of 218: original 199 retain 194 matches; all 18 resource/editing first RPCs and exact restoration pass. Current features retains 78/80; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 54 native-reference-java54-2 and native-reference-features54-2. All 18 related RPCs run once with reconstructed outbound source hashes. Forced cleanup is operational evidence |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current contextual Java hint slice passes 1,357 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 56; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 220 matched / 5 unmet of 225: original 218 retain 213 matches; all six contextual hint queries, 18 resource/editing first RPCs and exact restoration pass. Current features retains 78/80; library passes 13/13 after actual compilation; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 56 native-context-hints-java56-2, native-context-hints-features56-1 and native-context-hints-library56-1. Related RPCs run once with reconstructed outbound source hashes. Legacy forced cleanup is operational evidence |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
 | Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass 18/18 | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
+| Contextual inlay hints | Java var hints share completion types, preserve generic arguments and reflect unsaved Kotlin changes without inventing invalid types | Thirteen exact type/position cases match initially and after producer changes/restoration. Six native first responses cover those states, a visible line and three invalid initializers. Actual Kotlin/javac output verifies both producer variants | Focused repair verified; broader inference and display latency open | Checkpoint 56; initial partial-JDK String gap reproduced and repaired in shared type resolution. This is RPC/semantic evidence, not native hint-render timing or IDEA parity |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Source projected arguments share equality/lower/upper constraints. Plain method type variables now bind actual normalized arguments from Java/Kotlin; 1/8/20/32 nested Java calls retain useful types and bounded nonzero leaf work | Partial; focused source generic repair verified | Checkpoints 42/52. Javac completed controls and exact Kotlin navigation pass; capture, varying lower bounds, bounded constructors and compiled-only generic signatures remain gaps |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Real Spring retains nine focused first-response queries; current ObjectProvider.getObject native completion accepts exact buffers 31/31 | Focused repair verified; full-project acceptance partial | Checkpoints 29/53. Current Spring ktlsp shutdown exits 0; ten failed/ten missing source inputs and broader extension cases remain |
@@ -3116,6 +3117,95 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-sixth checkpoint: contextual Java hints and first-response correctness
+
+Java var hints now consume the existing contextual declaration-type query also used
+by completion and type navigation. The separate literal/name-only hint inference
+has been removed. Core syntax collection and labels accept normalized Type facts
+from the Java adapter, including unsaved-source context. Java projection labels use
+? extends, ? super and ?; Kotlin projection syntax remains unchanged. Both syntax
+walks prune subtrees outside the requested range while preserving the existing
+inclusive byte endpoint. No comparative range-walk speedup has been measured.
+
+The committed HintUse.java/Hints.kt fixture covers 13 positions: long and float
+literal suffixes, a parameterized constructor, String/int overload selection,
+three wildcard forms, a local alias, a generic identity method, a Kotlin producer,
+and try-resource/resource-alias declarations. The original focused baseline emitted
+four incorrect labels and omitted six of its ten original type cases. The fixture
+was subsequently extended with three wildcard cases; those were not part of that
+baseline. The resource alias is used, so javac retains its debug variable entry.
+
+Invalid initializers revealed a shared lookup defect: an unqualified missingCall()
+could bind an unrelated same-package class method. Global Java method fallback now
+requires the lexical owner or a matching static-import owner; inherited static
+members are checked through shared JVM candidates. Exact/wildcard imports, an
+inherited static method, an instance-method rejection and a lexical outer method
+have hint/navigation controls. Missing calls, self references and rejected
+overloads retain no invented type.
+
+Actual Neovim then exposed an initial-response gap that the original focused test
+had hidden by changing Kotlin before querying. Two Box<String> hints disappeared
+while the JDK index contained an unrelated String but not java.lang.String.
+Adding only that unrelated class reproduces exactly the two missing hints in Rust.
+Shared declaration identity now recognizes implicit Java String before JDK
+indexing; same-package shadowing and competing wildcard imports still retain their
+actual identities or ambiguity. Nine normalized-index controls include empty,
+partial and complete indexes, shadowing, explicit candidate scopes and Kotlin
+scope preservation. The editor's first response is checked directly, without
+retrying for a nonempty answer.
+
+Independent expected results use the actual Kotlin 2.4.0 compiler recipe and
+javac17 --release17 with debug variable/signature tables. Both Payload and Updated
+producer variants compile, emitting all 13 expected local types each and classfile
+major 61: 26 verified types. Three separately compiled invalid variants are rejected.
+The javac17 self-reference case emits its diagnostic but exits abnormally with code
+4; this is retained separately. javac21 --release17 confirms all three cases with
+normal compile-error exit 1. Additional actual javac/javap controls independently
+verify implicit java.lang.String, same-package and explicit-import user String
+descriptors, and wildcard ambiguity. The previous extension-source test's valid
+implicit String member now requires its exact object descriptor; unresolved Missing
+and generic T remain Unknown.
+
+Release b4e495f4 passes 1,357 workspace tests, zero failures and four ignored,
+formatting, shell/Lua syntax, both release builds and diff checks. Native observations:
+
+| Case | Expected | Observed / status |
+| --- | --- | --- |
+| Java contextual hints | Six first responses match exact labels/positions, invalid initializers emit none, both buffers restore without disk edits | 6/6 matched; all transmitted Java/Kotlin versions and reconstructed hashes recorded |
+| Existing Java surface | Preserve all original 218 expectations | 213/218 retained; with seven new checks, 220/225; original five diagnostic mismatches remain |
+| Existing features | Preserve all original 80 expectations | 78/80 retained; original missing-type diagnostic/explanation gaps remain |
+| Existing library surface | Real compilation plus dependency gd and unsaved JDK-source lifecycle | 13/13 after an actual Gradle9.6.1/KGP2.4.0 build |
+
+The six distinct hint RPC durations are 2.059, 4.662, 1.402, 0.542, 3.078 and
+1.991 ms in phase order. These are single observations of different semantic
+states, not repeated samples for a p95 estimate, a rendering benchmark or a
+comparison against IDEA. An initial native run retained its 11/13 first hints and
+a probe defect that rejected the protocol's valid null/no-hint response for invalid
+code. Both raw observations remain. The final probe accepts null only when zero
+hints are expected; valid useful-result cases still require every exact hint.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-context-hints-baseline56-1/, native-context-hints-focused56-{1..6}/,
+native-context-hints-rust56-{1,2,3}/, native-context-hints-java56-{1,2}/,
+native-context-hints-features56-1/, native-context-hints-library56-1/,
+independent-context-hints56-{1..5}/ and independent-java-string56-1/.
+Final hint artifact SHA256:
+6d9f1bc2d46d75075b36f532b355006aafde3b38764121589bd06643e494d877.
+Rust log SHA256:
+9e142350900dbf79df1724439d8da36aa4305c37bbc77b5ffa3063ce49c0565f.
+Actual 26-type compiler receipt SHA256:
+dab8ea655a3a013824fd811f534722c52180562df7da6b7dbc79b6e565033155.
+
+Source guards pass. Legacy editor scenarios force their fresh server shutdown;
+their remaining owned Job descendants are closed. This does not establish graceful
+server shutdown. New hints have no independent IDEA comparison yet. Wider generic
+inference, applied rename coverage across all roots, Java compiler/processor
+diagnostics and full-project parity remain open. The memory-only patch stays held.
+Next reproduce the original five Java diagnostic gaps with selected compiler
+inputs, starting from the unchanged java harness and the verified release in
+native-context-hints-rust56-3/bin/ktlsp.exe. Keep the original expectations and
+distinguish missing compiler authority from incorrect semantic output.
 
 ### Fifty-fifth checkpoint: measure warm startup phases and reduce context restoration cost
 

@@ -708,6 +708,144 @@ do
   end
 end
 
+-- Hints must use the same contextual types as completion, including unsaved Kotlin producers.
+do
+  local files = {
+    java = { path = project .. "/hints/HintUse.java" },
+    kotlin = { path = project .. "/hints/Hints.kt" },
+  }
+  local report = { requests = {}, outbound = {}, type_cases = 13, invalid_cases = 3, expected_requests = 6 }
+  for _, file in pairs(files) do
+    file.buf = vim.fn.bufadd(file.path)
+    vim.fn.bufload(file.buf)
+    file.original = vim.api.nvim_buf_get_lines(file.buf, 0, -1, false)
+    file.modified = vim.bo[file.buf].modified
+    file.uri = vim.uri_from_bufnr(file.buf)
+    file.hash = probe.buffer_sha256(file.buf)
+    file.disk = vim.fn.sha256(table.concat(vim.fn.readfile(file.path, "b"), "\n"))
+    file.wire = probe.buffer_full_text(file.buf)
+    vim.bo[file.buf].filetype = file == files.java and "java" or "kotlin"
+  end
+  local notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    for name, file in pairs(files) do
+      if params.textDocument and params.textDocument.uri == file.uri
+        and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
+        local wire, err
+        if method == "textDocument/didOpen" then wire = params.textDocument.text
+        else wire, err = probe.apply_content_changes(file.wire, params.contentChanges, client.offset_encoding or "utf-16") end
+        if sent and wire then file.wire = wire end
+        file.latest = { sent = not not sent, version = params.textDocument.version,
+          source_sha256 = probe.buffer_sha256(file.buf), wire_source_sha256 = wire and vim.fn.sha256(wire), error = err }
+        report.outbound[#report.outbound + 1] = { file = name, delivery = vim.deepcopy(file.latest) }
+      end
+    end
+    return sent
+  end
+  local function flush() require("vim.lsp._changetracking").flush(client) end
+  local function query(phase, kotlin_type, only, invalid)
+    local lines = vim.api.nvim_buf_get_lines(files.java.buf, 0, -1, false)
+    local expected, count = {}, 0
+    local range = { start = { line = 0, character = 0 }, ["end"] = { line = #lines, character = 0 } }
+    if invalid then
+      local position = probe.find(lines, "var missing = missingCall();", "missing")
+      range.start = { line = position.line, character = 0 }
+    else
+      for _, pair in ipairs({
+        { "longNumber", "long" }, { "floatNumber", "float" }, { "boxed", "Box<String>" },
+        { "selected", "Body" }, { "overloaded", "Box<String>" },
+        { "covariant", "Box<? extends Body>" }, { "contravariant", "Box<? super Body>" },
+        { "wildcard", "Box<?>" }, { "alias", "Body" }, { "generic", "Body" },
+        { "fromKotlin", kotlin_type }, { "resource", "Body" }, { "resourceAlias", "Body" },
+      }) do
+        if not only or pair[1] == only then
+          local _, token = probe.find(lines, "var " .. pair[1] .. " =", pair[1])
+          expected[token["end"].line .. ":" .. token["end"].character] = ": " .. pair[2]
+          count = count + 1
+          if only then range = { start = { line = token.start.line, character = 0 },
+            ["end"] = { line = token.start.line + 1, character = 0 } } end
+        end
+      end
+    end
+    local delivered, delivery = true, {}
+    for name, file in pairs(files) do
+      local current = probe.buffer_sha256(file.buf)
+      local latest = file.latest
+      delivered = delivered and latest and latest.sent and not latest.error
+        and latest.source_sha256 == current and latest.wire_source_sha256 == current
+        and latest.version == vim.lsp.util.buf_versions[file.buf]
+      delivery[name] = vim.deepcopy(latest)
+    end
+    local params = { textDocument = { uri = files.java.uri }, range = range }
+    local response, row
+    if delivered then response, row = request_rpc("textDocument/inlayHint", params, files.java.buf)
+    else
+      row = { method = "textDocument/inlayHint", params = params, attempted = false, attempts = 0,
+        availability = "not-run", delivery_error = "current Java/Kotlin source was not observed outbound" }
+      requests[#requests + 1] = row
+    end
+    local result = response and response.result
+    local actual = {}
+    if type(result) == "table" then
+      for _, hint in ipairs(result) do actual[hint.position.line .. ":" .. hint.position.character] = hint.label end
+    end
+    row.hint_phase, row.delivery, row.expected, row.actual = phase, delivery, expected, actual
+    report.requests[#report.requests + 1] = row
+    local empty = result == nil or result == vim.NIL
+    local matched = count == 0 and empty or type(result) == "table" and #result == count
+      and vim.deep_equal(actual, expected)
+    check("Java contextual hints " .. phase, matched, vim.inspect(result), row)
+  end
+  local ok, err = xpcall(function()
+    for _, file in pairs(files) do assert(vim.lsp.buf_attach_client(file.buf, id), "hint fixture did not attach") end
+    flush()
+    query("initial exact 13 types", "Payload")
+    local changed = vim.deepcopy(files.kotlin.original)
+    for line, text in ipairs(changed) do changed[line] = text:gsub("supply%(%)%: Payload = Payload%(%)", "supply(): Updated = Updated()") end
+    vim.api.nvim_buf_set_lines(files.kotlin.buf, 0, -1, false, changed)
+    flush()
+    query("unsaved Kotlin return Updated", "Updated")
+    vim.api.nvim_buf_set_lines(files.kotlin.buf, 0, -1, false, files.kotlin.original)
+    flush()
+    query("restored Kotlin return Payload", "Payload")
+    query("one visible line", "Payload", "floatNumber")
+    local invalid = vim.deepcopy(files.java.original)
+    for line, text in ipairs(invalid) do
+      if text:find("Body explicit = body;", 1, true) then
+        table.insert(invalid, line + 1, "        var missing = missingCall();")
+        table.insert(invalid, line + 2, "        var self = self;")
+        table.insert(invalid, line + 3, "        var rejected = factory.make(new Other());")
+        break
+      end
+    end
+    vim.api.nvim_buf_set_lines(files.java.buf, 0, -1, false, invalid)
+    flush()
+    query("invalid initializers stay unknown", "Payload", nil, true)
+    vim.api.nvim_buf_set_lines(files.java.buf, 0, -1, false, files.java.original)
+    flush()
+    query("restored Java exact 13 types", "Payload")
+  end, debug.traceback)
+  report.restored, report.disk_unchanged = true, true
+  for _, file in pairs(files) do
+    if not vim.deep_equal(vim.api.nvim_buf_get_lines(file.buf, 0, -1, false), file.original) then
+      vim.api.nvim_buf_set_lines(file.buf, 0, -1, false, file.original)
+      flush()
+    end
+    report.restored = report.restored and probe.buffer_sha256(file.buf) == file.hash
+    report.disk_unchanged = report.disk_unchanged
+      and vim.fn.sha256(table.concat(vim.fn.readfile(file.path, "b"), "\n")) == file.disk
+    vim.bo[file.buf].modified = file.modified
+  end
+  client.rpc.notify = notify
+  report.error = not ok and err or nil
+  check("Java contextual hint buffers restore without disk edits", report.restored and report.disk_unchanged, vim.inspect(report))
+  if not ok then check("Java contextual hint probes execute", false, err) end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-context-hints.json")
+  end
+end
+
 -- Imported superclasses must keep their declaration context across both languages and edits.
 do
   local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:gsub("^@", ""))
