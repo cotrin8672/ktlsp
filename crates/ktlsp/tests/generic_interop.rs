@@ -4018,3 +4018,332 @@ fn java_and_kotlin_plain_method_variables_share_the_argument_type() {
         );
     }
 }
+
+#[test]
+fn java_enhanced_for_typed_receivers_complete_java_and_kotlin_owners() {
+    for (owner, declaration) in [
+        ("Item.kt", ITEM),
+        (
+            "Item.java",
+            "package app; public class Item { public void useful() {} }",
+        ),
+    ] {
+        for line in [
+            "item.",
+            "System.out.println(item.);",
+            "System.out.println(item.",
+        ] {
+            let source = format!("package app; class Use {{ void run(Item[] values) {{\n for (Item item : values) {{\n {line}\n }} }} }}");
+            let mut ws = workspace(&[
+                (owner, declaration),
+                ("Other.kt", OTHER),
+                ("Use.java", &source),
+            ]);
+            assert_member(&mut ws, "Use.java", "item.", "useful", "usefulWrong");
+            assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source.as_str()));
+        }
+    }
+}
+
+#[test]
+fn java_enhanced_for_scope_keeps_the_outer_field_before_and_after() {
+    let source = r#"package app; class Use {
+ Other item;
+ void run(Item[] values) {
+  /*before*/ item.usefulWrong();
+  for (Item item : values) { /*inside*/ item.useful(); }
+  /*after*/ item.usefulWrong();
+ }
+}"#;
+    let mut ws = workspace(&[("Item.kt", ITEM), ("Other.kt", OTHER), ("Use.java", source)]);
+    for marker in ["before", "inside", "after"] {
+        let prefix = format!("/*{marker}*/ item.");
+        let (expected, excluded, declaration) = if marker == "inside" {
+            (
+                "useful",
+                "usefulWrong",
+                source.find("Item item :").unwrap() + "Item ".len(),
+            )
+        } else {
+            (
+                "usefulWrong",
+                "useful",
+                source.find("Other item;").unwrap() + "Other ".len(),
+            )
+        };
+        assert_member(&mut ws, "Use.java", &prefix, expected, excluded);
+        let usage = source.find(&prefix).unwrap() + prefix.find("item").unwrap();
+        let definitions = ws.goto_definition("Use.java", usage);
+        assert_eq!(definitions.len(), 1, "{marker}: {definitions:?}");
+        assert_eq!(definitions[0].file, "Use.java");
+        assert_eq!(definitions[0].start_byte, declaration, "{marker}");
+    }
+    assert_exact_definition(&mut ws, "Use.java", "item.useful()", "Item.kt", "useful");
+}
+
+#[test]
+fn java_enhanced_for_generic_receivers_keep_the_result_type() {
+    let source = "package app; class Use { void run(Box<Item>[] values) { for (Box<Item> item : values) { item.get().useful(); } } }";
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Box.java", JAVA_BOX),
+        ("Use.java", source),
+    ]);
+    assert_member(&mut ws, "Use.java", "item.get().", "useful", "usefulWrong");
+    assert_exact_definition(
+        &mut ws,
+        "Use.java",
+        "item.get().useful()",
+        "Item.kt",
+        "useful",
+    );
+}
+
+#[test]
+fn java_enhanced_for_result_chains_follow_unsaved_java_and_kotlin_owners() {
+    let source = "package app; class Use { void run(Holder[] values) { for (Holder item : values) { item.get().useful(); } } }";
+    for (owner, original) in [
+        (
+            "Holder.kt",
+            "package app\nclass Holder { fun get(): Item = error(\"fixture\") }\n",
+        ),
+        (
+            "Holder.java",
+            "package app; public class Holder { public Item get() { return null; } }",
+        ),
+    ] {
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            (owner, original),
+            ("Use.java", source),
+        ]);
+        assert_member(&mut ws, "Use.java", "item.get().", "useful", "usefulWrong");
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            "item.get().useful()",
+            "Item.kt",
+            "useful",
+        );
+        ws.change(owner, original.replace("Item", "Other"));
+        assert_member(&mut ws, "Use.java", "item.get().", "usefulWrong", "useful");
+        ws.change(owner, original.into());
+        assert_member(&mut ws, "Use.java", "item.get().", "useful", "usefulWrong");
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            "item.get().useful()",
+            "Item.kt",
+            "useful",
+        );
+        assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source));
+        assert_eq!(ws.doc_text(owner).as_deref(), Some(original));
+    }
+}
+
+#[test]
+fn java_enhanced_for_unknown_or_unsupported_types_do_not_fall_back() {
+    // Valid array receivers remain completion gaps; these are only no-false-type controls.
+    for (binding, values_type) in [
+        ("Missing item", "Item[]"),
+        ("var item", "Missing[]"),
+        ("Item item[]", "Item[][]"),
+        ("Item[] item", "Item[][]"),
+    ] {
+        let source = format!("package app; class Use {{ Other item; void run({values_type} values) {{ for ({binding} : values) {{\n item.\n }} }} }}");
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Use.java", &source),
+        ]);
+        let found = labels(&mut ws, "Use.java", "item.");
+        assert!(
+            !found.contains("useful") && !found.contains("usefulWrong"),
+            "{binding}: {found:?}"
+        );
+    }
+}
+
+const JAVA_FOREACH_ITERABLE: &str = "package java.lang; public interface Iterable<T> {}";
+
+#[test]
+fn java_enhanced_for_var_array_and_iterable_receivers_have_useful_completion() {
+    for (owner, declaration) in [
+        ("Item.kt", ITEM),
+        (
+            "Item.java",
+            "package app; public class Item { public void useful() {} }",
+        ),
+    ] {
+        for values in [
+            "Item[] values",
+            "Item values[]",
+            "java.lang.Iterable<Item> values",
+        ] {
+            for line in [
+                "item.",
+                "System.out.println(item.);",
+                "System.out.println(item.",
+            ] {
+                let source = format!("package app; class Use {{ void run({values}) {{\n for (var item : (values)) {{\n {line}\n }} }} }}");
+                let mut ws = workspace(&[
+                    (owner, declaration),
+                    ("Other.kt", OTHER),
+                    ("Iterable.java", JAVA_FOREACH_ITERABLE),
+                    ("Use.java", &source),
+                ]);
+                assert_member(&mut ws, "Use.java", "item.", "useful", "usefulWrong");
+                assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source.as_str()));
+            }
+        }
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_generic_hierarchy_and_array_elements_keep_substitution() {
+    for values in ["Values<Item> values", "Box<Item>[] values"] {
+        let expression = if values.starts_with("Values") {
+            "item."
+        } else {
+            "item.get()."
+        };
+        let source = format!("package app; class Use {{ void run({values}) {{ for (var item : values) {{ {expression}useful(); }} }} }}");
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Box.java", JAVA_BOX),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            (
+                "Values.java",
+                "package app; abstract class Values<T> implements java.lang.Iterable<T> {}",
+            ),
+            ("Use.java", &source),
+        ]);
+        assert_member(&mut ws, "Use.java", expression, "useful", "usefulWrong");
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{expression}useful()"),
+            "Item.kt",
+            "useful",
+        );
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_keeps_lexical_values_and_loop_scope() {
+    let source = r#"package app; class Use {
+ Other item;
+ Item[] values;
+ void run(Other[] values) {
+  /*before*/ item.usefulWrong();
+  for (var item : values) { /*inside*/ item.usefulWrong(); }
+  /*after*/ item.usefulWrong();
+ }
+ Other[] sameItems;
+ void sameName() { for (var sameItems : sameItems) { /*same*/ sameItems.usefulWrong(); } }
+}"#;
+    let mut ws = workspace(&[("Item.kt", ITEM), ("Other.kt", OTHER), ("Use.java", source)]);
+    for marker in ["before", "inside", "after", "same"] {
+        let name = if marker == "same" {
+            "sameItems"
+        } else {
+            "item"
+        };
+        let prefix = format!("/*{marker}*/ {name}.");
+        assert_member(&mut ws, "Use.java", &prefix, "usefulWrong", "useful");
+        let usage = source.find(&prefix).unwrap() + prefix.find(name).unwrap();
+        let definitions = ws.goto_definition("Use.java", usage);
+        let declaration = if marker == "inside" {
+            source.find("var item : values").unwrap() + "var ".len()
+        } else if marker == "same" {
+            source.find("var sameItems : sameItems").unwrap() + "var ".len()
+        } else {
+            source.find("Other item;").unwrap() + "Other ".len()
+        };
+        assert_eq!(definitions.len(), 1, "{marker}: {definitions:?}");
+        assert_eq!(definitions[0].file, "Use.java");
+        assert_eq!(definitions[0].start_byte, declaration, "{marker}");
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_tracks_unsaved_element_and_hierarchy_edits() {
+    for values in ["Item[] values", "java.lang.Iterable<Item> values"] {
+        let source = format!("package app; class Use {{ void run({values}) {{ for (var item : values) {{ item.useful(); }} }} }}");
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", &source),
+        ]);
+        assert_member(&mut ws, "Use.java", "item.", "useful", "usefulWrong");
+        ws.change("Use.java", source.replace("Item", "Other"));
+        assert_member(&mut ws, "Use.java", "item.", "usefulWrong", "useful");
+        ws.change("Use.java", source.clone());
+        assert_member(&mut ws, "Use.java", "item.", "useful", "usefulWrong");
+        assert_exact_definition(&mut ws, "Use.java", "item.useful()", "Item.kt", "useful");
+        ws.change("Item.kt", ITEM.replace("useful", "renamedUseful"));
+        assert_member(&mut ws, "Use.java", "item.", "renamedUseful", "useful");
+        ws.change("Item.kt", ITEM.into());
+        assert_member(&mut ws, "Use.java", "item.", "useful", "renamedUseful");
+    }
+    let values = "package app; abstract class Values<T> implements java.lang.Iterable<T> {}";
+    let source = "package app; class Use { void run(Values<Item> values) { for (var item : values) { item.useful(); } } }";
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Iterable.java", JAVA_FOREACH_ITERABLE),
+        ("Values.java", values),
+        ("Use.java", source),
+    ]);
+    assert_member(&mut ws, "Use.java", "item.", "useful", "usefulWrong");
+    ws.change(
+        "Values.java",
+        values.replace("Iterable<T>", "Iterable<Other>"),
+    );
+    assert_member(&mut ws, "Use.java", "item.", "usefulWrong", "useful");
+    ws.change("Values.java", values.into());
+    assert_member(&mut ws, "Use.java", "item.", "useful", "usefulWrong");
+}
+
+#[test]
+fn java_enhanced_for_var_unsupported_or_ambiguous_elements_never_invent_a_scalar() {
+    // Raw/captured iterable and array-valued elements remain valid completion gaps, not useful acceptance passes.
+    for values in [
+        "Missing[] values",
+        "Item[][] values",
+        "Item[] values[]",
+        "java.lang.Iterable values",
+        "java.lang.Iterable<? extends Item> values",
+        "java.lang.Iterable<? super Item> values",
+        "java.lang.Iterable<?> values",
+        "java.lang.Iterable<Missing> values",
+        "NotIterable<Item> values",
+    ] {
+        let source = format!("package app; class Use {{ Item item; void run({values}) {{ for (var item : values) {{\n item.\n }} }} }}");
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("NotIterable.java", "package app; class NotIterable<T> {}"),
+            ("Use.java", &source),
+        ]);
+        let found = labels(&mut ws, "Use.java", "item.");
+        assert!(
+            !found.contains("useful") && !found.contains("usefulWrong"),
+            "{values}: {found:?}"
+        );
+    }
+    for declaration in [
+        "package app; abstract class Values implements java.lang.Iterable<Item>, Missing {}",
+        "package app; interface Both extends java.lang.Iterable<Other> {} abstract class Values implements java.lang.Iterable<Item>, Both {}",
+    ] {
+        let source = "package app; class Use { Item item; void run(Values values) { for (var item : values) { item.useful(); } } }";
+        let mut ws = workspace(&[("Item.kt", ITEM), ("Other.kt", OTHER), ("Iterable.java", JAVA_FOREACH_ITERABLE), ("Values.java", declaration), ("Use.java", source)]);
+        let found = labels(&mut ws, "Use.java", "item.");
+        assert!(!found.contains("useful") && !found.contains("usefulWrong"), "{declaration}: {found:?}");
+    }
+}

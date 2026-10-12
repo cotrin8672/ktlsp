@@ -1189,6 +1189,7 @@ fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<Module
         .arg("-q")
         // Cached provider values must not replay stale compiler recipes or source membership.
         .arg("--no-configuration-cache")
+        .arg("-Dscan.capture-resource-usage=false")
         .arg("--console=plain");
     if offline {
         command.arg("--offline");

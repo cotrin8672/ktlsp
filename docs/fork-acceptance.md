@@ -79,12 +79,12 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Checkpoint65 shared identity/interface and suspend-consumer tests pass; serialized full suite1,393/0/4, formatting and release pass | Focused/serialized checks verified; existing parallel timer robustness open | Native rust65-7; reproduced suspend scalar/generic descriptor regressions now pass |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Checkpoint65 library41/41 includes all20 historical assertions plus21 interface-action/apply/goto/restoration assertions and18 once-only RPCs. Semantic142 and Java221/226/features78/80 remain the latest broader runs | Typed interface slice and focused suspend consumers verified; broader editor coverage open | Native library65-6, exact whole sources/wire/versions retained; no retroactive pass for earlier library runs |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Checkpoint66 typed/var enhanced-for tests pass; serialized full suite1,403/0/4, formatting and release pass | Focused/serialized checks verified; existing parallel timer robustness open | Native rust65-7; reproduced suspend scalar/generic descriptor regressions now pass |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Checkpoint66 Java229/234 after index completion; all26 resource first RPCs match. Startup227/234 retains two empty Iterable responses. Library65 remains41/41; semantic142 and features78/80 are earlier broader runs | Typed interface slice and focused suspend consumers verified; broader editor coverage open | Native library65-6, exact whole sources/wire/versions retained; no retroactive pass for earlier library runs |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Checkpoint62 retains all twelve normal gradle-live expectations in each of three editor starts. All four project completions match on their sole response after the existing project-indexed event | Warmed focused semantics verified; Gradle-blocked startup and broader proposals open | Project readiness is12,233.401ms with uncached model/populated Gradle, then61.875/62.453ms on model reuse. Each condition has one observation, no speedup or distribution claim |
-| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass 18/18 | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass26/26 after indexing, including typed/var enhanced-for; two pre-index Iterable empties remain startup gaps | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
 | Contextual inlay hints | Java var hints share completion types, preserve generic arguments and reflect unsaved Kotlin changes without inventing invalid types | Thirteen exact type/position cases match initially and after producer changes/restoration. Six native first responses cover those states, a visible line and three invalid initializers. Actual Kotlin/javac output verifies both producer variants | Focused repair verified; broader inference and display latency open | Checkpoint 56; initial partial-JDK String gap reproduced and repaired in shared type resolution. This is RPC/semantic evidence, not native hint-render timing or IDEA parity |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Shared declaration-identified parameters retain all Kotlin where/Java intersection bounds. CEM getEnchantmentLevel exact goto/partial completion now match2/2. Synthetic unsaved swap/removal/restoration matches16 first responses/33 checks; exact sent sources match eight independent compiler controls | Focused bounded-receiver repair verified; wider generic inference open | Checkpoint60. Parameter identities stay lexical, never global classes or compiler-absence authority. Recursive/F-bounds, parameterized bounds, bounded call solving and broader compiled signatures remain gaps |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
@@ -3122,6 +3122,89 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Sixty-sixth checkpoint: Java loop receivers and recovered Gradle discovery
+
+The immediate user priority remains false-positive diagnostics and missing useful
+completion. Ranking and additional code-action/inlay expansion are deferred. The
+following changes were agent-authored, reviewed/applied by root and tested through
+the existing Rust and Neovim routes. The goal remains in progress.
+
+Java's existing declaration adapter now recognizes typed enhanced-for binders.
+It also infers `var` elements from explicit rank1 array declarations and uniquely
+instantiated invariant `java.lang.Iterable<T>` facts, using the existing scoped
+resolver and shared supertype walk. Java and Kotlin element owners, incomplete
+selectors/nested calls, lexical scope, generic substitution and unsaved changes
+are covered. No global class fallback or separate completion algorithm is added.
+Rank>1 arrays, array-valued methods/aliases, raw/captured Iterable elements and
+Kotlin collection-to-JVM mapping remain valid completion gaps.
+
+Both focused RED runs reproduce four useful-member failures and one passing
+no-false-type control before their respective fixes. The final serialized run
+passes10 enhanced-for tests,100 generic interop tests and the full workspace
+**1,403 passed / 0 failed / 4 ignored**; formatting and release builds pass.
+All six final stages leave zero owned descendants at cleanup. Their elapsed
+times include build work and are not interactive latency samples.
+The immutable final ktlsp SHA256 is
+`dab7d6d155990e45befef6c594e4dd67de5c2f99f675cf70782841accb6fd8e0`.
+
+The exact committed resource fixture compiles with selected Kotlin1.9.23 and
+SDK17 javac against the actual Kotlin output and stdlib; the real JDK supplies
+Iterable, not the unit-test stub. Neovim retains all18 previous resource RPCs and
+adds four typed/four var loop RPCs. Whole source, reconstructed outbound wire,
+current versions, first response, buffer restoration and disk hashes are checked.
+Startup is227/234 assertions: the two var Iterable responses are empty while
+JDK indexing is unfinished and remain useful-completion failures. A separate
+opt-in control waits only for actual project/library completion notifications:
+the same immutable server then passes all26 resource RPCs on attempt1 and
+229/234 assertions overall. This proves after-index behavior, not startup repair.
+Both Java runs retain the same five missing-diagnostic checks; the published65
+server on the typed fixture reproduces those five plus the four then-unfixed
+typed loop checks. This slice does not claim the whole Java scenario passed.
+
+The original serialized six-root65 corpus sweep has41 matched /10 mismatched /
+9 not-run RPCs, with every attempted response on attempt1. Its old CEM disposable
+root lacks seven Gradle entry files and has zero dependency files; the actual
+failures are retained and are not attributed to a semantic regression. Spring
+has a real ambiguous overload definition. Gradle's nine requests could not run
+because current model discovery failed.
+
+A single discovery-only argument, `-Dscan.capture-resource-usage=false`, disables
+Develocity's failing Windows resource collector. The current Gradle8.14.3 replay
+captures model10, indexes11,325 project and57,686 library files, and passes the
+original3 golden plus6 incomplete first RPCs (including13 incomplete semantic
+assertions), with unchanged manifests, source/git guards, delivered edits and
+restoration. Both clients acknowledge shutdown and exit0 with zero forced stops
+or owned descendants. Ten failed archives and25 missing source archives remain
+coverage limitations; these focused passes do not prove complete project analysis.
+The option is documented by the
+[Develocity Gradle plugin](https://docs.develocity.ai/gradle/4.6/gradle-plugin/).
+
+The complete CEM snapshot retains all220 independent-compiler source/build input
+hashes and freshly discovers101 dependencies. Its unchanged golden manifest now
+matches3/4 first RPCs, including both useful completions and inherited Java goto.
+The generic HolderGetter goto remains mismatched. Two missing source archives
+remain. Incomplete and separate where-bound replays are next; no combined
+six-project parity or performance-distribution pass is claimed.
+
+Evidence under
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/`:
+`native-java-enhanced-for-red66-1`, `native-java-var-for-red66-1`,
+`native-var-foreach-rust66-1`, `native-typed-foreach-java66-1`,
+`native-java-baseline65-on66-1`, `native-var-foreach-java66-1`,
+`native-var-iterable-ready66-1/root-verification.json`,
+`native-ordinary-corpus65-1/root-verification.json`,
+`native-gradle-model-recovery66-2/root-verification.json`,
+`native-gradle-incomplete66-1/root-verification.json` and
+`native-cem-complete66-1`. Root receipts distinguish normalized Neovim source
+hashes from raw disk bytes. The older typed-only Rust/Java stages retain their
+recorded owned cleanup observations separately.
+
+Next: repair targeted default-JDK source seeding and recheck startup first
+responses; finish CEM's unchanged manifests; independently compile the exact
+original Retrofit55-source input and bind canonical valid-source diagnostics;
+then review the scoped Java compiler worker and producer guards. Diagnostic
+absence, generic overload coverage and full corpus latency remain open.
 
 ### Sixty-fifth checkpoint: typed interface implementation actions and shared builtin identity
 

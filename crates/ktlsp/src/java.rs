@@ -3551,16 +3551,24 @@ pub(crate) fn type_of_value_declaration(
     initializer_depth: usize,
 ) -> Option<Type> {
     let parent = decl.parent()?;
-    let type_node = match parent.kind() {
-        "formal_parameter" | "catch_formal_parameter" => parent.child_by_field_name("type")?,
-        "variable_declarator" => parent.parent()?.child_by_field_name("type")?,
-        "resource" => parent.child_by_field_name("type")?,
-        _ => return None,
-    };
+    // shortcut: array loop bindings stay Unknown until shared array receiver inference exists.
+    if parent.kind() == "enhanced_for_statement"
+        && parent.child_by_field_name("dimensions").is_some()
+    {
+        return None;
+    }
+    let type_node = value_declaration_type_node(decl)?;
     if type_node.kind() == "type_identifier" && node_text(type_node, src) == "var" {
         if initializer_depth >= infer::MAX_DEPTH {
             // shortcut: valid deeper var aliases stay Unknown until initializer expansion is iterative.
             return None;
+        }
+        if parent.kind() == "enhanced_for_statement" {
+            let value = parent.child_by_field_name("value")?;
+            if value.has_error() {
+                return None;
+            }
+            return enhanced_for_element_type(index, file, src, tree, value, initializer_depth + 1);
         }
         let local = parent.kind() == "resource"
             || parent.kind() == "variable_declarator"
@@ -3577,6 +3585,101 @@ pub(crate) fn type_of_value_declaration(
         return java_argument_type(index, file, src, tree, initializer, initializer_depth + 1);
     }
     receiver_type_from_type_node(index, file, src, tree, type_node)
+}
+
+fn value_declaration_type_node(declaration: Node<'_>) -> Option<Node<'_>> {
+    let parent = declaration.parent()?;
+    match parent.kind() {
+        "formal_parameter" | "catch_formal_parameter" | "resource" | "enhanced_for_statement" => {
+            parent.child_by_field_name("type")
+        }
+        "variable_declarator" => parent.parent()?.child_by_field_name("type"),
+        _ => None,
+    }
+}
+
+fn enhanced_for_element_type(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    mut value: Node<'_>,
+    initializer_depth: usize,
+) -> Option<Type> {
+    while value.kind() == "parenthesized_expression" {
+        value = value.named_child(0)?;
+    }
+    if value.kind() == "identifier" {
+        if let Some(declaration) =
+            local_declaration_node(src, value).or_else(|| same_file_field_declaration(src, value))
+        {
+            let ty = value_declaration_type_node(declaration)?;
+            let post_dimensions = declaration.parent()?.child_by_field_name("dimensions");
+            if ty.kind() == "array_type" || post_dimensions.is_some() {
+                let mut rank = 0;
+                for dimensions in [ty.child_by_field_name("dimensions"), post_dimensions]
+                    .into_iter()
+                    .flatten()
+                {
+                    if dimensions.has_error() {
+                        return None;
+                    }
+                    let mut cursor = dimensions.walk();
+                    rank += dimensions
+                        .children(&mut cursor)
+                        .filter(|child| child.kind() == "[")
+                        .count();
+                }
+                let element = if ty.kind() == "array_type" {
+                    ty.child_by_field_name("element")?
+                } else {
+                    ty
+                };
+                // shortcut: array-valued elements stay Unknown until shared array receiver inference exists.
+                if rank != 1 || element.kind() == "array_type" || element.has_error() {
+                    return None;
+                }
+                return receiver_type_from_type_node(index, file, src, tree, element);
+            }
+        }
+    }
+    let receiver = java_argument_type(index, file, src, tree, value, initializer_depth)?;
+    let mut result: Option<Type> = None;
+    let mut incomplete = false;
+    let _ = infer::walk_supertypes(index, &receiver, JAVA_SUPERTYPE_WALK_CAP, |current| {
+        if !current.is_member_receiver() {
+            incomplete = true;
+            return ControlFlow::Break(());
+        }
+        if current.name() == Some("Iterable")
+            && current.package() == Some("java.lang")
+            && current.container().is_none()
+        {
+            match current.args() {
+                [element]
+                    if element.projection() == crate::types::Projection::Invariant
+                        && element.is_member_receiver() =>
+                {
+                    if result.as_ref().is_some_and(|previous| previous != element) {
+                        incomplete = true;
+                        return ControlFlow::Break(());
+                    }
+                    result = Some(element.clone());
+                }
+                // shortcut: raw and captured iterable elements stay Unknown until capture types are represented.
+                _ => {
+                    incomplete = true;
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    if incomplete {
+        None
+    } else {
+        result
+    }
 }
 
 fn initializer_uses_declaration(src: &str, initializer: Node<'_>, declaration: Node<'_>) -> bool {

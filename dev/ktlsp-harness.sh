@@ -664,6 +664,46 @@ public class ResourceUse {
         System.out.println(factoryBody.string());
         identity(supply).string();
     }
+
+    public void kotlinLoop(Body[] values) {
+        for (Body kotlinItem : values) {
+            System.out.println(kotlinItem.string());
+        }
+    }
+
+    public void javaLoop(JavaLoopBody[] values) {
+        for (JavaLoopBody javaItem : values) {
+            System.out.println(javaItem.javaOnly());
+        }
+    }
+
+    public void varKotlinArray(Body[] values) {
+        for (var varKotlinArrayItem : values) {
+            System.out.println(varKotlinArrayItem.string());
+        }
+    }
+
+    public void varJavaArray(JavaLoopBody[] values) {
+        for (var varJavaArrayItem : values) {
+            System.out.println(varJavaArrayItem.javaOnly());
+        }
+    }
+
+    public void varKotlinIterable(Iterable<Body> values) {
+        for (var varKotlinIterableItem : values) {
+            System.out.println(varKotlinIterableItem.string());
+        }
+    }
+
+    public void varJavaIterable(Iterable<JavaLoopBody> values) {
+        for (var varJavaIterableItem : values) {
+            System.out.println(varJavaIterableItem.javaOnly());
+        }
+    }
+}
+
+class JavaLoopBody {
+    public String javaOnly() { return "java"; }
 }
 JAVA
 

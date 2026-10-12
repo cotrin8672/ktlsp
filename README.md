@@ -216,7 +216,11 @@ partial selectors and unfinished nested `println`, exact member/local/field navi
 and outer-field scope before the try, in catch/finally and after it. Valid `var`
 resources and same-file factory initializers require useful `Body.string` completion.
 It also checks a cursor before an authored selector suffix and 32 nested generic
-method results with exact Kotlin navigation. Empty results cannot satisfy these cases.
+method results with exact Kotlin navigation. Typed enhanced-for variables and `var`
+elements from rank1 arrays or invariant `java.lang.Iterable<T>` use the same receiver
+inference for Java and Kotlin members. The resource probe has 26 first RPCs; set
+`KTLSP_JAVA_WAIT_INDEX=1` for a separately labelled first-response-after-indexing control.
+The default run retains startup failures. Empty results cannot satisfy these cases.
 `java-resource-body.json` records reconstructed outbound edits, first RPCs and restoration.
 The same `java` scenario checks 13 contextual `var` hint types, including numeric suffixes,
 generic arguments, wildcards, overloads and Kotlin producers. Six first-response queries cover

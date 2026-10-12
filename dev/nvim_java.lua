@@ -42,7 +42,26 @@ vim.cmd("edit " .. vim.fn.fnameescape(project .. "/app/Main.java"))
 local bufnr = vim.api.nvim_get_current_buf()
 vim.bo[bufnr].filetype = "java"
 
+local index_state = { project = false, libraries = false, messages = {} }
+local wait_java_index = vim.env.KTLSP_JAVA_WAIT_INDEX == "1"
+local log_handler = vim.lsp.handlers["window/logMessage"]
 local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project,
+  handlers = { ["window/logMessage"] = function(err, params, ctx, config)
+    local message = params and params.message or ""
+    local project_files = message:match("^ktlsp indexed (%d+) project files")
+    local library_files = message:match("^ktlsp indexed (%d+) library files")
+    if project_files or library_files then
+      index_state.messages[#index_state.messages + 1] = { message = message, observed_ns = vim.uv.hrtime() }
+    end
+    if project_files then index_state.project, index_state.project_files = true, tonumber(project_files) end
+    if library_files then
+      index_state.libraries, index_state.library_files = true, tonumber(library_files)
+      index_state.libraries_observed_ns = vim.uv.hrtime()
+      local failed, missing = message:match("(%d+) failed, (%d+) missing sources")
+      index_state.failed, index_state.missing_sources = tonumber(failed), tonumber(missing)
+    end
+    if log_handler then return log_handler(err, params, ctx, config) end
+  end },
   on_exit = function(code, signal) shutdown.exit = { code = code, signal = signal } end })
 assert(id, "vim.lsp.start returned nil")
 vim.wait(8000, function()
@@ -596,7 +615,7 @@ do
   local original_disk = { java = disk_sha(path), kotlin = disk_sha(kotlin_path) }
   local resource_uri = vim.uri_from_bufnr(resource_buf)
   local wire_text, latest = probe.buffer_full_text(resource_buf), nil
-  local report = { requests = {}, outbound = {}, expected_probe_count = 18,
+  local report = { requests = {}, outbound = {}, expected_probe_count = 26,
     original_source_sha256 = original_hash, original_disk_sha256 = original_disk,
     valid_var_status = "OPEN unless the first response offers Body.string; empty is a mismatch" }
   local notify = client.rpc.notify
@@ -662,6 +681,16 @@ do
       probe.exact_definition(result, target, { range }), vim.inspect(result), row)
   end
   local ok, err = xpcall(function()
+    if wait_java_index then
+      -- This separate control measures the first response after indexing, never a content retry.
+      local ready = vim.wait(30000, function() return index_state.project and index_state.libraries end, 50)
+      report.index_readiness = { requested = true, ready = ready, observed = vim.deepcopy(index_state),
+        finished_ns = vim.uv.hrtime(), semantic_phase = "first-response-after-indexing" }
+      assert(ready, "Java resource control did not observe project and library indexing completion")
+    else
+      report.index_readiness = { requested = false, observed = vim.deepcopy(index_state),
+        finished_ns = vim.uv.hrtime(), semantic_phase = "startup-first-response" }
+    end
     completion("ordinary local unfinished println control", "System.out.println(localBody.string());", "localBody",
       "        System.out.println(localBody.", "string", "enqueue")
     completion("typed body.st", "System.out.println(body.string());", "body",
@@ -679,6 +708,22 @@ do
       definition(scope .. " outer field binding", anchor, "body", nil,
         path, original, "private Other body")
     end
+    completion("typed foreach Kotlin bare receiver", "System.out.println(kotlinItem.string());", "kotlinItem",
+      "            kotlinItem.", "string", "enqueue")
+    completion("typed foreach Kotlin unfinished println", "System.out.println(kotlinItem.string());", "kotlinItem",
+      "            System.out.println(kotlinItem.", "string", "enqueue")
+    completion("typed foreach Java bare receiver", "System.out.println(javaItem.javaOnly());", "javaItem",
+      "            javaItem.", "javaOnly", "string")
+    completion("typed foreach Java unfinished println", "System.out.println(javaItem.javaOnly());", "javaItem",
+      "            System.out.println(javaItem.", "javaOnly", "string")
+    completion("var foreach Kotlin array", "System.out.println(varKotlinArrayItem.string());", "varKotlinArrayItem",
+      "            System.out.println(varKotlinArrayItem.", "string", "enqueue")
+    completion("var foreach Java array", "System.out.println(varJavaArrayItem.javaOnly());", "varJavaArrayItem",
+      "            System.out.println(varJavaArrayItem.", "javaOnly", "string")
+    completion("var foreach Kotlin iterable", "System.out.println(varKotlinIterableItem.string());", "varKotlinIterableItem",
+      "            System.out.println(varKotlinIterableItem.", "string", "enqueue")
+    completion("var foreach Java iterable", "System.out.println(varJavaIterableItem.javaOnly());", "varJavaIterableItem",
+      "            System.out.println(varJavaIterableItem.", "javaOnly", "string")
     completion("valid var unfinished println positive", "System.out.println(inferredBody.string());", "inferredBody",
       "            System.out.println(inferredBody.", "string", "enqueue")
     completion("var factory unfinished println", "System.out.println(factoryBody.string());", "factoryBody",
