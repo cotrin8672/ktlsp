@@ -58,13 +58,13 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current streaming-cache slice passes 1,337 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 51; valid Java var, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 208 matched / 6 unmet of 214: the original 199 retain 194 matches; 13 new resource semantic checks and exact restoration pass, while valid var completion returns an incorrect empty response. Features 78/80 and semantic 107 are prior results | Partial; original gaps and positive var remain open | Checkpoint 50 native-java-resource-editor50-1. All 14 new RPCs run once with reconstructed outbound source hashes; older push-generation certification remains limited. Forced cleanup is operational evidence |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current Java var/shared generic recovery slice passes 1,351 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 52; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 213 matched / 5 unmet of 218: original 199 retain 194 matches; all 18 resource/editing first RPCs and exact restoration pass. Features 78/80 and semantic 107 are prior results | Partial; original diagnostic gaps remain open | Checkpoint 52 native-java-var-editor52-2. All 18 related RPCs run once with reconstructed outbound source hashes. Forced cleanup is operational evidence |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
-| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Earlier six-root focused requests remain recorded. Real OkHttp Java-to-Kotlin resource completion repairs a valid empty response to 31/31 exact native accepted buffers. Reduced typed resources, broken nested calls, lexical shadowing and exact navigation pass; valid var remains open | Partial; reproduced typed-resource gap repaired, wider editing behavior open | Checkpoint 50 and earlier 33/35/45. Original source and positive expectations stay unchanged; a fast empty result is a mismatch, while unavailable RPCs are unmeasured |
-| Inheritance and generics | Correct inherited members and substituted types across both languages | Typed superclasses/import switches retain their controls. Source projected arguments now share equality/lower/upper constraints, correctly infer Invocation/Other independently, preserve fixed receiver bindings and retain unknown overloads | Partial; focused source generic repair verified | Checkpoint 42: compiler controls 7/7; unchanged reduced first-response RPCs 13/13 baseline, 4/4 negative and 23/23 full. Capture, varying lower bounds, bounded constructors and compiled-only signatures remain coverage gaps |
+| Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass 18/18 | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
+| Inheritance and generics | Correct inherited members and substituted types across both languages | Source projected arguments share equality/lower/upper constraints. Plain method type variables now bind actual normalized arguments from Java/Kotlin; 1/8/20/32 nested Java calls retain useful types and bounded nonzero leaf work | Partial; focused source generic repair verified | Checkpoints 42/52. Javac completed controls and exact Kotlin navigation pass; capture, varying lower bounds, bounded constructors and compiled-only generic signatures remain gaps |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Current Spring reduction repairs four failed requests; real Spring passes all nine original/additional first-response queries, including explicit-this and dangling selectors | Focused repair verified; full-project acceptance partial | Checkpoint 29 below. Real Spring still has ten missing dependency source inputs and a 15-second forced shutdown |
 | Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks improve 31/44 to 44/44, preserving the previous 65 checks. Current normalized receiver arguments and inline nominal bounds have shared regression controls; ordinary semantic scenario retains 107 assertions | Focused semantics verified; where/F-bounds and projected receivers remain coverage gaps | Checkpoints 33/39: exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have Rust regression controls; no six-project parity or speed claim |
@@ -76,7 +76,7 @@ a useful known receiver in the same edited state.
 | Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Saved Java/Lombok probe retains 99/99. Current KAPT/KSP lifecycle retains actual builds/runtime, useful completion/navigation and unsaved-source controls. Kotlin 1.8.21 positive errors have accepted source/model/store generations; compiler/IDEA import-span calibration is recorded | Partial; focused Kotlin errors verified, Java producer diagnostics and unsaved regeneration remain open | Checkpoint 46. No canonical-clean or producer-closure claim; Java's six positive expectations lack final compiler authority |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Actual Retrofit's same focused 21 RPC / 25 semantic cases pass in both engines. Shared mixed fixture retains adapted IntelliJ LSP 38/38 and ktlsp 36/36, including strict first responses after change delivery | Shared fixture and focused actual-project cases verified | Checkpoint 43. Windows URI/version adapter remains explicit; these cases do not establish whole-project parity |
-| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA with conditions recorded | Moshi, Retrofit, CEM and OkHttp have focused 31-cycle native observations per engine across recorded revisions. Latest useful OkHttp warm input-to-popup p50/p95 is 34.060/39.371 ms for ktlsp and 299.936/456.674 ms for IDEA | Focused comparisons observed; wider controlled comparison pending | Checkpoints 44/50 record exact binaries, source, cache, JVM and sampling limits. Synthetic selection counts affect acceptance time; sampled working sets are not whole-lifetime peaks. No arbitrary time/memory acceptance gate |
+| Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA with conditions recorded | Moshi, Retrofit, CEM and OkHttp have focused 31-cycle native observations per engine across recorded revisions. Latest useful OkHttp warm input-to-popup p50/p95 is 33.896/35.372 ms for ktlsp; prior same-case IDEA observation is 299.936/456.674 ms | Focused comparisons observed; wider controlled comparison pending | Checkpoints 44/50/51/52 record exact inputs and measurement limits. Sampled server working-set peak is 2,074,353,664 bytes; no memory reduction or arbitrary time/memory acceptance gate claimed |
 
 ## Actual KAPT/KSP compile and runtime controls
 
@@ -3100,6 +3100,105 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-second checkpoint: Java var and current generic receiver facts
+
+Contextual var locals/resources now infer from their actual value initializer,
+including parameters, fields, constructors, parentheses, same-file methods and
+earlier resources. Unsaved Kotlin factory return changes update the Java result.
+Value bindings remain separate from method/type/selector names; self-referencing
+or unavailable initializers remain Unknown and cannot select an outer field.
+Only initializer expansion consumes the alias depth budget. Ordinary nested calls
+retain their existing depth policy and share already-computed argument facts.
+
+Independent baseline tests also exposed a shared plain method-variable gap:
+<T> T id(T value) returned Unknown even at depth 1. The existing constraint
+application now accepts method type variables as well as nested/projected
+parameters. Java and Kotlin use the same normalized argument/result binding.
+Known Item and Other arguments retain their exact identities; Unknown stays
+Unknown. Java calls at depths 1/8/20/32 retain Body.string completion and exact
+Kotlin definitions. Useful generic and unresolved-call controls assert bounded,
+nonzero leaf lookup work rather than treating an early empty result as fast.
+
+Real editor validation found another valid empty response after the first fix:
+32 unqualified same-file generic calls with a dangling selector. The reduced case
+also fails at depth 1 because the original incomplete parse indexes no declarations.
+Java now reuses the existing query-file recovery view before receiver inference
+when its full synthetic source repairs an erroneous authored parse. Synthetic
+insertions are mapped back to authored declaration offsets. A deliberately
+truncated local-only recovery never replaces the full file's declarations.
+Other files retain their selected compiler facts; recovered own declarations do
+not acquire compiler completeness. No shared index or authored buffer is mutated.
+
+Recovery also preserves an authored selector suffix/call instead of inserting ()
+inside its method name. A malformed argument ERROR can consume later declarations
+even when its enclosing block survives, so safe delimiter restoration handles that
+case too. Existing before/broken-later-statement, explicit Missing, same-name and
+computed-receiver controls remain unchanged.
+
+Focused Java adapter tests pass 25/25 and generic interop 75/75. The final full
+workspace passes 1,351 tests, zero failed, four ignored; formatting, harness syntax,
+diff checks and both release binaries pass. Immutable ktlsp SHA256:
+3c91cee330eb003f660f626cfb4397797449034c131ad43df1d1b0f6c2bfc682.
+The preceding 01a0 release preserves its failed native generic completion evidence;
+the final 3c91 release repairs that exact expectation.
+
+The existing real-Neovim java route retains all original 214 expectations and adds
+four first-response cases: a var factory, an authored selector suffix, 32 nested
+generic results and exact Kotlin navigation. Result: 213 matched / 5 mismatched /
+0 unmeasured of 218. All 18 related resource/editing RPCs run once, use the current
+reconstructed outbound source SHA and match their positive expectations. Complete
+buffers restore exactly and disk files stay unchanged. The five unchanged gaps
+are Java unresolved/call-shape/argument-type diagnostics and the Java/Kotlin changed
+superclass argument diagnostics. Legacy force-stop exit 1/signal 15 remains an
+operational observation, not a reclassification of the measured RPCs.
+
+Standalone javac completed counterparts pass both positive source groups, including
+20/32 generic chains, anonymous arguments and a same-named static imported value;
+all six negative sources receive the expected self-reference/missing-type/missing-
+method/value-namespace errors. JDK21 with --release17 yields exits 0/0/1/1/1/1/1/1
+and ten class files of major61. The first JDK17.0.7 attempt passes both positives
+and emits the correct self-reference error but exits4 and writes an argument file;
+that attempt is preserved separately and does not certify all negative controls.
+Its generated argument artifact was moved from repository cwd into the owned run.
+These standalone controls do not establish annotation-processor/plugin closure.
+
+The original OkHttp guide retains 31 first RPCs / 31 exact whole-buffer acceptances,
+unchanged disk, one acknowledged shutdown and native exit0/signal0 with zero
+termination requests. First RPC/popup/synthetic acceptance is 3.115/34.751/57.411 ms.
+Warm30 nearest-rank p50/p95: RPC 2.343/3.522 ms, popup 33.896/35.372 ms, synthetic
+acceptance 58.658/59.795 ms; target remains item6 of16. Sampled server working-set
+peak is 2,074,353,664 bytes, observed descendant sum 2,081,869,824, across 1,153
+rows with maximum gap157 ms. Compiler memory remains unmeasured. This is another
+instrumented observation, not a causal speedup or observed resident-memory reduction.
+The unchanged org.openjsse:openjsse:1.1.12 conditional/merged encoding input is
+still rejected; the matching ResponseBody case does not certify that source archive.
+
+A temporary external Rust probe reads all55 immutable OkHttp symbol caches with
+the exact current Cargo dependency/compiler fingerprints. It confirms 37,544 files
+and 909,952 symbols: IndexedSymbol504 bytes, TypeRef112, Option<TypeRef>112 and
+Option<Box<TypeRef>>8 on this x64 host. Return type is present547,882 times, value
+type269,440 times, and both never occur in this inventory. Cache/rlib/source hashes
+remain unchanged. These are layout/fact counts, not measured RSS savings. Two prior
+probe preparations stop at compiler-version/native-link mismatch and provide no
+inventory result. Sparse value-type storage is the next resident-memory candidate.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-java-var-red-1/, native-plain-method-variable-red-1/,
+native-java-var-cst-{1,2}/, native-java-var-green-{1,2,3,4,5}/,
+native-java-incomplete-generic-red52-1/, native-java-var-compiler52-{1,2}/,
+native-java-var-rust52-{1,2}/, native-java-var-editor52-{1,2}/,
+native-okhttp-var-ui52-1/ktlsp/artifacts/ui-semantic-derived.json and
+native-symbol-layout-probe-{1,2,3}/. Final native results and exact source/binary
+guards are in each receipt. User AGENTS.md and real project sources stay unchanged.
+
+Known valid gaps remain explicit: var aliases deeper than16 and anonymous/imported
+value initializer shapes still lack complete inferred types. This checkpoint does
+not close the five diagnostic expectations, compiler-producer closure, general
+generic inference, Spring/Gradle paired UI or broader six-project IDEA parity.
+Next integrate the reviewed repeated-reference removal improvement, verify sparse
+value-type storage with native memory observations, then run the prepared Spring
+and Gradle comparison cases.
 
 ### Fifty-first checkpoint: stream cache writes with unchanged library semantics
 

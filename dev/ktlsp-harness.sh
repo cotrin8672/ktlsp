@@ -584,6 +584,15 @@ public class ResourceUse {
             System.out.println(inferredBody.string());
         }
     }
+
+    private Body make() { return new Body(); }
+    private <T> T identity(T value) { return value; }
+
+    public void factory(Body supply) {
+        var factoryBody = make();
+        System.out.println(factoryBody.string());
+        identity(supply).string();
+    }
 }
 JAVA
 

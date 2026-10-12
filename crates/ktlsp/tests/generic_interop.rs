@@ -3337,3 +3337,262 @@ fn java_resource_completion_recovery_keeps_nested_lexical_scopes() {
         assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source));
     }
 }
+
+#[test]
+fn java_var_local_and_resource_receivers_use_current_initializers() {
+    for initializer in [
+        "supply",
+        "stored",
+        "Body",
+        "new Body()",
+        "make()",
+        "(supply)",
+    ] {
+        for resource in [false, true] {
+            for line in [
+                "body.",
+                "System.out.println(body.);",
+                "System.out.println(body.",
+            ] {
+                let binding = if resource {
+                    format!("try (var body = {initializer}) {{ {line} }}")
+                } else {
+                    format!("var body = {initializer}; {line}")
+                };
+                let source = format!("package app; class Use {{ static Body stored; static Body Body; Body make() {{ return null; }} void run(Body supply) {{ {binding} }} }}");
+                let mut ws = java_resource_workspace(&source);
+                let found = labels(&mut ws, "Use.java", "body.");
+                assert!(
+                    found.contains("string"),
+                    "resource={resource}, initializer={initializer}, line={line}: {found:?}"
+                );
+                assert!(
+                    !found.contains("enqueue"),
+                    "resource={resource}, initializer={initializer}, line={line}: {found:?}"
+                );
+                assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source.as_str()));
+            }
+        }
+    }
+}
+
+#[test]
+fn java_var_resource_chain_uses_the_earlier_resource_in_the_next_initializer() {
+    let source = "package app; class Use { void run(Body supply) { try (var first = supply; var body = first.next().next()) { body.string(); } } }";
+    let mut ws = java_resource_workspace(source);
+    ws.change("Body.kt", "package app\nclass Body : AutoCloseable {\n fun string(): String = \"body\"\n fun next(): Body = this\n override fun close() {}\n}\n".into());
+    assert_member(&mut ws, "Use.java", "first.", "string", "enqueue");
+    assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
+    assert_exact_definition(&mut ws, "Use.java", "first.next()", "Body.kt", "next");
+    assert_exact_definition(&mut ws, "Use.java", "body.string()", "Body.kt", "string");
+    assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source));
+}
+
+#[test]
+fn java_var_receiver_tracks_unsaved_cross_language_factory_return_changes() {
+    let source = "package app; class Use { void run(Factory factory) { try (var body = factory.make()) { body.string(); } } }";
+    let original = "package app\nclass Factory {\n fun make(): Body = Body()\n}\n";
+    let changed = "package app\nclass Factory {\n fun make(): Other = Other()\n}\n";
+    let mut ws = java_resource_workspace(source);
+    ws.open("Factory.kt", original.into());
+    assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
+    assert_exact_definition(&mut ws, "Use.java", "body.string()", "Body.kt", "string");
+    ws.change("Factory.kt", changed.into());
+    assert_member(&mut ws, "Use.java", "body.", "enqueue", "string");
+    ws.change("Factory.kt", original.into());
+    assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
+    assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source));
+}
+
+#[test]
+fn java_var_unknown_initializers_and_explicit_missing_types_keep_value_shadowing() {
+    for binding in [
+        "var body = missing;",
+        "var body = unknown();",
+        "var body = (Body);",
+        "Missing body = supply;",
+        "try (var body = missing)",
+        "try (Missing body = supply)",
+    ] {
+        let statements = if binding.starts_with("try") {
+            format!("{binding} {{ body.string(); }}")
+        } else {
+            format!("{binding} body.string();")
+        };
+        let source = format!(
+            "package app; class Use {{ Body body; void run(Body supply) {{ {statements} }} }}"
+        );
+        let mut ws = java_resource_workspace(&source);
+        let found = labels(&mut ws, "Use.java", "body.");
+        assert!(
+            !found.contains("string") && !found.contains("enqueue"),
+            "{binding}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn java_var_own_initializer_never_falls_through_to_the_outer_field() {
+    for initializer in ["body", "make(body)", "body.make()", "new Body(body)"] {
+        for resource in [false, true] {
+            let statements = if resource {
+                format!("try (var body = {initializer}) {{ body.string(); }}")
+            } else {
+                format!("var body = {initializer}; body.string();")
+            };
+            let source = format!("package app; class Use {{ Body body; Body make(Body value) {{ return value; }} void run() {{ {statements} }} }}");
+            let mut ws = java_resource_workspace(&source);
+            let found = labels(&mut ws, "Use.java", "body.");
+            assert!(
+                !found.contains("string") && !found.contains("enqueue"),
+                "resource={resource}, initializer={initializer}: {found:?}"
+            );
+            let declaration = source.find("var body =").unwrap() + "var ".len();
+            let usage = source.rfind("body.string()").unwrap();
+            let definitions = ws.goto_definition("Use.java", usage);
+            assert_eq!(
+                definitions.len(),
+                1,
+                "resource={resource}, initializer={initializer}: {definitions:?}"
+            );
+            assert_eq!(definitions[0].file, "Use.java");
+            assert_eq!(definitions[0].start_byte, declaration);
+        }
+    }
+}
+
+#[test]
+fn java_var_initializer_method_names_are_separate_from_the_local_value() {
+    let source = "package app; class Use { Other body; Body body() { return null; } void run() { var body = body(); body.string(); } }";
+    let mut ws = java_resource_workspace(source);
+    assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
+    let call_name = source.find("= body()").unwrap() + "= ".len();
+    let definitions = ws.goto_definition("Use.java", call_name);
+    assert_eq!(definitions.len(), 1, "{definitions:?}");
+    assert_eq!(definitions[0].file, "Use.java");
+    assert_eq!(
+        definitions[0].start_byte,
+        source.find("Body body()").unwrap() + "Body ".len()
+    );
+    assert_exact_definition(&mut ws, "Use.java", "body.string()", "Body.kt", "string");
+}
+
+#[test]
+fn java_var_alias_inference_keeps_typical_chains_and_bounds_longer_chains() {
+    for count in [infer::MAX_DEPTH, infer::MAX_DEPTH + 1] {
+        let mut statements = "var value0 = supply;".to_string();
+        for current in 1..count {
+            statements.push_str(&format!(" var value{current} = value{};", current - 1));
+        }
+        let prefix = format!("value{}.", count - 1);
+        let source = format!("package app; class Use {{ void run(Body supply) {{ {statements} {prefix}string(); }} }}");
+        let mut ws = java_resource_workspace(&source);
+        let found = labels(&mut ws, "Use.java", &prefix);
+        if count == infer::MAX_DEPTH {
+            assert!(
+                found.contains("string"),
+                "the typical chain must keep its useful type: {found:?}"
+            );
+        } else {
+            assert!(
+                !found.contains("string"),
+                "inference beyond the shared limit must remain unknown: {found:?}"
+            );
+        }
+        assert!(
+            !found.contains("enqueue"),
+            "an exhausted budget must not select an unrelated type: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn java_long_generic_identity_calls_keep_the_useful_receiver_type() {
+    for depth in [1, 8, 20, 32] {
+        let mut expression = "supply".to_string();
+        for _ in 0..depth {
+            expression = format!("identity.id({expression})");
+        }
+        let source = format!("package app; class Use {{ void run(Identity identity, Body supply) {{ {expression}.string(); }} }}");
+        let mut ws = java_resource_workspace(&source);
+        ws.open(
+            "Identity.java",
+            "package app; class Identity { public <T> T id(T value) { return value; } }".into(),
+        );
+        let found = labels(&mut ws, "Use.java", &format!("{expression}."));
+        assert!(
+            found.contains("string"),
+            "ordinary generic call depth {depth} must retain Body.string: {found:?}"
+        );
+        assert!(
+            !found.contains("enqueue"),
+            "ordinary call depth {depth} selected an unrelated type: {found:?}"
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{expression}.string()"),
+            "Body.kt",
+            "string",
+        );
+        assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source.as_str()));
+    }
+}
+
+#[test]
+fn java_ordinary_argument_values_retain_existing_base_members() {
+    for expression in ["new Body() {}", "(new Body() {})", "Body"] {
+        let prefix = format!("identity.id({expression}).");
+        let source = format!("package app; import static app.Values.Body; class Use {{ void run(Identity identity) {{ {prefix}string(); }} }}");
+        let mut ws = workspace(&[
+            (
+                "Body.java",
+                "package app; public class Body { public String string() { return null; } }",
+            ),
+            (
+                "Values.java",
+                "package app; public class Values { public static Body Body = new Body(); }",
+            ),
+            (
+                "Identity.java",
+                "package app; public class Identity { public <T> T id(T value) { return value; } }",
+            ),
+            ("Use.java", &source),
+        ]);
+        assert_member(&mut ws, "Use.java", &prefix, "string", "enqueue");
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{prefix}string()"),
+            "Body.java",
+            "string",
+        );
+        assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source.as_str()));
+    }
+}
+
+#[test]
+fn java_and_kotlin_plain_method_variables_share_the_argument_type() {
+    let mut ws = java_resource_workspace(
+        "package app; class Use { void run(Identity identity, Body supply) { identity.id(supply).string(); } }",
+    );
+    ws.open(
+        "Identity.java",
+        "package app; public class Identity { public <T> T id(T value) { return value; } }".into(),
+    );
+    ws.open(
+        "Use.kt",
+        "package app\nfun run(identity: Identity, supply: Body) { identity.id(supply).string() }\n"
+            .into(),
+    );
+    for file in ["Use.java", "Use.kt"] {
+        assert_member(&mut ws, file, "identity.id(supply).", "string", "enqueue");
+        assert_exact_definition(
+            &mut ws,
+            file,
+            "identity.id(supply).string()",
+            "Body.kt",
+            "string",
+        );
+    }
+}

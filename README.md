@@ -204,9 +204,10 @@ Java/Kotlin sources, including new buffers. Their accepted results use the ordin
 push/pull diagnostic store; unsupported, failed or stale runs cannot clear it.
 The `java` scenario also checks Kotlin body members from Java try-with-resources:
 partial selectors and unfinished nested `println`, exact member/local/field navigation,
-and outer-field scope before the try, in catch/finally and after it. A valid `var`
-resource requires useful `Body.string` completion and remains a coverage gap until
-that first response succeeds; empty results cannot satisfy this positive case.
+and outer-field scope before the try, in catch/finally and after it. Valid `var`
+resources and same-file factory initializers require useful `Body.string` completion.
+It also checks a cursor before an authored selector suffix and 32 nested generic
+method results with exact Kotlin navigation. Empty results cannot satisfy these cases.
 `java-resource-body.json` records reconstructed outbound edits, first RPCs and restoration.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
 and KMP navigation. Imported extension aliases also cover typed return chains with

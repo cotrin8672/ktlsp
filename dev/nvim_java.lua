@@ -596,7 +596,7 @@ do
   local original_disk = { java = disk_sha(path), kotlin = disk_sha(kotlin_path) }
   local resource_uri = vim.uri_from_bufnr(resource_buf)
   local wire_text, latest = probe.buffer_full_text(resource_buf), nil
-  local report = { requests = {}, outbound = {}, expected_probe_count = 14,
+  local report = { requests = {}, outbound = {}, expected_probe_count = 18,
     original_source_sha256 = original_hash, original_disk_sha256 = original_disk,
     valid_var_status = "OPEN unless the first response offers Body.string; empty is a mismatch" }
   local notify = client.rpc.notify
@@ -681,6 +681,16 @@ do
     end
     completion("valid var unfinished println positive", "System.out.println(inferredBody.string());", "inferredBody",
       "            System.out.println(inferredBody.", "string", "enqueue")
+    completion("var factory unfinished println", "System.out.println(factoryBody.string());", "factoryBody",
+      "        System.out.println(factoryBody.", "string", "enqueue")
+    completion("authored selector suffix after cursor", "System.out.println(factoryBody.string());", "string",
+      nil, "string", "enqueue")
+    local chain = "supply"
+    for _ = 1, 32 do chain = "identity(" .. chain .. ")" end
+    completion("32 nested generic results", "identity(supply).string();", "string",
+      "        " .. chain .. ".", "string", "enqueue")
+    definition("32 nested generic results Kotlin member", "identity(supply).string();", "string",
+      "        " .. chain .. ".string();", kotlin_path, kotlin_original, "fun string():")
   end, debug.traceback)
   if not vim.deep_equal(vim.api.nvim_buf_get_lines(resource_buf, 0, -1, false), original) then
     vim.api.nvim_buf_set_lines(resource_buf, 0, -1, false, original)

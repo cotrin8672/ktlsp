@@ -903,7 +903,7 @@ fn collect_unresolved_references(
             let name = node_text(name_node, src);
             let absent = if let Some(object) = node.child_by_field_name("object") {
                 !java_synthetic_member_resolves(name, name_node, src)
-                    && receiver_type(index, file, src, tree, object).is_some_and(|receiver| {
+                    && receiver_type(index, file, src, tree, object, 0).is_some_and(|receiver| {
                         crate::resolve::member_name_status_for_receiver(
                             index,
                             file,
@@ -1205,9 +1205,9 @@ fn java_call_entries_with_imports(
     package: &str,
     imports: &[Import],
 ) -> Vec<Entry> {
-    let arguments = java_call_arguments(index, file, src, tree, call);
+    let arguments = java_call_arguments(index, file, src, tree, call, 0);
     java_call_entries_with_arguments(
-        index, file, src, tree, call, name, symbol, package, imports, &arguments,
+        index, file, src, tree, call, name, symbol, package, imports, &arguments, 0,
     )
 }
 
@@ -1222,14 +1222,22 @@ fn java_call_entries_with_arguments(
     package: &str,
     imports: &[Import],
     arguments: &ktcore::members::CallArguments,
+    initializer_depth: usize,
 ) -> Vec<Entry> {
     let explicit_call =
         call.kind() == "method_invocation" && call.child_by_field_name("object").is_some();
     let mut arguments = arguments.clone();
     // Keep alternative arities for signature help and shape diagnostics while typing arguments.
     arguments.count = None;
-    let member_call =
-        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments);
+    let member_call = java_member_call_candidates_with_arguments(
+        index,
+        file,
+        src,
+        tree,
+        call,
+        &arguments,
+        initializer_depth,
+    );
     let resolved_member_call = member_call.is_some();
     let defs = if let Some(selection) = member_call {
         selection
@@ -1244,7 +1252,17 @@ fn java_call_entries_with_arguments(
     } else if explicit_call {
         return Vec::new();
     } else {
-        goto_definition_with_imports(index, file, src, tree, name.start_byte(), package, imports)
+        goto_definition_with_imports(
+            index,
+            file,
+            src,
+            tree,
+            name.start_byte(),
+            package,
+            imports,
+            Some(&arguments),
+            initializer_depth,
+        )
     };
     let seeds = defs
         .into_iter()
@@ -1382,7 +1400,7 @@ fn java_argument_type_mismatch_query(
     let mut arg_types = Vec::with_capacity(args.len());
     let mut labels = Vec::with_capacity(args.len());
     for arg in args {
-        let ty = java_expression_type(index, file, src, tree, arg)?;
+        let ty = java_expression_type(index, file, src, tree, arg, 0)?;
         labels.push(ty.name.clone());
         arg_types.push(ty);
     }
@@ -1427,6 +1445,7 @@ fn java_expression_type(
     src: &str,
     tree: &Tree,
     expr: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<JavaExprType> {
     match expr.kind() {
         "string_literal" => Some(JavaExprType {
@@ -1463,7 +1482,8 @@ fn java_expression_type(
         "identifier" => {
             let decl = local_declaration_node(src, expr)
                 .or_else(|| same_file_field_declaration(src, expr))?;
-            let receiver = type_of_value_declaration(index, file, src, tree, decl)?;
+            let receiver =
+                type_of_value_declaration(index, file, src, tree, decl, initializer_depth)?;
             Some(JavaExprType {
                 name: receiver.name()?.to_string(),
                 package: receiver.package().map(str::to_string),
@@ -1815,7 +1835,7 @@ pub fn authored_goto_definition(
 ) -> Vec<Def> {
     let package = package_of(tree, src);
     let imports = imports_of(tree, src);
-    goto_definition_with_imports(index, file, src, tree, offset, &package, &imports)
+    goto_definition_with_imports(index, file, src, tree, offset, &package, &imports, None, 0)
 }
 
 fn goto_definition_with_imports(
@@ -1826,6 +1846,8 @@ fn goto_definition_with_imports(
     offset: usize,
     package: &str,
     imports: &[Import],
+    arguments: Option<&ktcore::members::CallArguments>,
+    initializer_depth: usize,
 ) -> Vec<Def> {
     let usage = match identifier_at(tree, offset) {
         Some(node) => node,
@@ -1858,7 +1880,9 @@ fn goto_definition_with_imports(
             }];
         }
     }
-    if let Some(defs) = receiver_member_defs(index, file, src, tree, usage) {
+    if let Some(defs) =
+        receiver_member_defs(index, file, src, tree, usage, arguments, initializer_depth)
+    {
         return defs;
     }
     if let Some(defs) = qualified_member_defs(index, src, tree, usage) {
@@ -1901,7 +1925,9 @@ fn java_reference_resolves_with_ctx(
     if type_parameter_in_scope(usage, src) {
         return true;
     }
-    if receiver_member_defs(index, file, src, tree, usage).is_some_and(|defs| !defs.is_empty()) {
+    if receiver_member_defs(index, file, src, tree, usage, None, 0)
+        .is_some_and(|defs| !defs.is_empty())
+    {
         return true;
     }
     if qualified_member_defs(index, src, tree, usage).is_some_and(|defs| !defs.is_empty()) {
@@ -1989,7 +2015,7 @@ pub fn type_definition(
     } else {
         local_declaration_node(src, usage).or_else(|| same_file_field_declaration(src, usage))
     } {
-        if let Some(ty) = type_of_value_declaration(index, file, src, tree, decl) {
+        if let Some(ty) = type_of_value_declaration(index, file, src, tree, decl, 0) {
             return type_defs_for_receiver(index, &ty);
         }
     }
@@ -2277,6 +2303,17 @@ fn local_definition(file: &str, src: &str, usage: Node<'_>) -> Option<Def> {
 }
 
 fn local_declaration_node<'a>(src: &str, usage: Node<'a>) -> Option<Node<'a>> {
+    if usage.kind() != "identifier"
+        || is_java_call_name(usage)
+        || usage.parent().is_some_and(|parent| {
+            parent.kind() == "field_access" && parent.child_by_field_name("field") == Some(usage)
+                || parent.kind() == "method_reference"
+                    && parent.named_child(parent.named_child_count().saturating_sub(1))
+                        == Some(usage)
+        })
+    {
+        return None;
+    }
     let name = node_text(usage, src);
     let mut current = usage;
     while let Some(parent) = current.parent() {
@@ -2329,6 +2366,15 @@ fn local_declaration_from_parent<'a>(
     name: &str,
 ) -> Option<Node<'a>> {
     match parent.kind() {
+        "variable_declarator"
+            if parent
+                .parent()
+                .is_some_and(|declaration| declaration.kind() == "local_variable_declaration")
+                && parent.child_by_field_name("value") == Some(current) =>
+        {
+            // Local scope includes its own initializer; definite assignment is separate.
+            name_field(parent).filter(|declaration| node_text(*declaration, src) == name)
+        }
         "block" => {
             let mut cursor = parent.walk();
             let siblings = parent.named_children(&mut cursor).collect::<Vec<_>>();
@@ -2509,12 +2555,26 @@ fn receiver_member_defs(
     src: &str,
     tree: &Tree,
     usage: Node<'_>,
+    arguments: Option<&ktcore::members::CallArguments>,
+    initializer_depth: usize,
 ) -> Option<Vec<Def>> {
     let start = std::time::Instant::now();
     let parent = usage.parent()?;
     let kind = parent.kind();
     if kind == "method_invocation" && parent.child_by_field_name("name") == Some(usage) {
-        if let Some(selection) = java_member_call_candidates(index, file, src, tree, parent) {
+        let selection = match arguments {
+            Some(arguments) => java_member_call_candidates_with_arguments(
+                index,
+                file,
+                src,
+                tree,
+                parent,
+                arguments,
+                initializer_depth,
+            ),
+            None => java_member_call_candidates(index, file, src, tree, parent, initializer_depth),
+        };
+        if let Some(selection) = selection {
             return Some(
                 selection
                     .navigation_candidates()
@@ -2532,7 +2592,7 @@ fn receiver_member_defs(
         _ => None,
     }?;
     let name = node_text(usage, src);
-    let Some(recv) = receiver_type(index, file, src, tree, object) else {
+    let Some(recv) = receiver_type(index, file, src, tree, object, initializer_depth) else {
         return Some(Vec::new());
     };
     let members = java_member_entries(index, &recv, name, SymbolKind::Property);
@@ -2675,6 +2735,7 @@ fn receiver_type(
     src: &str,
     tree: &Tree,
     object: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<Type> {
     match object.kind() {
         "this" | "super" => {
@@ -2711,7 +2772,7 @@ fn receiver_type(
             if let Some(decl) = local_declaration_node(src, object)
                 .or_else(|| same_file_field_declaration(src, object))
             {
-                return type_of_value_declaration(index, file, src, tree, decl);
+                return type_of_value_declaration(index, file, src, tree, decl, initializer_depth);
             }
             receiver_type_from_type_identifier(index, file, src, tree, object)
         }
@@ -2719,7 +2780,9 @@ fn receiver_type(
             let ty = object.child_by_field_name("type")?;
             receiver_type_from_type_node(index, file, src, tree, ty)
         }
-        "method_invocation" => java_method_invocation_return_type(index, file, src, tree, object),
+        "method_invocation" => {
+            java_method_invocation_return_type(index, file, src, tree, object, initializer_depth)
+        }
         _ => None,
     }
 }
@@ -2755,6 +2818,7 @@ fn java_member_receiver(
     src: &str,
     tree: &Tree,
     call: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<(Type, ktcore::jvm::ReceiverKind)> {
     use ktcore::jvm::ReceiverKind;
     let Some(object) = call.child_by_field_name("object") else {
@@ -2765,8 +2829,15 @@ fn java_member_receiver(
         "identifier" => {
             if let Some(declaration) = local_declaration_node(src, object) {
                 return Some((
-                    type_of_value_declaration(index, file, src, tree, declaration)
-                        .unwrap_or(Type::Unknown),
+                    type_of_value_declaration(
+                        index,
+                        file,
+                        src,
+                        tree,
+                        declaration,
+                        initializer_depth,
+                    )
+                    .unwrap_or(Type::Unknown),
                     ReceiverKind::Value,
                 ));
             }
@@ -2787,8 +2858,15 @@ fn java_member_receiver(
                     ReceiverKind::Unknown
                 };
                 return Some((
-                    type_of_value_declaration(index, file, src, tree, declaration)
-                        .unwrap_or(Type::Unknown),
+                    type_of_value_declaration(
+                        index,
+                        file,
+                        src,
+                        tree,
+                        declaration,
+                        initializer_depth,
+                    )
+                    .unwrap_or(Type::Unknown),
                     kind,
                 ));
             }
@@ -2843,12 +2921,12 @@ fn java_member_receiver(
                 .map(|receiver| (receiver, ReceiverKind::Unknown))
         }
         "object_creation_expression" | "method_invocation" => {
-            receiver_type(index, file, src, tree, object)
+            receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
-        "this" | "super" => receiver_type(index, file, src, tree, object)
+        "this" | "super" => receiver_type(index, file, src, tree, object, initializer_depth)
             .map(|receiver| (receiver, implicit_receiver_kind(call, src))),
-        _ => receiver_type(index, file, src, tree, object)
+        _ => receiver_type(index, file, src, tree, object, initializer_depth)
             .map(|receiver| (receiver, ReceiverKind::Unknown)),
     }
 }
@@ -2889,6 +2967,7 @@ fn java_member_call_candidates<'a>(
     src: &str,
     tree: &Tree,
     call: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<ktcore::jvm::CallSelection<'a>> {
     java_member_call_candidates_with_arguments(
         index,
@@ -2896,7 +2975,8 @@ fn java_member_call_candidates<'a>(
         src,
         tree,
         call,
-        &java_call_arguments(index, file, src, tree, call),
+        &java_call_arguments(index, file, src, tree, call, initializer_depth),
+        initializer_depth,
     )
 }
 
@@ -2907,6 +2987,7 @@ fn java_member_call_candidates_with_arguments<'a>(
     tree: &Tree,
     call: Node<'_>,
     arguments: &ktcore::members::CallArguments,
+    initializer_depth: usize,
 ) -> Option<ktcore::jvm::CallSelection<'a>> {
     if call.kind() != "method_invocation" {
         return None;
@@ -2914,12 +2995,13 @@ fn java_member_call_candidates_with_arguments<'a>(
     let name = node_text(call.child_by_field_name("name")?, src);
     let object = call.child_by_field_name("object");
     let receiver = match object {
-        Some(object) => receiver_type(index, file, src, tree, object),
+        Some(object) => receiver_type(index, file, src, tree, object, initializer_depth),
         None => enclosing_type_name(call, src)
             .map(|name| Type::class(name, Some(package_of(tree, src)))),
     };
-    let receiver = receiver
-        .or_else(|| java_member_receiver(index, file, src, tree, call).map(|(ty, _)| ty))?;
+    let receiver = receiver.or_else(|| {
+        java_member_receiver(index, file, src, tree, call, initializer_depth).map(|(ty, _)| ty)
+    })?;
     let mut candidates = ktcore::jvm::member_candidates(index, &receiver, name);
     let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
     let selection = if candidates.iter().any(|candidate| {
@@ -2931,7 +3013,8 @@ fn java_member_call_candidates_with_arguments<'a>(
             }
         )
     }) {
-        let (verified_receiver, kind) = java_member_receiver(index, file, src, tree, call)?;
+        let (verified_receiver, kind) =
+            java_member_receiver(index, file, src, tree, call, initializer_depth)?;
         if verified_receiver != receiver {
             candidates = ktcore::jvm::member_candidates(index, &verified_receiver, name);
         }
@@ -2957,6 +3040,7 @@ fn java_call_arguments(
     src: &str,
     tree: &Tree,
     call: Node<'_>,
+    initializer_depth: usize,
 ) -> ktcore::members::CallArguments {
     let nodes = (!call.has_error())
         .then(|| java_argument_nodes(src, call))
@@ -2966,7 +3050,10 @@ fn java_call_arguments(
         types: nodes
             .into_iter()
             .flatten()
-            .map(|node| java_argument_type(index, file, src, tree, node).unwrap_or(Type::Unknown))
+            .map(|node| {
+                java_argument_type(index, file, src, tree, node, initializer_depth)
+                    .unwrap_or(Type::Unknown)
+            })
             .collect(),
         names: None,
         has_spread: false,
@@ -2980,13 +3067,26 @@ fn java_argument_type(
     src: &str,
     tree: &Tree,
     node: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<Type> {
-    if let Some(ty) = receiver_type(index, file, src, tree, node) {
+    if initializer_depth > 0 && node.kind() == "identifier" {
+        let declaration =
+            local_declaration_node(src, node).or_else(|| same_file_field_declaration(src, node))?;
+        return type_of_value_declaration(index, file, src, tree, declaration, initializer_depth);
+    }
+    if initializer_depth > 0
+        && node.kind() == "object_creation_expression"
+        && child_of_kind(node, "class_body").is_some()
+    {
+        // shortcut: anonymous initializer types stay unknown until their own members are indexed.
+        return None;
+    }
+    if let Some(ty) = receiver_type(index, file, src, tree, node, initializer_depth) {
         return Some(ty);
     }
     if node.kind() == "parenthesized_expression" {
         let child = node.named_child(0)?;
-        return java_argument_type(index, file, src, tree, child);
+        return java_argument_type(index, file, src, tree, child, initializer_depth);
     }
     if matches!(
         node.kind(),
@@ -3001,7 +3101,7 @@ fn java_argument_type(
             | "octal_integer_literal"
             | "binary_integer_literal"
     ) {
-        let ty = java_expression_type(index, file, src, tree, node)?;
+        let ty = java_expression_type(index, file, src, tree, node, initializer_depth)?;
         return Some(Type::class(ty.name, ty.package));
     }
     None
@@ -3019,7 +3119,7 @@ pub(crate) fn jvm_call_selection_at<'a>(
     if call.kind() != "method_invocation" || call.child_by_field_name("name") != Some(usage) {
         return None;
     }
-    java_member_call_candidates(index, file, src, tree, call)
+    java_member_call_candidates(index, file, src, tree, call, 0)
 }
 
 pub fn jvm_member_at(
@@ -3046,10 +3146,10 @@ pub fn jvm_call_signatures(
 ) -> (Vec<crate::signature::Signature>, bool) {
     let unqualified =
         call.kind() == "method_invocation" && call.child_by_field_name("object").is_none();
-    let mut arguments = java_call_arguments(index, file, src, tree, call);
+    let mut arguments = java_call_arguments(index, file, src, tree, call, 0);
     arguments.count = None;
     let Some(selection) =
-        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments)
+        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments, 0)
     else {
         return (Vec::new(), unqualified);
     };
@@ -3080,16 +3180,23 @@ fn java_method_invocation_return_type(
     src: &str,
     tree: &Tree,
     call: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<Type> {
     let name = call.child_by_field_name("name")?;
     let symbol = node_text(name, src);
     if symbol.is_empty() {
         return None;
     }
-    let arguments = java_call_arguments(index, file, src, tree, call);
-    if let Some(candidates) =
-        java_member_call_candidates_with_arguments(index, file, src, tree, call, &arguments)
-    {
+    let arguments = java_call_arguments(index, file, src, tree, call, initializer_depth);
+    if let Some(candidates) = java_member_call_candidates_with_arguments(
+        index,
+        file,
+        src,
+        tree,
+        call,
+        &arguments,
+        initializer_depth,
+    ) {
         if candidates.applicability == ktcore::members::Applicability::Rejected {
             return None;
         }
@@ -3124,7 +3231,17 @@ fn java_method_invocation_return_type(
     let package = package_of(tree, src);
     let imports = imports_of(tree, src);
     let entries = java_call_entries_with_arguments(
-        index, file, src, tree, call, name, symbol, &package, &imports, &arguments,
+        index,
+        file,
+        src,
+        tree,
+        call,
+        name,
+        symbol,
+        &package,
+        &imports,
+        &arguments,
+        initializer_depth,
     );
     if entries.is_empty() {
         return None;
@@ -3140,7 +3257,8 @@ fn java_method_invocation_return_type(
     let args = java_argument_nodes(src, call)?;
     let arg_count = args.len();
     let receiver = match call.child_by_field_name("object") {
-        Some(object) => receiver_type(index, file, src, tree, object).unwrap_or(Type::Unknown),
+        Some(object) => receiver_type(index, file, src, tree, object, initializer_depth)
+            .unwrap_or(Type::Unknown),
         None => enclosing_type_name(call, src)
             .map(|name| Type::class(name, Some(package.clone())))
             .unwrap_or(Type::Unknown),
@@ -3242,6 +3360,7 @@ fn type_of_value_declaration(
     src: &str,
     tree: &Tree,
     decl: Node<'_>,
+    initializer_depth: usize,
 ) -> Option<Type> {
     let parent = decl.parent()?;
     let type_node = match parent.kind() {
@@ -3250,7 +3369,47 @@ fn type_of_value_declaration(
         "resource" => parent.child_by_field_name("type")?,
         _ => return None,
     };
+    if type_node.kind() == "type_identifier" && node_text(type_node, src) == "var" {
+        if initializer_depth >= infer::MAX_DEPTH {
+            // shortcut: valid deeper var aliases stay Unknown until initializer expansion is iterative.
+            return None;
+        }
+        let local = parent.kind() == "resource"
+            || parent.kind() == "variable_declarator"
+                && parent
+                    .parent()
+                    .is_some_and(|declaration| declaration.kind() == "local_variable_declaration");
+        if !local || parent.child_by_field_name("dimensions").is_some() {
+            return None;
+        }
+        let initializer = parent.child_by_field_name("value")?;
+        if initializer.has_error() || initializer_uses_declaration(src, initializer, decl) {
+            return None;
+        }
+        return java_argument_type(index, file, src, tree, initializer, initializer_depth + 1);
+    }
     receiver_type_from_type_node(index, file, src, tree, type_node)
+}
+
+fn initializer_uses_declaration(src: &str, initializer: Node<'_>, declaration: Node<'_>) -> bool {
+    let mut cursor = initializer.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "identifier"
+            && node_text(node, src) == node_text(declaration, src)
+            && local_declaration_node(src, node) == Some(declaration)
+        {
+            return true;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return false;
+            }
+        }
+    }
 }
 
 fn receiver_type_from_type_node(
@@ -3568,23 +3727,81 @@ pub fn completion_query(
     let context = completion_context(tree, src, offset);
     if context == complete::CompletionContext::AfterDot {
         let (prefix, mut synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
-        // An unfinished `h.name` statement can parse as a type; a call forces a receiver expression.
-        synthetic.insert_str(syn_offset, "()");
+        let selector_end = syn_offset
+            + synthetic[syn_offset..]
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+                .map(char::len_utf8)
+                .sum::<usize>();
+        // Preserve an authored call, including a selector suffix to the right of the cursor.
+        let force_call = !synthetic[selector_end..].trim_start().starts_with('(');
+        if force_call {
+            synthetic.insert_str(selector_end, "()");
+        }
         let mut synthetic_tree = JavaParser::new().parse(&synthetic);
-        if completion_needs_scope(&synthetic_tree, syn_offset) {
-            if let Some(delimiters) = completion_delimiter_stack(&synthetic_tree, syn_offset + 2) {
-                if let Some(closers) = completion_call_closers(&synthetic, syn_offset, &delimiters)
-                {
-                    synthetic.insert_str(syn_offset + 2, &closers);
+        let call_end = if force_call {
+            Some(selector_end + 2)
+        } else {
+            completion_receiver_at(&synthetic_tree, syn_offset)
+                .and_then(|receiver| receiver.parent())
+                .and_then(|call| call.child_by_field_name("arguments"))
+                .filter(|arguments| !arguments.has_error())
+                .map(|arguments| arguments.end_byte())
+        };
+        let mut restored = None;
+        let mut truncated = false;
+        if let Some(call_end) =
+            call_end.filter(|_| completion_needs_scope(&synthetic_tree, syn_offset))
+        {
+            if let Some(delimiters) = completion_delimiter_stack(&synthetic_tree, call_end) {
+                if let Some(closers) = completion_call_closers(&synthetic, call_end, &delimiters) {
+                    restored = Some((call_end, closers.len()));
+                    synthetic.insert_str(call_end, &closers);
                     synthetic_tree = JavaParser::new().parse(&synthetic);
-                } else if let Some((prefix_source, prefix_tree)) =
-                    completion_prefix_source(&synthetic_tree, &synthetic, syn_offset, &delimiters)
-                {
+                } else if let Some((prefix_source, prefix_tree)) = completion_prefix_source(
+                    &synthetic_tree,
+                    &synthetic,
+                    syn_offset,
+                    call_end,
+                    &delimiters,
+                ) {
                     synthetic = prefix_source;
                     synthetic_tree = prefix_tree;
+                    truncated = true;
                 }
             }
         }
+        let mut source = crate::index::Index::new();
+        let recovered = if tree.root_node().has_error() && !truncated {
+            let mut symbols = extract_symbols(&synthetic_tree, &synthetic);
+            let (call_end, restored_closers) = restored.unwrap_or((selector_end, 0));
+            // Keep semantic identities at authored offsets; discard names touching synthetic text.
+            symbols.retain_mut(|symbol| {
+                for (at, len) in [
+                    (call_end, restored_closers),
+                    (selector_end, usize::from(force_call) * 2),
+                    (offset, complete::DOT_PLACEHOLDER.len()),
+                ] {
+                    if len == 0 {
+                        continue;
+                    }
+                    if symbol.start_byte >= at + len {
+                        symbol.start_byte -= len;
+                        symbol.end_byte -= len;
+                    } else if symbol.end_byte > at {
+                        return false;
+                    }
+                }
+                true
+            });
+            source.replace_file(file, symbols, crate::index::Tier::Volatile);
+            Some(semantic_query::RecoveredTypeIndex::replacing_file(
+                index, &source, file,
+            ))
+        } else {
+            None
+        };
+        let index: &dyn InferenceIndex = recovered.as_ref().map_or(index, |recovered| recovered);
         let receiver = completion_receiver_at(&synthetic_tree, syn_offset);
         let (ty, receiver_kind) = if index.may_have_compiled_callables() {
             receiver
@@ -3595,6 +3812,7 @@ pub fn completion_query(
                         &synthetic,
                         &synthetic_tree,
                         receiver.parent()?,
+                        0,
                     )
                 })
                 .unwrap_or((Type::Unknown, ktcore::jvm::ReceiverKind::Unknown))
@@ -3602,7 +3820,7 @@ pub fn completion_query(
             (
                 receiver
                     .and_then(|receiver| {
-                        receiver_type(index, file, &synthetic, &synthetic_tree, receiver)
+                        receiver_type(index, file, &synthetic, &synthetic_tree, receiver, 0)
                     })
                     .unwrap_or(Type::Unknown),
                 ktcore::jvm::ReceiverKind::Unknown,
@@ -3655,6 +3873,10 @@ fn completion_needs_scope(tree: &Tree, selector_offset: usize) -> bool {
     };
     let mut scope = Some(receiver);
     while let Some(node) = scope {
+        // A malformed call can swallow later declarations even when its block survives.
+        if node.kind() == "ERROR" {
+            return true;
+        }
         if node.kind() == "block" {
             return false;
         }
@@ -3665,12 +3887,10 @@ fn completion_needs_scope(tree: &Tree, selector_offset: usize) -> bool {
 
 fn completion_call_closers(
     src: &str,
-    selector_offset: usize,
+    insert_at: usize,
     delimiters: &[(u8, bool)],
 ) -> Option<String> {
-    // The caller just inserted () after the placeholder. Do not close an authored suffix or
-    // turn a following statement into a call argument.
-    let insert_at = selector_offset + 2;
+    // Do not close an authored suffix or turn a following statement into a call argument.
     let suffix = src.get(insert_at..)?.trim_start();
     if !suffix.is_empty() && !suffix.starts_with('}') {
         return None;
@@ -3700,13 +3920,13 @@ fn completion_prefix_source(
     tree: &Tree,
     src: &str,
     selector_offset: usize,
+    end: usize,
     delimiters: &[(u8, bool)],
 ) -> Option<(String, Tree)> {
     let original = completion_receiver_at(tree, selector_offset)?;
     if original.kind() != "identifier" {
         return None;
     }
-    let end = selector_offset + 2;
     if delimiters.iter().any(|(_, semicolon)| *semicolon) {
         return None;
     }
@@ -4655,7 +4875,7 @@ class Child extends Base {
             assert_eq!(call.kind(), "method_invocation");
             assert_eq!(node_text(call, &source), expression);
             assert_eq!(
-                java_method_invocation_return_type(&index, "Use.java", &source, &tree, call),
+                java_method_invocation_return_type(&index, "Use.java", &source, &tree, call, 0),
                 Some(Type::class("Result", Some("demo".into()))),
                 "the complete nested call must retain its useful result at depth {depth}"
             );
@@ -4668,6 +4888,79 @@ class Child extends Base {
         assert!(
             (1..=4).contains(&counts[1]),
             "leaf work must be bounded independently of nesting: {counts:?}"
+        );
+
+        let mut generic_counts = Vec::new();
+        for depth in [1, 8, 20, 32] {
+            let mut expression = "leaf.leaf()".to_string();
+            for _ in 0..depth {
+                expression = format!("identity.id({expression})");
+            }
+            let source = format!("package demo; class Result {{}} class Identity {{ public <T> T id(T value) {{ return value; }} }} class LeafOwner {{ public Result leaf() {{ return null; }} }} class Use {{ void use(Identity identity,LeafOwner leaf) {{ {expression}; }} }}");
+            let tree = JavaParser::new().parse(&source);
+            let mut raw = Index::new();
+            raw.replace_file("Use.java", extract_symbols(&tree, &source), Tier::Volatile);
+            let index = CountIndex {
+                index: raw,
+                leaf_queries: Cell::new(0),
+            };
+            let start = source.find(&expression).unwrap();
+            let call = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(call.kind(), "method_invocation");
+            assert_eq!(
+                java_method_invocation_return_type(&index, "Use.java", &source, &tree, call, 0),
+                Some(Type::class("Result", Some("demo".into()))),
+                "generic identity must retain the computed leaf type at ordinary call depth {depth}",
+            );
+            generic_counts.push(index.leaf_queries.get());
+        }
+        assert!(
+            generic_counts
+                .iter()
+                .all(|count| *count == generic_counts[0]),
+            "ordinary call depth must not repeat or skip the leaf: {generic_counts:?}"
+        );
+        assert!(
+            (1..=4).contains(&generic_counts[0]),
+            "the useful deep result requires bounded, nonzero leaf inference: {generic_counts:?}"
+        );
+
+        let mut unknown_counts = Vec::new();
+        for depth in [1, 8] {
+            let mut expression = "leaf.leaf()".to_string();
+            for _ in 0..depth {
+                expression = format!("missing({expression})");
+            }
+            let source = format!("package demo; class Result {{}} class LeafOwner {{ public Result leaf() {{ return null; }} }} class Use {{ void use(LeafOwner leaf) {{ var value = {expression}; }} }}");
+            let tree = JavaParser::new().parse(&source);
+            let mut raw = Index::new();
+            raw.replace_file("Use.java", extract_symbols(&tree, &source), Tier::Volatile);
+            let index = CountIndex {
+                index: raw,
+                leaf_queries: Cell::new(0),
+            };
+            let start = source.find(&expression).unwrap();
+            let call = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(call.kind(), "method_invocation");
+            assert_eq!(
+                java_method_invocation_return_type(&index, "Use.java", &source, &tree, call, 0),
+                None
+            );
+            unknown_counts.push(index.leaf_queries.get());
+        }
+        assert_eq!(
+            unknown_counts[0], unknown_counts[1],
+            "unresolved implicit calls must share their argument inference: {unknown_counts:?}"
+        );
+        assert!(
+            (1..=4).contains(&unknown_counts[1]),
+            "unknown fallback must not repeat the leaf inference: {unknown_counts:?}"
         );
     }
 
@@ -4776,6 +5069,62 @@ class Child extends Base {
     }
 
     #[test]
+    fn java_completion_recovers_current_same_file_factories_and_authored_call_suffixes() {
+        let types = "package app; class Body { String string() { return null; } }";
+        let mut index = Index::new();
+        let tree = JavaParser::new().parse(types);
+        index.replace_file("Body.java", extract_symbols(&tree, types), Tier::Volatile);
+        for (source, cursor) in [
+            ("package app; class Use { Body make() { return null; } void run() { var body = make(); System.out.println(body. } }", "body."),
+            ("package app; class Use { void run() { var body = make(); System.out.println(body. } Body make() { return null; } }", "body."),
+            ("package app; class Use { void run(Body body) { body.string(); } }", "body."),
+            ("package app; class Use { void run(Body body) { body.string(); } }", "body.str"),
+            ("package app; class Use { void run(Body body) { body.string; } }", "body.str"),
+        ] {
+            let tree = JavaParser::new().parse(source);
+            let original = extract_symbols(&tree, source);
+            index.replace_file("Use.java", original.clone(), Tier::Volatile);
+            let offset = source.find(cursor).unwrap() + cursor.len();
+            let query = completion_query(&index, "Use.java", source, &tree, offset, 100).unwrap();
+            assert!(query.candidates.iter().any(|candidate| candidate.label == "string"),
+                "{cursor} in {source}: {:?}", query.candidates);
+            assert_eq!(index.entries_for_file("Use.java").len(), original.len());
+        }
+    }
+
+    #[test]
+    fn java_completion_recovers_same_file_generic_calls_in_unfinished_statements() {
+        let types = "package app; class Body { String string() { return null; } }";
+        let mut index = Index::new();
+        let tree = JavaParser::new().parse(types);
+        index.replace_file("Body.java", extract_symbols(&tree, types), Tier::Volatile);
+        for depth in [1, 8, 32] {
+            let mut expression = "supply".to_string();
+            for _ in 0..depth {
+                expression = format!("identity({expression})");
+            }
+            let source = format!("package app; class Use {{ <T> T identity(T value) {{ return value; }} void run(Body supply) {{ {expression}. }} }}");
+            let tree = JavaParser::new().parse(&source);
+            index.replace_file("Use.java", extract_symbols(&tree, &source), Tier::Volatile);
+            let offset = source.find(&format!("{expression}.")).unwrap() + expression.len() + 1;
+            let query = completion_query(&index, "Use.java", &source, &tree, offset, 100).unwrap();
+            assert!(
+                query
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.label == "string"),
+                "depth {depth}: {:?}; original declarations: {:?}",
+                query.candidates,
+                index
+                    .entries_for_file("Use.java")
+                    .iter()
+                    .map(|entry| &entry.sym.name)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn java_receiver_field_goto_preserves_identifier_roles_and_local_shadowing() {
         let type_source = "package app; class Body { public void string() {} } class body {} class Other { Body body; }";
         let source = r#"package app; class Use {
@@ -4864,12 +5213,12 @@ class Child extends Base {
             synthetic.insert_str(selector_offset, "()");
             let tree = JavaParser::new().parse(&synthetic);
             let delimiters = completion_delimiter_stack(&tree, selector_offset + 2).unwrap();
-            let recovered = completion_prefix_source(&tree, &synthetic, selector_offset, &delimiters);
+            let recovered = completion_prefix_source(&tree, &synthetic, selector_offset, selector_offset + 2, &delimiters);
             if let Some(expected) = expected_type {
                 let (prefix, prefix_tree) = recovered.unwrap_or_else(|| panic!("{case}"));
                 let receiver = completion_receiver_at(&prefix_tree, selector_offset).unwrap();
                 let declaration = local_declaration_node(&prefix, receiver).unwrap();
-                let ty = type_of_value_declaration(&index, "Use.java", &prefix, &prefix_tree, declaration).unwrap();
+                let ty = type_of_value_declaration(&index, "Use.java", &prefix, &prefix_tree, declaration, 0).unwrap();
                 assert_eq!(ty.name(), Some(expected), "{case}");
                 let source_tree = JavaParser::new().parse(source);
                 let query = completion_query(&index, "Use.java", source, &source_tree, offset, 100).unwrap();
@@ -4883,6 +5232,40 @@ class Child extends Base {
             } else {
                 assert!(recovered.is_none(), "{case}");
             }
+        }
+    }
+
+    #[test]
+    fn java_var_initializer_bindings_respect_value_and_selector_names() {
+        for (initializer, owns_value) in [
+            ("/*probe*/body", true),
+            ("make(/*probe*/body)", true),
+            ("/*probe*/body.make()", true),
+            ("new Body(/*probe*/body)", true),
+            ("/*probe*/body()", false),
+            ("factory./*probe*/body()", false),
+            ("factory./*probe*/body", false),
+            ("new /*probe*/body()", false),
+            ("factory::/*probe*/body", false),
+            ("/*probe*/body::make", true),
+        ] {
+            let source = format!("class Use {{ Body body; Body body() {{ return null; }} void run(Factory factory) {{ var body = {initializer}; }} }}");
+            let tree = JavaParser::new().parse(&source);
+            assert!(
+                !tree.root_node().has_error(),
+                "{initializer}: {}",
+                tree.root_node().to_sexp()
+            );
+            let declaration =
+                identifier_at(&tree, source.find("var body =").unwrap() + "var ".len()).unwrap();
+            let usage = identifier_at(&tree, source.find("/*probe*/").unwrap() + "/*probe*/".len())
+                .unwrap();
+            assert_eq!(
+                local_declaration_node(&source, usage),
+                owns_value.then_some(declaration),
+                "{initializer}: role {} must retain its lexical binding",
+                usage.kind(),
+            );
         }
     }
 }

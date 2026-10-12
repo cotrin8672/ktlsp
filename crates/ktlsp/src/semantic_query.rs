@@ -848,14 +848,26 @@ pub fn scope_name_query(
     })
 }
 
-// Kotlin replaces only its query file; Java's type recovery preserves other packages' homonyms.
-struct RecoveredTypeIndex<'a> {
+// Query recovery replaces only its file; member presentation preserves other packages' homonyms.
+pub(crate) struct RecoveredTypeIndex<'a> {
     index: &'a dyn InferenceIndex,
     source: &'a Index,
     replaced_file: Option<&'a str>,
 }
 
-impl RecoveredTypeIndex<'_> {
+impl<'scope> RecoveredTypeIndex<'scope> {
+    pub(crate) fn replacing_file(
+        index: &'scope dyn InferenceIndex,
+        source: &'scope Index,
+        file: &'scope str,
+    ) -> Self {
+        Self {
+            index,
+            source,
+            replaced_file: Some(file),
+        }
+    }
+
     fn replace_file_entries<'a>(
         &self,
         original: LookupEntries<'a>,
@@ -875,6 +887,20 @@ impl RecoveredTypeIndex<'_> {
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn java_class_inventory(
+        &self,
+        owner: &Entry,
+    ) -> Option<std::sync::Arc<ktcore::classfile::ClassFileFacts>> {
+        (self.replaced_file != Some(owner.path.as_ref()))
+            .then(|| self.index.java_class_inventory(owner))
+            .flatten()
+    }
+
+    fn java_source_members_complete(&self, owner: &Entry) -> bool {
+        self.replaced_file != Some(owner.path.as_ref())
+            && self.index.java_source_members_complete(owner)
+    }
+
     fn may_have_compiled_callables(&self) -> bool {
         self.index.may_have_compiled_callables()
     }

@@ -3016,11 +3016,12 @@ pub(crate) fn projected_member_application(
     entry: &Entry,
     bound: &members::BoundArguments<'_>,
 ) -> Option<solve::Application> {
-    if !entry
-        .sym
-        .params
-        .iter()
-        .any(|ty| solve::has_projection(ty) || !ty.args.is_empty())
+    if entry.sym.type_params.is_empty()
+        && !entry
+            .sym
+            .params
+            .iter()
+            .any(|ty| solve::has_projection(ty) || !ty.args.is_empty())
     {
         return None;
     }
@@ -3844,6 +3845,49 @@ mod tests {
     use super::named_type_params;
     use crate::index::{Index, Tier};
     use crate::symbol::{IndexedSymbol, SymbolKind};
+
+    #[test]
+    fn plain_method_variable_result_uses_current_normalized_argument_facts() {
+        use crate::members::CallArguments;
+        use crate::parser::KotlinParser;
+        use crate::types::Type;
+
+        let source = "package app\nclass Item\nclass Other\nclass Identity {\n fun <T> id(value: T): T = value\n}\n";
+        let mut parser = KotlinParser::new();
+        let mut index = Index::new();
+        index.replace_file(
+            "Types.kt",
+            crate::indexer::extract_symbols(&parser.parse(source), source, "app"),
+            Tier::Volatile,
+        );
+        let entry = index.lookup_by_name("id").first().unwrap();
+        let receiver = Type::class("Identity", Some("app".into()));
+        let ctx = super::FileCtx::new("app".into(), Vec::new());
+        for actual in [
+            Type::class("Item", Some("app".into())),
+            Type::class("Other", Some("app".into())),
+            Type::Unknown,
+        ] {
+            let arguments = CallArguments {
+                count: Some(1),
+                types: vec![actual.clone()],
+                names: None,
+                has_spread: false,
+                trailing_lambda: false,
+            };
+            assert_eq!(
+                super::declared_member_call_type(
+                    &index,
+                    &receiver,
+                    entry,
+                    entry.sym.return_type.as_ref().unwrap(),
+                    &arguments,
+                    &ctx,
+                ),
+                actual,
+            );
+        }
+    }
 
     #[test]
     fn supertype_walk_reports_cycles_and_depth_limits_as_incomplete() {
