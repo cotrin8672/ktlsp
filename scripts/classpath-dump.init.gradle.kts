@@ -17,7 +17,6 @@ import org.gradle.api.provider.Provider
 import org.gradle.api.tasks.SourceSet
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.compile.JavaCompile
-import org.gradle.process.CommandLineArgumentProvider
 
 class KtlspSourceSet(
     val name: String,
@@ -45,6 +44,195 @@ object KtlspCompilerConfiguration {
             home?.takeIf { it.isAbsolute && it.isDirectory }
         }.getOrNull()
     }
+
+    private fun javaConfiguredState(task: JavaCompile): List<Any?> {
+        val o = task.options
+        return listOf(
+            task.source.files.toList(), task.classpath.files.toList(), task.sourceCompatibility, task.targetCompatibility,
+            task.javaCompiler.isPresent, task.destinationDirectory.orNull?.asFile, task.modularity.inferModulePath.orNull,
+            o.release.orNull, o.encoding, o.sourcepath?.toList(), o.bootstrapClasspath?.toList(), o.extensionDirs,
+            o.isDebug, o.debugOptions.debugLevel, o.isWarnings, o.isDeprecation, o.isVerbose, o.isListFiles,
+            o.isFailOnError, o.isIncremental, o.compilerArgs.toList(), o.allCompilerArgs.toList(),
+            o.compilerArgumentProviders.toList(), o.annotationProcessorPath?.toList(),
+            o.generatedSourceOutputDirectory.orNull?.asFile, o.headerOutputDirectory.orNull?.asFile,
+            o.javaModuleVersion.orNull, o.javaModuleMainClass.orNull, o.isFork,
+            o.forkOptions.javaHome, o.forkOptions.executable, o.forkOptions.jvmArgs?.toList(),
+            o.forkOptions.allJvmArgs?.toList(), o.forkOptions.jvmArgumentProviders.toList(),
+            o.forkOptions.memoryInitialSize, o.forkOptions.memoryMaximumSize,
+            o.forkOptions.tempDir,
+        )
+    }
+
+    private fun javaCompilerRecipe(task: JavaCompile, selectedHome: java.io.File?): Map<String, Any?> {
+        // shortcut: this ABI is verified only for Gradle 7.4.2/current JDK 17, plain in-process javac.
+        check(task.project.gradle.gradleVersion == "7.4.2") { "Unsupported Java recipe Gradle adapter" }
+        check(read(task.project.gradle.startParameter, "isConfigurationCache") == false) {
+            "Java recipe capture requires configuration cache disabled"
+        }
+        check(task.javaClass.name in listOf("org.gradle.api.tasks.compile.JavaCompile",
+            "org.gradle.api.tasks.compile.JavaCompile_Decorated")) { "Unsupported Java recipe task type" }
+        val o = task.options
+        // allJvmArgs invokes providers even when fork=false; reject before reading it.
+        check(o.forkOptions.jvmArgumentProviders.isEmpty()) { "Java JVM argument providers are unhandled" }
+        check(!o.isFork && o.forkOptions.executable == null && o.forkOptions.jvmArgs.isNullOrEmpty() &&
+            o.forkOptions.allJvmArgs.isNullOrEmpty() && o.forkOptions.memoryInitialSize == null &&
+            o.forkOptions.memoryMaximumSize == null && o.forkOptions.tempDir == null) { "Unsupported Java compiler fork policy" }
+        check(o.compilerArgumentProviders.isEmpty()) { "Java compiler argument providers are unhandled" }
+        check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none")) { "Opaque Java compiler arguments are unhandled" }
+        check(o.annotationProcessorPath?.files?.isEmpty() != false) { "Java annotation processing is unhandled" }
+        check(o.sourcepath == null && o.bootstrapClasspath == null && o.extensionDirs == null &&
+            o.release.orNull == null && o.encoding == null) { "Unsupported Java source/SDK/encoding policy" }
+        check(o.javaModuleVersion.orNull == null && o.javaModuleMainClass.orNull == null &&
+            task.source.files.none { it.name == "module-info.java" }) { "Java modules are unhandled" }
+        fun invoke(name: String): Any = JavaCompile::class.java.getDeclaredMethod(name).apply {
+            isAccessible = true
+        }.invoke(task) ?: error("Java compiler adapter returned null: $name")
+        val stableSources = invoke("getStableSources") as? FileCollection
+            ?: error("Java stable source inventory is unavailable")
+        check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
+        val selected = (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
+            ?: error("Selected Java compiler is unavailable")
+        check(selected.javaClass.name == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler") {
+            "Unsupported selected Java compiler"
+        }
+        val metadata = selected.metadata
+        val home = metadata.installationPath.asFile
+        check(metadata.languageVersion.asInt() == 17 && home.isAbsolute && selectedHome != null &&
+            home.canonicalFile == selectedHome.canonicalFile &&
+            home.canonicalFile == java.io.File(System.getProperty("java.home")).canonicalFile) {
+            "Java recipe requires the selected current JDK 17"
+        }
+        check(o.forkOptions.javaHome == null || o.forkOptions.javaHome?.canonicalFile == home.canonicalFile) {
+            "Java compiler home selection differs"
+        }
+        val before = javaConfiguredState(task)
+        val sourcepath = o.sourcepath
+        val forkHome = o.forkOptions.javaHome
+        val spec = try {
+            invoke("createSpec")
+        } finally {
+            // The pinned createSpec mutates these two public options, even during metadata capture.
+            o.sourcepath = sourcepath
+            o.forkOptions.javaHome = forkHome
+            check(before == javaConfiguredState(task)) { "Java compiler configuration was not restored" }
+        }
+        check(spec.javaClass.name == "org.gradle.api.internal.tasks.compile.DefaultJavaCompileSpec") {
+            "Unsupported Java compiler execution spec"
+        }
+        val compileOptions = read(spec, "getCompileOptions") ?: error("Java compile options are unavailable")
+        check((read(spec, "getModulePath") as? Collection<*>)?.isEmpty() == true &&
+            (read(spec, "getAnnotationProcessorPath") as? Collection<*>)?.isEmpty() == true &&
+            read(spec, "getRelease") == null && read(compileOptions, "getSourcepath") == null &&
+            read(compileOptions, "getBootClasspath") == null && read(compileOptions, "getExtensionDirs") == null) {
+            "Unsupported Java compiler effective inputs"
+        }
+        check(read(spec, "getCompileClasspath") == task.classpath.toList() &&
+            read(spec, "getDestinationDir") == task.destinationDirectory.orNull?.asFile &&
+            read(compileOptions, "getCompilerArgs") == o.allCompilerArgs.toList()) {
+            "Java effective compiler inputs differ from the recorded task"
+        }
+        val builderType = Class.forName("org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder",
+            false, JavaCompile::class.java.classLoader)
+        val builder = builderType.constructors.single {
+            it.parameterCount == 1 && it.parameterTypes[0].isInstance(spec)
+        }.newInstance(spec)
+        val arguments = read(builder, "build") as? List<*> ?: error("Java API compiler options are unavailable")
+        check(arguments.all { it is String } && "-proc:none" in arguments) { "Unsupported Java API compiler options" }
+        val runtimeVersion = read(metadata, "getJavaRuntimeVersion") as? String
+            ?: error("Selected Java runtime version is unavailable")
+        val gradleVersion = System.getProperty("java.version") ?: error("Gradle JVM version is unavailable")
+        val fileEncoding = System.getProperty("file.encoding") ?: error("Gradle JVM encoding property is unavailable")
+        check(runtimeVersion.isNotBlank() && gradleVersion.isNotBlank() && fileEncoding.isNotBlank()) {
+            "Selected Java runtime defaults are empty"
+        }
+        return linkedMapOf(
+            "adapter" to "gradle-7.4.2-current-jdk17-javac-api-v1",
+            "compiler_type" to selected.javaClass.name,
+            "java_runtime_version" to runtimeVersion,
+            "language_version" to metadata.languageVersion.toString(),
+            "gradle_java_version" to gradleVersion,
+            // file.encoding may differ from the JVM's already cached Charset.defaultCharset().
+            "gradle_file_encoding" to fileEncoding,
+            "effective_charset" to java.nio.charset.Charset.defaultCharset().name(),
+            "locale" to java.util.Locale.getDefault().toLanguageTag(),
+            "api_options" to arguments.filterIsInstance<String>(),
+        )
+    }
+
+    // shortcut: private Gradle 7.4.2 action ABI; an unknown layout never proves producer inactivity.
+    fun producerActions(task: Task): Map<String, Any?>? = runCatching {
+        check(task.project.gradle.gradleVersion == "7.4.2") { "Unsupported Gradle action adapter" }
+        val loader = Task::class.java.classLoader
+        val standard = Class.forName("org.gradle.api.internal.project.taskfactory.StandardTaskAction", false, loader)
+        val incremental = Class.forName("org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction", false, loader)
+        val methodField = standard.getDeclaredField("method").apply { isAccessible = true }
+        val rows = task.actions.map { action ->
+            val method = if (action.javaClass == incremental)
+                methodField.get(action) as? java.lang.reflect.Method else null
+            linkedMapOf<String, Any?>(
+                "class" to action.javaClass.name,
+                "declaringClass" to method?.declaringClass?.name,
+                "method" to method?.name,
+                "parameterTypes" to method?.parameterTypes?.map { it.name },
+            )
+        }
+        linkedMapOf("adapter" to "gradle-7.4.2-stock-actions-v1", "actions" to rows)
+    }.getOrNull()
+
+    // shortcut: stock Gradle 7.4.2 predicates and the pinned KGP 1.8.21 KAPT predicate only.
+    // Read identity/bytecode, never evaluate a task predicate or a compiler/AP argument provider.
+    private fun classEntrySha(type: Class<*>): String {
+        val location = type.protectionDomain.codeSource?.location ?: error("Predicate origin unavailable")
+        check(location.protocol == "file") { "Predicate origin is not a file" }
+        val file = java.io.File(location.toURI())
+        check(file.isAbsolute && file.isFile) { "Predicate origin is not an absolute JAR" }
+        val bytes = java.util.jar.JarFile(file, false).use { jar ->
+            val entry = jar.getJarEntry(type.name.replace('.', '/') + ".class") ?: error("Predicate class entry absent")
+            check(entry.size in 1L..65536L) { "Predicate class entry size unhandled" }
+            jar.getInputStream(entry).use { it.readBytes() }
+        }
+        return java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+
+    private fun stockKaptPredicate(predicate: Any): Boolean = runCatching {
+        val wrapperName = "org.jetbrains.kotlin.gradle.tasks.configuration.KaptConfigKt\$sam\$org_gradle_api_specs_Spec\$0"
+        if (predicate.javaClass.name != wrapperName) return@runCatching false
+        val wrapper = predicate.javaClass
+        check(classEntrySha(wrapper) == "17044b9583c5993e046245a18c8a811f803c557af3f3a229ac744d1736214885")
+        val function = wrapper.getDeclaredField("function").apply { isAccessible = true }.get(predicate)
+            ?: return@runCatching false
+        val expected = Class.forName("org.jetbrains.kotlin.gradle.tasks.configuration.KaptConfig\$1\$1\$2", false, wrapper.classLoader)
+        check(function.javaClass == expected && expected.protectionDomain.codeSource?.location == wrapper.protectionDomain.codeSource?.location)
+        check(classEntrySha(expected) == "fbcbfb273fe96e173cf38d128f6cde565a7ac1e9045462aa4912d69590a9edd3")
+        function === expected.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+    }.getOrDefault(false)
+
+    fun producerOnlyIf(task: Task): Map<String, Any?>? = runCatching {
+        check(task.project.gradle.gradleVersion == "7.4.2") { "Unsupported Gradle onlyIf adapter" }
+        val loader = Task::class.java.classLoader
+        val abstractTask = Class.forName("org.gradle.api.internal.AbstractTask", false, loader)
+        val factory = abstractTask.getDeclaredMethod("createNewOnlyIfSpec").apply { isAccessible = true }
+        val prototype = factory.invoke(task)
+        val actual = abstractTask.getMethod("getOnlyIf").invoke(task)
+        check(actual.javaClass == prototype.javaClass) { "Custom predicate composition" }
+        val composite = Class.forName("org.gradle.api.specs.CompositeSpec", false, loader)
+        val getSpecs = composite.getMethod("getSpecs")
+        val defaults = getSpecs.invoke(prototype) as? List<*> ?: error("Stock predicate inventory unavailable")
+        check(defaults.size == 1 && defaults[0] != null) { "Stock predicate inventory ambiguous" }
+        val enabledType = defaults[0]!!.javaClass
+        val predicates = getSpecs.invoke(actual) as? List<*> ?: error("Predicate inventory unavailable")
+        val rows = predicates.map { predicate ->
+            check(predicate != null) { "Null task predicate" }
+            linkedMapOf<String, Any?>(
+                "class" to predicate.javaClass.name,
+                "stockEnabledPredicate" to (predicate.javaClass == enabledType),
+                "stockKaptPredicate" to stockKaptPredicate(predicate),
+            )
+        }
+        linkedMapOf("adapter" to "gradle-7.4.2-stock-onlyif-v1", "predicates" to rows)
+    }.getOrNull()
+
 
     private fun read(bean: Any, getter: String): Any? {
         val method = bean.javaClass.methods.firstOrNull { it.name == getter && it.parameterCount == 0 }
@@ -174,7 +362,7 @@ object KtlspCompilerConfiguration {
             record["declared_input_files"] = task.inputs.files.files.map { it.absolutePath }.sorted()
             record["declared_output_roots"] = task.outputs.files.files.map { it.absolutePath }.sorted()
             if (task is JavaCompile) {
-                record["source_files"] = task.source.files.map { it.absolutePath }.sorted()
+                record["source_files"] = task.source.files.map { it.absolutePath }
                 record["classpath"] = task.classpath.files.map { it.absolutePath }
 
                 val options = task.options
@@ -185,7 +373,7 @@ object KtlspCompilerConfiguration {
                 val defaultHome = if (configuredCompiler == null) defaultJavaHome(task) else null
                 record["java_home"] = configuredCompiler?.metadata?.installationPath?.asFile?.absolutePath
                     ?: defaultHome?.absolutePath
-                record["options"] = linkedMapOf(
+                val javaOptions = linkedMapOf<String, Any?>(
                     "javaHomeSelection" to when {
                         configuredCompiler != null -> "javaCompiler"
                         defaultHome != null -> "gradle-current-jvm-7.4.2"
@@ -196,11 +384,25 @@ object KtlspCompilerConfiguration {
                     "release" to options.release.orNull,
                     "encoding" to options.encoding,
                     "bootstrapClasspath" to options.bootstrapClasspath?.files?.map { it.absolutePath },
+                    "taskActionInventory" to producerActions(task),
+                    "taskOnlyIfInventory" to producerOnlyIf(task),
                     "fork" to options.isFork,
                     "forkJavaHome" to options.forkOptions.javaHome?.absolutePath,
                     "forkExecutable" to options.forkOptions.executable,
                     "forkJvmArgs" to options.forkOptions.jvmArgs?.toList(),
                 )
+                javaOptions["javaCompilerRecipe"] = null
+                javaOptions["javaCompilerRecipeProblem"] = null
+                try {
+                    javaOptions["javaCompilerRecipe"] = javaCompilerRecipe(task,
+                        configuredCompiler?.metadata?.installationPath?.asFile ?: defaultHome)
+                } catch (failure: Exception) {
+                    // Recipe unavailability must not erase ordinary Java/Kotlin source ownership.
+                    javaOptions["javaCompilerRecipeProblem"] = (failure.cause ?: failure).toString()
+                } catch (failure: LinkageError) {
+                    javaOptions["javaCompilerRecipeProblem"] = "Selected Java compiler adapter cannot be loaded: $failure"
+                }
+                record["options"] = javaOptions
                 record["output_roots"] = listOfNotNull(task.destinationDirectory.orNull?.asFile?.absolutePath)
             } else if (task.javaClass.methods.any { it.name == "getSerializedCompilerArguments" && it.parameterCount == 0 }) {
                 // The public KGP getter keeps plugin options intact; unsupported versions stay unknown.
@@ -246,6 +448,10 @@ object KtlspCompilerConfiguration {
                 record["java_home"] = if ("-no-jdk" in strings) null else (explicitHome ?: javaHome).absolutePath
                 // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
                 record["kotlin_compiler"] = kotlinCompilerRecipe(task, toolchain, javaHome)
+                record["options"] = linkedMapOf(
+                    "taskActionInventory" to producerActions(task),
+                    "taskOnlyIfInventory" to producerOnlyIf(task),
+                )
             } else {
                 val processors = read(task, "getKaptClasspath") as? FileCollection
                     ?: error("Annotation processor classpath is unavailable")
@@ -258,10 +464,9 @@ object KtlspCompilerConfiguration {
                 }
                 val optionProviders = read(task, "getAnnotationProcessorOptionProviders") as? List<*>
                     ?: error("KAPT option providers are unavailable")
-                val providerArguments = optionProviders.flatMap { provider ->
-                    (provider as? CommandLineArgumentProvider)?.asArguments()?.toList()
-                        ?: error("Unsupported KAPT option provider")
-                }
+                // Presence is observed without executing user provider code. Empty flattened
+                // arguments never prove absence of a provider (including nested empty providers).
+                val providerArguments = if (optionProviders.isEmpty()) emptyList<String>() else null
                 record["options"] = linkedMapOf(
                     "pluginOptions" to pluginOptions,
                     "javacOptions" to read(task, "getJavacOptions"),
@@ -269,6 +474,9 @@ object KtlspCompilerConfiguration {
                     "includeCompileClasspath" to read(task, "getIncludeCompileClasspath"),
                     "classpath" to (read(task, "getClasspath") as FileCollection).files.map { it.absolutePath },
                     "providerArguments" to providerArguments,
+                    "annotationProcessorOptionProviderCount" to optionProviders.size,
+                    "taskActionInventory" to producerActions(task),
+                    "taskOnlyIfInventory" to producerOnlyIf(task),
                 )
                 record["output_roots"] = listOf("getClassesDir", "getDestinationDir", "getKotlinSourcesDestinationDir")
                     .mapNotNull { (read(task, it) as? org.gradle.api.file.Directory)?.asFile?.absolutePath }

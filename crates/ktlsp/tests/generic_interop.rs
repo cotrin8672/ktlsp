@@ -4347,3 +4347,598 @@ fn java_enhanced_for_var_unsupported_or_ambiguous_elements_never_invent_a_scalar
         assert!(!found.contains("useful") && !found.contains("usefulWrong"), "{declaration}: {found:?}");
     }
 }
+
+const JAVA_ARRAY_FOREACH_USE: &str = r#"package app;
+
+class Use {
+    private Item[] makeItems() { return new Item[0]; }
+    private Item makePostfixed()[] { return new Item[0]; }
+    private Item makeMatrix()[][] { return new Item[0][0]; }
+
+    void methods() {
+        for (var methodItem : makeItems()) {
+            Item exactMethodItem = methodItem;
+            methodItem.useful();
+        }
+        for (var postfixedItem : makePostfixed()) {
+            Item exactPostfixedItem = postfixedItem;
+            postfixedItem.useful();
+        }
+    }
+
+    void creation() {
+        for (var createdItem : new Item[0]) {
+            Item exactCreatedItem = createdItem;
+            createdItem.useful();
+        }
+        for (var initializedItem : new Item[] { new Item() }) {
+            Item exactInitializedItem = initializedItem;
+            initializedItem.useful();
+        }
+    }
+
+    void aliases(Item[] original) {
+        var declaredAlias = original;
+        for (var declaredAliasItem : declaredAlias) {
+            Item exactDeclaredAliasItem = declaredAliasItem;
+            declaredAliasItem.useful();
+        }
+        var methodAlias = makeItems();
+        for (var methodAliasItem : methodAlias) {
+            Item exactMethodAliasItem = methodAliasItem;
+            methodAliasItem.useful();
+        }
+        var newAlias = new Item[0];
+        for (var newAliasItem : newAlias) {
+            Item exactNewAliasItem = newAliasItem;
+            newAliasItem.useful();
+        }
+    }
+
+    void multidimensional(Item[][] original) {
+        var matrixAlias = original;
+        for (var declaredRow : matrixAlias) {
+            Item[] exactDeclaredRow = declaredRow;
+            int declaredLength = declaredRow.length;
+            for (var declaredCell : declaredRow) {
+                Item exactDeclaredCell = declaredCell;
+                declaredCell.useful();
+            }
+        }
+        for (var methodRow : makeMatrix()) {
+            Item[] exactMethodRow = methodRow;
+            int methodLength = methodRow.length;
+            for (var methodCell : methodRow) {
+                Item exactMethodCell = methodCell;
+                methodCell.useful();
+            }
+        }
+        for (var createdRow : new Item[0][0]) {
+            Item[] exactCreatedRow = createdRow;
+            int createdLength = createdRow.length;
+            for (var createdCell : createdRow) {
+                Item exactCreatedCell = createdCell;
+                createdCell.useful();
+            }
+        }
+    }
+}
+"#;
+const JAVA_ARRAY_ITERABLE_ITEM: &str = r#"package app;
+
+public class Item implements java.lang.Iterable<Other> {
+    public void useful() { }
+    @Override public java.util.Iterator<Other> iterator() {
+        return java.util.Collections.emptyIterator();
+    }
+}
+"#;
+
+#[test]
+fn java_enhanced_for_rank_one_method_array_returns_complete_java_and_kotlin_owners() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", JAVA_ARRAY_FOREACH_USE),
+        ]);
+        assert_member(&mut ws, "Use.java", "methodItem.", "useful", "usefulWrong");
+        assert_exact_definition(&mut ws, "Use.java", "methodItem.useful()", owner, "useful");
+    }
+}
+
+#[test]
+fn java_enhanced_for_rank_one_array_creation_completes_java_and_kotlin_owners() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", JAVA_ARRAY_FOREACH_USE),
+        ]);
+        for name in ["createdItem", "initializedItem"] {
+            assert_member(
+                &mut ws,
+                "Use.java",
+                &format!("{name}."),
+                "useful",
+                "usefulWrong",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.java",
+                &format!("{name}.useful()"),
+                owner,
+                "useful",
+            );
+        }
+    }
+}
+
+#[test]
+fn java_enhanced_for_postfixed_array_methods_do_not_become_iterable_scalars() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", JAVA_ARRAY_FOREACH_USE),
+        ]);
+        let found = labels(&mut ws, "Use.java", "postfixedItem.");
+        assert!(
+            !found.contains("usefulWrong"),
+            "postfixed Item[] was misread as scalar Iterable<Other>: {found:?}"
+        );
+        assert_member(
+            &mut ws,
+            "Use.java",
+            "postfixedItem.",
+            "useful",
+            "usefulWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            "postfixedItem.useful()",
+            owner,
+            "useful",
+        );
+        // Rank2 row completion may remain Unknown, but must never borrow either scalar owner.
+        for name in ["declaredRow", "methodRow", "createdRow"] {
+            let found = labels(&mut ws, "Use.java", &format!("{name}."));
+            assert!(
+                !found.contains("useful") && !found.contains("usefulWrong"),
+                "array row {name}: {found:?}"
+            );
+        }
+    }
+}
+
+const JAVA_ARRAY_FACTORY_SCOPED: &str = r#"package factory;
+import library.Item;
+public class Factory<T> {
+    public Item[] imported() { return null; }
+    public Item postfixed()[] { return null; }
+    public library.Item[] qualified() { return null; }
+    public T[] generic() { return null; }
+    public <U> U[] from(U value) { return null; }
+}
+"#;
+const JAVA_ARRAY_FACTORY_USE: &str = r#"package app;
+import factory.Factory;
+class Use {
+    void run(Factory<library.Item> factory, library.Item value) {
+        for (var importedElement : factory.imported()) { importedElement.useful(); }
+        for (var postfixedElement : factory.postfixed()) { postfixedElement.useful(); }
+        for (var qualifiedElement : factory.qualified()) { qualifiedElement.useful(); }
+        for (var genericElement : factory.generic()) { genericElement.useful(); }
+        for (var methodGenericElement : factory.from(value)) { methodGenericElement.useful(); }
+        for (var createdElement : new library.Item[0]) { createdElement.useful(); }
+    }
+}
+"#;
+const JAVA_ARRAY_LIBRARY_ITEM: &str = r#"package library; public class Item { public void useful() {} }
+"#;
+const JAVA_ARRAY_POISON_ITEM: &str = r#"package app; public class Item { public void usefulWrong() {} }
+"#;
+
+fn scoped_array_factory_workspace() -> Workspace {
+    workspace(&[
+        ("Factory.java", JAVA_ARRAY_FACTORY_SCOPED),
+        ("Use.java", JAVA_ARRAY_FACTORY_USE),
+        ("LibraryItem.java", JAVA_ARRAY_LIBRARY_ITEM),
+        ("PoisonItem.java", JAVA_ARRAY_POISON_ITEM),
+    ])
+}
+
+#[test]
+fn java_enhanced_for_array_methods_preserve_imports_and_shared_generic_substitution() {
+    let mut ws = scoped_array_factory_workspace();
+    for name in [
+        "importedElement",
+        "postfixedElement",
+        "qualifiedElement",
+        "genericElement",
+        "methodGenericElement",
+        "createdElement",
+    ] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{name}."),
+            "useful",
+            "usefulWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{name}.useful()"),
+            "LibraryItem.java",
+            "useful",
+        );
+    }
+}
+
+#[test]
+fn java_enhanced_for_array_methods_follow_unsaved_declaration_import_changes() {
+    let mut ws = scoped_array_factory_workspace();
+    for name in ["importedElement", "postfixedElement"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{name}."),
+            "useful",
+            "usefulWrong",
+        );
+    }
+    ws.change(
+        "Factory.java",
+        JAVA_ARRAY_FACTORY_SCOPED.replace("import library.Item;", "import app.Item;"),
+    );
+    for name in ["importedElement", "postfixedElement"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{name}."),
+            "usefulWrong",
+            "useful",
+        );
+    }
+    // Explicit qualification and T inferred from the current receiver/argument stay independent.
+    for name in ["qualifiedElement", "genericElement", "methodGenericElement"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{name}."),
+            "useful",
+            "usefulWrong",
+        );
+    }
+    ws.change("Factory.java", JAVA_ARRAY_FACTORY_SCOPED.into());
+    for name in ["importedElement", "postfixedElement"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{name}."),
+            "useful",
+            "usefulWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{name}.useful()"),
+            "LibraryItem.java",
+            "useful",
+        );
+    }
+}
+
+const JAVA_VAR_ARRAY_ALIAS_FACTORY: &str = r#"package app;
+public class Factory {
+    public Item[] items() { return new Item[0]; }
+    public Item[][] matrix() { return new Item[0][0]; }
+}
+"#;
+const JAVA_VAR_ARRAY_ALIAS_USE: &str = r#"package app;
+class AliasUse {
+    void run(Factory factory) {
+        var made = factory.items();
+        for (var methodElement : made) {
+            Item exactMethodElement = methodElement;
+            methodElement.useful();
+        }
+        var created = new Item[0];
+        for (var createdElement : created) {
+            Item exactCreatedElement = createdElement;
+            createdElement.useful();
+        }
+    }
+    void rows(Factory factory, Item[][] input) {
+        var fromCreated = new Item[0][0];
+        for (var createdRow : fromCreated) {
+            Item[] exactCreatedRow = createdRow;
+            int createdLength = createdRow.length;
+        }
+        var fromMethod = factory.matrix();
+        for (var methodRow : fromMethod) {
+            Item[] exactMethodRow = methodRow;
+            int methodLength = methodRow.length;
+        }
+        var fromDeclared = input;
+        for (var declaredRow : fromDeclared) {
+            Item[] exactDeclaredRow = declaredRow;
+            int declaredLength = declaredRow.length;
+        }
+    }
+}
+"#;
+
+#[test]
+fn java_enhanced_for_var_array_alias_components_complete_current_java_and_kotlin_owners() {
+    // These three exact alias bodies already occur in the independently compiled array fixture.
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", JAVA_ARRAY_FOREACH_USE),
+        ]);
+        for name in ["declaredAliasItem", "methodAliasItem", "newAliasItem"] {
+            assert_member(
+                &mut ws,
+                "Use.java",
+                &format!("{name}."),
+                "useful",
+                "usefulWrong",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.java",
+                &format!("{name}.useful()"),
+                owner,
+                "useful",
+            );
+        }
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_array_alias_unsaved_factory_and_initializer_changes_are_current() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Factory.java", JAVA_VAR_ARRAY_ALIAS_FACTORY),
+            ("AliasUse.java", JAVA_VAR_ARRAY_ALIAS_USE),
+        ]);
+        for name in ["methodElement", "createdElement"] {
+            assert_member(
+                &mut ws,
+                "AliasUse.java",
+                &format!("{name}."),
+                "useful",
+                "usefulWrong",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "AliasUse.java",
+                &format!("{name}.useful()"),
+                owner,
+                "useful",
+            );
+        }
+        // Factory changes first: the call body is temporarily invalid, but completion still follows
+        // the current array component. An independently compiled valid counterpart follows below.
+        ws.change(
+            "Factory.java",
+            JAVA_VAR_ARRAY_ALIAS_FACTORY.replace("Item", "Other"),
+        );
+        assert_member(
+            &mut ws,
+            "AliasUse.java",
+            "methodElement.",
+            "usefulWrong",
+            "useful",
+        );
+        assert_member(
+            &mut ws,
+            "AliasUse.java",
+            "createdElement.",
+            "useful",
+            "usefulWrong",
+        );
+        ws.change(
+            "AliasUse.java",
+            JAVA_VAR_ARRAY_ALIAS_USE
+                .replace("Item", "Other")
+                .replace(".useful()", ".usefulWrong()"),
+        );
+        for name in ["methodElement", "createdElement"] {
+            assert_member(
+                &mut ws,
+                "AliasUse.java",
+                &format!("{name}."),
+                "usefulWrong",
+                "useful",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "AliasUse.java",
+                &format!("{name}.usefulWrong()"),
+                "Other.kt",
+                "usefulWrong",
+            );
+        }
+        ws.change("Factory.java", JAVA_VAR_ARRAY_ALIAS_FACTORY.into());
+        ws.change("AliasUse.java", JAVA_VAR_ARRAY_ALIAS_USE.into());
+        for name in ["methodElement", "createdElement"] {
+            assert_member(
+                &mut ws,
+                "AliasUse.java",
+                &format!("{name}."),
+                "useful",
+                "usefulWrong",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "AliasUse.java",
+                &format!("{name}.useful()"),
+                owner,
+                "useful",
+            );
+        }
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_array_alias_rank_two_rows_never_become_scalar_components() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Factory.java", JAVA_VAR_ARRAY_ALIAS_FACTORY),
+            ("AliasUse.java", JAVA_VAR_ARRAY_ALIAS_USE),
+        ]);
+        for name in ["createdRow", "methodRow", "declaredRow"] {
+            let found = labels(&mut ws, "AliasUse.java", &format!("{name}."));
+            assert!(
+                !found.contains("useful") && !found.contains("usefulWrong"),
+                "rank2 alias row {name} leaked a scalar owner: {found:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_array_aliases_keep_lexical_bindings_and_initializer_method_names() {
+    let source = r#"package app; class Use {
+ Item[] values;
+ Other[] values() { return new Other[0]; }
+ void localShadow() {
+  var values = (new Other[0]);
+  var alias = (values);
+  for (var shadowElement : alias) { shadowElement.usefulWrong(); }
+ }
+ void methodName() {
+  var values = values();
+  for (var methodElement : values) { methodElement.usefulWrong(); }
+ }
+}"#;
+    let mut ws = workspace(&[("Item.kt", ITEM), ("Other.kt", OTHER), ("Use.java", source)]);
+    for name in ["shadowElement", "methodElement"] {
+        assert_member(
+            &mut ws,
+            "Use.java",
+            &format!("{name}."),
+            "usefulWrong",
+            "useful",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{name}.usefulWrong()"),
+            "Other.kt",
+            "usefulWrong",
+        );
+    }
+    let usage =
+        source.find("for (var shadowElement : alias)").unwrap() + "for (var shadowElement : ".len();
+    let definitions = ws.goto_definition("Use.java", usage);
+    assert_eq!(definitions.len(), 1, "{definitions:?}");
+    assert_eq!(definitions[0].file, "Use.java");
+    assert_eq!(
+        definitions[0].start_byte,
+        source.find("var alias =").unwrap() + "var ".len()
+    );
+
+    // Incomplete/invalid initializers must keep the local value shadow without using the field.
+    for initializer in [
+        "values",
+        "wrap(values)",
+        "values.make()",
+        "missing",
+        "unknown()",
+        "null",
+    ] {
+        let source = format!("package app; class Use {{ Item[] values; Item[] wrap(Item[] value) {{ return value; }} void run() {{ var values = {initializer}; for (var item : values) {{ item.useful(); }} }} }}");
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Use.java", &source),
+        ]);
+        let found = labels(&mut ws, "Use.java", "item.");
+        assert!(
+            !found.contains("useful") && !found.contains("usefulWrong"),
+            "{initializer}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_array_aliases_share_the_initializer_depth_limit() {
+    for count in [infer::MAX_DEPTH - 1, infer::MAX_DEPTH + 1] {
+        let mut statements = "var value0 = input;".to_string();
+        for current in 1..count {
+            statements.push_str(&format!(" var value{current} = value{};", current - 1));
+        }
+        let source = format!("package app; class Use {{ void run(Item[] input) {{ {statements} for (var item : value{}) {{ item.useful(); }} }} }}", count - 1);
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Use.java", &source),
+        ]);
+        let found = labels(&mut ws, "Use.java", "item.");
+        if count < infer::MAX_DEPTH {
+            assert!(
+                found.contains("useful"),
+                "bounded alias chain lost its component: {found:?}"
+            );
+        } else {
+            assert!(
+                !found.contains("useful"),
+                "exhausted chain must stay Unknown: {found:?}"
+            );
+        }
+        assert!(
+            !found.contains("usefulWrong"),
+            "alias budget leaked an unrelated scalar: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn java_enhanced_for_var_array_aliases_preserve_explicit_arrays_iterables_and_substitution() {
+    for (parameter, statements, receiver) in [
+        (
+            "Item[] input",
+            "Item[] explicit = input; var alias = explicit;",
+            "item.",
+        ),
+        (
+            "java.lang.Iterable<Item> input",
+            "var alias = (input);",
+            "item.",
+        ),
+        ("Box<Item>[] input", "var alias = input;", "item.get()."),
+    ] {
+        let source = format!("package app; class Use {{ void run({parameter}) {{ {statements} for (var item : alias) {{ {receiver}useful(); }} }} }}");
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Box.java", JAVA_BOX),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", &source),
+        ]);
+        assert_member(&mut ws, "Use.java", receiver, "useful", "usefulWrong");
+        assert_exact_definition(
+            &mut ws,
+            "Use.java",
+            &format!("{receiver}useful()"),
+            "Item.kt",
+            "useful",
+        );
+    }
+}

@@ -3123,6 +3123,95 @@ default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
 
+### Sixty-seventh checkpoint: false positives and useful basic completion
+
+The latest priority is false-positive diagnostics and missing basic completion;
+ranking improvements and extra UX remain deferred. The goal is in progress.
+The current source passes formatting, the full workspace (1454 passed,0 failed,
+4 ignored) and release builds. The immutable ktlsp binary is18759680 bytes,
+SHA-256 5c74bd8cf1c6ac3d71c8b1a9844b1643c1b56a59f97bf8d0ec657490773253d0.
+These checks do not establish editor acceptance or IDEA parity.
+
+| Case | Expected | Observed | Status / next action |
+| --- | --- | --- | --- |
+| Rank-one Java arrays in enhanced-for | Method returns, post-name dimensions and array creation expose the Java/Kotlin component members; import changes remove obsolete members | Three regressions fail before the repair; all15 enhanced-for and15 shared source/ABI controls then pass. Independent SDK17/Kotlin1.9.23 steps exit0,0,1,0,0, retaining both obsolete-call errors. The additive12 Neovim completion/navigation queries all match | Verified finite cases; preserve the original26 resource queries |
+| Local var array aliases | Declared, method-return and created arrays retain their component members through aliases and both unsaved producer edits | Independent full original/changed paired Kotlin+Java snapshots and boundary controls all compile (6/6). Two useful regressions fail before the repair. Current foreach controls21/21 pass. Neovim alias26 matches:24 useful completion/navigation queries plus2 rank-two scalar-leakage guards | Verified finite cases; rank-two useful completion, compiled/Kotlin array factories and valid chains beyond the existing16-level inference limit remain open |
+| Implicit java.lang source loading | Select exact archive members without full cache-tree or repeated full archive scans; invalid sources never publish | Two focused loader tests pass, including flat layouts, homonyms, old cache entries, invalid UTF-8 and bad CRC. Real default Neovim still returns empty for both early Iterable element completions: original resource24/26, with readiness wait unset and libraries not yet ready | Open initial-response coverage gap; do not replace it with a wait/retry control or claim latency improvement |
+| Seeded default-type navigation | Local/imported declarations and type parameters retain their identity when JDK sources arrive | Current seed/navigation/cache controls12/12 pass, including7 goto cases. Five Java lexical-parent cases and the Kotlin import-alias parent independently compile and select the expected JVM types. Foreign nested Kotlin parent aliases remain conservatively Unknown | Verified safety controls; valid Unknown navigation remains a useful-result coverage gap |
+| Auxiliary Java diagnostics | Proved current generated APIs remove dependent false positives without certifying unknown APIs or a clean Java file | Worker24/24, classpath43, watch13, editor8 and lifecycle6 pass. Current immutable release executes the unchanged114 processor checks:111 pass,3 fail. All3 failures are phase1 Java calls to obsolete generated methods, returning empty diagnostics. Phase2 retains all6 raw javac errors and publishes3 proved missing-import errors | Partial editor acceptance; keep the3 method-diagnostic failures and unknown API quarantine visible |
+
+The default Java editor run has275 checks:268 pass,7 fail, none unmeasured.
+Its7 failures are the2 early Iterable completions plus5 existing Java diagnostic
+expectations. The original26, additive array12 and alias26 requests are kept
+separate; each is attempted once. Empty useful responses remain mismatches.
+Both unsaved Java/Kotlin alias producer buffers and on-disk source restoration
+are recorded. A raw empty diagnostic response without an accepted current
+compiler result is never a clean certificate.
+
+Evidence under the temporary artifact root below:
+
+- native-workspace-release67-1/receipt.json
+  (SHA-256 8c43864d9a94bd2004b857ecb930735d66df20acec366c3272e9d7a1db126fe7).
+- native-java-loop-navigation-focused67-1/receipt.json:33 current focused controls.
+- native-java-array-green67-1/root-verification.json and
+  native-java-array-alias-fix-oracle67-1/receipt.json: independent compiler controls.
+- native-java-parent-identity-oracle67-1 and
+  native-java-kotlin-parent-oracle67-1: actual lexical-parent compiler selection.
+- native-java-editor67-1/receipt.json
+  (SHA-256 1df7c7d71a649284e21d1dd7a0ea914a5ec889978b9154ef474c253db8db1269);
+  run C:/Users/gummy/AppData/Local/Temp/kl67-java-editor-1/java.
+- native-java-worker-processor67-1/receipt.json
+  (SHA-256 3067eb788cdb6f1d85c3526a16152333b4ffabe0d37496967fa21649a53e1bbc);
+  run C:/Users/gummy/AppData/Local/Temp/kl67-worker-processor-1.
+- native-editor-smokes67-1: basic9/9 and library41/41 pass. The library fixture
+  executes all3 saved Gradle tasks successfully;6 selected Java diagnostic pulls
+  cover original, invalid, unsaved owner/caller changes and restoration.
+
+Array source facts require cache v28; Gradle model11 is separate. The proposed
+nominal overload rejection remains unapplied: independent lexical-binding
+counterexamples show that current imported TypeRef identity is not sufficient
+negative proof. No valid candidate is rejected to improve ranking here.
+The worker preserves canonical Kotlin diagnostics before its auxiliary Java
+analysis and never certifies a whole Java API or clean file. The current runtime
+compiles its selected helper in the fresh cache; an earlier standalone helper
+compatibility compile is separate evidence. Root controllers record zero
+fresh-owned processes after cleanup and do not open/adopt an existing JVM.
+The basic/Java smoke clients still terminate their server on exit; the processor
+client independently records clean shutdown/exit. No shutdown parity is claimed.
+
+Additional independent evidence with the published checkpoint66 binary:
+
+- CEM's complete unchanged220-input snapshot compiles with actual Kotlin2.4/SDK21
+  Gradle inputs. Six incomplete first requests and13 assertions pass; a separate
+  original where-bound goto/unfinished completion probe passes2/2 with full
+  wire/version/restoration guards. Four golden requests pass3/4:
+  HolderGetter.getOrThrow still retains two nominal overload heads.
+  Artifacts: native-cem-incomplete66-1, native-cem-where66-1,
+  native-cem-complete66-1. The older incomplete checkout does not isolate engine
+  causes for its historical CEM failures.
+- Original Retrofit has54 Java files and the4024-byte KotlinExtensions.kt,
+  not the4111-byte completed template. Its offline Gradle8.7/Kotlin1.9.23,
+  target-JDK8 rerun executes Kotlin and Java compilation successfully; all55
+  original source guards remain stable. Six golden first requests and two
+  canonical Kotlin pulls pass on those original sources. Original/restored Kotlin
+  each have zero errors, correlated with current source/model/generation.
+  This proves that file's focused case, not all Retrofit Java diagnostics.
+  Artifacts: native-retrofit-original-compile66-1,
+  native-retrofit-diagnostic66-1.
+- Actual Gradle7.4.2/KGP1.8.21 stock action/onlyIf metadata is captured for Kotlin,
+  stubs, KAPT and Java. Unknown/custom conditions remain rejected without invoking
+  predicates. This proves configuration metadata, not completed AP/producer closure.
+  Artifact: native-java-producer-capture66-1.
+
+All artifact names are beneath
+C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
+Next: fix first-response Iterable element inference and replay the existing
+Java scenario without a readiness wait. For ordinary real-project diagnostics,
+Moshi's captured -Xexplicit-api=strict option is the smallest next adapter gap;
+other unsupported Kotlin flags and Java/AP recipes remain explicit coverage
+gaps. Preserve the3 generated-method diagnostic failures. Six-project diagnostic
+absence, performance distributions and IDEA parity remain unproved.
+
 ### Sixty-sixth checkpoint: Java loop receivers and recovered Gradle discovery
 
 The immediate user priority remains false-positive diagnostics and missing useful

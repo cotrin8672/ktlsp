@@ -497,8 +497,8 @@ fn signature(
     node: Node<'_>,
     text: &str,
 ) -> Fact<MemberSignature> {
-    // Post-name dimensions are not represented by the existing TypeRef writer yet. Reading its
-    // base type here would claim int for an actual int[] field, parameter, or return value.
+    // Post-name dimensions remain outside the source-ABI slice, including fields/parameters
+    // whose writer still stores their base type. Keep their descriptors unavailable.
     if java && has_post_name_dimensions(node) {
         return unsupported();
     }
@@ -577,8 +577,8 @@ fn jvm_type(
         return None;
     }
     if java && ty.name.ends_with("[]") {
-        let name = ty.name.strip_suffix("[]")?;
-        let element = scope.type_ref(name, false, Vec::new());
+        let mut element = ty.clone();
+        element.name = ty.name.strip_suffix("[]")?.to_string();
         return jvm_type(index, &element, ctx, scope, java, type_parameters)
             .map(|ty| JvmType::Array(Box::new(ty)));
     }

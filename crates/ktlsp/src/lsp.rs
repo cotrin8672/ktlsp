@@ -233,11 +233,14 @@ impl Backend {
                 let mut java = crate::java::JavaParser::new();
                 let tree = java.parse(&text);
                 let imports = crate::java::explicit_import_fqns(&tree, &text);
-                let jdk_imports = imports
+                let mut jdk_imports = imports
                     .iter()
                     .filter(|fqn| fqn.starts_with("java.") || fqn.starts_with("javax."))
                     .cloned()
                     .collect::<Vec<_>>();
+                jdk_imports.extend(crate::java::referenced_java_lang_fqns(&tree, &text));
+                jdk_imports.sort();
+                jdk_imports.dedup();
                 let mut kotlin = crate::parser::KotlinParser::new();
                 let mut batches = crate::deps::resolve_jdk_imports(
                     &jdk_imports,

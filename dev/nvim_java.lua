@@ -616,8 +616,14 @@ do
   local resource_uri = vim.uri_from_bufnr(resource_buf)
   local wire_text, latest = probe.buffer_full_text(resource_buf), nil
   local report = { requests = {}, outbound = {}, expected_probe_count = 26,
+    array_requests = {}, expected_array_probe_count = 12,
+    alias_requests = {}, expected_alias_probe_count = 26, alias_positive_probe_count = 24,
+    alias_scalar_guard_count = 2,
+    array_coverage_gaps = "rank2 rows/nested cells and Kotlin/compiled array factories remain OPEN",
     original_source_sha256 = original_hash, original_disk_sha256 = original_disk,
     valid_var_status = "OPEN unless the first response offers Body.string; empty is a mismatch" }
+  local active_requests = report.requests
+  local alias_kotlin = {}
   local notify = client.rpc.notify
   client.rpc.notify = function(method, params)
     local sent = notify(method, params)
@@ -635,8 +641,11 @@ do
   local function flush()
     require("vim.lsp._changetracking").flush(client)
   end
-  local function once(phase, method, anchor, token, text)
-    local position = probe.find(original, anchor, token)
+  local function once(phase, method, anchor, token, text, anchor_token)
+    local position = probe.find(original, anchor, anchor_token or token)
+    local restore_line = active_requests == report.alias_requests
+      and vim.api.nvim_buf_get_lines(resource_buf, position.line, position.line + 1, false)[1]
+      or original[position.line + 1]
     if text then
       vim.api.nvim_buf_set_lines(resource_buf, position.line, position.line + 1, false, { text })
       flush()
@@ -650,6 +659,14 @@ do
     local sha = probe.buffer_sha256(resource_buf)
     local delivered = latest and latest.sent and latest.version == vim.lsp.util.buf_versions[resource_buf]
       and latest.source_sha256 == sha and latest.wire_source_sha256 == sha and not latest.wire_error
+    if active_requests == report.alias_requests then
+      local producer = alias_kotlin.latest
+      local producer_sha = probe.buffer_sha256(alias_kotlin.buf)
+      delivered = delivered and producer and producer.sent
+        and producer.version == vim.lsp.util.buf_versions[alias_kotlin.buf]
+        and producer.source_sha256 == producer_sha and producer.wire_source_sha256 == producer_sha
+        and not producer.wire_error
+    end
     local response, row
     if delivered then
       response, row = request_rpc(method, params, resource_buf)
@@ -659,10 +676,14 @@ do
       requests[#requests + 1] = row
     end
     row.resource_phase, row.source_sha256, row.delivery = phase, sha, vim.deepcopy(latest)
-    report.requests[#report.requests + 1] = row
+    if active_requests == report.array_requests then row.array_phase = phase end
+    if active_requests == report.alias_requests then
+      row.alias_phase, row.kotlin_delivery = phase, vim.deepcopy(alias_kotlin.latest)
+    end
+    active_requests[#active_requests + 1] = row
     if text then
       vim.api.nvim_buf_set_lines(resource_buf, position.line, position.line + 1, false,
-        { original[position.line + 1] })
+        { restore_line })
       flush()
     end
     local result = response and response.result
@@ -674,8 +695,8 @@ do
     check("Java resource " .. phase .. " offers " .. expected .. " and excludes " .. excluded,
       probe.completion_has(result, expected) and not probe.completion_has(result, excluded), vim.inspect(result), row)
   end
-  local function definition(phase, anchor, token, text, target, lines, declaration)
-    local result, row = once(phase, "textDocument/definition", anchor, token, text)
+  local function definition(phase, anchor, token, text, target, lines, declaration, anchor_token)
+    local result, row = once(phase, "textDocument/definition", anchor, token, text, anchor_token)
     local _, range = probe.find(lines, declaration, token)
     check("Java resource " .. phase .. " goes to exact " .. token .. " declaration",
       probe.exact_definition(result, target, { range }), vim.inspect(result), row)
@@ -736,10 +757,122 @@ do
       "        " .. chain .. ".", "string", "enqueue")
     definition("32 nested generic results Kotlin member", "identity(supply).string();", "string",
       "        " .. chain .. ".string();", kotlin_path, kotlin_original, "fun string():")
+    -- Preserve the original 26 first responses above; these 12 are a separate array denominator.
+    active_requests = report.array_requests
+    for _, case in ipairs({
+      { name = "Kotlin method array", receiver = "kotlinMethodArrayItem", member = "string", excluded = "enqueue", target = kotlin_path, lines = kotlin_original, declaration = "fun string():" },
+      { name = "Java method array", receiver = "javaMethodArrayItem", member = "javaOnly", excluded = "string", target = path, lines = original, declaration = "public String javaOnly()" },
+      { name = "Kotlin postfix array", receiver = "kotlinPostfixedArrayItem", member = "string", excluded = "enqueue", target = kotlin_path, lines = kotlin_original, declaration = "fun string():" },
+      { name = "Java postfix array", receiver = "javaPostfixedArrayItem", member = "javaOnly", excluded = "string", target = path, lines = original, declaration = "public String javaOnly()" },
+      { name = "Kotlin new array", receiver = "kotlinCreatedArrayItem", member = "string", excluded = "enqueue", target = kotlin_path, lines = kotlin_original, declaration = "fun string():" },
+      { name = "Java new array", receiver = "javaCreatedArrayItem", member = "javaOnly", excluded = "string", target = path, lines = original, declaration = "public String javaOnly()" },
+    }) do
+      local anchor = "System.out.println(" .. case.receiver .. "." .. case.member .. "());"
+      completion("array " .. case.name .. " unfinished println", anchor, case.receiver,
+        "            System.out.println(" .. case.receiver .. ".", case.member, case.excluded)
+      definition("array " .. case.name .. " exact member", anchor, case.member,
+        "            System.out.println(" .. case.receiver .. "." .. case.member .. "()",
+        case.target, case.lines, case.declaration)
+    end
+    -- Alias responses have their own denominator, after the original 26 and 12 requests.
+    alias_kotlin.buf = vim.fn.bufadd(kotlin_path)
+    vim.fn.bufload(alias_kotlin.buf)
+    alias_kotlin.modified = vim.bo[alias_kotlin.buf].modified
+    alias_kotlin.original = vim.api.nvim_buf_get_lines(alias_kotlin.buf, 0, -1, false)
+    alias_kotlin.hash = probe.buffer_sha256(alias_kotlin.buf)
+    assert(vim.deep_equal(alias_kotlin.original, kotlin_original), "alias Kotlin fixture was already edited")
+    alias_kotlin.uri, alias_kotlin.wire = vim.uri_from_bufnr(alias_kotlin.buf),
+      probe.buffer_full_text(alias_kotlin.buf)
+    local previous_notify = client.rpc.notify
+    client.rpc.notify = function(method, params)
+      local sent = previous_notify(method, params)
+      if params.textDocument and params.textDocument.uri == alias_kotlin.uri
+        and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
+        local wire, err
+        if method == "textDocument/didOpen" then wire = params.textDocument.text
+        else wire, err = probe.apply_content_changes(alias_kotlin.wire, params.contentChanges,
+          client.offset_encoding or "utf-16") end
+        if sent and wire then alias_kotlin.wire = wire end
+        alias_kotlin.latest = { sent = not not sent, version = params.textDocument.version,
+          buffer_version = vim.lsp.util.buf_versions[alias_kotlin.buf],
+          source_sha256 = probe.buffer_sha256(alias_kotlin.buf),
+          wire_source_sha256 = wire and vim.fn.sha256(wire), wire_error = err }
+        report.alias_kotlin_outbound = report.alias_kotlin_outbound or {}
+        report.alias_kotlin_outbound[#report.alias_kotlin_outbound + 1] = vim.deepcopy(alias_kotlin.latest)
+      end
+      return sent
+    end
+    vim.bo[alias_kotlin.buf].filetype = "kotlin"
+    assert(vim.lsp.buf_attach_client(alias_kotlin.buf, id), "alias Kotlin fixture did not attach")
+    -- An explicit full edit also observes the wire if this buffer was attached earlier.
+    vim.api.nvim_buf_set_lines(alias_kotlin.buf, 0, -1, false, alias_kotlin.original)
+    flush()
+    active_requests = report.alias_requests
+    local function alias_case(phase, case)
+      local anchor = "System.out.println(" .. case.receiver .. "." .. (case.anchor_member or case.member) .. "());"
+      completion("alias " .. phase .. " " .. case.receiver, anchor, case.receiver,
+        "            System.out.println(" .. case.receiver .. ".", case.member, case.excluded)
+      local member_line = "            System.out.println(" .. case.receiver .. "." .. case.member .. "());"
+      if case.member == "enqueue" then member_line = "            " .. case.receiver .. ".enqueue();" end
+      definition("alias " .. phase .. " " .. case.receiver, anchor, case.member, member_line,
+        case.target, case.lines, case.declaration, case.anchor_member)
+    end
+    local initial_cases = {
+      { receiver = "kotlinDeclaredAliasItem", member = "string", excluded = "enqueue", target = kotlin_path, lines = kotlin_original, declaration = "fun string():" },
+      { receiver = "javaDeclaredAliasItem", member = "javaOnly", excluded = "string", target = path, lines = original, declaration = "public String javaOnly()" },
+      { receiver = "kotlinMethodAliasItem", member = "string", excluded = "enqueue", target = kotlin_path, lines = kotlin_original, declaration = "fun string():" },
+      { receiver = "javaMethodAliasItem", member = "javaOnly", excluded = "string", target = path, lines = original, declaration = "public String javaOnly()" },
+      { receiver = "kotlinCreatedAliasItem", member = "string", excluded = "enqueue", target = kotlin_path, lines = kotlin_original, declaration = "fun string():" },
+      { receiver = "javaCreatedAliasItem", member = "javaOnly", excluded = "string", target = path, lines = original, declaration = "public String javaOnly()" },
+    }
+    for _, case in ipairs(initial_cases) do alias_case("initial", case) end
+    for _, receiver in ipairs({ "kotlinAliasRow", "javaAliasRow" }) do
+      local result, row = once("alias rank2 scalar guard " .. receiver, "textDocument/completion",
+        "System.out.println(" .. receiver .. ".length);", receiver,
+        "            System.out.println(" .. receiver .. ".")
+      check("Java resource alias rank2 " .. receiver .. " excludes scalar members",
+        not probe.completion_has(result, "string") and not probe.completion_has(result, "javaOnly")
+          and not probe.completion_has(result, "enqueue"), vim.inspect(result), row)
+    end
+    local kotlin_changed, java_changed = {}, {}
+    for i, line in ipairs(alias_kotlin.original) do
+      kotlin_changed[i] = line:gsub("fun string%(%):", "fun currentString():")
+    end
+    for i, line in ipairs(original) do
+      java_changed[i] = line:gsub("%.string%(%)", ".currentString()")
+        :gsub("var kotlinCreatedAlias = new Body%[0%];", "var kotlinCreatedAlias = new Other[0];")
+        :gsub("System%.out%.println%(kotlinCreatedAliasItem%.currentString%(%)%);",
+          "kotlinCreatedAliasItem.enqueue();")
+    end
+    vim.api.nvim_buf_set_lines(alias_kotlin.buf, 0, -1, false, kotlin_changed)
+    vim.api.nvim_buf_set_lines(resource_buf, 0, -1, false, java_changed)
+    flush()
+    report.alias_changed_source_sha256 = { java = probe.buffer_sha256(resource_buf),
+      kotlin = probe.buffer_sha256(alias_kotlin.buf) }
+    alias_case("two-file unsaved", { receiver = "kotlinMethodAliasItem", member = "currentString",
+      anchor_member = "string", excluded = "string", target = kotlin_path, lines = kotlin_changed,
+      declaration = "fun currentString():" })
+    alias_case("two-file unsaved", { receiver = "kotlinCreatedAliasItem", member = "enqueue",
+      anchor_member = "string", excluded = "currentString", target = kotlin_path, lines = kotlin_changed,
+      declaration = "fun enqueue()" })
+    alias_case("two-file unsaved Java control", initial_cases[4])
+    vim.api.nvim_buf_set_lines(alias_kotlin.buf, 0, -1, false, alias_kotlin.original)
+    vim.api.nvim_buf_set_lines(resource_buf, 0, -1, false, original)
+    flush()
+    for _, i in ipairs({ 3, 5, 4 }) do alias_case("restored", initial_cases[i]) end
+    active_requests = report.requests
   end, debug.traceback)
   if not vim.deep_equal(vim.api.nvim_buf_get_lines(resource_buf, 0, -1, false), original) then
     vim.api.nvim_buf_set_lines(resource_buf, 0, -1, false, original)
     flush()
+  end
+  if alias_kotlin.buf then
+    if not vim.deep_equal(vim.api.nvim_buf_get_lines(alias_kotlin.buf, 0, -1, false), alias_kotlin.original) then
+      vim.api.nvim_buf_set_lines(alias_kotlin.buf, 0, -1, false, alias_kotlin.original)
+      flush()
+    end
+    report.alias_kotlin_restored = probe.buffer_sha256(alias_kotlin.buf) == alias_kotlin.hash
+    vim.bo[alias_kotlin.buf].modified = alias_kotlin.modified
   end
   client.rpc.notify = notify
   vim.bo[resource_buf].modified = original_modified
@@ -747,6 +880,18 @@ do
   report.restored = probe.buffer_sha256(resource_buf) == original_hash and report.disk_unchanged
   report.error = not ok and err or nil
   check("Java resource buffers restore exactly without disk edits", report.restored, vim.inspect(report))
+  local array_once = #report.array_requests == report.expected_array_probe_count
+  for _, row in ipairs(report.array_requests) do
+    array_once = array_once and row.attempted and row.attempts == 1
+  end
+  check("Java resource 12 array requests each run exactly once", array_once, vim.inspect(report.array_requests))
+  local alias_once = #report.alias_requests == report.expected_alias_probe_count
+  for _, row in ipairs(report.alias_requests) do
+    alias_once = alias_once and row.attempted and row.attempts == 1
+  end
+  check("Java resource 26 alias requests each run exactly once", alias_once, vim.inspect(report.alias_requests))
+  check("Java resource alias both buffers restore exactly without disk edits",
+    report.restored and report.alias_kotlin_restored, vim.inspect(report))
   if not ok then check("Java resource probes execute", false, err) end
   if vim.env.KTLSP_TRACE then
     vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-resource-body.json")

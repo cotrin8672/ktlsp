@@ -700,6 +700,73 @@ public class ResourceUse {
             System.out.println(varJavaIterableItem.javaOnly());
         }
     }
+    private Body[] makeKotlinArray() { return new Body[0]; }
+    private JavaLoopBody[] makeJavaArray() { return new JavaLoopBody[0]; }
+    private Body makeKotlinPostfixed()[] { return new Body[0]; }
+    private JavaLoopBody makeJavaPostfixed()[] { return new JavaLoopBody[0]; }
+
+    public void varArrayMethods() {
+        for (var kotlinMethodArrayItem : makeKotlinArray()) {
+            System.out.println(kotlinMethodArrayItem.string());
+        }
+        for (var javaMethodArrayItem : makeJavaArray()) {
+            System.out.println(javaMethodArrayItem.javaOnly());
+        }
+        for (var kotlinPostfixedArrayItem : makeKotlinPostfixed()) {
+            System.out.println(kotlinPostfixedArrayItem.string());
+        }
+        for (var javaPostfixedArrayItem : makeJavaPostfixed()) {
+            System.out.println(javaPostfixedArrayItem.javaOnly());
+        }
+    }
+
+    public void varArrayCreation() {
+        for (var kotlinCreatedArrayItem : new Body[0]) {
+            System.out.println(kotlinCreatedArrayItem.string());
+        }
+        for (var javaCreatedArrayItem : new JavaLoopBody[0]) {
+            System.out.println(javaCreatedArrayItem.javaOnly());
+        }
+    }
+
+    public void varArrayAliases(Body[] kotlinValues, JavaLoopBody[] javaValues) {
+        var kotlinDeclaredAlias = kotlinValues;
+        for (var kotlinDeclaredAliasItem : kotlinDeclaredAlias) {
+            System.out.println(kotlinDeclaredAliasItem.string());
+        }
+        var javaDeclaredAlias = javaValues;
+        for (var javaDeclaredAliasItem : javaDeclaredAlias) {
+            System.out.println(javaDeclaredAliasItem.javaOnly());
+        }
+        var kotlinMethodAlias = makeKotlinArray();
+        for (var kotlinMethodAliasItem : kotlinMethodAlias) {
+            System.out.println(kotlinMethodAliasItem.string());
+        }
+        var javaMethodAlias = makeJavaArray();
+        for (var javaMethodAliasItem : javaMethodAlias) {
+            System.out.println(javaMethodAliasItem.javaOnly());
+        }
+        var kotlinCreatedAlias = new Body[0];
+        for (var kotlinCreatedAliasItem : kotlinCreatedAlias) {
+            System.out.println(kotlinCreatedAliasItem.string());
+        }
+        var javaCreatedAlias = new JavaLoopBody[0];
+        for (var javaCreatedAliasItem : javaCreatedAlias) {
+            System.out.println(javaCreatedAliasItem.javaOnly());
+        }
+    }
+
+    public void varArrayAliasRows() {
+        var kotlinAliasRows = new Body[0][0];
+        for (var kotlinAliasRow : kotlinAliasRows) {
+            System.out.println(kotlinAliasRow.length);
+        }
+        var javaAliasRows = new JavaLoopBody[0][0];
+        for (var javaAliasRow : javaAliasRows) {
+            System.out.println(javaAliasRow.length);
+        }
+    }
+
 }
 
 class JavaLoopBody {

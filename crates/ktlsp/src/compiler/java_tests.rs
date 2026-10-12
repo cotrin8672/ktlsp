@@ -1,0 +1,1421 @@
+use super::*;
+use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+use crate::workspace::Workspace;
+use serde_json::json;
+use std::sync::{atomic::AtomicBool, Arc};
+
+const JAVA: &str = "package fixture;\nimport generated.KspKotlin;\nimport generated.KspJava;\nimport generated.KaptJava;\nclass Main { void use(KspKotlin a, KspJava b, KaptJava c) { new Helper().editorUnsaved(); } }\n";
+const KOTLIN: &str = "package fixture\nclass Helper { fun editorUnsaved(): Int = 1 }\n";
+
+fn request(root: &Path) -> KotlinDiagnosticRequest {
+    let mut request = kotlin_test_request(root);
+    let recipe = request.task.kotlin_compiler.as_mut().unwrap();
+    recipe.compiler_version = "1.8.21".into();
+    recipe.gradle_plugin_version = "1.8.21".into();
+    recipe.run_via_build_tools_api = false;
+    let mut kotlin_actions = action_fact("org.jetbrains.kotlin.gradle.tasks.AbstractKotlinCompile");
+    kotlin_actions["actions"][0]["method"] = json!("execute");
+    request
+        .task
+        .options
+        .insert("taskActionInventory".into(), kotlin_actions);
+    request
+        .task
+        .options
+        .insert("taskOnlyIfInventory".into(), only_if_fact(false));
+    let output = root.join("build/classes/java/main");
+    let header = root.join("build/headers/java/main");
+    let generated = root.join("build/generated/java/main");
+    let classpath = vec![
+        root.join("libraries/target.jar"),
+        request.task.output_roots[0].clone(),
+    ];
+    let options = vec![
+        "-source".into(),
+        "17".into(),
+        "-target".into(),
+        "17".into(),
+        "-d".into(),
+        path_text(&output).unwrap(),
+        "-h".into(),
+        path_text(&header).unwrap(),
+        "-g".into(),
+        "-sourcepath".into(),
+        "".into(),
+        "-proc:none".into(),
+        "-s".into(),
+        path_text(&generated).unwrap(),
+        "-XDuseUnsharedTable=true".into(),
+        "-classpath".into(),
+        joined_classpath(&classpath).unwrap(),
+        "-proc:none".into(),
+    ];
+    request.java_task = Some(serde_json::from_value(json!({
+        "task": ":compileJava", "language": "java", "task_type": "org.gradle.api.tasks.compile.JavaCompile_Decorated",
+        "arguments": ["-proc:none"], "annotation_processor_path": [],
+        "source_files": [root.join("src/Main.java")], "classpath": classpath,
+        "declared_input_files": [root.join("src/Main.java")], "declared_output_roots": [output, header, generated],
+        "java_home": root.join("jdk"), "output_roots": [output], "complete": true, "problem": null,
+        "options": {"fork": false, "forkJavaHome": null, "forkExecutable": null, "forkJvmArgs": [],
+            "bootstrapClasspath": null, "release": null, "encoding": null, "javaCompilerRecipeProblem": null,
+            "taskActionInventory": action_fact("org.gradle.api.tasks.compile.JavaCompile"),
+            "taskOnlyIfInventory": only_if_fact(false),
+            "javaCompilerRecipe": {"adapter": "gradle-7.4.2-current-jdk17-javac-api-v1",
+                "compiler_type": "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler",
+                "java_runtime_version": "17.0.7+8-LTS-224", "language_version": "17", "gradle_java_version": "17.0.7",
+                "gradle_file_encoding": "MS932", "effective_charset": "UTF-8", "locale": "ja-JP", "api_options": options}}
+    })).unwrap());
+    request.overlays = request
+        .sources
+        .iter()
+        .map(|path| {
+            KotlinSourceOverlay::new(
+                crate::paths::file_key(path),
+                if path.extension().unwrap() == "java" {
+                    JAVA.into()
+                } else {
+                    KOTLIN.into()
+                },
+                1,
+            )
+        })
+        .collect();
+    request
+}
+
+fn fixture() -> (KotlinEditorOverlay, KotlinDiagnosticRequest) {
+    let parent = std::env::temp_dir().join("ktlsp-java-diagnostic-boundaries");
+    let owner = KotlinEditorOverlay::empty_in(
+        &kotlin_test_request(&parent.join("unused-project")),
+        &parent.join("runs"),
+    )
+    .unwrap();
+    let request = request(&owner.directory.join("project"));
+    (owner, request)
+}
+
+fn set_recipe(request: &mut KotlinDiagnosticRequest, recipe: JavaCompilerRecipe) {
+    request.java_task.as_mut().unwrap().options.insert(
+        "javaCompilerRecipe".into(),
+        serde_json::to_value(recipe).unwrap(),
+    );
+}
+
+#[test]
+fn actual_option_order_and_output_roles_survive_partial_header_replay() {
+    let (_owner, request) = fixture();
+    let task = request.java_task.as_ref().unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let output = request.project_dir.join("private");
+    let replayed = replay_options(task, &recipe, &request.task.output_roots[0], &output).unwrap();
+    for (position, original) in recipe.api_options.iter().enumerate() {
+        if ![5, 7, 13, 16].contains(&position) {
+            assert_eq!(&replayed[position], original);
+        }
+    }
+    assert_eq!(replayed[10], "");
+    assert_eq!(replayed[11], replayed[17]);
+    assert_eq!(
+        replayed[16],
+        joined_classpath(&[task.classpath[0].clone(), output.join("lease")]).unwrap()
+    );
+    assert!(!replayed[16].contains(&path_text(&request.task.output_roots[0]).unwrap()));
+}
+
+#[test]
+fn unavailable_java_keeps_kotlin_errors_and_cannot_publish_canonical_java_diagnostics() {
+    let kotlin = CompileDiagnostic {
+        path: "Use.kt".into(),
+        line: 1,
+        col: 1,
+        severity: Severity::Error,
+        message: "canonical error".into(),
+    };
+    let canonical_java = CompileDiagnostic {
+        path: "Use.java".into(),
+        message: "not selected by Javac".into(),
+        ..kotlin.clone()
+    };
+    let verified_java = CompileDiagnostic {
+        path: "Use.java".into(),
+        message: "checked import".into(),
+        ..kotlin.clone()
+    };
+    let mut unavailable = vec![kotlin.clone(), canonical_java.clone()];
+    append_positives(&mut unavailable, Vec::new());
+    assert_eq!(unavailable, vec![kotlin.clone()]);
+    let mut available = vec![kotlin.clone(), canonical_java];
+    append_positives(&mut available, vec![verified_java.clone()]);
+    assert_eq!(available, vec![kotlin, verified_java]);
+}
+
+#[test]
+fn opaque_options_new_sources_sdk_and_classpath_overlap_are_unavailable() {
+    let (_owner, original) = fixture();
+    for kind in [
+        "opaque",
+        "new-source",
+        "sdk",
+        "charset",
+        "duplicate-slot",
+        "parent-slot",
+        "ap",
+        "boot",
+        "missing-boot",
+    ] {
+        let mut request = request(&original.project_dir);
+        let mut recipe = request
+            .java_task
+            .as_ref()
+            .unwrap()
+            .java_compiler_recipe()
+            .unwrap();
+        match kind {
+            "opaque" => recipe.api_options.push("@unproven.args".into()),
+            "new-source" => request.sources.push(request.project_dir.join("src/New.kt")),
+            "sdk" => {
+                request.java_task.as_mut().unwrap().java_home =
+                    Some(request.project_dir.join("other-jdk"))
+            }
+            "charset" => recipe.effective_charset = "windows-31j".into(),
+            "duplicate-slot" | "parent-slot" => {
+                let path = if kind == "duplicate-slot" {
+                    request.task.output_roots[0].clone()
+                } else {
+                    request.task.output_roots[0].parent().unwrap().to_owned()
+                };
+                request.java_task.as_mut().unwrap().classpath.push(path);
+                recipe.api_options[16] =
+                    joined_classpath(&request.java_task.as_ref().unwrap().classpath).unwrap();
+            }
+            "ap" => request.java_task.as_mut().unwrap().arguments.clear(),
+            "boot" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("bootstrapClasspath".into(), json!([]));
+            }
+            "missing-boot" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .remove("bootstrapClasspath");
+            }
+            _ => unreachable!(),
+        }
+        set_recipe(&mut request, recipe);
+        assert!(configured_recipe(&request).is_err(), "{kind}");
+    }
+}
+
+#[test]
+fn whole_package_domain_includes_sources_whose_api_is_unknown() {
+    let expected = BTreeSet::from(["/source.kt".into(), "/consumer.kt".into()]);
+    let mut receipt = json!({"unknownSources": {"/consumer.kt": ["inferred-error-type"]}, "packageDomainProof": {
+        "stageCompleted": true, "allPackageDomainsKnown": true, "nameDomainIsWholePackage": true, "globalIssues": [],
+        "sourceDomains": [{"source": "/source.kt", "package": "fixture", "status": "KnownWholePackage", "issues": []},
+            {"source": "/consumer.kt", "package": "generated", "status": "KnownWholePackage", "issues": []}]}});
+    let packages: BTreeSet<_> = known_packages(&receipt, &expected)
+        .unwrap()
+        .into_values()
+        .collect();
+    assert!(!disjoint_import("generated.KspKotlin", &packages));
+    assert!(!disjoint_import("fixture.Outer.Nested", &packages));
+    assert!(disjoint_import("other.Generated", &packages));
+    assert!(!disjoint_import("other.*", &packages));
+    receipt["packageDomainProof"]["sourceDomains"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(known_packages(&receipt, &expected).is_err());
+    receipt["packageDomainProof"]["sourceDomains"] = json!([
+        {"source": "/source.kt", "package": "fixture", "status": "Unknown", "issues": ["synthetic-hook"]},
+        {"source": "/consumer.kt", "package": "generated", "status": "KnownWholePackage", "issues": []}]);
+    assert!(known_packages(&receipt, &expected).is_err());
+}
+
+#[test]
+fn incomplete_or_backend_error_headers_cannot_publish_a_lease() {
+    let (owner, request) = fixture();
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let expected = current_sources(&overlay).unwrap();
+    let mut receipt = json!({"schema": 1, "compilerVersion": "1.8.21", "callbackCount": 1,
+        "stageCompleted": true, "factoryDone": true, "bindingIdentityPreserved": true,
+        "bindingDiagnosticsPreserved": true, "allSelectedSourcesIncluded": true,
+        "irDiagnosticErrors": false, "incompleteHierarchyCount": 0, "badJavaSignatureCount": 0,
+        "extraJvmDiagnostics": ["CONFLICTING_JVM_DECLARATIONS:ERROR"], "irExtensions": [],
+        "classBuilderInterceptors": [], "classFileFinalizers": [], "analysisHandlers": ["ktlsp.headers.HeaderExtension"]});
+    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[]).is_err());
+    assert!(!overlay.directory.join("lease").exists());
+    receipt["extraJvmDiagnostics"] = json!([]);
+    receipt["stageCompleted"] = json!(false);
+    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[]).is_err());
+    assert!(!overlay.directory.join("lease").exists());
+}
+
+fn java_receipt(path: &Path, text: &str, recipe: &JavaCompilerRecipe) -> Value {
+    let uri = format!("test:{}", path.display());
+    let mut diagnostics = Vec::new();
+    let mut imports = Vec::new();
+    for name in [
+        "generated.KspKotlin",
+        "generated.KspJava",
+        "generated.KaptJava",
+    ] {
+        let start = text.find(name).unwrap();
+        // Exact selected JDK17 receipt: JCFieldAccess position is the dot before the class name.
+        let position = start + name.find('.').unwrap();
+        imports.push(json!({"sourceUri": uri, "static": false, "name": name, "start": start - 7, "end": start + name.len() + 1,
+            "qualifiedStart": start, "qualifiedEnd": start + name.len()}));
+        diagnostics.push(json!({"kind": "ERROR", "code": "compiler.err.doesnt.exist", "sourceUri": uri,
+            "position": position, "start": start, "end": start + name.len(), "line": -1, "column": 999,
+            "message": "パッケージgeneratedは存在しません"}));
+    }
+    for name in ["KspKotlin a", "KspJava b", "KaptJava c"] {
+        diagnostics.push(
+            json!({"kind": "ERROR", "code": "compiler.err.cant.resolve.location", "sourceUri": uri,
+            "position": text.find(name).unwrap(), "message": "シンボルを見つけられません"}),
+        );
+    }
+    let source =
+        json!({"path": path, "uri": uri, "bytes": text.len(), "sha256": sha(text.as_bytes())});
+    json!({"compileCompleted": true, "failure": null, "success": false, "options": recipe.api_options,
+        "gradleFileEncoding": recipe.gradle_file_encoding, "gradleEffectiveDefaultCharset": recipe.effective_charset,
+        "gradleEffectiveDefaultLocale": recipe.locale, "explicitFileManagerCharset": recipe.effective_charset,
+        "explicitDiagnosticLocale": recipe.locale, "runtime": {"javaVersion": recipe.gradle_java_version,
+            "javaRuntimeVersion": recipe.java_runtime_version, "defaultCharset": "windows-31j"},
+        "compilerClass": "com.sun.tools.javac.api.JavacTool", "fileManagerClass": "com.sun.tools.javac.file.JavacFileManager",
+        "sourcesBefore": [source], "sourcesAfter": [source], "parsedUnits": [uri], "imports": imports,
+        "diagnostics": diagnostics, "compilerOutput": ""})
+}
+
+#[test]
+fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_stream() {
+    let (owner, request) = fixture();
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let path = overlay
+        .sources
+        .iter()
+        .find(|path| path.extension().unwrap() == "java")
+        .unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let receipt = java_receipt(path, JAVA, &recipe);
+    let expected = vec![(path.clone(), sha(JAVA.as_bytes()))];
+    let packages = BTreeSet::from(["fixture".into()]);
+    let errors = import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1,
+    )
+    .unwrap();
+    assert_eq!(receipt["diagnostics"].as_array().unwrap().len(), 6);
+    assert_eq!(errors.len(), 3);
+    assert_eq!(errors[0].line, 2);
+    assert_eq!(errors[0].col, 18);
+    assert_eq!(
+        errors[0].path,
+        crate::paths::file_key(&request.project_dir.join("src/Main.java"))
+    );
+    assert_eq!(errors[0].message, "パッケージgeneratedは存在しません");
+    let mut wrong = receipt.clone();
+    wrong["imports"][0]["static"] = json!(true);
+    assert_eq!(
+        import_diagnostics(
+            &wrong,
+            &recipe.api_options,
+            &recipe,
+            &expected,
+            &overlay,
+            &packages,
+            1
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    wrong = receipt.clone();
+    wrong["parsedUnits"] = json!([]);
+    assert!(import_diagnostics(
+        &wrong,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1
+    )
+    .is_err());
+    wrong = receipt.clone();
+    wrong["diagnostics"][0]["position"] = json!(JAVA.find("generated.KspKotlin").unwrap());
+    assert_eq!(
+        import_diagnostics(
+            &wrong,
+            &recipe.api_options,
+            &recipe,
+            &expected,
+            &overlay,
+            &packages,
+            1
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    let overlapping = BTreeSet::from(["fixture".into(), "generated".into()]);
+    assert!(import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &overlapping,
+        1
+    )
+    .unwrap()
+    .is_empty());
+    std::fs::write(path, format!("{JAVA}// changed")).unwrap();
+    assert!(import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1
+    )
+    .is_err());
+}
+
+#[test]
+fn java_positions_use_utf16_offsets_instead_of_javac_visual_tab_columns() {
+    let (owner, mut request) = fixture();
+    let text = JAVA.replace("\nimport", "\n\timport");
+    let source = request
+        .overlays
+        .iter_mut()
+        .find(|source| source.key.ends_with(".java"))
+        .unwrap();
+    *source = KotlinSourceOverlay::new(source.key.clone(), text.clone(), 2);
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let path = overlay
+        .sources
+        .iter()
+        .find(|path| path.extension().unwrap() == "java")
+        .unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let receipt = java_receipt(path, &text, &recipe);
+    let expected = vec![(path.clone(), sha(text.as_bytes()))];
+    let errors = import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &BTreeSet::from(["fixture".into()]),
+        1,
+    )
+    .unwrap();
+    assert_eq!(errors[0].col, 19);
+    assert_eq!(errors.len(), 3);
+}
+
+fn inactive_kapt_tasks(request: &KotlinDiagnosticRequest) -> Vec<CompilerTask> {
+    let mut apt = request.task.clone();
+    apt.task = ":kaptKotlin".into();
+    apt.task_type = "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask_Decorated".into();
+    apt.arguments.clear();
+    apt.source_files.clear();
+    apt.kotlin_compiler = None;
+    apt.annotation_processor_path.clear();
+    apt.options = serde_json::from_value(json!({"processors": [], "providerArguments": [], "includeCompileClasspath": true,
+        "annotationProcessorOptionProviderCount": 0,
+        "taskActionInventory": action_fact("org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask"),
+        "taskOnlyIfInventory": only_if_fact(true)})).unwrap();
+    let mut stubs = request.task.clone();
+    stubs.task = ":kaptGenerateStubsKotlin".into();
+    stubs.task_type = "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated".into();
+    stubs.annotation_processor_path.clear();
+    stubs.output_roots = vec![request
+        .project_dir
+        .join("build/tmp/kapt3/incrementalData/main")];
+    stubs.declared_output_roots = vec![
+        stubs.output_roots[0].clone(),
+        request.project_dir.join("build/tmp/kapt3/stubs/main"),
+    ];
+    vec![apt, stubs]
+}
+
+#[test]
+fn unknown_or_active_auxiliary_producers_cannot_authorize_import_absence() {
+    let (_owner, request) = fixture();
+    let java = request.java_task.as_ref().unwrap();
+    let tasks = |auxiliary: Vec<CompilerTask>| {
+        let mut tasks = vec![request.task.clone(), java.clone()];
+        tasks.extend(auxiliary);
+        tasks
+    };
+    assert!(selected_tasks_supported(
+        &request.task,
+        java,
+        &tasks(Vec::new())
+    ));
+    assert!(selected_tasks_supported(
+        &request.task,
+        java,
+        &tasks(inactive_kapt_tasks(&request))
+    ));
+    for kind in [
+        "processor",
+        "ap-path",
+        "missing-processors",
+        "provider",
+        "custom",
+        "missing-pair",
+        "extra-ksp",
+        "stub-source",
+        "stub-runtime",
+        "stub-output",
+    ] {
+        let mut auxiliary = inactive_kapt_tasks(&request);
+        match kind {
+            "processor" => {
+                auxiliary[0]
+                    .options
+                    .insert("processors".into(), json!(["fixture.Processor"]));
+            }
+            "ap-path" => auxiliary[0]
+                .annotation_processor_path
+                .push(request.project_dir.join("processor.jar")),
+            "missing-processors" => {
+                auxiliary[0].options.remove("processors");
+            }
+            "provider" => {
+                auxiliary[0]
+                    .options
+                    .insert("providerArguments".into(), json!(["-Aenabled=true"]));
+            }
+            "custom" => auxiliary[0].task_type = "fixture.CustomKaptWithoutKotlincTask".into(),
+            "missing-pair" => {
+                auxiliary.pop();
+            }
+            "extra-ksp" => {
+                let mut task = request.task.clone();
+                task.task = ":kspKotlin".into();
+                auxiliary.push(task);
+            }
+            "stub-source" => auxiliary[1]
+                .source_files
+                .push(request.project_dir.join("generated/Foreign.kt")),
+            "stub-runtime" => {
+                auxiliary[1]
+                    .kotlin_compiler
+                    .as_mut()
+                    .unwrap()
+                    .compiler_version = "1.9.0".into()
+            }
+            "stub-output" => auxiliary[1]
+                .declared_output_roots
+                .push(java.classpath[0].clone()),
+            _ => unreachable!(),
+        }
+        assert!(
+            !selected_tasks_supported(&request.task, java, &tasks(auxiliary)),
+            "{kind}"
+        );
+    }
+}
+
+fn workspace(
+    request: &KotlinDiagnosticRequest,
+    providers: Vec<Arc<dyn crate::analysis_extensions::AnalysisProvider>>,
+) -> Workspace {
+    let mut ws = Workspace::with_analysis_providers(providers);
+    let mut tasks = vec![request.task.clone(), request.java_task.clone().unwrap()];
+    if request.positive_diagnostics_only {
+        tasks.extend(inactive_kapt_tasks(request));
+    }
+    ws.set_project_model(Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+        module: ":".into(),
+        project_dir: request.project_dir.clone(),
+        build: ":".into(),
+        entries: Vec::new(),
+        unresolved: Vec::new(),
+        source_sets: vec![SourceSetClasspath {
+            name: "main".into(),
+            source_roots: request.source_roots.clone(),
+            kotlin_compile_task: Some(request.task.task.clone()),
+            compiler_tasks: tasks,
+            ..Default::default()
+        }],
+    }])));
+    for source in &request.overlays {
+        ws.open(source.key.clone(), source.text.clone());
+    }
+    ws
+}
+
+fn positive(java: &str) -> KotlinDiagnosticOutcome {
+    KotlinDiagnosticOutcome::Verified {
+        clean: true,
+        diagnostics: vec![CompileDiagnostic {
+            path: java.into(),
+            line: 2,
+            col: 18,
+            severity: Severity::Error,
+            message: "パッケージgeneratedは存在しません".into(),
+        }],
+    }
+}
+
+#[test]
+fn java_positive_reports_reuse_same_generation_and_never_get_kotlin_clean_authority() {
+    let (_owner, request) = fixture();
+    let mut ws = workspace(&request, Vec::new());
+    let java = crate::paths::file_key(&request.project_dir.join("src/Main.java"));
+    let kt = crate::paths::file_key(&request.project_dir.join("src/Helper.kt"));
+    let target = ws.kotlin_diagnostic_targets().into_iter().next().unwrap().1;
+    assert_eq!(
+        target, kt,
+        "the existing queue selects an open Kotlin source"
+    );
+    let pending = ws.begin_kotlin_diagnostics(&target).unwrap();
+    assert!(pending.java_task.is_some());
+    let invalid = Arc::new(AtomicBool::new(false));
+    let changed = ws.finish_kotlin_diagnostics(&pending, positive(&java), invalid.clone());
+    assert!(changed.contains(&java));
+    assert_eq!(
+        ws.kotlin_diagnostic_trace(&java).unwrap()["clean"],
+        json!(false)
+    );
+    let accepted = ws.kotlin_diagnostic_result_id(&java).unwrap();
+    // A retry on a source not previously reported may be Kotlin-clean but cannot clear Java.
+    ws.change(&kt, format!("{KOTLIN}// new body\n"));
+    assert!(ws.kotlin_diagnostic_result_id(&java).is_none());
+    assert!(ws
+        .finish_kotlin_diagnostics(&pending, positive(&java), invalid.clone())
+        .is_empty());
+    let newer = ws.begin_kotlin_diagnostics(&java).unwrap();
+    let changed = ws.finish_kotlin_diagnostics(
+        &newer,
+        KotlinDiagnosticOutcome::Verified {
+            clean: true,
+            diagnostics: Vec::new(),
+        },
+        invalid,
+    );
+    assert!(!changed.contains(&java));
+    assert!(ws.kotlin_diagnostic_result_id(&java).is_none());
+    assert!(ws.kotlin_diagnostic_result_id(&kt).is_some());
+    assert!(!accepted.is_empty());
+}
+
+struct Provider;
+impl crate::analysis_extensions::AnalysisProvider for Provider {
+    fn id(&self) -> &str {
+        "java-virtual-target-control"
+    }
+    fn analyze(
+        &self,
+        _: &mut ktcore::extensions::ReadSession<'_>,
+    ) -> Result<(), ktcore::extensions::ContractError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn extension_provider_blocks_plain_java_negatives_without_disabling_kotlin_worker() {
+    let (_owner, request) = fixture();
+    let java = crate::paths::file_key(&request.project_dir.join("src/Main.java"));
+    let mut ws = workspace(&request, vec![Arc::new(Provider)]);
+    let pending = ws.begin_kotlin_diagnostics(&java).unwrap();
+    assert!(pending.java_task.is_none());
+    assert!(pending.task.kotlin_compiler.is_some());
+    let changed =
+        ws.finish_kotlin_diagnostics(&pending, positive(&java), Arc::new(AtomicBool::new(false)));
+    assert!(!changed.contains(&java));
+    assert!(ws.kotlin_diagnostic_result_id(&java).is_none());
+}
+
+#[test]
+fn auxiliary_producer_kotlin_clean_does_not_discard_an_independent_java_positive() {
+    let (_owner, mut request) = fixture();
+    request.positive_diagnostics_only = true;
+    let java = crate::paths::file_key(&request.project_dir.join("src/Main.java"));
+    let kt = crate::paths::file_key(&request.project_dir.join("src/Helper.kt"));
+    let mut ws = workspace(&request, Vec::new());
+    let pending = ws.begin_kotlin_diagnostics(&java).unwrap();
+    assert!(pending.positive_diagnostics_only);
+    assert!(pending.java_task.is_some());
+    let changed =
+        ws.finish_kotlin_diagnostics(&pending, positive(&java), Arc::new(AtomicBool::new(false)));
+    assert_eq!(changed, vec![java.clone()]);
+    assert_eq!(
+        ws.kotlin_diagnostic_trace(&java).unwrap()["clean"],
+        json!(false)
+    );
+    assert!(ws.kotlin_diagnostic_result_id(&kt).is_none());
+}
+
+fn action_fact(declaring: &str) -> Value {
+    json!({"adapter":"gradle-7.4.2-stock-actions-v1", "actions":[{
+        "class":"org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction",
+        "declaringClass":declaring,"method":"compile","parameterTypes":["org.gradle.work.InputChanges"]}]})
+}
+
+fn only_if_fact(kapt: bool) -> Value {
+    let mut predicates = vec![json!({"class":"org.gradle.api.internal.AbstractTask$8",
+        "stockEnabledPredicate":true,"stockKaptPredicate":false})];
+    if kapt {
+        predicates.push(json!({"class":"org.jetbrains.kotlin.gradle.tasks.configuration.KaptConfigKt$sam$org_gradle_api_specs_Spec$0",
+        "stockEnabledPredicate":false,"stockKaptPredicate":true}));
+    }
+    json!({"adapter":"gradle-7.4.2-stock-onlyif-v1", "predicates":predicates})
+}
+
+#[test]
+fn inactive_kapt_requires_actual_stock_action_and_absent_raw_providers() {
+    let (_owner, request) = fixture();
+    let java = request.java_task.as_ref().unwrap();
+    for case in [
+        "missing-fact",
+        "null-fact",
+        "doLast",
+        "actions-add",
+        "wrong-method",
+        "wrong-owner",
+        "wrong-parameters",
+        "unknown-action-adapter",
+        "missing-provider-count",
+        "empty-provider",
+        "nested-empty-provider",
+        "missing-onlyif",
+        "custom-onlyif",
+        "replacement-onlyif",
+        "same-wrapper-custom-function",
+        "unknown-onlyif-adapter",
+    ] {
+        let mut auxiliary = inactive_kapt_tasks(&request);
+        let apt = &mut auxiliary[0];
+        match case {
+            "missing-fact" => {
+                apt.options.remove("taskActionInventory");
+            }
+            "null-fact" => {
+                apt.options
+                    .insert("taskActionInventory".into(), Value::Null);
+            }
+            "doLast" | "actions-add" => {
+                apt.options.get_mut("taskActionInventory").unwrap()["actions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(
+                        json!({"class":"org.gradle.api.internal.AbstractTask$TaskActionWrapper"}),
+                    );
+            }
+            "wrong-method" => {
+                apt.options.get_mut("taskActionInventory").unwrap()["actions"][0]["method"] =
+                    json!("other");
+            }
+            "wrong-owner" => {
+                apt.options.get_mut("taskActionInventory").unwrap()["actions"][0]
+                    ["declaringClass"] = json!("fixture.CustomProducer");
+            }
+            "wrong-parameters" => {
+                apt.options.get_mut("taskActionInventory").unwrap()["actions"][0]
+                    ["parameterTypes"] = json!([]);
+            }
+            "unknown-action-adapter" => {
+                apt.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!("unknown");
+            }
+            "missing-provider-count" => {
+                apt.options.remove("annotationProcessorOptionProviderCount");
+            }
+            "empty-provider" | "nested-empty-provider" => {
+                apt.options
+                    .insert("annotationProcessorOptionProviderCount".into(), json!(1));
+            }
+            "missing-onlyif" => {
+                apt.options.remove("taskOnlyIfInventory");
+            }
+            "custom-onlyif" => {
+                apt.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"].as_array_mut().unwrap()
+                .push(json!({"class":"fixture.CustomPredicate","stockEnabledPredicate":false,"stockKaptPredicate":false}));
+            }
+            "replacement-onlyif" => {
+                apt.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"] = json!([]);
+            }
+            "same-wrapper-custom-function" => {
+                apt.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][1]
+                    ["stockKaptPredicate"] = json!(false);
+            }
+            "unknown-onlyif-adapter" => {
+                apt.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!("unknown");
+            }
+            _ => unreachable!(),
+        }
+        let mut tasks = vec![request.task.clone(), java.clone()];
+        tasks.extend(auxiliary);
+        assert!(
+            !selected_tasks_supported(&request.task, java, &tasks),
+            "{case}"
+        );
+    }
+}
+
+fn foreign_java_source(request: &KotlinDiagnosticRequest) -> SourceSetClasspath {
+    let root = request.project_dir.join("dependency");
+    let mut task = request.java_task.clone().unwrap();
+    task.task = ":dependency:compileJava".into();
+    task.source_files = vec![root.join("src/Dep.java")];
+    task.declared_input_files = task.source_files.clone();
+    task.classpath.clear();
+    task.arguments.clear();
+    task.output_roots = vec![root.join("build/classes/java/main")];
+    task.declared_output_roots = vec![
+        task.output_roots[0].clone(),
+        root.join("build/headers"),
+        root.join("build/generated"),
+    ];
+    task.options.insert(
+        "taskActionInventory".into(),
+        action_fact("org.gradle.api.tasks.compile.JavaCompile"),
+    );
+    task.options
+        .insert("taskOnlyIfInventory".into(), only_if_fact(false));
+    let mut recipe = task.java_compiler_recipe().unwrap();
+    recipe.api_options.pop(); // Actual Gradle default -proc:none remains; no explicit raw override.
+    for (at, path) in [
+        (5, &task.declared_output_roots[0]),
+        (7, &task.declared_output_roots[1]),
+        (13, &task.declared_output_roots[2]),
+    ] {
+        recipe.api_options[at] = path_text(path).unwrap();
+    }
+    recipe.api_options[16] = String::new();
+    task.options.insert(
+        "javaCompilerRecipe".into(),
+        serde_json::to_value(recipe).unwrap(),
+    );
+    SourceSetClasspath {
+        name: "main".into(),
+        source_roots: vec![root.join("src")],
+        output_roots: task.output_roots.clone(),
+        provided_artifacts: vec![root.join("build/libs/dependency.jar")],
+        compiler_tasks: vec![task],
+        ..Default::default()
+    }
+}
+
+fn dependency_model(
+    request: &KotlinDiagnosticRequest,
+    foreign: SourceSetClasspath,
+    read: Option<PathBuf>,
+) -> ProjectSnapshot {
+    let mut main = request.task.clone();
+    let mut java = request.java_task.clone().unwrap();
+    if let Some(read) = read {
+        main.classpath.push(read.clone());
+        java.classpath.push(read);
+    }
+    let mut recipe = java.java_compiler_recipe().unwrap();
+    recipe.api_options[16] = joined_classpath(&java.classpath).unwrap();
+    java.options.insert(
+        "javaCompilerRecipe".into(),
+        serde_json::to_value(recipe).unwrap(),
+    );
+    ProjectSnapshot::new(vec![
+        ModuleClasspath {
+            module: ":app".into(),
+            project_dir: request.project_dir.clone(),
+            build: ":".into(),
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(),
+                source_roots: request.source_roots.clone(),
+                entries: java.classpath.clone(),
+                output_roots: main.output_roots.clone(),
+                kotlin_compile_task: Some(main.task.clone()),
+                compiler_tasks: vec![main, java],
+                ..Default::default()
+            }],
+        },
+        ModuleClasspath {
+            module: ":dependency".into(),
+            project_dir: request.project_dir.join("dependency"),
+            build: ":".into(),
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+            source_sets: vec![foreign],
+        },
+    ])
+}
+
+fn participating_dependencies(
+    request: &KotlinDiagnosticRequest,
+    model: &ProjectSnapshot,
+) -> Option<Vec<SourceSetClasspath>> {
+    let key = crate::paths::file_key(&request.task.source_files[0]);
+    let (_, source) = model.owner_for_key(&key).unwrap();
+    let source = source.unwrap();
+    let primary = source
+        .compiler_tasks
+        .iter()
+        .find(|task| task.language == crate::classpath::CompilerLanguage::Kotlin)
+        .unwrap();
+    let java = source
+        .compiler_tasks
+        .iter()
+        .find(|task| task.language == crate::classpath::CompilerLanguage::Java)
+        .unwrap();
+    let scope = model
+        .file_origin(Path::new(&key))
+        .unwrap()
+        .project_scope
+        .unwrap();
+    let visibilities = model.scope_visibilities(&[]);
+    let visible = visibilities
+        .iter()
+        .find(|v| v.scope == scope)
+        .unwrap()
+        .ordered_origins
+        .iter()
+        .cloned()
+        .collect();
+    import_dependencies(primary, java, source, model, &visibilities, &visible)
+}
+
+#[test]
+fn participating_active_or_unknown_producers_deny_even_if_the_output_directory_exists() {
+    let (_owner, request) = fixture();
+    let source = foreign_java_source(&request);
+    let read = source.output_roots[0].clone();
+    let model = dependency_model(&request, source.clone(), Some(read.clone()));
+    assert_eq!(
+        participating_dependencies(&request, &model).unwrap().len(),
+        1
+    );
+    for case in [
+        "ksp",
+        "kapt",
+        "unknown-task",
+        "incomplete",
+        "unresolved",
+        "missing-tasks",
+        "missing-task-outputs",
+        "missing-source-outputs",
+        "custom-action",
+        "provider",
+        "active-ap",
+        "missing-recipe",
+        "custom-onlyif",
+        "missing-onlyif",
+    ] {
+        let mut foreign = source.clone();
+        match case {
+            "ksp" | "kapt" | "missing-source-outputs" => {
+                let mut producer = request.task.clone();
+                producer.task = format!(":dependency:{case}");
+                producer.task_type = format!("fixture.{case}Producer");
+                producer.output_roots = vec![read.clone()];
+                producer.declared_output_roots = vec![read.clone()];
+                foreign.compiler_tasks.push(producer);
+                if case == "missing-source-outputs" {
+                    foreign.output_roots.clear();
+                    foreign.provided_artifacts.clear();
+                }
+            }
+            "unknown-task" => {
+                foreign.compiler_tasks[0].task_type = "fixture.UnknownProducer".into();
+            }
+            "incomplete" => {
+                foreign.compiler_metadata_incomplete = true;
+            }
+            "unresolved" => {
+                foreign.unresolved.push("unknown".into());
+            }
+            "missing-tasks" => {
+                foreign.compiler_tasks.clear();
+            }
+            "missing-task-outputs" => {
+                foreign.compiler_tasks[0].output_roots.clear();
+                foreign.compiler_tasks[0].declared_output_roots.clear();
+            }
+            "custom-action" => {
+                foreign.compiler_tasks[0]
+                    .options
+                    .remove("taskActionInventory");
+            }
+            "provider" => {
+                foreign.compiler_tasks[0].options.insert(
+                    "javaCompilerRecipeProblem".into(),
+                    json!("argument provider unavailable"),
+                );
+            }
+            "active-ap" => {
+                foreign.compiler_tasks[0]
+                    .annotation_processor_path
+                    .push(request.project_dir.join("processor.jar"));
+            }
+            "missing-recipe" => {
+                foreign.compiler_tasks[0]
+                    .options
+                    .remove("javaCompilerRecipe");
+            }
+            "custom-onlyif" => {
+                foreign.compiler_tasks[0].options.get_mut("taskOnlyIfInventory").unwrap()["predicates"].as_array_mut().unwrap()
+                .push(json!({"class":"fixture.CustomPredicate","stockEnabledPredicate":false,"stockKaptPredicate":false}));
+            }
+            "missing-onlyif" => {
+                foreign.compiler_tasks[0]
+                    .options
+                    .remove("taskOnlyIfInventory");
+            }
+            _ => unreachable!(),
+        }
+        let model = dependency_model(&request, foreign, Some(read.clone()));
+        assert!(
+            participating_dependencies(&request, &model).is_none(),
+            "{case}/absent"
+        );
+        std::fs::create_dir_all(&read).unwrap();
+        assert!(
+            participating_dependencies(&request, &model).is_none(),
+            "{case}/present"
+        );
+        std::fs::remove_dir(&read).unwrap();
+    }
+}
+
+#[test]
+fn provided_jar_and_unknown_outputs_cannot_hide_a_producer_but_unrelated_modules_are_ignored() {
+    let (_owner, request) = fixture();
+    let mut source = foreign_java_source(&request);
+    let jar = source.provided_artifacts[0].clone();
+    source.compiler_tasks.clear(); // Missing task metadata falls back to source-set artifact ownership.
+    let model = dependency_model(&request, source.clone(), Some(jar.clone()));
+    assert!(participating_dependencies(&request, &model).is_none());
+    source.compiler_tasks.push(request.task.clone());
+    let model = dependency_model(&request, source.clone(), None);
+    // This clone owns the app Kotlin CP slot, so it is an intersecting unknown producer.
+    assert!(participating_dependencies(&request, &model).is_none());
+    source = foreign_java_source(&request);
+    let model = dependency_model(&request, source, Some(jar));
+    assert!(
+        participating_dependencies(&request, &model).is_none(),
+        "Jar/resource naming has no current proof yet"
+    );
+}
+
+#[test]
+fn genuinely_unrelated_unknown_producers_do_not_disable_owner_import_analysis() {
+    let (_owner, request) = fixture();
+    let mut source = foreign_java_source(&request);
+    source.compiler_tasks[0].task_type = "example.UnknownProducer".into();
+    source.compiler_tasks[0].complete = false;
+    // Keep its actual foreign output paths and do not add them to either owner read classpath.
+    let model = dependency_model(&request, source, None);
+    assert!(participating_dependencies(&request, &model)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn current_foreign_source_packages_block_missing_imports_after_new_saved_source_and_package_move() {
+    let (_owner, mut request) = fixture();
+    let source = foreign_java_source(&request);
+    let path = &source.compiler_tasks[0].source_files[0];
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, "package processor; class Dep {}\n").unwrap();
+    request.java_dependencies = vec![source.clone()];
+    let (packages, _) = dependency_domains(&request).unwrap();
+    assert!(disjoint_import("generated.NewType", &packages));
+    let saved_new = source.source_roots[0].join("NewType.java");
+    assert!(!source.compiler_tasks[0].source_files.contains(&saved_new));
+    std::fs::write(&saved_new, "package generated; class NewType {}\n").unwrap();
+    let (packages, receipt) = dependency_domains(&request).unwrap();
+    assert!(!disjoint_import("generated.NewType", &packages));
+    assert_eq!(receipt["sourceDomains"].as_array().unwrap().len(), 2);
+    std::fs::remove_file(&saved_new).unwrap();
+    std::fs::write(path, "package generated; class Dep {}\n").unwrap();
+    let (packages, _) = dependency_domains(&request).unwrap();
+    assert!(!disjoint_import("generated.NewType", &packages));
+    let bytes = std::fs::read(path).unwrap();
+    request.dependency_overlays.push(KotlinSourceOverlay::new(
+        crate::paths::file_key(path),
+        "package third; class Dep {}\n".into(),
+        2,
+    ));
+    assert!(
+        KotlinEditorOverlay::create_in(&request, &request.project_dir.join("private-overlay"))
+            .is_err(),
+        "existing dirty-visible-dependency boundary rejects before any compiler/Java absence"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn foreign_package_proof_rejects_unknown_syntax_unicode_escapes_modules_and_decorations() {
+    let mut parser = crate::java::JavaParser::new();
+    assert_eq!(
+        java_source_package(&mut parser, "package processor; class Dep {}\n").unwrap(),
+        "processor"
+    );
+    for text in [
+        "package generated.; class Dep {}",
+        "package \\u0067enerated; class Dep {}",
+        "module foo {}",
+        "@Unknown package generated;",
+        "package generated; class Dep {",
+        "package 日本; class Dep {}",
+        "class Dep {}",
+    ] {
+        assert!(java_source_package(&mut parser, text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn selected_foreign_source_outside_exported_roots_and_new_siblings_are_not_omitted() {
+    let (_owner, mut request) = fixture();
+    let mut source = foreign_java_source(&request);
+    let inside = source.compiler_tasks[0].source_files[0].clone();
+    let outside = request.project_dir.join("custom-sources/Outside.java");
+    for file in [&inside, &outside] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "package processor; class Dep {}\n").unwrap();
+    }
+    source.compiler_tasks[0].source_files.push(outside.clone());
+    request.java_dependencies = vec![source];
+    let (packages, first) = dependency_domains(&request).unwrap();
+    assert!(disjoint_import("generated.NewType", &packages));
+    assert_eq!(first["sourceDomains"].as_array().unwrap().len(), 2);
+    let inputs = dependency_inputs(&request).unwrap();
+    assert!(inputs.contains(outside.parent().unwrap()));
+    let plan =
+        crate::compiled_watch::WatchPlan::read_inputs(&inputs.into_iter().collect::<Vec<_>>())
+            .unwrap();
+    assert!(plan.includes_directory_watch(outside.parent().unwrap()));
+    std::fs::write(
+        outside.parent().unwrap().join("NewType.java"),
+        "package generated; class NewType {}\n",
+    )
+    .unwrap();
+    let (packages, second) = dependency_domains(&request).unwrap();
+    assert!(!disjoint_import("generated.NewType", &packages));
+    assert_eq!(second["sourceDomains"].as_array().unwrap().len(), 3);
+    std::fs::remove_file(outside).unwrap();
+    assert!(
+        dependency_domains(&request).is_err(),
+        "a missing selected input cannot become an empty domain"
+    );
+}
+
+#[test]
+fn unavailable_foreign_producer_retains_the_canonical_kotlin_worker_and_no_java_authority() {
+    let (_owner, request) = fixture();
+    let mut foreign = foreign_java_source(&request);
+    let read = foreign.output_roots[0].clone();
+    foreign.compiler_metadata_incomplete = true;
+    let mut ws = Workspace::new();
+    ws.set_project_model(Arc::new(dependency_model(&request, foreign, Some(read))));
+    for source in &request.overlays {
+        ws.open(source.key.clone(), source.text.clone());
+    }
+    let kt = crate::paths::file_key(&request.project_dir.join("src/Helper.kt"));
+    let java = crate::paths::file_key(&request.project_dir.join("src/Main.java"));
+    let pending = ws.begin_kotlin_diagnostics(&kt).unwrap();
+    assert!(pending.java_task.is_none() && pending.java_dependencies.is_empty());
+    assert!(pending.task.kotlin_compiler.is_some());
+    let diagnostic = CompileDiagnostic {
+        path: kt.clone(),
+        line: 2,
+        col: 1,
+        severity: Severity::Error,
+        message: "canonical Kotlin".into(),
+    };
+    let changed = ws.finish_kotlin_diagnostics(
+        &pending,
+        KotlinDiagnosticOutcome::Verified {
+            clean: false,
+            diagnostics: vec![diagnostic],
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(changed.contains(&kt));
+    assert!(ws.kotlin_diagnostic_result_id(&kt).is_some());
+    assert!(ws.kotlin_diagnostic_result_id(&java).is_none());
+}
+
+#[test]
+fn selected_java_custom_actions_or_predicates_cannot_authorize_missing_imports() {
+    let (_owner, request) = fixture();
+    for case in [
+        "missing-actions",
+        "custom-action",
+        "missing-onlyif",
+        "custom-onlyif",
+    ] {
+        let mut java = request.java_task.clone().unwrap();
+        match case {
+            "missing-actions" => {
+                java.options.remove("taskActionInventory");
+            }
+            "custom-action" => {
+                java.options.get_mut("taskActionInventory").unwrap()["actions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"class":"fixture.ProducerAction"}));
+            }
+            "missing-onlyif" => {
+                java.options.remove("taskOnlyIfInventory");
+            }
+            "custom-onlyif" => {
+                java.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"stockEnabledPredicate":false,"stockKaptPredicate":false}));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !selected_tasks_supported(&request.task, &java, &[request.task.clone(), java.clone()]),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn selected_kotlin_and_stubs_custom_producers_cannot_be_replaced_by_a_partial_header_lease() {
+    let (_owner, request) = fixture();
+    let java = request.java_task.as_ref().unwrap();
+    for which in ["primary", "stubs"] {
+        for case in [
+            "missing-actions",
+            "custom-action",
+            "missing-onlyif",
+            "custom-onlyif",
+            "wrong-method",
+        ] {
+            let mut primary = request.task.clone();
+            let mut auxiliary = inactive_kapt_tasks(&request);
+            let task = if which == "primary" {
+                &mut primary
+            } else {
+                &mut auxiliary[1]
+            };
+            match case {
+                "missing-actions" => {
+                    task.options.remove("taskActionInventory");
+                }
+                "custom-action" => {
+                    task.options.get_mut("taskActionInventory").unwrap()["actions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"class":"fixture.WritesUndeclaredApiToReadSlot"}));
+                }
+                "missing-onlyif" => {
+                    task.options.remove("taskOnlyIfInventory");
+                }
+                "custom-onlyif" => {
+                    task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"stockEnabledPredicate":false,"stockKaptPredicate":false}));
+                }
+                "wrong-method" => {
+                    task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["method"] =
+                        json!("other");
+                }
+                _ => unreachable!(),
+            }
+            let mut tasks = vec![primary.clone(), java.clone()];
+            tasks.extend(auxiliary);
+            assert!(
+                !selected_tasks_supported(&primary, java, &tasks),
+                "{which}/{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn closed_current_java_source_is_included_and_a_missing_closed_input_is_unavailable() {
+    let (owner, mut request) = fixture();
+    for source in &request.overlays {
+        let path = Path::new(&source.key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &source.text).unwrap();
+    }
+    let closed = request.source_roots[0].join("Current.java");
+    let text = "package generated; class Current {}\n";
+    std::fs::write(&closed, text).unwrap();
+    request.sources.push(closed.clone());
+    request.task.source_files.push(closed.clone());
+    request.task.declared_input_files.push(closed.clone());
+    let java = request.java_task.as_mut().unwrap();
+    java.source_files.push(closed.clone());
+    java.declared_input_files.push(closed.clone());
+    assert!(!request
+        .overlays
+        .iter()
+        .any(|source| same_path(Path::new(&source.key), &closed)));
+    assert!(configured_recipe(&request).is_ok());
+    let plan =
+        crate::compiled_watch::WatchPlan::read_inputs(&owned_membership_inputs(&request).unwrap())
+            .unwrap();
+    let receipt = owned_source_membership(&request, &plan).unwrap();
+    assert!(receipt["diskSources"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(header_key(&closed))));
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("closed-source-overlay"))
+            .unwrap();
+    let copied = overlay
+        .sources
+        .iter()
+        .find(|path| {
+            overlay
+                .paths
+                .get(&kotlin_path_key(&crate::paths::file_key(path)))
+                .is_some_and(|key| same_path(Path::new(key), &closed))
+        })
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(copied).unwrap(), text);
+    std::fs::remove_file(&closed).unwrap();
+    assert!(
+        owned_source_membership(&request, &plan).is_err(),
+        "closed selected source cannot silently disappear"
+    );
+}
+
+#[test]
+fn saved_closed_java_and_kotlin_arrivals_cannot_authorize_missing_imports_from_an_old_task_list() {
+    for (name, text) in [
+        ("NewType.java", "package generated; class NewType {}\n"),
+        ("NewType.kt", "package generated\nclass NewType\n"),
+    ] {
+        let (owner, request) = fixture();
+        for source in &request.overlays {
+            let path = Path::new(&source.key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &source.text).unwrap();
+        }
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(
+            &owned_membership_inputs(&request).unwrap(),
+        )
+        .unwrap();
+        assert!(owned_source_membership(&request, &plan).is_ok());
+        let added = request.source_roots[0].join(name);
+        std::fs::write(&added, text).unwrap();
+        assert!(!request.task.source_files.contains(&added));
+        assert!(!request
+            .overlays
+            .iter()
+            .any(|source| same_path(Path::new(&source.key), &added)));
+        assert!(
+            configured_recipe(&request).is_ok(),
+            "old exported task membership alone misses this current source"
+        );
+        assert!(owned_source_membership(&request, &plan).is_err(), "{name}");
+        let overlay =
+            KotlinEditorOverlay::create_in(&request, &owner.directory.join("canonical-inputs"))
+                .unwrap();
+        assert_eq!(
+            overlay.sources.len(),
+            request.sources.len(),
+            "auxiliary failure does not exclude canonical inputs"
+        );
+        assert_eq!(std::fs::read_to_string(&added).unwrap(), text);
+        std::fs::remove_file(&added).unwrap();
+        assert!(
+            owned_source_membership(&request, &plan).is_ok(),
+            "membership is current, not a permanent model denial"
+        );
+    }
+}
+
+#[test]
+fn closed_source_edits_before_owner_watch_cannot_authorize_import_absence_but_wire_bodies_can() {
+    for (extension, original_text, body_edit) in [
+        (
+            "java",
+            JAVA,
+            JAVA.replace("editorUnsaved()", "otherUnsaved()"),
+        ),
+        ("kt", KOTLIN, KOTLIN.replace("= 1", "= 2")),
+    ] {
+        let (owner, mut request) = fixture();
+        let original = request
+            .sources
+            .iter()
+            .find(|path| path.extension().unwrap() == extension)
+            .unwrap()
+            .clone();
+        let key = crate::paths::file_key(&original);
+        request.overlays.retain(|source| source.key != key);
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, original_text).unwrap();
+        let overlay = KotlinEditorOverlay::create_in(
+            &request,
+            &owner.directory.join("canonical-closed-copy"),
+        )
+        .unwrap();
+        let expected = current_sources(&overlay).unwrap();
+        assert!(check_closed_sources(&request, &overlay, &expected).is_ok());
+        for changed in [original_text.replace("fixture", "generated"), body_edit] {
+            // This is the concrete pre-watch window: canonical already copied the old body.
+            std::fs::write(&original, &changed).unwrap();
+            let plan = crate::compiled_watch::WatchPlan::read_inputs(
+                &owned_membership_inputs(&request).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                owned_source_membership(&request, &plan).is_ok(),
+                "same paths conceal the changed {extension} body"
+            );
+            assert!(check_closed_sources(&request, &overlay, &expected).is_err());
+            assert_eq!(
+                current_sources(&overlay).unwrap(),
+                expected,
+                "auxiliary denial preserves canonical private inputs"
+            );
+        }
+        std::fs::write(&original, original_text).unwrap();
+        assert!(
+            check_closed_sources(&request, &overlay, &expected).is_ok(),
+            "closed current bytes recover"
+        );
+        request.overlays.push(KotlinSourceOverlay::new(
+            key.clone(),
+            original_text.into(),
+            2,
+        ));
+        std::fs::write(&original, original_text.replace("fixture", "diskonly")).unwrap();
+        assert!(
+            check_closed_sources(&request, &overlay, &expected).is_ok(),
+            "wire body owns the canonical input despite disk divergence"
+        );
+        std::fs::remove_file(&original).unwrap();
+        assert!(
+            check_closed_sources(&request, &overlay, &expected).is_ok(),
+            "wire input need not have a disk file"
+        );
+        request.overlays.retain(|source| source.key != key);
+        assert!(
+            check_closed_sources(&request, &overlay, &expected).is_err(),
+            "unreadable closed input is unavailable"
+        );
+    }
+}

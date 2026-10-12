@@ -681,7 +681,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v27-source-named-call-defaults";
+const SYMCACHE_VERSION: &[u8] = b"v28-java-array-components";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1904,18 +1904,79 @@ fn resolve_jdk_imports_from_zip(
         return Vec::new();
     }
 
-    let mut paths = Vec::new();
-    let mut missing = BTreeSet::new();
+    let start = Instant::now();
+    let Ok(file) = fs::File::open(src_zip) else {
+        return Vec::new();
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let mut by_basename = BTreeMap::<&str, Vec<&String>>::new();
     for suffix in &suffixes {
-        if let Some(path) = find_extracted_source(&dest, suffix) {
-            paths.push(path);
-        } else {
-            missing.insert(suffix.clone());
+        by_basename
+            .entry(suffix.rsplit('/').next().unwrap_or(suffix.as_str()))
+            .or_default()
+            .push(suffix);
+    }
+    // Scan central-directory names once; local/unknown type names must not repeat directory walks.
+    let mut matches = Vec::new();
+    for name in archive.file_names() {
+        let normalized = name.replace('\\', "/");
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        if let Some(candidates) = by_basename.get(basename) {
+            for suffix in candidates {
+                if normalized.ends_with(suffix.as_str()) {
+                    matches.push((name.to_string(), (*suffix).clone()));
+                }
+            }
         }
     }
-    if !missing.is_empty() {
-        paths.extend(extract_sources_by_suffix(src_zip, &dest, &missing));
+    let mut paths = Vec::new();
+    let mut remaining = suffixes.clone();
+    let mut extracted = 0;
+    for (name, suffix) in matches {
+        if !remaining.contains(&suffix) {
+            continue;
+        }
+        let Ok(mut entry) = archive.by_name(&name) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue;
+        };
+        let path = dest.join(enclosed);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            remaining.remove(&suffix);
+            paths.push(path);
+            continue;
+        }
+        let read =
+            jar::read_source_text(&mut entry, 8192, Path::new(&name), JavaSourceEncoding::Utf8);
+        match read.and_then(|text| {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            jar::write_source_text(&path, &text)
+        }) {
+            Ok(()) => {
+                remaining.remove(&suffix);
+                paths.push(path);
+                extracted += 1;
+            }
+            Err(error) => tracing::warn!("extract source seed {name} failed: {error:#}"),
+        }
     }
+    crate::trace::span(
+        "deps.source_seed_extract",
+        "deps",
+        start,
+        serde_json::json!({
+            "requested": suffixes.len(), "extracted": extracted, "missing": remaining.len(),
+        }),
+    );
     paths.sort();
     paths.dedup();
     let mut batches: Vec<_> = paths
@@ -2305,6 +2366,323 @@ mod tests {
         );
     }
 
+    fn assert_jdk_seed_type_reference_goto(
+        case: &str,
+        source: &str,
+        anchor: &str,
+        expected: crate::symbol::Def,
+    ) {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_jdk_seed_goto_{case}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let src_zip = tmp.join("src.zip");
+        write_sources_jar(
+            &src_zip,
+            &[(
+                "java.base/java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> { java.util.Iterator<T> iterator(); }",
+            )],
+        );
+        let mut ws = crate::workspace::Workspace::new();
+        let file = "seed/Use.java";
+        let custom = "package custom; public interface Iterable<T> {}";
+        ws.open("custom/Iterable.java", custom.to_string());
+        ws.open(file, source.to_string());
+        let offset = source.find(anchor).unwrap();
+        let before = ws.goto_definition(file, offset);
+        let mut java = JavaParser::new();
+        let tree = java.parse(source);
+        let fqns = crate::java::referenced_java_lang_fqns(&tree, source);
+        assert!(fqns.iter().any(|fqn| fqn == "java.lang.Iterable"));
+        let batches =
+            resolve_jdk_imports_from_zip(&src_zip, &tmp.join("extract"), &fqns, &mut java);
+        assert_eq!(batches.len(), 1, "only the real JDK source is seeded");
+        assert!(batches[0]
+            .origin
+            .as_ref()
+            .unwrap()
+            .origin_id
+            .starts_with("jdk:"));
+        for batch in batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.bump_index_revision();
+        let after = ws.goto_definition(file, offset);
+        eprintln!("{case}: before seed {before:?}; after seed {after:?}");
+        let type_defs = ws.type_definition(file, offset);
+        eprintln!("{case}: seeded type definitions {type_defs:?}");
+        // A parameter type-definition positive is separate; no foreign nominal target is valid.
+        assert!(
+            type_defs.iter().all(|definition| definition == &expected),
+            "{case}: type definition captured a shadowed default type: {type_defs:?}"
+        );
+        assert_eq!(
+            after,
+            vec![expected],
+            "{case}: seeded default type must not capture a shadowed name"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn jdk_seed_goto_preserves_same_file_type_identity() {
+        let source = "package seed; class Iterable<T> {} class Use { Iterable<String> value; }";
+        let start = source.find("class Iterable").unwrap() + "class ".len();
+        assert_jdk_seed_type_reference_goto(
+            "same_file",
+            source,
+            "Iterable<String>",
+            crate::symbol::Def {
+                file: "seed/Use.java".into(),
+                start_byte: start,
+                end_byte: start + "Iterable".len(),
+            },
+        );
+    }
+
+    #[test]
+    fn jdk_seed_goto_preserves_explicit_import_identity() {
+        let source = "package seed; import custom.Iterable; class Use { Iterable<String> value; }";
+        let custom = "package custom; public interface Iterable<T> {}";
+        let start = custom.find("interface Iterable").unwrap() + "interface ".len();
+        assert_jdk_seed_type_reference_goto(
+            "explicit_import",
+            source,
+            "Iterable<String>",
+            crate::symbol::Def {
+                file: "custom/Iterable.java".into(),
+                start_byte: start,
+                end_byte: start + "Iterable".len(),
+            },
+        );
+    }
+
+    #[test]
+    fn jdk_seed_goto_preserves_lexical_type_parameter_identity() {
+        let source = "package seed; class Use<Iterable> { Iterable value; }";
+        let start = source.find("<Iterable>").unwrap() + 1;
+        assert_jdk_seed_type_reference_goto(
+            "type_parameter",
+            source,
+            "Iterable value",
+            crate::symbol::Def {
+                file: "seed/Use.java".into(),
+                start_byte: start,
+                end_byte: start + "Iterable".len(),
+            },
+        );
+    }
+
+    #[test]
+    fn jdk_seed_goto_preserves_nearest_member_type_identity() {
+        for (case, source, anchor, declaration, prefix) in [
+            ("member_nested",
+             "package seed; class Outer { class Iterable<T> {} void run(Iterable<String> value) {} } class Iterable<T> {}",
+             "Iterable<String>", "class Iterable", "class "),
+            ("nearest_member",
+             "package seed; class Outer { class Iterable<T> {} class Inner { class Iterable<T> { int nearest; } void run(Iterable<String> value) {} } } class Iterable<T> {}",
+             "Iterable<String>", "class Iterable<T> { int nearest; }", "class "),
+            ("outer_interface_member",
+             "package seed; interface Outer { interface Iterable<T> {} class Inner { void run(Iterable<String> value) {} } } class Iterable<T> {}",
+             "Iterable<String>", "interface Iterable", "interface "),
+            ("enum_member",
+             "package seed; enum Outer { VALUE; class Iterable<T> {} void run(Iterable<String> value) {} } class Iterable<T> {}",
+             "Iterable<String>", "class Iterable", "class "),
+            ("nearer_method_parameter",
+             "package seed; class Outer { class Iterable<T> {} <Iterable> void run(Iterable value) {} } class Iterable<T> {}",
+             "Iterable value", "<Iterable>", "<"),
+        ] {
+            let start = source.find(declaration).unwrap() + prefix.len();
+            let expected = crate::symbol::Def {
+                file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len(),
+            };
+            assert_jdk_seed_type_reference_goto(case, source, anchor, expected.clone());
+            if case != "nearer_method_parameter" {
+                let mut ws = crate::workspace::Workspace::new();
+                ws.open("seed/Use.java", source.to_string());
+                assert_eq!(ws.type_definition("seed/Use.java", source.find(anchor).unwrap()),
+                    vec![expected], "{case}: lexical member type definition");
+            }
+        }
+        // Duplicate current member declarations are ambiguous, never a first-name or JDK fallback.
+        let source = "package seed; class Outer { class Iterable {} class Iterable {} void run(Iterable value) {} } class Iterable {}";
+        let mut ws = crate::workspace::Workspace::new();
+        ws.open(
+            "java/lang/Iterable.java",
+            "package java.lang; public interface Iterable<T> {}".to_string(),
+        );
+        ws.open("seed/Use.java", source.to_string());
+        let offset = source.find("Iterable value").unwrap();
+        let definitions = ws.goto_definition("seed/Use.java", offset);
+        let type_definitions = ws.type_definition("seed/Use.java", offset);
+        eprintln!("duplicate members: goto {definitions:?}; type definitions {type_definitions:?}");
+        assert!(definitions.is_empty(), "{definitions:?}");
+        assert!(type_definitions.is_empty(), "{type_definitions:?}");
+    }
+
+    #[test]
+    fn jdk_seed_goto_resolves_current_source_inherited_type_identity() {
+        for (case, source, declaration, prefix, parameter) in [
+            ("inherited_outer", "package seed;\nclass Base { class Iterable {} }\nclass Outer {\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n", "class Iterable", "class ", false),
+            ("inherited_package", "package seed;\nclass Base { class Iterable {} }\nclass Use extends Base {\n    Iterable selected;\n    void run(Iterable value) {}\n}\nclass Iterable {}\n", "class Iterable", "class ", false),
+            ("inherited_import", "package seed;\nimport custom.Iterable;\nclass Base { class Iterable {} }\nclass Use extends Base {\n    Iterable selected;\n    void run(Iterable value) {}\n}\n", "class Iterable", "class ", false),
+            ("inherited_anonymous", "package seed;\nclass Base { class Iterable {} }\nclass Outer {\n    class Iterable {}\n    Object field = new Base() {\n        Iterable selected;\n        void run(Iterable value) {}\n    };\n}\n", "class Iterable", "class ", false),
+            ("own_member_before_inheritance", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { class Iterable { int own; } void run(Iterable value) {} } }", "class Iterable { int own; }", "class ", false),
+            ("own_parameter_before_inheritance", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner<Iterable> extends Base { void run(Iterable value) {} } }", "<Iterable>", "<", true),
+            ("method_parameter_before_inheritance", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { <Iterable> void run(Iterable value) {} } }", "<Iterable>", "<", true),
+            ("inherited_before_outer_parameter", "package seed; class Base { class Iterable {} } class Outer<Iterable> { class Inner extends Base { void run(Iterable value) {} } }", "class Iterable", "class ", false),
+            ("known_super_without_named_type", "package seed; class Base {} class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } }", "class Iterable", "class ", false),
+            ("inherited_with_incomplete_body", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) { value. } } }", "class Iterable", "class ", false),
+            ("qualified_parent_over_member_homonym", "package seed; class Base { class Iterable {} } class Outer { class Base { class Iterable {} } class Inner extends seed.Base { void run(Iterable value) {} } }", "class Iterable", "class ", false),
+        ] {
+            let start = source.find(declaration).unwrap() + prefix.len();
+            let expected = crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() };
+            assert_jdk_seed_type_reference_goto(case, source, "Iterable value", expected.clone());
+            let mut ws = crate::workspace::Workspace::new();
+            ws.open("seed/Use.java", source.to_string());
+            let definitions = ws.type_definition("seed/Use.java", source.find("Iterable value").unwrap());
+            eprintln!("{case}: current type definitions {definitions:?}");
+            if parameter {
+                assert!(definitions.is_empty(), "{case}: {definitions:?}");
+            } else {
+                assert_eq!(definitions, vec![expected], "{case}: exact inherited/member type definition");
+            }
+        }
+        // A known superclass without this name must preserve an ordinary imported type.
+        let custom = "package custom; public interface Iterable<T> {}";
+        let start = custom.find("interface Iterable").unwrap() + "interface ".len();
+        let expected = crate::symbol::Def {
+            file: "custom/Iterable.java".into(),
+            start_byte: start,
+            end_byte: start + "Iterable".len(),
+        };
+        for (case, source) in [
+            ("known_super_import", "package seed; import custom.Iterable; class Base {} class Use extends Base { Iterable value; }"),
+            ("known_super_import_incomplete_body", "package seed; import custom.Iterable; class Base {} class Use extends Base { void run(Iterable value) { value. } }"),
+        ] {
+            assert_jdk_seed_type_reference_goto(case, source, "Iterable value", expected.clone());
+            let mut ws = crate::workspace::Workspace::new();
+            ws.open("custom/Iterable.java", custom.to_string());
+            ws.open("seed/Use.java", source.to_string());
+            assert_eq!(ws.type_definition("seed/Use.java", source.find("Iterable value").unwrap()), vec![expected.clone()]);
+        }
+        // These are Unknown boundaries, not assertions that valid inherited navigation is complete.
+        for (case, source) in [
+            ("missing_ancestor", "package seed; class Outer { class Iterable {} class Inner extends Missing { void run(Iterable value) {} } } class Iterable {}"),
+            ("ambiguous_ancestor", "package seed; class Base { class Iterable {} } class Base {} class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } } class Iterable {}"),
+            ("ambiguous_inherited_types", "package seed; interface First { class Iterable {} } interface Second { class Iterable {} } class Outer { class Iterable {} class Inner implements First, Second { void run(Iterable value) {} } }"),
+            ("private_inherited_candidate", "package seed; class Base { private class Iterable {} } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } }"),
+            ("malformed_ancestor_header", "package seed; class Base extends { } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } } class Iterable {}"),
+            ("unindexed_anonymous_local_base", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} void create() { class Base {} Object value = new Base() { void run(Iterable value) {} }; } }"),
+            ("ambiguous_parent_container", "package seed; class Base { class Iterable {} } class Outer { class Base { class Iterable {} } class Inner extends Base { void run(Iterable value) {} } }"),
+        ] {
+            let mut ws = crate::workspace::Workspace::new();
+            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open("seed/Use.java", source.to_string());
+            let offset = source.find("Iterable value").unwrap();
+            let definitions = ws.goto_definition("seed/Use.java", offset);
+            let type_definitions = ws.type_definition("seed/Use.java", offset);
+            eprintln!("{case}: goto {definitions:?}; type definitions {type_definitions:?}");
+            assert!(definitions.is_empty(), "{case}: {definitions:?}");
+            assert!(type_definitions.is_empty(), "{case}: {type_definitions:?}");
+        }
+    }
+
+    #[test]
+    fn jdk_seed_goto_keeps_lexical_parent_identity_before_import_expansion() {
+        let base = "package custom; public class Base {}";
+        let container = "package custom; public class Container { public static class Base {} }";
+        let imported = "package custom; public interface Iterable<T> {}";
+        for (case, source, declaration) in [
+            ("import_shadowed_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n", None),
+            ("import_shadowed_anonymous_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Iterable {}\n    Object field = new Base() {\n        Iterable selected;\n        void run(Iterable value) {}\n    };\n}\n", None),
+            ("import_shadowed_parent_qualifier", "package seed; import custom.Container; class Outer { class Container { class Base { class Iterable {} } } class Iterable {} class Inner extends Container.Base { Inner(Container outer) { outer.super(); } void run(Iterable value) {} } }", None),
+            ("unshadowed_import_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n", Some("class Iterable")),
+            ("qualified_import_parent", "package seed; import custom.Base; class Outer { class Base { class Iterable {} } class Iterable { int selected; } class Inner extends custom.Base { void run(Iterable value) {} } }", Some("class Iterable { int selected; }")),
+            ("same_lexical_import_parent", "package seed; import seed.Outer.Base; class Outer { static class Base { class Iterable {} } class Iterable {} class Inner extends Base { void run(Iterable value) {} } }", Some("class Iterable")),
+        ] {
+            let mut ws = crate::workspace::Workspace::new();
+            ws.open("custom/Base.java", base.to_string());
+            ws.open("custom/Container.java", container.to_string());
+            ws.open("custom/Iterable.java", imported.to_string());
+            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open("seed/Use.java", source.to_string());
+            let offset = source.find("Iterable value").unwrap();
+            let definitions = ws.goto_definition("seed/Use.java", offset);
+            let type_definitions = ws.type_definition("seed/Use.java", offset);
+            eprintln!("{case}: goto {definitions:?}; type definitions {type_definitions:?}");
+            if let Some(declaration) = declaration {
+                let start = source.find(declaration).unwrap() + "class ".len();
+                let expected = vec![crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() }];
+                assert_eq!(definitions, expected, "{case}: exact useful goto");
+                assert_eq!(type_definitions, expected, "{case}: exact useful type definition");
+            } else {
+                // Valid source needs a lexical-parent resolver; never select the competing outer type.
+                assert!(definitions.is_empty(), "{case}: {definitions:?}");
+                assert!(type_definitions.is_empty(), "{case}: {type_definitions:?}");
+            }
+        }
+        let source = "package seed; class Use extends Outer.Middle { Use(Outer outer) { outer.super(); } Iterable selected; void run(Iterable value) {} } class Iterable {}";
+        for (case, helpers, source, shadowed) in [
+            ("foreign_import_shadowed_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Middle extends Base {}\n}\n", source, true),
+            ("foreign_unshadowed_import_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Middle extends Base {}\n}\n", source, false),
+            ("foreign_import_shadowed_qualifier", "package seed; import custom.Container; class Outer { class Container { class Base { class Iterable {} } } class Middle extends Container.Base { Middle(Container outer) { outer.super(); } } }", "package seed; class Use extends Outer.Middle { Use(Outer outer, Outer.Container container) { outer.super(container); } Iterable selected; void run(Iterable value) {} } class Iterable {}", true),
+        ] {
+            let mut ws = crate::workspace::Workspace::new();
+            ws.open("custom/Base.java", base.to_string());
+            ws.open("custom/Container.java", container.to_string());
+            ws.open("seed/Helpers.java", helpers.to_string());
+            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open("seed/Use.java", source.to_string());
+            let offset = source.find("Iterable value").unwrap();
+            let definitions = ws.goto_definition("seed/Use.java", offset);
+            let type_definitions = ws.type_definition("seed/Use.java", offset);
+            eprintln!("{case}: goto {definitions:?}; type definitions {type_definitions:?}");
+            if shadowed {
+                assert!(definitions.is_empty(), "{case}: {definitions:?}");
+                assert!(type_definitions.is_empty(), "{case}: {type_definitions:?}");
+            } else {
+                let start = source.find("class Iterable").unwrap() + "class ".len();
+                let expected = vec![crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() }];
+                assert_eq!(definitions, expected, "{case}: preserve useful fallback");
+                assert_eq!(type_definitions, expected, "{case}: preserve useful fallback");
+            }
+        }
+    }
+
+    #[test]
+    fn jdk_seed_goto_withholds_unproven_foreign_kotlin_nested_parent() {
+        let nested_use = "package seed; class Use extends Outer.Middle { Iterable selected; void run(Iterable value) {} } class Iterable {}";
+        let top_level_use = "package seed; class Use extends Middle { Iterable selected; void run(Iterable value) {} } class Iterable {}";
+        for (case, helpers_key, helpers, source, unavailable) in [
+            ("foreign_kotlin_alias_parent", "seed/Helpers.kt", "package seed\nimport custom.Base as Alias\nclass Outer {\n    open class Alias { class Iterable }\n    open class Middle : Alias()\n}\n", nested_use, true),
+            ("foreign_kotlin_nested_without_parent", "seed/Helpers.kt", "package seed\nclass Outer { open class Middle }\n", nested_use, false),
+            ("foreign_kotlin_top_level_parent", "seed/Helpers.kt", "package seed\nopen class Middle : custom.Base()\n", top_level_use, false),
+            ("foreign_java_nested_parent", "seed/Helpers.java", "package seed; class Outer { static class Middle extends custom.Base {} }", nested_use, false),
+        ] {
+            let mut ws = crate::workspace::Workspace::new();
+            ws.open("custom/Base.java", "package custom; public class Base {}".to_string());
+            ws.open(helpers_key, helpers.to_string());
+            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open("seed/Use.java", source.to_string());
+            let offset = source.find("Iterable value").unwrap();
+            let definitions = ws.goto_definition("seed/Use.java", offset);
+            let type_definitions = ws.type_definition("seed/Use.java", offset);
+            eprintln!("{case}: goto {definitions:?}; type definitions {type_definitions:?}");
+            if unavailable {
+                // Expected lexical target is Outer.Alias.Iterable; independent compilation is unmeasured.
+                assert!(definitions.is_empty(), "{case}: {definitions:?}");
+                assert!(type_definitions.is_empty(), "{case}: {type_definitions:?}");
+            } else {
+                let start = source.find("class Iterable").unwrap() + "class ".len();
+                let expected = vec![crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() }];
+                assert_eq!(definitions, expected, "{case}: preserve useful goto");
+                assert_eq!(type_definitions, expected, "{case}: preserve useful type definition");
+            }
+        }
+    }
+
     #[test]
     fn resolves_explicit_jdk_import_from_modular_src_zip() {
         let tmp = std::env::temp_dir().join(format!("ktlsp_jdk_seed_test_{}", std::process::id()));
@@ -2344,6 +2722,277 @@ public interface ExecutorService {
             .iter()
             .any(|sym| sym.name == "awaitTermination"));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn jdk_seed_default_type_supports_foreach_and_leaves_unknown_names_absent() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_jdk_default_seed_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let src_zip = tmp.join("src.zip");
+        write_sources_jar(
+            &src_zip,
+            &[(
+                "java.base/java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> { java.util.Iterator<T> iterator(); }",
+            )],
+        );
+        let src = r#"package seed;
+class Item { public void useful() {} }
+public class DefaultUse {
+    void run(Iterable<Item> values) {
+        for (var item : values) { item.useful(); }
+    }
+}
+"#;
+        let mut java = JavaParser::new();
+        let tree = java.parse(src);
+        let fqns = crate::java::referenced_java_lang_fqns(&tree, src);
+        assert_eq!(fqns, ["java.lang.Item", "java.lang.Iterable"]);
+        let mut ws = crate::workspace::Workspace::new();
+        ws.open("seed/DefaultUse.java", src.to_string());
+        let offset = src.find("item.useful").unwrap() + "item.".len();
+        assert!(ws.complete("seed/DefaultUse.java", offset, true).is_none());
+        let batches =
+            resolve_jdk_imports_from_zip(&src_zip, &tmp.join("extract"), &fqns, &mut java);
+        assert_eq!(
+            batches.len(),
+            1,
+            "only the actual archive entry can create facts"
+        );
+        assert!(batches[0]
+            .origin
+            .as_ref()
+            .unwrap()
+            .origin_id
+            .starts_with("jdk:"));
+        for batch in batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.bump_index_revision();
+        let got = ws
+            .complete("seed/DefaultUse.java", offset, true)
+            .expect("seeded Iterable receiver");
+        assert!(got.items.iter().any(|item| item.label == "useful"));
+        let items = ws.index.lookup_type("Item");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].sym.package, "seed");
+        let missing = r#"package seedunknown;
+public class UnknownUse {
+    void run(DefinitelyNotInJavaLang value) { value.toString(); }
+}
+"#;
+        let tree = java.parse(missing);
+        let fqns = crate::java::referenced_java_lang_fqns(&tree, missing);
+        assert_eq!(fqns, ["java.lang.DefinitelyNotInJavaLang"]);
+        assert!(
+            resolve_jdk_imports_from_zip(&src_zip, &tmp.join("extract"), &fqns, &mut java)
+                .is_empty()
+        );
+        assert!(ws.index.lookup_type("DefinitelyNotInJavaLang").is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn jdk_seed_preserves_same_file_and_type_parameter_shadowing() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_jdk_seed_shadow_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let src_zip = tmp.join("src.zip");
+        write_sources_jar(
+            &src_zip,
+            &[(
+                "java.base/java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> { java.util.Iterator<T> iterator(); }",
+            )],
+        );
+        let src = r#"package seedshadow;
+class Item {}
+class Iterable<T> { public void ownOnly() {} }
+public class ShadowUse {
+    void run(Iterable<Item> values) { values.ownOnly(); }
+}
+"#;
+        let mut java = JavaParser::new();
+        let tree = java.parse(src);
+        let fqns = crate::java::referenced_java_lang_fqns(&tree, src);
+        let mut ws = crate::workspace::Workspace::new();
+        ws.open("seedshadow/ShadowUse.java", src.to_string());
+        for batch in resolve_jdk_imports_from_zip(&src_zip, &tmp.join("extract"), &fqns, &mut java)
+        {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.bump_index_revision();
+        assert_eq!(ws.index.lookup_type("Iterable").len(), 2);
+        let offset = src.find("values.ownOnly").unwrap() + "values.".len();
+        let got = ws
+            .complete("seedshadow/ShadowUse.java", offset, true)
+            .expect("local Iterable receiver");
+        assert!(got.items.iter().any(|item| item.label == "ownOnly"));
+        assert!(!got.items.iter().any(|item| item.label == "iterator"));
+        let parameter = r#"package seedparameter;
+public class ParameterUse<Iterable> {
+    void run(Iterable value) { value.toString(); }
+}
+"#;
+        ws.open("seedparameter/ParameterUse.java", parameter.to_string());
+        let offset = parameter.find("value.toString").unwrap() + "value.".len();
+        assert!(!ws
+            .complete("seedparameter/ParameterUse.java", offset, true)
+            .is_some_and(|got| { got.items.iter().any(|item| item.label == "iterator") }));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn jdk_seed_flat_archive_selects_exact_members_and_reuses_their_cache() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_jdk_flat_seed_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let src_zip = tmp.join("src.zip");
+        write_sources_jar(
+            &src_zip,
+            &[
+                (
+                    "other/Iterable.java",
+                    "package other; public interface Iterable {}",
+                ),
+                (
+                    "java/lang/Iterable.java",
+                    "package java.lang; public interface Iterable<T> {}",
+                ),
+                (
+                    "javax/tools/Iterable.java",
+                    "package javax.tools; public interface Iterable {}",
+                ),
+                (
+                    "../java/lang/Missing.java",
+                    "package java.lang; public class Missing {}",
+                ),
+            ],
+        );
+        let extract = tmp.join("extract");
+        let fqns = [
+            "java.lang.Iterable".into(),
+            "javax.tools.Iterable".into(),
+            "java.lang.Missing".into(),
+        ];
+        let mut java = JavaParser::new();
+        let first = resolve_jdk_imports_from_zip(&src_zip, &extract, &fqns, &mut java);
+        assert_eq!(first.len(), 2);
+        let packages = first
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .filter(|symbol| symbol.name == "Iterable")
+            .map(|symbol| symbol.package.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            packages,
+            BTreeSet::from(["java.lang".into(), "javax.tools".into()])
+        );
+        let dest = extract.join("jdk").join(jar_fingerprint(&src_zip).unwrap());
+        let selected = dest.join("java/lang/Iterable.java");
+        assert!(first.iter().any(|batch| Path::new(&batch.file) == selected));
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&selected)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let before = fs::metadata(&selected).unwrap().modified().unwrap();
+        // Stale siblings are not members of this archive, even if their suffix sorts first.
+        let stale = dest.join("000/java/lang");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(
+            stale.join("Iterable.java"),
+            "package stale; public class Iterable {}",
+        )
+        .unwrap();
+        fs::write(
+            stale.join("Missing.java"),
+            "package stale; public class Missing {}",
+        )
+        .unwrap();
+        let second = resolve_jdk_imports_from_zip(&src_zip, &extract, &fqns, &mut java);
+        assert_eq!(
+            second.iter().map(|batch| &batch.file).collect::<Vec<_>>(),
+            first.iter().map(|batch| &batch.file).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fs::metadata(&selected).unwrap().modified().unwrap(),
+            before,
+            "warm requests must reuse the actual selected source without rewriting it"
+        );
+        assert_eq!(
+            fs::read_to_string(&selected).unwrap(),
+            "package java.lang; public interface Iterable<T> {}"
+        );
+        assert!(
+            !dest
+                .parent()
+                .unwrap()
+                .join("java/lang/Missing.java")
+                .exists(),
+            "an unsafe matching entry must not escape its extraction root"
+        );
+        assert!(!dest.join("other/Iterable.java").exists());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn jdk_seed_never_publishes_invalid_utf8_or_bad_crc() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_jdk_invalid_seed_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let payloads: &[(&str, &[u8])] = &[
+            (
+                "utf8",
+                b"// invalid \xff\npackage java.lang; public class Bad {}\n",
+            ),
+            ("crc", b"package java.lang; public class Bad {}\n"),
+        ];
+        let mut java = JavaParser::new();
+        for &(case, payload) in payloads {
+            let archive = tmp.join(format!("{case}.zip"));
+            let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+            writer
+                .start_file(
+                    "java.base/java/lang/Bad.java",
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(payload).unwrap();
+            writer.finish().unwrap();
+            if case == "crc" {
+                let mut bytes = fs::read(&archive).unwrap();
+                let offset = bytes
+                    .windows(payload.len())
+                    .position(|part| part == payload)
+                    .unwrap();
+                bytes[offset + payload.len() - 1] ^= 1;
+                fs::write(&archive, bytes).unwrap();
+            }
+            let extract = tmp.join(case);
+            assert!(
+                resolve_jdk_imports_from_zip(
+                    &archive,
+                    &extract,
+                    &["java.lang.Bad".into()],
+                    &mut java
+                )
+                .is_empty(),
+                "{case}"
+            );
+            let dest = extract.join("jdk").join(jar_fingerprint(&archive).unwrap());
+            assert!(
+                !dest.join("java.base/java/lang/Bad.java").exists(),
+                "{case}"
+            );
+        }
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     fn assert_dependency_buffer_lifecycle(batch: FileSymbols, source: &Path, original: &str) {

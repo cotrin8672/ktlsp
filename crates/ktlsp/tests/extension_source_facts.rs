@@ -408,3 +408,42 @@ fn java_constructor_is_not_an_ordinary_method_descriptor_with_the_owner_name() {
         Some(MemberImplementation::Concrete)
     );
 }
+
+#[test]
+fn java_array_signature_components_keep_qualification_and_generic_arguments() {
+    let source = r#"package oracle;
+public class Target {
+    public java.lang.String[] known(int[] values) { return null; }
+    public other.String[] foreign() { return null; }
+    public other.Box<java.lang.String>[] generic() { return null; }
+}
+"#;
+    let facts = facts_with_types(
+        "Target.java",
+        source,
+        &[
+            (
+                "ForeignString.java",
+                "package other; public class String {}",
+            ),
+            ("ForeignBox.java", "package other; public class Box<T> {}"),
+        ],
+    );
+    assert_eq!(
+        descriptor(named(&facts, source, "known")),
+        "([I)[Ljava/lang/String;"
+    );
+    for name in ["foreign", "generic"] {
+        assert!(
+            matches!(
+                named(&facts, source, name)
+                    .member
+                    .as_ref()
+                    .unwrap()
+                    .signature,
+                Knowledge::Unknown(_)
+            ),
+            "{name} must not erase an unrelated declaration to java.lang.String"
+        );
+    }
+}

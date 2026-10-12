@@ -7064,11 +7064,11 @@ impl Workspace {
             .file_origin(Path::new(key))
             .and_then(|origin| origin.project_scope)
             .ok_or("kotlin-source-scope-unknown")?;
-        let visible_origins: BTreeSet<_> = model
-            .scope_visibilities(&[])
-            .into_iter()
+        let visibilities = model.scope_visibilities(&[]);
+        let visible_origins: BTreeSet<_> = visibilities
+            .iter()
             .find(|visibility| visibility.scope == scope)
-            .map(|visibility| visibility.ordered_origins.into_iter().collect())
+            .map(|visibility| visibility.ordered_origins.iter().cloned().collect())
             .unwrap_or_default();
         let mut sources: BTreeMap<_, _> = task
             .source_files
@@ -7109,6 +7109,33 @@ impl Workspace {
         }
         overlays.sort_by(|a, b| a.key.cmp(&b.key));
         dependency_overlays.sort_by(|a, b| a.key.cmp(&b.key));
+        // Plain javac cannot reject virtual targets contributed by LSPExtension providers.
+        // Until Java compiler positives reconcile with those facts, keep this surface unavailable.
+        let java_inputs = if self.analysis_extensions.is_empty()
+            && sources
+                .keys()
+                .chain(dependency_overlays.iter().map(|source| &source.key))
+                .all(|file| self.index.contributions_for_file(file).is_empty())
+        {
+            model.plain_java_task(key).and_then(|java| {
+                java.java_compiler_recipe()?;
+                crate::compile::java_import_dependencies(
+                    task,
+                    java,
+                    source,
+                    &model,
+                    &visibilities,
+                    &visible_origins,
+                )
+                .map(|dependencies| (java.clone(), dependencies))
+            })
+        } else {
+            None
+        };
+        let (java_task, java_dependencies) = match java_inputs {
+            Some((task, dependencies)) => (Some(task), dependencies),
+            None => (None, Vec::new()),
+        };
         let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
         if self
             .kotlin_diagnostic_reports
@@ -7134,6 +7161,8 @@ impl Workspace {
             project_dir: module.project_dir.clone(),
             scope: scope.clone(),
             task: task.clone(),
+            java_task,
+            java_dependencies,
             positive_diagnostics_only: source.compiler_tasks.iter().any(|candidate| {
                 candidate.language == CompilerLanguage::Kotlin && candidate.task != task.task
             }),
@@ -7236,21 +7265,18 @@ impl Workspace {
             // A failure is not an empty successful compilation and cannot replace accepted reports.
             return Vec::new();
         };
-        if clean && request.positive_diagnostics_only {
-            // An independent main compile does not rerun KAPT/KSP or certify their source generation.
-            // Exit 0 cannot erase accepted errors while auxiliary producer semantics remain unknown.
-            tracing::debug!(
-                "selected Kotlin clean result cannot certify auxiliary producer semantics"
-            );
-            return Vec::new();
-        }
+        // A Kotlin clean result never gives Java clean authority, or auxiliary producer closure.
+        let kotlin_clean = clean && !request.positive_diagnostics_only;
         let mut by_file: BTreeMap<String, Vec<crate::diagnostics::Diagnostic>> = BTreeMap::new();
         for diagnostic in diagnostics {
-            let Some(source) = request
-                .overlays
-                .iter()
-                .find(|source| source.key == diagnostic.path && source.key.ends_with(".kt"))
-            else {
+            if clean && request.positive_diagnostics_only && diagnostic.path.ends_with(".kt") {
+                continue;
+            }
+            let Some(source) = request.overlays.iter().find(|source| {
+                source.key == diagnostic.path
+                    && (source.key.ends_with(".kt")
+                        || (source.key.ends_with(".java") && request.java_task.is_some()))
+            }) else {
                 continue;
             };
             let index = crate::text::LineIndex::new(&source.text);
@@ -7290,7 +7316,7 @@ impl Workspace {
             .overlays
             .iter()
             .filter(|source| {
-                source.key.ends_with(".kt") && (clean || by_file.contains_key(&source.key))
+                by_file.contains_key(&source.key) || (source.key.ends_with(".kt") && kotlin_clean)
             })
             .map(|source| source.key.clone())
             .collect();
@@ -7304,7 +7330,7 @@ impl Workspace {
                     environment_invalid: environment_invalid.clone(),
                     diagnostics: by_file.remove(key).unwrap_or_default(),
                     store_epoch: self.kotlin_diagnostic_store_epoch,
-                    clean,
+                    clean: clean && key.ends_with(".kt"),
                 },
             );
         }

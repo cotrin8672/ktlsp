@@ -357,9 +357,12 @@ fn walk_declaration_container<'tree>(
                     sym.min_arity = sym.arity;
                     sym.has_vararg = has_vararg_parameter(child);
                     if child.kind() == "method_declaration" {
-                        sym.return_type = child
-                            .child_by_field_name("type")
-                            .and_then(|ty| type_ref_from_node(ty, src, scope));
+                        sym.return_type = child.child_by_field_name("type").and_then(|ty| {
+                            with_array_dimensions(
+                                type_ref_from_node(ty, src, scope)?,
+                                child.child_by_field_name("dimensions"),
+                            )
+                        });
                     } else if let Some(container) = container {
                         sym.return_type = Some(TypeRef::simple(container));
                     }
@@ -452,6 +455,15 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
         "type_identifier" | "scoped_type_identifier" => {
             Some(scope.type_ref(&type_path(node, src)?, false, Vec::new()))
         }
+        "array_type" => {
+            if node.has_error() {
+                return None;
+            }
+            with_array_dimensions(
+                type_ref_from_node(node.child_by_field_name("element")?, src, scope)?,
+                Some(node.child_by_field_name("dimensions")?),
+            )
+        }
         "wildcard" => {
             use crate::types::Projection;
             let mut projection = Projection::Star;
@@ -493,6 +505,40 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
         }
         _ => Some(TypeRef::simple(text.replace("...", "[]"))),
     }
+}
+
+// Array shape stays in the existing TypeRef spelling. Resolving its rank-one component uses
+// the original declaration's imports, generic arguments, and lexical substitutions.
+fn array_dimensions_rank(dimensions: Node<'_>) -> Option<usize> {
+    if dimensions.has_error() || !matches!(dimensions.kind(), "dimensions" | "dimensions_expr") {
+        return None;
+    }
+    let mut cursor = dimensions.walk();
+    let rank = dimensions
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "[")
+        .count();
+    (rank > 0).then_some(rank)
+}
+
+fn with_array_dimensions(mut ty: TypeRef, dimensions: Option<Node<'_>>) -> Option<TypeRef> {
+    if let Some(dimensions) = dimensions {
+        for _ in 0..array_dimensions_rank(dimensions)? {
+            ty.name.push_str("[]");
+        }
+    }
+    Some(ty)
+}
+
+fn rank_one_array_component(ty: &TypeRef) -> Option<TypeRef> {
+    let name = ty.name.strip_suffix("[]")?;
+    if name.is_empty() || name.ends_with("[]") {
+        // shortcut: array-valued components stay Unknown without a shared array receiver type.
+        return None;
+    }
+    let mut component = ty.clone();
+    component.name = name.to_string();
+    Some(component)
 }
 
 /// A type's qualified identity without generic arguments. Generic outer owners remain in the
@@ -1906,6 +1952,31 @@ pub fn explicit_import_fqns(tree: &Tree, src: &str) -> Vec<String> {
         .collect()
 }
 
+/// Default-import JDK source candidates mentioned by simple Java type references.
+/// Loading a real source file does not change lexical or import resolution precedence.
+pub(crate) fn referenced_java_lang_fqns(tree: &Tree, src: &str) -> Vec<String> {
+    // shortcut: expression-only class names wait for background indexing until value/type contexts are distinguished.
+    let mut names = HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_identifier"
+            && node.parent().is_some_and(|parent| {
+                !matches!(parent.kind(), "scoped_type_identifier" | "type_parameter")
+            })
+        {
+            let name = node_text(node, src);
+            if !name.is_empty() && name != "var" {
+                names.insert(format!("java.lang.{name}"));
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let mut names = names.into_iter().collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 /// Explicit regular import containing `offset`, as a fully-qualified name.
 pub fn explicit_import_fqn_at(tree: &Tree, src: &str, offset: usize) -> Option<String> {
     let root = tree.root_node();
@@ -2043,6 +2114,18 @@ fn goto_definition_with_imports(
     }
     if let Some(defs) = qualified_type_defs(index, src, tree, usage) {
         return defs;
+    }
+    if usage.kind() == "type_identifier" {
+        if let Some(definitions) = lexical_member_type_definitions(index, file, src, tree, usage) {
+            return definitions;
+        }
+        let Some(ty) = receiver_type_from_type_node(index, file, src, tree, usage) else {
+            return Vec::new();
+        };
+        return match ty {
+            Type::Parameter { definition, .. } => vec![definition],
+            ty => type_defs_for_receiver(index, &ty),
+        };
     }
     if let Some(local) = local_definition(file, src, usage) {
         return vec![local];
@@ -2195,7 +2278,12 @@ pub fn type_definition(
         if let Some(defs) = qualified_type_defs(index, src, tree, usage) {
             return defs;
         }
-        return type_defs_for_name(index, file, src, tree, node_text(usage, src));
+        if let Some(definitions) = lexical_member_type_definitions(index, file, src, tree, usage) {
+            return definitions;
+        }
+        return receiver_type_from_type_node(index, file, src, tree, usage)
+            .map(|ty| type_defs_for_receiver(index, &ty))
+            .unwrap_or_default();
     }
     if let Some(decl) = if is_declaration_name(usage) {
         Some(usage)
@@ -2207,6 +2295,418 @@ pub fn type_definition(
         }
     }
     Vec::new()
+}
+
+fn lexical_member_type_definitions(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    usage: Node<'_>,
+) -> Option<Vec<Def>> {
+    let name = node_text(usage, src);
+    let mut current = usage.parent();
+    while let Some(node) = current {
+        // A nearer type parameter keeps the existing declaration-scoped resolver.
+        if type_parameter_names(node, src)
+            .iter()
+            .any(|parameter| parameter == name)
+        {
+            return None;
+        }
+        if matches!(
+            node.kind(),
+            "class_body" | "interface_body" | "enum_body_declarations" | "annotation_type_body"
+        ) {
+            let mut cursor = node.walk();
+            let declarations = node
+                .named_children(&mut cursor)
+                .filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "class_declaration"
+                            | "interface_declaration"
+                            | "enum_declaration"
+                            | "record_declaration"
+                            | "annotation_type_declaration"
+                    )
+                })
+                .filter_map(|child| name_field(child).filter(|decl| node_text(*decl, src) == name))
+                .collect::<Vec<_>>();
+            match declarations.as_slice() {
+                [] => {}
+                [declaration] => {
+                    return Some(vec![Def {
+                        file: file.to_string(),
+                        start_byte: declaration.start_byte(),
+                        end_byte: declaration.end_byte(),
+                    }])
+                }
+                _ => return Some(Vec::new()),
+            }
+            let mut owner = node.parent()?;
+            if owner.kind() == "enum_body" {
+                owner = owner.parent()?;
+            }
+            // This class's parameters precede inherited names; an outer class's do not.
+            if type_parameter_names(owner, src)
+                .iter()
+                .any(|parameter| parameter == name)
+            {
+                return None;
+            }
+            if let Some(definitions) =
+                inherited_member_type_definitions(index, file, src, tree, owner, name)
+            {
+                return Some(definitions);
+            }
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn current_java_type_declaration<'tree>(
+    file: &str,
+    src: &str,
+    tree: &'tree Tree,
+    entry: &Entry,
+) -> Option<Node<'tree>> {
+    if entry.path.as_ref() != file || !entry.sym.kind.is_type_like() {
+        return None;
+    }
+    let name = tree
+        .root_node()
+        .named_descendant_for_byte_range(entry.sym.start_byte, entry.sym.end_byte)?;
+    let declaration = name.parent()?;
+    (name.start_byte() == entry.sym.start_byte
+        && name.end_byte() == entry.sym.end_byte
+        && node_text(name, src) == entry.sym.name
+        && name_field(declaration) == Some(name)
+        && matches!(
+            declaration.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        )
+        && java_type_parameter_facts(declaration).known_invariant())
+    .then_some(declaration)
+}
+
+fn inherited_member_type_definitions(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    owner: Node<'_>,
+    name: &str,
+) -> Option<Vec<Def>> {
+    let anonymous = owner.kind() == "object_creation_expression";
+    let mut cursor = owner.walk();
+    if !anonymous
+        && !owner.named_children(&mut cursor).any(|child| {
+            matches!(
+                child.kind(),
+                "superclass" | "super_interfaces" | "extends_interfaces"
+            )
+        })
+    {
+        return None;
+    }
+    let scope = type_scope(tree, src);
+    let written_scope = TypeScope::with_default_imports("", Vec::new(), &[]);
+    let receiver = if anonymous {
+        // Method-local type declarations are not indexed; do not guess the created base through one.
+        let mut ancestor = owner.parent();
+        while let Some(node) = ancestor {
+            if matches!(
+                node.kind(),
+                "class_body" | "interface_body" | "enum_body_declarations"
+            ) {
+                break;
+            }
+            if matches!(node.kind(), "block" | "constructor_body" | "switch_block") {
+                return Some(Vec::new());
+            }
+            ancestor = node.parent();
+        }
+        let Some(parent) = owner.child_by_field_name("type") else {
+            return Some(Vec::new());
+        };
+        let scoped = java_declaration_scope(owner, src, &scope);
+        let Some(written) = type_ref_from_node(parent, src, &written_scope) else {
+            return Some(Vec::new());
+        };
+        let Some(expanded) = type_ref_from_node(parent, src, scoped.as_ref().unwrap_or(&scope))
+        else {
+            return Some(Vec::new());
+        };
+        if parent_type_import_shadowed(index, file, src, owner, &[written], &[expanded]) {
+            return Some(Vec::new());
+        }
+        let Some(ty) = receiver_type_from_type_node(index, file, src, tree, parent) else {
+            return Some(Vec::new());
+        };
+        ty
+    } else {
+        let Some(declaration) = name_field(owner) else {
+            return Some(Vec::new());
+        };
+        let Some(entry) = hierarchy::entry_for_name_range(
+            index,
+            file,
+            declaration.start_byte(),
+            declaration.end_byte(),
+        ) else {
+            return Some(Vec::new());
+        };
+        if current_java_type_declaration(file, src, tree, &entry) != Some(owner) {
+            return Some(Vec::new());
+        }
+        let scoped = java_declaration_scope(owner, src, &scope);
+        if entry.sym.supertype_refs != supertype_refs(owner, src, scoped.as_ref().unwrap_or(&scope))
+        {
+            return Some(Vec::new());
+        }
+        Type::Class {
+            name: entry.sym.name.clone(),
+            package: Some(entry.sym.package.clone()),
+            container: entry.sym.container.clone(),
+            nullable: false,
+            args: vec![Type::Unknown; entry.sym.type_params.len()],
+        }
+    };
+    let package = package_of(tree, src);
+    let mut definitions = Vec::new();
+    let mut incomplete = false;
+    let mut package_member = false;
+    let mut foreign_package = false;
+    let _ = infer::walk_supertypes(index, &receiver, JAVA_SUPERTYPE_WALK_CAP, |current| {
+        let mut heads = index
+            .lookup_type(current.name().unwrap_or_default())
+            .into_iter()
+            .filter(|entry| {
+                current.package() == Some(entry.sym.package.as_str())
+                    && current.container() == entry.sym.container.as_deref()
+            });
+        let Some(head) = heads.next() else {
+            incomplete = true;
+            return ControlFlow::Break(());
+        };
+        // These existing facts also reject a malformed ancestor header with a dropped parent.
+        if heads.next().is_some()
+            || (!head.sym.type_parameter_facts.known_unbounded()
+                && !head.sym.type_parameter_facts.known_invariant())
+            || (anonymous
+                && current == &receiver
+                && index
+                    .lookup_type(&head.sym.name)
+                    .iter()
+                    .filter(|entry| entry.sym.package == head.sym.package)
+                    .count()
+                    != 1)
+        {
+            incomplete = true;
+            return ControlFlow::Break(());
+        }
+        if head.path.as_ref() == file {
+            let Some(declaration) = current_java_type_declaration(file, src, tree, head) else {
+                incomplete = true;
+                return ControlFlow::Break(());
+            };
+            let scoped = java_declaration_scope(declaration, src, &scope);
+            if head.sym.package != package
+                || head.sym.supertype_refs
+                    != supertype_refs(declaration, src, scoped.as_ref().unwrap_or(&scope))
+            {
+                incomplete = true;
+                return ControlFlow::Break(());
+            }
+            if parent_type_import_shadowed(
+                index,
+                file,
+                src,
+                declaration,
+                &supertype_refs(declaration, src, &written_scope),
+                &head.sym.supertype_refs,
+            ) {
+                incomplete = true;
+                return ControlFlow::Break(());
+            }
+        } else {
+            // shortcut: foreign nested Kotlin parents stay Unknown until lexical alias binding is available.
+            if (head.path.ends_with(".kt") || head.path.ends_with(".kts"))
+                && head.sym.container.is_some()
+                && (!head.sym.supertype_refs.is_empty() || !head.sym.supertypes.is_empty())
+            {
+                incomplete = true;
+                return ControlFlow::Break(());
+            }
+            // Without this ancestor's raw header, a lexical member may have been import-expanded.
+            for parent in &head.sym.supertype_refs {
+                let mut container = head.sym.container.as_deref();
+                while let Some(outer) = container {
+                    if index.members_of(outer).iter().any(|member| {
+                        member.path == head.path
+                            && member.sym.kind.is_type_like()
+                            && (member.sym.name == parent.name
+                                || parent.qualification.as_deref().is_some_and(|prefix| {
+                                    prefix.split('.').any(|segment| member.sym.name == segment)
+                                }))
+                            && member.sym.package == head.sym.package
+                            && member.sym.container.as_deref() == Some(outer)
+                    }) {
+                        incomplete = true;
+                        return ControlFlow::Break(());
+                    }
+                    container = outer.rsplit_once('.').map(|(outer, _)| outer);
+                }
+            }
+        }
+        // The existing parent TypeRef cannot choose a lexical member head from same-package homonyms.
+        if head.sym.supertype_refs.iter().any(|parent| {
+            parent.qualification.is_none()
+                && parent.container_candidates.is_empty()
+                && parent
+                    .package_candidates
+                    .iter()
+                    .find_map(|package| {
+                        let count = index
+                            .lookup_type(&parent.name)
+                            .iter()
+                            .filter(|entry| entry.sym.package == *package)
+                            .count();
+                        (count != 0).then_some(count > 1)
+                    })
+                    .unwrap_or(false)
+        }) {
+            incomplete = true;
+            return ControlFlow::Break(());
+        }
+        foreign_package |= head.sym.package != package;
+        if !anonymous && current == &receiver {
+            return ControlFlow::Continue(());
+        }
+        let Some(root) = infer::receiver_root_key(index, current) else {
+            incomplete = true;
+            return ControlFlow::Break(());
+        };
+        for member in index.members_of(&root).into_iter().filter(|entry| {
+            entry.sym.kind.is_type_like()
+                && entry.sym.name == name
+                && entry.sym.package == head.sym.package
+                && entry.sym.container.as_deref() == Some(root.as_str())
+        }) {
+            let Some(declaration) = current_java_type_declaration(file, src, tree, member) else {
+                incomplete = true;
+                return ControlFlow::Break(());
+            };
+            let mut access = Vec::new();
+            if let Some(modifiers) = child_of_kind(declaration, "modifiers") {
+                let mut cursor = modifiers.walk();
+                access.extend(modifiers.children(&mut cursor).filter_map(|modifier| {
+                    match modifier.kind() {
+                        "public" | "protected" | "private" => Some(modifier.kind()),
+                        _ => None,
+                    }
+                }));
+            }
+            match access.as_slice() {
+                [] => package_member = true,
+                ["public"] | ["protected"] => {}
+                _ => {
+                    incomplete = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            definitions.push(Def {
+                file: member.path.to_string(),
+                start_byte: member.sym.start_byte,
+                end_byte: member.sym.end_byte,
+            });
+        }
+        ControlFlow::Continue(())
+    });
+    definitions.sort();
+    definitions.dedup();
+    if incomplete || package_member && foreign_package || definitions.len() > 1 {
+        Some(Vec::new())
+    } else if definitions.is_empty() {
+        None
+    } else {
+        Some(definitions)
+    }
+}
+
+fn parent_type_import_shadowed(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    owner: Node<'_>,
+    written: &[TypeRef],
+    expanded: &[TypeRef],
+) -> bool {
+    let ctx = FileCtx::new(String::new(), Vec::new()).with_file(file);
+    for parent in written {
+        let first = parent
+            .qualification
+            .as_deref()
+            .and_then(|prefix| prefix.split('.').next())
+            .unwrap_or(&parent.name);
+        let mut current = owner.parent();
+        while let Some(node) = current {
+            if matches!(
+                node.kind(),
+                "class_body" | "interface_body" | "enum_body_declarations" | "annotation_type_body"
+            ) {
+                let mut cursor = node.walk();
+                let declarations = node
+                    .named_children(&mut cursor)
+                    .filter(|child| {
+                        matches!(
+                            child.kind(),
+                            "class_declaration"
+                                | "interface_declaration"
+                                | "enum_declaration"
+                                | "record_declaration"
+                                | "annotation_type_declaration"
+                        )
+                    })
+                    .filter_map(|child| {
+                        name_field(child).filter(|name| node_text(*name, src) == first)
+                    })
+                    .collect::<Vec<_>>();
+                if !declarations.is_empty() {
+                    // A qualified lexical root requires member-path binding the stamped import cannot prove.
+                    if declarations.len() != 1 || parent.qualification.is_some() {
+                        return true;
+                    }
+                    let targets = expanded
+                        .iter()
+                        .filter(|target| target.name == parent.name)
+                        .collect::<Vec<_>>();
+                    let [target] = targets.as_slice() else {
+                        return true;
+                    };
+                    let expected = Def {
+                        file: file.to_string(),
+                        start_byte: declarations[0].start_byte(),
+                        end_byte: declarations[0].end_byte(),
+                    };
+                    if type_defs_for_receiver(index, &infer::declared_type(index, target, &ctx))
+                        != vec![expected]
+                    {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            current = node.parent();
+        }
+    }
+    false
 }
 
 fn type_defs_for_receiver(index: &dyn InferenceIndex, ty: &Type) -> Vec<Def> {
@@ -3370,6 +3870,29 @@ fn java_method_invocation_return_type(
     call: Node<'_>,
     initializer_depth: usize,
 ) -> Option<Type> {
+    java_method_invocation_projected_return_type(
+        index,
+        file,
+        src,
+        tree,
+        call,
+        initializer_depth,
+        false,
+    )
+    .map(|(ty, _)| ty)
+}
+
+// The flag identifies a proven rank-one array component. Ordinary iterable results reuse the
+// same call selection instead of resolving the method a second time.
+fn java_method_invocation_projected_return_type(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    call: Node<'_>,
+    initializer_depth: usize,
+    array_component: bool,
+) -> Option<(Type, bool)> {
     let name = call.child_by_field_name("name")?;
     let symbol = node_text(name, src);
     if symbol.is_empty() {
@@ -3409,11 +3932,13 @@ fn java_method_invocation_return_type(
             {
                 return None;
             }
+            // Compiled/lowered array mappings are outside the currently admitted JVM slice.
             return ktcore::jvm::projected_return_type_in_context(
                 index,
                 *candidate,
                 &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
-            );
+            )
+            .map(|ty| (ty, false));
         }
     }
     let package = package_of(tree, src);
@@ -3452,18 +3977,24 @@ fn java_method_invocation_return_type(
             .unwrap_or(Type::Unknown),
     };
     let ctx = FileCtx::new(package, inference_imports(tree, src));
-    let mut result: Option<Type> = None;
+    let mut result: Option<(Type, bool)> = None;
     for entry in entries {
         let min = entry.sym.min_arity.expect("guarded above") as usize;
         let max = entry.sym.arity.expect("guarded above") as usize;
         if !(min..=max).contains(&arg_count) {
             continue;
         }
+        let declared = entry.sym.return_type.as_ref()?;
+        let component = if array_component && declared.name.ends_with("[]") {
+            Some(rank_one_array_component(declared)?)
+        } else {
+            None
+        };
         let ty = infer::declared_member_call_type(
             index,
             &receiver,
             &entry,
-            entry.sym.return_type.as_ref()?,
+            component.as_ref().unwrap_or(declared),
             &arguments,
             &ctx,
         );
@@ -3473,9 +4004,10 @@ fn java_method_invocation_return_type(
         {
             return None;
         }
+        let projected = (ty, component.is_some());
         match &result {
-            None => result = Some(ty),
-            Some(prev) if *prev == ty => {}
+            None => result = Some(projected),
+            Some(prev) if *prev == projected => {}
             Some(_) => return None,
         }
     }
@@ -3609,26 +4141,68 @@ fn enhanced_for_element_type(
     while value.kind() == "parenthesized_expression" {
         value = value.named_child(0)?;
     }
+    if value.has_error() {
+        return None;
+    }
+    if value.kind() == "array_creation_expression" {
+        let mut cursor = value.walk();
+        let rank = value
+            .children_by_field_name("dimensions", &mut cursor)
+            .try_fold(0usize, |rank, dimensions| {
+                Some(rank + array_dimensions_rank(dimensions)?)
+            })?;
+        if rank != 1 {
+            // shortcut: rank-two rows stay Unknown without a shared array receiver type.
+            return None;
+        }
+        return receiver_type_from_type_node(
+            index,
+            file,
+            src,
+            tree,
+            value.child_by_field_name("type")?,
+        );
+    }
     if value.kind() == "identifier" {
         if let Some(declaration) =
             local_declaration_node(src, value).or_else(|| same_file_field_declaration(src, value))
         {
             let ty = value_declaration_type_node(declaration)?;
-            let post_dimensions = declaration.parent()?.child_by_field_name("dimensions");
+            let parent = declaration.parent()?;
+            let post_dimensions = parent.child_by_field_name("dimensions");
+            if ty.kind() == "type_identifier" && node_text(ty, src) == "var" {
+                if initializer_depth >= infer::MAX_DEPTH
+                    || post_dimensions.is_some()
+                    || parent.kind() != "variable_declarator"
+                    || !parent
+                        .parent()
+                        .is_some_and(|local| local.kind() == "local_variable_declaration")
+                {
+                    return None;
+                }
+                let initializer = parent.child_by_field_name("value")?;
+                if initializer.has_error()
+                    || initializer_uses_declaration(src, initializer, declaration)
+                {
+                    return None;
+                }
+                // Project the initializer here so an array alias keeps its component type.
+                return enhanced_for_element_type(
+                    index,
+                    file,
+                    src,
+                    tree,
+                    initializer,
+                    initializer_depth + 1,
+                );
+            }
             if ty.kind() == "array_type" || post_dimensions.is_some() {
                 let mut rank = 0;
                 for dimensions in [ty.child_by_field_name("dimensions"), post_dimensions]
                     .into_iter()
                     .flatten()
                 {
-                    if dimensions.has_error() {
-                        return None;
-                    }
-                    let mut cursor = dimensions.walk();
-                    rank += dimensions
-                        .children(&mut cursor)
-                        .filter(|child| child.kind() == "[")
-                        .count();
+                    rank += array_dimensions_rank(dimensions)?;
                 }
                 let element = if ty.kind() == "array_type" {
                     ty.child_by_field_name("element")?
@@ -3643,7 +4217,23 @@ fn enhanced_for_element_type(
             }
         }
     }
-    let receiver = java_argument_type(index, file, src, tree, value, initializer_depth)?;
+    let receiver = if value.kind() == "method_invocation" {
+        let (ty, component) = java_method_invocation_projected_return_type(
+            index,
+            file,
+            src,
+            tree,
+            value,
+            initializer_depth,
+            true,
+        )?;
+        if component {
+            return Some(ty);
+        }
+        ty
+    } else {
+        java_argument_type(index, file, src, tree, value, initializer_depth)?
+    };
     let mut result: Option<Type> = None;
     let mut incomplete = false;
     let _ = infer::walk_supertypes(index, &receiver, JAVA_SUPERTYPE_WALK_CAP, |current| {
@@ -4546,6 +5136,23 @@ public class Greeter {
         // A method-body local must NOT be indexed.
         assert!(by_name("name").is_some()); // the field `name`
         assert_eq!(by_name("name").unwrap().kind, SymbolKind::Property);
+    }
+
+    #[test]
+    fn jdk_seed_selects_simple_type_references_without_value_or_qualified_names() {
+        let src = r#"package seed;
+import java.util.List;
+import static java.lang.Math.max;
+class Seed<OnlyDeclared> {
+    Iterable<String> values;
+    java.util.Map<Long, java.time.Instant> qualified;
+    void run() { var value = 1; int OnlyValue = 0; }
+}"#;
+        let tree = JavaParser::new().parse(src);
+        assert_eq!(
+            referenced_java_lang_fqns(&tree, src),
+            ["java.lang.Iterable", "java.lang.Long", "java.lang.String"]
+        );
     }
 
     #[test]

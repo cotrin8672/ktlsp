@@ -90,6 +90,12 @@ impl WatchPlan {
         Ok(plan)
     }
 
+    /// Concrete nonrecursive directory registrations in this immutable plan. After extend
+    /// succeeds, a current read traversal may not rely on a directory omitted during planning.
+    pub(crate) fn includes_directory_watch(&self, path: &Path) -> bool {
+        self.directories.contains(path)
+    }
+
     pub(crate) fn covers_read(&self, path: &str, directory: bool) -> bool {
         let path = key(Path::new(path));
         // The callback ignores delegated output writes; a containing read tree cannot prove them.
@@ -881,6 +887,34 @@ mod tests {
 mod selected_kotlin_read_watch_tests {
     use super::*;
     use notify::event::{DataChange, ModifyKind};
+
+    #[test]
+    fn current_directory_membership_cannot_rely_on_a_directory_omitted_during_planning() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-java-domain-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("sources");
+        let existing = source.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let plan = WatchPlan::read_inputs(&[source.clone()]).unwrap();
+        assert!(plan.includes_directory_watch(&source));
+        assert!(plan.includes_directory_watch(&existing));
+        let arrived = existing.join("new/nested");
+        std::fs::create_dir_all(&arrived).unwrap();
+        assert!(
+            plan.covers_read(&crate::paths::file_key(&arrived), true),
+            "logical read-tree coverage alone is insufficient for nonrecursive registrations"
+        );
+        assert!(!plan.includes_directory_watch(&arrived));
+        let current = WatchPlan::read_inputs(&[source]).unwrap();
+        assert!(current.includes_directory_watch(&arrived));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn retained_binary_read_plan_does_not_restore_authority_after_a_b_a() {

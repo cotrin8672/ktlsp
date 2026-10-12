@@ -218,10 +218,15 @@ resources and same-file factory initializers require useful `Body.string` comple
 It also checks a cursor before an authored selector suffix and 32 nested generic
 method results with exact Kotlin navigation. Typed enhanced-for variables and `var`
 elements from rank1 arrays or invariant `java.lang.Iterable<T>` use the same receiver
-inference for Java and Kotlin members. The resource probe has 26 first RPCs; set
-`KTLSP_JAVA_WAIT_INDEX=1` for a separately labelled first-response-after-indexing control.
-The default run retains startup failures. Empty results cannot satisfy these cases.
-`java-resource-body.json` records reconstructed outbound edits, first RPCs and restoration.
+inference for Java and Kotlin members. Rank1 array method returns, post-name dimensions,
+array creation and local `var` alias chains preserve the component type. The resource
+probe keeps the original26 first RPCs, adds12 array queries and26 alias queries;
+the alias group has24 useful queries and two rank2 scalar-leakage guards.
+Paired unsaved Java/Kotlin changes check current completion, exact navigation and
+restoration. Set `KTLSP_JAVA_WAIT_INDEX=1` for a separately labelled
+first-response-after-indexing control. The default run retains startup failures.
+Empty useful results fail. `java-resource-body.json` records reconstructed outbound
+edits, both producer wires for alias queries, first RPCs and restoration.
 The same `java` scenario checks 13 contextual `var` hint types, including numeric suffixes,
 generic arguments, wildcards, overloads and Kotlin producers. Six first-response queries cover
 unsaved producer changes, a visible line, invalid initializers and restoration;

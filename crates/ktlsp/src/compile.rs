@@ -3310,6 +3310,27 @@ mod observed_path_cache_tests {
     }
 }
 
+#[path = "compiler/java.rs"]
+mod java_diagnostics;
+
+pub(crate) fn java_import_dependencies(
+    primary: &crate::classpath::CompilerTask,
+    java: &crate::classpath::CompilerTask,
+    owner: &crate::classpath::SourceSetClasspath,
+    model: &crate::classpath::ProjectSnapshot,
+    visibilities: &[crate::project_model::ScopeVisibility],
+    visible_origins: &std::collections::BTreeSet<String>,
+) -> Option<Vec<crate::classpath::SourceSetClasspath>> {
+    java_diagnostics::import_dependencies(
+        primary,
+        java,
+        owner,
+        model,
+        visibilities,
+        visible_origins,
+    )
+}
+
 // Selected Kotlin/JVM diagnostics use an editor overlay. They never mint class-output receipts.
 #[derive(Clone, Debug)]
 pub(crate) struct KotlinSourceOverlay {
@@ -3338,6 +3359,10 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub project_dir: PathBuf,
     pub scope: crate::project_model::ProjectScope,
     pub task: crate::classpath::CompilerTask,
+    /// Optional plain Java task on this same model/source-set snapshot; only positive imports are admitted.
+    pub java_task: Option<crate::classpath::CompilerTask>,
+    /// Existing source-set facts for participating plain Java dependencies; no binary API authority.
+    pub java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     /// Auxiliary Kotlin tasks may produce semantics this independent invocation cannot certify.
     pub positive_diagnostics_only: bool,
     pub source_roots: Vec<PathBuf>,
@@ -3368,6 +3393,9 @@ struct KotlinEnvironmentKey {
     java_home: Option<PathBuf>,
     recipe: crate::classpath::KotlinCompilerRecipe,
     extra_inputs: Vec<PathBuf>,
+    java_task: Option<crate::classpath::CompilerTask>,
+    java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
+    java_helper_sha256: Option<String>,
 }
 
 impl KotlinEnvironmentKey {
@@ -3396,6 +3424,7 @@ impl KotlinEnvironmentKey {
             .filter(|p| !sources.contains(&crate::paths::file_key(p)))
             .cloned()
             .collect();
+        let java_available = java_diagnostics::configured_recipe(request).is_ok();
         Ok(Self {
             project_dir: request.project_dir.clone(),
             arguments: request.task.arguments.clone(),
@@ -3403,6 +3432,13 @@ impl KotlinEnvironmentKey {
             java_home: request.task.java_home.clone(),
             recipe,
             extra_inputs,
+            java_task: java_available.then(|| request.java_task.clone()).flatten(),
+            java_dependencies: if java_available {
+                request.java_dependencies.clone()
+            } else {
+                Vec::new()
+            },
+            java_helper_sha256: java_available.then(java_diagnostics::assets_sha256),
         })
     }
 
@@ -3439,6 +3475,8 @@ pub(crate) struct KotlinDiagnosticEnvironment {
     stamps: Vec<(PathBuf, KotlinInputStamp)>,
     environment_sha256: String,
     watch: std::sync::Arc<crate::compiled_watch::NativeInputWatch>,
+    // Failed helper builds retain their watched assets and cannot erase canonical Kotlin results.
+    java_tools: std::sync::Mutex<Option<(java_diagnostics::Tools, Result<(), String>)>>,
 }
 
 impl KotlinDiagnosticEnvironment {
@@ -3537,6 +3575,7 @@ impl KotlinDiagnosticEnvironment {
             stamps,
             environment_sha256,
             watch,
+            java_tools: std::sync::Mutex::new(None),
         });
         environment.check_live()?;
         request.check_live()?;
@@ -3764,7 +3803,7 @@ impl KotlinEditorOverlay {
         )
     }
 
-    fn create_in(request: &KotlinDiagnosticRequest, parent: &Path) -> anyhow::Result<Self> {
+    fn empty_in(request: &KotlinDiagnosticRequest, parent: &Path) -> anyhow::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         request.check_live()?;
@@ -3794,7 +3833,7 @@ impl KotlinEditorOverlay {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&directory)?;
-        let mut overlay = Self {
+        let overlay = Self {
             directory,
             paths: Default::default(),
             sources: Vec::new(),
@@ -3804,6 +3843,11 @@ impl KotlinEditorOverlay {
             .create_new(true)
             .open(overlay.directory.join("owner"))?;
         std::fs::create_dir(overlay.directory.join("classes"))?;
+        Ok(overlay)
+    }
+
+    fn create_in(request: &KotlinDiagnosticRequest, parent: &Path) -> anyhow::Result<Self> {
+        let mut overlay = Self::empty_in(request, parent)?;
         for (i, original) in request.sources.iter().enumerate() {
             request.check_live()?;
             anyhow::ensure!(
@@ -3891,6 +3935,7 @@ pub(crate) enum KotlinDiagnosticOutcome {
     /// Exit 0 proves this invocation completed; exit 1 admits only the errors it actually reported.
     Verified {
         diagnostics: Vec<CompileDiagnostic>,
+        /// The canonical Kotlin invocation only; appended Java positives never grant Java clean authority.
         clean: bool,
     },
     Unverified(String),
@@ -4015,14 +4060,42 @@ pub(crate) fn run_kotlin_editor_compile(
             out.push_str(&err);
             request.check_live()?;
             environment.check_live()?;
-            Ok(selected_kotlin_output(
+            let mut outcome = selected_kotlin_output(
                 &out,
                 &recipe.compiler_version,
                 status.code(),
                 interrupted,
                 out_complete && err_complete,
                 &overlay.paths,
-            ))
+            );
+            if let KotlinDiagnosticOutcome::Verified { diagnostics, clean } = &mut outcome {
+                if request.java_task.is_some() {
+                    let started = Instant::now();
+                    let java = match java_diagnostics::run(
+                        request,
+                        environment,
+                        &overlay,
+                        diagnostics,
+                        *clean,
+                    ) {
+                        Ok(java) => java,
+                        Err(error) => {
+                            tracing::debug!(%error, "selected Java diagnostics unavailable; retaining Kotlin result");
+                            crate::trace::span(
+                                "compiler.java.editor-unavailable",
+                                "compiler",
+                                started,
+                                serde_json::json!({ "reason": error.to_string(), "generation": request.generation }),
+                            );
+                            Vec::new()
+                        }
+                    };
+                    java_diagnostics::append_positives(diagnostics, java);
+                }
+            }
+            request.check_live()?;
+            environment.check_live()?;
+            Ok(outcome)
         }
         #[cfg(not(windows))]
         {
@@ -4090,6 +4163,8 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         },
         sources: task.source_files.clone(),
         task,
+        java_task: None,
+        java_dependencies: Vec::new(),
         positive_diagnostics_only: false,
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),
