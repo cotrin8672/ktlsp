@@ -697,6 +697,209 @@ pub fn inherited_method_relation(
     )
 }
 
+/// Missing ordinary interface methods for one concrete source class. Unsupported signatures,
+/// provider conflicts and incomplete owners stay unknown rather than authorizing a guessed stub.
+/// The host supplies the complete Object inventory from the caller's selected target SDK.
+pub fn required_interface_methods<'a>(
+    index: &'a dyn InferenceIndex,
+    owner: &Entry,
+    object: &crate::classfile::ClassFileFacts,
+    facts: &resolve::CompletenessFacts,
+    source_owner_known: &dyn Fn(&Entry) -> bool,
+) -> resolve::ResolutionStatus<Vec<(&'a Entry, crate::extensions::JvmType)>> {
+    use crate::extensions::{Dispatch, Visibility};
+    use crate::symbol::{MemberImplementation, SymbolKind};
+    use resolve::{IncompletenessReason, ResolutionStatus};
+
+    let unknown = || {
+        ResolutionStatus::Unknown(vec![IncompletenessReason::MemberSurfaceIncomplete(
+            crate::symbol::Def {
+                file: owner.path.to_string(),
+                start_byte: owner.sym.start_byte,
+                end_byte: owner.sym.end_byte,
+            },
+        )])
+    };
+    if !index.scope_is_complete()
+        || owner.sym.kind != SymbolKind::Class
+        || owner.sym.container.is_some()
+        || !owner.sym.type_params.is_empty()
+        || object.identity.internal_name != "java/lang/Object"
+        || !matches!(
+            object.identity.input,
+            crate::jvm::InputIdentity::Binary { .. }
+        )
+        || object.super_name.is_some()
+        || !object.interfaces.is_empty()
+        || object.signature.is_some()
+        || object.access_flags & 0x0001 == 0
+        || object.access_flags & 0xe600 != 0
+    {
+        return unknown();
+    }
+    let receiver = Type::class(&owner.sym.name, Some(owner.sym.package.clone()));
+    let ctx = FileCtx::new(owner.sym.package.clone(), Vec::new());
+    let mut declarations = Vec::new();
+    let mut incomplete = false;
+    let _ = infer::walk_supertypes(index, &receiver, 32, |current| {
+        let Some(name) = current.name() else {
+            incomplete = true;
+            return ControlFlow::Break(());
+        };
+        let mut matching = index.lookup_type(name).into_iter().filter(|entry| {
+            current.package() == Some(entry.sym.package.as_str())
+                && current.container() == entry.sym.container.as_deref()
+        });
+        let Some(declaration) = matching.next() else {
+            incomplete = true;
+            return ControlFlow::Break(());
+        };
+        if matching.next().is_some()
+            || current.container().is_some()
+            || !current.args().is_empty()
+            || !declaration.sym.type_params.is_empty()
+            || !index.contributions_for_file(&declaration.path).is_empty()
+            || facts.member_surfaces_unknown.contains(&crate::symbol::Def {
+                file: declaration.path.to_string(),
+                start_byte: declaration.sym.start_byte,
+                end_byte: declaration.sym.end_byte,
+            })
+            || !source_owner_known(declaration)
+            || if current == &receiver {
+                declaration.path != owner.path
+                    || declaration.sym.start_byte != owner.sym.start_byte
+                    || declaration.sym.end_byte != owner.sym.end_byte
+            } else {
+                declaration.sym.kind != SymbolKind::Interface
+            }
+        {
+            incomplete = true;
+            return ControlFlow::Break(());
+        }
+        declarations.push(declaration);
+        ControlFlow::Continue(())
+    });
+    if incomplete {
+        return unknown();
+    }
+    let mut methods: BTreeMap<&str, Vec<(&Entry, crate::extensions::JvmType)>> = BTreeMap::new();
+    for declaration in declarations {
+        for entry in index.members_of(&declaration.sym.name) {
+            if entry.path != declaration.path
+                || entry.sym.package != declaration.sym.package
+                || entry.sym.container.as_deref() != Some(declaration.sym.name.as_str())
+                || entry.sym.kind.is_type_like()
+                || entry.sym.source_member.implementation()
+                    == Some(MemberImplementation::Constructor)
+            {
+                continue;
+            }
+            let flags = entry.sym.source_member;
+            let inherited = declaration.sym.kind == SymbolKind::Interface;
+            if inherited
+                && !entry.path.ends_with(".java")
+                && flags.implementation() == Some(MemberImplementation::Concrete)
+            {
+                // Kotlin JVM-default producer modes are not yet part of this source query.
+                return unknown();
+            }
+            if inherited
+                && (flags.dispatch() == Some(Dispatch::Static)
+                    || flags.visibility() == Some(Visibility::Private))
+            {
+                continue;
+            }
+            if entry.sym.kind != SymbolKind::Function
+                || entry.sym.arity != Some(0)
+                || !entry.sym.params.is_empty()
+                || entry.sym.has_vararg
+                || !entry.sym.type_params.is_empty()
+                || entry.sym.ext_receiver.is_some()
+                || entry.sym.extension_receiver.is_some()
+                || flags.jvm_restricted()
+                || flags.dispatch() != Some(Dispatch::Instance)
+                || flags.visibility() != Some(Visibility::Public)
+                || flags.implementation().is_none()
+            {
+                // This slice implements the whole required surface, not a misleading subset.
+                return unknown();
+            }
+            let Some(written_return) = &entry.sym.return_type else {
+                return unknown();
+            };
+            let Some(ty) = crate::extensions::source::source_scalar_jvm_type(
+                index,
+                written_return,
+                &ctx,
+                entry.path.ends_with(".java"),
+                &entry.sym.type_params,
+            ) else {
+                // Nullable/boxed, nominal/generic and projected returns stay unsupported.
+                return unknown();
+            };
+            methods
+                .entry(&entry.sym.name)
+                .or_default()
+                .push((entry, ty));
+        }
+    }
+    let mut required = Vec::new();
+    for (name, group) in methods {
+        let abstract_ = group.iter().any(|(entry, _)| {
+            entry.sym.source_member.implementation() == Some(MemberImplementation::Abstract)
+        });
+        let ty = &group[0].1;
+        if group.iter().any(|(_, other)| other != ty)
+            || object
+                .methods
+                .iter()
+                .any(|method| method.name.as_ref() == name && method.descriptor.starts_with("()"))
+        {
+            // Includes final Object methods, inherited concrete methods and incompatible returns.
+            return unknown();
+        }
+        let local: Vec<_> = group
+            .iter()
+            .filter(|(entry, _)| {
+                entry.path == owner.path
+                    && entry.sym.container.as_deref() == Some(owner.sym.name.as_str())
+            })
+            .collect();
+        if !local.is_empty() {
+            if local.len() != 1
+                || local[0].0.sym.source_member.implementation()
+                    != Some(MemberImplementation::Concrete)
+            {
+                return unknown();
+            }
+            continue;
+        }
+        let mut effective: Vec<_> = group.iter().map(|(entry, _)| *entry).collect();
+        if remove_overridden_members(index, &receiver, &mut effective, &ctx, true) {
+            return unknown();
+        }
+        let concrete = effective
+            .iter()
+            .filter(|entry| {
+                entry.sym.source_member.implementation() == Some(MemberImplementation::Concrete)
+            })
+            .count();
+        if concrete != 0 {
+            if effective.len() != 1 {
+                return unknown();
+            }
+            continue;
+        }
+        let Some(entry) = effective.first() else {
+            return unknown();
+        };
+        if abstract_ {
+            required.push((*entry, ty.clone()));
+        }
+    }
+    ResolutionStatus::Found(required)
+}
+
 fn signature_inheritance_relation(
     index: &dyn InferenceIndex,
     child: &Entry,

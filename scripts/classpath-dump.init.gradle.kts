@@ -195,6 +195,7 @@ object KtlspCompilerConfiguration {
                     "targetCompatibility" to task.targetCompatibility,
                     "release" to options.release.orNull,
                     "encoding" to options.encoding,
+                    "bootstrapClasspath" to options.bootstrapClasspath?.files?.map { it.absolutePath },
                     "fork" to options.isFork,
                     "forkJavaHome" to options.forkOptions.javaHome?.absolutePath,
                     "forkExecutable" to options.forkOptions.executable,

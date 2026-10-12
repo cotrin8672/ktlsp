@@ -1024,7 +1024,14 @@ async fn index_workspace(
     if gradle {
         let registered = watches.lock().registration.is_some();
         if !registered {
+            let watch_start = Instant::now();
             register_project_watches(&client, &root, None, &watches).await;
+            crate::trace::span(
+                "workspace.watch_initial",
+                "workspace",
+                watch_start,
+                serde_json::json!({"root": root.to_string_lossy(), "generation": generation}),
+            );
         }
     }
     if !ws.lock().is_current_generation(generation) {
@@ -1034,8 +1041,18 @@ async fn index_workspace(
         return;
     }
     let model = if gradle {
-        let root = root.clone();
-        match tokio::task::spawn_blocking(move || classpath::load_snapshot(&root, force)).await {
+        let model_start = Instant::now();
+        let load_root = root.clone();
+        let result =
+            tokio::task::spawn_blocking(move || classpath::load_snapshot(&load_root, force)).await;
+        crate::trace::span(
+            "workspace.model_load",
+            "workspace",
+            model_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+                "forcedModel": force, "ok": matches!(&result, Ok(Ok(_)))}),
+        );
+        match result {
             Ok(Ok(model)) => Some(model),
             result => {
                 tracing::warn!(
@@ -1050,18 +1067,27 @@ async fn index_workspace(
         None
     };
     let count = if let Some(model) = &model {
+        let prepare_start = Instant::now();
         let known = ws.lock().source_stamps();
         let prepared_model = model.clone();
         let update = tokio::task::spawn_blocking(move || {
             crate::workspace::prepare_model_sources(&prepared_model, &known)
         })
         .await;
+        crate::trace::span(
+            "workspace.source_prepare",
+            "workspace",
+            prepare_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+                "joined": update.is_ok()}),
+        );
         let Ok(update) = update else {
             if let Some(p) = ongoing {
                 p.finish_with_message("project source refresh failed").await;
             }
             return;
         };
+        let install_start = Instant::now();
         let count = {
             let mut guard = ws.lock();
             let count = guard.install_project_update(generation, model.clone(), update);
@@ -1070,6 +1096,13 @@ async fn index_workspace(
             }
             count
         };
+        crate::trace::span(
+            "workspace.source_install",
+            "workspace",
+            install_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+                "accepted": count.is_some(), "files": count}),
+        );
         let Some(count) = count else {
             if let Some(p) = ongoing {
                 p.finish_with_message("superseded by project changes").await;
@@ -1081,18 +1114,33 @@ async fn index_workspace(
             .iter()
             .any(|module| !module.source_sets.is_empty())
         {
+            let store_start = Instant::now();
             let cache_model = model.clone();
             let cache_root = root.clone();
             let cache_ws = ws.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let stored = tokio::task::spawn_blocking(move || {
                 let current = cache_ws.lock().is_current_generation(generation);
                 if current {
                     classpath::store_snapshot(&cache_root, &cache_model);
                 }
             })
             .await;
+            crate::trace::span(
+                "workspace.model_store",
+                "workspace",
+                store_start,
+                serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+                    "joined": stored.is_ok()}),
+            );
         }
+        let watch_start = Instant::now();
         register_project_watches(&client, &root, Some(model), &watches).await;
+        crate::trace::span(
+            "workspace.watch_selected",
+            "workspace",
+            watch_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation}),
+        );
         count
     } else {
         tokio::task::spawn_blocking(move || {

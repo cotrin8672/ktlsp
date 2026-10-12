@@ -270,6 +270,14 @@ distribution and Maven artifacts or network access; compilation is captured in `
 `dev/smoke_library.sh` delegates to this same fixture. Unsaved method renames and
 deletions must update Kotlin completion and navigation; closing and reopening the source must
 restore the disk contents without rewriting the dependency cache.
+The same scenario checks `Implement missing methods` across Java/Kotlin source interfaces:
+typed proposals after unsaved return changes, actual returned edits applied to both buffers,
+exact goto, duplicate/unknown/conflicting requirements and restoration. The initial supported
+slice covers public zero-argument primitive/String/Unit methods in validated ordinary source
+contracts; broader implementation/override support remains in progress.
+`artifacts/library-interface-implementations.json` retains the first responses, exact wire
+sources and three compiler snapshots, including the actual applied edits.
+
 Declared Java source encoding is also exercised through the `corpus` route with incomplete/full
 library-member probes and exact materialized source positions; see the
 [CEM acceptance record](docs/fork-acceptance.md) for results and remaining input-coverage failures.

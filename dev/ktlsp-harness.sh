@@ -277,6 +277,8 @@ plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0' }
 repositories { mavenCentral() }
 java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 kotlin { compilerOptions { jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17 } }
+// This ordinary fixture has no scripts or compiler transformations.
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach { pluginClasspath.setFrom([]) }
 configurations {
     librarySources { canBeConsumed = false; canBeResolved = true; transitive = false }
 }

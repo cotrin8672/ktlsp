@@ -368,6 +368,322 @@ if vim.fn.filereadable(plain_use) == 1 then
   if vim.env.KTLSP_TRACE then
     vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/library-java-diagnostics.json")
   end
+
+  -- Both languages share these three disposable, unsaved source buffers. Capture both changed
+  -- action responses before applying either returned edit; never inject a generated method body.
+  local action_report = { requests = {}, outbound = {}, applied = {}, compiler_snapshots = {} }
+  local order = { "kotlin", "java_owner", "java_use" }
+  local buffers = { kotlin = { path = main, buf = bufnr }, java_owner = files.owner, java_use = files.use }
+  for _, name in ipairs(order) do
+    local file = buffers[name]
+    file.original = vim.api.nvim_buf_get_lines(file.buf, 0, -1, false)
+    file.hash, file.disk = probe.buffer_sha256(file.buf), disk_hash(file)
+    file.modified, file.uri = vim.bo[file.buf].modified, vim.uri_from_bufnr(file.buf)
+    file.wire, file.latest = probe.buffer_full_text(file.buf), nil
+  end
+  local previous_notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = previous_notify(method, params)
+    for _, name in ipairs(order) do
+      local file = buffers[name]
+      if params and params.textDocument and params.textDocument.uri == file.uri
+        and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
+        local wire, wire_error
+        if method == "textDocument/didOpen" then wire = params.textDocument.text
+        else wire, wire_error = probe.apply_content_changes(file.wire, params.contentChanges, client.offset_encoding) end
+        if sent and type(wire) == "string" then file.wire = wire end
+        file.latest = { sent = not not sent, version = params.textDocument.version,
+          source_sha256 = probe.buffer_sha256(file.buf), wire_source_sha256 = wire and vim.fn.sha256(wire),
+          sent_ns = vim.uv.hrtime(), error = wire_error }
+        action_report.outbound[#action_report.outbound + 1] = { file = name, delivery = vim.deepcopy(file.latest) }
+      end
+    end
+    return sent
+  end
+  local function snapshot()
+    local state = {}
+    for _, name in ipairs(order) do
+      local file = buffers[name]
+      local source = probe.buffer_full_text(file.buf)
+      state[name] = { path = file.path, uri = file.uri, source = source, source_sha256 = vim.fn.sha256(source),
+        wire_source_sha256 = vim.fn.sha256(file.wire), delivery = vim.deepcopy(file.latest),
+        version = vim.lsp.util.buf_versions[file.buf], changedtick = vim.api.nvim_buf_get_changedtick(file.buf) }
+    end
+    return state
+  end
+  local function emit(desc, row)
+    if row.measured then check("interface methods: " .. desc, row.outcome == "matched", vim.inspect(row))
+    else print("UNMEASURED  interface methods: " .. desc .. " -> " .. vim.inspect(row)); ok = false end
+  end
+  local function ask(desc, name, method, params, accepts)
+    flush()
+    local row = { phase = desc, file = name, method = method, params = params, attempts = 0, attempted = false,
+      timeout_ms = 8000, before = snapshot() }
+    for _, role in ipairs(order) do
+      local state, delivery = row.before[role], row.before[role].delivery
+      if not delivery or not delivery.sent or delivery.error or type(state.version) ~= "number"
+        or delivery.version ~= state.version or delivery.source_sha256 ~= state.source_sha256
+        or delivery.wire_source_sha256 ~= state.source_sha256 or state.wire_source_sha256 ~= state.source_sha256 then
+        row.error = "source-delivery-unavailable: " .. role
+      end
+    end
+    if not row.error then
+      row.attempted, row.attempts, row.started_ns = true, 1, vim.uv.hrtime()
+      local called, response, request_error = pcall(client.request_sync, client, method, params, row.timeout_ms, buffers[name].buf)
+      if called then row.response, row.error = response, request_error else row.error = tostring(response) end
+      row.ended_ns = vim.uv.hrtime()
+    end
+    row.after = snapshot()
+    row.source_unchanged = vim.deep_equal(row.before, row.after)
+    if not row.source_unchanged then row.error = "source-changed-during-RPC" end
+    if method == "textDocument/codeAction" and row.response and row.response.err == nil and not row.error
+      and row.response.result ~= nil and row.response.result ~= vim.NIL
+      and (type(row.response.result) ~= "table" or not vim.islist(row.response.result)) then row.error = "invalid-code-action-list" end
+    row.outcome = probe.request_outcome(row.response, row.error, function(value) return accepts(value, row) end, row.attempted)
+    row.measured = row.outcome == "matched" or row.outcome == "mismatch"
+    action_report.requests[#action_report.requests + 1] = row
+    emit(desc, row)
+    return row.response and row.response.result, row
+  end
+  local function selected(result)
+    local actions = {}
+    for _, action in ipairs(type(result) == "table" and result or {}) do
+      if type(action) == "table" and action.title == "Implement missing methods" then actions[#actions + 1] = action end
+    end
+    return actions
+  end
+  local function returned_edit(name, action, state)
+    local file, edits = buffers[name], {}
+    local safe = type(action) == "table" and action.kind == "quickfix" and type(action.edit) == "table"
+      and not action.disabled and not action.command and type(state[name].version) == "number"
+    local function collect(uri, changes, version)
+      local decoded, path = pcall(vim.uri_to_fname, uri)
+      safe = safe and decoded and probe.path_key(path) == probe.path_key(file.path)
+        and type(changes) == "table" and vim.islist(changes)
+        and (version == nil or version == vim.NIL or version == state[name].version)
+      for _, edit in ipairs(type(changes) == "table" and changes or {}) do edits[#edits + 1] = edit end
+    end
+    if safe then
+      if action.edit.changes ~= nil then
+        if type(action.edit.changes) ~= "table" then safe = false
+        else for uri, changes in pairs(action.edit.changes) do collect(uri, changes) end end
+      end
+      if action.edit.documentChanges ~= nil then
+        if type(action.edit.documentChanges) ~= "table" or not vim.islist(action.edit.documentChanges) then safe = false
+        else
+          for _, change in ipairs(action.edit.documentChanges) do
+            if type(change) == "table" and type(change.textDocument) == "table" and change.kind == nil then
+              collect(change.textDocument.uri, change.edits, change.textDocument.version)
+            else safe = false end
+          end
+        end
+      end
+    end
+    local position = probe.find(vim.api.nvim_buf_get_lines(file.buf, 0, -1, false), "// HERE_", "// HERE_")
+    local insertion = { line = position.line + 1, character = 0 }
+    safe = safe and #edits == 1 and type(edits[1]) == "table" and type(edits[1].newText) == "string"
+      and edits[1].newText ~= "" and vim.deep_equal(edits[1].range, { start = insertion, ["end"] = insertion })
+      and probe.buffer_sha256(file.buf) == state[name].source_sha256
+      and vim.lsp.util.buf_versions[file.buf] == state[name].version
+    if not safe then return nil, "missing or unsafe returned workspace edit" end
+    return { changes = { [file.uri] = edits } }
+  end
+  local function actions(desc, name, marker, count, signature)
+    local position = probe.find(vim.api.nvim_buf_get_lines(buffers[name].buf, 0, -1, false), marker, marker)
+    local result, row = ask(desc, name, "textDocument/codeAction", {
+      textDocument = { uri = buffers[name].uri }, range = { start = position, ["end"] = position },
+      context = { diagnostics = {} } }, function(value, row)
+        local found = selected(value)
+        if #found ~= count then return false end
+        if count == 0 then return true end
+        local edit, error = returned_edit(name, found[1], row.after)
+        row.edit_valid, row.edit_validation_error = edit ~= nil, error
+        return edit ~= nil and edit.changes[buffers[name].uri][1].newText:find(signature, 1, true) ~= nil
+      end)
+    return selected(result)[1], row
+  end
+  local function install(sources)
+    for _, name in ipairs(order) do vim.api.nvim_buf_set_lines(buffers[name].buf, 0, -1, false, sources[name]) end
+    flush()
+  end
+  local function record_compiler(phase, expected_valid, prerequisites)
+    action_report.compiler_snapshots[#action_report.compiler_snapshots + 1] = {
+      phase = phase, expected_valid = expected_valid, prerequisites = prerequisites, sources = snapshot() }
+  end
+  local function model_snapshot()
+    local found = {}
+    for _, path in ipairs(vim.fn.globpath((vim.env.KTLSP_CACHE_DIR or "") .. "/classpath", "*.json", false, true)) do
+      local handle = assert(io.open(path, "rb")); local raw = handle:read("*a"); handle:close()
+      local decoded, value = pcall(vim.json.decode, raw)
+      if decoded and type(value) == "table" then
+        for _, module in ipairs(value.modules or {}) do
+          if type(module.project_dir) == "string" and probe.path_key(module.project_dir) == probe.path_key(project) then
+            found[#found + 1] = { path = path, source_sha256 = vim.fn.sha256(raw), raw_text = raw,
+              model_version = value.model_version, module = module, stamp = vim.uv.fs_stat(path) }
+          end
+        end
+      end
+    end
+    if #found ~= 1 then return { error = "unique-current-project-cache-unavailable", matches = #found } end
+    local observed = found[1]
+    observed.role = "raw project-cache observation; accepted model generation requires the root trace receipt"
+    for _, source in ipairs(observed.module.source_sets or {}) do
+      if source.name == "main" then
+        for _, task in ipairs(source.compiler_tasks or {}) do
+          if task.language == "kotlin" and task.task == source.kotlin_compile_task then
+            observed.kotlin_task, observed.kotlin_has_plugin = task.task, false
+            for _, argument in ipairs(task.arguments or {}) do
+              if argument:match("^-Xplugin") then observed.kotlin_has_plugin = true end
+            end
+          elseif task.language == "java" then
+            observed.java_task = task.task
+            observed.java_bootstrap_null = task.options and task.options.bootstrapClasspath == vim.NIL
+          end
+        end
+      end
+    end
+    observed.fixture_minimum_prerequisites = observed.kotlin_task ~= nil and observed.kotlin_has_plugin == false
+      and observed.java_task ~= nil and observed.java_bootstrap_null == true
+    return observed
+  end
+  local initial = {
+    kotlin = { "package app", "interface Contract { fun required(): Int }", "class Impl : PlainOwner {",
+      "    // HERE_KOTLIN", "}", "class OtherKotlin {", "    // OTHER_KOTLIN", "}",
+      "fun useRequired(value: Impl) = value.required()" },
+    java_owner = { "package app;", "public interface PlainOwner { int required(); }" },
+    java_use = { "package app;", "public class PlainUse implements Contract {", "    // HERE_JAVA", "}",
+      "class OtherJava {", "    // OTHER_JAVA", "}",
+      "class Calls { static long use(PlainUse value) { return value.required(); } }" },
+  }
+  local function variants(kotlin_return, java_return)
+    local sources = vim.deepcopy(initial)
+    sources.kotlin[2] = "interface Contract { fun required(): " .. kotlin_return .. " }"
+    sources.java_owner[2] = "public interface PlainOwner { " .. java_return .. " required(); }"
+    return sources
+  end
+  local function apply_returned(name, action, row)
+    local applied = { request = row.phase, before = snapshot(), success = false }
+    local file = buffers[name]
+    local normalized, validation_error = returned_edit(name, action, applied.before)
+    local owner = name == "java_use" and "kotlin" or "java_owner"
+    local safe = row.outcome == "matched" and normalized ~= nil
+      and applied.before[name].source_sha256 == row.before[name].source_sha256
+      and applied.before[name].version == row.before[name].version
+      and applied.before[owner].source_sha256 == row.before[owner].source_sha256
+      and applied.before[owner].version == row.before[owner].version
+    if safe then
+      local edit = normalized.changes[file.uri][1]
+      applied.expected_source, applied.error = probe.apply_content_changes(applied.before[name].source,
+        { { range = edit.range, text = edit.newText } }, client.offset_encoding)
+      if applied.expected_source then
+        applied.edit = normalized
+        applied.success, applied.error = pcall(vim.lsp.util.apply_workspace_edit, normalized, client.offset_encoding)
+      end
+    else applied.error = validation_error or "caller or owner changed after returned action" end
+    flush()
+    applied.after = snapshot()
+    applied.whole_buffers_match = applied.success
+    for _, role in ipairs(order) do
+      local expected = role == name and applied.expected_source or applied.before[role].source
+      applied.whole_buffers_match = applied.whole_buffers_match and applied.after[role].source == expected
+    end
+    check("interface methods: actual " .. name .. " edit applies once and preserves exact whole buffers",
+      applied.whole_buffers_match, vim.inspect(applied))
+    action_report.applied[name] = applied
+    return applied.whole_buffers_match
+  end
+  local executed, action_error = xpcall(function()
+    for _, name in ipairs(order) do assert(vim.lsp.buf_attach_client(buffers[name].buf, id)) end
+    install(initial)
+    action_report.model = model_snapshot()
+    if not action_report.model.fixture_minimum_prerequisites then
+      print("UNMEASURED  interface methods: selected ordinary prerequisites unavailable -> " .. vim.inspect(action_report.model))
+      ok = false
+      return
+    end
+    actions("unrelated Java class", "java_use", "// OTHER_JAVA", 0)
+    actions("unrelated Kotlin class", "kotlin", "// OTHER_KOTLIN", 0)
+    actions("initial Java implements Kotlin Int", "java_use", "// HERE_JAVA", 1, "public int required()")
+    actions("initial Kotlin implements Java int", "kotlin", "// HERE_KOTLIN", 1, "override fun required(): kotlin.Int")
+    record_compiler("initial missing implementations", false, true)
+    install(variants("Long", "long"))
+    local java_action, java_row = actions("unsaved Kotlin Long changes Java action", "java_use", "// HERE_JAVA", 1, "public long required()")
+    local kotlin_action, kotlin_row = actions("unsaved Java long changes Kotlin action", "kotlin", "// HERE_KOTLIN", 1, "override fun required(): kotlin.Long")
+    record_compiler("changed missing implementations", false, true)
+    local java_applied = apply_returned("java_use", java_action, java_row)
+    local kotlin_applied = apply_returned("kotlin", kotlin_action, kotlin_row)
+    record_compiler("both actual changed edits applied", true, java_applied and kotlin_applied)
+    actions("Java applied implementation is not duplicated", "java_use", "// HERE_JAVA", 0)
+    actions("Kotlin applied implementation is not duplicated", "kotlin", "// HERE_KOTLIN", 0)
+    for _, name in ipairs({ "java_use", "kotlin" }) do
+      if action_report.applied[name].whole_buffers_match then
+        local lines = vim.api.nvim_buf_get_lines(buffers[name].buf, 0, -1, false)
+        local anchor = name == "java_use" and "public long required()" or "override fun required(): kotlin.Long"
+        local _, target = probe.find(lines, anchor, "required")
+        local position = probe.find(lines, "value.required()", "required")
+        ask(name .. " goto selects actual applied method", name, "textDocument/definition", {
+          textDocument = { uri = buffers[name].uri }, position = position }, function(result)
+            return probe.exact_definition(result, buffers[name].path, { target })
+          end)
+      else
+        local row = { phase = name .. " goto selects actual applied method", attempted = false, attempts = 0,
+          outcome = "not-run", measured = false, error = "returned-edit-not-applied" }
+        action_report.requests[#action_report.requests + 1] = row; emit(row.phase, row)
+      end
+    end
+    install(variants("Missing", "Missing"))
+    actions("unknown Kotlin return withholds Java action", "java_use", "// HERE_JAVA", 0)
+    actions("unknown Java return withholds Kotlin action", "kotlin", "// HERE_KOTLIN", 0)
+    local conflict = variants("Long", "long")
+    table.insert(conflict.kotlin, "interface Clash { fun required(): Int }")
+    conflict.kotlin[3] = "class Impl : PlainOwner, Clash {"
+    conflict.java_use[2] = "public class PlainUse implements Contract, Clash {"
+    install(conflict)
+    actions("incompatible inherited returns withhold Java action", "java_use", "// HERE_JAVA", 0)
+    actions("incompatible inherited returns withhold Kotlin action", "kotlin", "// HERE_KOTLIN", 0)
+    local removed = vim.deepcopy(initial)
+    removed.kotlin[2], removed.java_owner[2] = "interface Contract {}", "public interface PlainOwner {}"
+    install(removed)
+    actions("removed Kotlin requirement leaves no Java action", "java_use", "// HERE_JAVA", 0)
+    actions("removed Java requirement leaves no Kotlin action", "kotlin", "// HERE_KOTLIN", 0)
+    install(initial)
+    actions("restored Kotlin Int restores Java action", "java_use", "// HERE_JAVA", 1, "public int required()")
+    actions("restored Java int restores Kotlin action", "kotlin", "// HERE_KOTLIN", 1, "override fun required(): kotlin.Int")
+    action_report.model_after = model_snapshot()
+  end, debug.traceback)
+  action_report.restored, action_report.disk_unchanged, action_report.restore_errors = true, true, {}
+  action_report.restoration = {}
+  for _, name in ipairs(order) do
+    local file = buffers[name]
+    local restored, source_ok, disk_ok = pcall(function()
+      vim.api.nvim_buf_set_lines(file.buf, 0, -1, false, file.original)
+      vim.bo[file.buf].modified = file.modified
+      return probe.buffer_sha256(file.buf) == file.hash, disk_hash(file) == file.disk
+    end)
+    action_report.restored = action_report.restored and restored and source_ok
+    action_report.disk_unchanged = action_report.disk_unchanged and restored and disk_ok
+    action_report.restoration[name] = { source_restored = restored and source_ok or false,
+      disk_unchanged = restored and disk_ok or false, expected_modified = file.modified }
+    if not restored then action_report.restore_errors[name] = tostring(source_ok) end
+  end
+  local action_flushed, action_flush_error = pcall(flush)
+  client.rpc.notify = previous_notify
+  action_report.notify_hook_restored = client.rpc.notify == previous_notify
+  for _, name in ipairs(order) do
+    local state = action_report.restoration[name]
+    local read, modified = pcall(function() return vim.bo[buffers[name].buf].modified end)
+    if read then state.actual_modified = modified else state.readback_error = tostring(modified) end
+    state.modified_restored = read and modified == state.expected_modified
+    action_report.restored = action_report.restored and state.modified_restored
+  end
+  if not action_flushed then action_report.restore_errors.flush = tostring(action_flush_error) end
+  action_report.error = not executed and action_error or nil
+  check("interface method buffers restore without disk edits", action_report.restored and action_report.disk_unchanged
+    and action_flushed and action_report.notify_hook_restored, vim.inspect(action_report))
+  if not executed then check("interface method probes execute", false, action_error) end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(action_report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/library-interface-implementations.json")
+  end
 end
 
 if ok then

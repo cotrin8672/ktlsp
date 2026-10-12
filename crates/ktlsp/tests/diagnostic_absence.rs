@@ -767,6 +767,236 @@ fn binary_inventory() -> BinaryInventoryIndex {
     }
 }
 
+#[test]
+fn required_interface_methods_use_proven_implementations_and_withhold_provider_conflicts() {
+    use ktcore::members::required_interface_methods;
+    use ktlsp::resolve::{CompletenessFacts, ResolutionStatus};
+    let replace = |index: &mut BinaryInventoryIndex, file, source: &str| {
+        let tree = ktlsp::java::JavaParser::new().parse(source);
+        assert!(!tree.root_node().has_error(), "{source}");
+        index.index.replace_file(
+            file,
+            ktlsp::java::extract_symbols(&tree, source),
+            Tier::Volatile,
+        );
+    };
+    for (body, extra, provided) in [
+        ("", "", false),
+        ("public int required() { return 1; }", "", true),
+        ("public long required() { return 1; }", "", false),
+        ("private int required() { return 1; }", "", false),
+        ("public static int required() { return 1; }", "", false),
+        ("", ", DefaultProvider", false),
+    ] {
+        let mut index = binary_inventory();
+        replace(
+            &mut index,
+            "Contract.java",
+            "package app; public interface Contract { int required(); }",
+        );
+        replace(&mut index, "DefaultProvider.java", "package app; public interface DefaultProvider { default int required() { return 1; } }");
+        replace(
+            &mut index,
+            "Impl.java",
+            &format!("package app; public class Impl implements Contract{extra} {{ {body} }}"),
+        );
+        let owner = index.index.lookup_type("Impl")[0];
+        let status = required_interface_methods(
+            &index,
+            owner,
+            &index.classes["Object.java"],
+            &CompletenessFacts::complete(),
+            &|_| true,
+        );
+        if provided {
+            assert!(matches!(status, ResolutionStatus::Found(ref methods) if methods.is_empty()));
+        } else if body.is_empty() && extra.is_empty() {
+            assert!(matches!(status, ResolutionStatus::Found(ref methods) if methods.len() == 1));
+        } else {
+            assert!(
+                matches!(status, ResolutionStatus::Unknown(_)),
+                "{body} {extra}"
+            );
+        }
+    }
+    for (contract, providers, expected_empty) in [
+        ("default int required() { return 1; }", "Contract", true),
+        (
+            "default int required() { return 1; }",
+            "Contract, DefaultProvider",
+            false,
+        ),
+        ("int required();", "Contract, WrongReturn", false),
+    ] {
+        let mut index = binary_inventory();
+        replace(
+            &mut index,
+            "Contract.java",
+            &format!("package app; public interface Contract {{ {contract} }}"),
+        );
+        replace(&mut index, "DefaultProvider.java", "package app; public interface DefaultProvider { default int required() { return 1; } }");
+        replace(
+            &mut index,
+            "WrongReturn.java",
+            "package app; public interface WrongReturn { long required(); }",
+        );
+        replace(
+            &mut index,
+            "Impl.java",
+            &format!("package app; public class Impl implements {providers} {{}}"),
+        );
+        let status = required_interface_methods(
+            &index,
+            index.index.lookup_type("Impl")[0],
+            &index.classes["Object.java"],
+            &CompletenessFacts::complete(),
+            &|_| true,
+        );
+        assert_eq!(
+            matches!(status, ResolutionStatus::Found(ref methods) if methods.is_empty()),
+            expected_empty
+        );
+        if !expected_empty {
+            assert!(matches!(status, ResolutionStatus::Unknown(_)));
+        }
+    }
+}
+
+#[test]
+fn required_interface_methods_use_complete_object_facts_instead_of_a_name_blacklist() {
+    use ktcore::members::required_interface_methods;
+    use ktlsp::resolve::{CompletenessFacts, ResolutionStatus};
+    let mut index = binary_inventory();
+    for (file, source) in [
+        (
+            "Contract.java",
+            "package app; public interface Contract { int required(); }",
+        ),
+        (
+            "Impl.java",
+            "package app; public class Impl implements Contract {}",
+        ),
+    ] {
+        let tree = ktlsp::java::JavaParser::new().parse(source);
+        index.index.replace_file(
+            file,
+            ktlsp::java::extract_symbols(&tree, source),
+            Tier::Volatile,
+        );
+    }
+    for flags in [0x0001, 0x0011] {
+        let object = std::sync::Arc::make_mut(index.classes.get_mut("Object.java").unwrap());
+        object.methods[0].name = "required".into();
+        object.methods[0].access_flags = flags;
+        let owner = index.index.lookup_type("Impl")[0];
+        assert!(matches!(
+            required_interface_methods(
+                &index,
+                owner,
+                &index.classes["Object.java"],
+                &CompletenessFacts::complete(),
+                &|_| true
+            ),
+            ResolutionStatus::Unknown(_)
+        ));
+    }
+    std::sync::Arc::make_mut(index.classes.get_mut("Object.java").unwrap()).methods[0].name =
+        "toString".into();
+    let mut facts = CompletenessFacts::complete();
+    let owner = index.index.lookup_type("Impl")[0];
+    let object = index.classes["Object.java"].clone();
+    assert!(
+        matches!(required_interface_methods(&index, owner, &object, &facts, &|_| true),
+        ResolutionStatus::Found(ref methods) if methods.len() == 1)
+    );
+    assert!(matches!(
+        required_interface_methods(&index, owner, &object, &facts, &|_| false),
+        ResolutionStatus::Unknown(_)
+    ));
+    facts.member_surfaces_unknown.insert(ktlsp::symbol::Def {
+        file: owner.path.to_string(),
+        start_byte: owner.sym.start_byte,
+        end_byte: owner.sym.end_byte,
+    });
+    assert!(matches!(
+        required_interface_methods(&index, owner, &object, &facts, &|_| true),
+        ResolutionStatus::Unknown(_)
+    ));
+}
+
+#[test]
+fn required_interface_methods_do_not_confuse_source_primitive_spellings_or_java_unit_objects() {
+    use ktcore::members::required_interface_methods;
+    use ktlsp::resolve::{CompletenessFacts, ResolutionStatus};
+    for (file, source) in [
+        (
+            "Contract.java",
+            "package app; public interface Contract { kotlin.Unit required(); }",
+        ),
+        (
+            "Contract.java",
+            "package app; public interface Contract { Int required(); }",
+        ),
+        (
+            "Contract.java",
+            "package app; public interface Contract { int required()[]; }",
+        ),
+        (
+            "Contract.java",
+            "package app; public interface Contract { final int required(); }",
+        ),
+        (
+            "Contract.java",
+            "package app; public interface Contract { synchronized int required(); }",
+        ),
+        (
+            "Contract.java",
+            "package app; public interface Contract { strictfp int required(); }",
+        ),
+        (
+            "Contract.kt",
+            "package app\ninterface Contract { fun required(): int }",
+        ),
+        (
+            "Contract.kt",
+            "package app\ninterface Contract { fun required(): void }",
+        ),
+        (
+            "Contract.kt",
+            "package app\ninterface Contract { final fun required(): Int }",
+        ),
+    ] {
+        let mut index = binary_inventory();
+        let language = ktlsp::language::SourceLanguage::for_key(file);
+        let tree = ktlsp::language::LanguageParsers::new().parse(language, source);
+        let facts = ktlsp::language::symbol_facts(language, &tree, source);
+        assert!(facts.clean);
+        index
+            .index
+            .replace_file(file, facts.symbols, Tier::Volatile);
+        let implementation = "package app; public class Impl implements Contract {}";
+        let tree = ktlsp::java::JavaParser::new().parse(implementation);
+        index.index.replace_file(
+            "Impl.java",
+            ktlsp::java::extract_symbols(&tree, implementation),
+            Tier::Volatile,
+        );
+        assert!(
+            matches!(
+                required_interface_methods(
+                    &index,
+                    index.index.lookup_type("Impl")[0],
+                    &index.classes["Object.java"],
+                    &CompletenessFacts::complete(),
+                    &|_| true
+                ),
+                ResolutionStatus::Unknown(_)
+            ),
+            "{source}"
+        );
+    }
+}
+
 fn inventory_status(
     index: &BinaryInventoryIndex,
     file: &str,

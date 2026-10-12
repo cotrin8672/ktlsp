@@ -2632,6 +2632,11 @@ impl Workspace {
             );
             let mut out =
                 java::unused_import_actions(key, text, tree, &diagnostics, range_start, range_end);
+            if let Some(action) =
+                self.interface_implementation_action(key, text, tree, cursor_offset)
+            {
+                out.push(action);
+            }
             if let Some(action) = java::organize_imports_action(key, text, tree) {
                 out.push(action);
             }
@@ -2649,6 +2654,9 @@ impl Workspace {
         let diagnostics = crate::diagnostics::compute(text, tree);
         let mut out =
             actions::unused_import_actions(key, text, tree, &diagnostics, range_start, range_end);
+        if let Some(action) = self.interface_implementation_action(key, text, tree, cursor_offset) {
+            out.push(action);
+        }
         if let Some(action) = actions::organize_imports_action(key, text, tree) {
             out.push(action);
         }
@@ -2668,6 +2676,106 @@ impl Workspace {
             }
         }
         out
+    }
+
+    fn interface_implementation_action(
+        &self,
+        key: &str,
+        text: &str,
+        tree: &Tree,
+        offset: usize,
+    ) -> Option<Action> {
+        let model = self
+            .project_model
+            .as_deref()
+            .filter(|_| !self.project_refresh_pending)?;
+        let scoped = self.index.scoped_for_file(key);
+        let (owner, body) =
+            crate::refactor::implementation_class(&scoped, key, text, tree, offset, |file| {
+                self.open_docs
+                    .get(file)
+                    .is_some_and(|doc| !doc.tree.root_node().has_error())
+                    && !self.analysis_extensions.needs_source(file)
+            })?;
+        if owner.sym.supertypes.is_empty() && owner.sym.supertype_refs.is_empty() {
+            return None;
+        }
+        let object = self
+            .class_inventory
+            .borrow_mut()
+            .object_for_caller(model, key)?;
+        let source_owner_known = |declaration: &crate::index::Entry| {
+            if declaration.tier != Tier::Volatile
+                || self.analysis_extensions.needs_source(&declaration.path)
+                || !self
+                    .annotated_type_owners
+                    .get(declaration.path.as_ref())
+                    .is_some_and(|owners| !owners.contains(&rename_definition(declaration)))
+            {
+                return false;
+            }
+            if let Some(doc) = self.open_docs.get(declaration.path.as_ref()) {
+                if doc.tree.root_node().has_error() {
+                    return false;
+                }
+            } else {
+                let Some(meta) = self.project_file_meta.get(declaration.path.as_ref()) else {
+                    return false;
+                };
+                let Some(stamp) = self.source_stamps.get(declaration.path.as_ref()) else {
+                    return false;
+                };
+                let Some(mut batch) = parse_project_file(
+                    Path::new(declaration.path.as_ref()),
+                    &mut LanguageParsers::new(),
+                ) else {
+                    return false;
+                };
+                if !meta.clean
+                    || !batch.clean
+                    || batch.stamp != Some(*stamp)
+                    || batch.package != meta.package
+                {
+                    return false;
+                }
+                batch.symbols.sort_by(|a, b| {
+                    a.start_byte
+                        .cmp(&b.start_byte)
+                        .then(a.end_byte.cmp(&b.end_byte))
+                        .then(a.name.cmp(&b.name))
+                });
+                if !self
+                    .index
+                    .entries_for_file(&declaration.path)
+                    .iter()
+                    .map(|entry| entry.sym.as_ref())
+                    .eq(batch.symbols.iter())
+                    || language::annotated_type_owners(
+                        &self.index,
+                        &declaration.path,
+                        &batch.source.1,
+                        &batch.source.0,
+                    )
+                    .contains(&rename_definition(declaration))
+                {
+                    return false;
+                }
+            }
+            self.class_inventory
+                .borrow_mut()
+                .object_for_caller(model, &declaration.path)
+                .is_some_and(|selected| selected.identity == object.identity)
+        };
+        crate::refactor::implement_missing_methods(
+            &scoped,
+            key,
+            text,
+            &owner,
+            body,
+            &object,
+            &self.effective_completeness(),
+            &source_owner_known,
+        )
     }
 
     fn unambiguous_import_candidate(
@@ -3445,6 +3553,890 @@ fn is_generated_source_file(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IMPLEMENT_INTERFACE_ACTION_TITLE: &str = "Implement missing methods";
+
+    // Explicit unit-test inventory, not a claim that source-only fixtures have a selected SDK.
+    // Native/independent compiler probes use the actual selected java.base archive.
+    fn interface_sdk_fixture(ws: &mut Workspace, files: &[&str]) -> std::path::PathBuf {
+        use crate::classpath::{
+            CompilerTask, ModuleClasspath, ProjectSnapshot, SourceSetClasspath,
+        };
+        let root = unique_tmp("interface-sdk");
+        let home = root.join("jdk");
+        std::fs::create_dir_all(home.join("jmods")).unwrap();
+        std::fs::write(
+            home.join("jmods/java.base.jmod"),
+            b"explicit inventory stamp",
+        )
+        .unwrap();
+        let mut kotlin = crate::compile::kotlin_test_request(&root).task;
+        kotlin.source_files = files
+            .iter()
+            .filter(|file| file.ends_with(".kt"))
+            .map(|file| std::path::PathBuf::from(*file))
+            .collect();
+        kotlin.classpath.clear();
+        kotlin.arguments = vec!["-jvm-target".into(), "17".into()];
+        let source_root = if files[0].starts_with("mem:///") {
+            Path::new("mem:")
+        } else {
+            Path::new(files[0]).parent().unwrap()
+        };
+        let java: CompilerTask = serde_json::from_value(serde_json::json!({
+            "task": ":compileJava", "language": "java",
+            "task_type": "org.gradle.api.tasks.compile.JavaCompile",
+            "arguments": [], "annotation_processor_path": [],
+            "source_files": files.iter().filter(|file| file.ends_with(".java")).collect::<Vec<_>>(),
+            "classpath": [], "java_home": home,
+            "options": {"fork": false, "forkJavaHome": null, "forkExecutable": null,
+                "forkJvmArgs": [], "release": null, "bootstrapClasspath": null},
+            "output_roots": [], "complete": true, "problem": null,
+        }))
+        .unwrap();
+        ws.set_project_model(Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+            module: ":".into(),
+            project_dir: source_root.into(),
+            build: String::new(),
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(),
+                source_roots: vec![source_root.into()],
+                kotlin_compile_task: Some(kotlin.task.clone()),
+                compiler_tasks: vec![java, kotlin],
+                ..Default::default()
+            }],
+        }])));
+        ws.class_inventory.get_mut().inject_object_for_tests(
+            &home,
+            ktcore::classfile::ClassFileFacts {
+                identity: ktcore::jvm::ClassIdentity {
+                    origin_id: crate::classpath::jdk_origin_id(&home.join("lib/src.zip")),
+                    internal_name: "java/lang/Object".into(),
+                    input: ktcore::jvm::InputIdentity::Binary {
+                        content_sha256: [1; 32],
+                    },
+                },
+                major_version: 61,
+                minor_version: 0,
+                access_flags: 1,
+                super_name: None,
+                interfaces: Vec::new(),
+                signature: None,
+                source_file: None,
+                attribute_names: Vec::new(),
+                fields: Vec::new(),
+                methods: Vec::new(),
+            },
+        );
+        root
+    }
+
+    fn required_interface_actions_at(ws: &mut Workspace, key: &str, cursor: usize) -> Vec<Action> {
+        let actions = ws.code_actions(key, cursor, cursor, cursor);
+        eprintln!("required-interface query {key}:{cursor}, all_code_actions = {actions:#?}");
+        actions
+            .into_iter()
+            .filter(|action| action.title == IMPLEMENT_INTERFACE_ACTION_TITLE)
+            .collect()
+    }
+
+    fn required_interface_actions(ws: &mut Workspace, key: &str, src: &str) -> Vec<Action> {
+        let cursor = src.find("// HERE").unwrap() + 3;
+        required_interface_actions_at(ws, key, cursor)
+    }
+
+    fn preview_required_interface_action(
+        ws: &mut Workspace,
+        key: &str,
+        src: &str,
+        expected_return: &str,
+    ) -> String {
+        let actions = required_interface_actions(ws, key, src);
+        assert_eq!(actions.len(), 1, "one implementation action: {actions:?}");
+        assert_eq!(actions[0].kind, crate::actions::ActionKind::QuickFix);
+        let edits = &actions[0].edits;
+        let body_start = src.find('{').unwrap() + 1;
+        let body_end = body_start + src[body_start..].find('}').unwrap();
+        assert!(!edits.is_empty());
+        assert!(edits.iter().all(|edit| edit.file == key
+            && edit.start_byte >= body_start
+            && edit.end_byte <= body_end));
+        let applied = crate::edit::apply_to_text(key, src, edits).unwrap();
+        assert_eq!(
+            ws.doc_text(key).as_deref(),
+            Some(src),
+            "query cannot apply edits"
+        );
+        let language = SourceLanguage::for_key(key);
+        let tree = LanguageParsers::new().parse(language, &applied);
+        assert!(!tree.root_node().has_error(), "{applied}");
+        let facts = language::symbol_facts(language, &tree, &applied);
+        let methods: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.name == "required" && symbol.container.as_deref() == Some("Impl")
+            })
+            .collect();
+        assert_eq!(methods.len(), 1, "{applied}");
+        let method = methods[0];
+        assert_eq!(method.arity, Some(0));
+        assert!(method.params.is_empty());
+        assert_eq!(method.return_type.as_ref().unwrap().name, expected_return);
+        assert_eq!(
+            method.source_member.implementation(),
+            Some(ktcore::symbol::MemberImplementation::Concrete)
+        );
+        assert_eq!(
+            method.source_member.dispatch(),
+            Some(ktcore::extensions::Dispatch::Instance)
+        );
+        assert_eq!(
+            method.source_member.visibility(),
+            Some(ktcore::extensions::Visibility::Public)
+        );
+        if language.is_java() {
+            assert!(applied.contains("@Override") || applied.contains("@java.lang.Override"));
+        } else {
+            let words = applied.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("override fun required"), "{applied}");
+        }
+        applied
+    }
+
+    fn assert_cross_language_interface_implementation(java_caller: bool) {
+        let (
+            owner_key,
+            caller_key,
+            clash_key,
+            duplicate_key,
+            owner,
+            clash,
+            caller,
+            old_return,
+            new_return,
+        ) = if java_caller {
+            (
+                    "mem:///Contract.kt", "mem:///Impl.java", "mem:///Clash.kt", "mem:///Duplicate.kt",
+                    "package generated\ninterface Contract { fun required(): Int }\n",
+                    "package generated\ninterface Clash { fun required(): Long }\n",
+                    "package generated;\npublic class Impl implements Contract {\n    // HERE\n}\nclass Other {\n    // OTHER\n}\nclass Calls { static long use(Impl value) { return value.required(); } }\n",
+                    "int", "long",
+                )
+        } else {
+            (
+                    "mem:///Contract.java", "mem:///Impl.kt", "mem:///Clash.java", "mem:///Duplicate.java",
+                    "package generated;\npublic interface Contract { int required(); }\n",
+                    "package generated;\npublic interface Clash { long required(); }\n",
+                    "package generated\nclass Impl : Contract {\n    // HERE\n}\nclass Other {\n    // OTHER\n}\nfun use(value: Impl) = value.required()\n",
+                    "Int", "Long",
+                )
+        };
+        let mut ws = Workspace::new();
+        ws.open(owner_key, owner.into());
+        ws.open(clash_key, clash.into());
+        ws.open(caller_key, caller.into());
+        assert!(
+            required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+            "without a selected SDK inventory the source-only fixture is unavailable"
+        );
+        let sdk =
+            interface_sdk_fixture(&mut ws, &[owner_key, clash_key, caller_key, duplicate_key]);
+        let parent_start = owner.find("required").unwrap();
+        let call_start = caller.rfind("required").unwrap();
+        assert_eq!(
+            ws.goto_definition(caller_key, call_start),
+            vec![Def {
+                file: owner_key.into(),
+                start_byte: parent_start,
+                end_byte: parent_start + "required".len(),
+            }],
+            "the current inherited method is already indexed and resolves"
+        );
+        let parent = ws
+            .index
+            .lookup_by_name("required")
+            .into_iter()
+            .find(|entry| entry.path.as_ref() == owner_key)
+            .unwrap();
+        assert_eq!(
+            parent.sym.source_member.implementation(),
+            Some(ktcore::symbol::MemberImplementation::Abstract)
+        );
+        assert_eq!(
+            parent.sym.source_member.dispatch(),
+            Some(ktcore::extensions::Dispatch::Instance)
+        );
+        assert_eq!(
+            parent.sym.source_member.visibility(),
+            Some(ktcore::extensions::Visibility::Public)
+        );
+        for cursor in [caller.find("// OTHER").unwrap() + 3, call_start] {
+            assert!(
+                required_interface_actions_at(&mut ws, caller_key, cursor).is_empty(),
+                "do not generate for an unrelated class or method-body cursor"
+            );
+        }
+        let interface_cursor = owner.find('{').unwrap() + 1;
+        assert!(
+            required_interface_actions_at(&mut ws, owner_key, interface_cursor).is_empty(),
+            "the requested containing declaration must be a class"
+        );
+        let changed = if java_caller {
+            owner.replace(": Int", ": Long")
+        } else {
+            owner.replace("int required", "long required")
+        };
+        let unknown = if java_caller {
+            owner.replace(": Int", ": Missing")
+        } else {
+            owner.replace("int required", "Missing required")
+        };
+        ws.change(owner_key, unknown);
+        assert!(
+            required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+            "unresolved return types cannot produce a signature"
+        );
+        ws.change(owner_key, owner.into());
+        ws.open(duplicate_key, changed.clone());
+        assert!(
+            required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+            "two current owners disagreeing on the same signature are ambiguous"
+        );
+        ws.change(duplicate_key, changed.replace("Contract", "OtherContract"));
+        let conflicted = if java_caller {
+            caller.replace("implements Contract", "implements Contract, Clash")
+        } else {
+            caller.replace(": Contract", ": Contract, Clash")
+        };
+        ws.change(caller_key, conflicted.clone());
+        assert!(
+            required_interface_actions(&mut ws, caller_key, &conflicted).is_empty(),
+            "incompatible inherited return types cannot be repaired by one method"
+        );
+        ws.change(caller_key, caller.into());
+        preview_required_interface_action(&mut ws, caller_key, caller, old_return);
+        ws.change(owner_key, changed.clone());
+        let applied = preview_required_interface_action(&mut ws, caller_key, caller, new_return);
+        ws.change(caller_key, applied.clone());
+        assert_eq!(ws.doc_text(owner_key).as_deref(), Some(changed.as_str()));
+        assert!(
+            required_interface_actions(&mut ws, caller_key, &applied).is_empty(),
+            "an applied implementation must not be proposed again"
+        );
+        let implemented = applied.find("required").unwrap();
+        let use_start = applied.rfind("required").unwrap();
+        assert_eq!(
+            ws.goto_definition(caller_key, use_start),
+            vec![Def {
+                file: caller_key.into(),
+                start_byte: implemented,
+                end_byte: implemented + "required".len(),
+            }],
+            "navigation must observe the applied current declaration"
+        );
+        ws.change(caller_key, caller.into());
+        let empty_owner = if java_caller {
+            "package generated\ninterface Contract {}\n"
+        } else {
+            "package generated;\npublic interface Contract {}\n"
+        };
+        ws.change(owner_key, empty_owner.into());
+        assert!(
+            required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+            "removing the inherited requirement invalidates the proposal"
+        );
+        ws.change(owner_key, owner.into());
+        preview_required_interface_action(&mut ws, caller_key, caller, old_return);
+        std::fs::remove_dir_all(sdk).unwrap();
+    }
+
+    #[test]
+    fn implement_java_interface_in_kotlin_uses_current_signature_and_applied_edit() {
+        assert_cross_language_interface_implementation(false);
+    }
+
+    #[test]
+    fn implement_kotlin_interface_in_java_uses_current_signature_and_applied_edit() {
+        assert_cross_language_interface_implementation(true);
+    }
+
+    #[test]
+    fn interface_implementation_kotlin_long_survives_indexed_java_wrapper() {
+        let kotlin_key = "mem:///Main.kt";
+        let owner_key = "mem:///PlainOwner.java";
+        let caller_key = "mem:///PlainUse.java";
+        let kotlin = "package app\ninterface Contract { fun required(): Int }\nclass Impl : PlainOwner {\n    // HERE_KOTLIN\n}\nclass OtherKotlin {\n    // OTHER_KOTLIN\n}\nfun useRequired(value: Impl) = value.required()\n";
+        let owner = "package app;\npublic interface PlainOwner { int required(); }\n";
+        let caller = "package app;\npublic class PlainUse implements Contract {\n    // HERE_JAVA\n}\nclass OtherJava {\n    // OTHER_JAVA\n}\nclass Calls { static long use(PlainUse value) { return value.required(); } }\n";
+        let preview = |ws: &mut Workspace, expected: &str| {
+            let actions =
+                required_interface_actions_at(ws, caller_key, caller.find("// HERE_JAVA").unwrap());
+            assert_eq!(actions.len(), 1, "one implementation action: {actions:?}");
+            let edits = &actions[0].edits;
+            assert_eq!(edits.len(), 1);
+            assert_eq!(
+                (
+                    edits[0].file.as_str(),
+                    edits[0].start_byte,
+                    edits[0].end_byte
+                ),
+                (
+                    caller_key,
+                    caller.find("\n}").unwrap() + 1,
+                    caller.find("\n}").unwrap() + 1
+                )
+            );
+            let applied = crate::edit::apply_to_text(caller_key, caller, edits).unwrap();
+            assert_eq!(ws.doc_text(caller_key).as_deref(), Some(caller));
+            let tree = LanguageParsers::new().parse(SourceLanguage::Java, &applied);
+            assert!(!tree.root_node().has_error());
+            let facts = language::symbol_facts(SourceLanguage::Java, &tree, &applied);
+            let methods: Vec<_> = facts
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.name == "required" && symbol.container.as_deref() == Some("PlainUse")
+                })
+                .collect();
+            assert_eq!(methods.len(), 1);
+            assert_eq!(methods[0].return_type.as_ref().unwrap().name, expected);
+            applied
+        };
+        let mut ws = Workspace::new();
+        ws.open(kotlin_key, kotlin.into());
+        ws.open(owner_key, owner.into());
+        ws.open(caller_key, caller.into());
+        // The actual selected stdlib has expect/actual Long; the selected JDK adds java.lang.Long.
+        ws.open(
+            "mem:///CommonPrimitives.kt",
+            "package kotlin\npublic expect class Long\n".into(),
+        );
+        ws.open(
+            "mem:///JvmPrimitives.kt",
+            "package kotlin\npublic actual class Long private constructor()\n".into(),
+        );
+        ws.open(
+            "mem:///Long.java",
+            "package java.lang; public final class Long {}".into(),
+        );
+        let sdk = interface_sdk_fixture(
+            &mut ws,
+            &[
+                kotlin_key,
+                owner_key,
+                caller_key,
+                "mem:///CommonPrimitives.kt",
+                "mem:///JvmPrimitives.kt",
+                "mem:///Long.java",
+                "mem:///Shadow.kt",
+            ],
+        );
+        assert_eq!(ws.index.lookup_type("Long").len(), 3);
+        preview(&mut ws, "int");
+        let changed = kotlin.replace(": Int", ": Long");
+        ws.change(kotlin_key, changed.clone());
+        ws.change(owner_key, owner.replace("int required", "long required"));
+        ws.change(caller_key, caller.into());
+        let parent = ws
+            .index
+            .lookup_by_name("required")
+            .into_iter()
+            .find(|entry| entry.path.as_ref() == kotlin_key)
+            .unwrap();
+        let written = parent.sym.return_type.as_ref().unwrap();
+        assert_eq!(written.name, "Long");
+        assert!(written.qualification.is_none());
+        let scoped = ws.index.scoped_for_file(caller_key);
+        let resolved = crate::infer::declared_type(
+            &scoped,
+            written,
+            &crate::infer::FileCtx::new("app".into(), Vec::new()),
+        );
+        eprintln!(
+            "actual header Long candidates: {:?}; written: {written:?}; resolved: {resolved:?}",
+            ws.index.lookup_type("Long")
+        );
+        let applied = preview(&mut ws, "long");
+        assert_eq!(
+            resolved,
+            crate::types::Type::class("Long", Some("kotlin".into()))
+        );
+        for imported in [
+            "import java.lang.*",
+            "import kotlin.*\nimport java.lang.*",
+            "import java.lang.*\nimport kotlin.*",
+        ] {
+            ws.change(
+                kotlin_key,
+                changed.replacen("package app\n", &format!("package app\n{imported}\n"), 1),
+            );
+            preview(&mut ws, "long");
+        }
+        for imported in ["import java.lang.Long", "import java.lang.Long as Long"] {
+            ws.change(
+                kotlin_key,
+                changed.replacen("package app\n", &format!("package app\n{imported}\n"), 1),
+            );
+            assert!(
+                required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+                "an explicitly imported boxed return cannot authorize primitive long: {imported}"
+            );
+        }
+        ws.change(kotlin_key, changed.clone());
+        ws.open("mem:///Shadow.kt", "package app\nclass Long\n".into());
+        assert!(
+            required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+            "a same-package nominal return cannot authorize primitive long"
+        );
+        ws.change("mem:///Shadow.kt", "package app\n".into());
+        ws.change(caller_key, applied.clone());
+        assert!(
+            required_interface_actions(&mut ws, caller_key, &applied).is_empty(),
+            "the actual applied Long method is not duplicated"
+        );
+        ws.change(caller_key, caller.into());
+        ws.change(kotlin_key, kotlin.into());
+        ws.change(owner_key, owner.into());
+        preview(&mut ws, "int");
+        std::fs::remove_dir_all(sdk).unwrap();
+    }
+
+    #[test]
+    fn interface_implementation_ignores_unrelated_stdlib_extension_prefixes() {
+        // The selected 2.2.20 JvmClassMapping.kt declares both public extension properties.
+        // Index their authored receiver/header facts; the explicit SDK fixture supplies Object.
+        let mappings = "package kotlin.jvm\nimport kotlin.reflect.KClass\npublic val <T> KClass<T>.java: Class<T> get() = throw UnsupportedOperationException()\npublic val <T : Any> Class<T>.kotlin: KClass<T> get() = throw UnsupportedOperationException()\n";
+        for java_caller in [false, true] {
+            let (owner_key, caller_key, owner, caller, result) = if java_caller {
+                (
+                    "mem:///Contract.kt",
+                    "mem:///Impl.java",
+                    "package generated\ninterface Contract { fun required(): Int }\n",
+                    "package generated;\npublic class Impl implements Contract {\n    // HERE\n}\n",
+                    "int",
+                )
+            } else {
+                (
+                    "mem:///Contract.java",
+                    "mem:///Impl.kt",
+                    "package generated;\npublic interface Contract { int required(); }\n",
+                    "package generated\nclass Impl : Contract {\n    // HERE\n}\n",
+                    "Int",
+                )
+            };
+            let mut ws = Workspace::new();
+            ws.open(owner_key, owner.into());
+            ws.open(caller_key, caller.into());
+            ws.open("mem:///JvmClassMapping.kt", mappings.into());
+            ws.open(
+                "mem:///Class.java",
+                "package java.lang; public final class Class<T> {}".into(),
+            );
+            ws.open(
+                "mem:///KClass.kt",
+                "package kotlin.reflect\npublic interface KClass<T> {}".into(),
+            );
+            ws.open(
+                "mem:///Other.kt",
+                "package unrelated\nclass Other {}".into(),
+            );
+            let sdk = interface_sdk_fixture(
+                &mut ws,
+                &[
+                    owner_key,
+                    caller_key,
+                    "mem:///JvmClassMapping.kt",
+                    "mem:///Class.java",
+                    "mem:///KClass.kt",
+                    "mem:///Other.kt",
+                    "mem:///Shadow.kt",
+                    "mem:///Shadow.java",
+                ],
+            );
+            for prefix in ["java", "kotlin"] {
+                let entries = ws.index.lookup_by_name(prefix);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].sym.kind, SymbolKind::Property);
+                assert!(entries[0].sym.extension_receiver.is_some());
+            }
+            let cursor = caller.find("// HERE").unwrap();
+            assert_eq!(required_interface_actions_at(&mut ws, caller_key, cursor).len(), 1,
+                "the native first-slash cursor must produce the action with both stdlib properties indexed");
+            preview_required_interface_action(&mut ws, caller_key, caller, result);
+            let prefix = if java_caller { "java" } else { "kotlin" };
+            ws.open(
+                "mem:///Shadow.java",
+                format!("package generated; class {prefix} {{}}"),
+            );
+            assert!(
+                required_interface_actions_at(&mut ws, caller_key, cursor).is_empty(),
+                "a visible type can obscure the generated qualified prefix"
+            );
+            ws.change("mem:///Shadow.java", "package generated;".into());
+            if !java_caller {
+                for shadow in [
+                    "val kotlin = 0",
+                    "val Any.kotlin: Int get() = 0",
+                    "val Impl.kotlin: Int get() = 0",
+                    "val Missing.kotlin: Int get() = 0",
+                    "typealias Alias = Impl\nval Alias.kotlin: Int get() = 0",
+                    "import generated.Impl as Other\nval Other.kotlin: Int get() = 0",
+                    "val <T> T.kotlin: Int get() = 0",
+                ] {
+                    ws.open("mem:///Shadow.kt", format!("package generated\n{shadow}\n"));
+                    if shadow.starts_with("import") {
+                        let receiver = ws
+                            .index
+                            .lookup_by_name("kotlin")
+                            .iter()
+                            .find(|entry| entry.path.as_ref() == "mem:///Shadow.kt")
+                            .unwrap()
+                            .sym
+                            .extension_receiver
+                            .as_ref()
+                            .unwrap();
+                        assert_eq!(
+                            (
+                                receiver.ty.name.as_str(),
+                                receiver.ty.qualification.as_deref()
+                            ),
+                            ("Impl", Some("generated")),
+                            "import aliases retain their authored target"
+                        );
+                    }
+                    assert!(
+                        required_interface_actions_at(&mut ws, caller_key, cursor).is_empty(),
+                        "an applicable or unproven prefix value remains a blocker: {shadow}"
+                    );
+                }
+                ws.change("mem:///Shadow.kt", "package generated\n".into());
+                preview_required_interface_action(&mut ws, caller_key, caller, result);
+            }
+            std::fs::remove_dir_all(sdk).unwrap();
+        }
+    }
+
+    #[test]
+    fn interface_implementation_java_prefix_ignores_unresolved_extension_receivers() {
+        let owner_key = "mem:///Contract.kt";
+        let caller_key = "mem:///Impl.java";
+        let caller =
+            "package generated;\npublic class Impl implements Contract {\n    // HERE\n}\n";
+        let mut ws = Workspace::new();
+        ws.open(
+            owner_key,
+            "package generated\ninterface Contract { fun required(): Int }\n".into(),
+        );
+        ws.open(caller_key, caller.into());
+        ws.open("mem:///JvmClassMapping.kt",
+            "package kotlin.jvm\nimport kotlin.reflect.KClass\npublic val <T> KClass<T>.java: Class<T> get() = throw UnsupportedOperationException()\n".into());
+        let sdk = interface_sdk_fixture(
+            &mut ws,
+            &[
+                owner_key,
+                caller_key,
+                "mem:///JvmClassMapping.kt",
+                "mem:///CommonKClass.kt",
+                "mem:///JvmKClass.kt",
+                "mem:///Shadow.java",
+            ],
+        );
+        assert!(ws.index.lookup_type("KClass").is_empty());
+        let entries = ws.index.lookup_by_name("java");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].sym.extension_receiver.is_some());
+        let cursor = caller.find("// HERE").unwrap();
+        assert_eq!(
+            required_interface_actions_at(&mut ws, caller_key, cursor).len(),
+            1,
+            "Kotlin extension receiver availability cannot obscure a Java type name"
+        );
+        // The actual selected stdlib source archive contains both expect/actual KClass heads.
+        ws.open(
+            "mem:///CommonKClass.kt",
+            "package kotlin.reflect\npublic expect interface KClass<T : Any> : KClassifier {}\n"
+                .into(),
+        );
+        ws.open("mem:///JvmKClass.kt",
+            "package kotlin.reflect\npublic actual interface KClass<T : Any> : KDeclarationContainer, KAnnotatedElement, KClassifier {}\n".into());
+        assert_eq!(ws.index.lookup_type("KClass").len(), 2);
+        assert_eq!(
+            required_interface_actions_at(&mut ws, caller_key, cursor).len(),
+            1,
+            "ambiguous Kotlin extension receiver heads cannot obscure a Java type name"
+        );
+        preview_required_interface_action(&mut ws, caller_key, caller, "int");
+        ws.open(
+            "mem:///Shadow.java",
+            "package generated; class java {}".into(),
+        );
+        assert!(
+            required_interface_actions_at(&mut ws, caller_key, cursor).is_empty(),
+            "a real visible Java type still obscures the generated qualified type names"
+        );
+        std::fs::remove_dir_all(sdk).unwrap();
+    }
+
+    #[test]
+    fn interface_implementation_withholds_unusable_or_stale_selected_sdk() {
+        use crate::classpath::{CompilerLanguage, ProjectSnapshot};
+        for java_caller in [false, true] {
+            let (contract_key, caller_key, contract, caller) = if java_caller {
+                (
+                    "mem:///Contract.kt",
+                    "mem:///Impl.java",
+                    "package generated\ninterface Contract { fun required(): Int }\n",
+                    "package generated; public class Impl implements Contract { // HERE\n}",
+                )
+            } else {
+                (
+                    "mem:///Contract.java",
+                    "mem:///Impl.kt",
+                    "package generated; public interface Contract { int required(); }",
+                    "package generated\nclass Impl : Contract { // HERE\n}",
+                )
+            };
+            let mut ws = Workspace::new();
+            ws.open(contract_key, contract.into());
+            ws.open(caller_key, caller.into());
+            let sdk = interface_sdk_fixture(&mut ws, &[contract_key, caller_key]);
+            assert_eq!(
+                required_interface_actions(&mut ws, caller_key, caller).len(),
+                1
+            );
+            let model = ws.project_model.clone().unwrap();
+            for fault in [
+                "SDK",
+                "KotlinSDK",
+                "relativeSDK",
+                "bootstrap-absent",
+                "bootstrap-custom",
+                "release",
+                "no-jdk",
+                "jdk-release",
+                "argfile",
+                "plugin",
+                "primary",
+                "ambiguous",
+                "custom",
+                "source",
+                "incomplete",
+            ] {
+                let mut modules = model.modules.clone();
+                let source = &mut modules[0].source_sets[0];
+                match fault {
+                    "SDK" => source.compiler_tasks[0].java_home = None,
+                    "KotlinSDK" => source.compiler_tasks[1].java_home = None,
+                    "relativeSDK" => {
+                        source.compiler_tasks[0].java_home = Some("relative-sdk".into())
+                    }
+                    "bootstrap-absent" => {
+                        source.compiler_tasks[0]
+                            .options
+                            .remove("bootstrapClasspath");
+                    }
+                    "bootstrap-custom" => {
+                        source.compiler_tasks[0].options.insert(
+                            "bootstrapClasspath".into(),
+                            serde_json::json!(["custom-boot.jar"]),
+                        );
+                    }
+                    "release" => {
+                        source.compiler_tasks[0]
+                            .options
+                            .insert("release".into(), serde_json::json!(8));
+                    }
+                    "no-jdk" => source.compiler_tasks[1].arguments.push("-no-jdk".into()),
+                    "jdk-release" => source.compiler_tasks[1]
+                        .arguments
+                        .push("-Xjdk-release=8".into()),
+                    "argfile" => source.compiler_tasks[1]
+                        .arguments
+                        .push("@opaque.args".into()),
+                    "plugin" => source.compiler_tasks[1]
+                        .arguments
+                        .push("-Xplugin=opaque.jar".into()),
+                    "primary" => source.kotlin_compile_task = None,
+                    "ambiguous" => source.compiler_tasks.push(source.compiler_tasks[1].clone()),
+                    "custom" => source.compiler_tasks[1].task_type = "custom.Compiler".into(),
+                    "source" => source.compiler_tasks[1].source_files.clear(),
+                    "incomplete" => source.compiler_metadata_incomplete = true,
+                    _ => unreachable!(),
+                }
+                // Keep the same injected archive; only the accepted immutable model changes.
+                ws.project_model = Some(Arc::new(ProjectSnapshot::new(modules)));
+                assert!(
+                    required_interface_actions(&mut ws, caller_key, caller).is_empty(),
+                    "{fault}"
+                );
+            }
+            ws.project_model = Some(model);
+            ws.change(contract_key, format!("{contract}\nclass Broken {{"));
+            assert!(required_interface_actions(&mut ws, caller_key, caller).is_empty());
+            ws.change(contract_key, contract.into());
+            let prefix = if java_caller { "java" } else { "kotlin" };
+            ws.change(caller_key, format!("{caller}\nclass {prefix} {{}}"));
+            assert!(required_interface_actions(&mut ws, caller_key, caller).is_empty());
+            ws.change(caller_key, caller.into());
+            ws.project_refresh_pending = true;
+            assert!(required_interface_actions(&mut ws, caller_key, caller).is_empty());
+            ws.project_refresh_pending = false;
+            assert_eq!(
+                required_interface_actions(&mut ws, caller_key, caller).len(),
+                1
+            );
+            let task = ws.project_model.as_ref().unwrap().modules[0].source_sets[0]
+                .compiler_tasks
+                .iter()
+                .find(|task| task.language == CompilerLanguage::Java)
+                .unwrap();
+            std::fs::write(
+                task.java_home
+                    .as_ref()
+                    .unwrap()
+                    .join("jmods/java.base.jmod"),
+                b"changed SDK inventory must be reread",
+            )
+            .unwrap();
+            assert!(required_interface_actions(&mut ws, caller_key, caller).is_empty());
+            std::fs::remove_dir_all(sdk).unwrap();
+        }
+    }
+
+    #[test]
+    fn interface_implementation_rechecks_closed_owner_before_watched_refresh() {
+        for java_caller in [false, true] {
+            let root = unique_tmp("interface-current-owner");
+            std::fs::create_dir_all(&root).unwrap();
+            let (contract_file, caller_file, contract, caller, old, new) = if java_caller {
+                (
+                    "Contract.kt",
+                    "Impl.java",
+                    "package generated\ninterface Contract { fun required(): Int }",
+                    "package generated; public class Impl implements Contract { // HERE\n}",
+                    "required(): Int",
+                    "required(): Long",
+                )
+            } else {
+                (
+                    "Contract.java",
+                    "Impl.kt",
+                    "package generated; public interface Contract { int required(); }",
+                    "package generated\nclass Impl : Contract { // HERE\n}",
+                    "int required()",
+                    "long required()",
+                )
+            };
+            let contract_key = crate::paths::file_key(&root.join(contract_file));
+            let caller_key = crate::paths::file_key(&root.join(caller_file));
+            std::fs::write(&contract_key, contract).unwrap();
+            std::fs::write(&caller_key, caller).unwrap();
+            let mut ws = Workspace::new();
+            ws.open(&caller_key, caller.into());
+            let sdk = interface_sdk_fixture(&mut ws, &[&contract_key, &caller_key]);
+            ws.scan(&root);
+            assert_eq!(
+                required_interface_actions(&mut ws, &caller_key, caller).len(),
+                1
+            );
+            std::fs::write(&contract_key, contract.replace(old, new)).unwrap();
+            assert!(
+                required_interface_actions(&mut ws, &caller_key, caller).is_empty(),
+                "disk changed before watched refresh"
+            );
+            ws.scan(&root);
+            let actions = required_interface_actions(&mut ws, &caller_key, caller);
+            assert_eq!(actions.len(), 1);
+            assert!(actions[0].edits[0].new_text.contains(if java_caller {
+                "long required"
+            } else {
+                "kotlin.Long"
+            }));
+            if !java_caller {
+                let shadow_key = crate::paths::file_key(&root.join("Shadow.kt"));
+                let shadow = "package generated\nclass Box {}\nval Box.kotlin: Int get() = 0\n";
+                std::fs::write(&shadow_key, shadow).unwrap();
+                ws.scan(&root);
+                assert!(!ws.open_docs.contains_key(&shadow_key));
+                assert!(
+                    ws.index
+                        .lookup_by_name("kotlin")
+                        .iter()
+                        .any(|entry| entry.path.as_ref() == shadow_key
+                            && entry.tier == Tier::Volatile)
+                );
+                std::fs::write(&shadow_key, shadow.replace("Box.kotlin", "Impl.kotlin")).unwrap();
+                assert!(
+                    required_interface_actions(&mut ws, &caller_key, caller).is_empty(),
+                    "closed prefix receiver facts may change before watched refresh"
+                );
+                ws.open(&shadow_key, shadow.into());
+                assert_eq!(
+                    required_interface_actions(&mut ws, &caller_key, caller).len(),
+                    1,
+                    "the current clean unrelated extension receiver can be rejected"
+                );
+                let head_key = crate::paths::file_key(&root.join("Head.kt"));
+                let head = "package generated\nclass ClosedBox {}\n";
+                std::fs::write(&head_key, head).unwrap();
+                ws.scan(&root);
+                ws.change(
+                    &shadow_key,
+                    "package generated\nval ClosedBox.kotlin: Int get() = 0\n".into(),
+                );
+                assert!(!ws.open_docs.contains_key(&head_key));
+                assert!(ws
+                    .index
+                    .lookup_type("ClosedBox")
+                    .iter()
+                    .any(|entry| entry.path.as_ref() == head_key && entry.tier == Tier::Volatile));
+                std::fs::write(&head_key, "package generated\ntypealias ClosedBox = Impl\n")
+                    .unwrap();
+                assert!(
+                    required_interface_actions(&mut ws, &caller_key, caller).is_empty(),
+                    "closed formal receiver heads may become applicable aliases before refresh"
+                );
+                ws.open(&head_key, head.into());
+                assert_eq!(
+                    required_interface_actions(&mut ws, &caller_key, caller).len(),
+                    1,
+                    "a current unrelated nominal receiver head can prove rejection"
+                );
+                ws.change(&shadow_key, shadow.into());
+                ws.change(&shadow_key, format!("{shadow}\nclass Broken {{"));
+                assert!(ws.open_docs[&shadow_key].tree.root_node().has_error());
+                assert!(
+                    required_interface_actions(&mut ws, &caller_key, caller).is_empty(),
+                    "a broken prefix source cannot prove receiver rejection"
+                );
+                ws.change(&shadow_key, shadow.into());
+                struct Provider;
+                impl crate::analysis_extensions::AnalysisProvider for Provider {
+                    fn id(&self) -> &str {
+                        "prefix-source-test"
+                    }
+                    fn analyze(
+                        &self,
+                        _: &mut ktcore::extensions::ReadSession<'_>,
+                    ) -> Result<(), ktcore::extensions::ContractError> {
+                        Ok(())
+                    }
+                }
+                ws.analysis_extensions =
+                    crate::analysis_extensions::AnalysisExtensions::new(vec![Arc::new(Provider)]);
+                assert!(ws.analysis_extensions.needs_source(&shadow_key));
+                assert!(
+                    required_interface_actions(&mut ws, &caller_key, caller).is_empty(),
+                    "synthetic source providers keep the ordinary action unavailable"
+                );
+            }
+            std::fs::remove_dir_all(sdk).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn workspace_symbols_preserve_payload_duplicates_and_stable_tier_order() {

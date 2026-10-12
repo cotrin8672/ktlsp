@@ -3963,6 +3963,118 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_primitive_identity_survives_indexed_java_wrappers() {
+        use crate::parser::KotlinParser;
+        use crate::types::Type;
+
+        for name in ["Byte", "Short", "Long", "Float", "Double", "Boolean"] {
+            let mut index = Index::new();
+            for package in ["kotlin", "java.lang"] {
+                index.replace_file(
+                    package,
+                    vec![IndexedSymbol::new(
+                        name,
+                        SymbolKind::Class,
+                        package,
+                        None,
+                        0,
+                        name.len(),
+                    )],
+                    Tier::Durable,
+                );
+            }
+            let mut parser = KotlinParser::new();
+            for (package, imports, written, expected) in [
+                ("app", String::new(), name, "kotlin"),
+                ("app", "import java.lang.*\n".into(), name, "kotlin"),
+                (
+                    "app",
+                    "import kotlin.*\nimport java.lang.*\n".into(),
+                    name,
+                    "kotlin",
+                ),
+                (
+                    "app",
+                    "import java.lang.*\nimport kotlin.*\n".into(),
+                    name,
+                    "kotlin",
+                ),
+                (
+                    "app",
+                    format!("import java.lang.{name}\n"),
+                    name,
+                    "java.lang",
+                ),
+                (
+                    "app",
+                    format!("import java.lang.{name} as JValue\n"),
+                    "JValue",
+                    "java.lang",
+                ),
+                ("java.lang", String::new(), name, "java.lang"),
+            ] {
+                let source = format!(
+                    "package {package}\n{imports}fun echo(value: {written}): {written} = value\n"
+                );
+                let symbols =
+                    crate::indexer::extract_symbols(&parser.parse(&source), &source, package);
+                let function = symbols.iter().find(|symbol| symbol.name == "echo").unwrap();
+                let reference = function.return_type.as_ref().unwrap();
+                // Shared declaration facts keep their source package even in another consumer context.
+                for consumer in ["app", "java.lang"] {
+                    assert_eq!(
+                        super::declared_type(
+                            &index,
+                            reference,
+                            &super::FileCtx::new(consumer.into(), Vec::new())
+                        ),
+                        Type::class(name, Some(expected.into())),
+                        "{source}, consumer {consumer}"
+                    );
+                }
+            }
+            index.replace_file(
+                "Shadow.kt",
+                vec![IndexedSymbol::new(
+                    name,
+                    SymbolKind::Class,
+                    "app",
+                    None,
+                    0,
+                    name.len(),
+                )],
+                Tier::Volatile,
+            );
+            let source = format!("package app\nfun echo(value: {name}): {name} = value\n");
+            let symbols = crate::indexer::extract_symbols(&parser.parse(&source), &source, "app");
+            let reference = symbols
+                .iter()
+                .find(|symbol| symbol.name == "echo")
+                .unwrap()
+                .return_type
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                super::declared_type(
+                    &index,
+                    reference,
+                    &super::FileCtx::new("consumer".into(), Vec::new())
+                ),
+                Type::class(name, Some("app".into()))
+            );
+            assert_eq!(
+                super::declared_type(
+                    &index,
+                    &crate::types::TypeRef::simple(name),
+                    &super::FileCtx::new("java.lang".into(), Vec::new())
+                ),
+                Type::class(name, Some("java.lang".into())),
+                "legacy context without stamped candidates"
+            );
+        }
+    }
+
+    #[test]
     fn plain_method_variable_result_uses_current_normalized_argument_facts() {
         use crate::members::CallArguments;
         use crate::parser::KotlinParser;
@@ -4458,10 +4570,15 @@ pub(crate) fn is_intrinsic_type_ref(
     }
     !index.lookup_type(&tr.name).iter().any(|entry| {
         entry.sym.package != "kotlin"
-            // The top-level JVM String represents Kotlin String, not a competing user type.
-            && !(tr.name == "String"
-                && entry.sym.package == "java.lang"
-                && entry.sym.container.is_none())
+            // Default/wildcard JVM wrappers do not compete with Kotlin's primitive builtins.
+            // A declaration in java.lang still binds its own package; explicit imports were
+            // already expanded into qualification, above. Prefer declaration context to use-site ctx.
+            && !(entry.sym.package == "java.lang"
+                && entry.sym.container.is_none()
+                && (tr.name == "String"
+                    || matches!(tr.name.as_str(), "Byte" | "Short" | "Long" | "Float" | "Double" | "Boolean")
+                        && tr.package_candidates.first().map_or(ctx.package.as_str(), String::as_str)
+                            != "java.lang"))
             && if tr.package_candidates.is_empty() {
                 entry.sym.package == ctx.package
                     || ctx

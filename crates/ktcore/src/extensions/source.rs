@@ -548,7 +548,7 @@ fn signature(
     result.map(Knowledge::Found).unwrap_or_else(unsupported)
 }
 
-fn has_post_name_dimensions(node: Node<'_>) -> bool {
+pub(crate) fn has_post_name_dimensions(node: Node<'_>) -> bool {
     if child_of_kind(node, "dimensions").is_some() {
         return true;
     }
@@ -581,6 +581,21 @@ fn jvm_type(
         let element = scope.type_ref(name, false, Vec::new());
         return jvm_type(index, &element, ctx, scope, java, type_parameters)
             .map(|ty| JvmType::Array(Box::new(ty)));
+    }
+    source_scalar_jvm_type(index, ty, ctx, java, type_parameters)
+}
+
+/// Shared source ABI identity for the ordinary scalar signature slice. Java primitive tokens
+/// and Kotlin builtins are distinct spellings; unresolved lookalikes must not be interchanged.
+pub(crate) fn source_scalar_jvm_type(
+    index: &dyn InferenceIndex,
+    ty: &TypeRef,
+    ctx: &FileCtx,
+    java: bool,
+    type_parameters: &[String],
+) -> Option<JvmType> {
+    if ty.nullable || ty.qualification.is_none() && type_parameters.contains(&ty.name) {
+        return None;
     }
     if !ty.args.is_empty() {
         return None;

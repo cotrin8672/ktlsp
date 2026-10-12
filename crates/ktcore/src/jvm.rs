@@ -173,10 +173,15 @@ impl<'a> CallableCandidate<'a> {
         let ctx = FileCtx::new(source.facts.package.clone(), Vec::new());
         let mut descriptor = "(".to_string();
         for ty in &facts.params {
-            descriptor.push_str(&erased_descriptor(index, ty, &ctx)?);
+            descriptor.push_str(&erased_descriptor(index, ty, &ctx, &facts.type_params)?);
         }
         descriptor.push(')');
-        descriptor.push_str(&erased_descriptor(index, &facts.return_type, &ctx)?);
+        descriptor.push_str(&erased_descriptor(
+            index,
+            &facts.return_type,
+            &ctx,
+            &facts.type_params,
+        )?);
         let origin_id = index
             .origin_facts()
             .and_then(|origins| origins.file_origin(&source.file))
@@ -213,7 +218,15 @@ impl SourceFile {
 
 /// Never invent Object erasure for unresolved source types. Suspend lowering inserts its verified
 /// Object return and Continuation parameter explicitly in the source producer.
-fn erased_descriptor(index: &dyn InferenceIndex, ty: &TypeRef, ctx: &FileCtx) -> Option<String> {
+fn erased_descriptor(
+    index: &dyn InferenceIndex,
+    ty: &TypeRef,
+    ctx: &FileCtx,
+    type_parameters: &[String],
+) -> Option<String> {
+    if ty.qualification.is_none() && type_parameters.contains(&ty.name) {
+        return None;
+    }
     if ty.qualification.as_deref() == Some("java.lang") && ty.name == "Object" {
         return Some("Ljava/lang/Object;".into());
     }
@@ -229,6 +242,48 @@ fn erased_descriptor(index: &dyn InferenceIndex, ty: &TypeRef, ctx: &FileCtx) ->
     else {
         return None;
     };
+    if container.is_none() && package == "kotlin" {
+        // shortcut: generic array erasure remains Unknown until its element/boxing rules are covered.
+        if name == "Array" {
+            return None;
+        }
+        if crate::defaults::is_builtin_type(&name) {
+            let mut non_nullable = ty.clone();
+            non_nullable.nullable = false;
+            let scalar = crate::extensions::source::source_scalar_jvm_type(
+                index,
+                &non_nullable,
+                ctx,
+                false,
+                type_parameters,
+            )?;
+            use crate::extensions::{JvmType, MemberSignature};
+            if scalar == JvmType::Void {
+                // Unit is a value parameter here; only ordinary method returns lower it to void.
+                return Some("Lkotlin/Unit;".into());
+            }
+            if ty.nullable && scalar != JvmType::String {
+                let wrapper = match scalar {
+                    JvmType::Boolean => "Boolean",
+                    JvmType::Byte => "Byte",
+                    JvmType::Char => "Character",
+                    JvmType::Short => "Short",
+                    JvmType::Int => "Integer",
+                    JvmType::Long => "Long",
+                    JvmType::Float => "Float",
+                    JvmType::Double => "Double",
+                    _ => return None,
+                };
+                return Some(format!("Ljava/lang/{wrapper};"));
+            }
+            return Some(
+                MemberSignature::field(&scalar)
+                    .ok()?
+                    .descriptor()
+                    .to_string(),
+            );
+        }
+    }
     Some(format!(
         "L{}{name};",
         if let Some(container) = container {
@@ -1354,5 +1409,208 @@ mod tests {
         );
         assert_eq!(selected.applicability, Applicability::Applicable);
         assert_eq!(selected.consumable_candidates().len(), 1);
+    }
+
+    fn suspend_source_fixture(text: &str) -> (crate::index::Index, SourceFile) {
+        let file = "/scalar/Api.kt";
+        let mut parser = crate::parser::KotlinParser::new();
+        let tree = parser.parse(text);
+        let symbols = crate::indexer::extract_symbols(&tree, text, "scalar");
+        let facts = source_facts(file, &tree, text, &symbols).expect("real suspend source facts");
+        let mut index = crate::index::Index::new();
+        index.replace_file(file, symbols, Tier::Volatile);
+        for (name, wrapper) in [
+            ("Boolean", "Boolean"),
+            ("Byte", "Byte"),
+            ("Char", "Character"),
+            ("Short", "Short"),
+            ("Int", "Integer"),
+            ("Long", "Long"),
+            ("Float", "Float"),
+            ("Double", "Double"),
+        ] {
+            for source_set in ["common", "jvm"] {
+                index.replace_file(
+                    &format!("/stdlib/{source_set}/{name}.kt"),
+                    vec![IndexedSymbol::new(
+                        name,
+                        SymbolKind::Class,
+                        "kotlin",
+                        None,
+                        0,
+                        name.len(),
+                    )],
+                    Tier::Durable,
+                );
+            }
+            index.replace_file(
+                &format!("/sdk/{wrapper}.java"),
+                vec![IndexedSymbol::new(
+                    wrapper,
+                    SymbolKind::Class,
+                    "java.lang",
+                    None,
+                    0,
+                    wrapper.len(),
+                )],
+                Tier::Durable,
+            );
+        }
+        for name in ["String", "Unit"] {
+            index.replace_file(
+                &format!("/stdlib/{name}.kt"),
+                vec![IndexedSymbol::new(
+                    name,
+                    SymbolKind::Class,
+                    "kotlin",
+                    None,
+                    0,
+                    name.len(),
+                )],
+                Tier::Durable,
+            );
+        }
+        (
+            index,
+            SourceFile {
+                file: file.into(),
+                revision: 1,
+                tier: Tier::Volatile,
+                facts,
+            },
+        )
+    }
+
+    #[test]
+    fn suspend_source_scalar_identities_use_actual_primitive_and_wrapper_descriptors() {
+        let mut text = "package scalar\nimport java.lang.Long as JLong\n".to_string();
+        let mut expected = Vec::new();
+        for (name, primitive, wrapper) in [
+            ("Long", "J", "Long"),
+            ("Short", "S", "Short"),
+            ("Byte", "B", "Byte"),
+            ("Float", "F", "Float"),
+            ("Double", "D", "Double"),
+            ("Boolean", "Z", "Boolean"),
+            ("Char", "C", "Character"),
+            ("Int", "I", "Integer"),
+        ] {
+            text.push_str(&format!(
+                "suspend fun p{name}(value: {name}): {name} = value\n"
+            ));
+            text.push_str(&format!(
+                "suspend fun n{name}(value: {name}?): {name}? = value\n"
+            ));
+            expected.push((format!("p{name}"), primitive.to_string()));
+            expected.push((format!("n{name}"), format!("Ljava/lang/{wrapper};")));
+        }
+        for (name, written, descriptor) in [
+            ("boxed", "java.lang.Long", "Ljava/lang/Long;"),
+            ("alias", "JLong", "Ljava/lang/Long;"),
+            ("string", "String", "Ljava/lang/String;"),
+            ("nullableString", "String?", "Ljava/lang/String;"),
+            ("unit", "Unit", "Lkotlin/Unit;"),
+            ("nullableUnit", "Unit?", "Lkotlin/Unit;"),
+        ] {
+            text.push_str(&format!(
+                "suspend fun {name}(value: {written}): {written} = value\n"
+            ));
+            expected.push((name.to_string(), descriptor.to_string()));
+        }
+        let (index, source) = suspend_source_fixture(&text);
+        assert_eq!(source.facts.callables.len(), expected.len());
+        for (name, parameter) in expected {
+            let facts = source
+                .facts
+                .callables
+                .iter()
+                .find(|facts| facts.name == name)
+                .unwrap();
+            let identity = CallableCandidate::Jvm {
+                owner: JvmOwner::Source(&source),
+                facts,
+            }
+            .identity(&index)
+            .unwrap();
+            assert_eq!(identity.class.internal_name, "scalar/ApiKt");
+            assert_eq!(
+                identity.descriptor,
+                format!("({parameter}Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"),
+                "{name}"
+            );
+            assert!(
+                !identity.descriptor.contains("Lkotlin/Long;"),
+                "{name}: {identity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn suspend_source_unknown_generic_and_array_erasure_never_fabricates_identity() {
+        let text = "package scalar\nsuspend fun <Long> generic(value: Long): Long = value\nsuspend fun missing(value: Missing): Missing = value\nsuspend fun <T> array(value: Array<T>): Array<T> = value\nsuspend fun concreteArray(value: Array<Long>): Array<Long> = value\nsuspend fun invalidScalar(value: Long<String>): Long<String> = value\n";
+        let (mut index, source) = suspend_source_fixture(text);
+        index.replace_file(
+            "/stdlib/Array.kt",
+            vec![IndexedSymbol::new(
+                "Array",
+                SymbolKind::Class,
+                "kotlin",
+                None,
+                0,
+                5,
+            )],
+            Tier::Durable,
+        );
+        assert_eq!(source.facts.callables.len(), 5);
+        let generic = source
+            .facts
+            .callables
+            .iter()
+            .find(|facts| facts.name == "generic")
+            .unwrap();
+        assert_eq!(generic.type_params, ["Long"]);
+        assert!(generic.params[0].qualification.is_none());
+        for facts in &source.facts.callables {
+            let identity = CallableCandidate::Jvm {
+                owner: JvmOwner::Source(&source),
+                facts,
+            }
+            .identity(&index);
+            assert!(
+                identity.is_none(),
+                "{} must remain unsupported: {identity:?}",
+                facts.name
+            );
+        }
+    }
+
+    #[test]
+    fn suspend_source_nominal_nested_and_generic_owner_erasure_is_preserved() {
+        let text = "package scalar\nclass Long\nclass Outer { class Inner }\nclass Box<T>\nsuspend fun user(value: Long): Long = value\nsuspend fun nested(value: Outer.Inner): Outer.Inner = value\nsuspend fun <T> boxedGeneric(value: Box<T>): Box<T> = value\n";
+        let (index, source) = suspend_source_fixture(text);
+        assert_eq!(source.facts.callables.len(), 3);
+        for (name, parameter) in [
+            ("user", "Lscalar/Long;"),
+            ("nested", "Lscalar/Outer$Inner;"),
+            ("boxedGeneric", "Lscalar/Box;"),
+        ] {
+            let facts = source
+                .facts
+                .callables
+                .iter()
+                .find(|facts| facts.name == name)
+                .unwrap();
+            let identity = CallableCandidate::Jvm {
+                owner: JvmOwner::Source(&source),
+                facts,
+            }
+            .identity(&index)
+            .unwrap();
+            assert_eq!(
+                identity.descriptor,
+                format!("({parameter}Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"),
+                "{name}"
+            );
+        }
     }
 }

@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 9;
+const MODEL_VERSION: u32 = 10;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -953,11 +953,28 @@ fn load_snapshot_with(
     force: bool,
     dump: impl FnOnce() -> anyhow::Result<Vec<ModuleClasspath>>,
 ) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    let lock_start = std::time::Instant::now();
     let _guard = RESOLUTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::trace::span(
+        "classpath.model_lock",
+        "classpath",
+        lock_start,
+        serde_json::json!({"root": root.to_string_lossy(), "forcedModel": force}),
+    );
+    let cache_start = std::time::Instant::now();
+    let trace_cache = |source: &str| {
+        crate::trace::span(
+            "classpath.model_cache",
+            "classpath",
+            cache_start,
+            serde_json::json!({"root": root.to_string_lossy(), "forcedModel": force, "source": source}),
+        )
+    };
     if let Some(model) = snapshot(root).filter(|_| !force) {
         if model.mtimes == build_file_mtimes(root, &model.modules) {
+            trace_cache("memory");
             return Ok(model);
         }
     }
@@ -969,10 +986,12 @@ fn load_snapshot_with(
             {
                 let mut model = ProjectSnapshot::new(entry.modules);
                 model.mtimes = entry.mtimes;
+                trace_cache("disk");
                 return Ok(Arc::new(model));
             }
         }
     }
+    trace_cache("miss");
     let modules = dump()?;
     let mtimes = build_file_mtimes(root, &modules);
     log_unresolved(&modules);
@@ -1092,15 +1111,27 @@ fn module_cache_path(root: &Path, module: &str) -> PathBuf {
 /// state, immune to repository flakiness. An empty or failed offline dump means the cache isn't
 /// populated (fresh machine) — fall back to the online run for completeness.
 fn dump_with_fallback(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClasspath>> {
-    match run_dump(root, task, true) {
+    let run = |offline| {
+        let start = std::time::Instant::now();
+        let result = run_dump(root, task, offline);
+        crate::trace::span(
+            "classpath.gradle_dump",
+            "classpath",
+            start,
+            serde_json::json!({"root": root.to_string_lossy(), "task": task, "offline": offline,
+                "ok": result.is_ok(), "modules": result.as_ref().ok().map(Vec::len)}),
+        );
+        result
+    };
+    match run(true) {
         Ok(modules) if modules.iter().any(|m| !m.entries.is_empty()) => Ok(modules),
         Ok(_) => {
             tracing::info!("offline classpath dump resolved no entries; retrying online");
-            run_dump(root, task, false)
+            run(false)
         }
         Err(offline_err) => {
             tracing::info!("offline classpath dump failed ({offline_err:#}); retrying online");
-            run_dump(root, task, false)
+            run(false)
         }
     }
 }

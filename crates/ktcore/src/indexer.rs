@@ -389,6 +389,9 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     if !value && !matches!(node.kind(), "function_declaration" | "method_declaration") {
         return SourceMemberFlags::default();
     }
+    if java && crate::extensions::source::has_post_name_dimensions(node) {
+        return SourceMemberFlags::default();
+    }
     let mut cursor = node.walk();
     if node
         .children(&mut cursor)
@@ -424,11 +427,15 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     let mut expect = false;
     let mut default_ = false;
     let mut final_ = false;
+    let mut interface_forbidden = false;
+    let mut strictfp = false;
     let mut jvm_restricted = false;
     if let Some(modifiers) = child_of_kind(node, "modifiers") {
         let mut cursor = modifiers.walk();
         for modifier in modifiers.children(&mut cursor) {
             match node_text(modifier, src) {
+                "synchronized" | "transient" | "volatile" if java => interface_forbidden = true,
+                "strictfp" if java => strictfp = true,
                 "abstract" => abstract_ = true,
                 "static" => static_ = true,
                 "private" => private = true,
@@ -563,6 +570,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     if expect
         || conflicting_access
         || java && default_ && (!interface || static_ || private || abstract_)
+        || interface && (final_ || interface_forbidden || strictfp && !body)
         || interface && (native || java && body && !default_ && !static_ && !private)
         || (abstract_ && (body || native || static_ || private || final_))
         || native && body

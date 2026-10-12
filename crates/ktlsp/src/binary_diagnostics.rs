@@ -33,6 +33,117 @@ impl ClassInventoryCache {
         self.class_bytes = 0;
     }
 
+    /// Complete implicit root for a code action, from this caller's current selected JVM task.
+    /// This uses the existing stamped/bounded decoded cache, without indexing the SDK.
+    pub(crate) fn object_for_caller(
+        &mut self,
+        model: &ProjectSnapshot,
+        caller: &str,
+    ) -> Option<Arc<ClassFileFacts>> {
+        use classpath::CompilerLanguage;
+        let task = if crate::language::SourceLanguage::for_key(caller).is_java() {
+            let task = model.plain_java_task(caller)?;
+            if task.options.get("release") != Some(&serde_json::Value::Null)
+                || task.options.get("bootstrapClasspath") != Some(&serde_json::Value::Null)
+                || !self.plain_caller(task)
+            {
+                return None;
+            }
+            task
+        } else {
+            let (_, source) = model.owner_for_key(caller)?;
+            let source = source?;
+            if source.compiler_metadata_incomplete
+                || source.classpath_incomplete
+                || !source.unresolved.is_empty()
+            {
+                return None;
+            }
+            let selected = source.kotlin_compile_task.as_deref()?;
+            let mut tasks = source
+                .compiler_tasks
+                .iter()
+                .filter(|task| task.language == CompilerLanguage::Kotlin && task.task == selected);
+            let task = tasks.next()?;
+            if tasks.next().is_some()
+                || !task.complete
+                || task.problem.is_some()
+                || task.kotlin_compiler.is_none()
+                || !task.annotation_processor_path.is_empty()
+                || !matches!(
+                    task.task_type.as_str(),
+                    "org.jetbrains.kotlin.gradle.tasks.KotlinCompile"
+                        | "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated"
+                )
+            {
+                return None;
+            }
+            // Keep target-SDK substitutions, plugins and opaque/custom arguments unknown.
+            let mut arguments = task.arguments.iter();
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "-d" | "-jvm-target" | "-module-name" | "-language-version"
+                    | "-api-version" | "-classpath" | "-cp" | "-jdk-home" => {
+                        let value = arguments.next()?;
+                        if value.is_empty()
+                            || value.starts_with(['-', '@'])
+                            || value.contains('\0')
+                            || argument == "-jdk-home"
+                                && task.java_home.as_deref() != Some(Path::new(value))
+                        {
+                            return None;
+                        }
+                    }
+                    "-no-stdlib"
+                    | "-no-reflect"
+                    | "-nowarn"
+                    | "-Werror"
+                    | "-progressive"
+                    | "-Xallow-no-source-files" => {}
+                    _ => return None,
+                }
+            }
+            task
+        };
+        if !task
+            .source_files
+            .iter()
+            .any(|path| crate::paths::file_key(path) == caller)
+        {
+            return None;
+        }
+        let home = task.java_home.as_ref()?;
+        if !home.is_absolute() {
+            return None;
+        }
+        let origin = classpath::jdk_origin_id(&home.join("lib/src.zip"));
+        let class = self
+            .read(
+                &home.join("jmods/java.base.jmod"),
+                "classes/java/lang/Object.class",
+                &origin,
+            )
+            .ok()??;
+        (class.identity.origin_id == origin && class.identity.internal_name == "java/lang/Object")
+            .then_some(class)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_object_for_tests(&mut self, home: &Path, facts: ClassFileFacts) {
+        let path = home.join("jmods/java.base.jmod");
+        let stamp = file_stamp(&path).unwrap().expect("explicit test SDK stamp");
+        let origin = classpath::jdk_origin_id(&home.join("lib/src.zip"));
+        assert_eq!(facts.identity.origin_id, origin);
+        assert_eq!(facts.identity.internal_name, "java/lang/Object");
+        self.classes.insert(
+            (path, "classes/java/lang/Object.class".into(), origin),
+            CachedClass {
+                stamp: Some(stamp),
+                facts: Some(Arc::new(facts)),
+            },
+        );
+    }
+
     pub(crate) fn plain_caller(&mut self, task: &CompilerTask) -> bool {
         if task.source_files.iter().any(|path| {
             path.file_name()
