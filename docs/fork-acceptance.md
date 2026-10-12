@@ -34,6 +34,11 @@ stall as a product issue separately. A missing source archive fails a navigation
 only when that case requires its source and cannot resolve correctly. Historical
 harness exit codes below include broader operational checks and are not analysis scores.
 
+Implementation priority, clarified by the user: (1) startup, indexing and completion
+speed; (2) code actions, navigation, inlay hints and other editing UX, including
+their speed; (3) memory reductions that preserve fast behavior and useful analysis.
+Memory-only storage changes are held while the first two priorities are addressed.
+
 ## Initial environment
 
 - Starting revision: `f2c4c96799f68e11014021b7a77a0ef950770da7`, branch `main`.
@@ -58,8 +63,8 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current Java var/shared generic recovery slice passes 1,351 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 52; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 213 matched / 5 unmet of 218: original 199 retain 194 matches; all 18 resource/editing first RPCs and exact restoration pass. Features 78/80 and semantic 107 are prior results | Partial; original diagnostic gaps remain open | Checkpoint 52 native-java-var-editor52-2. All 18 related RPCs run once with reconstructed outbound source hashes. Forced cleanup is operational evidence |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current reverse-reference update slice passes 1,352 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 54; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 213 matched / 5 unmet of 218: original 199 retain 194 matches; all 18 resource/editing first RPCs and exact restoration pass. Current features retains 78/80; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 54 native-reference-java54-2 and native-reference-features54-2. All 18 related RPCs run once with reconstructed outbound source hashes. Forced cleanup is operational evidence |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -3099,6 +3104,58 @@ has separately identified its exact default same-daemon selection. That fallback
 is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
+
+
+### Fifty-fourth checkpoint: avoid repeated reverse-reference scans during edits
+
+An edited file previously retained the entire cross-file name bucket once for
+every occurrence of that name. Removal now visits each distinct spelling once,
+using borrowed keys and the existing FxBuildHasher. Other files' paths, order and
+exact ranges, edited ranges, restored names, empty updates and declaration lifetime
+are covered by the new focused regression. No public API or cache schema changes.
+
+The same standalone source links the baseline and updated release core artifacts.
+Each of five cases checks every peer/edited path and range after every update;
+construction and assertions are outside the clock. One first update and 31 warm
+updates per case are recorded separately. Warm nearest-rank p50/p95 microseconds:
+
+| Case | Baseline | Updated |
+| --- | --- | --- |
+| One usage, no peer | 0.2 / 0.2 | 0.2 / 0.3 |
+| 64 distinct names, 32 peers | 3.1 / 3.2 | 4.8 / 5.0 |
+| 32 names repeated 32 times, 32 peers | 430.9 / 600.1 | 42.5 / 53.4 |
+| One name repeated 1024 times, 8192 peer sites | 2110.6 / 2600.8 | 25.8 / 34.5 |
+| One name repeated 1024 times, 32768 peer sites | 11389.5 / 15683.9 | 37.4 / 51.2 |
+
+The distinct-name case pays for the temporary set; tiny cases approach the clock's
+100 ns granularity. These sequential synthetic observations establish the repaired
+update cost and tradeoff, not a startup or whole-project speedup. Initial artifact-selection
+and launcher-argument failures are preserved; neither ran the benchmark. The initial
+standard-hash implementation is retained separately from the final Fx variant.
+
+Final release de5e64a2 passes 1,352 Rust tests, zero failures, four ignored, format,
+harness syntax and release builds. Actual Neovim Java retains 213/218 matches and
+all 18 resource/editing first RPCs with exact restoration; features retains 78/80.
+The same five Java and two features diagnostic expectations remain unmet, with no
+unmeasured requests or weakened expectations. Both legacy scenarios still force
+client shutdown; their exit statuses are not whole-suite semantic success.
+
+Actual OkHttp native completion retains 31 first RPCs and 31 exact accepted whole
+buffers. Warm RPC p50/p95 is 2.078/2.669 ms and input-to-popup handoff is
+33.446/35.016 ms. Normal shutdown acknowledges once and exits 0/signal 0 with no
+termination. Prior checkpoint 52 popup observation was 33.896/35.372 ms; these
+sequential observations preserve useful responsiveness without a causal speedup
+claim. Current sampled server working-set peak is 2,102,169,600 bytes, 1037 polls,
+maximum gap 110 ms; compiler memory remains unmeasured. No memory saving is claimed.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+source-reference-speed54-1/, native-reference-speed54-baseline-3/,
+native-reference-speed54-candidate-{1,2}/, native-reference-speed-rust54-{1,2,3}/,
+native-reference-java54-2/, native-reference-features54-2/ and
+native-okhttp-reference-ui54-1/ktlsp/. Release/binary source guards and original
+project source hashes pass. The prepared sparse value-type patch remains unapplied.
+Next separate model import from source/dependency indexing in startup measurements,
+then use shared analysis for precise, fast hints; original diagnostics remain open.
 
 
 ### Fifty-third checkpoint: complete focused Spring and Gradle paired UI observations

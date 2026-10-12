@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Index as SliceIndex;
 use std::sync::Arc;
 
-use crate::fxhash::FxHashMap;
+use crate::fxhash::{FxBuildHasher, FxHashMap};
 use crate::project_model::{FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation};
 use crate::symbol::{IndexedSymbol, SymbolKind};
 use crate::types::TypeRef;
@@ -722,7 +722,12 @@ impl Index {
 
     fn remove_refs(&mut self, path: &str) {
         if let Some(old) = self.ref_files.remove(path) {
-            for u in old {
+            let mut removed_names = HashSet::with_hasher(FxBuildHasher::default());
+            for u in &old {
+                // Every occurrence of this spelling was removed by its first retain.
+                if !removed_names.insert(u.name.as_ref()) {
+                    continue;
+                }
                 if let Some(entries) = self.refs_by_name.get_mut(u.name.as_ref()) {
                     entries.retain(|e| e.path.as_ref() != path);
                     if entries.is_empty() {
@@ -1949,6 +1954,110 @@ mod tests {
 
         idx.remove_file("b.kt");
         assert_eq!(idx.lookup_by_name("foo").len(), 0);
+    }
+
+    #[test]
+    fn repeated_reference_names_replace_and_remove_only_the_contributing_file() {
+        let usage = |name: &str, start_byte| Usage {
+            name: Arc::from(name),
+            start_byte,
+            end_byte: start_byte + name.len(),
+        };
+        let sites = |index: &Index, name: &str| {
+            index
+                .lookup_refs(name)
+                .iter()
+                .map(|site| (site.path.to_string(), site.start_byte, site.end_byte))
+                .collect::<Vec<_>>()
+        };
+        let mut index = Index::new();
+        index.replace_file("Use.kt", vec![sym("kotlinOwner")], Tier::Volatile);
+        index.replace_file("Use.java", vec![sym("javaOwner")], Tier::Volatile);
+        // Equal spellings have distinct Arc allocations; removal keys are textual.
+        index.replace_file_refs(
+            "Use.kt",
+            vec![
+                usage("shared", 10),
+                usage("shared", 20),
+                usage("ktOnly", 30),
+            ],
+        );
+        index.replace_file_refs(
+            "Use.java",
+            vec![
+                usage("shared", 100),
+                usage("shared", 110),
+                usage("javaOnly", 120),
+            ],
+        );
+        assert_eq!(
+            sites(&index, "shared"),
+            vec![
+                ("Use.kt".into(), 10, 16),
+                ("Use.kt".into(), 20, 26),
+                ("Use.java".into(), 100, 106),
+                ("Use.java".into(), 110, 116),
+            ]
+        );
+
+        // An unsaved replacement keeps every peer site, then appends all new sites.
+        index.replace_file_refs(
+            "Use.kt",
+            vec![
+                usage("shared", 40),
+                usage("shared", 50),
+                usage("renamed", 60),
+            ],
+        );
+        assert_eq!(
+            sites(&index, "shared"),
+            vec![
+                ("Use.java".into(), 100, 106),
+                ("Use.java".into(), 110, 116),
+                ("Use.kt".into(), 40, 46),
+                ("Use.kt".into(), 50, 56),
+            ]
+        );
+        assert!(!index.refs_by_name.contains_key("ktOnly"));
+        assert_eq!(sites(&index, "renamed"), vec![("Use.kt".into(), 60, 67)]);
+        assert_eq!(
+            sites(&index, "javaOnly"),
+            vec![("Use.java".into(), 120, 128)]
+        );
+        assert_eq!(index.lookup_by_name("kotlinOwner").len(), 1);
+
+        index.remove_file("Use.java");
+        assert_eq!(
+            sites(&index, "shared"),
+            vec![("Use.kt".into(), 40, 46), ("Use.kt".into(), 50, 56)]
+        );
+        assert!(!index.refs_by_name.contains_key("javaOnly"));
+        assert!(index.lookup_by_name("javaOwner").is_empty());
+        assert_eq!(index.lookup_by_name("kotlinOwner").len(), 1);
+
+        // Restoring the original spelling/ranges removes the renamed sites exactly.
+        index.replace_file_refs(
+            "Use.kt",
+            vec![
+                usage("shared", 10),
+                usage("shared", 20),
+                usage("ktOnly", 30),
+            ],
+        );
+        assert_eq!(
+            sites(&index, "shared"),
+            vec![("Use.kt".into(), 10, 16), ("Use.kt".into(), 20, 26)]
+        );
+        assert!(!index.refs_by_name.contains_key("renamed"));
+        assert_eq!(sites(&index, "ktOnly"), vec![("Use.kt".into(), 30, 36)]);
+
+        index.replace_file_refs("Use.kt", Vec::new());
+        assert!(index.refs_by_name.is_empty());
+        assert_eq!(index.lookup_by_name("kotlinOwner").len(), 1);
+        index.remove_file("Use.kt");
+        index.remove_file("Use.java");
+        assert!(index.ref_files.is_empty());
+        assert!(index.by_name.is_empty());
     }
 
     #[test]
