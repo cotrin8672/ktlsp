@@ -426,7 +426,7 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
             projection: crate::types::Projection::Star,
             ..TypeRef::default()
         },
-        Type::Unknown => TypeRef::default(),
+        Type::Unknown | Type::Parameter { .. } => TypeRef::default(),
     }
 }
 
@@ -798,7 +798,7 @@ fn type_label(ty: &Type) -> Option<String> {
             }
             Some(out)
         }
-        Type::Unknown | Type::Projected { .. } | Type::Star => None,
+        Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
     }
 }
 

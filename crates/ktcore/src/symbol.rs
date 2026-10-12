@@ -311,7 +311,7 @@ pub fn reshare_file_type_contexts(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Def {
     pub file: String,
     pub start_byte: usize,

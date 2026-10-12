@@ -100,6 +100,19 @@ impl TypeRef {
     }
 }
 
+/// Lexical declaration facts supplied by a syntax adapter, nearest scope first.
+/// These facts describe the current source and are never serialized into the symbol cache.
+#[derive(Clone, Debug)]
+pub struct TypeParameterBounds {
+    pub name: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub scope_start: usize,
+    pub scope_end: usize,
+    pub upper_bounds: Vec<TypeRef>,
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Class {
@@ -108,6 +121,12 @@ pub enum Type {
         container: Option<String>,
         nullable: bool,
         args: Vec<Type>,
+    },
+    Parameter {
+        definition: crate::symbol::Def,
+        name: String,
+        nullable: bool,
+        upper_bounds: Vec<Type>,
     },
     /// Only projected arguments allocate a bound; ordinary Class values keep their layout.
     Projected {
@@ -151,51 +170,52 @@ impl Type {
     pub fn name(&self) -> Option<&str> {
         match self {
             Type::Class { name, .. } => Some(name),
-            Type::Unknown | Type::Projected { .. } | Type::Star => None,
+            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
         }
     }
 
     pub fn package(&self) -> Option<&str> {
         match self {
             Type::Class { package, .. } => package.as_deref(),
-            Type::Unknown | Type::Projected { .. } | Type::Star => None,
+            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
         }
     }
 
     pub fn container(&self) -> Option<&str> {
         match self {
             Type::Class { container, .. } => container.as_deref(),
-            Type::Unknown | Type::Projected { .. } | Type::Star => None,
+            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
         }
     }
 
     pub fn is_nullable(&self) -> bool {
-        matches!(self, Type::Class { nullable: true, .. })
+        matches!(
+            self,
+            Type::Class { nullable: true, .. } | Type::Parameter { nullable: true, .. }
+        )
+    }
+
+    /// Parameters expose their bounds through the shared member walk, without a nominal head.
+    pub fn is_member_receiver(&self) -> bool {
+        matches!(self, Type::Class { .. } | Type::Parameter { .. })
+    }
+
+    pub fn with_nullability(mut self, value: bool) -> Self {
+        match &mut self {
+            Type::Class { nullable, .. } | Type::Parameter { nullable, .. } => *nullable = value,
+            _ => {}
+        }
+        self
     }
 
     pub fn args(&self) -> &[Type] {
         match self {
             Type::Class { args, .. } => args,
-            Type::Unknown | Type::Projected { .. } | Type::Star => &[],
+            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => &[],
         }
     }
 
     pub fn into_non_null(self) -> Type {
-        match self {
-            Type::Class {
-                name,
-                package,
-                container,
-                args,
-                ..
-            } => Type::Class {
-                name,
-                package,
-                container,
-                nullable: false,
-                args,
-            },
-            other => other,
-        }
+        self.with_nullability(false)
     }
 }

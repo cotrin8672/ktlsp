@@ -504,7 +504,7 @@ pub(crate) fn member_completion_query_for_type_with_ctx(
         SourceLanguage::Java => ImportStyle::Java,
     };
     let layout = imports::import_layout_with_style(style, tree, src);
-    if ty.name().is_none() {
+    if !ty.is_member_receiver() {
         return Some(CompletionQuery {
             context: complete::CompletionContext::AfterDot,
             prefix,
@@ -540,6 +540,8 @@ pub(crate) fn member_completion_query_for_type_with_ctx(
         prefix,
         status: if withheld_compiled {
             CompletionStatus::Unknown(vec![CompletionIncompletenessReason::UnknownReceiverKind])
+        } else if candidates.is_empty() && ty.name().is_none() {
+            CompletionStatus::Unknown(vec![CompletionIncompletenessReason::UnknownReceiverType])
         } else if candidates.is_empty() && !index.scope_is_complete() {
             CompletionStatus::Unknown(vec![CompletionIncompletenessReason::QueryScopeIncomplete])
         } else if candidates.is_empty() {
@@ -1072,6 +1074,9 @@ fn member_candidates(
             .map(|source| source as &dyn InferenceIndex)
             .unwrap_or(index);
         for e in members_index.members_of(&cur) {
+            if !ktcore::members::receiver_member_accessible(ty, e) {
+                continue;
+            }
             if let Some(p) = cur_pkg {
                 if e.sym.package != p {
                     continue;
@@ -1274,6 +1279,9 @@ fn synth_arg_types(
 
 fn type_label(ty: &Type) -> Option<String> {
     match ty {
+        Type::Parameter { name, nullable, .. } => {
+            Some(format!("{name}{}", if *nullable { "?" } else { "" }))
+        }
         Type::Class {
             name,
             nullable,

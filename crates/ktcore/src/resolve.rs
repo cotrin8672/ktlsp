@@ -1563,7 +1563,7 @@ fn resolve_member_with_ctx(
                 // same-named type in another package can't be picked.
                 let ty =
                     infer::member_receiver_type(receiver, infer::infer(index, receiver, src, &ctx));
-                if ty.name().is_some() {
+                if ty.is_member_receiver() {
                     let computed = normalized
                         .is_none()
                         .then(|| member_use(index, selector, src, ctx));
@@ -1812,7 +1812,8 @@ fn scan_block<'t>(
     let mut cursor = scope.walk();
     for st in scope.named_children(&mut cursor) {
         match st.kind() {
-            "property_declaration" => {
+            // A block local cannot shadow an outer callable inside its own initializer.
+            "property_declaration" if st.end_byte() <= u => {
                 collect_var_names(st, name, SymbolKind::LocalVariable, src, &mut cands)
             }
             "lambda_parameters" => {

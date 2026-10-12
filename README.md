@@ -232,6 +232,9 @@ server exit are recorded separately in `semantic-shutdown.json`.
 Function-local extensions cover lexical and sibling scopes, typed result chains,
 incomplete completion, and unsaved declaration rename/removal/return-type changes in
 `semantic-local-extension.json`; every query consumes its first response.
+The same scenario checks Kotlin `where` and Java `extends A & B` receiver completion and exact
+navigation through unsaved bound swap/removal/restoration, recording first responses and source/wire
+identity in `semantic-bounded-receivers.json`.
 Shared generic interoperability tests also cover parameterized extension receivers,
 inline nominal bounds, class literals and real-stdlib expect/actual declaration shapes.
 Java/Kotlin source calls also share a conservative equality/lower/upper constraint

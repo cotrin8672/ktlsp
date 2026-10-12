@@ -20,7 +20,7 @@ use crate::symbol::{
     ExtensionReceiverFacts, IndexedSymbol, KotlinValueParameter, MemberImplementation,
     SourceMemberFlags, SymbolKind,
 };
-use crate::types::TypeRef;
+use crate::types::{TypeParameterBounds, TypeRef};
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
     // Same conservative density heuristic as `extract_usages`, scaled for declarations: dense
@@ -895,6 +895,127 @@ fn type_params_of(decl: Node, src: &str) -> Vec<String> {
                 out.push(node_text(id, src).to_string());
             }
         }
+    }
+    out
+}
+
+/// Normalize bounds in lexical order without indexing local parameters as nominal types.
+pub fn type_parameters_in_scope(
+    node: Node,
+    src: &str,
+    package: &str,
+    imports: &[Import],
+) -> Vec<TypeParameterBounds> {
+    let mut declarations = Vec::new();
+    let mut current = Some(node);
+    let mut accessible = true;
+    while let Some(decl) = current {
+        if matches!(
+            decl.kind(),
+            "class_declaration" | "function_declaration" | "property_declaration"
+        ) {
+            declarations.push((decl, accessible));
+        }
+        if decl.kind() == "class_declaration" {
+            let inner = child_of_kind(decl, "modifiers")
+                .and_then(|modifiers| find_descendant(modifiers, "class_modifier"))
+                .is_some_and(|modifier| node_text(modifier, src) == "inner");
+            let nested = decl
+                .parent()
+                .is_some_and(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"));
+            accessible &= inner || !nested;
+        } else if matches!(decl.kind(), "object_declaration" | "companion_object") {
+            accessible = false;
+        }
+        current = decl.parent();
+    }
+    if declarations
+        .iter()
+        .all(|(decl, _)| child_of_kind(*decl, "type_parameters").is_none())
+    {
+        return Vec::new();
+    }
+    let file_scope = TypeScope::new(package, imports.to_vec());
+    let mut out = Vec::new();
+    for (ordinal, (decl, accessible)) in declarations.iter().enumerate() {
+        let Some(parameters) = child_of_kind(*decl, "type_parameters") else {
+            continue;
+        };
+        let names: Vec<_> = declarations[ordinal..]
+            .iter()
+            .flat_map(|(decl, _)| type_params_of(*decl, src))
+            .collect();
+        let scoped = file_scope.without_shadowed_imports(&names);
+        let scope = scoped.as_ref().unwrap_or(&file_scope);
+        let mut cursor = decl.walk();
+        let valid_header = *accessible
+            && !parameters.has_error()
+            && !decl.named_children(&mut cursor).any(|child| {
+                !matches!(
+                    child.kind(),
+                    "function_body" | "class_body" | "enum_class_body"
+                ) && child.has_error()
+            });
+        let mut own = Vec::new();
+        let mut cursor = parameters.walk();
+        for parameter in parameters
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "type_parameter")
+        {
+            let Some(name) = first_ident(parameter) else {
+                continue;
+            };
+            let mut upper_bounds = Vec::new();
+            let mut complete = valid_header && !parameter.has_error();
+            if has_child_token(parameter, ":") {
+                let mut cursor = parameter.walk();
+                let bound = parameter
+                    .named_children(&mut cursor)
+                    .find_map(|bound| type_ref_from(bound, src, Some(scope)));
+                match bound {
+                    Some(bound) => upper_bounds.push(bound),
+                    None => complete = false,
+                }
+            }
+            own.push(TypeParameterBounds {
+                name: node_text(name, src).to_string(),
+                start_byte: name.start_byte(),
+                end_byte: name.end_byte(),
+                scope_start: decl.start_byte(),
+                scope_end: decl.end_byte(),
+                upper_bounds,
+                complete,
+            });
+        }
+        let mut constraints_valid = true;
+        if let Some(constraints) = child_of_kind(*decl, "type_constraints") {
+            let mut cursor = constraints.walk();
+            for constraint in constraints.named_children(&mut cursor) {
+                let parameter = first_ident(constraint).and_then(|name| {
+                    own.iter_mut()
+                        .find(|parameter| parameter.name == node_text(name, src))
+                });
+                let mut cursor = constraint.walk();
+                let bound = constraint
+                    .named_children(&mut cursor)
+                    .find_map(|node| type_ref_from(node, src, Some(scope)));
+                match (parameter, bound) {
+                    (Some(parameter), Some(bound)) if !constraint.has_error() => {
+                        parameter.upper_bounds.push(bound)
+                    }
+                    _ => constraints_valid = false,
+                }
+            }
+        }
+        let duplicate = own.iter().enumerate().any(|(i, parameter)| {
+            own[..i]
+                .iter()
+                .any(|earlier| earlier.name == parameter.name)
+        });
+        for parameter in &mut own {
+            parameter.complete &= constraints_valid && !duplicate;
+        }
+        out.extend(own);
     }
     out
 }

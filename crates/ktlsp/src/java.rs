@@ -26,7 +26,7 @@ use crate::semantic_query::{
     self, CompletionIncompletenessReason, CompletionQuery, CompletionStatus,
 };
 use crate::symbol::{Def, IndexedSymbol, SymbolKind};
-use crate::types::{Type, TypeRef};
+use crate::types::{Type, TypeParameterBounds, TypeRef};
 
 /// A reusable Java parser.
 pub struct JavaParser {
@@ -563,6 +563,85 @@ fn type_parameter_names(node: Node<'_>, src: &str) -> Vec<String> {
             name
         })
         .collect()
+}
+
+fn type_parameters_in_scope(node: Node<'_>, src: &str, tree: &Tree) -> Vec<TypeParameterBounds> {
+    let file_scope = type_scope(tree, src);
+    let mut out = Vec::new();
+    let mut current = Some(node);
+    let mut accessible = true;
+    while let Some(decl) = current {
+        if let Some(parameters) = decl.child_by_field_name("type_parameters") {
+            let scoped = java_declaration_scope(decl, src, &file_scope);
+            let scope = scoped.as_ref().unwrap_or(&file_scope);
+            let mut cursor = decl.walk();
+            let valid_header = accessible
+                && !parameters.has_error()
+                && !decl.named_children(&mut cursor).any(|child| {
+                    !matches!(child.kind(), "block" | "class_body" | "interface_body")
+                        && child.has_error()
+                });
+            let mut own = Vec::new();
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                let mut cursor = parameter.walk();
+                let Some(name) = parameter
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "type_identifier")
+                else {
+                    continue;
+                };
+                let mut upper_bounds = Vec::new();
+                let mut complete = valid_header && !parameter.has_error();
+                if let Some(bounds) = child_of_kind(parameter, "type_bound") {
+                    let mut cursor = bounds.walk();
+                    for bound in bounds.named_children(&mut cursor) {
+                        match type_ref_from_node(bound, src, scope) {
+                            Some(bound) => upper_bounds.push(bound),
+                            None => complete = false,
+                        }
+                    }
+                    complete &= !upper_bounds.is_empty();
+                }
+                own.push(TypeParameterBounds {
+                    name: node_text(name, src).to_string(),
+                    start_byte: name.start_byte(),
+                    end_byte: name.end_byte(),
+                    scope_start: decl.start_byte(),
+                    scope_end: decl.end_byte(),
+                    upper_bounds,
+                    complete,
+                });
+            }
+            let duplicate = own.iter().enumerate().any(|(i, parameter)| {
+                own[..i]
+                    .iter()
+                    .any(|earlier| earlier.name == parameter.name)
+            });
+            for parameter in &mut own {
+                parameter.complete &= !duplicate;
+            }
+            out.extend(own);
+        }
+        let is_static = child_of_kind(decl, "modifiers").is_some_and(|modifiers| {
+            let mut cursor = modifiers.walk();
+            let found = modifiers
+                .children(&mut cursor)
+                .any(|modifier| modifier.kind() == "static");
+            found
+        });
+        accessible &= !is_static
+            && !matches!(
+                decl.kind(),
+                "interface_declaration"
+                    | "annotation_type_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "static_initializer"
+            );
+        current = decl.parent();
+    }
+    out
 }
 
 fn inference_imports(tree: &Tree, src: &str) -> Vec<crate::parser::Import> {
@@ -2757,6 +2836,7 @@ fn java_member_entries(
                 .filter(|entry| entry.sym.name == name)
                 .filter(|entry| java_member_kind_matches(entry.sym.kind, expected_kind))
                 .filter(|entry| cur_pkg.is_none_or(|pkg| entry.sym.package == pkg))
+                .filter(|entry| ktcore::members::receiver_member_accessible(recv, entry))
                 .cloned(),
         );
         ControlFlow::Continue(())
@@ -3527,12 +3607,14 @@ fn receiver_type_from_type_node(
     tree: &Tree,
     type_node: Node<'_>,
 ) -> Option<Type> {
-    let _ = file;
-    let ty = type_ref_from_node(type_node, src, &type_scope(tree, src))?;
-    Some(infer::declared_type(
+    let file_scope = type_scope(tree, src);
+    let scoped = java_declaration_scope(type_node, src, &file_scope);
+    let ty = type_ref_from_node(type_node, src, scoped.as_ref().unwrap_or(&file_scope))?;
+    Some(infer::declared_type_in_scope(
         index,
         &ty,
-        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
+        &FileCtx::new(package_of(tree, src), inference_imports(tree, src)).with_file(file),
+        &type_parameters_in_scope(type_node, src, tree),
     ))
 }
 

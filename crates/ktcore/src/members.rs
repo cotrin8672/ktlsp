@@ -404,6 +404,10 @@ pub fn extension_receiver_applicability(
     receiver: &Type,
     entry: &Entry,
 ) -> Applicability {
+    // shortcut: bounded receivers need extension-constraint proof before exposing extensions.
+    if matches!(receiver, Type::Parameter { .. }) {
+        return Applicability::Unknown;
+    }
     if entry.sym.extension_receiver.is_none()
         || infer::receiver_type_bindings(index, receiver, entry).is_some()
     {
@@ -442,6 +446,7 @@ fn collect_candidates<'a>(
         members.extend(index.members_of(&root).into_iter().filter(|entry| {
             name.matches(&entry.sym.name)
                 && current.package().is_none_or(|pkg| entry.sym.package == pkg)
+                && receiver_member_accessible(receiver, entry)
         }));
         if include_extensions {
             extensions.extend(index.extensions_for(&root).into_iter().filter(|entry| {
@@ -494,6 +499,19 @@ fn collect_candidates<'a>(
         uncertain_receivers,
         hierarchy_complete,
     }
+}
+
+/// Bound surfaces must not borrow inaccessible declarations from their nominal upper bounds.
+pub fn receiver_member_accessible(receiver: &Type, entry: &Entry) -> bool {
+    use crate::extensions::{Dispatch, Visibility};
+    // shortcut: bound receivers expose public instance members until access and static dispatch are modeled.
+    !matches!(receiver, Type::Parameter { .. })
+        || entry.sym.source_member.visibility() == Some(Visibility::Public)
+            && entry.sym.source_member.dispatch() == Some(Dispatch::Instance)
+            && entry.sym.source_member.implementation()
+                != Some(crate::symbol::MemberImplementation::Constructor)
+            && entry.sym.ext_receiver.is_none()
+            && entry.sym.extension_receiver.is_none()
 }
 
 // shortcut: static/visibility validity needs declaration metadata before invalid overrides can be diagnosed.

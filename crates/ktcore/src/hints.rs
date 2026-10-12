@@ -292,6 +292,9 @@ fn type_label(ty: Type, syntax: TypeSyntax) -> Option<String> {
 
 fn format_type(ty: &Type, syntax: TypeSyntax) -> Option<String> {
     match ty {
+        Type::Parameter { name, nullable, .. } => {
+            Some(format!("{name}{}", if *nullable { "?" } else { "" }))
+        }
         Type::Projected { projection, bound } => {
             let prefix = match projection {
                 crate::types::Projection::Out => match syntax {

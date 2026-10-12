@@ -150,7 +150,8 @@ fn expr_type_at_depth(
         return Type::Unknown;
     };
     let facts = file_ctx_facts(db, file);
-    let mut ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone());
+    let mut ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone())
+        .with_file(file.scope_key(db));
     ctx.local_extensions = facts.local_extensions.clone();
     let scoped_index = ScopedIndex::new(db.index(), file.scope_key(db));
     if !supports_compositional_expr(node) {
@@ -391,5 +392,107 @@ mod tests {
         assert_eq!(facts.package, "demo");
         assert!(facts.symbols.iter().any(|symbol| symbol.name == "Main"));
         assert!(facts.symbols.iter().any(|symbol| symbol.name == "run"));
+    }
+
+    #[test]
+    fn parameter_bounds_track_source_scope_text_and_index_revisions() {
+        fn query(
+            state: &mut SalsaState,
+            index: &Index,
+            scope: &str,
+            source: &str,
+            expression: &str,
+            revision: u64,
+        ) -> Type {
+            let tree = parser::KotlinParser::new().parse(source);
+            let start = source.rfind(expression).unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(&source[node.byte_range()], expression);
+            state.expr_type_in_file(
+                "synthetic.kt",
+                scope,
+                source,
+                Durability::LOW,
+                index,
+                revision,
+                ExprKey::from_node(node),
+            )
+        }
+        let mut state = SalsaState::new();
+        let mut index = Index::new();
+        let level = "package app\ninterface Level { fun getEnchantmentLevel(): Int }\n";
+        let wrong = "package app\ninterface Wrong { fun wrongOnly(): Int }\n";
+        for (file, source) in [("Level.kt", level), ("Wrong.kt", wrong)] {
+            let tree = parser::KotlinParser::new().parse(source);
+            index.replace_file(
+                file,
+                crate::indexer::extract_symbols(&tree, source, "app"),
+                crate::index::Tier::Volatile,
+            );
+        }
+        let source = "package app\nfun <T : Level> run(value: T) { value.getEnchantmentLevel() }\n";
+        for scope in ["actual/Use.kt", "other/Use.kt"] {
+            let Type::Parameter { definition, .. } =
+                query(&mut state, &index, scope, source, "value", 1)
+            else {
+                panic!("parameter provenance missing");
+            };
+            assert_eq!(definition.file, scope);
+            assert_eq!(
+                query(
+                    &mut state,
+                    &index,
+                    scope,
+                    source,
+                    "value.getEnchantmentLevel()",
+                    1
+                ),
+                Type::class("Int", Some("kotlin".into()))
+            );
+        }
+        let changed = source.replace("T : Level", "T : Wrong");
+        assert_eq!(
+            query(
+                &mut state,
+                &index,
+                "other/Use.kt",
+                &changed,
+                "value.getEnchantmentLevel()",
+                1
+            ),
+            Type::Unknown
+        );
+        assert_eq!(
+            query(
+                &mut state,
+                &index,
+                "other/Use.kt",
+                source,
+                "value.getEnchantmentLevel()",
+                1
+            ),
+            Type::class("Int", Some("kotlin".into()))
+        );
+        let changed = level.replace(": Int", ": String");
+        let tree = parser::KotlinParser::new().parse(&changed);
+        index.replace_file(
+            "Level.kt",
+            crate::indexer::extract_symbols(&tree, &changed, "app"),
+            crate::index::Tier::Volatile,
+        );
+        assert_eq!(
+            query(
+                &mut state,
+                &index,
+                "other/Use.kt",
+                source,
+                "value.getEnchantmentLevel()",
+                2
+            ),
+            Type::class("String", Some("kotlin".into()))
+        );
     }
 }

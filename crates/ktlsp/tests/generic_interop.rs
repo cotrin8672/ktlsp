@@ -76,7 +76,429 @@ fn infer_expression(ws: &Workspace, file: &str, expression: &str) -> Type {
         .descendant_for_byte_range(start, start + expression.len())
         .unwrap();
     assert_eq!(&src[node.byte_range()], expression);
-    infer::infer(&ws.index, node, &src, &FileCtx::from_tree(&tree, &src))
+    infer::infer(
+        &ws.index,
+        node,
+        &src,
+        &FileCtx::from_tree_in_file(&tree, &src, file),
+    )
+}
+
+const BOUND_LEVEL: &str = "package app\ninterface Level {\n fun getEnchantmentLevel(): Int\n}\n";
+const BOUND_MOVE: &str = "package app; public interface Move { void move(); }";
+const BOUND_OTHER: &str = "package app\ninterface Wrong {\n fun wrongOnly(): Int\n}\n";
+
+fn bounds_workspace(file: &str, source: &str) -> Workspace {
+    workspace(&[
+        ("Level.kt", BOUND_LEVEL),
+        ("Move.java", BOUND_MOVE),
+        ("Wrong.kt", BOUND_OTHER),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Box.java", JAVA_BOX),
+        (
+            "GlobalT.kt",
+            "package app\nclass T {\n fun poisoned() {}\n}\n",
+        ),
+        (file, source),
+    ])
+}
+
+#[test]
+fn lexical_class_and_method_bounds_share_completion_navigation_and_inference() {
+    for (file, source) in [
+        ("Use.kt", "package app\nclass Use<T>(private val value: T) where T : Move, T : Level {\n fun run() { value.move(); value.getEnchantmentLevel() }\n}\n"),
+        ("Use.kt", "package app\nfun <T : Move> run(value: T) where T : Level { value.move(); value.getEnchantmentLevel() }\n"),
+        ("Use.java", "package app; class Use<T extends Move & Level> { T value; void run() { value.move(); value.getEnchantmentLevel(); } }"),
+        ("Use.java", "package app; class Use { <T extends Move & Level> void run(T value) { value.move(); value.getEnchantmentLevel(); } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        for (name, target) in [("move", "Move.java"), ("getEnchantmentLevel", "Level.kt")] {
+            assert_member(&mut ws, file, "value.", name, "poisoned");
+            assert_exact_definition(&mut ws, file, &format!("value.{name}()"), target, name);
+        }
+        if file.ends_with(".kt") {
+            assert_eq!(infer_expression(&ws, file, "value.getEnchantmentLevel()"), Type::class("Int", Some("kotlin".into())));
+        }
+    }
+}
+
+#[test]
+fn generic_bound_arguments_use_the_shared_receiver_substitution() {
+    for (file, source) in [
+        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Box<Item>, T : Level {\n fun run() { value.get().useful(); value.getEnchantmentLevel() }\n}\n"),
+        ("Use.java", "package app; class Use<T extends Box<Item> & Level> { T value; void run() { value.get().useful(); value.getEnchantmentLevel(); } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        assert_member(&mut ws, file, "value.get().use", "useful", "usefulWrong");
+        assert_exact_definition(&mut ws, file, "value.get().useful()", "Item.kt", "useful");
+        if file.ends_with(".kt") {
+            assert_eq!(infer_expression(&ws, file, "value.get()"), Type::class("Item", Some("app".into())));
+        }
+    }
+}
+
+#[test]
+fn lexical_bounds_shadow_class_parameters_imports_and_global_type_names() {
+    for (file, source) in [
+        ("Use.kt", "package app\nimport poison.T\nclass Use<T : Wrong>(val outer: T) {\n fun <T : Level> run(inner: T) { outer.wrongOnly(); inner.getEnchantmentLevel() }\n}\n"),
+        ("Use.java", "package app; import poison.T; class Use<T extends Wrong> { T outer; <T extends Level> void run(T inner) { outer.wrongOnly(); inner.getEnchantmentLevel(); } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        ws.open("Poison.java", "package poison; public class T { public void poisoned() {} }".into());
+        assert_member(&mut ws, file, "outer.", "wrongOnly", "getEnchantmentLevel");
+        assert_member(&mut ws, file, "inner.", "getEnchantmentLevel", "wrongOnly");
+        assert!(!labels(&mut ws, file, "inner.").contains("poisoned"));
+        assert_exact_definition(&mut ws, file, "inner.getEnchantmentLevel()", "Level.kt", "getEnchantmentLevel");
+    }
+}
+
+#[test]
+fn nested_and_outer_bounds_resolve_in_their_declaration_scope() {
+    let source = "package app\nclass Use<T : Level, U : T>(val outer: U) {\n inner class Child<T : Wrong>(val inner: T) {\n  fun run() { val alias: U = outer; alias.getEnchantmentLevel(); inner.wrongOnly() }\n }\n}\n";
+    let mut ws = bounds_workspace("Use.kt", source);
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "alias.",
+        "getEnchantmentLevel",
+        "wrongOnly",
+    );
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "inner.",
+        "wrongOnly",
+        "getEnchantmentLevel",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "alias.getEnchantmentLevel()",
+        "Level.kt",
+        "getEnchantmentLevel",
+    );
+}
+
+#[test]
+fn parameter_identity_requires_the_real_file_and_declaration_span() {
+    let source = "package app\nfun <T : Level> run(value: T) { value.getEnchantmentLevel() }\n";
+    let mut ws = bounds_workspace("First.kt", source);
+    ws.open("Second.kt", source.into());
+    let mut parser = KotlinParser::new();
+    let tree = parser.parse(source);
+    let start = source.find("value.getEnchantmentLevel").unwrap();
+    let receiver = tree
+        .root_node()
+        .descendant_for_byte_range(start, start + "value".len())
+        .unwrap();
+    let first = infer::infer(
+        &ws.index,
+        receiver,
+        source,
+        &FileCtx::from_tree_in_file(&tree, source, "First.kt"),
+    );
+    let second = infer::infer(
+        &ws.index,
+        receiver,
+        source,
+        &FileCtx::from_tree_in_file(&tree, source, "Second.kt"),
+    );
+    let Type::Parameter { definition, .. } = &first else {
+        panic!("missing parameter identity: {first:?}")
+    };
+    assert_eq!(definition.file, "First.kt");
+    assert_eq!(&source[definition.start_byte..definition.end_byte], "T");
+    assert_ne!(
+        first, second,
+        "same spelling and byte positions in different files are distinct parameters"
+    );
+    assert_eq!(
+        infer::infer(
+            &ws.index,
+            receiver,
+            source,
+            &FileCtx::from_tree(&tree, source)
+        ),
+        Type::Unknown
+    );
+    let mut visited = Vec::new();
+    let _ = infer::walk_supertypes(&ws.index, &first, 0, |ty| {
+        visited.push(ty.clone());
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(
+        visited,
+        [Type::Unknown],
+        "the bound expansion obeys the shared traversal cap"
+    );
+}
+
+#[test]
+fn unsaved_bound_and_bound_member_edits_replace_both_language_surfaces() {
+    for (file, source, before, after) in [
+        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Move, T : Level {\n fun run() { value.getEnchantmentLevel() }\n}\n", "T : Level", "T : Wrong"),
+        ("Use.java", "package app; class Use<T extends Move & Level> { T value; void run() { value.getEnchantmentLevel(); } }", "& Level", "& Wrong"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        for changed in [source.replace(before, after), source.to_string()] {
+            ws.change(file, changed.clone());
+            let restored = changed == source;
+            assert_member(&mut ws, file, "value.", if restored { "getEnchantmentLevel" } else { "wrongOnly" }, if restored { "wrongOnly" } else { "getEnchantmentLevel" });
+            if restored {
+                assert_exact_definition(&mut ws, file, "value.getEnchantmentLevel()", "Level.kt", "getEnchantmentLevel");
+            } else {
+                assert!(ws.goto_definition(file, changed.find("value.getEnchantmentLevel").unwrap() + "value.".len()).is_empty());
+            }
+        }
+        ws.change("Level.kt", BOUND_LEVEL.replace("getEnchantmentLevel", "renamedLevel"));
+        assert_member(&mut ws, file, "value.", "renamedLevel", "getEnchantmentLevel");
+        ws.change("Level.kt", BOUND_LEVEL.into());
+        assert_member(&mut ws, file, "value.", "getEnchantmentLevel", "renamedLevel");
+    }
+}
+
+#[test]
+fn incomplete_bodies_keep_valid_bounds_but_invalid_or_unmodeled_bounds_stay_unknown() {
+    for (file, source) in [
+        ("Use.kt", "package app\nclass Use<T : Level>(val value: T) {\n fun run() { value.getEnchantmentLevel(); val broken = }\n}\n"),
+        ("Use.java", "package app; class Use<T extends Level> { T value; void run() { value.getEnchantmentLevel(); Object broken = ; } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        assert_member(&mut ws, file, "value.", "getEnchantmentLevel", "poisoned");
+        assert_exact_definition(&mut ws, file, "value.getEnchantmentLevel()", "Level.kt", "getEnchantmentLevel");
+    }
+    for (file, source) in [
+        ("Use.kt", "package app\nclass Use<T>(val value: T) {\n fun run() { value.poisoned() }\n}\n"),
+        ("Use.kt", "package app\nclass Use<T : Missing>(val value: T) {\n fun run() { value.getEnchantmentLevel() }\n}\n"),
+        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Move, T : Missing {\n fun run() { value.move() }\n}\n"),
+        ("Use.kt", "package app\nclass Use<T : U, U : T>(val value: T) {\n fun run() { value.poisoned() }\n}\n"),
+        ("Use.kt", "package app\nclass Use<T : Move, T : Level>(val value: T) {\n fun run() { value.move() }\n}\n"),
+        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Level, Missing : Wrong {\n fun run() { value.getEnchantmentLevel() }\n}\n"),
+        ("Use.kt", "package app\nclass Use<T : Recursive<T>>(val value: T) {\n fun run() { value.getEnchantmentLevel() }\n}\n"),
+        ("Use.java", "package app; class Use<T> { T value; void run() { value.poisoned(); } }"),
+        ("Use.java", "package app; class Use<T extends Missing> { T value; void run() { value.getEnchantmentLevel(); } }"),
+        ("Use.java", "package app; class Use<T extends Move & Missing> { T value; void run() { value.move(); } }"),
+        ("Use.java", "package app; class Use<T extends U, U extends T> { T value; void run() { value.poisoned(); } }"),
+        ("Use.java", "package app; class Use<T extends Move, T extends Level> { T value; void run() { value.move(); } }"),
+        ("Use.java", "package app; class Use<T extends Recursive<T>> { T value; void run() { value.getEnchantmentLevel(); } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        ws.open("Recursive.java", "package app; public interface Recursive<T> { int getEnchantmentLevel(); }".into());
+        assert!(labels(&mut ws, file, "value.").is_empty(), "{file}: {source}");
+    }
+}
+
+#[test]
+fn nullable_bound_receivers_preserve_safe_navigation_result_nullability() {
+    let source = "package app\nfun <T : Level?> run(value: T) { value?.getEnchantmentLevel() }\n";
+    let mut ws = bounds_workspace("Use.kt", source);
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "value?.",
+        "getEnchantmentLevel",
+        "poisoned",
+    );
+    let result = infer_expression(&ws, "Use.kt", "value?.getEnchantmentLevel()");
+    assert_eq!(result.name(), Some("Int"));
+    assert!(
+        result.is_nullable(),
+        "safe navigation lost nullable T: {result:?}"
+    );
+}
+
+#[test]
+fn conflicting_bound_results_do_not_choose_the_first_declaration() {
+    let mut ws = bounds_workspace(
+        "Use.kt",
+        "package app\nfun <T> run(value: T) where T : Left, T : Right { value.read().useful() }\n",
+    );
+    ws.open(
+        "Left.java",
+        "package app; public interface Left { Item read(); }".into(),
+    );
+    ws.open(
+        "Right.java",
+        "package app; public interface Right { Other read(); }".into(),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "value.read()"),
+        Type::Unknown
+    );
+    assert!(labels(&mut ws, "Use.kt", "value.read().use").is_empty());
+}
+
+#[test]
+fn local_classes_capture_function_bounds_but_static_nested_scopes_do_not() {
+    let source = "package app\nfun <T : Level> run(value: T) {\n class Local(val item: T) { fun read() { item.getEnchantmentLevel() } }\n}\n";
+    let mut ws = bounds_workspace("Use.kt", source);
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "item.",
+        "getEnchantmentLevel",
+        "poisoned",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "item.getEnchantmentLevel()",
+        "Level.kt",
+        "getEnchantmentLevel",
+    );
+    for (file, source) in [
+        ("Use.kt", "package app\nclass Use<T : Level> { class Nested(val value: T) { fun run() { value.getEnchantmentLevel() } } }\n"),
+        ("Use.java", "package app; class Use<T extends Level> { static class Nested { T value; void run() { value.getEnchantmentLevel(); } } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        assert!(labels(&mut ws, file, "value.").is_empty(), "{file}: inaccessible outer parameter leaked");
+    }
+}
+
+#[test]
+fn bounds_expose_only_proven_public_instance_members() {
+    for (file, source) in [
+        ("Use.kt", "package app\nfun <T : Access> run(value: T) { value.publicOnly(); value.privateOnly(); value.publicField; value.privateField }\n"),
+        ("Use.java", "package app; class Use { <T extends Access> void run(T value) { value.publicOnly(); value.privateOnly(); int result = value.publicField + value.privateField; } }"),
+    ] {
+        let mut ws = bounds_workspace(file, source);
+        ws.open("Access.java", "package app; public class Access { public int publicField; private int privateField; public void publicOnly() {} private void privateOnly() {} protected void protectedOnly() {} void packageOnly() {} public static void staticOnly() {} }".into());
+        let got = labels(&mut ws, file, "value.");
+        assert!(got.contains("publicOnly"), "{file}: {got:?}");
+        for name in ["privateOnly", "protectedOnly", "packageOnly", "staticOnly", "privateField"] {
+            assert!(!got.contains(name), "{file}: member outside the proven bound surface: {name}: {got:?}");
+        }
+        assert_exact_definition(&mut ws, file, "value.publicOnly()", "Access.java", "publicOnly");
+        assert_exact_definition(&mut ws, file, "value.publicField", "Access.java", "publicField");
+        assert!(ws.goto_definition(file, source.find("value.privateOnly").unwrap() + "value.".len()).is_empty());
+        assert!(ws.goto_definition(file, source.find("value.privateField").unwrap() + "value.".len()).is_empty());
+    }
+}
+
+#[test]
+fn bounded_receivers_do_not_promote_unproven_extension_applicability() {
+    let source = "package app\nfun Level.extensionOnly(): Int = 1\nfun run(known: Level) { known.extensionOnly() }\nfun <T : Level> runBound(value: T) { value.extensionOnly() }\n";
+    let mut ws = bounds_workspace("Use.kt", source);
+    assert_member(&mut ws, "Use.kt", "known.", "extensionOnly", "poisoned");
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "value.",
+        "getEnchantmentLevel",
+        "extensionOnly",
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "value.extensionOnly()"),
+        Type::Unknown
+    );
+    assert!(ws
+        .goto_definition(
+            "Use.kt",
+            source.find("value.extensionOnly").unwrap() + "value.".len()
+        )
+        .is_empty());
+    ws.open(
+        "Access.kt",
+        "package app\nclass Access { fun publicOnly() {} fun Wrong.memberExtensionOnly() {} }\n"
+            .into(),
+    );
+    let source =
+        "package app\nfun <T : Access> runMember(value: T) { value.memberExtensionOnly() }\n";
+    ws.open("MemberUse.kt", source.into());
+    assert_member(
+        &mut ws,
+        "MemberUse.kt",
+        "value.",
+        "publicOnly",
+        "memberExtensionOnly",
+    );
+    assert_eq!(
+        infer_expression(&ws, "MemberUse.kt", "value.memberExtensionOnly()"),
+        Type::Unknown
+    );
+    assert!(ws
+        .goto_definition(
+            "MemberUse.kt",
+            source.find("value.memberExtensionOnly").unwrap() + "value.".len()
+        )
+        .is_empty());
+}
+
+#[test]
+fn lexical_parameter_identity_survives_existing_implicit_receiver_routes() {
+    let source = "package app\nfun <T : Level> T.inside() { this.getEnchantmentLevel() }\nfun <T : Level> run(value: T) { value.let { it.getEnchantmentLevel() }; value.apply { this.getEnchantmentLevel() } }\n";
+    let mut ws = bounds_workspace("Use.kt", source);
+    for prefix in ["this.", "it.", "value.apply { this."] {
+        assert_member(&mut ws, "Use.kt", prefix, "getEnchantmentLevel", "poisoned");
+    }
+    for usage in [
+        "this.getEnchantmentLevel()",
+        "it.getEnchantmentLevel()",
+        "value.apply { this.getEnchantmentLevel()",
+    ] {
+        assert_exact_definition(&mut ws, "Use.kt", usage, "Level.kt", "getEnchantmentLevel");
+    }
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "it.getEnchantmentLevel()"),
+        Type::class("Int", Some("kotlin".into()))
+    );
+}
+
+#[test]
+fn repeated_parameter_bound_expansion_stays_unknown_with_bounded_work() {
+    let mut source = String::from("package app\nclass Use<");
+    for level in 0..7 {
+        source.push_str(&format!(
+            "T{level} : Repeated<{}>, ",
+            vec![format!("T{}", level + 1); 8].join(", ")
+        ));
+    }
+    source.push_str("T7 : Level>(val value: T0) { fun run() { value.getEnchantmentLevel() } }\n");
+    let mut ws = bounds_workspace("Use.kt", &source);
+    ws.open(
+        "Repeated.java",
+        "package app; public interface Repeated<A,B,C,D,E,F,G,H> { int getEnchantmentLevel(); }"
+            .into(),
+    );
+    assert!(labels(&mut ws, "Use.kt", "value.").is_empty());
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "value.getEnchantmentLevel()"),
+        Type::Unknown
+    );
+}
+
+#[test]
+fn constructor_initializers_do_not_borrow_their_own_local_binder() {
+    let source = "package app\nfun run() { val Dog = Dog(); Dog.bark() }\n";
+    let mut ws = bounds_workspace("Use.kt", source);
+    ws.open(
+        "Dog.kt",
+        "package app\nclass Dog { fun bark(): Int = 1 }\n".into(),
+    );
+    assert_member(&mut ws, "Use.kt", "Dog.", "bark", "poisoned");
+    assert_exact_definition(&mut ws, "Use.kt", "val Dog = Dog()", "Dog.kt", "Dog");
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "Dog.bark()"),
+        Type::class("Int", Some("kotlin".into()))
+    );
+    for source in [
+        "package app\nfun run() { val Dog = missingValue; Dog.bark() }\n",
+        "package app\nfun run(Dog: Item) { Dog() }\n",
+        "package app\nfun run() { val Dog = Item(); Dog() }\n",
+    ] {
+        ws.change("Use.kt", source.into());
+        let expression = if source.contains("Dog.bark()") {
+            "Dog.bark()"
+        } else {
+            "Dog()"
+        };
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::Unknown,
+            "{source}"
+        );
+    }
 }
 
 #[test]

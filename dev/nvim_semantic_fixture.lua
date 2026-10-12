@@ -10,6 +10,7 @@
 -- - `super` navigation and return completion exclude private vararg overloads
 -- - Imported extension aliases through unsaved rebind, references, and applied rename
 -- - Function-local extensions through unsaved declaration changes and sibling scope exclusion
+-- - Kotlin where/Java intersection bounds through unsaved swap, removal, and restoration
 
 local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:sub(2))
 local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
@@ -326,9 +327,23 @@ if client then
     if sent and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
       local document = params.textDocument
       sent_versions[document.uri] = document.version
-      report.notifications[#report.notifications + 1] = {
+      local notification = {
         method = method, uri = document.uri, version = document.version,
       }
+      report.notifications[#report.notifications + 1] = notification
+      if report.wire then
+        local key = report.source_keys[probe.path_key(vim.uri_to_fname(document.uri))]
+        if key then
+          local text, wire_error
+          if method == "textDocument/didOpen" then text = document.text
+          else text, wire_error = probe.apply_content_changes(report.wire[key], params.contentChanges, client.offset_encoding) end
+          report.wire[key] = text
+          notification.source = key
+          notification.wire_error = wire_error
+          notification.content_changes = params.contentChanges
+          notification.wire_source_sha256 = text and vim.fn.sha256(text)
+        end
+      end
     end
     return sent
   end
@@ -360,22 +375,25 @@ if client then
   local function ask(name, key, method, anchor, token, extra)
     local located, position, range = pcall(probe.find, lines(key), anchor, token)
     if not located then
-      report.first_responses[#report.first_responses + 1] = { name = name, phase = report.phase, attempts = 0,
+      local row = { name = name, phase = report.phase, attempts = 0,
         method = method, response_received = false, error = position, anchor = anchor, token = token }
+      report.first_responses[#report.first_responses + 1] = row
       save_alias()
-      return nil, false
+      return nil, false, row
     end
     if method == "textDocument/completion" then position = range["end"] end
     local params = vim.tbl_extend("force", {
       textDocument = { uri = vim.uri_from_bufnr(buffers[key]) }, position = position,
     }, extra or {})
-    local reply, err = client:request_sync(method, params, 4000, buffers[key])
-    report.first_responses[#report.first_responses + 1] = { name = name, phase = report.phase, attempts = 1,
+    local called, reply, err = pcall(client.request_sync, client, method, params, 4000, buffers[key])
+    if not called then err, reply = tostring(reply), nil end
+    local row = { name = name, phase = report.phase, attempts = 1,
       method = method, params = params, response_received = reply ~= nil, response = reply,
       error = err, protocol_error = reply and reply.err,
       sent_version = sent_versions[params.textDocument.uri] }
+    report.first_responses[#report.first_responses + 1] = row
     save_alias()
-    return reply and reply.result, reply ~= nil and reply.err == nil
+    return reply and reply.result, reply ~= nil and reply.err == nil, row
   end
   local function definition(name, key, anchor, token, target, declaration, target_lines)
     local _, expected = probe.find(target_lines or original[target], declaration, token)
@@ -676,7 +694,126 @@ if client then
   local_extension.counts = { checks = #local_extension.checks, failures = #local_extension.failures,
     first_responses = #local_extension.first_responses }
   save_alias()
+
+  -- Reuse the first-response transport; the bound edits also certify exact wire text.
+  report = { checks = {}, failures = {}, unmeasured = {}, first_responses = {}, deliveries = {},
+    notifications = {}, disk = {}, wire = {}, source_keys = {}, edits = {}, request_timeout_ms = 4000,
+    timeout_policy = "execution bound, not latency acceptance", oracle = "synthetic expectations; independent compiler validation required" }
+  artifact_name, check_prefix = "semantic-bounded-receivers.json", "bounded receiver "
+  paths = { kotlin = root .. "/probe/bounds/KotlinBounds.kt", java = root .. "/probe/bounds/JavaBounds.java" }
+  buffers, original, disk, sent_versions, order = {}, {}, {}, {}, { "kotlin", "java" }
+  local modified = {}
+  local function snapshots()
+    local sources = {}
+    for _, key in ipairs(order) do
+      local text = probe.buffer_full_text(buffers[key])
+      sources[key] = { text = text, source_sha256 = vim.fn.sha256(text),
+        wire_source_sha256 = report.wire[key] and vim.fn.sha256(report.wire[key]),
+        version = vim.lsp.util.buf_versions[buffers[key]],
+        sent_version = sent_versions[vim.uri_from_bufnr(buffers[key])],
+        changedtick = vim.api.nvim_buf_get_changedtick(buffers[key]), wire_matches_source = report.wire[key] == text }
+    end
+    return sources
+  end
+  local function bound_query(name, key, method, token, accepts, expected)
+    local before = snapshots()
+    local _, _, row = ask(name, key, method, "return value.leftOnly()", token,
+      method == "textDocument/completion" and { context = { triggerKind = 1 } } or nil)
+    row.before, row.after, row.expected = before, snapshots(), expected
+    for _, source in ipairs(order) do
+      local first, last = row.before[source], row.after[source]
+      if not first.wire_matches_source or first.version == nil or first.version ~= first.sent_version
+          or not vim.deep_equal(first, last) then row.error = "source-wire-version-identity-unavailable: " .. source end
+    end
+    row.outcome = probe.request_outcome(row.response, row.error, accepts, row.attempts == 1)
+    if row.outcome == "matched" or row.outcome == "mismatch" then
+      alias_check(name, row.outcome == "matched", row)
+    else
+      report.unmeasured[#report.unmeasured + 1] = name
+      report.checks[#report.checks + 1] = { name = name, kind = "unmeasured", outcome = row.outcome, detail = row }
+      failures[#failures + 1] = check_prefix .. name .. " (unmeasured)"
+      print("UNMEASURED  " .. check_prefix .. name .. "  (" .. tostring(row.error or row.outcome) .. ")")
+      save_alias()
+    end
+  end
+  local ran, run_error = xpcall(function()
+    local same_client = true
+    for _, key in ipairs(order) do
+      report.source_keys[probe.path_key(paths[key])] = key
+      buffers[key] = open_file(paths[key])
+      same_client = same_client and id == client.id
+      original[key], disk[key], modified[key] = lines(key), vim.fn.readfile(paths[key], "b"), vim.bo[buffers[key]].modified
+      report.disk[key] = { path = paths[key], before_sha256 = vim.fn.sha256(table.concat(disk[key], "\n")) }
+    end
+    alias_check("both source buffers share the existing client", same_client)
+    local swapped = {
+      kotlin = replaced(original.kotlin, "T : KotlinRight", "T : KotlinReplacement"),
+      java = replaced(original.java, "JavaLeft & JavaRight", "JavaLeft & JavaReplacement"),
+    }
+    for _, key in ipairs(order) do swapped[key] = replaced(swapped[key], "value.rightOnly()", "value.replacementOnly()") end
+    local removed = {
+      kotlin = replaced(swapped.kotlin, ", T : KotlinReplacement", ""),
+      java = replaced(swapped.java, "JavaLeft & JavaReplacement", "JavaLeft"),
+    }
+    for _, state in ipairs({ { "initial", original }, { "swapped", swapped }, { "removed", removed }, { "restored", original } }) do
+      local phase, expected = state[1], state[2]
+      local exact = true
+      for _, key in ipairs(order) do
+        if not vim.deep_equal(lines(key), expected[key]) then
+          vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, expected[key])
+        end
+        exact = exact and vim.deep_equal(lines(key), expected[key])
+      end
+      report.edits[#report.edits + 1] = { phase = phase, expected = vim.deepcopy(expected), exact = exact }
+      alias_check(phase .. " applies the exact whole sources", exact)
+      deliver(phase, order)
+      local right, replacement = phase == "initial" or phase == "restored", phase == "swapped"
+      for _, key in ipairs(order) do
+        bound_query(phase .. " " .. key .. " completion reflects both current bounds", key, "textDocument/completion", "value.",
+          function(raw)
+            return type(raw) == "table" and probe.completion_has(raw, "leftOnly")
+              and probe.completion_has(raw, "rightOnly") == right
+              and probe.completion_has(raw, "replacementOnly") == replacement
+          end, { leftOnly = true, rightOnly = right, replacementOnly = replacement })
+        local member = right and "rightOnly" or "replacementOnly"
+        local _, range = probe.find(original[key], (key == "kotlin" and "fun " or "int ") .. member .. "()", member)
+        bound_query(phase .. " " .. key .. " definition reflects the current second bound", key, "textDocument/definition", member,
+          function(raw)
+            if phase == "removed" then
+              return raw == nil or raw == vim.NIL or (type(raw) == "table" and vim.islist(raw) and #raw == 0)
+            end
+            return probe.exact_definition(raw, paths[key], { range })
+          end, phase == "removed" and { absent = true } or { path = paths[key], range = range })
+      end
+    end
+  end, debug.traceback)
+  local restored, restore_error = pcall(function()
+    for _, key in ipairs(order) do
+      if original[key] and vim.api.nvim_buf_is_valid(buffers[key]) and not vim.deep_equal(lines(key), original[key]) then
+        vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, original[key])
+      end
+    end
+    require("vim.lsp._changetracking").flush(client)
+    for _, key in ipairs(order) do
+      if original[key] then
+        local current = vim.fn.readfile(paths[key], "b")
+        report.disk[key].after_sha256 = vim.fn.sha256(table.concat(current, "\n"))
+        local exact = vim.deep_equal(lines(key), original[key]) and vim.deep_equal(current, disk[key])
+        alias_check("cleanup restores the complete buffer and untouched disk: " .. key, exact, report.disk[key])
+        alias_check("cleanup restoration reaches the wire: " .. key,
+          report.wire[key] == probe.buffer_full_text(buffers[key])
+            and sent_versions[vim.uri_from_bufnr(buffers[key])] == vim.lsp.util.buf_versions[buffers[key]])
+        if exact then vim.bo[buffers[key]].modified = modified[key] end
+      end
+    end
+  end)
   client.rpc.notify = rpc_notify
+  if not ran then alias_check("slice executes", false, run_error) end
+  if not restored then alias_check("cleanup executes", false, restore_error) end
+  report.completed = ran and restored
+  report.counts = { checks = #report.checks, failures = #report.failures, unmeasured = #report.unmeasured,
+    first_responses = #report.first_responses }
+  save_alias()
 else
   check("extension alias uses the existing initialized client", false)
 end

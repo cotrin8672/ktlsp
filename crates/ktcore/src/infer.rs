@@ -29,7 +29,7 @@ use crate::parser::{
 use crate::resolve::{self, UseKind};
 use crate::solve;
 use crate::symbol::SymbolKind;
-use crate::types::{Projection, Type, TypeRef};
+use crate::types::{Projection, Type, TypeParameterBounds, TypeRef};
 
 /// Recursion guard for the inference walk (chained calls, initializer cycles like `val x = x`).
 pub const MAX_DEPTH: usize = 16;
@@ -42,6 +42,7 @@ const SUPERTYPE_CAP: usize = 32;
 pub struct FileCtx {
     pub package: String,
     pub imports: Vec<Import>,
+    file: Option<Arc<str>>,
     pub local_extensions: Option<Arc<Vec<crate::indexer::LocalExtension>>>,
     inference_cache: RefCell<FxHashMap<(usize, usize, u16), Type>>,
     /// Per-node implicit-receiver contributions, keyed by the boundary node's position + kind +
@@ -56,6 +57,7 @@ impl FileCtx {
         FileCtx {
             package,
             imports,
+            file: None,
             local_extensions: None,
             inference_cache: RefCell::new(FxHashMap::default()),
             receiver_cache: RefCell::new(FxHashMap::default()),
@@ -66,8 +68,15 @@ impl FileCtx {
         FileCtx::new(package_of(tree, src), imports_of(tree, src))
     }
 
+    pub fn with_file(mut self, file: &str) -> Self {
+        self.file = (!file.is_empty()).then(|| Arc::from(file));
+        self.inference_cache.get_mut().clear();
+        self.receiver_cache.get_mut().clear();
+        self
+    }
+
     pub fn from_tree_in_file(tree: &Tree, src: &str, file: &str) -> Self {
-        let mut ctx = Self::from_tree(tree, src);
+        let mut ctx = Self::from_tree(tree, src).with_file(file);
         let locals =
             crate::indexer::local_extensions(tree, src, file, &ctx.package, ctx.imports.clone());
         if !locals.is_empty() {
@@ -979,8 +988,17 @@ fn cached_fn_receiver_contribution(
     if let Some(hit) = receiver_cache_lookup(ctx, declaration, depth) {
         return hit;
     }
-    let ty = extension_function_receiver_ref(declaration, src)
-        .map(|receiver| resolve_type_ref(index, &receiver, ctx, depth + 1));
+    let ty = extension_function_receiver_ref(declaration, src).map(|receiver| {
+        if depth >= MAX_DEPTH {
+            return Type::Unknown;
+        }
+        declared_type_in_scope(
+            index,
+            &receiver,
+            ctx,
+            &crate::indexer::type_parameters_in_scope(declaration, src, &ctx.package, &ctx.imports),
+        )
+    });
     receiver_cache_store(ctx, declaration, depth, ty)
 }
 
@@ -1200,10 +1218,10 @@ fn lambda_receiver_or_element(
     let recv = callee.named_child(0)?;
     let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
     if sel == "let" || sel == "also" {
-        recv_ty.name().is_some().then_some(recv_ty)
+        recv_ty.is_member_receiver().then_some(recv_ty)
     } else if ELEMENT_LAMBDA_OPS.contains(&sel) {
         match recv_ty.args() {
-            [elem] if elem.name().is_some() => Some(elem.clone()),
+            [elem] if elem.is_member_receiver() => Some(elem.clone()),
             _ => None,
         }
     } else {
@@ -1359,7 +1377,7 @@ fn hardcoded_receiver_lambda_type(
                 return None;
             }
             let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
-            recv_ty.name().is_some().then_some(recv_ty)
+            recv_ty.is_member_receiver().then_some(recv_ty)
         }
         _ => None,
     }
@@ -1522,10 +1540,7 @@ fn infer_identifier(
     }
     // 1. A local val/var/parameter in scope wins (so `val Dog = Dog(); Dog.` is the instance).
     if let Some((decl, _)) = resolve::local_decl(ident, name, UseKind::Value, src) {
-        let t = decl_type(index, decl, src, ctx, depth, child_infer);
-        if t.name().is_some() {
-            return t;
-        }
+        return decl_type(index, decl, src, ctx, depth, child_infer);
     }
     // 2. A bare identifier naming a known type -> that type (companion / enum-entry / static access).
     if !index.lookup_type(name).is_empty() {
@@ -1558,7 +1573,17 @@ fn decl_type(
             }
             // Explicit annotation (`val x: T`, `val x: T?`, `val x: List<T>`).
             if let Some(tr) = crate::indexer::value_type_of(parent, src) {
-                return resolve_type_ref(index, &tr, ctx, depth);
+                return declared_type_in_scope(
+                    index,
+                    &tr,
+                    ctx,
+                    &crate::indexer::type_parameters_in_scope(
+                        parent,
+                        src,
+                        &ctx.package,
+                        &ctx.imports,
+                    ),
+                );
             }
             // Initializer: `val x = <expr>` — the expression is a sibling under property_declaration.
             if let Some(prop) = parent.parent() {
@@ -1571,7 +1596,19 @@ fn decl_type(
             Type::Unknown
         }
         "parameter" | "class_parameter" => crate::indexer::value_type_of(parent, src)
-            .map(|tr| resolve_type_ref(index, &tr, ctx, depth))
+            .map(|tr| {
+                declared_type_in_scope(
+                    index,
+                    &tr,
+                    ctx,
+                    &crate::indexer::type_parameters_in_scope(
+                        parent,
+                        src,
+                        &ctx.package,
+                        &ctx.imports,
+                    ),
+                )
+            })
             .unwrap_or(Type::Unknown),
         _ => Type::Unknown,
     }
@@ -2630,9 +2667,7 @@ fn is_safe_navigation_receiver(receiver: Node) -> bool {
 
 fn navigation_result_type(mut result: Type, nullable_result: bool) -> Type {
     if nullable_result {
-        if let Type::Class { nullable, .. } = &mut result {
-            *nullable = true;
-        }
+        result = result.with_nullability(true);
     }
     result
 }
@@ -2640,9 +2675,7 @@ fn navigation_result_type(mut result: Type, nullable_result: bool) -> Type {
 /// A safe navigation tests the non-null receiver before selecting its member.
 pub fn member_receiver_type(receiver: Node, mut ty: Type) -> Type {
     if is_safe_navigation_receiver(receiver) {
-        if let Type::Class { nullable, .. } = &mut ty {
-            *nullable = false;
-        }
+        ty = ty.into_non_null();
     }
     ty
 }
@@ -2663,9 +2696,9 @@ fn member_type(
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Type {
-    let Some(_) = recv_ty.name() else {
+    if !recv_ty.is_member_receiver() {
         return Type::Unknown;
-    };
+    }
     let usage = if want_function {
         let types = arg_types.unwrap_or_default().to_vec();
         MemberUse::Call(match call {
@@ -3622,8 +3655,22 @@ pub fn walk_supertypes(
     mut visit: impl FnMut(&Type) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
     let mut visited = HashSet::new();
-    let mut frontier = vec![(receiver.clone(), Vec::new())];
-    while let Some((current, mut path)) = frontier.pop() {
+    let mut frontier = vec![(receiver.clone(), Vec::new(), 0)];
+    while let Some((current, mut path, depth)) = frontier.pop() {
+        if depth > max_depth {
+            if visited.insert(Type::Unknown) {
+                visit(&Type::Unknown)?;
+            }
+            continue;
+        }
+        if let Type::Parameter { upper_bounds, .. } = &current {
+            if visited.insert(current.clone()) {
+                for bound in upper_bounds {
+                    frontier.push((bound.clone(), path.clone(), depth + 1));
+                }
+            }
+            continue;
+        }
         let Some(name) = current.name() else {
             if visited.insert(current.clone()) {
                 visit(&current)?;
@@ -3635,7 +3682,7 @@ pub fn walk_supertypes(
             current.package().map(str::to_string),
             current.container().map(str::to_string),
         );
-        if path.len() > max_depth || path.contains(&identity) {
+        if path.contains(&identity) {
             if visited.insert(Type::Unknown) {
                 visit(&Type::Unknown)?;
             }
@@ -3647,7 +3694,7 @@ pub fn walk_supertypes(
         visit(&current)?;
         path.push(identity);
         for supertype in direct_supertypes(index, &current) {
-            frontier.push((supertype, path.clone()));
+            frontier.push((supertype, path.clone(), depth + 1));
         }
     }
     ControlFlow::Continue(())
@@ -3655,6 +3702,9 @@ pub fn walk_supertypes(
 
 /// Instantiate a type's direct superclasses/interfaces using its actual type arguments.
 pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
+    if let Type::Parameter { upper_bounds, .. } = ty {
+        return upper_bounds.clone();
+    }
     let Some(declaration) = type_declaration(index, ty) else {
         return vec![Type::Unknown];
     };
@@ -4186,6 +4236,150 @@ fn resolve_type_ref_unprojected(
 /// Resolve normalized declaration facts without requiring a particular source grammar.
 pub fn declared_type(index: &dyn InferenceIndex, tr: &TypeRef, ctx: &FileCtx) -> Type {
     resolve_type_ref(index, tr, ctx, 0)
+}
+
+/// Resolve lexical parameters before nominal names, using the declaring source's visibility.
+/// Bounds expose members; they do not solve bounded generic applications or certify absence.
+pub fn declared_type_in_scope(
+    index: &dyn InferenceIndex,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+    parameters: &[TypeParameterBounds],
+) -> Type {
+    fn bound_known(index: &dyn InferenceIndex, ty: &Type) -> bool {
+        match ty {
+            Type::Parameter { upper_bounds, .. } => {
+                !upper_bounds.is_empty()
+                    && upper_bounds.iter().all(|bound| bound_known(index, bound))
+            }
+            Type::Class { .. } => receiver_arguments_known(index, ty, 0),
+            _ => false,
+        }
+    }
+    fn resolve(
+        index: &dyn InferenceIndex,
+        tr: &TypeRef,
+        ctx: &FileCtx,
+        parameters: &[TypeParameterBounds],
+        path: &mut Vec<usize>,
+        depth: usize,
+        position: Option<usize>,
+        remaining: &mut usize,
+    ) -> Type {
+        if depth > MAX_DEPTH || tr.name.is_empty() || *remaining == 0 {
+            return Type::Unknown;
+        }
+        *remaining -= 1;
+        if tr.projection == Projection::Star {
+            return Type::Star;
+        }
+        let parameter = tr
+            .qualification
+            .is_none()
+            .then(|| {
+                parameters.iter().find(|parameter| {
+                    parameter.name == tr.name
+                        && position.is_none_or(|at| {
+                            parameter.scope_start <= at && at < parameter.scope_end
+                        })
+                })
+            })
+            .flatten();
+        let resolved = if let Some(parameter) = parameter {
+            let Some(file) = &ctx.file else {
+                return Type::Unknown;
+            };
+            if path.contains(&parameter.start_byte) {
+                return Type::Unknown;
+            }
+            path.push(parameter.start_byte);
+            let mut upper_bounds = if parameter.complete && tr.args.is_empty() {
+                parameter
+                    .upper_bounds
+                    .iter()
+                    .map(|bound| {
+                        resolve(
+                            index,
+                            bound,
+                            ctx,
+                            parameters,
+                            path,
+                            depth + 1,
+                            Some(parameter.start_byte),
+                            remaining,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![Type::Unknown]
+            };
+            path.pop();
+            // shortcut: implicit roots and recursive bounds stay incomplete until separately covered.
+            if upper_bounds.is_empty()
+                || !upper_bounds.iter().all(|bound| bound_known(index, bound))
+            {
+                upper_bounds = vec![Type::Unknown];
+            }
+            let nullable = tr.nullable
+                || upper_bounds.iter().all(|bound| {
+                    !bound.is_member_receiver()
+                        || bound.is_nullable()
+                        || matches!(bound, Type::Class { .. }) && !type_head_is_known(index, bound)
+                });
+            Type::Parameter {
+                definition: crate::symbol::Def {
+                    file: file.to_string(),
+                    start_byte: parameter.start_byte,
+                    end_byte: parameter.end_byte,
+                },
+                name: parameter.name.clone(),
+                nullable,
+                upper_bounds,
+            }
+        } else {
+            let Some((package, container)) = type_ref_identity(index, tr, ctx) else {
+                return Type::Unknown;
+            };
+            Type::Class {
+                name: tr.name.clone(),
+                package,
+                container,
+                nullable: tr.nullable,
+                args: tr
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        resolve(
+                            index,
+                            arg,
+                            ctx,
+                            parameters,
+                            path,
+                            depth + 1,
+                            position,
+                            remaining,
+                        )
+                    })
+                    .collect(),
+            }
+        };
+        Type::projected(tr.projection, resolved)
+    }
+    if parameters.is_empty() {
+        return declared_type(index, tr, ctx);
+    }
+    // shortcut: cap total bound expansion until repeated parameter dependencies are memoized.
+    let mut remaining = MAX_DEPTH * MAX_DEPTH;
+    resolve(
+        index,
+        tr,
+        ctx,
+        parameters,
+        &mut Vec::new(),
+        0,
+        None,
+        &mut remaining,
+    )
 }
 
 fn type_ref_identity(
