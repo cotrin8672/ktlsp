@@ -259,7 +259,7 @@ local function run()
           end
         end
         if decoded and type(model) == 'table' and stamp(vim.uv.fs_stat(path)) == file_stamp
-          and model.model_version == 8 and type(model.mtimes) == 'table'
+          and model.model_version == 9 and type(model.mtimes) == 'table'
           and actual_mtime == expected_mtime then
           for _, module in ipairs(model.modules or {}) do
             if module.module == ':app' and probe.path_key(module.project_dir) == probe.path_key(root .. '/app') then

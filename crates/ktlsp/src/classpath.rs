@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 8;
+const MODEL_VERSION: u32 = 9;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2347,6 +2347,12 @@ dependencies {
             .unwrap(),
             serde_json::to_vec(&CacheEntry {
                 model_version: 7,
+                mtimes: model.mtimes.clone(),
+                modules: model.modules.clone(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&CacheEntry {
+                model_version: 8,
                 mtimes: model.mtimes.clone(),
                 modules: model.modules.clone(),
             })

@@ -41,3 +41,15 @@ manual-pull attempt, native Neovim refresh
 cancels that request; its four diagnostic checks remain unmeasured. Automatic
 results are independent supplemental evidence, not a passing manual request.
 See checkpoint48 in docs/fork-acceptance.md for exact artifacts and limitations.
+
+For the default-JDK metadata regression, replace the disposable copy's
+build.gradle.kts with metadata-guards.gradle.kts. It uses the same two Java files
+and Gradle7.4.2 wrapper, without setting main's toolchain. Run the wrapper with
+the repository's scripts/classpath-dump.init.gradle.kts and ktlspDumpClasspath.
+The main and apDisabled records must report the actual Gradle JDK with
+javaHomeSelection=gradle-current-jvm-7.4.2. Fork mode, fork home, executable,
+JVM arguments and the custom JavaCompile subclass must retain unknown homes;
+each record must still be complete and have no problem.
+An explicit Java toolchain must keep javaHomeSelection=javaCompiler.
+The ordinary default configuration now reproduces the same five matches/two
+type-import gaps; checkpoint49 records the before/after native runs.

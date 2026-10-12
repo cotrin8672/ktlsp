@@ -27,6 +27,25 @@ class KtlspSourceSet(
 )
 
 object KtlspCompilerConfiguration {
+    private fun defaultJavaHome(task: JavaCompile): java.io.File? {
+        // shortcut: other Gradle defaults stay unknown; extend after verifying their compiler selector.
+        if (task.project.gradle.gradleVersion != "7.4.2" || task.javaClass.name !in listOf(
+                "org.gradle.api.tasks.compile.JavaCompile",
+                "org.gradle.api.tasks.compile.JavaCompile_Decorated",
+            )) return null
+        val options = task.options
+        if (task.javaCompiler.isPresent || options.isFork || options.forkOptions.javaHome != null ||
+            options.forkOptions.executable != null || !options.forkOptions.jvmArgs.isNullOrEmpty()) return null
+        return runCatching {
+            // Use the same Gradle classloader and singleton as the actual default compiler selection.
+            val type = Class.forName("org.gradle.internal.jvm.Jvm", false, JavaCompile::class.java.classLoader)
+            val current = type.getMethod("current").invoke(null)
+            if (type.getMethod("isJdk").invoke(current) != true) return@runCatching null
+            val home = type.getMethod("getJavaHome").invoke(current) as? java.io.File
+            home?.takeIf { it.isAbsolute && it.isDirectory }
+        }.getOrNull()
+    }
+
     private fun read(bean: Any, getter: String): Any? {
         val method = bean.javaClass.methods.firstOrNull { it.name == getter && it.parameterCount == 0 }
             ?: error("Compiler task does not expose $getter")
@@ -153,8 +172,16 @@ object KtlspCompilerConfiguration {
                 record["arguments"] = options.allCompilerArgs.toList()
                 record["annotation_processor_path"] = options.annotationProcessorPath?.files
                     ?.map { it.absolutePath } ?: emptyList<String>()
-                record["java_home"] = task.javaCompiler.orNull?.metadata?.installationPath?.asFile?.absolutePath
+                val configuredCompiler = task.javaCompiler.orNull
+                val defaultHome = if (configuredCompiler == null) defaultJavaHome(task) else null
+                record["java_home"] = configuredCompiler?.metadata?.installationPath?.asFile?.absolutePath
+                    ?: defaultHome?.absolutePath
                 record["options"] = linkedMapOf(
+                    "javaHomeSelection" to when {
+                        configuredCompiler != null -> "javaCompiler"
+                        defaultHome != null -> "gradle-current-jvm-7.4.2"
+                        else -> null
+                    },
                     "sourceCompatibility" to task.sourceCompatibility,
                     "targetCompatibility" to task.targetCompatibility,
                     "release" to options.release.orNull,

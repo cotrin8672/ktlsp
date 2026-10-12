@@ -329,6 +329,8 @@ requests have 65 shared semantic expectations for ktlsp and IntelliJ.
 The [Java diagnostic reduction](dev/corpus/fixtures/java-source-diagnostics/README.md)
 keeps closed-owner member errors and the remaining missing type/import expectations
 in the same corpus route.
+Its alternative metadata fixture checks Gradle's default JDK selection and conservative
+fork/custom-task controls without configuring a project toolchain.
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus
