@@ -89,6 +89,7 @@ pub struct Backend {
     compile_workers: Arc<tokio::sync::Semaphore>,
     compile_watch: CompilerWatchSlot,
     kotlin_diagnostics: Arc<Mutex<KotlinDiagnosticState>>,
+    jdk_source_seeds: Arc<Mutex<HashMap<String, (u64, tokio::sync::watch::Receiver<()>)>>>,
 }
 
 impl Backend {
@@ -115,6 +116,7 @@ impl Backend {
             compile_workers: Arc::new(tokio::sync::Semaphore::new(1)),
             compile_watch: Arc::new(Mutex::new(None)),
             kotlin_diagnostics: Arc::new(Mutex::new(KotlinDiagnosticState::default())),
+            jdk_source_seeds: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -126,6 +128,7 @@ impl Backend {
         let changed = {
             let mut ws = self.ws.lock();
             state.requested = ws.begin_analysis_generation();
+            self.jdk_source_seeds.lock().clear();
             ws.take_extension_diagnostic_changes()
         };
         for key in changed {
@@ -216,22 +219,28 @@ impl Backend {
         schedule_owned_diagnostic(&self.ws, &self.client, &self.doc_versions, key);
     }
 
-    fn seed_jdk_imports_for_open_java(&self, key: String, text: String) {
-        if !key.ends_with(".java") {
+    fn seed_jdk_imports_for_open_java(&self, key: String, workspace: &Workspace) {
+        let Some((text, tree)) = workspace.open_java_source(&key) else {
             return;
-        }
+        };
         let ws = self.ws.clone();
         let root = self.root.lock().clone();
-        let (generation, model) = {
-            let guard = ws.lock();
-            (guard.analysis_generation(), guard.project_snapshot())
-        };
-        let trace_key = key.clone();
+        let generation = workspace.analysis_generation();
+        let model = workspace.project_snapshot();
+        let pending = self.jdk_source_seeds.clone();
+        // Closing this channel wakes every first request, including failed or panicking workers.
+        let (published, ready) = tokio::sync::watch::channel(());
+        pending
+            .lock()
+            .insert(key.clone(), (generation, ready.clone()));
         tokio::spawn(async move {
             let start = Instant::now();
+            let seed_ws = ws.clone();
+            let seed_pending = pending.clone();
+            let seed_ready = ready.clone();
+            let trace_key = key.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let mut java = crate::java::JavaParser::new();
-                let tree = java.parse(&text);
                 let imports = crate::java::explicit_import_fqns(&tree, &text);
                 let mut jdk_imports = imports
                     .iter()
@@ -241,12 +250,45 @@ impl Backend {
                 jdk_imports.extend(crate::java::referenced_java_lang_fqns(&tree, &text));
                 jdk_imports.sort();
                 jdk_imports.dedup();
-                let mut kotlin = crate::parser::KotlinParser::new();
-                let mut batches = crate::deps::resolve_jdk_imports(
+                let batches = crate::deps::resolve_jdk_imports(
                     &jdk_imports,
                     &crate::deps::extract_root(),
                     &mut java,
                 );
+                let files = batches.len();
+                let symbols = batches
+                    .iter()
+                    .map(|batch| batch.symbols.len())
+                    .sum::<usize>();
+                let current = {
+                    let mut guard = seed_ws.lock();
+                    if !guard.is_current_generation(generation) {
+                        false
+                    } else {
+                        if !batches.is_empty() {
+                            for batch in batches {
+                                guard.index_dependency_batch_for_generation(generation, batch);
+                            }
+                            guard.bump_index_revision();
+                        }
+                        true
+                    }
+                };
+                {
+                    let mut seeds = seed_pending.lock();
+                    if seeds
+                        .get(&key)
+                        .is_some_and(|(_, seed)| seed.same_channel(&seed_ready))
+                    {
+                        seeds.remove(&key);
+                    }
+                }
+                // Publish JDK facts before unrelated local-jar import resolution can delay completion.
+                drop(published);
+                if !current {
+                    return None;
+                }
+                let mut batches = Vec::new();
                 if let Some(root) = root {
                     if crate::deps::gradle_root(&root).is_some() {
                         let local_jars = model
@@ -255,6 +297,7 @@ impl Backend {
                             .unwrap_or_default();
                         if !local_jars.is_empty() {
                             let extract_root = crate::deps::extract_root();
+                            let mut kotlin = crate::parser::KotlinParser::new();
                             for fqn in imports.iter().filter(|fqn| {
                                 !fqn.starts_with("java.") && !fqn.starts_with("javax.")
                             }) {
@@ -270,18 +313,27 @@ impl Backend {
                         }
                     }
                 }
-                (imports.len(), batches)
+                Some((imports.len(), files, symbols, batches))
             })
             .await;
-            let Ok((imports, batches)) = result else {
+            {
+                let mut seeds = pending.lock();
+                if seeds
+                    .get(&trace_key)
+                    .is_some_and(|(_, seed)| seed.same_channel(&ready))
+                {
+                    seeds.remove(&trace_key);
+                }
+            }
+            let Ok(Some((imports, mut files, mut symbols, batches))) = result else {
                 return;
             };
-            let files = batches.len();
-            let symbols = batches
+            files += batches.len();
+            symbols += batches
                 .iter()
                 .map(|batch| batch.symbols.len())
                 .sum::<usize>();
-            if files > 0 {
+            if !batches.is_empty() {
                 let mut guard = ws.lock();
                 if !guard.is_current_generation(generation) {
                     return;
@@ -1911,14 +1963,14 @@ impl LanguageServer for Backend {
             let text = doc.text;
             {
                 let mut ws = self.ws.lock();
-                ws.open(key.clone(), text.clone());
+                ws.open(key.clone(), text);
                 self.doc_versions
                     .lock()
                     .entry(key.clone())
                     .or_default()
                     .document_version = Some(doc.version);
+                self.seed_jdk_imports_for_open_java(key.clone(), &ws);
             }
-            self.seed_jdk_imports_for_open_java(key.clone(), text);
             self.schedule_diagnostics(key);
         }
     }
@@ -1947,6 +1999,7 @@ impl LanguageServer for Backend {
                 let mut ws = self.ws.lock();
                 ws.close(&key);
                 self.doc_versions.lock().remove(&key);
+                self.jdk_source_seeds.lock().remove(&key);
             }
             self.schedule_diagnostics(key.clone());
             publish_diagnostics(&self.ws, &self.client, &self.doc_versions, &key).await;
@@ -3039,20 +3092,14 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        // Synchronous; the lock is never held across an `.await`. Current text builds the line
-        // index and byte offset. One shared completion query supplies trace metadata and items.
         let snippets = *self.snippets_supported.lock();
-        let (items, is_incomplete, symbol, semantic) = {
-            let mut ws = self.ws.lock();
-            let text = match ws.doc_text(&key) {
-                Some(t) => t,
-                None => return Ok(None),
-            };
+        let query = |ws: &mut Workspace| {
+            let text = ws.doc_text(&key)?;
             let line_index = LineIndex::new(&text);
             let offset = line_index.offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
             let (shaped, semantic) = ws.complete_with_semantic(&key, offset, snippets);
-            match shaped {
+            let (items, is_incomplete, symbol, semantic) = match shaped {
                 Some(shaped) => {
                     let incomplete = shaped.is_incomplete;
                     let items = shaped
@@ -3062,12 +3109,85 @@ impl LanguageServer for Backend {
                         .collect::<Vec<_>>();
                     (items, incomplete, symbol, semantic)
                 }
-                // No completion offered (e.g. not in a completable position): trace as empty rather
-                // than returning early, so "completion produced nothing here" is visible.
                 None => (Vec::new(), false, symbol, semantic),
-            }
+            };
+            Some((items, is_incomplete, symbol, semantic, text))
         };
-
+        let (first, generation, version, pending) = {
+            let mut ws = self.ws.lock();
+            let first = query(&mut ws);
+            let pending = if first.as_ref().is_some_and(|(items, _, _, semantic, _)| {
+                items.is_empty()
+                    && semantic.as_ref().is_some_and(|(kind, status, reasons)| {
+                        *kind == "member"
+                            && *status == "unknown"
+                            && reasons
+                                .iter()
+                                .any(|reason| reason == "unknown-receiver-type")
+                    })
+            }) {
+                self.jdk_source_seeds.lock().get(&key).cloned()
+            } else {
+                None
+            };
+            (
+                first,
+                ws.analysis_generation(),
+                self.doc_versions
+                    .lock()
+                    .get(&key)
+                    .map(|revision| revision.document_version),
+                pending,
+            )
+        };
+        let Some((mut items, mut is_incomplete, mut symbol, mut semantic, source)) = first else {
+            return Ok(None);
+        };
+        if let Some((seed_generation, mut ready)) =
+            pending.filter(|(seed_generation, _)| *seed_generation == generation)
+        {
+            // shortcut: only the current open-file JDK seed participates; new imports after edits wait for indexing.
+            let _ = ready.changed().await;
+            let mut ws = self.ws.lock();
+            {
+                let mut seeds = self.jdk_source_seeds.lock();
+                if seeds
+                    .get(&key)
+                    .is_some_and(|(_, seed)| seed.same_channel(&ready))
+                {
+                    seeds.remove(&key);
+                }
+            }
+            if !ws.is_current_generation(seed_generation)
+                || self
+                    .doc_versions
+                    .lock()
+                    .get(&key)
+                    .map(|revision| revision.document_version)
+                    != version
+            {
+                return Ok(None);
+            }
+            let Some((
+                current_items,
+                current_incomplete,
+                current_symbol,
+                current_semantic,
+                current_source,
+            )) = query(&mut ws)
+            else {
+                return Ok(None);
+            };
+            if current_source != source {
+                return Ok(None);
+            }
+            (items, is_incomplete, symbol, semantic) = (
+                current_items,
+                current_incomplete,
+                current_symbol,
+                current_semantic,
+            );
+        }
         let count = items.len();
         if let Some((kind, status, reasons)) = semantic {
             crate::trace::semantic(
@@ -5684,6 +5804,7 @@ impl Backend {
 impl Drop for Backend {
     fn drop(&mut self) {
         self.close_compiler_jobs();
+        self.jdk_source_seeds.lock().clear();
     }
 }
 
@@ -6090,5 +6211,249 @@ mod kotlin_diagnostic_queue_tests {
             "Ignored.kt".into(),
         );
         assert_eq!(state.next(), None);
+    }
+}
+
+#[cfg(test)]
+mod first_java_completion_seed_tests {
+    use super::*;
+
+    fn open_use(backend: &Backend, name: &str, source: &str) -> String {
+        let key = crate::paths::file_key(&std::env::temp_dir().join(name).join("Use.java"));
+        backend.ws.lock().open(key.clone(), source.to_string());
+        backend
+            .doc_versions
+            .lock()
+            .entry(key.clone())
+            .or_default()
+            .document_version = Some(1);
+        key
+    }
+
+    fn pending_seed(backend: &Backend, key: &str) -> tokio::sync::watch::Sender<()> {
+        let (published, ready) = tokio::sync::watch::channel(());
+        let generation = backend.ws.lock().analysis_generation();
+        backend
+            .jdk_source_seeds
+            .lock()
+            .insert(key.to_string(), (generation, ready));
+        published
+    }
+
+    fn params(key: &str, source: &str) -> CompletionParams {
+        let offset = source.find("item.").unwrap() + "item.".len();
+        let (line, character) = LineIndex::new(source).position(source, offset);
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: key_to_uri(key).unwrap(),
+                },
+                position: Position { line, character },
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn labels(response: Option<CompletionResponse>) -> Vec<String> {
+        match response {
+            Some(CompletionResponse::List(list)) => list.items,
+            Some(CompletionResponse::Array(items)) => items,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|item| item.label)
+        .collect()
+    }
+
+    fn publish_iterable(backend: &Backend, generation: u64) -> bool {
+        // A minimal source fixture; the editor regression uses the actual selected JDK src.zip.
+        let source =
+            "package java.lang; public interface Iterable<T> { java.util.Iterator<T> iterator(); }";
+        let mut java = crate::java::JavaParser::new();
+        let tree = java.parse(source);
+        let batch = crate::deps::FileSymbols {
+            file: crate::paths::file_key(
+                &std::env::temp_dir().join("ktlsp-first-seed-sdk/java/lang/Iterable.java"),
+            ),
+            symbols: crate::java::extract_symbols(&tree, source),
+            jvm: None,
+            origin: None,
+        };
+        let mut ws = backend.ws.lock();
+        let indexed = ws.index_dependency_batch_for_generation(generation, batch);
+        ws.bump_index_revision();
+        indexed
+    }
+
+    const USE: &str = "package firstseed; class Use { void run(Iterable<Item> values) { for (var item : values) { item.; } } }";
+
+    #[tokio::test]
+    async fn first_unknown_java_completion_uses_the_pending_jdk_publication_once() {
+        for (owner_name, owner, useful) in [
+            (
+                "Item.kt",
+                "package firstseed\nclass Item { fun usefulKotlin() {} }",
+                "usefulKotlin",
+            ),
+            (
+                "Item.java",
+                "package firstseed; class Item { public void usefulJava() {} }",
+                "usefulJava",
+            ),
+        ] {
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            backend.ws.lock().open(owner_name, owner.to_string());
+            let key = open_use(backend, owner_name, USE);
+            let published = pending_seed(backend, &key);
+            let generation = backend.ws.lock().analysis_generation();
+            let mut response = Box::pin(backend.completion(params(&key, USE)));
+            tokio::select! {
+                biased;
+                result = &mut response => panic!("first response escaped before actual source publication: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(publish_iterable(backend, generation));
+            drop(published);
+            let got = labels(response.await.unwrap());
+            assert!(
+                got.iter().any(|label| label == useful),
+                "first response: {got:?}"
+            );
+            assert!(backend.jdk_source_seeds.lock().is_empty());
+            assert!(backend
+                .ws
+                .lock()
+                .index
+                .lookup_type("NotInJavaLang")
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn useful_java_completion_does_not_wait_for_pending_jdk_work() {
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        backend.ws.lock().open(
+            "Item.kt",
+            "package firstseed\nclass Item { fun useful() {} }".to_string(),
+        );
+        let source = "package firstseed; class Use { void run(Item item) { item.; } }";
+        let key = open_use(backend, "known-first-seed", source);
+        let published = pending_seed(backend, &key);
+        let mut response = Box::pin(backend.completion(params(&key, source)));
+        let got = tokio::select! {
+            biased;
+            result = &mut response => labels(result.unwrap()),
+            _ = tokio::task::yield_now() => panic!("a useful receiver waited for unrelated JDK work"),
+        };
+        assert!(got.iter().any(|label| label == "useful"), "{got:?}");
+        assert!(published.receiver_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn failed_jdk_publication_does_not_invent_a_receiver() {
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        backend.ws.lock().open(
+            "Item.kt",
+            "package firstseed\nclass Item { fun useful() {} }".to_string(),
+        );
+        let key = open_use(backend, "failed-first-seed", USE);
+        let published = pending_seed(backend, &key);
+        drop(published);
+        assert!(backend
+            .completion(params(&key, USE))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(backend.jdk_source_seeds.lock().is_empty());
+        assert!(backend.ws.lock().index.lookup_type("Iterable").is_empty());
+    }
+
+    #[tokio::test]
+    async fn jdk_wait_does_not_return_a_completion_for_an_edited_closed_or_stale_document() {
+        for event in ["edit", "close", "reopen", "generation"] {
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            backend.ws.lock().open("Item.kt", "package firstseed\nclass Item { fun obsolete() {} }\nclass Other { fun current() {} }".to_string());
+            let key = open_use(backend, event, USE);
+            let published = pending_seed(backend, &key);
+            let generation = backend.ws.lock().analysis_generation();
+            let mut response = Box::pin(backend.completion(params(&key, USE)));
+            tokio::select! {
+                biased;
+                result = &mut response => panic!("first response escaped publication: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            let changed = USE.replace("Iterable<Item>", "Iterable<Other>");
+            match event {
+                "edit" => {
+                    backend.ws.lock().change(&key, changed.clone());
+                    backend
+                        .doc_versions
+                        .lock()
+                        .get_mut(&key)
+                        .unwrap()
+                        .document_version = Some(2);
+                }
+                "close" | "reopen" => {
+                    backend
+                        .did_close(DidCloseTextDocumentParams {
+                            text_document: TextDocumentIdentifier {
+                                uri: key_to_uri(&key).unwrap(),
+                            },
+                        })
+                        .await;
+                    assert!(backend.jdk_source_seeds.lock().is_empty());
+                    if event == "reopen" {
+                        open_use(backend, event, &changed);
+                    }
+                }
+                _ => {
+                    backend.ws.lock().begin_analysis_generation();
+                }
+            }
+            assert_eq!(publish_iterable(backend, generation), event != "generation");
+            drop(published);
+            assert!(
+                response.await.unwrap().is_none(),
+                "{event}: stale completion escaped"
+            );
+            assert!(backend.jdk_source_seeds.lock().is_empty());
+            if event == "edit" || event == "reopen" {
+                let got = labels(backend.completion(params(&key, &changed)).await.unwrap());
+                assert!(got.iter().any(|label| label == "current"), "{got:?}");
+                assert!(!got.iter().any(|label| label == "obsolete"), "{got:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn jdk_publication_preserves_lexical_parameters_and_explicit_imports() {
+        for source in [
+            "package firstseed; class Iterable<T> {} class Use { void run(Iterable<Item> values) { for (var item : values) { item.; } } }",
+            "package firstseed; class Use<Iterable> { void run(Iterable values) { for (var item : values) { item.; } } }",
+            "package firstseed; import other.Iterable; class Use { void run(Iterable<Item> values) { for (var item : values) { item.; } } }",
+        ] {
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            backend.ws.lock().open("Item.kt", "package firstseed\nclass Item { fun forbidden() {} }".to_string());
+            backend.ws.lock().open("Other.java", "package other; public class Iterable<T> {}".to_string());
+            let key = open_use(backend, "lexical-first-seed", source);
+            let published = pending_seed(backend, &key);
+            let generation = backend.ws.lock().analysis_generation();
+            assert!(publish_iterable(backend, generation));
+            drop(published);
+            assert!(backend.completion(params(&key, source)).await.unwrap().is_none(), "{source}");
+            assert!(backend.jdk_source_seeds.lock().is_empty());
+        }
     }
 }

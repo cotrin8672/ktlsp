@@ -3734,7 +3734,8 @@ fn kotlin_editor_arguments(
             | "-nowarn"
             | "-Werror"
             | "-progressive"
-            | "-Xallow-no-source-files" => result.push(argument.clone()),
+            | "-Xallow-no-source-files"
+            | "-Xexplicit-api=strict" => result.push(argument.clone()),
             _ if argument.starts_with("-Xplugin=") => {
                 kotlin_plugin_paths(std::slice::from_ref(argument))?;
                 result.push(argument.clone());
@@ -4293,6 +4294,53 @@ mod kotlin_editor_compile_tests {
         source.text.push_str(" changed after capture");
         request.overlays.push(source);
         assert!(KotlinEditorOverlay::create_in(&request, &tree.0.join("cache")).is_err());
+    }
+
+    #[test]
+    fn explicit_api_strict_reaches_the_selected_compiler_and_invalidates_its_environment() {
+        let root = std::env::temp_dir().join("ktlsp-explicit-api");
+        let mut request = kotlin_test_request(&root);
+        let baseline = KotlinEnvironmentKey::new(&request).unwrap();
+        request.task.arguments.push("-Xexplicit-api=strict".into());
+        let private = root.join("private/classes");
+        let sources = [
+            root.join("private/legacy/KotlinJsonAdapter.kt"),
+            root.join("private/reflect/KotlinJsonAdapter.kt"),
+        ];
+        let arguments = kotlin_editor_arguments(&request, &private, &sources).unwrap();
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|arg| *arg == "-Xexplicit-api=strict")
+                .count(),
+            1
+        );
+        assert_eq!(
+            &arguments[arguments.len() - sources.len()..],
+            &sources.map(|path| path.to_string_lossy().into_owned())
+        );
+        assert!(KotlinEnvironmentKey::new(&request).unwrap() != baseline);
+        for tail in [
+            vec!["-Xexplicit-api=warning"],
+            vec!["-Xexplicit-api=disable"],
+            vec!["-Xexplicit-api=unknown"],
+            vec!["-Xexplicit-api=strict/../output"],
+            vec!["-Xexplicit-api=strict\u{0}"],
+            vec!["-Xexplicit-api=strict\n"],
+            vec!["-Xexplicit-api", "strict"],
+            vec!["-Xunknown"],
+        ] {
+            let mut invalid = kotlin_test_request(&root);
+            invalid.task.arguments.push("-Xexplicit-api=strict".into());
+            invalid
+                .task
+                .arguments
+                .extend(tail.iter().map(|value| value.to_string()));
+            assert!(
+                kotlin_editor_arguments(&invalid, &private, &[]).is_err(),
+                "{tail:?}"
+            );
+        }
     }
 
     #[test]

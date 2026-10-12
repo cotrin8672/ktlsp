@@ -587,6 +587,15 @@ impl Workspace {
         })
     }
 
+    /// Source seeding reuses the open buffer's parsed tree without a second whole-file parse.
+    pub(crate) fn open_java_source(&self, key: &str) -> Option<(String, Tree)> {
+        if !is_java_path(key) {
+            return None;
+        }
+        let doc = self.open_docs.get(key)?;
+        Some((doc.text.clone(), doc.tree.clone()))
+    }
+
     /// Index a project file from an already-parsed tree: its declarations (volatile tier) and its
     /// identifier usages (reverse-reference index).
     fn index_from_tree(&mut self, key: &str, text: &str, tree: &Tree) {

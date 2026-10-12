@@ -223,8 +223,10 @@ array creation and local `var` alias chains preserve the component type. The res
 probe keeps the original26 first RPCs, adds12 array queries and26 alias queries;
 the alias group has24 useful queries and two rank2 scalar-leakage guards.
 Paired unsaved Java/Kotlin changes check current completion, exact navigation and
-restoration. Set `KTLSP_JAVA_WAIT_INDEX=1` for a separately labelled
-first-response-after-indexing control. The default run retains startup failures.
+restoration. An initially unknown receiver can use its already-running JDK source
+seed before the first response; useful candidates return without waiting. Set
+`KTLSP_JAVA_WAIT_INDEX=1` for a separately labelled first-response-after-indexing
+control. The default run checks startup responses with readiness flags unset.
 Empty useful results fail. `java-resource-body.json` records reconstructed outbound
 edits, both producer wires for alias queries, first RPCs and restoration.
 The same `java` scenario checks 13 contextual `var` hint types, including numeric suffixes,
