@@ -791,7 +791,7 @@ pub fn diagnostics_with_options(
     if facts.project_scan_complete
         && include_call_shape
         && index.scope_is_complete()
-        && facts.compiler_surface_status(None).is_found()
+        && (facts.compiler_producers_complete || durable_indexes_complete(facts))
     {
         collect_call_shape_mismatches(
             index,
@@ -1145,9 +1145,43 @@ fn java_call_shape_query(
     if symbol.is_empty() {
         return None;
     }
+    let proven_receiver = if facts.compiler_producers_complete {
+        None
+    } else {
+        // shortcut: selected-source proof is method-only, widen after constructor proof and coverage.
+        if call.kind() != "method_invocation" {
+            return None;
+        }
+        let (receiver, kind) = java_member_receiver(index, file, src, tree, call, 0)?;
+        if kind != ktcore::jvm::ReceiverKind::Value || receiver.container().is_some() {
+            return None;
+        }
+        let owner_complete = {
+            let package = receiver.package()?;
+            let mut owners = index
+                .lookup_type(receiver.name()?)
+                .into_iter()
+                .filter(|owner| owner.sym.package == package && owner.sym.container.is_none());
+            let owner = owners.next()?;
+            owners.next().is_none() && index.java_source_members_complete(owner)
+        };
+        if !owner_complete {
+            return None;
+        }
+        Some(receiver)
+    };
     let entries = java_call_entries_with_imports(
         index, file, src, tree, call, name, &symbol, package, imports,
     );
+    // A certified base declaration cannot close overloads on an unproven child receiver.
+    if proven_receiver.is_some_and(|receiver| {
+        entries.iter().any(|entry| {
+            receiver.name() != entry.sym.container.as_deref()
+                || receiver.package() != Some(entry.sym.package.as_str())
+        })
+    }) {
+        return None;
+    }
     if entries
         .iter()
         .any(|entry| !crate::resolve::declaration_surface_status(index, entry, facts).is_found())

@@ -568,24 +568,8 @@ pub fn member_name_status_for_receiver(
         && file.ends_with(".java")
         && recv_ty.container().is_none()
         && binary_owner(index, &format!("{}/{}", root_pkg.replace('.', "/"), root)).is_some_and(
-            |owner| {
-                owner.tier == crate::index::Tier::Volatile
-                    && owner.path.ends_with(".java")
-                    && owner.sym.kind == SymbolKind::Class
-                    && owner.sym.container.is_none()
-                    && owner.sym.type_params.is_empty()
-                    && owner.sym.supertypes.is_empty()
-                    && owner.sym.supertype_refs.is_empty()
-                    && index.java_source_members_complete(owner)
-            },
+            |owner| plain_java_source_member_surface_complete(index, owner, name, facts),
         )
-        && java_binary_member_status(
-            index,
-            &Type::class("Object", Some("java.lang".into())),
-            name,
-            facts,
-        )
-        .is_some_and(|status| status.is_definitely_absent())
     {
         // A selected plain javac source closes this owner's own names, and the exact SDK
         // inventory closes its implicit Object ancestor. Keep every other proof obligation.
@@ -621,6 +605,29 @@ pub fn member_name_status_for_receiver(
     } else {
         ResolutionStatus::Unknown(reasons)
     }
+}
+
+fn plain_java_source_member_surface_complete(
+    index: &dyn InferenceIndex,
+    owner: &Entry,
+    name: &str,
+    facts: &CompletenessFacts,
+) -> bool {
+    owner.tier == crate::index::Tier::Volatile
+        && owner.path.ends_with(".java")
+        && owner.sym.kind == SymbolKind::Class
+        && owner.sym.container.is_none()
+        && owner.sym.type_params.is_empty()
+        && owner.sym.supertypes.is_empty()
+        && owner.sym.supertype_refs.is_empty()
+        && index.java_source_members_complete(owner)
+        && java_binary_member_status(
+            index,
+            &Type::class("Object", Some("java.lang".into())),
+            name,
+            facts,
+        )
+        .is_some_and(|status| status.is_definitely_absent())
 }
 
 fn java_binary_member_status(
@@ -937,11 +944,38 @@ pub fn declaration_surface_status(
             container.into(),
         )]);
     }
+    let unique_owner = owners.len() == 1;
     for owner in owners {
-        if let ResolutionStatus::Unknown(reasons) =
+        if let ResolutionStatus::Unknown(mut reasons) =
             facts.compiler_surface_status(Some(&to_def(owner)))
         {
-            return ResolutionStatus::Unknown(reasons);
+            if !unique_owner
+                || owner.path != entry.path
+                || !reasons
+                    .iter()
+                    .all(|reason| *reason == IncompletenessReason::CompilerProducerIncomplete)
+                || !plain_java_source_member_surface_complete(index, owner, &entry.sym.name, facts)
+            {
+                return ResolutionStatus::Unknown(reasons);
+            }
+            reasons.extend(hierarchy_package_reasons(
+                index,
+                &Type::class(&owner.sym.name, Some(owner.sym.package.clone())),
+                facts,
+            ));
+            reasons.extend(visible_package_reasons_with_ctx(
+                &owner.path,
+                &entry.sym.name,
+                facts,
+                &owner.sym.package,
+                &[],
+            ));
+            // This owner proof lifts only the producer gap, never another incomplete world.
+            reasons.retain(|reason| *reason != IncompletenessReason::CompilerProducerIncomplete);
+            dedup_reasons(&mut reasons);
+            if !reasons.is_empty() {
+                return ResolutionStatus::Unknown(reasons);
+            }
         }
     }
     if !index.scope_is_complete() {

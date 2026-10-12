@@ -244,7 +244,7 @@ write_mixed_project() {
 
 write_library_project() {
   local project="$projects/library"
-  mkdir -p "$project/gradle/wrapper" "$project/src/main/kotlin"
+  mkdir -p "$project/gradle/wrapper" "$project/src/main/kotlin" "$project/src/main/java/app"
   for file in gradlew gradlew.bat gradle/wrapper/gradle-wrapper.jar; do
     cp "$repo/dev/gradle-wrapper-template/$file" "$project/$file"
   done
@@ -304,6 +304,7 @@ fun useConnection(connection: Connection) {
     connection.close()
 }
 KOTLIN
+  cp "$repo/dev/corpus/fixtures/java-diagnostics/"*.java "$project/src/main/java/app/"
   printf '%s\n' "$project"
 }
 

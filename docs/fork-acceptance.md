@@ -74,8 +74,8 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current diagnostic-version slice passes 1,358 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 57; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 221 matched / 5 unmet of 226: original 225 retain 220 matches; all four diagnostic notifications now carry their exact edited Java/Kotlin versions. Six contextual hint queries, 18 resource/editing first RPCs and restoration pass. Features retains 78/80; library passes 13/13 after actual compilation; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 57 native-diagnostic-versions-java57-1, native-diagnostic-versions-features57-1 and native-diagnostic-versions-library57-1. Related RPCs run once with reconstructed outbound source hashes. Legacy forced cleanup is operational evidence |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current selected Java call-shape slice passes 1,362 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 58; broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java retains 221/226 and features 78/80, with the same five/two diagnostic gaps and none unmeasured. Library now passes 20/20, including six exact first-pull Java edit states and restoration after actual Gradle compilation | Partial; selected Java repair verified, first cold diagnostic cost open | Checkpoint 58 native-selected-java-{java,features,library}58-1. Six exported source states independently match javac; initial diagnostic pull is 323.444 ms versus 3.623-4.381 ms for subsequent states, not a stable latency distribution |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -3117,6 +3117,95 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-eighth checkpoint: selected Java overload diagnostics after unsaved edits
+
+An actual Gradle9.6.1/KGP2.4.0/JDK17 library project reproduces missing Java
+overload errors despite having a selected plain JavaCompile task and current
+source-owner evidence. The immutable checkpoint57 binary matches 17/20 checks:
+its original 13 library/JDK checks pass, but all three error-bearing edit states
+return empty full reports. These are semantic mismatches, with zero unavailable
+requests, rather than compiler failures or observation deadlines.
+
+The shared declaration-surface query now reuses the existing selected Java source
+and exact SDK Object name-absence proof. It removes only CompilerProducerIncomplete;
+scope, hierarchy, annotations, source/model identity and package obligations remain.
+Java's collector can use that evidence without globally closing project producers.
+An early actual-receiver/owner check prevents an unproven child from borrowing a
+base declaration's authority. Unsupported owners stop before overload collection.
+The Kotlin global guard, selected compiler policy and public extension API do not
+change. Class-qualified static calls and constructors remain outside this new proof.
+
+The existing library harness now builds PlainOwner.java/PlainUse.java before
+starting the real client. Its six pulls run once each, with exact full-invocation
+ranges/codes, both buffers' source/version/tick/attachment snapshots, reconstructed
+outbound hashes, pre/post stability checks and protected restoration. A closed
+owner requires unchanged disk/source identity. Missing, cancelled, malformed or
+undelivered responses are unmeasured; a valid empty report against an expected
+error remains a mismatch. No desired-content retry is introduced.
+
+| Edit state | Expected errors | Fixed first pull |
+| --- | ---: | --- |
+| Original caller, closed owner | 0 | Matched |
+| Caller has wrong arity and boolean type | 2 | Matched |
+| Unsaved owner now accepts boolean | 1 | Matched |
+| Caller repaired for that owner | 0 | Matched |
+| Owner restored while caller still passes boolean | 1 | Matched |
+| Caller restored | 0 | Matched |
+
+Correct Object.wait(long), generic identity and varargs calls remain clean in
+every state. Independently replaying these exact six exported snapshots through
+the captured JDK17 javac and ordered classpath produces the same 0/2/1/0/1/0 error
+counts and lines, with normal exit0/1. The three valid states emit both class files
+at major61. Fixed and baseline snapshots, compiler options and ordered classpath
+contents are identical; a separate input-identity receipt links the oracle to
+the repaired native run. This is compiler evidence, not an IDEA comparison.
+
+Four focused regressions retain exact byte spans/messages, incomplete-world
+guards, unproven receiver controls and a closed-world constructor control. The
+initial test adapter omitted entries_for_file forwarding and therefore discarded
+all Def-to-Entry seeds; it is repaired with an explicit valid-call navigation,
+arity-metadata and owner-authority control. The earlier unit failures are not
+used as independent evidence of production failure. The actual native baseline
+and javac replay provide that evidence. The corrected diagnostic_absence suite
+passes 35/35; the full Rust suite passes 1,362/0 failed/4 ignored.
+
+Native release verification passes library20/20. Java retains221/226 and features
+78/80, with exactly the prior five/two unmet expectations and zero unmeasured
+results. All four edited diagnostic document versions remain certified. Formatting,
+shell/Lua syntax, diff checks and both release binaries pass. Legacy editor cleanup
+still forces owned descendants; no graceful-shutdown claim is added.
+
+Performance remains open: six distinct first-response observations are
+323.444, 4.381, 4.207, 3.623, 4.179 and 3.647 ms. The old initial report took2.582 ms
+but omitted required analysis, so this is not a semantic-equivalent speed comparison.
+The one-off cold cost may block other requests under the workspace lock and must
+be reduced or moved before claiming responsive editing. These are six different
+states, not six independent startup samples or a p95 result. Next inspect the
+existing class-inventory/service archive reads; also reproduce the real CEM
+where-bound receiver completion candidate before expanding generic semantics.
+Java AP/opaque producers, unsaved regeneration and the wider six-project/IDEA
+acceptance remain open. The original five/two expectations are unchanged.
+
+Evidence is under
+C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-selected-java-baseline58-2/, independent-selected-java58-1/,
+selected-java-oracle-link58-1/, native-selected-java-focused58-{1,2}/,
+native-selected-java-rust58-1/ and native-selected-java-{java,features,library}58-1/.
+The initial baseline58-1 guard stopped before launch because the prior binary
+receipt preceded its committed acceptance-record update; no runtime result is
+claimed from that directory. Source guards and user AGENTS preservation pass.
+
+ktlsp SHA256:
+c680e620e8e4bfa09c6ea2b6b7291f67db3b584c1b4a75eea2b96bca683bb588.
+Full Rust log SHA256:
+1f0571cf38ec22d59ddbb2ae755c6a872084afc5680c24c9ba716472d526a911.
+Native library raw artifact SHA256:
+a00f8ae65b59ae589ec1be1def7277b20ddfc1a4584473c733633cec62dadfe2.
+Independent javac receipt SHA256:
+2a15e911589854b8ae72412a6dc9e9ac6c4babeab905ba75e6df035184c8b0ff.
+Oracle input-identity receipt SHA256:
+4ad5c825c7aa2b578379e63ac4c8965407150d23091f3fe12e74e418a91dd944.
 
 ### Fifty-seventh checkpoint: bind diagnostics to the client's document version
 

@@ -209,6 +209,167 @@ if connection_location then
   vim.api.nvim_buf_set_lines(bufnr, main_line, main_line + 1, false, original_main_line)
 end
 
+local plain_use = project .. "/src/main/java/app/PlainUse.java"
+if vim.fn.filereadable(plain_use) == 1 then
+  local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:gsub("^@", ""))
+  local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
+  local client = assert(vim.lsp.get_client_by_id(id))
+  local files = { use = { path = plain_use }, owner = { path = project .. "/src/main/java/app/PlainOwner.java" } }
+  local report = { requests = {}, outbound = {} }
+  local function disk_text(file) return table.concat(vim.fn.readfile(file.path, "b"), "\n") end
+  local function disk_hash(file) return vim.fn.sha256(disk_text(file)) end
+  for _, file in pairs(files) do
+    file.buf = vim.fn.bufadd(file.path)
+    vim.fn.bufload(file.buf)
+    file.original = vim.api.nvim_buf_get_lines(file.buf, 0, -1, false)
+    file.hash, file.disk = probe.buffer_sha256(file.buf), disk_hash(file)
+    file.modified, file.uri = vim.bo[file.buf].modified, vim.uri_from_bufnr(file.buf)
+    file.wire = probe.buffer_full_text(file.buf)
+    vim.bo[file.buf].filetype = "java"
+  end
+  local function source_state(file)
+    local source, disk = probe.buffer_full_text(file.buf), disk_text(file)
+    return { source_sha256 = vim.fn.sha256(source), disk_sha256 = vim.fn.sha256(disk),
+      version = vim.lsp.util.buf_versions[file.buf], changedtick = vim.api.nvim_buf_get_changedtick(file.buf),
+      attached = vim.lsp.buf_is_attached(file.buf, id) }, source, disk
+  end
+  local notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    for name, file in pairs(files) do
+      if params and params.textDocument and params.textDocument.uri == file.uri
+        and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
+        local wire, err
+        if method == "textDocument/didOpen" then wire = params.textDocument.text
+        else wire, err = probe.apply_content_changes(file.wire, params.contentChanges, client.offset_encoding or "utf-16") end
+        if sent and wire then file.wire = wire end
+        file.latest = { sent = not not sent, version = params.textDocument.version,
+          source_sha256 = probe.buffer_sha256(file.buf), wire_source_sha256 = wire and vim.fn.sha256(wire), error = err }
+        report.outbound[#report.outbound + 1] = { file = name, delivery = vim.deepcopy(file.latest) }
+      end
+    end
+    return sent
+  end
+  local function flush() require("vim.lsp._changetracking").flush(client) end
+  local function query(phase, anchors)
+    flush()
+    local row = { phase = phase, method = "textDocument/diagnostic", attempts = 0, attempted = false,
+      params = { textDocument = { uri = files.use.uri } }, timeout_ms = 8000,
+      delivery = {}, sources = {}, before = {}, after = {}, source_unchanged = true, expected = {}, actual = {} }
+    for name, file in pairs(files) do
+      local state, source, disk = source_state(file)
+      row.before[name], row.sources[name], row.delivery[name] = state, source, vim.deepcopy(file.latest)
+      local delivered
+      if state.attached then
+        delivered = file.latest and file.latest.sent and file.latest.source_sha256 == state.source_sha256
+          and file.latest.wire_source_sha256 == state.source_sha256 and not file.latest.error
+          and file.latest.version == state.version
+      else
+        row.sources[name] = disk
+        row.delivery[name] = { closed = true, source_sha256 = state.disk_sha256, disk_sha256 = state.disk_sha256 }
+        delivered = name == "owner" and not file.latest and state.source_sha256 == state.disk_sha256
+          and state.disk_sha256 == file.disk
+      end
+      if not delivered then row.error = row.error or ("source-delivery-unavailable: " .. name) end
+    end
+    local lines = vim.api.nvim_buf_get_lines(files.use.buf, 0, -1, false)
+    local function key(range, code)
+      return ("%d:%d:%d:%d:%s"):format(range.start.line, range.start.character,
+        range["end"].line, range["end"].character, code)
+    end
+    for _, anchor in ipairs(anchors) do
+      local _, range = probe.find(lines, anchor, anchor)
+      row.expected[#row.expected + 1] = key(range, "call_shape_mismatch")
+    end
+    if not row.error then
+      row.attempted, row.attempts, row.started_ns = true, 1, vim.uv.hrtime()
+      local called, response, request_error = pcall(client.request_sync, client,
+        row.method, row.params, row.timeout_ms, files.use.buf)
+      if called then row.response, row.error = response, request_error
+      else row.error = "diagnostic-RPC-failed: " .. tostring(response) end
+      row.ended_ns = vim.uv.hrtime()
+    end
+    for name, file in pairs(files) do
+      row.after[name] = source_state(file)
+      if not vim.deep_equal(row.before[name], row.after[name]) then
+        row.source_unchanged = false
+        row.error = row.error or ("source-changed-during-diagnostic-pull: " .. name)
+      end
+    end
+    local result = row.response and row.response.result
+    row.valid_report = type(result) == "table" and result.kind == "full"
+      and type(result.items) == "table" and vim.islist(result.items)
+    if row.response and row.response.err == nil and row.error == nil then
+      if not row.valid_report then row.error = "invalid-full-diagnostic-report"
+      else
+        for _, item in ipairs(result.items) do
+          if item.severity == vim.diagnostic.severity.ERROR then row.actual[#row.actual + 1] = key(item.range, item.code or "") end
+        end
+      end
+    end
+    table.sort(row.expected)
+    table.sort(row.actual)
+    row.availability = probe.request_outcome(row.response, row.error, function() return true end, row.attempted)
+    if row.availability == "matched" then row.availability = "responded" end
+    row.outcome = probe.request_outcome(row.response, row.error, function()
+      return row.valid_report and vim.deep_equal(row.actual, row.expected)
+    end, row.attempted)
+    row.measured = row.outcome == "matched" or row.outcome == "mismatch"
+    report.requests[#report.requests + 1] = row
+    if row.measured then check("selected Java diagnostics: " .. phase, row.outcome == "matched", vim.inspect(row))
+    else
+      print("UNMEASURED  selected Java diagnostics: " .. phase .. " -> " .. vim.inspect(row))
+      ok = false
+    end
+  end
+  local success, err = xpcall(function()
+    assert(vim.lsp.buf_attach_client(files.use.buf, id))
+    query("original closed owner", {})
+    local invalid = vim.deepcopy(files.use.original)
+    for i, line in ipairs(invalid) do
+      invalid[i] = line:gsub('accept%("Ada"%)', 'accept()'):gsub('accept%(1, 2%)', 'accept(true)')
+    end
+    vim.api.nvim_buf_set_lines(files.use.buf, 0, -1, false, invalid)
+    query("wrong arity and type", { "value.accept()", "value.accept(true)" })
+    assert(vim.lsp.buf_attach_client(files.owner.buf, id))
+    local changed = vim.deepcopy(files.owner.original)
+    for i, line in ipairs(changed) do changed[i] = line:gsub("accept%(String value%)", "accept(boolean value)") end
+    vim.api.nvim_buf_set_lines(files.owner.buf, 0, -1, false, changed)
+    query("unsaved owner accepts boolean", { "value.accept()" })
+    local repaired = vim.deepcopy(files.use.original)
+    for i, line in ipairs(repaired) do repaired[i] = line:gsub('accept%("Ada"%)', 'accept(true)') end
+    vim.api.nvim_buf_set_lines(files.use.buf, 0, -1, false, repaired)
+    query("repaired caller", {})
+    vim.api.nvim_buf_set_lines(files.owner.buf, 0, -1, false, files.owner.original)
+    query("restored owner rejects boolean", { "value.accept(true)" })
+    vim.api.nvim_buf_set_lines(files.use.buf, 0, -1, false, files.use.original)
+    query("restored caller", {})
+  end, debug.traceback)
+  client.rpc.notify = notify
+  report.restored, report.disk_unchanged, report.restore_errors = true, true, {}
+  for name, file in pairs(files) do
+    local restored, source_ok, disk_ok = pcall(function()
+      if probe.buffer_sha256(file.buf) ~= file.hash then
+        vim.api.nvim_buf_set_lines(file.buf, 0, -1, false, file.original)
+      end
+      vim.bo[file.buf].modified = file.modified
+      return probe.buffer_sha256(file.buf) == file.hash, disk_hash(file) == file.disk
+    end)
+    report.restored = report.restored and restored and source_ok
+    report.disk_unchanged = report.disk_unchanged and restored and disk_ok
+    if not restored then report.restore_errors[name] = tostring(source_ok) end
+  end
+  local flushed, flush_error = pcall(flush)
+  if not flushed then report.restore_errors.flush = tostring(flush_error) end
+  report.error = not success and err or nil
+  check("selected Java diagnostic buffers restore without disk edits",
+    report.restored and report.disk_unchanged and flushed, vim.inspect(report.restore_errors))
+  if not success then check("selected Java diagnostic probes execute", false, err) end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/library-java-diagnostics.json")
+  end
+end
+
 if ok then
   os.exit(0)
 else

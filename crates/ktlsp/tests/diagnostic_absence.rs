@@ -670,6 +670,9 @@ impl ktlsp::index::InferenceIndex for BinaryInventoryIndex {
     fn members_of(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
         ktlsp::index::InferenceIndex::members_of(&self.index, name)
     }
+    fn entries_for_file(&self, file: &str) -> Vec<ktlsp::index::Entry> {
+        ktlsp::index::InferenceIndex::entries_for_file(&self.index, file)
+    }
     fn extensions_for(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
         ktlsp::index::InferenceIndex::extensions_for(&self.index, name)
     }
@@ -1030,4 +1033,328 @@ fn plain_java_source_authority_keeps_dirty_unknown_sdk_annotation_and_hierarchy_
             "{gap}"
         );
     }
+}
+
+const PLAIN_OWNER: &str =
+    include_str!("../../../dev/corpus/fixtures/java-diagnostics/PlainOwner.java");
+const PLAIN_USE: &str = include_str!("../../../dev/corpus/fixtures/java-diagnostics/PlainUse.java");
+
+fn plain_java_call_shape_inventory() -> BinaryInventoryIndex {
+    let mut index = source_member_inventory();
+    index.index.remove_file("Current.java");
+    index.source_owners.clear();
+    index.source_owners.insert("PlainOwner.java".into());
+    for (file, source) in [
+        ("PlainOwner.java", PLAIN_OWNER),
+        ("PlainUse.java", PLAIN_USE),
+    ] {
+        let tree = ktlsp::java::JavaParser::new().parse(source);
+        index.index.replace_file(
+            file,
+            ktlsp::java::extract_symbols(&tree, source),
+            Tier::Volatile,
+        );
+    }
+    let object = std::sync::Arc::make_mut(index.classes.get_mut("Object.java").unwrap());
+    let mut wait = object.methods[0].clone();
+    wait.name = "wait".into();
+    wait.descriptor = "(J)V".into();
+    object.methods.push(wait);
+    index
+}
+
+#[test]
+fn plain_java_call_shape_authority_tracks_unsaved_owner_and_caller_edits() {
+    let mut index = plain_java_call_shape_inventory();
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    facts.project_packages_complete.insert("app".into());
+    let tree = ktlsp::java::JavaParser::new().parse(PLAIN_USE);
+    let definitions = ktlsp::java::goto_definition(
+        &index,
+        "PlainUse.java",
+        PLAIN_USE,
+        &tree,
+        PLAIN_USE.find("accept(\"Ada\")").unwrap(),
+    );
+    assert_eq!(definitions.len(), 1, "{definitions:?}");
+    let definition = &definitions[0];
+    let declaration = ktlsp::hierarchy::entry_for_name_range(
+        &index,
+        &definition.file,
+        definition.start_byte,
+        definition.end_byte,
+    )
+    .expect("a selected Java call must retain its indexed callable metadata");
+    assert_eq!(declaration.path.as_ref(), "PlainOwner.java");
+    assert_eq!(
+        (declaration.sym.arity, declaration.sym.min_arity),
+        (Some(1), Some(1))
+    );
+    let status = ktlsp::resolve::declaration_surface_status(&index, &declaration, &facts);
+    assert!(status.is_found(), "{status:?}");
+    let boolean_owner = PLAIN_OWNER.replace("accept(String value)", "accept(boolean value)");
+    let broken = PLAIN_USE
+        .replace("accept(\"Ada\")", "accept()")
+        .replace("accept(1, 2)", "accept(true)");
+    let repaired = PLAIN_USE.replace("accept(\"Ada\")", "accept(true)");
+    let arity_error = (
+        "value.accept()",
+        "No overload of accept accepts 0 arguments",
+    );
+    let type_error = (
+        "value.accept(true)",
+        "No overload of accept accepts argument type (boolean)",
+    );
+    let both_errors = [arity_error, type_error];
+    let arity_only = [arity_error];
+    let type_only = [type_error];
+    for (phase, owner, caller, expected_calls) in [
+        ("original", PLAIN_OWNER, PLAIN_USE, &[][..]),
+        (
+            "caller broken",
+            PLAIN_OWNER,
+            broken.as_str(),
+            &both_errors[..],
+        ),
+        (
+            "owner accepts boolean",
+            boolean_owner.as_str(),
+            broken.as_str(),
+            &arity_only[..],
+        ),
+        (
+            "caller repaired",
+            boolean_owner.as_str(),
+            repaired.as_str(),
+            &[][..],
+        ),
+        (
+            "owner restored",
+            PLAIN_OWNER,
+            repaired.as_str(),
+            &type_only[..],
+        ),
+        ("caller restored", PLAIN_OWNER, PLAIN_USE, &[][..]),
+    ] {
+        for (file, source) in [("PlainOwner.java", owner), ("PlainUse.java", caller)] {
+            let tree = ktlsp::java::JavaParser::new().parse(source);
+            index.index.replace_file(
+                file,
+                ktlsp::java::extract_symbols(&tree, source),
+                Tier::Volatile,
+            );
+        }
+        let tree = ktlsp::java::JavaParser::new().parse(caller);
+        let diagnostics = ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, caller, &facts);
+        let actual: Vec<_> = diagnostics
+            .iter()
+            .map(|item| {
+                (
+                    item.start_byte,
+                    item.end_byte,
+                    item.code,
+                    item.message.as_str(),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = expected_calls
+            .iter()
+            .map(|(call, message)| {
+                let start = caller.find(*call).unwrap();
+                (
+                    start,
+                    start + call.len(),
+                    Some(DiagnosticCode::CallShapeMismatch),
+                    *message,
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "{phase}: {diagnostics:?}");
+        assert!(!facts.compiler_producers_complete);
+    }
+}
+
+#[test]
+fn plain_java_call_shape_authority_preserves_incomplete_world_guards() {
+    let caller = PLAIN_USE
+        .replace("accept(\"Ada\")", "accept()")
+        .replace("accept(1, 2)", "accept(true)");
+    for gap in [
+        "authority",
+        "sdk",
+        "caller",
+        "jdk",
+        "library",
+        "dirty",
+        "annotation",
+        "generic",
+        "unknown-super",
+        "explicit-super",
+    ] {
+        let mut index = plain_java_call_shape_inventory();
+        let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+        facts.compiler_producers_complete = false;
+        facts.project_packages_complete.insert("app".into());
+        match gap {
+            "authority" => index.source_owners.clear(),
+            "sdk" => {
+                index.classes.remove("Object.java");
+            }
+            "caller" => index.caller_known = false,
+            "jdk" => facts.jdk_index_complete = false,
+            "library" => facts.library_index_complete = false,
+            "dirty" => {
+                facts.project_scan_complete = false;
+                facts.project_packages_complete.clear();
+            }
+            "annotation" => {
+                let owner = index.index.lookup_type("PlainOwner")[0];
+                facts.member_surfaces_unknown.insert(ktlsp::symbol::Def {
+                    file: owner.path.to_string(),
+                    start_byte: owner.sym.start_byte,
+                    end_byte: owner.sym.end_byte,
+                });
+            }
+            "generic" | "unknown-super" | "explicit-super" => {
+                let declaration = match gap {
+                    "generic" => "class PlainOwner<T>",
+                    "unknown-super" => "class PlainOwner extends Missing",
+                    "explicit-super" => "class PlainOwner extends java.lang.Object",
+                    _ => unreachable!(),
+                };
+                let source = PLAIN_OWNER.replace("class PlainOwner", declaration);
+                let tree = ktlsp::java::JavaParser::new().parse(&source);
+                index.index.replace_file(
+                    "PlainOwner.java",
+                    ktlsp::java::extract_symbols(&tree, &source),
+                    Tier::Volatile,
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            index
+                .index
+                .members_of("PlainOwner")
+                .iter()
+                .filter(|entry| entry.sym.name == "accept")
+                .count(),
+            2,
+            "{gap}"
+        );
+        let tree = ktlsp::java::JavaParser::new().parse(&caller);
+        let diagnostics = ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, &caller, &facts);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.code != Some(DiagnosticCode::CallShapeMismatch)),
+            "{gap}: {diagnostics:?}"
+        );
+        assert!(!facts.compiler_producers_complete);
+    }
+}
+
+#[test]
+fn plain_java_call_shape_authority_does_not_close_an_unproven_receiver() {
+    for (receiver, source) in [
+        ("Missing", None),
+        (
+            "Child",
+            Some("package app; public class Child extends PlainOwner {}"),
+        ),
+        (
+            "AnnotatedChild",
+            Some("package app; @Generate public class AnnotatedChild extends PlainOwner {} @interface Generate {}"),
+        ),
+    ] {
+        let mut index = plain_java_call_shape_inventory();
+        let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+        facts.compiler_producers_complete = false;
+        facts.project_packages_complete.insert("app".into());
+        if let Some(source) = source {
+            let tree = ktlsp::java::JavaParser::new().parse(source);
+            let file = format!("{receiver}.java");
+            index.index.replace_file(
+                &file,
+                ktlsp::java::extract_symbols(&tree, source),
+                Tier::Volatile,
+            );
+            if receiver == "AnnotatedChild" {
+                let owner = index.index.lookup_type(receiver)[0];
+                facts.member_surfaces_unknown.insert(ktlsp::symbol::Def {
+                    file: owner.path.to_string(),
+                    start_byte: owner.sym.start_byte,
+                    end_byte: owner.sym.end_byte,
+                });
+            }
+        }
+        let valid = PLAIN_USE.replace("PlainOwner value", &format!("{receiver} value"));
+        if source.is_some() {
+            let tree = ktlsp::java::JavaParser::new().parse(&valid);
+            let definitions = ktlsp::java::goto_definition(
+                &index,
+                "PlainUse.java",
+                &valid,
+                &tree,
+                valid.find("accept(\"Ada\")").unwrap(),
+            );
+            assert!(!definitions.is_empty(), "{receiver}");
+            assert!(
+                definitions
+                    .iter()
+                    .all(|definition| definition.file == "PlainOwner.java"),
+                "{receiver}: {definitions:?}"
+            );
+        }
+        let caller = valid
+            .replace("accept(\"Ada\")", "accept()")
+            .replace("accept(1, 2)", "accept(true)");
+        let tree = ktlsp::java::JavaParser::new().parse(&caller);
+        let diagnostics =
+            ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, &caller, &facts);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.code != Some(DiagnosticCode::CallShapeMismatch)),
+            "{receiver}: {diagnostics:?}"
+        );
+        assert!(!facts.compiler_producers_complete);
+    }
+}
+
+#[test]
+fn plain_java_call_shape_authority_does_not_expand_constructor_diagnostics() {
+    let mut index = plain_java_call_shape_inventory();
+    let owner = PLAIN_OWNER.replace(
+        "public class PlainOwner {",
+        "public class PlainOwner {\n    public PlainOwner(String value) {}\n    public void construct() { new PlainOwner(); }",
+    );
+    let tree = ktlsp::java::JavaParser::new().parse(&owner);
+    index.index.replace_file(
+        "PlainOwner.java",
+        ktlsp::java::extract_symbols(&tree, &owner),
+        Tier::Volatile,
+    );
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.project_packages_complete.insert("app".into());
+    let diagnostics = ktlsp::java::diagnostics(&index, "PlainOwner.java", &tree, &owner, &facts);
+    let call = "new PlainOwner()";
+    let start = owner.find(call).unwrap();
+    assert!(
+        diagnostics.iter().any(|item| {
+            item.code == Some(DiagnosticCode::CallShapeMismatch)
+                && item.start_byte == start
+                && item.end_byte == start + call.len()
+        }),
+        "closed-world constructor control: {diagnostics:?}"
+    );
+    facts.compiler_producers_complete = false;
+    let diagnostics = ktlsp::java::diagnostics(&index, "PlainOwner.java", &tree, &owner, &facts);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|item| item.code != Some(DiagnosticCode::CallShapeMismatch)),
+        "{diagnostics:?}"
+    );
 }

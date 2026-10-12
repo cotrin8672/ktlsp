@@ -199,6 +199,12 @@ that exact document version. Workspace pull reports also retain the client versi
 unsaved changes and close/reopen. A versionless notification from another server has an
 explicit correlation assumption; neither it nor a first empty push proves that asynchronous
 compiler diagnostics are final.
+The library scenario also compiles a plain Java owner/caller pair and checks six
+first diagnostic pulls through unsaved edits in both buffers. It covers exact overload
+error ranges, valid Object/generic/varargs calls, delivery identity and restoration.
+The selected Java source proof preserves unknown compiler-plugin and hierarchy cases.
+Its first cold diagnostic cost remains recorded as a performance gap in the fork
+acceptance log.
 The Gradle reload probe also checks captured Kotlin source/library/JDK inputs. The
 project model records the selected compiler runtime and launch policy separately;
 captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.
