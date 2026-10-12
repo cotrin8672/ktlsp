@@ -14,10 +14,15 @@ end
 local probe = arg[3] or (root .. "/src/main/kotlin/com/example/fixture/_Probe.kt")
 
 local server_messages = {}
+local server_started_ns
+local project_indexed_ns
 local default_log_message = vim.lsp.handlers["window/logMessage"]
 vim.lsp.handlers["window/logMessage"] = function(err, result, ctx, config)
   if result and result.message then
     server_messages[#server_messages + 1] = result.message
+    if not project_indexed_ns and result.message:match("^ktlsp indexed %d+ project files$") then
+      project_indexed_ns = vim.loop.hrtime()
+    end
   end
   if default_log_message then
     return default_log_message(err, result, ctx, config)
@@ -27,6 +32,7 @@ end
 vim.cmd("edit " .. probe)
 local buf = vim.api.nvim_get_current_buf()
 vim.bo[buf].filetype = "kotlin"
+server_started_ns = vim.loop.hrtime()
 local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = root })
 vim.wait(10000, function()
   local c = vim.lsp.get_client_by_id(id)
@@ -96,11 +102,13 @@ local function check_wait(desc, needle, expected, timeout_ms)
   return ok
 end
 
--- 1) Wait for the project scan to warm (project-local completion resolves).
-vim.wait(20000, function()
-  local labels = labels_after("    g.gr")
-  return labels["greet"] == true
-end, 300)
+-- 1) Observe project source installation, then query each completion exactly once.
+if not wait_for_message("^ktlsp indexed %d+ project files$", 300000) then
+  print("UNMEASURED project-local completion: project indexing event not observed")
+  os.exit(1)
+end
+print(("project source readiness (client start to event): %.3f ms"):format(
+  (project_indexed_ns - server_started_ns) / 1000000))
 
 -- Project-local inference (no library download needed).
 check("member completion on a local (BasicGreeter)", "    g.gr", "greet")

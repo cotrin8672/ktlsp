@@ -426,6 +426,10 @@ configuration-cache runs to preserve unresolved-dependency output and reuse the 
 Both runs also execute the production compiler loader factory and verify that closing it preserves
 another loader's pending resource; the ordinary cached-loader control must reproduce the failure.
 
+The editor waits for the project-indexed event before the first request for each of four project
+completions and records client start-to-ready time. An unavailable event is `UNMEASURED`; the
+observation timeout is separate from a latency budget.
+
 `KTLSP_GRADLE_RELOAD=1 dev/ktlsp-harness.sh gradle-live` uses a disposable mixed project with
 Gradle 9.6.1 and Kotlin 2.4.0. Set `GRADLE_USER_HOME` to a populated wrapper/plugin cache and
 `JAVA_HOME` to JDK 17 or newer. Four offline builds add, update and remove compiled dependencies

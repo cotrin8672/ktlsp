@@ -74,11 +74,11 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Compiler resource isolation retains 1,378 / 0 failed / 4 ignored; formatting, shell/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint61; broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Checkpoint62 focused source-installation test passes; unchanged full suite passes1,379/0/4 with --test-threads=1. Default-parallel run retains six existing timer failures | Focused/serialized Rust, formatting and native first responses verified; parallel timer robustness open | Checkpoint62 preserves both runs. Checkpoint61 release remains unchanged; no timeout thresholds or expectations weakened |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current semantic scenario passes142 assertions:109 existing plus33 bounded-receiver checks. Java221/226 and features78/80 retain exactly the prior five/two diagnostic gaps, none unmeasured. Checkpoint59 library20/20 remains the latest library run | Partial; current bounded semantics and existing editor surface verified | Checkpoint60 native-bounded-receiver-{semantic,java,features}60-1; assertion accounting corrects concatenated PASS-line undercounts, with no lost historical expectation |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
-| Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Prior focused controls remain. Checkpoint61 normal gradle-live has eight useful checks and four empty completions before the source model was installed; the project-scan span is50.419285s | Partial; startup availability gap reproduced, warmed four cases unmeasured | Remove completion polling as a readiness test, verify the same four first responses after explicit project readiness, then reduce Gradle-blocked source startup; annotation/override proposals remain pending |
+| Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Checkpoint62 retains all twelve normal gradle-live expectations in each of three editor starts. All four project completions match on their sole response after the existing project-indexed event | Warmed focused semantics verified; Gradle-blocked startup and broader proposals open | Project readiness is12,233.401ms with uncached model/populated Gradle, then61.875/62.453ms on model reuse. Each condition has one observation, no speedup or distribution claim |
 | Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass 18/18 | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
 | Contextual inlay hints | Java var hints share completion types, preserve generic arguments and reflect unsaved Kotlin changes without inventing invalid types | Thirteen exact type/position cases match initially and after producer changes/restoration. Six native first responses cover those states, a visible line and three invalid initializers. Actual Kotlin/javac output verifies both producer variants | Focused repair verified; broader inference and display latency open | Checkpoint 56; initial partial-JDK String gap reproduced and repaired in shared type resolution. This is RPC/semantic evidence, not native hint-render timing or IDEA parity |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Shared declaration-identified parameters retain all Kotlin where/Java intersection bounds. CEM getEnchantmentLevel exact goto/partial completion now match2/2. Synthetic unsaved swap/removal/restoration matches16 first responses/33 checks; exact sent sources match eight independent compiler controls | Focused bounded-receiver repair verified; wider generic inference open | Checkpoint60. Parameter identities stay lexical, never global classes or compiler-absence authority. Recursive/F-bounds, parameterized bounds, bounded call solving and broader compiled signatures remain gaps |
@@ -3117,6 +3117,67 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Sixty-second checkpoint: first useful completion after project readiness
+
+The normal gradle-live observer no longer polls for a desired completion result.
+It observes the existing project-indexed event, retains the same four expected
+members and queries each exactly once. An unavailable event is UNMEASURED and
+exits1; the observation deadline is separate from a latency budget. Client start
+to event time is recorded independently. No production startup algorithm changes.
+
+The focused Workspace regression opens the complete committed probe before any
+model sources arrive, then installs generation-checked source/model facts. Its
+first four queries must provide greet, greet, default and salutation without a
+library index. The same native assertions pass12/12 in each of three starts of
+the exact disposable Gradle project. Trace verification proves one LSP request
+per original cursor, all after source installation, with useful nonempty results.
+There are nine total completion RPCs per start; the old12,704-query warmup is gone.
+The other completion, navigation and unused-import expectations are unchanged.
+
+| Condition (one observation each) | Client start to project event ms | Project scan ms | Library indexing ms |
+| --- | ---: | ---: | ---: |
+| No ktlsp model/index cache; populated private Gradle cache | 12233.401 | 12197.680 | 7267.985 |
+| First model reuse | 61.875 | 27.585 | 4718.715 |
+| Next model reuse | 62.453 | 25.563 | 775.142 |
+
+The first reuse decodes only JDK/annotation symbol caches, whereas the next reuse
+decodes all seven. In the latter run, all source-JAR SHA256/mtime identities,
+source markers and symbol-cache hashes remain identical before/after execution.
+The intermediate cache miss remains under investigation. These distinct cache
+conditions are not a distribution, an old/new causal comparison, a fully cold
+machine measurement or proof that startup speed targets are met. Library readiness
+is separate from project-local completion availability. Input-to-display latency,
+physical rendering and steady/peak RSS are not measured by these probes.
+
+Formatting, Lua/Bash syntax, the focused Rust test, both configuration-cache
+resource controls and git diff checks pass. The default-parallel full Rust run
+fails six existing timer-sensitive tests: four LSP channel waits and two owned
+native-child lifecycle waits. That raw failure is retained. With identical source,
+the full suite passes1,379 tests, zero failures and four ignored using
+cargo test --workspace --locked --offline -- --test-threads=1. A readonly audit
+finds no direct shared-state collision introduced by the new test; a scheduling
+cause is possible, not proven. No timing assertion or timeout was changed.
+
+The native binary is unchanged checkpoint61 SHA256
+42b8df23f3cf2acc9ca3bb9de6b1f970aa0bb8c5226bbb651313f232f92391d7.
+Each native Job is fresh; cleanup closes one owned descendant, with zero
+preexisting process handles. The legacy observer uses os.exit, so these runs do
+not prove standard LSP shutdown. The user's AGENTS.md stays unchanged.
+
+Artifacts under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-first-result-rust62-1/, native-first-result-rust62-serial1/,
+native-first-result-gradle-live62-1/, native-third-warm62-1/,
+first-result-evidence62-1/receipt.json.
+The actual initial native run is C:/Users/gummy/AppData/Local/Temp/kl62-gradle-live-native1.
+Evidence receipt SHA256:
+0d667c6d279261dd360a28912737f16c0936a08987a81f7424a367e6d36c8bf8.
+Serialized full Rust log SHA256:
+d5a02e19c820b24beaea5c4d5c2808d398636e1676f3183be89e521da2378cd0.
+
+Next reduce verified startup/indexing costs without publishing unscoped or stale
+facts, and carry the current Kotlin API into Java editor diagnostics. The original
+six KAPT/KSP Java diagnostic gaps and broader six-project IDEA parity remain open.
 
 ### Sixty-first checkpoint: isolate compiler resources and retain exact editor inputs
 

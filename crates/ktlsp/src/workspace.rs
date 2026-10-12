@@ -4111,6 +4111,68 @@ mod tests {
     }
 
     #[test]
+    fn gradle_live_project_completion_updates_after_model_sources_arrive() {
+        let root = unique_tmp("gradle-live-completion");
+        let source = root.join("src/main/kotlin/com/example/fixture");
+        std::fs::create_dir_all(&source).unwrap();
+        let probe = include_str!(
+            "../../../dev/gradle-sample/src/main/kotlin/com/example/fixture/_Probe.kt"
+        );
+        for (name, text) in [
+            ("_Probe.kt", probe),
+            (
+                "Greetings.kt",
+                include_str!(
+                    "../../../dev/gradle-sample/src/main/kotlin/com/example/fixture/Greetings.kt"
+                ),
+            ),
+            (
+                "Model.kt",
+                include_str!(
+                    "../../../dev/gradle-sample/src/main/kotlin/com/example/fixture/Model.kt"
+                ),
+            ),
+        ] {
+            std::fs::write(source.join(name), text).unwrap();
+        }
+        let key = crate::paths::file_key(&source.join("_Probe.kt"));
+        let cases = [
+            ("    g.gr", "greet"),
+            ("    greeterFor(\"en\").gr", "greet"),
+            ("    BasicGreeter.def", "default"),
+            ("    BasicGreeter.default().sal", "salutation"),
+        ];
+        let mut ws = Workspace::new();
+        ws.open(key.clone(), probe.to_string());
+        let generation = ws.begin_analysis_generation();
+        for (needle, _) in cases {
+            let offset = probe.find(needle).unwrap() + needle.len();
+            assert!(ws.complete(&key, offset, true).is_none(), "{needle}");
+        }
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(
+            crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nEND\t:app\n",
+                root.display(),
+                root.join("src/main/kotlin").display()
+            )),
+        ));
+        let update = prepare_model_sources(&model, &ws.source_stamps());
+        assert_eq!(
+            ws.install_project_update(generation, model, update),
+            Some(2)
+        );
+        for (needle, expected) in cases {
+            let offset = probe.find(needle).unwrap() + needle.len();
+            let result = ws.complete(&key, offset, true).expect(needle);
+            assert!(
+                result.items.iter().any(|item| item.label == expected),
+                "{needle}: expected {expected}, got {result:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn model_refresh_updates_changed_closed_sources_and_preserves_dirty_buffers() {
         let root = unique_tmp("model-refresh-sources");
         let source = root.join("custom-generated");
