@@ -96,12 +96,76 @@ function M.buffer_sha256(buffer)
   return vim.fn.sha256(M.buffer_full_text(buffer))
 end
 
+local function nonnegative_integer(value)
+  return type(value) == 'number' and value >= 0 and value < math.huge and value == math.floor(value)
+end
+
+local function wire_position(text, position, encoding)
+  if type(position) ~= 'table' or not nonnegative_integer(position.line)
+      or not nonnegative_integer(position.character) then return nil end
+  local first = 1
+  for _ = 1, position.line do
+    local ending = text:find('[\r\n]', first)
+    if not ending then return nil end
+    first = ending + (text:sub(ending, ending + 1) == '\r\n' and 2 or 1)
+  end
+  local ending = text:find('[\r\n]', first)
+  local line = text:sub(first, ending and ending - 1 or #text)
+  local ok, byte = pcall(vim.str_byteindex, line, encoding, position.character, true)
+  if not ok then return nil end
+  -- Neovim rounds a UTF-16 index inside a surrogate pair upwards; it is not an exact wire position.
+  local exact, units = pcall(vim.str_utfindex, line, encoding, byte, true)
+  local next_byte = line:byte(byte + 1)
+  if not exact or units ~= position.character or (next_byte and next_byte >= 128 and next_byte < 192) then
+    return nil
+  end
+  return first - 1 + byte
+end
+
+-- contentChanges are ordered operations: every range refers to the text after its predecessors.
+-- Reconstruct wire bytes from the armed old snapshot, never from the desired post-edit source.
+function M.apply_content_changes(text, changes, encoding)
+  encoding = encoding or 'utf-16'
+  if type(text) ~= 'string' or type(changes) ~= 'table' or #changes == 0 then
+    return nil, 'invalid-content-changes'
+  end
+  if encoding ~= 'utf-8' and encoding ~= 'utf-16' and encoding ~= 'utf-32' then
+    return nil, 'unsupported-position-encoding'
+  end
+  local count = #changes
+  for key in pairs(changes) do
+    if not nonnegative_integer(key) or key < 1 or key > count then return nil, 'invalid-content-changes' end
+  end
+  for index = 1, count do
+    local change = changes[index]
+    if type(change) ~= 'table' or type(change.text) ~= 'string' then return nil, 'invalid-content-change' end
+    if change.range == nil then
+      text = change.text
+    else
+      if type(change.range) ~= 'table' then return nil, 'invalid-range' end
+      local first = wire_position(text, change.range.start, encoding)
+      local last = wire_position(text, change.range['end'], encoding)
+      if first == nil or last == nil or last < first then return nil, 'invalid-range' end
+      if change.rangeLength ~= nil then
+        local ok, length = pcall(vim.str_utfindex, text:sub(first + 1, last), encoding)
+        if not nonnegative_integer(change.rangeLength) or not ok or change.rangeLength ~= length then
+          return nil, 'invalid-range-length'
+        end
+      end
+      text = text:sub(1, first) .. change.text .. text:sub(last + 1)
+    end
+  end
+  return text
+end
+
 -- Arm before one edit; callers flush didChange before awaiting its first target notification.
 function M.observe_diagnostics(client, buffer)
   local uri, tick = vim.uri_from_bufnr(buffer), vim.api.nvim_buf_get_changedtick(buffer)
   local key = M.path_key(vim.api.nvim_buf_get_name(buffer))
+  local wire_text, encoding = M.buffer_full_text(buffer), client.offset_encoding or 'utf-16'
   local row = { method = 'textDocument/publishDiagnostics', uri = uri, buffer = buffer,
-    before_changedtick = tick, attempted = false, outbound = {}, notifications = {} }
+    before_changedtick = tick, before_source_sha256 = vim.fn.sha256(wire_text), offset_encoding = encoding,
+    attempted = false, outbound = {}, notifications = {} }
   local function source_hash() return M.buffer_sha256(buffer) end
   local function is_target(value)
     if type(value) ~= 'string' then return false end
@@ -121,11 +185,21 @@ function M.observe_diagnostics(client, buffer)
         fileformat = vim.bo[buffer].fileformat, eol = vim.bo[buffer].eol }
       local changes = params.contentChanges
       local change = type(changes) == 'table' and #changes == 1 and changes[1] or nil
-      if type(change) == 'table' and change.range == nil and type(change.text) == 'string' then
-        item.wire_source_sha256 = vim.fn.sha256(change.text)
+      local reconstructed, change_error = M.apply_content_changes(wire_text, changes, encoding)
+      item.content_change_count = type(changes) == 'table' and #changes or nil
+      if reconstructed then
+        item.wire_source_sha256 = vim.fn.sha256(reconstructed)
         item.wire_matches_snapshot = item.wire_source_sha256 == item.source_sha256
-        if not item.wire_matches_snapshot then row.wire_error = 'outbound-full-text-mismatch' end
+        if not item.wire_matches_snapshot then
+          item.wire_error = type(change) == 'table' and change.range == nil
+            and 'outbound-full-text-mismatch' or 'outbound-incremental-text-mismatch'
+        end
+        if sent then wire_text = reconstructed end
+      else
+        item.wire_matches_snapshot = false
+        item.wire_error = 'outbound-' .. change_error
       end
+      row.wire_error = row.wire_error or item.wire_error
       row.outbound[#row.outbound + 1] = item
       if sent and item.changedtick > tick and item.version == item.buffer_version then
         row.attempted, row.expected_version, row.source_sha256 = true, item.version, item.source_sha256

@@ -58,7 +58,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current named/default-call slice passes 1,318 / 0 failed / 4 ignored. Shared binding, exact free-call qualification and linear nested-inference controls pass. Formatting and both release binaries pass | Current Rust, formatting and release verified | Checkpoints 39–47; capture/upper-only/LUB inference, where/F-bounds, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current Java source-authority slice passes 1,327 / 0 failed / 4 ignored. Shared binding, linear nested inference and conservative source/JDK diagnostic controls pass. Formatting and both release binaries pass | Current Rust, formatting and release verified | Checkpoints 39–48; capture/upper-only/LUB inference, where/F-bounds, arbitrary compiler plugins and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 194 matched / 5 unmet, features 78 matched / 2 unmet and semantic 107 passing assertions retain the same expectations. Prior basic 9/9, library 13/13 and saved Java publication 99/99 | Partial; same seven ordinary expectations remain open | Checkpoint 42 native-editors-r4-1; six ordinary push observations lack generation certification, explainResolution is a direct unmet response. Forced cleanup is operational evidence, not an analysis score |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Twentieth indexes 101 dependencies with zero failed inputs and two missing sources. All seven strict first-response completion/goto assertions and native popup acceptance pass; the whole accepted buffer compiles. Error Prone annotations and Gson now load; missing Patchy and KotlinForForge sources retain a broader harness exit 1 | Focused queried semantics and accepted code verified; broader cases open | `ktlsp-cem-twentieth-fixed-1-20261011/{run-cem-first,actual-accepted-compiler}/result.json`. Full CEM diagnostics, overrides, required missing-source navigation cases and performance remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -3019,6 +3019,86 @@ Known completion and exact navigation pass in that same state. IDEA comparison o
 the edited diagnostics is still unmeasured: the harness must first reconstruct its
 negotiated incremental changes. Keep those observation repairs separate from product
 diagnostics and retain all original positive expectations.
+
+
+### Forty-eighth checkpoint: Java source-member absence and editor observation
+
+The unchanged Java reduction previously returned a valid full empty diagnostic
+report. Independent javac17.0.7 with the captured JDK17, source/target17 and
+-proc:none rejects its exact edited snapshot: missing.Gone import, removed member,
+Missing type and the Gone use. Japanese javac output is CP932 after an RTK UTF-8
+prefix; the raw log and the corrected read-only semantic decoding are retained.
+The initial English-message matcher failure is not hidden.
+
+A shared owner-local proof now diagnoses absent Java members without declaring
+all project producers complete. It requires a unique ordinary Java class, exact
+selected JavaCompile inputs, current source/model facts, no transforming compiler
+services and the selected JDK's raw Object inventory. Kotlin owners, annotations,
+inheritance, generic/nested classes and uncertainty retain their existing reasons.
+Standalone -proc:none can disable AP discovery; Java Plugin services remain checked.
+A Gradle-applied forkJavaHome is accepted only when it equals the captured selected
+JDK; unknown or contradictory homes still reject the proof.
+
+Closed owners reuse the existing one-file parser only during a failed-member
+diagnostic, with stable indexed timestamps and exact whole declaration-fact
+equality. A per-diagnostic memo avoids repeated owner reads. No recursive source walk,
+new persistent source cache or completion-path parsing is added. Unsaved owners,
+closed-file replacement/reindex/restoration, missing timestamps/files, model changes,
+services and dirty shapes have focused regression controls.
+
+Native Neovim keeps Current.java closed. The same four first RPCs/seven semantic
+expectations improve from **4 matched / 3 mismatched** to **5 matched / 2 mismatched**,
+with zero unmeasured results. The new full report contains the exact removed member
+error. Missing bare-type and import positives still mismatch; the complete scenario
+retains its nonzero exit. Known completion, exact navigation, edited useful completion,
+wire SHA and complete restoration pass. Standard server shutdown exits zero without
+forced termination; its fresh owned job has one unclassified live descendant at cleanup.
+
+The shared harness now reconstructs ordered incremental changes from the armed old
+text and compares the resulting SHA with the actual current buffer. It retains the
+negotiated synchronization/encoding. UTF-16 surrogate boundaries, Japanese text,
+UTF-8/32, CRLF/CR/LF, sequential changes and invalid ranges have controls. Existing
+corpus matcher/request/diagnostic checks pass **445 assertions**. The old invalid
+synthetic incremental range is corrected for its positive test and retained as an
+explicit negative control. No semantic expectation or desired-content retry is added.
+
+IDEA advertises document diagnostic support. Its edited completion and wire proof
+pass, but native Neovim workspace diagnostic refresh cancels the manual pull;
+RequestCancelled is discarded by its RPC layer, so request_sync reaches its observation
+bound. The original IDEA manual run remains **3 matched / zero mismatched / 4 unmeasured**.
+The subsequent native automatic pull returns the exact removed-member and Missing
+errors, plus an error on the import's missing package qualifier and the Gone use.
+The frozen hook expects an import error covering Gone; IDEA's qualifier span does
+not match that expectation. This calibration difference remains explicit. The
+automatic result is supplemental positive-oracle evidence, not retroactive success
+for the cancelled manual request or a clean/generation-closure claim.
+
+The [portable reduction](../dev/corpus/fixtures/java-source-diagnostics/README.md)
+retains all seven expectations. A fresh external copy reproduces the same five
+matches and two positive diagnostic mismatches, with zero unmeasured results.
+Nine focused new controls, diagnostic_absence31,
+generic60, implicit-receiver63, member-selection62, **1,327 workspace tests /
+zero failed / four ignored**, formatting and both release binaries pass.
+ktlsp SHA256:
+d5491ca0573d38085f480e862ac8432ab00026320c40ac8066fad65ed42b434d.
+
+Artifacts under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+source-java-diagnostic-reduction-1/, native-java-source-plain-selected-build-3/,
+independent-java-source-plain-1/, source-java-source-authority-1/,
+source-java-source-authority-apply-1/, source-incremental-wire-apply-1/,
+native-java-source-plain-new-rust-1/, native-java-source-plain-old-2/,
+native-java-source-plain-new-1/, native-java-source-plain-portable-1/,
+native-java-source-plain-intellij-1/
+(the original unsupported wire observation), native-java-source-plain-intellij-2/
+(correct wire, cancelled manual pull), source-idea-java-diagnostic-observation-1/ and source-java-authority-comparison-1/.
+The binary receipt captures 52 current source guards; no timing or RSS result is claimed.
+
+The initial plain Gradle7.4.2 default-task dump captured no selected java_home.
+An explicit toolchain control supplies verified JDK17; Gradle source investigation
+has separately identified its exact default same-daemon selection. That fallback
+is not part of this checkpoint. Next cover missing Java type/import diagnostics,
+default-JDK/cache freshness and the original six Java producer-positive gaps;
+Kotlin processor checks and the wider six-project acceptance remain in scope.
 
 ### Current slice: requires-only compatibility artifacts
 

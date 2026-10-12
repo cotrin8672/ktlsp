@@ -47,6 +47,13 @@ arguments, generic overloads, omitted defaults and exact Java/Kotlin targets. It
 extra hook checks one-file unsaved edits, restoration and genuine ambiguity using
 the same corpus client and first-response policy.
 
+## Java source diagnostic regressions
+
+The [plain Java fixture](fixtures/java-source-diagnostics/README.md) preserves the
+closed-owner missing-member repair and two remaining type/import coverage gaps.
+Its seven original expectations remain required; the full scenario currently exits
+nonzero. Manual diagnostic availability is separate from native automatic pulls.
+
 ## CEM source snapshot and declaration oracles
 
 `cem-working-copy.json` records the user's existing source snapshot, including

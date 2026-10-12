@@ -93,6 +93,77 @@ for _, case in ipairs({
   vim.api.nvim_buf_delete(buffer, { force = true })
 end
 
+local function wire_change(text, start_line, start_character, end_line, end_character, length)
+  return { text = text, rangeLength = length, range = {
+    start = { line = start_line, character = start_character },
+    ['end'] = { line = end_line, character = end_character },
+  } }
+end
+
+-- Wire payloads and expected whole texts are independent literals, including shifted later ranges.
+for _, case in ipairs({
+  { name = 'incremental ASCII replacement', before = 'before\n',
+    changes = { wire_change('after', 0, 0, 0, 6, 6) }, expected = 'after\n' },
+  { name = 'incremental UTF-16 Japanese and surrogate pair', before = '甲😀乙\n次行\n',
+    changes = { wire_change('文', 0, 1, 0, 3, 2) }, expected = '甲文乙\n次行\n' },
+  { name = 'incremental zero-length insertion', before = '甲😀乙',
+    changes = { wire_change('文', 0, 1, 0, 1, 0) }, expected = '甲文😀乙' },
+  { name = 'incremental deletion', before = '甲😀乙',
+    changes = { wire_change('', 0, 1, 0, 3, 2) }, expected = '甲乙' },
+  { name = 'incremental sequential ranges use preceding edits', before = '甲😀乙\n次行\n',
+    changes = { wire_change('文', 0, 1, 0, 1, 0), wire_change('', 0, 2, 0, 4, 2),
+      wire_change('!\n新', 0, 2, 1, 1, 3), wire_change('終', 2, 0, 2, 0, 0) },
+    expected = '甲文!\n新行\n終' },
+  { name = 'incremental CRLF range preserves wire bytes', before = '甲😀乙\r\n次行\r\n',
+    changes = { wire_change('文\r\n新', 0, 1, 1, 1, 6) }, expected = '甲文\r\n新行\r\n' },
+  { name = 'incremental CR range preserves wire bytes', before = '甲😀乙\r次行\r',
+    changes = { wire_change('文\r新', 0, 1, 1, 1, 5) }, expected = '甲文\r新行\r' },
+  { name = 'incremental empty document insertion', before = '',
+    changes = { wire_change('日本語', 0, 0, 0, 0, 0) }, expected = '日本語' },
+  { name = 'incremental insertion at final empty line', before = '甲\n',
+    changes = { wire_change('乙', 1, 0, 1, 0, 0) }, expected = '甲\n乙' },
+  { name = 'full replacement remains supported', before = 'old\r\n',
+    changes = { { text = 'new\n' } }, expected = 'new\n' },
+  { name = 'full then ranged changes use replacement text', before = 'old\r\n',
+    changes = { { text = '再😀\n' }, wire_change('検', 0, 1, 0, 3, 2) }, expected = '再検\n' },
+  { name = 'ranged then full changes use array order', before = '甲😀乙',
+    changes = { wire_change('文', 0, 1, 0, 3, 2), { text = '' } }, expected = '' },
+  { name = 'UTF-8 negotiated byte positions', encoding = 'utf-8', before = '甲😀乙',
+    changes = { wire_change('文', 0, 3, 0, 7, 4) }, expected = '甲文乙' },
+  { name = 'UTF-32 negotiated character positions', encoding = 'utf-32', before = '甲😀乙',
+    changes = { wire_change('文', 0, 1, 0, 2, 1) }, expected = '甲文乙' },
+}) do
+  local text, error = probe.apply_content_changes(case.before, case.changes, case.encoding)
+  check(case.name .. ': exact reconstructed text', text, case.expected)
+  check(case.name .. ': valid payload has no error', error, nil)
+end
+for _, case in ipairs({
+  { name = 'surrogate start boundary', changes = { wire_change('x', 0, 2, 0, 3) } },
+  { name = 'surrogate end boundary', changes = { wire_change('x', 0, 1, 0, 2) } },
+  { name = 'column beyond source', changes = { wire_change('x', 0, 1, 0, 5) } },
+  { name = 'line beyond source', changes = { wire_change('x', 3, 0, 3, 0) } },
+  { name = 'negative position', changes = { wire_change('x', -1, 0, 0, 0) } },
+  { name = 'fractional position', changes = { wire_change('x', 0, 1.5, 0, 3) } },
+  { name = 'reversed same-line range', changes = { wire_change('x', 0, 3, 0, 1) } },
+  { name = 'reversed multiline range', changes = { wire_change('x', 1, 0, 0, 1) } },
+  { name = 'wrong replaced UTF-16 length', changes = { wire_change('x', 0, 1, 0, 3, 1) } },
+  { name = 'negative replaced length', changes = { wire_change('x', 0, 1, 0, 3, -1) } },
+  { name = 'missing range endpoint', changes = { { text = 'x', range = { start = { line = 0, character = 1 } } } } },
+  { name = 'missing change text', changes = { { range = identifier } } },
+  { name = 'empty changes', changes = {} },
+  { name = 'missing changes' },
+  { name = 'sparse changes', changes = { [2] = { text = 'x' } } },
+  { name = 'non-array changes', changes = { [1] = { text = 'x' }, other = { text = 'y' } } },
+  { name = 'unknown encoding', encoding = 'latin1', changes = { { text = 'x' } } },
+  { name = 'UTF-8 codepoint split', encoding = 'utf-8', changes = { wire_change('x', 0, 4, 0, 7) } },
+  { name = 'later invalid change rejects entire reconstruction',
+    changes = { wire_change('文', 0, 1, 0, 3, 2), wire_change('x', 0, 20, 0, 20) } },
+}) do
+  local text, error = probe.apply_content_changes('甲😀乙\n次行\n', case.changes, case.encoding)
+  check(case.name .. ': no reconstructed snapshot', text, nil)
+  check(case.name .. ': explicit wire error', type(error), 'string')
+end
+
 for _, case in ipairs({
   { name = 'versioned diagnostic', version = 2, diagnostics = { { message = 'required' } }, expected = 'matched' },
   { name = 'versionless empty diagnostic', diagnostics = {}, expected = 'mismatch', limited = true },
@@ -108,28 +179,42 @@ for _, case in ipairs({
   { name = 'diagnostic error is not measured', version = 2, diagnostics = {}, error = { code = -32603 }, expected = 'protocol-error' },
   { name = 'wrong full-text wire hash cannot certify diagnostic', version = 2, diagnostics = { { message = 'required' } },
     wrong_wire = true, expected = 'protocol-error' },
-  { name = 'incremental legacy notification retains version correlation', version = 2, diagnostics = { { message = 'required' } },
+  { name = 'incremental notification proves exact wire correlation', version = 2, diagnostics = { { message = 'required' } },
     incremental = true, expected = 'matched' },
+  { name = 'multiple incremental changes prove exact wire correlation', version = 2,
+    diagnostics = { { message = 'required' } }, expected = 'matched',
+    changes = { wire_change('aft', 0, 0, 0, 3, 3), wire_change('er', 0, 3, 0, 6, 3) } },
+  { name = 'UTF-16 incremental notification proves exact wire correlation', version = 2,
+    old_lines = { '甲😀乙' }, new_lines = { '甲文乙' }, diagnostics = { { message = 'required' } }, expected = 'matched',
+    changes = { wire_change('文', 0, 1, 0, 3, 2) } },
+  { name = 'valid wrong incremental wire cannot certify diagnostic', version = 2,
+    diagnostics = { { message = 'required' } }, expected = 'protocol-error',
+    changes = { wire_change('wrong', 0, 0, 0, 6, 6) } },
+  { name = 'invalid incremental range cannot certify diagnostic', version = 2,
+    diagnostics = { { message = 'required' } }, expected = 'protocol-error',
+    changes = { wire_change('after', 0, 6, 0, 10) } },
 }) do
   local buffer = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(buffer, vim.fn.tempname() .. '.kt')
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'before' })
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, case.old_lines or { 'before' })
   vim.bo[buffer].fileformat, vim.bo[buffer].eol = 'unix', true
   vim.lsp.util.buf_versions[buffer] = 1
   local forwarded = 0
   local old_handler = function() forwarded = forwarded + 1 end
   local old_notify = function() return not case.send_failed end
-  local client = { handlers = { ['textDocument/publishDiagnostics'] = old_handler }, rpc = { notify = old_notify } }
+  local client = { offset_encoding = 'utf-16',
+    handlers = { ['textDocument/publishDiagnostics'] = old_handler }, rpc = { notify = old_notify } }
   local row, finish = probe.observe_diagnostics(client, buffer)
   local function publish(version, diagnostics)
     client.handlers['textDocument/publishDiagnostics'](case.error,
       { uri = vim.uri_from_bufnr(buffer), version = version, diagnostics = diagnostics }, {})
   end
   if case.before then publish(1, {}) end
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'after' })
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, case.new_lines or { 'after' })
   vim.lsp.util.buf_versions[buffer] = 2
   local changes = { { text = case.wrong_wire and 'after\r\n' or 'after\n' } }
-  if case.incremental then changes = { { text = 'after', range = identifier } } end
+  if case.incremental then changes = { wire_change('after', 0, 0, 0, 6, 6) } end
+  if case.changes then changes = case.changes end
   client.rpc.notify('textDocument/didChange', { textDocument = { uri = vim.uri_from_bufnr(buffer), version = 2 },
     contentChanges = changes })
   if case.changed then vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { 'another edit' }) end
@@ -147,6 +232,12 @@ for _, case in ipairs({
   check(case.name .. ': restores notification handler', client.handlers['textDocument/publishDiagnostics'] == old_handler, true)
   check(case.name .. ': restores outbound hook', client.rpc.notify == old_notify, true)
   check(case.name .. ': records outbound version', row.outbound[1].version, 2)
+  if case.expected == 'matched' or case.expected == 'mismatch' then
+    check(case.name .. ': reconstructed wire matches actual buffer', row.wire_matches_snapshot, true)
+    check(case.name .. ': reconstructed wire SHA matches actual buffer', row.wire_source_sha256, probe.buffer_sha256(buffer))
+    check(case.name .. ': records armed old snapshot', row.before_source_sha256,
+      vim.fn.sha256(table.concat(case.old_lines or { 'before' }, '\n') .. '\n'))
+  end
   if case.limited then
     check(case.name .. ': versionless generation is explicitly limited', row.generation_certified == false
       and type(row.generation_limit) == 'string', true)
@@ -160,6 +251,10 @@ end
 -- Canonical compiler receipt controls reuse the real buffer/outbound observer and RPC envelopes.
 for _, case in ipairs({
   { name = 'fast versionless empty then accepted error', expected = 'matched', final_push = true },
+  { name = 'incremental wire permits canonical diagnostic pull', expected = 'matched',
+    changes = { wire_change('aft', 0, 0, 0, 3, 3), wire_change('er', 0, 3, 0, 6, 3) } },
+  { name = 'wrong incremental wire prevents canonical diagnostic pull', expected = 'not-run',
+    changes = { wire_change('wrong', 0, 0, 0, 6, 6) } },
   { name = 'clean canonical empty is a positive mismatch', clean = true, empty = true, expected = 'mismatch' },
   { name = 'partial canonical wrong empty is a positive mismatch', empty = true, expected = 'mismatch' },
   { name = 'pre-arm accepted receipt is stale', preexisting = true, no_accept = true, expected = 'not-run' },
@@ -243,6 +338,7 @@ for _, case in ipairs({
       vim.api.nvim_buf_set_lines(buffer, 0, -1, false, after_lines)
       vim.lsp.util.buf_versions[buffer] = 2
       local changes = not case.missing_wire and { { text = case.wrong_wire and 'after\npeer\n' or wire_text } } or nil
+      if case.changes then changes = case.changes end
       client.rpc.notify('textDocument/didChange', { textDocument = { uri = uri, version = 2 }, contentChanges = changes })
       publish({})
       if case.changed_wait or case.aba_wait or case.format_wait then

@@ -561,6 +561,36 @@ pub fn member_name_status_for_receiver(
         &ctx.package,
         &ctx.imports,
     ));
+    if !facts.compiler_producers_complete
+        && reasons
+            .iter()
+            .all(|reason| matches!(reason, IncompletenessReason::CompilerProducerIncomplete))
+        && file.ends_with(".java")
+        && recv_ty.container().is_none()
+        && binary_owner(index, &format!("{}/{}", root_pkg.replace('.', "/"), root)).is_some_and(
+            |owner| {
+                owner.tier == crate::index::Tier::Volatile
+                    && owner.path.ends_with(".java")
+                    && owner.sym.kind == SymbolKind::Class
+                    && owner.sym.container.is_none()
+                    && owner.sym.type_params.is_empty()
+                    && owner.sym.supertypes.is_empty()
+                    && owner.sym.supertype_refs.is_empty()
+                    && index.java_source_members_complete(owner)
+            },
+        )
+        && java_binary_member_status(
+            index,
+            &Type::class("Object", Some("java.lang".into())),
+            name,
+            facts,
+        )
+        .is_some_and(|status| status.is_definitely_absent())
+    {
+        // A selected plain javac source closes this owner's own names, and the exact SDK
+        // inventory closes its implicit Object ancestor. Keep every other proof obligation.
+        reasons.retain(|reason| *reason != IncompletenessReason::CompilerProducerIncomplete);
+    }
     dedup_reasons(&mut reasons);
     if reasons.is_empty() {
         if receiver_world_is_library_or_jdk(index, root, root_pkg) {

@@ -239,6 +239,13 @@ pub trait InferenceIndex {
         None
     }
 
+    /// The current Java source declaration has a complete declared member surface under the
+    /// caller's selected plain javac inputs. This certifies only this owner, never the project
+    /// producer/type world. Implementations must retract the proof with source/model changes.
+    fn java_source_members_complete(&self, _owner: &Entry) -> bool {
+        false
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_>;
     fn members_of(&self, type_name: &str) -> LookupEntries<'_>;
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_>;

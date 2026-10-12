@@ -657,9 +657,13 @@ struct BinaryInventoryIndex {
     index: ktlsp::index::Index,
     classes: std::collections::BTreeMap<String, std::sync::Arc<ktcore::classfile::ClassFileFacts>>,
     caller_known: bool,
+    source_owners: std::collections::BTreeSet<String>,
 }
 
 impl ktlsp::index::InferenceIndex for BinaryInventoryIndex {
+    fn java_source_members_complete(&self, owner: &ktlsp::index::Entry) -> bool {
+        self.source_owners.contains(owner.path.as_ref())
+    }
     fn lookup_by_name(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
         ktlsp::index::InferenceIndex::lookup_by_name(&self.index, name)
     }
@@ -756,6 +760,7 @@ fn binary_inventory() -> BinaryInventoryIndex {
         index,
         classes,
         caller_known: true,
+        source_owners: Default::default(),
     }
 }
 
@@ -881,4 +886,148 @@ fn java_binary_inventory_visits_interfaces_and_accepts_a_diamond_without_closing
         .interfaces
         .push("missing/Parent".into());
     assert!(!inventory_status(&index, "Use.java", "oldApi", &facts).is_definitely_absent());
+}
+
+fn source_member_inventory() -> BinaryInventoryIndex {
+    let mut index = binary_inventory();
+    let source = "package app; public class Current { public int current() { return 2; } }";
+    let tree = ktlsp::java::JavaParser::new().parse(source);
+    index.index.replace_file(
+        "Current.java",
+        ktlsp::java::extract_symbols(&tree, source),
+        Tier::Volatile,
+    );
+    index.source_owners.insert("Current.java".into());
+    index
+}
+
+fn source_member_status(
+    index: &BinaryInventoryIndex,
+    caller: &str,
+    owner: &str,
+    name: &str,
+    facts: &ktlsp::resolve::CompletenessFacts,
+) -> ktlsp::resolve::ResolutionStatus<()> {
+    ktlsp::resolve::member_name_status_for_receiver(
+        index,
+        caller,
+        &ktlsp::types::Type::class(owner, Some("app".into())),
+        name,
+        facts,
+        &ktlsp::infer::FileCtx::new("app".into(), Vec::new()),
+    )
+}
+
+#[test]
+fn plain_java_source_authority_diagnoses_only_its_owner_without_global_producer_closure() {
+    let index = source_member_inventory();
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    facts.project_packages_complete.insert("app".into());
+    assert!(
+        source_member_status(&index, "Use.java", "Current", "removed", &facts)
+            .is_definitely_absent()
+    );
+    assert!(source_member_status(&index, "Use.java", "Current", "current", &facts).is_found());
+    assert!(
+        !source_member_status(&index, "Use.java", "Current", "toString", &facts)
+            .is_definitely_absent()
+    );
+    assert!(
+        !source_member_status(&index, "Use.kt", "Current", "removed", &facts)
+            .is_definitely_absent()
+    );
+    let text =
+        "package app; class Use { void run(Current value) { value.current(); value.removed(); } }";
+    let tree = ktlsp::java::JavaParser::new().parse(text);
+    let diagnostics = ktlsp::java::diagnostics(&index, "Use.java", &tree, text, &facts);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item.start_byte == text.find("removed").unwrap()
+                && item.code == Some(DiagnosticCode::UnresolvedReference)),
+        "{diagnostics:?}"
+    );
+    assert!(!diagnostics
+        .iter()
+        .any(|item| item.start_byte == text.find("current").unwrap()));
+    let import = ktlsp::parser::Import {
+        path: "app.Missing".into(),
+        alias: None,
+        wildcard: false,
+    };
+    assert!(!ktlsp::resolve::import_target_status(
+        &index,
+        "Use.java",
+        &import,
+        &facts,
+        &ktlsp::infer::FileCtx::new("app".into(), Vec::new())
+    )
+    .is_definitely_absent());
+    assert!(!facts.compiler_producers_complete);
+}
+
+#[test]
+fn plain_java_source_authority_keeps_dirty_unknown_sdk_annotation_and_hierarchy_reasons() {
+    for gap in [
+        "authority",
+        "sdk",
+        "jdk",
+        "library",
+        "dirty",
+        "annotation",
+        "hierarchy",
+        "kotlin",
+    ] {
+        let mut index = source_member_inventory();
+        let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+        facts.compiler_producers_complete = false;
+        facts.project_packages_complete.insert("app".into());
+        match gap {
+            "authority" => index.source_owners.clear(),
+            "sdk" => {
+                index.classes.remove("Object.java");
+            }
+            "jdk" => facts.jdk_index_complete = false,
+            "library" => facts.library_index_complete = false,
+            "dirty" => {
+                facts.project_scan_complete = false;
+                facts.project_packages_complete.clear();
+            }
+            "annotation" => {
+                let owner = index.index.lookup_type("Current")[0];
+                facts.member_surfaces_unknown.insert(ktlsp::symbol::Def {
+                    file: owner.path.to_string(),
+                    start_byte: owner.sym.start_byte,
+                    end_byte: owner.sym.end_byte,
+                });
+            }
+            "hierarchy" => {
+                let source = "package app; public class Current extends Missing {}";
+                let tree = ktlsp::java::JavaParser::new().parse(source);
+                index.index.replace_file(
+                    "Current.java",
+                    ktlsp::java::extract_symbols(&tree, source),
+                    Tier::Volatile,
+                );
+            }
+            "kotlin" => {
+                index.index.remove_file("Current.java");
+                let source = "package app\nclass Current";
+                let tree = ktlsp::parser::KotlinParser::new().parse(source);
+                index.index.replace_file(
+                    "Current.kt",
+                    ktlsp::indexer::extract_symbols(&tree, source, "app"),
+                    Tier::Volatile,
+                );
+                index.source_owners.insert("Current.kt".into()); // Even an over-broad adapter cannot close a Kotlin owner.
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !source_member_status(&index, "Use.java", "Current", "removed", &facts)
+                .is_definitely_absent(),
+            "{gap}"
+        );
+    }
 }

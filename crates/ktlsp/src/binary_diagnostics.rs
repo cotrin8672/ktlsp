@@ -17,7 +17,7 @@ const MAX_CLASS_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Default)]
 pub(crate) struct ClassInventoryCache {
     classes: BTreeMap<(PathBuf, String, String), CachedClass>,
-    services: BTreeMap<PathBuf, (FileStamp, bool)>,
+    services: BTreeMap<(PathBuf, bool), (FileStamp, bool)>,
     class_bytes: usize,
 }
 
@@ -41,27 +41,29 @@ impl ClassInventoryCache {
             // shortcut: modular compiler service discovery needs a module-path inventory.
             return false;
         }
+        let processors_disabled = task.annotation_processing_disabled();
         task.classpath.iter().all(|path| {
             if path.is_dir() {
                 // Nested service files can change without changing the classpath root's mtime.
-                return crate::jar::plain_java_classpath_entry(path);
+                return crate::jar::plain_java_classpath_entry(path, processors_disabled);
             }
             let Ok(Some(before)) = file_stamp(path) else {
                 return false;
             };
-            if let Some((stamp, absent)) = self.services.get(path) {
+            let key = (path.clone(), processors_disabled);
+            if let Some((stamp, absent)) = self.services.get(&key) {
                 if *stamp == before {
                     return *absent;
                 }
             }
-            let absent = crate::jar::plain_java_classpath_entry(path);
+            let absent = crate::jar::plain_java_classpath_entry(path, processors_disabled);
             if file_stamp(path) != Ok(Some(before)) {
                 return false;
             }
             if self.services.len() >= MAX_CACHE_ENTRIES {
                 self.services.clear();
             }
-            self.services.insert(path.clone(), (before, absent));
+            self.services.insert(key, (before, absent));
             absent
         })
     }
@@ -240,9 +242,13 @@ fn file_stamp(path: &Path) -> Result<Option<FileStamp>, ()> {
 pub(crate) struct BinaryDiagnostics<'a> {
     pub index: &'a dyn InferenceIndex,
     pub inventory: &'a dyn Fn(&Entry) -> Option<Arc<ClassFileFacts>>,
+    pub source_members: &'a dyn Fn(&Entry) -> bool,
 }
 
 impl InferenceIndex for BinaryDiagnostics<'_> {
+    fn java_source_members_complete(&self, owner: &Entry) -> bool {
+        (self.source_members)(owner)
+    }
     fn java_class_inventory(&self, owner: &Entry) -> Option<Arc<ClassFileFacts>> {
         (self.inventory)(owner)
     }
@@ -447,6 +453,43 @@ mod tests {
     }
 
     #[test]
+    fn compiler_service_cache_separates_ap_disable_and_never_disables_plugins() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_proc_none_cache_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("processor.jar");
+        jar(
+            &binary,
+            &[(
+                "META-INF/services/javax.annotation.processing.Processor",
+                b"ap.Provider",
+            )],
+        );
+        let normal = task(&[binary.clone()]);
+        let mut disabled = normal.clone();
+        disabled.arguments.push("-proc:none".into());
+        let mut cache = ClassInventoryCache::default();
+        assert!(!cache.plain_caller(&normal));
+        assert!(cache.plain_caller(&disabled));
+        assert!(!cache.plain_caller(&normal));
+        assert!(cache.plain_caller(&disabled));
+        let plugin = root.join("plugin.jar");
+        jar(
+            &plugin,
+            &[(
+                "META-INF/services/com.sun.source.util.Plugin",
+                b"plugin.Provider",
+            )],
+        );
+        disabled.classpath = vec![plugin];
+        assert!(!cache.plain_caller(&disabled));
+        disabled.classpath.clear();
+        disabled.source_files.push(root.join("module-info.java"));
+        assert!(!cache.plain_caller(&disabled));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn static_receiver_diagnostics_do_not_walk_unrelated_index_files() {
         struct LocalIndex {
             index: crate::index::Index,
@@ -488,6 +531,7 @@ mod tests {
         let index = BinaryDiagnostics {
             index: &inner,
             inventory: &|_| None,
+            source_members: &|_| false,
         };
         let mut facts = crate::resolve::CompletenessFacts::complete();
         facts.project_packages_complete.insert("app".into());

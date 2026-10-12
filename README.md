@@ -326,6 +326,9 @@ The [named-call fixture](dev/corpus/fixtures/named-call-binding/README.md) uses 
 same route for reordered arguments, omitted defaults, overload selection, exact
 Java/Kotlin definitions, and one-file unsaved parameter-name edits. Its 47 first
 requests have 65 shared semantic expectations for ktlsp and IntelliJ.
+The [Java diagnostic reduction](dev/corpus/fixtures/java-source-diagnostics/README.md)
+keeps closed-owner member errors and the remaining missing type/import expectations
+in the same corpus route.
 `check(name, ok, detail, kind, outcome)` defaults to a semantic assertion; pass the request outcome
 from `nvim_lsp_probe.request_outcome` and register hook requests in `request_outcomes`.
 For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harness.sh corpus

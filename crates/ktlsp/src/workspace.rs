@@ -2331,9 +2331,25 @@ impl Workspace {
                 .borrow_mut()
                 .inventory(model, task, key, owner, &origin.origin_id)
         };
+        let source_proofs: RefCell<BTreeMap<Arc<str>, bool>> = RefCell::new(BTreeMap::new());
+        let source_members = |owner: &crate::index::Entry| {
+            if let Some(complete) = source_proofs.borrow().get(owner.path.as_ref()) {
+                return *complete;
+            }
+            let (Some(model), Some(task)) = (model, caller) else {
+                return false;
+            };
+            let complete = self.plain_java_source_members_complete(model, task, key, owner)
+                && *services.get_or_init(|| self.class_inventory.borrow_mut().plain_caller(task));
+            source_proofs
+                .borrow_mut()
+                .insert(owner.path.clone(), complete);
+            complete
+        };
         let index = crate::binary_diagnostics::BinaryDiagnostics {
             index: &scoped,
             inventory: &inventory,
+            source_members: &source_members,
         };
         language::diagnostics(
             &index,
@@ -2355,6 +2371,133 @@ impl Workspace {
             .member_surfaces_unknown
             .extend(self.annotated_type_owners.values().flatten().cloned());
         facts
+    }
+
+    /// A current Java owner under the caller's selected javac task. This does not close project
+    /// producers or Kotlin output. A closed owner is re-read only for this negative diagnostic,
+    /// with a stable indexed stamp and exact current declaration facts; no source cache is added.
+    fn plain_java_source_members_complete(
+        &self,
+        model: &crate::classpath::ProjectSnapshot,
+        task: &crate::classpath::CompilerTask,
+        caller: &str,
+        owner: &crate::index::Entry,
+    ) -> bool {
+        if self.project_refresh_pending
+            || owner.tier != Tier::Volatile
+            || !is_java_path(&owner.path)
+            || owner.sym.kind != SymbolKind::Class
+            || owner.sym.container.is_some()
+            || !owner.sym.type_params.is_empty()
+            || !owner.sym.supertypes.is_empty()
+            || !owner.sym.supertype_refs.is_empty()
+            || self.analysis_extensions.needs_source(&owner.path)
+            || !self
+                .annotated_type_owners
+                .get(owner.path.as_ref())
+                .is_some_and(|owners| !owners.contains(&rename_definition(owner)))
+            || !std::ptr::eq(
+                task,
+                match model.plain_java_task(&owner.path) {
+                    Some(selected) => selected,
+                    None => return false,
+                },
+            )
+            || !task
+                .source_files
+                .iter()
+                .any(|path| crate::paths::file_key(path) == owner.path.as_ref())
+        {
+            return false;
+        }
+        let Some(meta) = self.project_file_meta.get(owner.path.as_ref()) else {
+            return false;
+        };
+        if !meta.clean
+            || meta.package != owner.sym.package
+            || meta.scope.is_none()
+            || meta.scope != self.project_scope_for_file(caller)
+            || !self.index.file_origin(&owner.path).is_some_and(|origin| {
+                origin.representation == crate::project_model::SourceRepresentation::Source
+                    && origin.project_scope == meta.scope
+            })
+        {
+            return false;
+        }
+        let closed;
+        let (text, tree) = if let Some(doc) = self.open_docs.get(owner.path.as_ref()) {
+            (doc.text.as_str(), &doc.tree)
+        } else {
+            let Some(stamp) = self.source_stamps.get(owner.path.as_ref()) else {
+                return false;
+            };
+            let Some(mut batch) =
+                parse_project_file(Path::new(owner.path.as_ref()), &mut LanguageParsers::new())
+            else {
+                return false;
+            };
+            if batch.stamp != Some(*stamp) || !batch.clean || batch.package != meta.package {
+                return false;
+            }
+            batch.symbols.sort_by(|a, b| {
+                a.start_byte
+                    .cmp(&b.start_byte)
+                    .then(a.end_byte.cmp(&b.end_byte))
+                    .then(a.name.cmp(&b.name))
+            });
+            let indexed = self.index.entries_for_file(&owner.path);
+            if !indexed
+                .iter()
+                .map(|entry| entry.sym.as_ref())
+                .eq(batch.symbols.iter())
+                || language::annotated_type_owners(
+                    &self.index,
+                    &owner.path,
+                    &batch.source.1,
+                    &batch.source.0,
+                )
+                .contains(&rename_definition(owner))
+            {
+                return false;
+            }
+            closed = batch.source;
+            (closed.0.as_ref(), &closed.1)
+        };
+        let root = tree.root_node();
+        if root.has_error() {
+            return false;
+        }
+        let is_type = |node: &tree_sitter::Node<'_>| {
+            matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            )
+        };
+        let mut cursor = root.walk();
+        let mut declarations = root.named_children(&mut cursor).filter(is_type);
+        let Some(declaration) = declarations.next() else {
+            return false;
+        };
+        if declaration.kind() != "class_declaration" || declarations.next().is_some() {
+            return false;
+        }
+        if !declaration.child_by_field_name("name").is_some_and(|name| {
+            name.start_byte() == owner.sym.start_byte
+                && name.end_byte() == owner.sym.end_byte
+                && &text[name.byte_range()] == owner.sym.name
+        }) {
+            return false;
+        }
+        let Some(body) = declaration.child_by_field_name("body") else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        let nested = body.named_children(&mut cursor).any(|node| is_type(&node));
+        !nested
     }
 
     fn record_project_file_meta(&mut self, key: &str, package: String, clean: bool) {
@@ -6563,5 +6706,212 @@ mod kotlin_diagnostic_lifecycle_tests {
             accepted,
             "exit 0 advances the canonical accepted store"
         );
+    }
+}
+
+#[cfg(test)]
+mod java_source_authority_tests {
+    use super::*;
+
+    fn fixture(
+        generated: bool,
+        extension: &str,
+        source: &str,
+    ) -> (
+        Workspace,
+        Arc<crate::classpath::ProjectSnapshot>,
+        String,
+        String,
+    ) {
+        use crate::classpath::{
+            CompilerTask, ModuleClasspath, ProjectSnapshot, SourceSetClasspath,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-plain-java-source-authority-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let source_root = root.join(if generated {
+            "build/generated/java/main"
+        } else {
+            "src/main/java"
+        });
+        let owner = crate::paths::file_key(&source_root.join(format!("Current.{extension}")));
+        let caller = crate::paths::file_key(&source_root.join("Use.java"));
+        let java: CompilerTask = serde_json::from_value(serde_json::json!({
+            "task": ":compileJava", "language": "java",
+            "task_type": "org.gradle.api.tasks.compile.JavaCompile_Decorated",
+            "arguments": ["-proc:none"], "annotation_processor_path": [],
+            "source_files": [&owner, &caller], "classpath": [],
+            "java_home": root.join("jdk"),
+            "options": {"fork": false, "forkJavaHome": null, "forkExecutable": null, "forkJvmArgs": [], "release": null},
+            "output_roots": [], "complete": true, "problem": null
+        })).unwrap();
+        let kotlin: CompilerTask = serde_json::from_value(serde_json::json!({
+            "task": ":compileKotlin", "language": "kotlin", "task_type": "KotlinCompile",
+            "arguments": ["-Xplugin=/plugins/transform.jar"], "annotation_processor_path": [],
+            "java_home": null, "options": {}, "output_roots": [], "complete": true, "problem": null
+        }))
+        .unwrap();
+        let model = Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+            module: ":".into(),
+            project_dir: root,
+            build: String::new(),
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(),
+                source_roots: vec![source_root],
+                compiler_tasks: vec![java, kotlin],
+                ..Default::default()
+            }],
+        }]));
+        let mut ws = Workspace::new();
+        ws.set_project_model(model.clone());
+        ws.project_scan_initialized = true;
+        ws.open(&owner, source.into());
+        ws.open(&caller, "package app; class Use { void run(Current value) { value.current(); value.removed(); } }".into());
+        (ws, model, owner, caller)
+    }
+
+    fn proof(
+        ws: &Workspace,
+        model: &crate::classpath::ProjectSnapshot,
+        owner: &str,
+        caller: &str,
+    ) -> bool {
+        let Some(task) = model.plain_java_task(caller) else {
+            return false;
+        };
+        let mut entries = ws
+            .index
+            .lookup_type("Current")
+            .into_iter()
+            .filter(|entry| entry.path.as_ref() == owner);
+        let Some(entry) = entries.next() else {
+            return false;
+        };
+        entries.next().is_none()
+            && ws.plain_java_source_members_complete(model, task, caller, entry)
+    }
+
+    #[test]
+    fn current_java_owner_authority_is_independent_of_kotlin_tasks_and_generated_origin() {
+        let source = "package app; public class Current { public int current() { return 2; } }";
+        for generated in [false, true] {
+            let (ws, model, owner, caller) = fixture(generated, "java", source);
+            assert!(proof(&ws, &model, &owner, &caller));
+            assert!(!ws.effective_completeness().compiler_producers_complete);
+            assert_eq!(model.modules[0].source_sets[0].compiler_tasks.len(), 2);
+        }
+    }
+
+    #[test]
+    fn current_java_owner_authority_retracts_with_unsaved_shape_source_and_model_uncertainty() {
+        let source = "package app; public class Current { public int current() { return 2; } }";
+        let (mut ws, model, owner, caller) = fixture(false, "java", source);
+        assert!(proof(&ws, &model, &owner, &caller));
+        for changed in [
+            "package app; public class Current {",
+            "package app; @Unknown public class Current { public int current() { return 2; } }",
+            "package app; public record Current(int component) {}",
+            "package app; public class Current<T> {}",
+            "package app; public class Current extends Missing {}",
+            "package app; public class Current { class Nested {} }",
+            "package app; public class Current {} class Other {}",
+        ] {
+            ws.change(&owner, changed.into());
+            assert!(!proof(&ws, &model, &owner, &caller), "{changed}");
+            ws.change(&owner, source.into());
+            assert!(
+                proof(&ws, &model, &owner, &caller),
+                "restoration after {changed}"
+            );
+        }
+        ws.project_refresh_pending = true;
+        assert!(!proof(&ws, &model, &owner, &caller));
+        ws.project_refresh_pending = false;
+        ws.annotated_type_owners.remove(&owner);
+        assert!(!proof(&ws, &model, &owner, &caller));
+        ws.change(&owner, source.into());
+        assert!(proof(&ws, &model, &owner, &caller));
+        ws.project_file_meta.get_mut(&owner).unwrap().scope = None;
+        assert!(!proof(&ws, &model, &owner, &caller));
+        ws.change(&owner, source.into());
+        assert!(proof(&ws, &model, &owner, &caller));
+        for gap in ["inventory", "jdk", "opaque"] {
+            let (mut ws, model, owner, caller) = fixture(false, "java", source);
+            let mut modules = model.modules.clone();
+            let java = &mut modules[0].source_sets[0].compiler_tasks[0];
+            match gap {
+                "inventory" => java.source_files = vec![caller.clone().into()],
+                "jdk" => java.java_home = None,
+                "opaque" => java.arguments.push("-Xplugin:transform".into()),
+                _ => unreachable!(),
+            }
+            let changed = Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+            ws.set_project_model(changed.clone());
+            assert!(!proof(&ws, &changed, &owner, &caller), "{gap}");
+        }
+        ws.open_docs.remove(&owner);
+        assert!(!proof(&ws, &model, &owner, &caller));
+        let (ws, model, owner, caller) = fixture(
+            false,
+            "kt",
+            "package app\nclass Current { fun current() = 2 }",
+        );
+        assert!(!proof(&ws, &model, &owner, &caller));
+    }
+
+    #[test]
+    fn closed_java_owner_authority_requires_fresh_matching_declarations_and_restores_after_edits() {
+        let source = "package app; public class Current { public int current() { return 2; } }";
+        let (mut ws, model, owner, caller) = fixture(false, "java", source);
+        std::fs::create_dir_all(Path::new(&owner).parent().unwrap()).unwrap();
+        std::fs::write(&owner, source).unwrap();
+        ws.source_stamps
+            .insert(owner.clone(), source_stamp(Path::new(&owner)).unwrap());
+        ws.close(&owner);
+        assert!(
+            !ws.open_docs.contains_key(&owner),
+            "the target oracle stays closed"
+        );
+        assert!(proof(&ws, &model, &owner, &caller));
+
+        let changed = "package app; public class Current { public int removed() { return 2; } }";
+        std::fs::write(&owner, changed).unwrap();
+        // Even a misleading matching timestamp cannot certify an old declaration inventory.
+        ws.source_stamps
+            .insert(owner.clone(), source_stamp(Path::new(&owner)).unwrap());
+        assert!(!proof(&ws, &model, &owner, &caller));
+        ws.reindex(&owner, changed);
+        assert!(proof(&ws, &model, &owner, &caller));
+        std::fs::write(&owner, source).unwrap();
+        ws.source_stamps
+            .insert(owner.clone(), source_stamp(Path::new(&owner)).unwrap());
+        assert!(!proof(&ws, &model, &owner, &caller));
+        ws.reindex(&owner, source);
+        assert!(proof(&ws, &model, &owner, &caller));
+
+        ws.open(&owner, changed.into());
+        assert!(
+            proof(&ws, &model, &owner, &caller),
+            "the unsaved declaration wins over disk"
+        );
+        ws.close(&owner);
+        assert!(
+            proof(&ws, &model, &owner, &caller),
+            "closing restores the disk declaration"
+        );
+        ws.source_stamps.remove(&owner);
+        assert!(!proof(&ws, &model, &owner, &caller));
+        ws.source_stamps
+            .insert(owner.clone(), source_stamp(Path::new(&owner)).unwrap());
+        std::fs::remove_file(&owner).unwrap();
+        assert!(!proof(&ws, &model, &owner, &caller));
+        std::fs::remove_dir_all(&model.modules[0].project_dir).unwrap();
     }
 }

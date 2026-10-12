@@ -1,0 +1,19 @@
+{
+    "build_tool":  "gradle",
+    "scope":  "AP-free reduction; positive known controls plus separate diagnostic hook",
+    "probes":  [
+                   {
+                       "id":  "Java known current",
+                       "source":  "src/main/java/probe/Use.java",
+                       "source_sha256":  "96b61ffeed7c661945346663e390806a05c16fab158ffa0c9e1fbf75740cf923",
+                       "anchor":  "value.current()",
+                       "token":  "current",
+                       "completion_prefix":  "curr",
+                       "completion_token":  "current",
+                       "target_file":  "src/main/java/probe/Current.java",
+                       "target_sha256":  "220c0660a5b80abe7a124d4958447dfead2aad327c77d26896c724902ccf6b3a",
+                       "target_anchor":  "public int current()",
+                       "target_token":  "current"
+                   }
+               ]
+}

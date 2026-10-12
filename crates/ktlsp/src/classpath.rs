@@ -114,6 +114,12 @@ pub struct CompilerTask {
     pub problem: Option<String>,
 }
 
+impl CompilerTask {
+    pub(crate) fn annotation_processing_disabled(&self) -> bool {
+        self.arguments.len() == 1 && self.arguments[0] == "-proc:none"
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSetClasspath {
     pub name: String,
@@ -303,6 +309,14 @@ impl ProjectSnapshot {
             .iter()
             .filter(|task| task.language == CompilerLanguage::Java);
         let task = java.next()?;
+        let fork_java_home_matches = match task.options.get("forkJavaHome") {
+            Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(home)) => task
+                .java_home
+                .as_ref()
+                .is_some_and(|selected| path_key(Path::new(home)) == path_key(selected)),
+            _ => false,
+        };
         if java.next().is_some()
             || !task.complete
             || task.problem.is_some()
@@ -312,11 +326,11 @@ impl ProjectSnapshot {
                     | "org.gradle.api.tasks.compile.JavaCompile_Decorated"
             )
             || task.source_files.is_empty()
-            || !task.arguments.is_empty()
+            || (!task.arguments.is_empty() && !task.annotation_processing_disabled())
             || !task.annotation_processor_path.is_empty()
             || task.java_home.is_none()
             || task.options.get("fork") != Some(&serde_json::Value::Bool(false))
-            || task.options.get("forkJavaHome") != Some(&serde_json::Value::Null)
+            || !fork_java_home_matches
             || task.options.get("forkExecutable") != Some(&serde_json::Value::Null)
         {
             return None;
@@ -1635,6 +1649,56 @@ mod tests {
         assert!(plain_java_snapshot(&[legacy])
             .plain_java_task(caller)
             .is_none());
+    }
+
+    #[test]
+    fn plain_java_task_accepts_only_the_explicit_standalone_ap_disable_flag() {
+        let caller = "/repo/app/src/main/java/Use.java";
+        let mut java = plain_java_configuration();
+        java["arguments"] = serde_json::json!(["-proc:none"]);
+        let model = plain_java_snapshot(&[java.clone()]);
+        assert!(model
+            .plain_java_task(caller)
+            .unwrap()
+            .annotation_processing_disabled());
+        for args in [
+            serde_json::json!(["-proc:none", "-Xplugin:transform"]),
+            serde_json::json!(["-proc:none", "@compiler.args"]),
+            serde_json::json!(["-proc:none", "-parameters"]),
+            serde_json::json!(["-proc:none", "-proc:only"]),
+        ] {
+            java["arguments"] = args;
+            assert!(plain_java_snapshot(&[java.clone()])
+                .plain_java_task(caller)
+                .is_none());
+        }
+        java["arguments"] = serde_json::json!(["-proc:none"]);
+        java["java_home"] = serde_json::Value::Null;
+        assert!(plain_java_snapshot(&[java])
+            .plain_java_task(caller)
+            .is_none());
+    }
+
+    #[test]
+    fn plain_java_task_accepts_an_applied_toolchain_home_only_when_it_matches_the_selected_jdk() {
+        let caller = "/repo/app/src/main/java/Use.java";
+        for args in [serde_json::json!([]), serde_json::json!(["-proc:none"])] {
+            let mut java = plain_java_configuration();
+            java["arguments"] = args;
+            java["options"]["forkJavaHome"] = java["java_home"].clone();
+            assert!(plain_java_snapshot(&[java.clone()])
+                .plain_java_task(caller)
+                .is_some());
+            java["options"]["forkJavaHome"] = serde_json::json!("/other-jdk");
+            assert!(plain_java_snapshot(&[java.clone()])
+                .plain_java_task(caller)
+                .is_none());
+            java["options"]["forkJavaHome"] = serde_json::json!("/jdk");
+            java["java_home"] = serde_json::Value::Null;
+            assert!(plain_java_snapshot(&[java])
+                .plain_java_task(caller)
+                .is_none());
+        }
     }
 
     #[test]

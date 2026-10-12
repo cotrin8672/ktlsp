@@ -91,7 +91,7 @@ pub(crate) fn read_class_file(
     read().map_err(|error| format!("read class {entry_name} from {}: {error:#}", path.display()))
 }
 
-pub(crate) fn plain_java_classpath_entry(path: &Path) -> bool {
+pub(crate) fn plain_java_classpath_entry(path: &Path, processors_disabled: bool) -> bool {
     const SERVICES: [&str; 2] = [
         "META-INF/services/javax.annotation.processing.Processor",
         "META-INF/services/com.sun.source.util.Plugin",
@@ -99,6 +99,9 @@ pub(crate) fn plain_java_classpath_entry(path: &Path) -> bool {
     const MANIFEST: &str = "META-INF/MANIFEST.MF";
     if path.is_dir() {
         for service in SERVICES {
+            if processors_disabled && service == SERVICES[0] {
+                continue;
+            }
             match fs::symlink_metadata(path.join(service)) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 _ => return false,
@@ -132,6 +135,9 @@ pub(crate) fn plain_java_classpath_entry(path: &Path) -> bool {
         return false;
     }
     for service in SERVICES {
+        if processors_disabled && service == SERVICES[0] {
+            continue;
+        }
         if !matches!(
             archive.by_name(service),
             Err(zip::result::ZipError::FileNotFound)
@@ -722,6 +728,77 @@ mod tests {
     }
 
     #[test]
+    fn explicit_ap_disable_keeps_javac_plugin_and_manifest_guards() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_proc_none_services_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for (name, entries, expected) in [
+            (
+                "processor",
+                vec![(
+                    "META-INF/services/javax.annotation.processing.Processor",
+                    "ap.Provider",
+                )],
+                true,
+            ),
+            (
+                "plugin",
+                vec![(
+                    "META-INF/services/com.sun.source.util.Plugin",
+                    "plugin.Provider",
+                )],
+                false,
+            ),
+            (
+                "both",
+                vec![
+                    (
+                        "META-INF/services/javax.annotation.processing.Processor",
+                        "ap.Provider",
+                    ),
+                    (
+                        "META-INF/services/com.sun.source.util.Plugin",
+                        "plugin.Provider",
+                    ),
+                ],
+                false,
+            ),
+            (
+                "redirect",
+                vec![(
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\nClass-Path: hidden.jar\n",
+                )],
+                false,
+            ),
+        ] {
+            let jar = root.join(format!("{name}.jar"));
+            write_jar(&jar, &entries);
+            assert_eq!(
+                plain_java_classpath_entry(&jar, true),
+                expected,
+                "jar {name}"
+            );
+            let directory = root.join(name);
+            for (entry, contents) in entries {
+                let path = directory.join(entry);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, contents).unwrap();
+            }
+            assert_eq!(
+                plain_java_classpath_entry(&directory, true),
+                expected,
+                "directory {name}"
+            );
+            assert!(
+                !plain_java_classpath_entry(&jar, false),
+                "normal discovery {name}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn plain_java_classpath_checks_services_and_manifest_in_jars_and_directories() {
         let cases: &[(&str, &[(&str, &str)], bool)] = &[
             ("empty", &[], true),
@@ -763,7 +840,11 @@ mod tests {
         for (name, entries, expected) in cases {
             let jar = root.join(format!("{name}.JAR"));
             write_jar(&jar, entries);
-            assert_eq!(plain_java_classpath_entry(&jar), *expected, "jar {name}");
+            assert_eq!(
+                plain_java_classpath_entry(&jar, false),
+                *expected,
+                "jar {name}"
+            );
             let directory = root.join(name);
             fs::create_dir_all(&directory).unwrap();
             for (entry, contents) in *entries {
@@ -772,16 +853,25 @@ mod tests {
                 fs::write(path, contents).unwrap();
             }
             assert_eq!(
-                plain_java_classpath_entry(&directory),
+                plain_java_classpath_entry(&directory, false),
                 *expected,
                 "directory {name}"
             );
         }
-        assert!(!plain_java_classpath_entry(&root.join("missing.jar")));
+        assert!(!plain_java_classpath_entry(
+            &root.join("missing.jar"),
+            false
+        ));
         write_jar(&root.join("unknown.zip"), &[]);
-        assert!(!plain_java_classpath_entry(&root.join("unknown.zip")));
+        assert!(!plain_java_classpath_entry(
+            &root.join("unknown.zip"),
+            false
+        ));
         fs::write(root.join("corrupt.jar"), b"not a zip").unwrap();
-        assert!(!plain_java_classpath_entry(&root.join("corrupt.jar")));
+        assert!(!plain_java_classpath_entry(
+            &root.join("corrupt.jar"),
+            false
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -795,8 +885,8 @@ mod tests {
         for body in [b"\xff".as_slice(), vec![b'x'; 64 * 1024 + 1].as_slice()] {
             fs::write(&manifest, body).unwrap();
             write_binary_jar(&jar, &[("META-INF/MANIFEST.MF", body)]);
-            assert!(!plain_java_classpath_entry(&root));
-            assert!(!plain_java_classpath_entry(&jar));
+            assert!(!plain_java_classpath_entry(&root, false));
+            assert!(!plain_java_classpath_entry(&jar, false));
         }
         write_jar(&jar, &[("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")]);
         let mut corrupt = fs::read(&jar).unwrap();
@@ -806,15 +896,15 @@ mod tests {
             .unwrap();
         corrupt[start] ^= 1;
         fs::write(&jar, corrupt).unwrap();
-        assert!(!plain_java_classpath_entry(&jar));
+        assert!(!plain_java_classpath_entry(&jar, false));
         write_jar(
             &jar,
             &[("meta-inf/manifest.mf", "Class-Path: hidden.jar\n")],
         );
-        assert!(!plain_java_classpath_entry(&jar));
+        assert!(!plain_java_classpath_entry(&jar, false));
         fs::remove_file(&manifest).unwrap();
         fs::create_dir(&manifest).unwrap();
-        assert!(!plain_java_classpath_entry(&root));
+        assert!(!plain_java_classpath_entry(&root, false));
         fs::remove_dir_all(root).unwrap();
     }
 
