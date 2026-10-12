@@ -90,7 +90,7 @@ a useful known receiver in the same edited state.
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Current model-v9 native automatic-watching lifecycle retains all 86 original checks, including Kotlin's obsolete oldApi diagnostic. Four real builds, completion, exact definitions, generated-source changes, dirty buffers and clean shutdown pass | Focused automatic-refresh semantics verified; wider transforming cases open | Checkpoint 49: native-gradle-default-jdk-gradle-reload-1; the same 86 original expectations and native automatic watch delivery. Positive Kotlin result has transmitted-text SHA and accepted-store generation proof |
 | Kotlin compiler inputs | Capture and use the task's actual source selection, ordered libraries, compiler runtime and selected JDK across refresh | Main/test/runtime mapping remains verified on1.8.21,1.9.23 and2.4.0. Current1.8.21 processor run preserves all three exact unsaved wire bodies, full validated cache and selected tasks before each canonical Kotlin pull; source/generation correlation succeeds in both phases | Captured inputs and focused unsaved positive diagnostics verified | Checkpoint61; cache+refresh-generation correlation is not a server model-hash proof. Opaque options, other hosts/source sets and general producer closure remain open |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current KAPT/KSP108/114, zero unmeasured; same six Java diagnostic gaps. Independent current-API experiment preserves three Kotlin errors and Javac reports exactly three obsolete Java calls with no editorUnsaved/versionTwo false errors. Saved Lombok99/99 remains prior evidence | Partial; exact phase1 Java oracle verified, editor worker/handoff and disabled phase2 API remain open | Checkpoint61; actual selected JDK17/defaults captured from successful Gradle7.4.2 execution. No Java editor compiler worker exists. API stubs do not prove codegen/AP/producer closure |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current KAPT/KSP108/114, zero unmeasured; same six Java editor gaps. Independent current-API experiments preserve phase1 obsolete-call errors and all six disabled-phase2 Java errors, while current Source.editorUnsaved resolves | Partial; both phase compiler oracles verified, Java editor worker/handoff open | Checkpoints61/63; actual selected Gradle7.4.2/JDK17 options, effective UTF-8 charset and locale retained. Tool-owned Kotlin headers prove only checked APIs and conservative package domains; general plugins, AP and producer closure remain open |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Actual Retrofit's same focused 21 RPC / 25 semantic cases pass in both engines. Shared mixed fixture retains adapted IntelliJ LSP 38/38 and ktlsp 36/36, including strict first responses after change delivery | Shared fixture and focused actual-project cases verified | Checkpoint 43. Windows URI/version adapter remains explicit; these cases do not establish whole-project parity |
 | Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA with conditions recorded | Six roots have focused31-cycle observations across revisions. Current CEM bounds UI accepts31 exact buffers in each engine with actual SDK21; warm30 popup p50/p95 is40.428/42.548 ms for ktlsp and814.588/1459.806 ms for IDEA | Focused observations verified; wider controlled comparison pending | Checkpoint60. One first plus30 same-case repetitions; input-to-popup handoff, not physical rendering. Cache/order/instrumentation differ; no causal ratio, startup distribution or arbitrary pass gate |
@@ -3118,6 +3118,71 @@ default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
 
+### Sixty-third checkpoint: current Kotlin API and conservative package domains
+
+The disabled-processor phase previously stopped before Java compilation. An
+independent disposable Gradle7.4.2/JDK17 run now executes the original selected
+JavaCompile action, excluding only compileKotlin. It fails as expected; no current
+API, old Kotlin output or generated source is inserted. The complete Java task
+matches the accepted phase2 configuration after explicit project/cache-coordinate
+mapping. The fresh Kotlin dump differs in classpath and declared transform inputs,
+so it is not presented as the same Kotlin task.
+
+The actual Java compiler options, ordered seven-slot classpath, source inventory,
+SDK, locale and effective source charset are retained. Gradle reports
+file.encoding=MS932 but Charset.defaultCharset=UTF-8. A fresh helper instead has
+windows-31j as its default; the public StandardJavaFileManager explicitly receives
+the measured UTF-8 charset and ja-JP locale. Its options preserve both proc:none
+entries, empty sourcepath and the XD option. Only three private output paths and
+the absent Kotlin-output classpath slot are replaced.
+
+The independent public Javac API helper uses the two checked current Kotlin
+headers, while all three exact editor wire sources remain preserved separately.
+SourceAccess successfully calls the real current Source.editorUnsaved() API.
+The unchanged current JavaUse overlay reports all six errors: the three removed
+generated imports on lines2/3/4 and three associated parameter-type errors on
+line5. Every structured diagnostic is retained, with no three-error count cap.
+Source.editorUnsaved has no false diagnostic. These are independent compiler
+observations; the production Java editor still has the original six gaps.
+
+A separate tool-owned header experiment preserves the selected Kotlin1.8.21
+compiler, original plugins, source selection and all three wire texts. Normal
+compiler and auxiliary-header output are byte-identical in all six cases, retaining
+the six original Kotlin errors. Completed lowering accounts for all emitted class
+internal names and source origins. The ordinary case establishes only the whole
+declared package as each Kotlin source's possible naming domain; KotlinUse's API
+remains Unknown. File-level JVM naming, malformed package syntax, registered
+synthetic resolution, a foreign package provider and an unexplained registrar all
+deny the corresponding domain proof. No Unknown class is granted API authority.
+
+Independent normal valid-copy compilations confirm Source's public descriptors,
+access flags, superclass and interfaces agree with its checked header, and that
+JvmName really emits the renamed facade. Class bytes differ, as expected for a
+header. These controls do not establish generic ABI, arbitrary plugins, producer
+closure, negative-diagnostic authority or product integration.
+
+The root completed all ten public-Javac experiment stages and all twenty-six
+domain experiment stages, including fifteen native domain commands. All process
+trees were fresh owned Jobs and settled to zero before cleanup; preexisting
+process handles remain zero. No new LSP performance or IDEA-parity claim follows.
+The original phase1 generated-source bytes must still be captured before the next
+clean; historical metadata cannot reconstruct them.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-phase2-java-defaults62-1/receipt.json,
+independent-phase2-javac-api63-1/receipt.json,
+independent-tool-owned-header-domains63-1/receipt.json,
+domain63-independent-byte-check.json.
+Their receipt SHA256 values are respectively
+8ba32e0ec9f60fe6827102965f250a10e9ea258072c35dc818adb8428227baf5,
+c65072c1c50f536ccac584652441088cc3b94871edffcfc09943ccf3b366a82f,
+e301d3beb05711334d0e07134d43d068fb3b4baed22ec06c16854c1359c1c5ae,
+188b3c8d20585bde1b127678fee853c13906d762cf2802fef2e624179d14003f.
+Actual experiment roots are kl62-phase2-java-1, kl62-phase2-javac-api-1 and
+kl63-tool-header-domains-1 under the same Windows Temp directory. They are external
+experiments, not a portable product regression suite. Next integrate only proved
+inputs, preserve extension facts and reproduce the original Java editor cases.
+
 ### Sixty-second checkpoint: first useful completion after project readiness
 
 The normal gradle-live observer no longer polls for a desired completion result.
@@ -3144,8 +3209,16 @@ The other completion, navigation and unused-import expectations are unchanged.
 The first reuse decodes only JDK/annotation symbol caches, whereas the next reuse
 decodes all seven. In the latter run, all source-JAR SHA256/mtime identities,
 source markers and symbol-cache hashes remain identical before/after execution.
-The intermediate cache miss remains under investigation. These distinct cache
-conditions are not a distribution, an old/new causal comparison, a fully cold
+The intermediate five source-JAR misses were independently traced to the
+controller's lexical cache path: the first run appended /cache while the next used
+backslash-cache. The existing raw-path fingerprint changes despite identical JAR
+bytes and mtimes; reproducing only that separator change yields all five observed
+cache-key pairs. The third run reuses the same spelling. No product path
+normalization change follows from this controller difference. Evidence:
+gradle-live-cache-path62-1/reproduce.ps1 and
+gradle-live-cache-path62-1/root-reproduction.json under the artifact base.
+These distinct cache conditions are not a distribution, an old/new causal
+comparison, a fully cold
 machine measurement or proof that startup speed targets are met. Library readiness
 is separate from project-local completion availability. Input-to-display latency,
 physical rendering and steady/peak RSS are not measured by these probes.
