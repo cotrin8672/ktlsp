@@ -903,6 +903,8 @@ fn index_dependencies(
         {
             continue;
         }
+        let install_start = crate::trace::enabled().then(Instant::now);
+        let previous_files = stats.files;
         let mut files_for_coord = Vec::new();
         for batch in result.batches {
             let mut guard = ws.lock();
@@ -933,6 +935,14 @@ fn index_dependencies(
             guard.index_dependency_batch_for_generation(generation, batch);
             guard.bump_index_revision();
             stats.files += 1;
+        }
+        if let Some(start) = install_start {
+            crate::trace::span(
+                "deps.install_batch",
+                "deps",
+                start,
+                serde_json::json!({ "label": result.label, "files": stats.files - previous_files }),
+            );
         }
         if let Some(coord) = result.coord.clone() {
             indexed_files.insert(coord, files_for_coord);

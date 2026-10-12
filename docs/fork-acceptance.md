@@ -39,6 +39,17 @@ speed; (2) code actions, navigation, inlay hints and other editing UX, including
 their speed; (3) memory reductions that preserve fast behavior and useful analysis.
 Memory-only storage changes are held while the first two priorities are addressed.
 
+The 31-cycle native completion observations mean one first operation plus 30
+repetitions of the same representative operation in one editor/server session,
+not 31 distinct semantic cases or independent startup runs. Their nearest-rank
+warm p95 is the second-slowest of only 30 samples; it is a descriptive observation,
+not a precise tail estimate or a universal acceptance threshold. These checks cover
+unsaved-buffer delivery, useful candidates, popup handoff and exact accepted text.
+Core semantic tests and independent compiler/IDEA expectations cover different,
+overlapping failure modes. Broader completion quality requires distinct unfinished
+contexts, overloads, ambiguous names, cross-language edits and dependency changes;
+repeating one successful operation cannot substitute for that coverage.
+
 ## Initial environment
 
 - Starting revision: `f2c4c96799f68e11014021b7a77a0ef950770da7`, branch `main`.
@@ -63,7 +74,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current reverse-reference update slice passes 1,352 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 54; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current dependency-cache restoration slice passes 1,352 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 55; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 213 matched / 5 unmet of 218: original 199 retain 194 matches; all 18 resource/editing first RPCs and exact restoration pass. Current features retains 78/80; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 54 native-reference-java54-2 and native-reference-features54-2. All 18 related RPCs run once with reconstructed outbound source hashes. Forced cleanup is operational evidence |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -3105,6 +3116,72 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-fifth checkpoint: measure warm startup phases and reduce context restoration cost
+
+Startup tracing now separates symbol-cache decoding, declaration-context restoration
+and installation into the shared index. Timers and extra payloads are conditional
+on tracing. Source-policy validation, archive identity checks and the v27 cache
+wire format are unchanged. Context restoration uses the existing FxBuildHasher;
+the existing regression verifies exact values, distinct ordered scopes, all symbol
+and JVM type positions, empty scopes and repeated restoration.
+
+The profile also reproduced a trace defect: appending a serialized event and its
+newline separately allowed concurrent writers to concatenate JSON objects on one
+line. The complete line is now passed to one write_all call. All lines in the six
+updated startup runs and both accepted library editor runs parse separately.
+Baseline concatenated objects are retained and decoded without dropping events.
+
+Six fresh server lifetimes per variant run in baseline/updated/updated/baseline
+order repeated three times, using the same already-warmed explicit OkHttp cache,
+project, selected JDK17 and private Gradle home. Both variants include phase traces;
+the updated binary also includes the append fix. Per-run medians and ranges, ms:
+
+| Observation, n=6 per variant | Baseline median [min, max] | Updated median [min, max] |
+| --- | --- | --- |
+| Library ready from spawn | 2554.5 [2484, 2968] | 2515.5 [2469, 2672] |
+| Dependency indexing span | 2141.835 [2112.686, 2434.608] | 2121.585 [2075.497, 2227.088] |
+| Sum of cache restoration spans | 435.840 [425.236, 464.748] | 382.595 [374.476, 400.307] |
+
+Worker spans overlap, so their sum is not an end-to-end duration or measured CPU
+time. Decoding and installation medians remain similar; restoration is the local
+improvement. End-to-end ranges overlap, so no general startup speedup or precise
+p95 is established. OS cache and host load remain uncontrolled. An earlier single
+warm observation took 22.660 seconds for dependency indexing; the instrument-only
+binary subsequently took 2.126 seconds before the hashing change. That unexplained
+variation is retained and is not attributed to this fix.
+
+Every comparative run retains 55 cache batches, 37,544 files, 909,952 symbols,
+13,891 JDK files and 285,542 JDK symbols, with 126 useful semantic tokens and normal
+acknowledged shutdown/exit 0. The same OpenJSSE source-policy failure remains;
+missingSources is zero. These counts are indexing controls, not broad semantic
+coverage. No memory saving is claimed.
+
+Release 241c014a passes all 1,352 workspace tests, zero failures, four ignored,
+formatting, harness syntax and both release builds. Real Neovim's existing library
+scenario passes all 13 assertions after an actual Gradle9.6.1/KGP2.4.0 compilation,
+then again with all three JDK/stdlib/annotations cache batches loaded, 14,308 files.
+These include library gd, unsaved Java method edits visible in Kotlin completion,
+exact current declarations, deletion, close/reopen restoration and unchanged disk
+source. The legacy probe uses os.exit; graceful server shutdown is not measured by
+that probe, and only its fresh Job descendants are closed.
+
+An intermediate run also matches all 13 editor assertions but its observer rejects
+the assumed Maven cache hits: changing the private Gradle-home path changes the
+source-archive cache identity. It loads the JDK cache and reparses Maven sources.
+That partial-cache run is retained; the final cache control reuses only the task's
+completed original home and verifies all three restored batches. No user Java
+process is adopted or inspected.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-okhttp-warm-startup54-1/, native-dependency-phase-rust55-1/,
+native-okhttp-warm-startup55-{1,2}/, native-context-speed-rust55-1/,
+source-context-startup55-1/, native-okhttp-context55-{01..12}-{baseline,updated}/,
+and native-context-library55-{1,2,3}/. Comparative results SHA256:
+549af1a0e7935162c3f35da6e11f7894040ccf90819bf8cd817ecc39d8a97666.
+Current source/project guards pass; the memory-only sparse value-type patch remains
+held. Next remove larger verified startup waits and improve hints through shared
+contextual analysis. Original diagnostic and six-project coverage gaps remain open.
 
 ### Fifty-fourth checkpoint: avoid repeated reverse-reference scans during edits
 

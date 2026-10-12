@@ -257,10 +257,11 @@ pub fn reshare_file_type_contexts(
     symbols: &mut [IndexedSymbol],
     jvm: Option<&mut crate::jvm::SourceFileFacts>,
 ) {
+    use crate::fxhash::FxBuildHasher;
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    fn visit(ty: &mut TypeRef, pool: &mut HashSet<Arc<Vec<String>>>) {
+    fn visit(ty: &mut TypeRef, pool: &mut HashSet<Arc<Vec<String>>, FxBuildHasher>) {
         if let Some(shared) = pool.get(&ty.package_candidates) {
             if !Arc::ptr_eq(shared, &ty.package_candidates) {
                 ty.package_candidates = Arc::clone(shared);
@@ -273,7 +274,7 @@ pub fn reshare_file_type_contexts(
         }
     }
 
-    let mut pool = HashSet::new();
+    let mut pool = HashSet::with_hasher(FxBuildHasher::default());
     for symbol in symbols {
         if let Some(receiver) = symbol.extension_receiver.as_deref_mut() {
             visit(&mut receiver.ty, &mut pool);

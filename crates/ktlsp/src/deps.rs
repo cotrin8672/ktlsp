@@ -716,6 +716,7 @@ fn symcache_load(fingerprint: &str, source_dir: &Path) -> Option<Vec<FileSymbols
 }
 
 fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSymbols>> {
+    let decode_start = crate::trace::enabled().then(std::time::Instant::now);
     // A missing cache file is a normal miss (not an error).
     let bytes = fs::read(cache_file).ok()?;
     let decoded = zstd::stream::decode_all(&bytes[..]).ok()?;
@@ -729,6 +730,20 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
             return None;
         }
     };
+    if let Some(start) = decode_start {
+        crate::trace::span(
+            "deps.symcache_decode",
+            "deps",
+            start,
+            serde_json::json!({
+                "cache": cache_file.file_name().map(|name| name.to_string_lossy()),
+                "compressedBytes": bytes.len(),
+                "decodedBytes": decoded.len(),
+                "files": cached.len(),
+            }),
+        );
+    }
+    let restore_start = crate::trace::enabled().then(std::time::Instant::now);
     // Cached facts must have the same identity as the editor's file URI, including caches written
     // with native separators before path keys were normalized.
     for batch in &mut cached {
@@ -741,6 +756,17 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
     {
         for batch in &mut cached {
             ktcore::symbol::reshare_file_type_contexts(&mut batch.symbols, batch.jvm.as_mut());
+        }
+        if let Some(start) = restore_start {
+            crate::trace::span(
+                "deps.symcache_restore",
+                "deps",
+                start,
+                serde_json::json!({
+                    "cache": cache_file.file_name().map(|name| name.to_string_lossy()),
+                    "files": cached.len(),
+                }),
+            );
         }
         Some(cached)
     } else {

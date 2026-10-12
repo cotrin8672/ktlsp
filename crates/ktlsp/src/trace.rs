@@ -56,15 +56,16 @@ fn record(event: &TraceEvent) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(line) = serde_json::to_string(event) else {
+    let Ok(mut line) = serde_json::to_string(event) else {
         return;
     };
+    line.push('\n');
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
