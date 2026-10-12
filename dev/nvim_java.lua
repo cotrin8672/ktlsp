@@ -1264,6 +1264,16 @@ do
   end
 end
 
+local versions_match = #diagnostic_probes == 4
+for _, observation in ipairs(diagnostic_probes) do
+  local result = observation.response and observation.response.result
+  versions_match = versions_match and observation.generation_certified == true
+    and observation.wire_matches_snapshot == true and result ~= nil
+    and result.version == observation.expected_version
+end
+check("diagnostic notifications use exact edited document versions", versions_match,
+  vim.inspect(diagnostic_probes))
+
 shutdown.force_requested = true
 shutdown.stop_ok, shutdown.stop_error = pcall(function() client:stop(true) end)
 vim.wait(300)

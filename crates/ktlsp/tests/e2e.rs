@@ -1043,3 +1043,97 @@ async fn expanded_editor_surface_requests_round_trip() {
 
     assert!(backend.shutdown().await.is_ok());
 }
+
+#[tokio::test]
+async fn workspace_diagnostic_versions_follow_unsaved_edits_and_reopen() {
+    async fn report(backend: &Backend, uri: &Uri) -> WorkspaceFullDocumentDiagnosticReport {
+        let response = backend
+            .workspace_diagnostic(WorkspaceDiagnosticParams {
+                identifier: None,
+                previous_result_ids: Vec::new(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .unwrap();
+        let WorkspaceDiagnosticReportResult::Report(report) = response else {
+            panic!("expected a complete workspace report");
+        };
+        report
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                WorkspaceDocumentDiagnosticReport::Full(report) if report.uri == *uri => {
+                    Some(report)
+                }
+                _ => None,
+            })
+            .expect("open document absent from workspace diagnostics")
+    }
+    let (service, _socket) = LspService::new(Backend::new);
+    let backend = service.inner();
+    for (file, language, broken, valid, initial) in [
+        (
+            "Versions.java",
+            "java",
+            "class Versions { void run( }",
+            "class Versions {}",
+            7,
+        ),
+        ("Versions.kt", "kotlin", "fun run( {", "fun run() {}", -17),
+    ] {
+        let uri = test_uri(file);
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: language.into(),
+                    version: initial,
+                    text: broken.into(),
+                },
+            })
+            .await;
+        let first = report(backend, &uri).await;
+        assert_eq!(first.version, Some(i64::from(initial)));
+        assert!(!first.full_document_diagnostic_report.items.is_empty());
+        for (version, text) in [(41, valid), (42, broken), (99, valid)] {
+            backend
+                .did_change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: text.into(),
+                    }],
+                })
+                .await;
+            let current = report(backend, &uri).await;
+            assert_eq!(current.version, Some(i64::from(version)));
+            assert_eq!(
+                current.full_document_diagnostic_report.items.is_empty(),
+                text == valid
+            );
+        }
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await;
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: language.into(),
+                    version: 1,
+                    text: valid.into(),
+                },
+            })
+            .await;
+        let reopened = report(backend, &uri).await;
+        assert_eq!(reopened.version, Some(1));
+        assert!(reopened.full_document_diagnostic_report.items.is_empty());
+    }
+}

@@ -194,8 +194,11 @@ Editor-facing changes should also run the smallest relevant harness scenario: `f
 `features-results.json` and `java-results.json` retain each RPC's first raw response and
 classify unavailable requests as unmeasured. An observation deadline is not a speed target.
 Edited diagnostic probes record the outbound version and source hash before judging the
-first target notification. A versionless notification has an explicit correlation assumption;
-neither it nor a first empty push proves that asynchronous compiler diagnostics are final.
+first target notification. The `java` scenario requires each Java/Kotlin notification to carry
+that exact document version. Workspace pull reports also retain the client version across
+unsaved changes and close/reopen. A versionless notification from another server has an
+explicit correlation assumption; neither it nor a first empty push proves that asynchronous
+compiler diagnostics are final.
 The Gradle reload probe also checks captured Kotlin source/library/JDK inputs. The
 project model records the selected compiler runtime and launch policy separately;
 captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.

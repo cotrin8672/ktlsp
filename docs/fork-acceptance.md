@@ -74,8 +74,8 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current contextual Java hint slice passes 1,357 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 56; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 220 matched / 5 unmet of 225: original 218 retain 213 matches; all six contextual hint queries, 18 resource/editing first RPCs and exact restoration pass. Current features retains 78/80; library passes 13/13 after actual compilation; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 56 native-context-hints-java56-2, native-context-hints-features56-1 and native-context-hints-library56-1. Related RPCs run once with reconstructed outbound source hashes. Legacy forced cleanup is operational evidence |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current diagnostic-version slice passes 1,358 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 57; deeper var aliases, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 221 matched / 5 unmet of 226: original 225 retain 220 matches; all four diagnostic notifications now carry their exact edited Java/Kotlin versions. Six contextual hint queries, 18 resource/editing first RPCs and restoration pass. Features retains 78/80; library passes 13/13 after actual compilation; semantic 107 is a prior result | Partial; original diagnostic gaps remain open | Checkpoint 57 native-diagnostic-versions-java57-1, native-diagnostic-versions-features57-1 and native-diagnostic-versions-library57-1. Related RPCs run once with reconstructed outbound source hashes. Legacy forced cleanup is operational evidence |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
@@ -3117,6 +3117,66 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-seventh checkpoint: bind diagnostics to the client's document version
+
+The current push and workspace pull paths omitted document versions. A real
+Backend regression reproduces workspace version None instead of the opening
+version 7 before the fix. The internal debounce generation is now stored alongside,
+and separately from, the client's signed document version. Open/change/close update
+source and version under the same workspace lock; diagnostic text, merged items,
+compiler-store identity and version come from that snapshot. UTF-16 conversion and
+the asynchronous publish remain outside the lock. No new map, dependency or public
+extension API is added.
+
+The focused regression covers both Java and Kotlin, initial versions 7 and -17,
+nonconsecutive edits 41/42/99, broken-to-valid and valid-to-broken text, and reopening
+at version 1. It checks exact workspace report versions and actual syntax-error
+presence after each edit. The initial observer compile error was a test type
+mismatch between i32 and the workspace report's i64; it is retained separately
+from the subsequent genuine failing baseline. The fixed focused test passes once.
+
+The existing java scenario now requires all four edited diagnostic notifications
+to carry their actual outbound version and a matching reconstructed source hash.
+Their first accepted notifications are Java 5, Java 11, Kotlin 11 and Java 19;
+all four are certified by exact version. The prior fallback assumption for other
+servers remains explicit. Exact version identifies the source generation; it
+does not make an early empty notification a final compiler result.
+
+| Case | Expected | Observed / status |
+| --- | --- | --- |
+| Workspace pull regression | Exact source version and syntax state through both-language edits/reopen | 1 focused test passed; full Rust suite 1,358 passed / 0 failed / 4 ignored |
+| Native diagnostic correlation | Four exact edited versions with matching outbound text hashes | 4/4 matched; one new metadata assertion passes |
+| Existing Java semantic surface | Preserve all original 225 expectations | 220/225 retained; 221/226 including metadata; same five diagnostic mismatches, none unmeasured |
+| Existing features | Preserve all 80 expectations | 78/80 retained; same two missing-type diagnostic/explanation mismatches, none unmeasured |
+| Actual Gradle library lifecycle | Build, dependency navigation and unsaved JDK edits | 13/13 after actual Gradle9.6.1/KGP2.4.0 compilation |
+
+Formatting, harness/Lua syntax, diff checks and both release binaries pass.
+ktlsp SHA256:
+99b21c549acc072dee6af7211f02ea1952665db6574a76dc9871ed9073f4f5af.
+ktcheck SHA256:
+f5d74e31adc9cda459aeb7e9d5ecdcecd26a639a860b2187b3562249f2daccce.
+Full Rust log SHA256:
+dc24c325f5e8500b57c655e66906fb8b078aa5ece5a8443dc86a8f2e7b456915.
+Native Java raw artifact SHA256:
+ff540e7acc31c0b73ae45e71a8332bc86bfe52e7bd571f0e8808ca39798c8fc0.
+
+Evidence is under
+C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-diagnostic-versions-baseline57-{1,2}/,
+native-diagnostic-versions-focused57-1/, native-diagnostic-versions-rust57-1/,
+native-diagnostic-versions-java57-1/, native-diagnostic-versions-features57-1/
+and native-diagnostic-versions-library57-1/. Source guards pass; fresh owned Job
+descendants are closed. The legacy editor shutdown still forces termination and
+does not supply graceful-shutdown evidence. No new latency or IDEA parity claim.
+
+The semantic gaps remain open: ordinary no-build-model fixtures do not have closed
+compiler-producer authority, and the current fast call-shape gate requires global
+closure even where selected plain Java owner evidence exists. Next reduce an actual
+selected Gradle Java call with that owner evidence and compare its unsaved errors
+against javac; reuse the existing java/library/Gradle probes. Do not globally set
+compiler_producers_complete or weaken the original five expectations. Java AP and
+opaque compiler plugins need their real compiler result, not source-only closure.
 
 ### Fifty-sixth checkpoint: contextual Java hints and first-response correctness
 

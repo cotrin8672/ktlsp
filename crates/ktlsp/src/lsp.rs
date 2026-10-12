@@ -63,6 +63,12 @@ enum DiagnosticScope {
     Workspace,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct DiagnosticRevision {
+    generation: u64,
+    document_version: Option<i32>,
+}
+
 pub struct Backend {
     client: Client,
     ws: Arc<Mutex<Workspace>>,
@@ -71,9 +77,8 @@ pub struct Backend {
     /// Whether the client advertised snippet support in `initialize`. Set once; gates whether
     /// completion items insert `name($0)` snippets or plain bare names.
     snippets_supported: Mutex<bool>,
-    /// Per-document edit counter for debouncing diagnostics: each `did_open`/`did_change` bumps the
-    /// counter; a scheduled recompute only publishes if the counter still matches (else superseded).
-    doc_versions: Arc<Mutex<HashMap<String, u64>>>,
+    /// Client document versions stay separate from debounce generations used for invalidation.
+    doc_versions: Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     /// Whether the client advertised `window.workDoneProgress` in `initialize`. Gates server-initiated
     /// progress (the indexing spinner); when false we fall back to log messages.
     progress_supported: Arc<Mutex<bool>>,
@@ -158,6 +163,7 @@ impl Backend {
                 index_workspace(
                     client.clone(),
                     ws.clone(),
+                    diagnostic_versions.clone(),
                     root.clone(),
                     progress,
                     gradle,
@@ -986,6 +992,7 @@ fn index_dependencies(
 async fn index_workspace(
     client: Client,
     ws: Arc<Mutex<Workspace>>,
+    versions: Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     root: PathBuf,
     progress: bool,
     gradle: bool,
@@ -1249,7 +1256,7 @@ async fn index_workspace(
             }
             return;
         }
-        publish_diagnostics(&ws, &client, &key).await;
+        publish_diagnostics(&ws, &client, &versions, &key).await;
     }
     if !ws.lock().is_current_generation(generation) {
         if let Some(p) = ongoing {
@@ -1851,7 +1858,15 @@ impl LanguageServer for Backend {
         let doc = params.text_document;
         if let Some(key) = uri_to_key(&doc.uri) {
             let text = doc.text;
-            self.ws.lock().open(key.clone(), text.clone());
+            {
+                let mut ws = self.ws.lock();
+                ws.open(key.clone(), text.clone());
+                self.doc_versions
+                    .lock()
+                    .entry(key.clone())
+                    .or_default()
+                    .document_version = Some(doc.version);
+            }
             self.seed_jdk_imports_for_open_java(key.clone(), text);
             self.schedule_diagnostics(key);
         }
@@ -1861,7 +1876,15 @@ impl LanguageServer for Backend {
         // FULL sync: the last (only) change holds the entire new document.
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             if let Some(change) = params.content_changes.into_iter().last() {
-                self.ws.lock().change(&key, change.text);
+                {
+                    let mut ws = self.ws.lock();
+                    ws.change(&key, change.text);
+                    self.doc_versions
+                        .lock()
+                        .entry(key.clone())
+                        .or_default()
+                        .document_version = Some(params.text_document.version);
+                }
                 self.schedule_diagnostics(key);
             }
         }
@@ -1869,10 +1892,13 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
-            self.ws.lock().close(&key);
-            self.doc_versions.lock().remove(&key);
+            {
+                let mut ws = self.ws.lock();
+                ws.close(&key);
+                self.doc_versions.lock().remove(&key);
+            }
             self.schedule_diagnostics(key.clone());
-            publish_diagnostics(&self.ws, &self.client, &key).await;
+            publish_diagnostics(&self.ws, &self.client, &self.doc_versions, &key).await;
         }
     }
 
@@ -1968,7 +1994,7 @@ impl LanguageServer for Backend {
             );
         };
         let start = Instant::now();
-        let (items, result_id) = lsp_diagnostics_with_result(&self.ws, &key);
+        let (items, result_id, _) = lsp_diagnostics_with_result(&self.ws, &self.doc_versions, &key);
         crate::trace::span(
             "diagnostics_pull",
             "lsp",
@@ -2003,11 +2029,12 @@ impl LanguageServer for Backend {
             let Some(uri) = key_to_uri(&key) else {
                 continue;
             };
-            let (diagnostics, result_id) = lsp_diagnostics_with_result(&self.ws, &key);
+            let (diagnostics, result_id, version) =
+                lsp_diagnostics_with_result(&self.ws, &self.doc_versions, &key);
             items.push(WorkspaceDocumentDiagnosticReport::Full(
                 WorkspaceFullDocumentDiagnosticReport {
                     uri,
-                    version: None,
+                    version: version.map(i64::from),
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
                         result_id,
                         items: diagnostics,
@@ -3687,33 +3714,39 @@ fn severity_to_lsp(severity: Severity) -> DiagnosticSeverity {
 
 /// Publish the current fast diagnostics for `key`. Computes under the workspace lock and drops it
 /// before the publish `.await`.
-async fn publish_diagnostics(ws: &Arc<Mutex<Workspace>>, client: &Client, key: &str) {
+async fn publish_diagnostics(
+    ws: &Arc<Mutex<Workspace>>,
+    client: &Client,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
+    key: &str,
+) {
     let uri = match key_to_uri(key) {
         Some(u) => u,
         None => return,
     };
-    let items = lsp_diagnostics(ws, key);
-    client.publish_diagnostics(uri, items, None).await;
-}
-
-fn lsp_diagnostics(ws: &Arc<Mutex<Workspace>>, key: &str) -> Vec<Diagnostic> {
-    lsp_diagnostics_with_result(ws, key).0
+    let (items, _, version) = lsp_diagnostics_with_result(ws, versions, key);
+    client.publish_diagnostics(uri, items, version).await;
 }
 
 fn lsp_diagnostics_with_result(
     ws: &Arc<Mutex<Workspace>>,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     key: &str,
-) -> (Vec<Diagnostic>, Option<String>) {
-    let (text, diagnostics, result_id) = {
+) -> (Vec<Diagnostic>, Option<String>, Option<i32>) {
+    let (text, diagnostics, result_id, version) = {
         let mut ws = ws.lock();
+        let version = versions
+            .lock()
+            .get(key)
+            .and_then(|revision| revision.document_version);
         match ws.doc_text(key) {
             Some(text) => {
                 let diagnostics = ws.diagnostics(key);
                 // The compiler-store identity and merged items come from the same locked snapshot.
                 let result_id = ws.kotlin_diagnostic_result_id(key);
-                (Some(text), diagnostics, result_id)
+                (Some(text), diagnostics, result_id, version)
             }
-            None => (None, Vec::new(), None),
+            None => (None, Vec::new(), None, version),
         }
     };
     let items = match text {
@@ -3726,7 +3759,7 @@ fn lsp_diagnostics_with_result(
         }
         None => Vec::new(),
     };
-    (items, result_id)
+    (items, result_id, version)
 }
 
 /// Convert a core `Def` (file key + byte range) into an LSP `Location`, reading the target file's
@@ -5326,14 +5359,14 @@ mod tests {
 fn schedule_owned_diagnostic(
     ws: &Arc<Mutex<Workspace>>,
     client: &Client,
-    versions: &Arc<Mutex<HashMap<String, u64>>>,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     key: String,
 ) {
     let version = {
         let mut versions = versions.lock();
-        let n = versions.entry(key.clone()).or_insert(0);
-        *n += 1;
-        *n
+        let revision = versions.entry(key.clone()).or_default();
+        revision.generation += 1;
+        *revision
     };
     let ws = ws.clone();
     let client = client.clone();
@@ -5343,7 +5376,7 @@ fn schedule_owned_diagnostic(
         if versions.lock().get(&key).copied() != Some(version) {
             return;
         }
-        publish_diagnostics(&ws, &client, &key).await;
+        publish_diagnostics(&ws, &client, &versions, &key).await;
     });
 }
 
@@ -5740,7 +5773,7 @@ impl KotlinDiagnosticState {
 fn schedule_selected_kotlin_diagnostics(
     ws: &Arc<Mutex<Workspace>>,
     client: &Client,
-    versions: &Arc<Mutex<HashMap<String, u64>>>,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     state: &Arc<Mutex<KotlinDiagnosticState>>,
     workers: &Arc<tokio::sync::Semaphore>,
     watches: &Arc<Mutex<WatchState>>,
@@ -5928,7 +5961,7 @@ fn schedule_selected_kotlin_diagnostics(
             match result {
                 Ok(keys) => {
                     for key in keys {
-                        publish_diagnostics(&ws, &client, &key).await;
+                        publish_diagnostics(&ws, &client, &versions, &key).await;
                     }
                 }
                 Err(error) => {
