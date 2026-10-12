@@ -65,7 +65,7 @@ pub(crate) fn read_class_file(
             metadata.is_file(),
             "classpath entry is not a file or directory"
         );
-        let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
+        let mut archive = open_archive(path)?;
         // shortcut: Version-specific class selection is unsupported; reject only the affected owner.
         anyhow::ensure!(
             !archive.file_names().any(|name| {
@@ -122,10 +122,7 @@ pub(crate) fn plain_java_classpath_entry(path: &Path, processors_disabled: bool)
     {
         return false;
     }
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+    let Ok(mut archive) = open_archive(path) else {
         return false;
     };
     if archive

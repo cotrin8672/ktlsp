@@ -74,14 +74,14 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current selected Java call-shape slice passes 1,362 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 58; broader generic inference, arbitrary compiler plugins and full-project parity remain open |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java retains 221/226 and features 78/80, with the same five/two diagnostic gaps and none unmeasured. Library now passes 20/20, including six exact first-pull Java edit states and restoration after actual Gradle compilation | Partial; selected Java repair verified, first cold diagnostic cost open | Checkpoint 58 native-selected-java-{java,features,library}58-1. Six exported source states independently match javac; initial diagnostic pull is 323.444 ms versus 3.623-4.381 ms for subsequent states, not a stable latency distribution |
-| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Selected Java diagnostics and the existing-archive-reader reuse pass 1,362 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 59; broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Java retains checkpoint58's 221/226 and features78/80, with the same five/two diagnostic gaps and none unmeasured. Current archive-reader release retains library20/20, including exact first-pull Java edit states after actual Gradle compilation | Partial; selected diagnostics and archive-reader change verified | Checkpoint 59 native-selected-archive-library59-1. Initial pull19.391 ms; following distinct states3.460-4.763 ms. Startup variability remains open; these are not a stable latency distribution |
+| CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and successfully compiles Kotlin and Java. Prior non-Mixin native completion accepts31/31 whole buffers in each engine. Latest same-JDK21 comparison exposes multiple-where-bound member lookup: ktlsp0/2, IDEA2/2 | Focused compiler/model and earlier UI evidence verified; newly reproduced bound gap open | Checkpoints50/59. Original goto and unsaved partial completion use identical unchanged source snapshots. Latest IDEA semantics pass, but graceful exit is unobserved. Repair shared bounded receivers and recheck real popup acceptance |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
 | Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass 18/18 | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
 | Contextual inlay hints | Java var hints share completion types, preserve generic arguments and reflect unsaved Kotlin changes without inventing invalid types | Thirteen exact type/position cases match initially and after producer changes/restoration. Six native first responses cover those states, a visible line and three invalid initializers. Actual Kotlin/javac output verifies both producer variants | Focused repair verified; broader inference and display latency open | Checkpoint 56; initial partial-JDK String gap reproduced and repaired in shared type resolution. This is RPC/semantic evidence, not native hint-render timing or IDEA parity |
-| Inheritance and generics | Correct inherited members and substituted types across both languages | Source projected arguments share equality/lower/upper constraints. Plain method type variables now bind actual normalized arguments from Java/Kotlin; 1/8/20/32 nested Java calls retain useful types and bounded nonzero leaf work | Partial; focused source generic repair verified | Checkpoints 42/52. Javac completed controls and exact Kotlin navigation pass; capture, varying lower bounds, bounded constructors and compiled-only generic signatures remain gaps |
+| Inheritance and generics | Correct inherited members and substituted types across both languages | Source projected arguments share constraints; plain method variables bind normalized Java/Kotlin arguments and32 nested calls retain useful types. Actual CEM T with three where bounds still returns empty goto and partial completion where IDEA returns getEnchantmentLevel | Partial; actual bounded-receiver gap reproduced | Checkpoints42/52/59. Repair shared lexical parameter/bound facts, then measure exact definitions and unsaved acceptance; capture, varying lower bounds, bounded constructors and compiled-only signatures remain open |
 | Overloads and nullability | Select correct overloads; preserve nullable/platform types; no arbitrary ambiguous target | Tenth-fixed-2 known Java Int/String calls share typed selection across navigation, result inference and references. Strict typed override dominance preserves distinct overloads, boxed signatures and unknown competitors. Phased Java widening/boxing specificity remains Unknown | Partial; current focused/editor hierarchy controls verified | Related eleven suites pass 205 tests, including 58 member-selection and 27 JVM projection cases. Measure wider compiler/IDEA cases |
 | Kotlin extensions | Visible compatible extensions resolve and complete, including chained results | Retrofit's six golden/six incomplete requests pass. Real Spring retains nine focused first-response queries; current ObjectProvider.getObject native completion accepts exact buffers 31/31 | Focused repair verified; full-project acceptance partial | Checkpoints 29/53. Current Spring ktlsp shutdown exits 0; ten failed/ten missing source inputs and broader extension cases remain |
 | Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks improve 31/44 to 44/44, preserving the previous 65 checks. Current normalized receiver arguments and inline nominal bounds have shared regression controls; ordinary semantic scenario retains 107 assertions | Focused semantics verified; where/F-bounds and projected receivers remain coverage gaps | Checkpoints 33/39: exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have Rust regression controls; no six-project parity or speed claim |
@@ -3117,6 +3117,85 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-ninth checkpoint: reuse in-memory ZIP reads for selected Java facts
+
+Selected Java diagnostics repeatedly open java.base.jmod for Object facts and
+classpath JARs for processor-service eligibility. Both readers previously built
+ZipArchive<File>, even though jar.rs already has open_archive, used by source
+indexing to avoid archive seek churn. The two readers now reuse that helper.
+The production diff adds two lines and removes five. Selection, multi-release,
+manifest/service, class-size and decode checks stay in their existing paths.
+
+An isolated checkout at checkpoint58 plus exactly this production diff prevents
+the concurrent bounded-type implementation from entering the measurement or
+release binary. A temporary ignored timing probe calls the actual read_class_file
+and plain_java_classpath_entry functions without workspace/cache reuse. Each
+input is hashed before/after; every result must equal the warmed reference.
+Three warmups and31 samples per input are recorded for each variant/batch.
+Result/input hashes match across raw File, BufReader and existing Cursor helper.
+
+| Ordered batch | JDK Object p50/p95 ms | stdlib service p50/p95 ms |
+| --- | --- | --- |
+| Raw A1 | 51.503 /61.445 | 7.996 /8.773 |
+| Buffered B1 | 43.077 /45.921 | 6.707 /7.390 |
+| Buffered B2 | 43.274 /47.705 | 6.699 /7.229 |
+| Raw A2 | 50.218 /52.878 | 7.772 /8.732 |
+| Existing helper C1 | 11.778 /13.743 | 1.202 /1.406 |
+| Raw A3 | 50.638 /54.251 | 8.222 /11.913 |
+| Existing helper C2 | 12.697 /15.586 | 1.239 /1.501 |
+| Raw A4 | 50.244 /55.950 | 7.925 /8.319 |
+
+These are repeated warm-OS direct archive operations on one actual JDK/JAR set,
+not independent startup samples, popup latency, or a general IDE speed ratio.
+The pinned zip2.4.2 reader walks local headers while parsing central entries;
+BufReader still seeks between those regions. Reusing the in-memory helper avoids
+that file-seek work. It temporarily holds compressed archive bytes (18.34 MiB
+for this java.base.jmod), then releases them on return/error. There is no new
+persistent cache. The existing helper has no total archive-byte cap; no claim
+of bounded whole-archive memory or peak-RSS reduction is made.
+
+The temporary test was removed before verification; its70-line patch and
+immutable A/B/C test executables remain in external evidence. Existing portable
+archive/class tests remain unchanged. Full Rust passes1,362/0 failed/4 ignored;
+formatting, shell/Lua syntax, diff checks and both release binaries pass.
+Actual Gradle compilation succeeds and real Neovim library20/20 preserves JDK
+unsaved-source completion/navigation plus all six selected Java diagnostic states.
+Each state consumes one first pull, with exact source/wire identity and restoration.
+Its initial pull is19.391 ms and the later distinct states are3.460-4.763 ms.
+Earlier raw/Buffered initial pulls varied substantially (72.968/66.238 ms on
+repeat), so no causal whole-editor speed ratio follows. Legacy probe os.exit
+cleanup closes only fresh owned descendants; graceful shutdown is not measured.
+
+A separate actual-CEM reproduction establishes the next semantic gap. At
+EnchantablePressBehaviour.kt:108, be:T has three Kotlin where bounds, including
+EnchantableBlockEntity. The successful actual Kotlin/Java compiler control accepts
+be.getEnchantmentLevel(efficiency). The checkpoint58-based buffered experiment returns valid empty
+results for exact goto and unsaved partial getEnchantmentLe completion:0/2,
+zero unavailable. IDEA returns the exact EnchantableBlockEntity.kt:15 declaration
+and the expected Int-returning candidate:2/2. Both actual Gradle imports use JDK21;
+all220 source/build guards and unsaved wire/restoration checks match.
+The IDEA operations record remains incomplete because no clean server exit was
+observed after standard shutdown/exit, independently of its two semantic matches.
+The partial probe is RPC evidence; native popup acceptance is prepared but unrun.
+
+Next repair shared declaration-identified bounded receivers without publishing T
+as a global class or promoting bounds into compiler-producer absence authority.
+Then verify the CEM candidate through real popup selection and exact accepted text.
+The Java AP/unsaved-regeneration gap and wider six-project IDEA acceptance remain.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+archive-reader-bench59-1/ignored-archive-reader-timing.patch,
+native-archive-reader59-{A1,B1,B2,A2,C1,A3,C2,A4}/,
+native-selected-archive-{rust,library}59-1/,
+cem-where-bound-probe-1/ and native-cem-where-bound-{ktlsp,idea}59-1/.
+Both production jar.rs Git blobs are388da0c55e492eb7313e0ecee4d9d0794e3751ad.
+ktlsp SHA256:
+e393d676210b31be0c580d201c1cdc392b5e88ce80c08e475d4e8dcf30d56cdc.
+Full Rust log SHA256:
+f6ee051e41de521fc5826ea5c5210b2e06dab564b113e51fd4d3eb56f3812c4e.
+Native library raw artifact SHA256:
+e86f14294510e4f004a885b94f26f33d189dd322a8e78f37561477e61153eb0a.
 
 ### Fifty-eighth checkpoint: selected Java overload diagnostics after unsaved edits
 
