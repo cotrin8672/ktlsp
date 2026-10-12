@@ -855,16 +855,25 @@ fn symcache_store(fingerprint: &str, data: &[FileSymbols]) {
             }
         }
     });
-    if let Ok(bytes) = bincode::serialize(data) {
-        if let Ok(compressed) = zstd::stream::encode_all(&bytes[..], 3) {
-            let path = dir.join(format!("{fingerprint}.zst"));
-            let sequence = SYMCACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-            let tmp = path.with_extension(format!("zst.{}.{sequence}.tmp", std::process::id()));
-            if fs::write(&tmp, compressed).is_ok() {
-                let _ = fs::rename(tmp, path);
-            }
-        }
+    let path = dir.join(format!("{fingerprint}.zst"));
+    let sequence = SYMCACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let tmp = path.with_extension(format!("zst.{}.{sequence}.tmp", std::process::id()));
+    if symcache_write_file(&tmp, data).is_ok() {
+        let _ = fs::rename(tmp, path);
     }
+}
+
+fn symcache_write_file(path: &Path, data: &[FileSymbols]) -> anyhow::Result<()> {
+    // Keep the existing bincode payload while avoiding full raw and compressed cache buffers.
+    let file = fs::File::create(path)?;
+    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
+    // Batch primitive serde writes before entering the compressor.
+    let mut writer = io::BufWriter::new(encoder);
+    bincode::serialize_into(&mut writer, data)?;
+    let encoder = writer.into_inner().map_err(|error| error.into_error())?;
+    // Finish the frame and close its file before the caller publishes it (required on Windows).
+    drop(encoder.finish()?);
+    Ok(())
 }
 
 /// Parse every extracted `.kt`/`.java` source under `dest` into per-file symbol batches.
@@ -2403,6 +2412,48 @@ public interface ExecutorService {
             assert_dependency_buffer_lifecycle(batch, &source, original);
         }
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn streamed_symcache_preserves_legacy_payload_and_roundtrips_source_facts() {
+        let sequence = SYMCACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "ktlsp_streamed_symcache_{}_{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("Library.kt");
+        let text =
+            "package lib\nclass Payload\nsuspend fun first(value: Payload): Payload = TODO()\n";
+        fs::write(&source, text).unwrap();
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let mut batch = parse_source_file(&source, text, &mut kotlin, &mut java).unwrap();
+        batch.origin = Some(FileOrigin {
+            origin_id: "maven:lib:sample:1".into(),
+            representation: SourceRepresentation::Source,
+            project_scope: None,
+        });
+        let data = vec![batch];
+        assert_eq!(data[0].jvm.as_ref().unwrap().callables.len(), 1);
+        let legacy_wire = bincode::serialize(&data).unwrap();
+        let pending = tmp.join("pending.zst");
+        symcache_write_file(&pending, &data).unwrap();
+        let cache = tmp.join("published.zst");
+        fs::rename(&pending, &cache).unwrap();
+        let decoded = zstd::stream::decode_all(&fs::read(&cache).unwrap()[..]).unwrap();
+        assert_eq!(
+            decoded, legacy_wire,
+            "streaming must preserve the existing bincode payload"
+        );
+        let loaded = symcache_load_file(&cache, &tmp).unwrap();
+        assert_eq!(loaded[0].symbols, data[0].symbols);
+        assert_eq!(loaded[0].jvm, data[0].jvm);
+        assert!(
+            loaded[0].origin.is_none(),
+            "runtime origins must remain unpersisted"
+        );
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

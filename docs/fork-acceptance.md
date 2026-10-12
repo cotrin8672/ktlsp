@@ -58,7 +58,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current Java resource/recovery slice passes 1,336 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 50; valid Java var, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current streaming-cache slice passes 1,337 / 0 failed / 4 ignored; formatting, harness syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 51; valid Java var, broader generic inference, arbitrary compiler plugins and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java 208 matched / 6 unmet of 214: the original 199 retain 194 matches; 13 new resource semantic checks and exact restoration pass, while valid var completion returns an incorrect empty response. Features 78/80 and semantic 107 are prior results | Partial; original gaps and positive var remain open | Checkpoint 50 native-java-resource-editor50-1. All 14 new RPCs run once with reconstructed outbound source hashes; older push-generation certification remains limited. Forced cleanup is operational evidence |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete 220-file CEM snapshot captures actual Gradle9.6.1/KGP2.4.0 Java/Kotlin main tasks, source and compiler inputs. Forced Kotlin and Java compilation executes and succeeds. Non-Mixin native completion accepts exact whole buffers 31/31 in each engine | Focused semantics and actual compiler inputs verified; broader cases open | Checkpoint 50 native-cem-complete-model-1 and native-cem-complete-compile-rerun-1. IDEA import selects JDK22 versus ktlsp JDK21; no controlled-JVM speed claim. Full diagnostics, overrides and wider edits remain |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -3100,6 +3100,58 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Fifty-first checkpoint: stream cache writes with unchanged library semantics
+
+Symbol-cache writes now serialize through a small BufWriter into the existing
+zstd encoder and unpublished temporary file. This removes simultaneous whole
+bincode and compressed output buffers from the writer. Finalization closes the
+Windows file handle before the existing atomic rename. Loader, fingerprint,
+cache version, source facts and publication/error behavior stay unchanged;
+there is no new dependency or persistent abstraction.
+
+One regression verifies byte-for-byte decompressed equality with the legacy
+bincode payload, unchanged source/JVM facts, omitted runtime origins and rename
+after close. It and all43 dependency regressions pass. The full workspace passes
+1,337 tests, zero failed, four ignored; formatting, existing harness syntax and
+both release builds pass. Immutable ktlsp SHA256:
+ffa44655a6ff92b91dea6ca1100f5e2ec384adbb94fb7a24e8f8858bff06a197bc1e89d.
+Its404-input receipt differs from checkpoint50 only in deps.rs and this evidence
+record. No semantic Java/Kotlin change is included.
+
+The unchanged OkHttp native UI case retains31 first responses and31 exact accepted
+whole buffers with unchanged disk and standard shutdown/exit0, no termination.
+Warm30 nearest-rank RPC p50/p95 is2.396/2.976 ms, popup33.776/34.654 ms and synthetic
+acceptance58.913/59.572 ms, selecting item6 of16. Resource sampling overlaps UI
+timings; these and the preceding paired observations are instrumented measurements,
+not an uninstrumented profiling baseline or proof of a causal runtime speedup.
+
+Sampled server working-set peak is2,077,442,048 bytes, observed descendant sum
+2,084,945,920 bytes, across1,043 rows with maximum gap218 ms. The preceding
+037f-binary run reports2,075,639,808 bytes: there is no observed whole-server peak
+reduction. Compiler memory remains unmeasured; the sampler's aggregate unmeasured
+status does not invalidate the certified server samples. This change reduces a
+known transient allocation path; it does not satisfy the outstanding resident
+memory investigation. Actual sparse type-field inventory and cache-load/index
+allocation remain next measurements.
+
+The existing real-Neovim library route passes all13 individual assertions:
+stdlib/JDK navigation, Kotlin completion from an opened JDK source, unsaved method
+rename/deletion, exact current navigation and restoration after closing the dirty
+source. Disk source is never rewritten. The wrapper accidentally also required a
+nonexistent ALL PASS text marker; raw result preserves that false flag and a
+separate derived receipt records the13 actual passes and no failed assertion.
+Harness status is0. Owned descendant cleanup and its50.922-second controller
+duration remain operational observations, not semantic or latency gates.
+
+Evidence under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+source-streaming-symcache-apply-1/, native-streaming-symcache-rust-1/,
+native-okhttp-streaming-ui51-1/ktlsp/ui-semantic-derived.json and
+native-streaming-symcache-library-1/assertions-derived.json. All native workflows
+use fresh owned jobs, explicit private caches and private Gradle homes where used.
+User AGENTS.md stays unchanged. Positive Java var completion, five preexisting
+Java diagnostic expectations, compiler-producer closure, Spring/Gradle paired UI
+and broader six-project IDEA parity remain open.
 
 ### Fiftieth checkpoint: incomplete Java resources and real-project native completion
 
