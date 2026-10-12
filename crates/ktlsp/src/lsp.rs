@@ -1406,6 +1406,34 @@ fn project_watchers(
                         patterns.insert((directory, "**/*.{kt,kts,java}".to_string()));
                     }
                 }
+                for file in source
+                    .compiler_tasks
+                    .iter()
+                    .filter(|task| {
+                        task.language == classpath::CompilerLanguage::Kotlin
+                            && source.kotlin_compile_task.as_deref() == Some(task.task.as_str())
+                    })
+                    .flat_map(|task| &task.source_files)
+                {
+                    let key = crate::paths::file_key(file);
+                    if path_is_under(&key, &root_key) {
+                        workspace_files = true;
+                        continue;
+                    }
+                    if source
+                        .source_roots
+                        .iter()
+                        .any(|directory| path_is_under(&key, &crate::paths::file_key(directory)))
+                    {
+                        continue;
+                    }
+                    if let (Some(parent), Some(name)) = (
+                        file.parent(),
+                        file.file_name().and_then(|name| name.to_str()),
+                    ) {
+                        patterns.insert((crate::paths::file_key(parent), glob_literal(name)));
+                    }
+                }
                 for directory in &source.output_roots {
                     let directory = crate::paths::file_key(directory);
                     if path_is_under(&directory, &root_key) {
@@ -1560,9 +1588,10 @@ fn project_change(
             return Some(true);
         }
         if crate::language::SourceLanguage::for_project_path(file).is_some()
-            && model
+            && (model
                 .owner_for_key(key)
                 .is_some_and(|(_, source)| source.is_some())
+                || model.has_selected_kotlin_source_key(key))
         {
             return Some(false);
         }
@@ -4636,6 +4665,104 @@ mod tests {
             .parse::<Uri>()
             .unwrap();
         assert_eq!(uri_to_key(&uri).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn selected_external_closed_sources_have_literal_watches_and_source_refresh_events() {
+        let temp = std::env::temp_dir().join(format!(
+            "ktlsp_watch_selected_external_{}",
+            std::process::id()
+        ));
+        let root = temp.join("workspace");
+        let external = temp.join("external[generated]");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let generated = external.join("Adapter[1].kt");
+        let future = external.join("future[more]/NotYet.java");
+        std::fs::write(&generated, "class Generated").unwrap();
+        let neighbor = external.join("Unselected.kt");
+        let mut task = crate::compile::kotlin_test_request(&root).task;
+        task.source_files
+            .extend([generated.clone(), future.clone()]);
+        let mut auxiliary = task.clone();
+        auxiliary.task = ":unselectedAuxiliary".into();
+        auxiliary.source_files = vec![neighbor.clone()];
+        let model = classpath::ProjectSnapshot::new(vec![classpath::ModuleClasspath {
+            module: ":".into(),
+            project_dir: root.clone(),
+            build: ":".into(),
+            source_sets: vec![classpath::SourceSetClasspath {
+                name: "main".into(),
+                source_roots: vec![root.join("src")],
+                kotlin_compile_task: Some(task.task.clone()),
+                compiler_tasks: vec![task, auxiliary],
+                ..Default::default()
+            }],
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+        }]);
+        assert!(model.file_origin(&generated).is_none());
+        for file in [&generated, &future] {
+            assert_eq!(
+                project_change(&root, Some(&model), &crate::paths::file_key(file)),
+                Some(false)
+            );
+        }
+        assert_eq!(
+            project_change(&root, Some(&model), &crate::paths::file_key(&neighbor)),
+            None
+        );
+        let mut replacement_modules = model.modules.clone();
+        replacement_modules[0].source_sets[0].kotlin_compile_task = None;
+        let replacement = classpath::ProjectSnapshot::new(replacement_modules);
+        assert_eq!(
+            project_change(
+                &root,
+                Some(&replacement),
+                &crate::paths::file_key(&generated)
+            ),
+            None
+        );
+        assert_eq!(
+            project_change(&root, Some(&model), &crate::paths::file_key(&generated)),
+            Some(false),
+            "an older snapshot retains its exact selected inputs"
+        );
+        for relative in [false, true] {
+            let watches = project_watchers(&root, Some(&model), relative);
+            assert_eq!(
+                watches.len(),
+                3,
+                "one workspace tree and two exact external files"
+            );
+            for expected in [r"Adapter\[1\].kt", r"future\[more\]/NotYet.java"] {
+                assert!(
+                    watches.iter().any(|watch| {
+                        assert!(watch.kind.is_none());
+                        match &watch.glob_pattern {
+                            GlobPattern::Relative(pattern) => {
+                                assert!(relative);
+                                pattern.pattern == expected
+                                    && matches!(&pattern.base_uri, OneOf::Right(uri)
+                                    if uri_to_key(uri).as_deref()
+                                        == Some(crate::paths::file_key(&external).as_str()))
+                            }
+                            GlobPattern::String(pattern) => {
+                                assert!(!relative);
+                                pattern
+                                    == &format!(
+                                        "{}/{}",
+                                        glob_literal(&crate::paths::file_key(&external)),
+                                        expected
+                                    )
+                            }
+                        }
+                    }),
+                    "{expected}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

@@ -79,10 +79,10 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint67b passes1,460 tests,0 failures,4 existing ignored; formatting/release and focused Kotlin adapter9/Java SDK publication5 also pass | Current finite slices verified; whole-project acceptance remains open | native-workspace-release67-2; both new regressions failed before their fixes |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint68 passes1,469 tests,0 failures,4 existing ignored; formatting/release, selected-source33 and Spring adapter5 also pass | Current finite slices verified; whole-project acceptance remains open | native-workspace-release68-2; selected-source positive regressions and exact-option rejection failed before their fixes |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current default Java270/275; all64 resource first RPCs match without a readiness wait, including both previously empty Iterable completions. Current basic9/9 and library41/41 pass | Initial SDK completion gap repaired;5 existing Java diagnostic omissions remain | native-java-editor67-2/native-editor-smokes67-2; older semantic142/features78/80 remain historical |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
-| Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
+| Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned; saved-source identities guarded and ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Checkpoint62 retains all twelve normal gradle-live expectations in each of three editor starts. All four project completions match on their sole response after the existing project-indexed event | Warmed focused semantics verified; Gradle-blocked startup and broader proposals open | Project readiness is12,233.401ms with uncached model/populated Gradle, then61.875/62.453ms on model reuse. Each condition has one observation, no speedup or distribution claim |
 | Incomplete editing | Useful completion in unfinished Java/Kotlin, including syntax errors and partial selectors | Current default Neovim original26+array12+alias26 first RPCs match:62 useful results and2 deliberate rank2 empty guards. Both Java/Kotlin unsaved aliases and restoration are verified | These finite editing gaps repaired; broader syntax/inference coverage open | checkpoint67b; unchanged requests attempted once, no readiness flag or content retry; valid empty results remain mismatches |
 | Contextual inlay hints | Java var hints share completion types, preserve generic arguments and reflect unsaved Kotlin changes without inventing invalid types | Thirteen exact type/position cases match initially and after producer changes/restoration. Six native first responses cover those states, a visible line and three invalid initializers. Actual Kotlin/javac output verifies both producer variants | Focused repair verified; broader inference and display latency open | Checkpoint 56; initial partial-JDK String gap reproduced and repaired in shared type resolution. This is RPC/semantic evidence, not native hint-render timing or IDEA parity |
@@ -3122,6 +3122,126 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Sixty-eighth checkpoint: configured compilers and generated-source input gaps
+
+The immediate priority remains correct diagnostics and useful basic completion.
+This checkpoint admits OkHttp's exact legacy JVM-default flag and four measured
+Spring compiler settings without rewriting them. It also captures exact selected
+generated Kotlin inputs and their unsaved changes. Generation, actual editor
+responses and producer closure remain separate acceptance questions.
+
+The reviewed current source passes formatting and the full workspace:
+1469 passed,0 failed,4 ignored. Release builds pass. The immutable current
+ktlsp binary is18829312 bytes, SHA256
+`ee52a2861526d5f6354fad3749d6ba94b9f5b05627cbf0b5a2132e2760b3fe16`.
+Evidence: `native-workspace-release68-2/receipt.json`. These checks
+include the Spring option and selected-source repairs. Real Neovim also verifies
+the selected Spring Kotlin diagnostics0/1/0 and both projects' basic gold
+completions. The OkHttp finite UI/error result and its unmeasured canonical
+absence are distinguished below; build success does not certify clean diagnostics.
+
+| Case | Expected | Observed | Status / next action |
+| --- | --- | --- | --- |
+| Original OkHttp guide | Saved Java/Kotlin tasks compile unchanged | Gradle7.5 `:samples:guide:compileJava :samples:guide:compileKotlin --rerun-tasks --offline --no-daemon --console=plain` exits0. All508 tracked regular files, HEAD and the preexisting missing gitlink status stay unchanged | Saved-build prerequisite verified |
+| OkHttp full selected compiler | Original/error/restored reflect the exact task | Fresh MODEL11 has52 sources (21 Kotlin/31 Java),13 arguments, runtime9/plugins14/CP17. Kotlin1.8.21 CLI exits0,1,0; the private String-to-Int error is at56:50. Original/restored emit byte-identical56 classes plus metadata. Compatibility deprecation warning retained | Native finite controls verified |
+| OkHttp release/editor | Useful completion/goto and current diagnostics | Current ee52 release:4 gold completion/goto matches; finite UI pulls0/1/0, exact canonical String/Int error at55:49–50, later current-version pull/push clear. Historical hook reports9 matched/1 mismatch/3 unmeasured because plain-CLI lowercase differs from GradleStyle uppercase | Separate root renderer audit verifies the exact error and UI clearing; original/restored canonical clean and global absence remain UNMEASURED |
+| Generated task inputs | Exact selected generated files, including unsaved text, participate and invalidate correctly | Exactly two KAPT-generated Kotlin files are in selected task52 and KAPT's output tree, outside the three SourceSet roots. Shared overlay rejects them; begin/CAS also omit their unsaved buffers because ordinary root ownership is absent | Exact selected-membership and existing watch/event repair applied:4 positive regressions fail before the fix; related33 pass afterwards, including the unselected-neighbor guard and Windows normalized-wire identity. Current editor rebind verifies all52 selected source images, both open wire buffers and the detected error; clean producer authority unchanged |
+| Original Spring beans | Saved tasks compile with original SDK/dependency producers | Gradle8.10.2 `:spring-beans:compileJava :spring-beans:compileKotlin --rerun-tasks --offline --no-daemon --console=plain` exits0;10860 regular tracked files and the docs symlink target stay unchanged. Oracle17 host/BellSoft17 target guarded separately | Saved-build prerequisite verified |
+| Spring full selected compiler | Preserve335 sources,19 arguments, CP14, runtime7/plugins7; detect an actual type error and retain parameter metadata | CLI original0/valid-parameter0/type-error1. Error at67:42 is String where Int is required; javap confirms the named MethodParameters entry. Original package-default null experiment actual0/proposed1 is preserved separately | Native finite controls and named-parameter output verified |
+| Spring nullability/configuration | Test direct annotation separately from Java package discovery | Direct `@Nullable` return gives exit1 at67:72. Adding only a private Java root to the earlier nullable argument case gives exit1 at67:90; it otherwise exits0. Selected KGP uses individual Java freeArgs, without a Java-root side channel. Four exact flags applied after positive regression fails at argument rejection | Do not add experimental Java-root policy to production or claim IDEA package-default parity; focused adapter5/5 and workspace1469 green; current Neovim canonical Kotlin0/1/0 with exact error range66:41–42. Both basic completion golds pass; provider overload goto still returns two heads |
+| Spring shutdown | Readiness and clean exit measured separately | Earlier benchmark's15-second forced stop remains recorded. Current real Neovim ee52 run exits0 gracefully, about13.87 seconds after exit notification, with no terminate call and owned Jobs0 | Editor shutdown verified; benchmark-specific cause and optional held-stdin/EOF comparison remain open |
+| Gradle ABI plugin | Keep normal classes separate from private ABI output; invalidate target API changes | Minimal candidate and tests prepared; original producers, fresh MODEL11 and full12-source controls unrun | Product held |
+
+Evidence base:
+`C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/`.
+OkHttp: `native-okhttp-original-compile68-2`,
+`native-okhttp-model-capture68-1`, `kotlin-jvm-default-okhttp-fresh68-1`,
+`native-okhttp-jvm-default-controls68-2` and
+`native-okhttp-jvm-default-controls68-3/root-verification.json`.
+All1160 input guards (1053 files,5 directory inventories,102 absent slots),
+120 build stamps and source/git guards stay stable. Historical bookkeeping
+failures are retained; the final verification binds exact0/1/0, input order,
+the actual String/Int error and identical restored output bytes.
+Fresh MODEL11 SHA256:
+`0f77154528e3962ac99d5826d3393a38ec28dd6d7f25b86904c6fcf09cd1beb1`.
+
+The failing editor run is `native-okhttp-editor68-1`, immutable release
+`native-workspace-release68-1/bin/ktlsp.exe` SHA256
+`6b6a07bbe340e1a0a0994a9cd74352df8f50c7e26311679b274bf346630c8d53`.
+The hook's original/restored time bounds are observation limits, not evidence of
+semantic failure or performance acceptance. Actual no-invocation cause is in
+`kotlin-okhttp-owned-source-audit68-1`. Auxiliary KAPT tasks intentionally
+prevent empty results from certifying complete producer closure; repairing source
+admission alone does not change that contract. Standard first responses and
+the known error must therefore be measured separately from canonical absence.
+
+The selected-source fix is limited to exact selected Kotlin-task inputs. It
+captures their current unsaved bodies and rechecks them before publication.
+External inputs use the existing literal watch builder; inputs under the workspace
+reuse its tree watch. A snapshot caches selected keys once, avoiding a task scan on
+each file event. Normalized file keys connect Windows captured/native paths to the
+same editor wire identity. Ordinary ownership and producer clean authority stay
+unchanged.
+Evidence: `native-selected-source-red68-1` (29 pass/4 fail),
+`native-selected-source-green68-1` (33 pass/0 fail), and
+`root-selected-source-product68-1.json`; the two scoped packets are
+`kotlin-selected-source-overlay68-1` and its mandatory normalized-path
+successor `kotlin-selected-source-overlay68-2`. Formatting affects only the
+four reviewed Rust files. The focused test controller terminates one residual
+fresh-owned child after Cargo has returned; owned Jobs are zero at cleanup.
+Spring exact-option evidence is `native-spring-options-red68-1` and
+`native-spring-options-green68-1` (5 pass/0 fail).
+
+Current editor evidence is `native-okhttp-editor68-2` and
+`native-spring-editor68-3`, both using ee52. The independent root audit,
+`root-editor-verification68-1.json` SHA256
+`3e858d882b26c7127327f5ab9823df328bba7dfcf2340cdad0d92c5261af0bd5`,
+checks all52/335 selected disk source hashes, both complete open wire images in
+each phase, exact private invalid suffixes, unchanged model/source images,
+versions3/4/5 and restoration. Spring's three canonical results match0/1/0;
+its overall corpus remains6 matches/1 existing overload-goto mismatch. OkHttp's
+four gold completion/goto checks pass. Its canonical positive error matches
+the exact uppercase GradleStyle message, severity1 and range55:49–50;
+the later version5 first pull and exact-version push contain no errors.
+The original hook/report's lowercase mismatch and gated clear=false remain
+unchanged. This audit is an explicit renderer erratum, not a relaxed case-folded
+expectation or a rerun. Kotlin1.8.21's
+[plain renderer](https://github.com/JetBrains/kotlin/blob/v1.8.21/compiler/cli/src/org/jetbrains/kotlin/cli/common/messages/PlainTextMessageRenderer.java)
+decapitalizes this diagnostic; its
+[GradleStyle renderer](https://github.com/JetBrains/kotlin/blob/v1.8.21/compiler/cli/src/org/jetbrains/kotlin/cli/common/messages/GradleStyleMessagerRenderer.kt)
+preserves the message. The selected server adapter explicitly requests GradleStyle.
+Pinned code/runtime/raw evidence is in `kotlin-okhttp-renderer-audit68-1`.
+
+Spring's first preparation and first actual hook run failed on Windows long paths;
+they are retained separately from semantic results. The IO-only successor
+`kotlin-spring-diagnostics-hook68-2` preserves logical paths and expectations.
+Both final editor controllers close their own Jobs at zero without residual
+termination; Neovim records graceful server exit0. OkHttp original/restored
+canonical primary completion, full Java/AP producer closure, actual server
+compiler source order, all-six-project current-binary acceptance and latency
+distributions remain UNMEASURED. No whole-project clean claim follows from these
+finite Kotlin and UI observations.
+
+Spring: `native-spring-original-compile68-4`,
+`native-spring-model-capture68-1`,
+`native-spring-compiler-controls68-1` and
+`native-spring-compiler-controls68-2/root-verification.json`,
+`native-spring-jsr305-controls68-1`,
+`kotlin-spring-java-root-audit68-1`.
+All335 source copies,11979 project-prefix files, four classpath directories and
+both task identities are guarded. Raw javap retains its original mixed encoding;
+ASCII descriptor/MethodParameters structure is verified without replacement
+decoding. The private-root causal experiment differs from captured Gradle inputs.
+Fresh MODEL11 SHA256:
+`05e36235145c7961343ca7bd7bafbf8b2a7a4aaf236569058864a45a48c3efeb`.
+The original actual0/proposed1 receipt is immutable, not reclassified as strict
+package-default semantic proof. New direct-annotation and private-root controls
+both exit1. Completed owned Jobs reach zero; no preexisting process handles.
+
+These checks do not certify canonical Java diagnostics (Spring AP24 and OkHttp's
+Gradle7.5 worker need separate coverage), six-project acceptance, IDEA parity or
+latency distributions. Further ranking/UX expansion remains deferred.
 
 ### Sixty-seventh checkpoint: false positives and useful basic completion
 

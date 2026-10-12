@@ -224,6 +224,7 @@ pub struct ProjectSnapshot {
     output_owners: BTreeMap<String, OutputOwners>,
     file_origins: BTreeMap<String, String>,
     local_source_keys: std::collections::BTreeSet<String>,
+    selected_kotlin_source_keys: std::collections::BTreeSet<String>,
     mtimes: BTreeMap<String, u128>,
     visibilities: Vec<ScopeVisibility>,
 }
@@ -232,11 +233,23 @@ impl ProjectSnapshot {
     pub fn new(modules: Vec<ModuleClasspath>) -> Self {
         let mut owners = BTreeMap::new();
         let mut output_owners: BTreeMap<String, OutputOwners> = BTreeMap::new();
+        let mut selected_kotlin_source_keys = std::collections::BTreeSet::new();
         for (module_idx, module) in modules.iter().enumerate() {
             owners
                 .entry(path_key(&module.project_dir))
                 .or_insert((module_idx, None));
             for (source_idx, source) in module.source_sets.iter().enumerate() {
+                selected_kotlin_source_keys.extend(
+                    source
+                        .compiler_tasks
+                        .iter()
+                        .filter(|task| {
+                            task.language == CompilerLanguage::Kotlin
+                                && source.kotlin_compile_task.as_deref() == Some(task.task.as_str())
+                        })
+                        .flat_map(|task| &task.source_files)
+                        .map(|path| crate::paths::file_key(path)),
+                );
                 for (path, is_output) in source
                     .output_roots
                     .iter()
@@ -274,6 +287,7 @@ impl ProjectSnapshot {
             output_owners,
             file_origins: BTreeMap::new(),
             local_source_keys: std::collections::BTreeSet::new(),
+            selected_kotlin_source_keys,
             mtimes: BTreeMap::new(),
             visibilities: Vec::new(),
         };
@@ -404,6 +418,11 @@ impl ProjectSnapshot {
     pub(crate) fn has_dependency_key(&self, key: &str) -> bool {
         self.file_origins.contains_key(key.trim_end_matches('/'))
             || self.local_source_keys.contains(key)
+    }
+
+    /// Exact selected compiler inputs also need watch events, without assigning file ownership.
+    pub(crate) fn has_selected_kotlin_source_key(&self, key: &str) -> bool {
+        self.selected_kotlin_source_keys.contains(key)
     }
 
     pub fn file_origin(&self, file: &Path) -> Option<FileOrigin> {

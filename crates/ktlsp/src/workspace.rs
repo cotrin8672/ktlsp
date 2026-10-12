@@ -7087,14 +7087,23 @@ impl Workspace {
         let mut overlays = Vec::new();
         let mut dependency_overlays = Vec::new();
         for (open_key, doc) in &self.open_docs {
-            let Some(origin) = model.file_origin(Path::new(open_key)) else {
+            let origin = model.file_origin(Path::new(open_key));
+            // Selected generated inputs can be outside the SourceSet's registered roots.
+            let own = sources.contains_key(open_key)
+                || origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.project_scope.as_ref() == Some(&scope));
+            let dependency = origin
+                .as_ref()
+                .is_some_and(|origin| visible_origins.contains(&origin.origin_id));
+            if !own && !dependency {
                 continue;
-            };
+            }
             let revision = self
                 .index
                 .jvm_source_for_file(open_key)
                 .map_or(self.index_revision, |source| source.revision);
-            if origin.project_scope.as_ref() == Some(&scope) {
+            if own {
                 if open_key.ends_with(".kt") || open_key.ends_with(".java") {
                     // Explicit editing policy: owned new buffers join the selected task overlay.
                     // This is not proof that custom Gradle Spec/Closure filters would include them.
@@ -7105,7 +7114,7 @@ impl Workspace {
                         revision,
                     ));
                 }
-            } else if visible_origins.contains(&origin.origin_id) {
+            } else {
                 dependency_overlays.push(crate::compile::KotlinSourceOverlay::new(
                     open_key.clone(),
                     doc.text.clone(),
@@ -7198,14 +7207,25 @@ impl Workspace {
         let Some(model) = &self.project_model else {
             return false;
         };
+        let selected: BTreeSet<_> = request
+            .task
+            .source_files
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
         let mut actual = BTreeSet::new();
         for (key, doc) in &self.open_docs {
-            let Some(origin) = model.file_origin(Path::new(key)) else {
-                continue;
-            };
-            let own = origin.project_scope.as_ref() == Some(&request.scope)
+            let origin = model.file_origin(Path::new(key));
+            let own = (selected.contains(key)
+                || origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.project_scope.as_ref() == Some(&request.scope)))
                 && (key.ends_with(".kt") || key.ends_with(".java"));
-            if !own && !request.visible_origins.contains(&origin.origin_id) {
+            if !own
+                && origin
+                    .as_ref()
+                    .is_none_or(|origin| !request.visible_origins.contains(&origin.origin_id))
+            {
                 continue;
             }
             let captured = if own {
@@ -7575,6 +7595,75 @@ mod kotlin_diagnostic_lifecycle_tests {
         assert_eq!(ws.kotlin_diagnostic_result_id(&editor).unwrap(), accepted);
         assert_eq!(ws.current_kotlin_diagnostics(&editor).len(), 1);
         assert!(ws.kotlin_diagnostic_result_id(&helper).is_none());
+    }
+
+    #[test]
+    fn selected_generated_wire_outside_source_set_roots_is_captured_and_checked_before_publish() {
+        for change in [
+            "body-without-notification",
+            "disk-event",
+            "external-disk-event",
+            "close",
+        ] {
+            let (mut ws, editor, _, _) = fixture();
+            let mut modules = request_model(&ws);
+            let generated = if change == "external-disk-event" {
+                modules[0]
+                    .project_dir
+                    .parent()
+                    .unwrap()
+                    .join("ktlsp-kotlin-diagnostic-external/Generated.kt")
+            } else {
+                modules[0]
+                    .project_dir
+                    .join("build/generated/source/kapt/main/Generated.kt")
+            };
+            let generated_key = crate::paths::file_key(&generated);
+            let task = &mut modules[0].source_sets[0].compiler_tasks[0];
+            task.source_files.push(generated.clone());
+            task.declared_input_files.push(generated.clone());
+            ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+            assert!(ws.project_scope_for_file(&generated_key).is_none());
+            ws.open(
+                generated_key.clone(),
+                "class Generated { val unsaved = 1 }".into(),
+            );
+            let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+            assert!(!request
+                .source_roots
+                .iter()
+                .any(|root| generated.starts_with(root)));
+            assert!(request
+                .overlays
+                .iter()
+                .any(|source| source.key == generated_key
+                    && source.text == "class Generated { val unsaved = 1 }"));
+            assert!(ws.kotlin_overlay_matches(&request));
+            let outcome = reported(&request, &editor, "oldApi");
+            match change {
+                "body-without-notification" => ws
+                    .open_docs
+                    .get_mut(&generated_key)
+                    .unwrap()
+                    .text
+                    .push_str(" // changed after capture"),
+                "disk-event" | "external-disk-event" => {
+                    ws.observe_compiled_resource(&generated_key);
+                    assert!(request.invalid.load(Ordering::Acquire));
+                }
+                "close" => ws.close(&generated_key),
+                _ => unreachable!(),
+            }
+            assert!(
+                ws.finish_kotlin_diagnostics(&request, outcome, Arc::new(AtomicBool::new(false)))
+                    .is_empty(),
+                "{change}"
+            );
+            assert!(
+                ws.kotlin_diagnostic_result_id(&editor).is_none(),
+                "{change}"
+            );
+        }
     }
 
     #[test]

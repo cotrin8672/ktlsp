@@ -3734,7 +3734,12 @@ fn kotlin_editor_arguments(
             | "-nowarn"
             | "-Werror"
             | "-progressive"
+            | "-Xjvm-default=compatibility"
             | "-Xallow-no-source-files"
+            | "-java-parameters"
+            | "-Xsuppress-version-warnings"
+            | "-Xjsr305=strict"
+            | "-opt-in=kotlin.RequiresOptIn"
             | "-Xexplicit-api=strict" => result.push(argument.clone()),
             _ if argument.starts_with("-Xplugin=") => {
                 kotlin_plugin_paths(std::slice::from_ref(argument))?;
@@ -3849,14 +3854,22 @@ impl KotlinEditorOverlay {
 
     fn create_in(request: &KotlinDiagnosticRequest, parent: &Path) -> anyhow::Result<Self> {
         let mut overlay = Self::empty_in(request, parent)?;
+        let selected_sources: std::collections::BTreeSet<_> = request
+            .task
+            .source_files
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
         for (i, original) in request.sources.iter().enumerate() {
             request.check_live()?;
+            let key = crate::paths::file_key(original);
             anyhow::ensure!(
                 original.is_absolute()
-                    && request
-                        .source_roots
-                        .iter()
-                        .any(|root| original.starts_with(root)),
+                    && (selected_sources.contains(&key)
+                        || request
+                            .source_roots
+                            .iter()
+                            .any(|root| original.starts_with(root))),
                 "kotlin-source-outside-owned-roots-unhandled"
             );
             let extension = original.extension().and_then(|e| e.to_str());
@@ -3864,7 +3877,6 @@ impl KotlinEditorOverlay {
                 matches!(extension, Some("kt" | "java")),
                 "kotlin-script-source-unhandled"
             );
-            let key = crate::paths::file_key(original);
             let text = match request.overlays.iter().find(|source| source.key == key) {
                 Some(source) => {
                     use sha2::{Digest, Sha256};
@@ -4275,6 +4287,119 @@ mod kotlin_editor_compile_tests {
     }
 
     #[test]
+    fn overlay_includes_exact_selected_generated_sources_outside_source_set_roots() {
+        let tree = TestDirectory::new();
+        let project = tree.0.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let mut request = kotlin_test_request(&project);
+        for source in &request.sources {
+            std::fs::write(source, "").unwrap();
+        }
+        let generated = project.join("build/generated/source/kapt/main/Generated.kt");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        request.task.source_files.push(generated.clone());
+        request.task.declared_input_files.push(generated.clone());
+        request.sources.push(generated.clone());
+        assert!(!request
+            .source_roots
+            .iter()
+            .any(|root| generated.starts_with(root)));
+        let original_key = crate::paths::file_key(&generated);
+        for text in [
+            "class Generated { val first = 1 }",
+            "class Generated { val next = 2 }",
+        ] {
+            std::fs::write(&generated, text).unwrap();
+            let overlay =
+                KotlinEditorOverlay::create_in(&request, &tree.0.join("private-cache")).unwrap();
+            let copy = overlay
+                .paths
+                .iter()
+                .find(|(_, original)| *original == &original_key)
+                .unwrap()
+                .0;
+            assert_eq!(std::fs::read_to_string(copy).unwrap(), text);
+            assert_eq!(std::fs::read_to_string(&generated).unwrap(), text);
+            assert_eq!(overlay.sources.len(), request.task.source_files.len());
+            assert!(overlay
+                .sources
+                .iter()
+                .all(|path| path.starts_with(&overlay.directory)));
+        }
+        assert!(!request.task.output_roots[0].exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn selected_verbatim_generated_input_uses_normalized_editor_wire_identity() {
+        let tree = TestDirectory::new();
+        let project = tree.0.join("project");
+        let generated = project.join("build/generated/source/kapt/main/Generated.kt");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "class Generated { val saved = 1 }").unwrap();
+        let key = crate::paths::file_key(&generated);
+        let verbatim = PathBuf::from(format!(r"\\?\{}", key.replace('/', "\\")));
+        let mut request = kotlin_test_request(&project);
+        request.task.source_files = vec![verbatim];
+        request.sources = vec![PathBuf::from(&key)];
+        assert_ne!(request.task.source_files[0], request.sources[0]);
+        request.overlays.push(KotlinSourceOverlay::new(
+            key.clone(),
+            "class Generated { val unsaved = 2 }".into(),
+            7,
+        ));
+        let overlay =
+            KotlinEditorOverlay::create_in(&request, &tree.0.join("private-cache")).unwrap();
+        assert_eq!(overlay.sources.len(), 1);
+        let copy = overlay
+            .paths
+            .iter()
+            .find(|(_, original)| *original == &key)
+            .unwrap()
+            .0;
+        assert_eq!(
+            std::fs::read_to_string(copy).unwrap(),
+            "class Generated { val unsaved = 2 }"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&generated).unwrap(),
+            "class Generated { val saved = 1 }"
+        );
+    }
+
+    #[test]
+    fn overlay_rejects_unselected_sources_outside_source_set_roots_even_with_a_wire() {
+        let tree = TestDirectory::new();
+        let outsider = tree
+            .0
+            .join("build/generated/source/kapt/main/Unselected.kt");
+        std::fs::create_dir_all(outsider.parent().unwrap()).unwrap();
+        std::fs::write(&outsider, "class Unselected").unwrap();
+        let mut request = kotlin_test_request(&tree.0);
+        request.sources = vec![outsider.clone()];
+        for wire in [false, true] {
+            if wire {
+                request.overlays.push(KotlinSourceOverlay::new(
+                    crate::paths::file_key(&outsider),
+                    "class Unselected { val unsaved = 1 }".into(),
+                    1,
+                ));
+            }
+            let error = KotlinEditorOverlay::create_in(&request, &tree.0.join("private-cache"))
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "kotlin-source-outside-owned-roots-unhandled"
+            );
+        }
+        let relative = PathBuf::from("build/generated/Relative.kt");
+        request.task.source_files = vec![relative.clone()];
+        request.sources = vec![relative];
+        assert!(KotlinEditorOverlay::create_in(&request, &tree.0.join("private-cache")).is_err());
+    }
+
+    #[test]
     fn overlay_rejects_dirty_visible_dependency_and_corrupt_body_identity() {
         let tree = TestDirectory::new();
         let mut request = kotlin_test_request(&tree.0);
@@ -4339,6 +4464,54 @@ mod kotlin_editor_compile_tests {
             assert!(
                 kotlin_editor_arguments(&invalid, &private, &[]).is_err(),
                 "{tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_adapter_preserves_only_jvm_default_compatibility_and_input_order() {
+        let root = std::env::temp_dir().join("ktlsp-jvm-default-args");
+        let mut request = kotlin_test_request(&root);
+        let output = root.join("private/classes");
+        let sources = request.sources.clone();
+        let mut expected = kotlin_editor_arguments(&request, &output, &sources).unwrap();
+        let original_key = KotlinEnvironmentKey::new(&request).unwrap();
+        let position = request.task.arguments.len();
+        request
+            .task
+            .arguments
+            .push("-Xjvm-default=compatibility".into());
+        let selected = request.task.arguments.clone();
+        expected.insert(position, "-Xjvm-default=compatibility".into());
+        assert_eq!(
+            kotlin_editor_arguments(&request, &output, &sources).unwrap(),
+            expected,
+            "only the exact selected flag is added; Kotlin/Java inputs and options retain order"
+        );
+        assert_eq!(request.task.arguments, selected);
+        assert!(KotlinEnvironmentKey::new(&request).unwrap() != original_key);
+    }
+
+    #[test]
+    fn argument_adapter_rejects_unverified_jvm_default_values() {
+        let root = std::env::temp_dir().join("ktlsp-jvm-default-rejected");
+        for argument in [
+            "-Xjvm-default=all",
+            "-Xjvm-default=all-compatibility",
+            "-Xjvm-default=enable",
+            "-Xjvm-default=disable",
+            "-Xjvm-default=",
+            "-Xjvm-default=compatibility-extra",
+            "-Xjvm-default",
+            "-Xunknown",
+        ] {
+            let mut request = kotlin_test_request(&root);
+            request.task.arguments.push(argument.into());
+            let error =
+                kotlin_editor_arguments(&request, &root.join("private/classes"), &[]).unwrap_err();
+            assert!(
+                error.to_string().contains("kotlin-argument-unhandled-at-"),
+                "{argument}: {error}"
             );
         }
     }
@@ -4427,6 +4600,96 @@ mod kotlin_editor_compile_tests {
             assert!(
                 kotlin_editor_arguments(&request, &private, &sources).is_err(),
                 "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_adapter_preserves_exact_spring_options_and_invalidates_each_setting() {
+        let root = std::env::temp_dir().join("ktlsp-spring-options");
+        let mut request = kotlin_test_request(&root);
+        let private = root.join("private/classes");
+        let sources = [root.join("private/Z.java"), root.join("private/A.kt")];
+        let baseline = kotlin_editor_arguments(&request, &private, &sources).unwrap();
+        let flags = [
+            "-java-parameters",
+            "-Xsuppress-version-warnings",
+            "-Xjsr305=strict",
+            "-opt-in=kotlin.RequiresOptIn",
+        ];
+        request.task.arguments.extend(flags.map(String::from));
+        let selected = request.task.arguments.clone();
+        let arguments = kotlin_editor_arguments(&request, &private, &sources).unwrap();
+        let retained: Vec<_> = arguments
+            .iter()
+            .filter(|argument| flags.contains(&argument.as_str()))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            retained, flags,
+            "preserve the four selected policies in order"
+        );
+        let unchanged: Vec<_> = arguments
+            .iter()
+            .filter(|argument| !flags.contains(&argument.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            unchanged, baseline,
+            "SDK, plugins, output and Java/Kotlin order stay intact"
+        );
+        assert_eq!(request.task.arguments, selected);
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        for flag in flags {
+            let position = request
+                .task
+                .arguments
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap();
+            request.task.arguments.remove(position);
+            assert!(
+                KotlinEnvironmentKey::new(&request).unwrap() != key,
+                "{flag}"
+            );
+            request.task.arguments.insert(position, flag.into());
+        }
+        assert_eq!(request.task.arguments, selected);
+    }
+
+    #[test]
+    fn argument_adapter_rejects_unmeasured_spring_option_variants() {
+        let root = std::env::temp_dir().join("ktlsp-spring-options-rejected");
+        for tail in [
+            vec!["-java-parameters=true"],
+            vec!["-java-parameters", "true"],
+            vec!["-Xsuppress-version-warnings=true"],
+            vec!["-Xsuppress-version-warnings\n"],
+            vec!["-Xjsr305=warn"],
+            vec!["-Xjsr305=ignore"],
+            vec!["-Xjsr305=strict-extra"],
+            vec!["-Xjsr305", "strict"],
+            vec!["-opt-in=other.Marker"],
+            vec!["-opt-in=kotlin.RequiresOptIn,other.Marker"],
+            vec!["-opt-in", "kotlin.RequiresOptIn"],
+            vec!["-java-parameters\u{0}"],
+            vec!["-P", "plugin:opaque:value=1"],
+            vec!["-Xunknown"],
+        ] {
+            let mut request = kotlin_test_request(&root);
+            request.task.arguments.extend([
+                "-java-parameters".into(),
+                "-Xsuppress-version-warnings".into(),
+                "-Xjsr305=strict".into(),
+                "-opt-in=kotlin.RequiresOptIn".into(),
+            ]);
+            request
+                .task
+                .arguments
+                .extend(tail.iter().map(|value| value.to_string()));
+            assert!(
+                kotlin_editor_arguments(&request, &root.join("private/classes"), &[]).is_err(),
+                "{tail:?}"
             );
         }
     }
