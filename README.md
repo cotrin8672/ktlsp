@@ -467,6 +467,9 @@ After each build the probe orders current model/shared analysis refresh before o
 Kotlin pulls correlate the transmitted unsaved text with accepted source/model/store generations.
 Phase 1 and 2 receipts preserve all three flushed buffer texts and wire identities before the canonical
 Kotlin pull, together with the validated refreshed cache and selected task inputs.
+All four phases preserve the exact selected source inventories and raw disk/buffer/wire bytes in
+`artifacts/processor-selected-sources/phase-N`, before a later clean can remove generated files.
+Byte export has separate timing and availability metadata; it adds no semantic checks or requests.
 Producer scopes publish located Kotlin errors but cannot certify clean results or unsaved regeneration.
 Java producer diagnostics remain an open case. Missing observations are recorded as unmeasured.
 Transformed APIs such as Lombok remain covered by their separate compiler-plugin cases.

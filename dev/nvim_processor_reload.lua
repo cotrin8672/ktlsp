@@ -5,7 +5,7 @@ local root, binary, artifacts = vim.fs.abspath(assert(arg[1])), assert(arg[2]), 
 probe.outside_project(root, artifacts)
 assert(vim.fn.isdirectory(root) == 0, 'processor reload fixture must be new')
 local report = { checks = {}, phases = {}, requests = {}, messages = {}, notifications = {}, delivery = {},
-  canonical = {}, refresh_ordering = {}, snapshots = {}, source_notifications = {}, open_authority = {
+  canonical = {}, refresh_ordering = {}, snapshots = {}, selected_source_exports = {}, source_notifications = {}, open_authority = {
     Java = "AP and Kotlin-produced class authority remain unsupported",
     unsaved_regeneration = "producer execution is not certified by this compiler overlay",
   } }
@@ -363,6 +363,142 @@ local function run()
     report.refresh_ordering[tostring(number)] = observation
     return ready
   end
+  -- This is an artifact observer; it contributes no assertions, requests, or producer authority.
+  local function strict_utf8(text)
+    local i = 1
+    while i <= #text do
+      local b, count, low, high = text:byte(i), 1, 0x80, 0xbf
+      if b <= 0x7f then count = 1
+      elseif b >= 0xc2 and b <= 0xdf then count = 2
+      elseif b >= 0xe0 and b <= 0xef then
+        count = 3
+        if b == 0xe0 then low = 0xa0 elseif b == 0xed then high = 0x9f end
+      elseif b >= 0xf0 and b <= 0xf4 then
+        count = 4
+        if b == 0xf0 then low = 0x90 elseif b == 0xf4 then high = 0x8f end
+      else return false end
+      if i + count - 1 > #text then return false end
+      for offset = 1, count - 1 do
+        local next_byte = text:byte(i + offset)
+        if next_byte < (offset == 1 and low or 0x80) or next_byte > (offset == 1 and high or 0xbf) then return false end
+      end
+      i = i + count
+    end
+    return true
+  end
+  local function capture_selected_sources(number, model)
+    local row = { phase = number, availability = 'unmeasured', tasks = {}, disk_files = {}, wire_overlays = {},
+      started_ns = vim.uv.hrtime(), producer_closure_complete = false, diagnostic_authority = false,
+      capture_boundary = number == 0 and 'initial index readiness before first acceptance sweep'
+        or 'accepted final post-build model before first phase diagnostic/acceptance RPC' }
+    report.selected_source_exports[tostring(number)] = row
+    local ok, error = pcall(function()
+      assert(model, 'accepted selected task model unavailable')
+      row.model_cache_sha256, row.model_reference = model.cache_sha256, number == 0 and 'initial current-cache observation'
+        or 'refresh_ordering.' .. number .. '.model'
+      row.refresh_generation = report.refresh_ordering[tostring(number)]
+        and vim.tbl_get(report.refresh_ordering[tostring(number)], 'trace', 'scan', 'generation')
+      local function read(path)
+        local file = assert(io.open(path, 'rb'), 'source/export bytes unavailable: ' .. path)
+        local bytes = file:read('*a')
+        assert(file:close() and bytes ~= nil, 'source/export read failed: ' .. path)
+        return bytes
+      end
+      local function stat(path)
+        local value = assert(vim.uv.fs_stat(path), 'source/export stat unavailable: ' .. path)
+        return { ino = value.ino, dev = value.dev, size = value.size, type = value.type,
+          mtime = value.mtime, ctime = value.ctime }
+      end
+      local function cache_current()
+        local before = stamp(vim.uv.fs_stat(model.cache_file))
+        return before == model.cache_stamp and read(model.cache_file) == model.cache_text
+          and stamp(vim.uv.fs_stat(model.cache_file)) == before
+          and vim.fn.sha256(model.cache_text) == model.cache_sha256
+      end
+      assert(cache_current(), 'selected cache changed before byte export')
+      local destination = artifacts .. '/processor-selected-sources/phase-' .. number
+      assert(vim.fn.isdirectory(destination) == 0, 'source export phase must be fresh')
+      vim.fn.mkdir(destination, 'p')
+      local function preserve(bytes, relative)
+        local path = destination .. '/' .. relative
+        assert(vim.fn.filereadable(path) == 0, 'source export must be absent')
+        local file = assert(io.open(path, 'wb'), 'source export unavailable: ' .. path)
+        local written = file:write(bytes)
+        assert(file:close() and written, 'source export write failed: ' .. path)
+        assert(read(path) == bytes, 'source export bytes changed')
+        -- Blob hashing preserves NUL, CRLF and non-UTF8 bytes; it never hashes a decoded Vim string.
+        local hash = vim.fn.eval('sha256(readblob(' .. vim.fn.string(path) .. '))')
+        assert(type(hash) == 'string' and #hash == 64 and hash:match('^[0-9a-f]+$'), 'raw SHA256 unavailable')
+        local valid = strict_utf8(bytes)
+        return { artifact = path, relative_artifact = relative, bytes = #bytes, sha256 = hash,
+          strict_utf8 = valid, utf8_text = valid and bytes or nil }
+      end
+      local all, positions, base = {}, {}, probe.path_key(root) .. '/'
+      local function task(role, selected)
+        assert(selected and type(selected.source_files) == 'table', 'selected ' .. role .. ' source inventory unavailable')
+        local entry = { role = role, task = selected.task, language = selected.language,
+          source_files = vim.deepcopy(selected.source_files), file_indices = {} }
+        row.tasks[#row.tasks + 1] = entry
+        for index, path in ipairs(selected.source_files) do
+          local normalized = vim.fs.normalize(vim.fs.abspath(path))
+          local key = probe.path_key(normalized)
+          assert(key:sub(1, #base) == base, 'selected source escapes owned fixture: ' .. path)
+          local position = positions[key]
+          if not position then
+            position = #all + 1
+            positions[key], all[position] = position, { origin_path = path, normalized_path = normalized,
+              real_path = assert(vim.uv.fs_realpath(path), 'selected source realpath unavailable'),
+              source_key = key, memberships = {} }
+          end
+          all[position].memberships[#all[position].memberships + 1] = { role = role, task = selected.task,
+            source_index = index, original_path = path }
+          entry.file_indices[#entry.file_indices + 1] = position
+        end
+      end
+      task('kotlin-primary', model.selected_kotlin_task)
+      assert(model.selected_java_task_count == 1, 'selected Java source task is not unique')
+      task('java-primary', model.selected_java_task)
+      for index, entry in ipairs(all) do
+        row.disk_files[index] = entry
+        entry.before = stat(entry.origin_path)
+        assert(entry.before.type == 'file', 'selected source is not a regular file')
+        local bytes = read(entry.origin_path)
+        entry.after = stat(entry.origin_path)
+        entry.stable_while_read = vim.deep_equal(entry.before, entry.after) and entry.after.size == #bytes
+          and probe.path_key(entry.origin_path) == entry.source_key
+        assert(entry.stable_while_read, 'selected source changed while reading')
+        entry.content = preserve(bytes, ('source-%04d.bin'):format(index))
+      end
+      for label, buffer in pairs(buffers) do
+        local path, uri = vim.api.nvim_buf_get_name(buffer), vim.uri_from_bufnr(buffer)
+        local text, outbound = probe.buffer_full_text(buffer), wire[uri]
+        local entry = { label = label, path = path, uri = uri, source_key = probe.path_key(path),
+          version = vim.lsp.util.buf_versions[buffer], sent_version = versions[uri],
+          changedtick = vim.api.nvim_buf_get_changedtick(buffer), wire_matches_source = text == outbound,
+          selected_file_index = positions[probe.path_key(path)] }
+        row.wire_overlays[#row.wire_overlays + 1] = entry
+        entry.buffer_content = preserve(text, 'overlay-' .. label .. '-buffer.bin')
+        assert(type(outbound) == 'string', 'outbound source overlay unavailable')
+        entry.wire_content = preserve(outbound, 'overlay-' .. label .. '-wire.bin')
+        entry.identity_complete = entry.selected_file_index ~= nil and entry.wire_matches_source
+          and entry.version ~= nil and entry.version == entry.sent_version
+        assert(entry.identity_complete, 'outbound source overlay identity incomplete')
+      end
+      assert(cache_current(), 'selected cache changed during byte export')
+      row.exact_selected_membership = true
+      row.consistency = 'current accepted cache and per-file stable observations; not an atomic compiler snapshot'
+      row.availability = 'captured'
+    end)
+    row.completed_ns, row.elapsed_ns = vim.uv.hrtime(), vim.uv.hrtime() - row.started_ns
+    if not ok then row.error, row.availability = tostring(error), 'unmeasured' end
+    local destination = artifacts .. '/processor-selected-sources/phase-' .. number
+    if vim.fn.isdirectory(destination) == 1 then
+      local saved, save_error = pcall(function()
+        assert(vim.fn.writefile({ vim.json.encode(row) }, destination .. '/manifest.json') == 0, 'source manifest write failed')
+      end)
+      if not saved then row.error, row.availability = tostring(save_error), 'unmeasured' end
+    end
+  end
   local function capture_snapshot(number)
     local row = { phase = number, sources = {}, source_identity_complete = true, producer_closure_complete = false }
     for label, buffer in pairs(buffers) do
@@ -390,6 +526,7 @@ local function run()
     else row.model_error = 'accepted-model-unavailable' end
     row.availability = row.source_identity_complete and row.model_cache_current and row.refresh_generation ~= nil
       and 'captured' or 'unmeasured'
+    capture_selected_sources(number, model)
     row.captured_ns = vim.uv.hrtime()
     report.snapshots[tostring(number)] = row
     vim.fn.writefile({ vim.json.encode(report) }, artifacts .. '/processor-reload.json')
@@ -494,6 +631,10 @@ local function run()
     if (number == 1 or number == 2) and not report.snapshots[tostring(number)] then
       vim.lsp._changetracking.flush(client)
       capture_snapshot(number)
+    end
+    if not report.selected_source_exports[tostring(number)] then
+      local model = number == 0 and refreshed_model({}) or vim.tbl_get(report.refresh_ordering, tostring(number), 'model')
+      capture_selected_sources(number, model)
     end
     -- One acceptance sweep after build/model ordering; desired completion contents are not polled.
     request_prerequisite = number > 0 and not refresh_ready and 'final-model-refresh-unavailable' or nil
