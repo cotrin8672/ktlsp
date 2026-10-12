@@ -125,7 +125,16 @@ object KtlspCompilerConfiguration {
         check(daemonArguments.all { it is String }) { "Unsupported Kotlin compiler daemon JVM argument value" }
         val compilerVersion = try {
             // No parent loader: the KGP plugin version must not stand in for the selected compiler.
-            URLClassLoader((compilerClasspath + listOfNotNull(toolsJar)).map { it.toURI().toURL() }.toTypedArray(), null).use { loader ->
+            object : URLClassLoader((compilerClasspath + listOfNotNull(toolsJar)).map { it.toURI().toURL() }.toTypedArray(), null) {
+                override fun getResourceAsStream(name: String): java.io.InputStream? {
+                    val resource = getResource(name) ?: return null
+                    return try {
+                        resource.openConnection().apply { useCaches = false }.getInputStream()
+                    } catch (_: java.io.IOException) {
+                        null
+                    }
+                }
+            }.use { loader ->
                 val versionClass = Class.forName("org.jetbrains.kotlin.config.KotlinCompilerVersion", true, loader)
                 val version = versionClass.getMethod("getVersion").invoke(null) as? String
                     ?: error("Selected Kotlin compiler version is unavailable")

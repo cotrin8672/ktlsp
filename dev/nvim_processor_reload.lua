@@ -5,7 +5,7 @@ local root, binary, artifacts = vim.fs.abspath(assert(arg[1])), assert(arg[2]), 
 probe.outside_project(root, artifacts)
 assert(vim.fn.isdirectory(root) == 0, 'processor reload fixture must be new')
 local report = { checks = {}, phases = {}, requests = {}, messages = {}, notifications = {}, delivery = {},
-  canonical = {}, refresh_ordering = {}, open_authority = {
+  canonical = {}, refresh_ordering = {}, snapshots = {}, source_notifications = {}, open_authority = {
     Java = "AP and Kotlin-produced class authority remain unsupported",
     unsaved_regeneration = "producer execution is not certified by this compiler overlay",
   } }
@@ -135,14 +135,32 @@ local function run()
     return client and client.initialized
   end, 50))
   assert(client and client.initialized, 'client initialization failed')
-  local versions, notification_role = {}, "automatic"
+  local versions, wire, source_buffers, notification_role = {}, {}, {}, "automatic"
+  for _, buffer in pairs(buffers) do
+    local uri = vim.uri_from_bufnr(buffer)
+    wire[uri], source_buffers[uri] = probe.buffer_full_text(buffer), buffer
+  end
   local notify = client.rpc.notify
   client.rpc.notify = function(method, params)
     local sent = notify(method, params)
     if method == 'workspace/didChangeWatchedFiles' then
       report.notifications[#report.notifications + 1] = { phase = report.phase, sent = sent, params = params, role = notification_role }
-    elseif method == 'textDocument/didChange' and sent then
-      versions[params.textDocument.uri] = params.textDocument.version
+    elseif sent and (method == 'textDocument/didOpen' or method == 'textDocument/didChange') then
+      local document = params.textDocument
+      versions[document.uri] = document.version
+      local buffer = source_buffers[document.uri]
+      if buffer then
+        local text, error
+        if method == 'textDocument/didOpen' then text = document.text
+        else text, error = probe.apply_content_changes(wire[document.uri], params.contentChanges, client.offset_encoding) end
+        wire[document.uri] = text
+        report.source_notifications[#report.source_notifications + 1] = {
+          phase = report.phase, method = method, uri = document.uri, version = document.version,
+          changedtick = vim.api.nvim_buf_get_changedtick(buffer), source_sha256 = probe.buffer_sha256(buffer),
+          wire_source_sha256 = text and vim.fn.sha256(text), wire_matches_source = text == probe.buffer_full_text(buffer),
+          content_changes = params.contentChanges, wire_error = error,
+        }
+      end
     end
     return sent
   end
@@ -266,16 +284,26 @@ local function run()
               for _, source_set in ipairs(module.source_sets or {}) do
                 if source_set.name == 'main' and not source_set.compiler_metadata_incomplete
                   and not source_set.classpath_incomplete and #(source_set.unresolved or {}) == 0 then
-                  local selected, count, auxiliary = nil, 0, 0
+                  local selected, count, auxiliary, java, java_count = nil, 0, 0, nil, 0
                   for _, task in ipairs(source_set.compiler_tasks or {}) do
                     if task.language == 'kotlin' and task.task == source_set.kotlin_compile_task then
                       selected, count = task, count + 1
-                    elseif task.language == 'kotlin' then auxiliary = auxiliary + 1 end
+                    elseif task.language == 'kotlin' then auxiliary = auxiliary + 1
+                    elseif task.language == 'java' then
+                      for _, source_file in ipairs(task.source_files or {}) do
+                        if probe.path_key(source_file) == probe.path_key(vim.api.nvim_buf_get_name(buffers.Java)) then
+                          java, java_count = task, java_count + 1
+                          break
+                        end
+                      end
+                    end
                   end
                   local recipe = selected and selected.kotlin_compiler
                   if count == 1 and selected.complete and recipe and recipe.compiler_version == '1.8.21'
                     and recipe.gradle_plugin_version == '1.8.21' then
-                    return { cache_file = path, cache_stamp = file_stamp, cache_sha256 = vim.fn.sha256(raw),
+                    return { cache_file = path, cache_stamp = file_stamp, cache_sha256 = vim.fn.sha256(raw), cache_text = raw,
+                      selected_kotlin_task = selected, selected_java_task_count = java_count,
+                      selected_java_task = java_count == 1 and java or nil,
                       properties_mtime_ns = expected_mtime, model_version = model.model_version,
                       primary_task = selected.task, compiler_version = recipe.compiler_version,
                       gradle_plugin_version = recipe.gradle_plugin_version,
@@ -335,6 +363,37 @@ local function run()
     report.refresh_ordering[tostring(number)] = observation
     return ready
   end
+  local function capture_snapshot(number)
+    local row = { phase = number, sources = {}, source_identity_complete = true, producer_closure_complete = false }
+    for label, buffer in pairs(buffers) do
+      local uri, text = vim.uri_from_bufnr(buffer), probe.buffer_full_text(buffer)
+      local source = { path = vim.api.nvim_buf_get_name(buffer), uri = uri, text = text,
+        source_sha256 = vim.fn.sha256(text), wire_text = wire[uri], wire_source_sha256 = wire[uri] and vim.fn.sha256(wire[uri]),
+        version = vim.lsp.util.buf_versions[buffer], sent_version = versions[uri],
+        changedtick = vim.api.nvim_buf_get_changedtick(buffer), wire_matches_source = text == wire[uri] }
+      row.sources[label] = source
+      row.source_identity_complete = row.source_identity_complete and source.wire_matches_source
+        and source.version ~= nil and source.version == source.sent_version
+    end
+    local ordering = report.refresh_ordering[tostring(number)]
+    local model = ordering and ordering.model
+    row.refresh_generation = ordering and ordering.trace and ordering.trace.scan and ordering.trace.scan.generation
+    row.model_reference = 'refresh_ordering.' .. number .. '.model'
+    row.model_identity_limit = 'accepted cache and refresh generation; server trace has no model hash'
+    if model then
+      local before = stamp(vim.uv.fs_stat(model.cache_file))
+      local file = io.open(model.cache_file, 'rb')
+      local current = file and file:read('*a')
+      if file then file:close() end
+      row.model_cache_current = before == model.cache_stamp and stamp(vim.uv.fs_stat(model.cache_file)) == before
+        and current == model.cache_text and vim.fn.sha256(model.cache_text) == model.cache_sha256
+    else row.model_error = 'accepted-model-unavailable' end
+    row.availability = row.source_identity_complete and row.model_cache_current and row.refresh_generation ~= nil
+      and 'captured' or 'unmeasured'
+    row.captured_ns = vim.uv.hrtime()
+    report.snapshots[tostring(number)] = row
+    vim.fn.writefile({ vim.json.encode(report) }, artifacts .. '/processor-reload.json')
+  end
   local request_prerequisite
   local function request(buffer, method, receiver, member, role)
     if request_prerequisite then
@@ -388,23 +447,53 @@ local function run()
             vim.api.nvim_buf_set_lines(buffers.Kotlin, -1, -1, false,
               { '// canonical generated API probe phase ' .. number })
           end,
-          flush = function() vim.lsp._changetracking.flush(client) end,
+          flush = function()
+            vim.lsp._changetracking.flush(client)
+            capture_snapshot(number)
+          end,
         })
         local ordering = phase_traces[number]
+        local accepted = type(observation.accepted) == 'table' and observation.accepted or nil
+        local accepted_generation = accepted and type(accepted.result_id) == 'string'
+          and tonumber(accepted.result_id:match('^kotlin:(%d+):%d+:%d+:%d+$')) or nil
         if observation.canonical_certified then
           local traced = ordering and ordering.read()
-          local accepted_generation = tonumber(observation.accepted.result_id:match('^kotlin:(%d+):'))
-          if not traced or ordering.row.error or accepted_generation ~= ordering.row.scan.generation then
+          if not traced or ordering.row.error or accepted_generation == nil
+            or accepted_generation ~= ordering.row.scan.generation then
             canonical, observation.canonical_certified = nil, false
             observation.error, observation.availability = 'canonical-refresh-generation-mismatch', 'protocol-error'
           end
           observation.refresh_generation = ordering and ordering.row.scan and ordering.row.scan.generation
+        end
+        local snapshot = report.snapshots[tostring(number)]
+        if snapshot then
+          snapshot.sources_unchanged_through_diagnostic_rpc = true
+          for label, buffer in pairs(buffers) do
+            local source = snapshot.sources[label]
+            source.unchanged_through_diagnostic_rpc = probe.buffer_full_text(buffer) == source.text
+              and wire[source.uri] == source.wire_text and vim.lsp.util.buf_versions[buffer] == source.version
+              and versions[source.uri] == source.sent_version and vim.api.nvim_buf_get_changedtick(buffer) == source.changedtick
+            snapshot.sources_unchanged_through_diagnostic_rpc = snapshot.sources_unchanged_through_diagnostic_rpc
+              and source.unchanged_through_diagnostic_rpc
+          end
+          snapshot.captured_before_diagnostic_rpc = observation.rpc_started_ns ~= nil
+            and snapshot.captured_ns < observation.rpc_started_ns
+          snapshot.canonical_source_matches = accepted ~= nil and accepted.source_sha256 == snapshot.sources.Kotlin.source_sha256
+          snapshot.canonical_generation_matches = accepted_generation ~= nil
+            and accepted_generation == snapshot.refresh_generation
+          snapshot.kotlin_receipt_correlated = observation.canonical_certified == true and snapshot.availability == 'captured'
+            and snapshot.sources_unchanged_through_diagnostic_rpc and snapshot.captured_before_diagnostic_rpc
+            and snapshot.canonical_source_matches and snapshot.canonical_generation_matches
         end
         report.canonical[tostring(number)] = observation
         report.requests[#report.requests + 1] = { phase = number, role = 'canonical acceptance',
           method = observation.method, uri = observation.uri, result = canonical,
           error = observation.error, response = observation.response, attempted = observation.attempted }
       else refresh_ready = refresh_after_build(number, version, enabled) end
+    end
+    if (number == 1 or number == 2) and not report.snapshots[tostring(number)] then
+      vim.lsp._changetracking.flush(client)
+      capture_snapshot(number)
     end
     -- One acceptance sweep after build/model ordering; desired completion contents are not polled.
     request_prerequisite = number > 0 and not refresh_ready and 'final-model-refresh-unavailable' or nil

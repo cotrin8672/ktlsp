@@ -338,6 +338,72 @@ afterEvaluate {
     dependencies.add("implementation", "com.example:ktlsp-harness-missing:0.0.0")
 }
 KOTLIN
+  cat > "$project/build.gradle.kts" <<'KOTLIN'
+import java.io.File
+import java.io.IOException
+import java.net.URLClassLoader
+import java.util.jar.JarEntry
+import java.util.jar.JarOutputStream
+
+class CompilerResourceProbe(private val jar: File) : Action<Task>, java.io.Serializable {
+    private fun inspector(compilerClasspath: List<File>, toolsJar: File?): URLClassLoader =
+KOTLIN
+  # Execute the production factory itself; extraction drift must stop the probe before Gradle runs.
+  awk '
+    /val compilerVersion = try \{/ { recipes++; recipe = 1; next }
+    recipe && /^            (object : )?URLClassLoader\(/ { starts++; copying = 1 }
+    copying {
+      if (index($0, ".use { loader ->") != 0) {
+        sub(/\.use \{ loader ->.*/, ""); print; copying = 0; recipe = 0; ends++
+      } else print
+    }
+    END {
+      if (recipes != 1 || starts != 1 || ends != 1) {
+        print "Compiler resource probe: expected one production compiler loader factory; extraction drifted" > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$repo/scripts/classpath-dump.init.gradle.kts" >> "$project/build.gradle.kts" || return $?
+  cat >> "$project/build.gradle.kts" <<'KOTLIN'
+
+    override fun execute(task: Task) {
+        val expected = ByteArray(17783) { (it % 251).toByte() }
+        check(jar.parentFile.mkdirs() || jar.parentFile.isDirectory)
+        JarOutputStream(jar.outputStream()).use { output ->
+            listOf("inspector" to byteArrayOf(42), "victim" to expected).forEach { (name, bytes) ->
+                output.putNextEntry(JarEntry(name)); output.write(bytes); output.closeEntry()
+            }
+        }
+        val urls = arrayOf(jar.toURI().toURL())
+        for (production in listOf(false, true)) {
+            URLClassLoader(urls, null).use { victim ->
+                checkNotNull(victim.getResourceAsStream("victim")).use { pending ->
+                    val inspector = if (production) inspector(listOf(jar), null) else URLClassLoader(urls, null)
+                    check(inspector.parent == null && inspector.getURLs().contentEquals(urls))
+                    inspector.use { loader ->
+                        checkNotNull(loader.getResourceAsStream("inspector")).use { check(it.read() == 42) }
+                    }
+                    check(inspector.findResource("inspector") == null) { "Inspector loader was not closed" }
+                    val result = runCatching { pending.readBytes() }
+                    if (production) {
+                        check(result.getOrThrow().contentEquals(expected)) { "Production inspector changed victim bytes" }
+                    } else {
+                        val failure = result.exceptionOrNull()
+                        check(failure is IOException && failure.message.orEmpty().contains("closed", ignoreCase = true)) {
+                            "Ordinary inspector did not invalidate the pending victim stream"
+                        }
+                    }
+                }
+            }
+        }
+        task.logger.quiet("PASS  compiler inspector closes without invalidating another loader's pending resource")
+    }
+}
+
+tasks.register("ktlspCompilerResourceProbe") {
+    doLast(CompilerResourceProbe(layout.buildDirectory.file("compiler-resource-probe.jar").get().asFile))
+}
+KOTLIN
   printf '%s\n' "$project"
 }
 
@@ -350,7 +416,7 @@ run_classpath_config_cache_probe() {
   (
     cd "$project"
     ./gradlew -I "$repo/scripts/classpath-dump.init.gradle.kts" \
-      :app:ktlspDumpClasspath -q --console=plain --configuration-cache \
+      ktlspCompilerResourceProbe :app:ktlspDumpClasspath -q --console=plain --configuration-cache \
       --configuration-cache-problems=fail --offline
   ) >"$cold_out" 2>&1 || status=$?
   cat "$cold_out"
@@ -359,11 +425,12 @@ run_classpath_config_cache_probe() {
   fi
   grep -q $'^PROJECT\t:app\t' "$cold_out" || return 1
   grep -q $'^UNRESOLVED\tcom.example:ktlsp-harness-missing:0.0.0\t' "$cold_out" || return 1
+  grep -q '^PASS  compiler inspector closes without invalidating' "$cold_out" || return 1
 
   (
     cd "$project"
     ./gradlew -I "$repo/scripts/classpath-dump.init.gradle.kts" \
-      :app:ktlspDumpClasspath --console=plain --configuration-cache \
+      ktlspCompilerResourceProbe :app:ktlspDumpClasspath --console=plain --configuration-cache \
       --configuration-cache-problems=fail --offline --info
   ) >"$warm_out" 2>&1 || status=$?
   cat "$warm_out"
@@ -373,6 +440,7 @@ run_classpath_config_cache_probe() {
   grep -q '^Reusing configuration cache\.$' "$warm_out" || return 1
   grep -q '^Configuration cache entry reused\.$' "$warm_out" || return 1
   grep -q $'^UNRESOLVED\tcom.example:ktlsp-harness-missing:0.0.0\t' "$warm_out" || return 1
+  grep -q '^PASS  compiler inspector closes without invalidating' "$warm_out" || return 1
   echo "PASS  classpath dump handles late configuration creation and reuses configuration cache"
 }
 

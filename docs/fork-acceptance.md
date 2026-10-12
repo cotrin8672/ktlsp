@@ -74,11 +74,11 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Shared lexical bounded receivers and initializer scope correction pass 1,378 / 0 failed / 4 ignored; formatting, harness/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint 60; broader generic inference, arbitrary compiler plugins and full-project parity remain open |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Compiler resource isolation retains 1,378 / 0 failed / 4 ignored; formatting, shell/Lua syntax and both release binaries pass | Current Rust, formatting and release verified | Checkpoint61; broader generic inference, arbitrary compiler plugins and full-project parity remain open |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current semantic scenario passes142 assertions:109 existing plus33 bounded-receiver checks. Java221/226 and features78/80 retain exactly the prior five/two diagnostic gaps, none unmeasured. Checkpoint59 library20/20 remains the latest library run | Partial; current bounded semantics and existing editor surface verified | Checkpoint60 native-bounded-receiver-{semantic,java,features}60-1; assertion accounting corrects concatenated PASS-line undercounts, with no lost historical expectation |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned and clean; concrete ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
-| Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Java `h.as` baseline empty; first fix returns useful members through shared queries; focused Java/Kotlin completion tests pass 143 with 1 ignored | Partial | Verify release editor behavior; annotation/override smart proposals remain pending |
+| Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Prior focused controls remain. Checkpoint61 normal gradle-live has eight useful checks and four empty completions before the source model was installed; the project-scan span is50.419285s | Partial; startup availability gap reproduced, warmed four cases unmeasured | Remove completion polling as a readiness test, verify the same four first responses after explicit project readiness, then reduce Gradle-blocked source startup; annotation/override proposals remain pending |
 | Incomplete editing | Useful context-aware completion in unfinished Java/Kotlin, including syntax errors, partial names, missing delimiters and unresolved argument types | Real OkHttp Java-to-Kotlin resource completion retains 31/31 exact native accepted buffers. Var locals/resources, unsaved factory return changes, current same-file declarations, authored suffixes and 32 nested generic results have focused controls; current Neovim related first RPCs pass 18/18 | Partial; these reproduced gaps repaired, wider editing behavior open | Checkpoint 52 and earlier 33/35/45. Expectations and real project source stay unchanged; valid empty responses remain mismatches, unavailable RPCs unmeasured |
 | Contextual inlay hints | Java var hints share completion types, preserve generic arguments and reflect unsaved Kotlin changes without inventing invalid types | Thirteen exact type/position cases match initially and after producer changes/restoration. Six native first responses cover those states, a visible line and three invalid initializers. Actual Kotlin/javac output verifies both producer variants | Focused repair verified; broader inference and display latency open | Checkpoint 56; initial partial-JDK String gap reproduced and repaired in shared type resolution. This is RPC/semantic evidence, not native hint-render timing or IDEA parity |
 | Inheritance and generics | Correct inherited members and substituted types across both languages | Shared declaration-identified parameters retain all Kotlin where/Java intersection bounds. CEM getEnchantmentLevel exact goto/partial completion now match2/2. Synthetic unsaved swap/removal/restoration matches16 first responses/33 checks; exact sent sources match eight independent compiler controls | Focused bounded-receiver repair verified; wider generic inference open | Checkpoint60. Parameter identities stay lexical, never global classes or compiler-absence authority. Recursive/F-bounds, parameterized bounds, bounded call solving and broader compiled signatures remain gaps |
@@ -89,8 +89,8 @@ a useful known receiver in the same edited state.
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Actual Retrofit preserves all four complete expected buffers after applying rename. Tenth-fixed-2 applies the six-site override family and passes independent compilation plus 33 bytecode assertions. JVM facade and external consumer applied renames also pass | Focused actual-project and fixture cases verified; wider corpus and inherited implementation edges pending | Checkpoints 43 and the earlier compiler-backed override-family controls. Ambiguous or read-only family members refuse partial edits |
 | Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Sixth release repairs the Gradle 7 regression: Moshi passes 3/3 golden and 6/6 incomplete requests. Gradle retains 3/3 exact golden targets. All six model-v3 snapshots have complete source sets and zero unresolved entries; five roots still lack dependency sources | Partial; model repair verified | [fork-corpus.md](fork-corpus.md) records all twelve immutable runs, unchanged inputs, exact remaining semantic gaps and independent missing-source failures |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Current model-v9 native automatic-watching lifecycle retains all 86 original checks, including Kotlin's obsolete oldApi diagnostic. Four real builds, completion, exact definitions, generated-source changes, dirty buffers and clean shutdown pass | Focused automatic-refresh semantics verified; wider transforming cases open | Checkpoint 49: native-gradle-default-jdk-gradle-reload-1; the same 86 original expectations and native automatic watch delivery. Positive Kotlin result has transmitted-text SHA and accepted-store generation proof |
-| Kotlin compiler inputs | Capture and use the task's actual source selection, ordered libraries, compiler runtime and selected JDK across refresh | Public main/test task mapping and selected runtime verified on 1.8.21, 1.9.23 and 2.4.0. Current 1.8.21 producer overlay receives exact unsaved obsolete-method and missing-type errors after final model refresh | Captured inputs and focused unsaved positive diagnostics verified | Checkpoints 40/41/46; 1.9 also clears a repaired new buffer and preserves UTF-16 positions. Opaque options, other hosts/source sets and general producer closure remain open |
-| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Saved Java/Lombok99/99 and KAPT/KSP108/114 remain the latest editor results. Independent selected1.8.21 main compile retains three real Kotlin errors; actual KAPT stubs-only output preserves unsaved editorUnsaved and current versionTwo API despite those errors | Partial; current private API experiment verified, Java worker/handoff and unsaved regeneration remain open | Checkpoint60 experiment record. No selected Java editor compiler worker exists yet. Stubs-only success is neither Kotlin-clean nor full codegen/AP/producer-closure authority; actual SDK/default recapture is next |
+| Kotlin compiler inputs | Capture and use the task's actual source selection, ordered libraries, compiler runtime and selected JDK across refresh | Main/test/runtime mapping remains verified on1.8.21,1.9.23 and2.4.0. Current1.8.21 processor run preserves all three exact unsaved wire bodies, full validated cache and selected tasks before each canonical Kotlin pull; source/generation correlation succeeds in both phases | Captured inputs and focused unsaved positive diagnostics verified | Checkpoint61; cache+refresh-generation correlation is not a server model-hash proof. Opaque options, other hosts/source sets and general producer closure remain open |
+| Compiler plugins and processors | Analyze generated and transformed APIs used from both languages, including unsaved source changes | Current KAPT/KSP108/114, zero unmeasured; same six Java diagnostic gaps. Independent current-API experiment preserves three Kotlin errors and Javac reports exactly three obsolete Java calls with no editorUnsaved/versionTwo false errors. Saved Lombok99/99 remains prior evidence | Partial; exact phase1 Java oracle verified, editor worker/handoff and disabled phase2 API remain open | Checkpoint61; actual selected JDK17/defaults captured from successful Gradle7.4.2 execution. No Java editor compiler worker exists. API stubs do not prove codegen/AP/producer closure |
 | Extension boundary | Separate consumer reads semantic facts and contributes consistent enabled/disabled results | Sixteenth external Mixin consumer passes 140/140 actual LSP checks, with zero failed/missing dependency inputs. Completion, diagnostics, navigation, exact references, applied rename, enabled/disabled/configuration and unsaved-type controls pass | Focused extension contract verified; general generated APIs and loading ABI remain open | `ktlsp-shadow-sixteenth-replay-20261011/final-editor-proof.json`. Twenty-nine first responses, nineteen delivery barriers and four applied/inspected renames. Actual server exit zero, one acknowledged shutdown and no forced termination |
 | Independent IDEA comparison | Expected member/type/navigation/diagnostic behavior verified in IDEA for acceptance cases | Actual Retrofit's same focused 21 RPC / 25 semantic cases pass in both engines. Shared mixed fixture retains adapted IntelliJ LSP 38/38 and ktlsp 36/36, including strict first responses after change delivery | Shared fixture and focused actual-project cases verified | Checkpoint 43. Windows URI/version adapter remains explicit; these cases do not establish whole-project parity |
 | Correctness plus latency | Useful responses stay responsive, with latency and memory compared against IDEA with conditions recorded | Six roots have focused31-cycle observations across revisions. Current CEM bounds UI accepts31 exact buffers in each engine with actual SDK21; warm30 popup p50/p95 is40.428/42.548 ms for ktlsp and814.588/1459.806 ms for IDEA | Focused observations verified; wider controlled comparison pending | Checkpoint60. One first plus30 same-case repetitions; input-to-popup handoff, not physical rendering. Cache/order/instrumentation differ; no causal ratio, startup distribution or arbitrary pass gate |
@@ -3117,6 +3117,92 @@ is not part of this checkpoint. Next cover missing Java type/import diagnostics,
 default-JDK/cache freshness and the original six Java producer-positive gaps;
 Kotlin processor checks and the wider six-project acceptance remain in scope.
 
+
+### Sixty-first checkpoint: isolate compiler resources and retain exact editor inputs
+
+The selected Kotlin version inspector used an ordinary URLClassLoader. Closing
+that inspector can close a globally cached JAR also supplying another loader's
+pending stream. The inspector now opens its resource connections with useCaches
+false, while preserving runtime order, parent-null isolation, actual getVersion,
+K2JVMCompiler loadability checks, IOException-to-null behavior and loader closure.
+The actual selected version reader closes its stream on normal and exceptional
+returns. No global JVM cache setting or filename-derived compiler version is used.
+[Kotlin's source documents the shared-JAR hazard](https://raw.githubusercontent.com/JetBrains/kotlin/v1.8.21/core/deserialization/src/org/jetbrains/kotlin/serialization/deserialization/builtins/BuiltInsResourceLoader.kt).
+
+An owned JDK17 probe uses the actual selected1.8.21 runtime and kotlin-reflect MR9
+resource loader. All three old-factory controls close the pending victim stream;
+all three new-factory controls preserve its exact17,783 bytes. Actual compiler
+version, K2 loadability, inspector closure and runtime hashes are checked in every
+case. This proves the mechanism; the first failed instrumented Gradle capture's
+cause remains unproven because both subsequent whole-build controls succeeded.
+The existing gradle-live configuration-cache fixture now executes the verbatim
+production factory against a private two-resource JAR. Its cold and warm builds
+both pass, retaining late plugin creation, unresolved dependency and cache reuse
+assertions. No new test framework or compiler download is needed for that fixture.
+
+Root captures actual JavaCompile defaults adjacent to its real Gradle7.4.2 action:
+the selected SDK is JDK17.0.7, the source inventory has three files and the ordered
+classpath has eight entries. Debug/header/generated-output switches, empty
+sourcepath, duplicate proc:none and configured encoding null are retained. The
+captured runtime reports MS932/ja/JP; source/argument bytes are ASCII. There is no
+claim that a reset file.encoding property measures Gradle's cached defaultCharset.
+The separate full-set CLI experiment changes only private outputs, exact overlay
+source paths and the sole Kotlin output classpath slot. Main Kotlin still reports
+its three real versionOne errors. Actual configured KAPT stubs preserve the current
+Source.editorUnsaved()I and KspKotlin.versionTwo API; actual Javac then reports only
+JavaUse's three versionOne errors at lines6,8,10, with no error on editorUnsaved or
+versionTwo. No old Kotlin output or failed full-compile output is a fallback.
+All98 input guards and the frozen packet remain unchanged. This proves the phase1
+oracle, not Gradle incremental equivalence, arbitrary plugin ABI fidelity, full
+producer closure, a Java editor worker, or disabled-phase2 API authority.
+
+The processor harness now retains each of three flushed source texts, complete
+wire identities and validated model cache/task inputs before the one canonical
+Kotlin diagnostic pull. Existing114 expectations are unchanged. An initial owned
+cache junction was correctly rejected by the compiler input watch guard:100 match,
+six Java mismatches, eight Kotlin checks unmeasured. Its raw report remains intact;
+non-UTF8 Javac stderr is confined to a build-control detail, and strict UTF8 source/
+model exports are separate. A new fully materialized private cache and actual short
+run directory remove that environment defect. The rerun is108/114 with exactly the
+same six Java mismatches and zero unmeasured. Both phases capture the exact three
+wire bodies before the RPC and correlate accepted Kotlin source/generations.
+The trace has no server model hash; cache+refresh-generation correlation is stated
+as such. The server acknowledges shutdown and exits0 without forced termination;
+one owned Gradle descendant is closed by the fresh Job cleanup. No preexisting JVM
+is inspected, adopted or terminated.
+
+The normal gradle-live run separately exposes startup availability. It prints
+eight matches and four empty ordinary completions. The source scan spans50.419285s;
+all four empty queries precede source-model installation after Gradle discovery.
+The legacy readiness loop sends12,704 synchronous requests at the first cursor.
+These are startup observations, not four proved warmed semantic failures or a
+latency distribution. The next slice replaces semantic polling with an explicit
+readiness observation, retains all twelve expectations and records first-use
+availability separately. Source indexing waiting behind Gradle remains a speed
+gap even if the later first-response semantics pass.
+
+Validation: cargo fmt, cargo test --workspace --locked --offline (1,378 pass,
+zero failed, four ignored), release bins, Bash syntax, processor Lua syntax and
+git diff --check pass. The new immutable ktlsp is SHA256
+42b8df23f3cf2acc9ca3bb9de6b1f970aa0bb8c5226bbb651313f232f92391d7.
+Rust log SHA256:
+049faba775fb266a7e4fe0a280c9f04137eff48a0a08bbe496afefe9f7c614df.
+No completion-speed, startup-speed or RSS improvement is claimed for this fix.
+
+Artifacts under C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/:
+native-kotlin-loader-resource61-1/, kotlin-loader-harness61-1/,
+native-loader-rust61-1/, native-java-defaults61-{1,control2,instrumented3}/,
+current-api-javac-probe61-1/, independent-current-api-javac61-1/,
+native-loader-gradle-live61-1/, native-processor-snapshot61-{1,2}/.
+Actual short native run directories:
+C:/Users/gummy/AppData/Local/Temp/kl61-gradle-live-native1 and
+C:/Users/gummy/AppData/Local/Temp/kl61-processor-native2.
+Phase1 compiler/API/Javac receipt SHA256:
+531b81532fd631b30aeeb27634efe8caa3ae51b5dec8ae859a15567543c87009.
+Current processor report SHA256:
+6df57f3cff55fca4e9c7bf8bd453ac50025ef71a86653a7159f9cf0f8ccf4df9.
+Exact source/model export SHA256:
+555301f0b9140b39922447adc95550ef583f3b256c97d0b090fc3daf2d6fc309.
 
 ### Sixtieth checkpoint: shared bounded receivers and actual CEM acceptance
 

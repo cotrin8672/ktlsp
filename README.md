@@ -423,6 +423,8 @@ Compile the fixture first; generated targets are hash-pinned and are never handw
 `gradle-live` also verifies classpath discovery against a disposable Gradle project that creates
 `compileClasspath` from a late `afterEvaluate` callback. The probe requires cold and warm
 configuration-cache runs to preserve unresolved-dependency output and reuse the cache entry.
+Both runs also execute the production compiler loader factory and verify that closing it preserves
+another loader's pending resource; the ordinary cached-loader control must reproduce the failure.
 
 `KTLSP_GRADLE_RELOAD=1 dev/ktlsp-harness.sh gradle-live` uses a disposable mixed project with
 Gradle 9.6.1 and Kotlin 2.4.0. Set `GRADLE_USER_HOME` to a populated wrapper/plugin cache and
@@ -459,6 +461,8 @@ preserved unsaved Java/Kotlin buffers. Results are in `artifacts/processor-reloa
 The model selects the public main Kotlin compilation independently of auxiliary KAPT/KSP tasks.
 After each build the probe orders current model/shared analysis refresh before one acceptance sweep;
 Kotlin pulls correlate the transmitted unsaved text with accepted source/model/store generations.
+Phase 1 and 2 receipts preserve all three flushed buffer texts and wire identities before the canonical
+Kotlin pull, together with the validated refreshed cache and selected task inputs.
 Producer scopes publish located Kotlin errors but cannot certify clean results or unsaved regeneration.
 Java producer diagnostics remain an open case. Missing observations are recorded as unmeasured.
 Transformed APIs such as Lombok remain covered by their separate compiler-plugin cases.
