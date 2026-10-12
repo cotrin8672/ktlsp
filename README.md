@@ -202,6 +202,12 @@ captured configuration alone does not prove a compiler ran or diagnosed an unsav
 On Windows, supported captured tasks also diagnose private overlays of unsaved owned
 Java/Kotlin sources, including new buffers. Their accepted results use the ordinary
 push/pull diagnostic store; unsupported, failed or stale runs cannot clear it.
+The `java` scenario also checks Kotlin body members from Java try-with-resources:
+partial selectors and unfinished nested `println`, exact member/local/field navigation,
+and outer-field scope before the try, in catch/finally and after it. A valid `var`
+resource requires useful `Body.string` completion and remains a coverage gap until
+that first response succeeds; empty results cannot satisfy this positive case.
+`java-resource-body.json` records reconstructed outbound edits, first RPCs and restoration.
 The `semantic` scenario checks receiver/result chains, public `super` overload selection
 and KMP navigation. Imported extension aliases also cover typed return chains with
 same-named decoys, incomplete completion, unsaved import removal/rebinding, references
@@ -301,6 +307,8 @@ blocks; it also supports this project's Kotlin DSL warnings-as-errors policy.
 For pinned Moshi, set `KTLSP_UI_CASES` to the absolute path of
 `dev/corpus/moshi-1.15.2-ui.json` and `KTLSP_UI_SAMPLES=31` with the same corpus route.
 For pinned Retrofit, use `dev/corpus/retrofit-2.11.0-ui.json` with that sample count.
+For pinned OkHttp4.12.0, use `dev/corpus/okhttp-4.12.0-ui.json`; it checks Java's
+typed Kotlin `responseBody.string()` in the original guide, including accepted whole-buffer SHA256.
 These check one first-after-readiness and thirty repeated native popup/acceptance cycles,
 including the exact whole buffer after accepting each completion.
 Spring extension-receiver and incomplete-selector regressions use the same route with

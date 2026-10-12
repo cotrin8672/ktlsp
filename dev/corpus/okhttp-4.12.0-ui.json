@@ -1,0 +1,21 @@
+{
+  "build_tool": "gradle",
+  "files": {
+    "java": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java"
+  },
+  "source_sha256": {
+    "java": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2"
+  },
+  "cases": [
+    {
+      "name": "java",
+      "anchor": "System.out.println(responseBody.string());",
+      "source_token": "string",
+      "before": "          System.out.println(responseBody",
+      "member": "string",
+      "excluded": "enqueue",
+      "after": "          System.out.println(responseBody.string());",
+      "post_input": ");"
+    }
+  ]
+}

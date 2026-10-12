@@ -578,6 +578,126 @@ do
   vim.wait(200)
 end
 
+-- Java resources keep their Kotlin body type through incomplete calls and lexical scopes.
+do
+  local path = project .. "/resourcecase/ResourceUse.java"
+  local kotlin_path = project .. "/resourcecase/Bodies.kt"
+  local resource_buf = vim.fn.bufadd(path)
+  vim.fn.bufload(resource_buf)
+  vim.bo[resource_buf].filetype = "java"
+  assert(vim.lsp.buf_attach_client(resource_buf, id), "resource fixture did not attach")
+  local original = vim.api.nvim_buf_get_lines(resource_buf, 0, -1, false)
+  local kotlin_original = vim.fn.readfile(kotlin_path)
+  local original_modified = vim.bo[resource_buf].modified
+  local original_hash = probe.buffer_sha256(resource_buf)
+  local function disk_sha(file)
+    return vim.fn.sha256(table.concat(vim.fn.readfile(file, "b"), "\n"))
+  end
+  local original_disk = { java = disk_sha(path), kotlin = disk_sha(kotlin_path) }
+  local resource_uri = vim.uri_from_bufnr(resource_buf)
+  local wire_text, latest = probe.buffer_full_text(resource_buf), nil
+  local report = { requests = {}, outbound = {}, expected_probe_count = 14,
+    original_source_sha256 = original_hash, original_disk_sha256 = original_disk,
+    valid_var_status = "OPEN unless the first response offers Body.string; empty is a mismatch" }
+  local notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    if method == "textDocument/didChange" and params.textDocument.uri == resource_uri then
+      local reconstructed, err = probe.apply_content_changes(wire_text, params.contentChanges,
+        client.offset_encoding or "utf-16")
+      latest = { sent = not not sent, version = params.textDocument.version,
+        buffer_version = vim.lsp.util.buf_versions[resource_buf], source_sha256 = probe.buffer_sha256(resource_buf),
+        wire_source_sha256 = reconstructed and vim.fn.sha256(reconstructed), wire_error = err }
+      if sent and reconstructed then wire_text = reconstructed end
+      report.outbound[#report.outbound + 1] = vim.deepcopy(latest)
+    end
+    return sent
+  end
+  local function flush()
+    require("vim.lsp._changetracking").flush(client)
+  end
+  local function once(phase, method, anchor, token, text)
+    local position = probe.find(original, anchor, token)
+    if text then
+      vim.api.nvim_buf_set_lines(resource_buf, position.line, position.line + 1, false, { text })
+      flush()
+      if method == "textDocument/completion" then
+        position.character = vim.str_utfindex(text, "utf-16")
+      else
+        position = probe.find(vim.api.nvim_buf_get_lines(resource_buf, 0, -1, false), text, token)
+      end
+    end
+    local params = { textDocument = { uri = resource_uri }, position = position }
+    local sha = probe.buffer_sha256(resource_buf)
+    local delivered = latest and latest.sent and latest.version == vim.lsp.util.buf_versions[resource_buf]
+      and latest.source_sha256 == sha and latest.wire_source_sha256 == sha and not latest.wire_error
+    local response, row
+    if delivered then
+      response, row = request_rpc(method, params, resource_buf)
+    else
+      row = { method = method, params = params, attempted = false, attempts = 0,
+        availability = "not-run", delivery_error = "current edited/restored source was not observed outbound" }
+      requests[#requests + 1] = row
+    end
+    row.resource_phase, row.source_sha256, row.delivery = phase, sha, vim.deepcopy(latest)
+    report.requests[#report.requests + 1] = row
+    if text then
+      vim.api.nvim_buf_set_lines(resource_buf, position.line, position.line + 1, false,
+        { original[position.line + 1] })
+      flush()
+    end
+    local result = response and response.result
+    if result == vim.NIL then result = nil end
+    return result, row
+  end
+  local function completion(phase, anchor, token, text, expected, excluded)
+    local result, row = once(phase, "textDocument/completion", anchor, token, text)
+    check("Java resource " .. phase .. " offers " .. expected .. " and excludes " .. excluded,
+      probe.completion_has(result, expected) and not probe.completion_has(result, excluded), vim.inspect(result), row)
+  end
+  local function definition(phase, anchor, token, text, target, lines, declaration)
+    local result, row = once(phase, "textDocument/definition", anchor, token, text)
+    local _, range = probe.find(lines, declaration, token)
+    check("Java resource " .. phase .. " goes to exact " .. token .. " declaration",
+      probe.exact_definition(result, target, { range }), vim.inspect(result), row)
+  end
+  local ok, err = xpcall(function()
+    completion("ordinary local unfinished println control", "System.out.println(localBody.string());", "localBody",
+      "        System.out.println(localBody.", "string", "enqueue")
+    completion("typed body.st", "System.out.println(body.string());", "body",
+      "            body.st", "string", "enqueue")
+    completion("typed unfinished println body.", "System.out.println(body.string());", "body",
+      "            System.out.println(body.", "string", "enqueue")
+    definition("unfinished println Kotlin member", "System.out.println(body.string());", "string",
+      "            System.out.println(body.string()", kotlin_path, kotlin_original, "fun string():")
+    definition("try body binding", "System.out.println(body.string());", "body", nil,
+      path, original, "try (Body body = supply)")
+    for _, scope in ipairs({ "before", "caught", "finished", "after" }) do
+      local anchor = "/* " .. scope .. " */ body.enqueue();"
+      completion(scope .. " outer field body.en", anchor, "body",
+        "        /* " .. scope .. " */ body.en", "enqueue", "string")
+      definition(scope .. " outer field binding", anchor, "body", nil,
+        path, original, "private Other body")
+    end
+    completion("valid var unfinished println positive", "System.out.println(inferredBody.string());", "inferredBody",
+      "            System.out.println(inferredBody.", "string", "enqueue")
+  end, debug.traceback)
+  if not vim.deep_equal(vim.api.nvim_buf_get_lines(resource_buf, 0, -1, false), original) then
+    vim.api.nvim_buf_set_lines(resource_buf, 0, -1, false, original)
+    flush()
+  end
+  client.rpc.notify = notify
+  vim.bo[resource_buf].modified = original_modified
+  report.disk_unchanged = disk_sha(path) == original_disk.java and disk_sha(kotlin_path) == original_disk.kotlin
+  report.restored = probe.buffer_sha256(resource_buf) == original_hash and report.disk_unchanged
+  report.error = not ok and err or nil
+  check("Java resource buffers restore exactly without disk edits", report.restored, vim.inspect(report))
+  if not ok then check("Java resource probes execute", false, err) end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-resource-body.json")
+  end
+end
+
 -- Imported superclasses must keep their declaration context across both languages and edits.
 do
   local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:gsub("^@", ""))

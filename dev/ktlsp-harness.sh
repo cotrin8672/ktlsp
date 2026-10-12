@@ -543,6 +543,50 @@ fun useSuperclasses(child: ImportedChild, kotlin: KotlinImportedChild) {
     kotlin.accept("ok")
 }
 KOTLIN
+  mkdir -p "$project/resourcecase"
+  cat > "$project/resourcecase/Bodies.kt" <<'KOTLIN'
+package resourcecase
+
+class Body : AutoCloseable {
+    fun string(): String = "body"
+    override fun close() { }
+}
+
+class Other {
+    fun enqueue() { }
+}
+KOTLIN
+  cat > "$project/resourcecase/ResourceUse.java" <<'JAVA'
+package resourcecase;
+
+public class ResourceUse {
+    private Other body = new Other();
+
+    public void run(Body supply) {
+        /* before */ body.enqueue();
+        try (Body body = supply) {
+            System.out.println(body.string());
+        } catch (Exception failure) {
+            /* caught */ body.enqueue();
+        } finally {
+            /* finished */ body.enqueue();
+        }
+        /* after */ body.enqueue();
+    }
+
+    public void local(Body supply) {
+        Body localBody = supply;
+        System.out.println(localBody.string());
+    }
+
+    public void inferred(Body supply) {
+        try (var inferredBody = supply) {
+            System.out.println(inferredBody.string());
+        }
+    }
+}
+JAVA
+
   mkdir -p "$project/selection"
   cat > "$project/selection/Reader.java" <<'JAVA'
 package selection;

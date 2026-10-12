@@ -1844,6 +1844,20 @@ fn goto_definition_with_imports(
     if let Some(local) = local_definition(file, src, usage) {
         return vec![local];
     }
+    if usage.kind() == "identifier"
+        && usage.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "method_invocation" | "field_access")
+                && parent.child_by_field_name("object") == Some(usage)
+        })
+    {
+        if let Some(field) = same_file_field_declaration(src, usage) {
+            return vec![Def {
+                file: file.to_string(),
+                start_byte: field.start_byte(),
+                end_byte: field.end_byte(),
+            }];
+        }
+    }
     if let Some(defs) = receiver_member_defs(index, file, src, tree, usage) {
         return defs;
     }
@@ -2344,6 +2358,27 @@ fn local_declaration_from_parent<'a>(
             }
             None
         }
+        "try_with_resources_statement" => {
+            if parent.child_by_field_name("body") == Some(current) {
+                return declaration_in_resources_before(
+                    src,
+                    parent.child_by_field_name("resources")?,
+                    name,
+                    current.start_byte(),
+                );
+            }
+            None
+        }
+        "resource_specification" => {
+            declaration_in_resources_before(src, parent, name, current.start_byte())
+        }
+        "resource" => {
+            // A resource is in scope in its own initializer; definite assignment is separate.
+            if parent.child_by_field_name("value") == Some(current) {
+                return declaration_in_statement(src, parent, name);
+            }
+            None
+        }
         "for_statement" => {
             if let Some(body) = parent.child_by_field_name("body") {
                 if body == current || body.start_byte() <= current.start_byte() {
@@ -2362,6 +2397,25 @@ fn local_declaration_from_parent<'a>(
         }
         _ => None,
     }
+}
+
+fn declaration_in_resources_before<'a>(
+    src: &str,
+    resources: Node<'a>,
+    name: &str,
+    before: usize,
+) -> Option<Node<'a>> {
+    let mut found = None;
+    let mut cursor = resources.walk();
+    for resource in resources.named_children(&mut cursor) {
+        if resource.start_byte() >= before {
+            break;
+        }
+        if let Some(declaration) = declaration_in_statement(src, resource, name) {
+            found = Some(declaration);
+        }
+    }
+    found
 }
 
 fn declaration_in_statement<'a>(src: &str, node: Node<'a>, name: &str) -> Option<Node<'a>> {
@@ -3398,6 +3452,7 @@ fn is_declaration_name(node: Node) -> bool {
         "variable_declarator",
         "enum_constant",
         "formal_parameter",
+        "resource",
     ];
     if !declaration_kinds.contains(&parent.kind()) {
         return false;
@@ -3515,7 +3570,21 @@ pub fn completion_query(
         let (prefix, mut synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
         // An unfinished `h.name` statement can parse as a type; a call forces a receiver expression.
         synthetic.insert_str(syn_offset, "()");
-        let synthetic_tree = JavaParser::new().parse(&synthetic);
+        let mut synthetic_tree = JavaParser::new().parse(&synthetic);
+        if completion_needs_scope(&synthetic_tree, syn_offset) {
+            if let Some(delimiters) = completion_delimiter_stack(&synthetic_tree, syn_offset + 2) {
+                if let Some(closers) = completion_call_closers(&synthetic, syn_offset, &delimiters)
+                {
+                    synthetic.insert_str(syn_offset + 2, &closers);
+                    synthetic_tree = JavaParser::new().parse(&synthetic);
+                } else if let Some((prefix_source, prefix_tree)) =
+                    completion_prefix_source(&synthetic_tree, &synthetic, syn_offset, &delimiters)
+                {
+                    synthetic = prefix_source;
+                    synthetic_tree = prefix_tree;
+                }
+            }
+        }
         let receiver = completion_receiver_at(&synthetic_tree, syn_offset);
         let (ty, receiver_kind) = if index.may_have_compiled_callables() {
             receiver
@@ -3573,6 +3642,162 @@ pub fn completion_query(
         layout: imports::import_layout_with_style(ImportStyle::Java, tree, src),
         status,
     })
+}
+
+/// Restore call delimiters only in a completion view whose parser lost the enclosing block.
+/// Balanced source and delimiters below the active brace remain untouched.
+fn completion_needs_scope(tree: &Tree, selector_offset: usize) -> bool {
+    if !tree.root_node().has_error() {
+        return false;
+    }
+    let Some(receiver) = completion_receiver_at(tree, selector_offset) else {
+        return false;
+    };
+    let mut scope = Some(receiver);
+    while let Some(node) = scope {
+        if node.kind() == "block" {
+            return false;
+        }
+        scope = node.parent();
+    }
+    true
+}
+
+fn completion_call_closers(
+    src: &str,
+    selector_offset: usize,
+    delimiters: &[(u8, bool)],
+) -> Option<String> {
+    // The caller just inserted () after the placeholder. Do not close an authored suffix or
+    // turn a following statement into a call argument.
+    let insert_at = selector_offset + 2;
+    let suffix = src.get(insert_at..)?.trim_start();
+    if !suffix.is_empty() && !suffix.starts_with('}') {
+        return None;
+    }
+    let brace = delimiters.iter().rposition(|(open, _)| *open == b'{')?;
+    let unmatched = &delimiters[brace + 1..];
+    if unmatched.is_empty() || unmatched.iter().any(|(_, semicolon)| *semicolon) {
+        return None;
+    }
+    Some(
+        unmatched
+            .iter()
+            .rev()
+            .map(|(open, _)| match *open {
+                b'(' => ')',
+                b'[' => ']',
+                _ => unreachable!("only call/index delimiters follow the innermost brace"),
+            })
+            .collect(),
+    )
+}
+
+/// A later incomplete statement can erase an earlier receiver's block. Recover only a prefix
+/// that proves the same identifier is a preserved local, parameter or resource; fields and types
+/// may depend on declarations in the discarded suffix, so their full view must remain available.
+fn completion_prefix_source(
+    tree: &Tree,
+    src: &str,
+    selector_offset: usize,
+    delimiters: &[(u8, bool)],
+) -> Option<(String, Tree)> {
+    let original = completion_receiver_at(tree, selector_offset)?;
+    if original.kind() != "identifier" {
+        return None;
+    }
+    let end = selector_offset + 2;
+    if delimiters.iter().any(|(_, semicolon)| *semicolon) {
+        return None;
+    }
+    let brace = delimiters.iter().rposition(|(open, _)| *open == b'{')?;
+    let close = |open| match open {
+        b'(' => ')',
+        b'[' => ']',
+        b'{' => '}',
+        _ => unreachable!("only structural delimiters are recorded"),
+    };
+    let mut prefix = String::from(src.get(..end)?);
+    for (open, _) in delimiters[brace + 1..].iter().rev() {
+        prefix.push(close(*open));
+    }
+    prefix.push(';');
+    for (index, (open, _)) in delimiters[..=brace].iter().enumerate().rev() {
+        prefix.push(close(*open));
+        if index > 0 && delimiters[index - 1].0 == b'{' {
+            prefix.push(';');
+        }
+    }
+    let prefix_tree = JavaParser::new().parse(&prefix);
+    let recovered = completion_receiver_at(&prefix_tree, selector_offset)?;
+    if recovered.kind() != "identifier"
+        || recovered.start_byte() != original.start_byte()
+        || recovered.end_byte() != original.end_byte()
+        || node_text(recovered, &prefix) != node_text(original, src)
+    {
+        return None;
+    }
+    local_declaration_node(&prefix, recovered)?;
+    Some((prefix, prefix_tree))
+}
+
+fn completion_delimiter_stack(tree: &Tree, insert_at: usize) -> Option<Vec<(u8, bool)>> {
+    let mut delimiters: Vec<(u8, bool)> = Vec::new();
+    let mut cursor = tree.walk();
+    'walk: loop {
+        let node = cursor.node();
+        if node.start_byte() >= insert_at {
+            break;
+        }
+        if node.child_count() > 0 && cursor.goto_first_child() {
+            continue;
+        }
+        // Terminal kinds, rather than source characters, exclude quoted/comment delimiters.
+        if !node.is_missing() {
+            match node.kind() {
+                "(" => delimiters.push((b'(', false)),
+                "[" => delimiters.push((b'[', false)),
+                "{" => delimiters.push((b'{', false)),
+                ")" | "]" | "}" => {
+                    let expected = match node.kind() {
+                        ")" => b'(',
+                        "]" => b'[',
+                        _ => b'{',
+                    };
+                    let (open, semicolon) = delimiters.pop()?;
+                    if open != expected {
+                        return None;
+                    }
+                    // A prior balanced for (...; ...; ...) must not poison a later call.
+                    // Semicolons in nested brace bodies do not belong to enclosing arguments.
+                    if semicolon && open != b'{' {
+                        if let Some((parent, invalid)) = delimiters.last_mut() {
+                            if *parent != b'{' {
+                                *invalid = true;
+                            }
+                        }
+                    }
+                }
+                ";" => {
+                    if let Some((open, invalid)) = delimiters.last_mut() {
+                        if *open != b'{' {
+                            *invalid = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    Some(delimiters)
 }
 
 fn completion_receiver_at(tree: &Tree, offset: usize) -> Option<Node<'_>> {
@@ -4444,5 +4669,220 @@ class Child extends Base {
             (1..=4).contains(&counts[1]),
             "leaf work must be bounded independently of nesting: {counts:?}"
         );
+    }
+
+    #[test]
+    fn java_resource_bindings_follow_the_specification_and_try_body_only() {
+        let source = r#"class Use {
+ void run() {
+  try (First first = open(); Second second = first.next()) {
+   first.inside(); second.inside();
+  } catch (Exception e) { first.caught(); } finally { first.finished(); }
+  first.after();
+  try (First before = later.forward(); Second later = open()) {}
+  try (First self = self.make()) {}
+  First existing = open();
+  try (existing) { existing.reused(); }
+ }
+}"#;
+        let tree = JavaParser::new().parse(source);
+        assert!(!tree.root_node().has_error());
+        for (usage, declaration) in [
+            ("first.next", Some("first =")),
+            ("first.inside", Some("first =")),
+            ("second.inside", Some("second =")),
+            ("first.caught", None),
+            ("first.finished", None),
+            ("first.after", None),
+            ("later.forward", None),
+            ("self.make", Some("self =")),
+            ("existing.reused", Some("existing =")),
+        ] {
+            let offset = source.find(usage).unwrap();
+            let node = identifier_at(&tree, offset).unwrap();
+            let found = local_declaration_node(source, node);
+            assert_eq!(
+                found.map(|decl| decl.start_byte()),
+                declaration.map(|text| source.find(text).unwrap()),
+                "{usage}"
+            );
+        }
+        let declaration = source.find("first =").unwrap();
+        let definitions =
+            authored_goto_definition(&Index::new(), "Use.java", source, &tree, declaration);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].start_byte, declaration);
+    }
+
+    #[test]
+    fn java_incomplete_nested_invocation_keeps_the_completion_receiver() {
+        let type_source = "package app; class Body { public String string() { return null; } } class body { public static void enqueue() {} }";
+        let type_tree = JavaParser::new().parse(type_source);
+        let mut index = Index::new();
+        index.replace_file(
+            "Types.java",
+            extract_symbols(&type_tree, type_source),
+            Tier::Volatile,
+        );
+        for (case, source) in [
+            ("bare", "package app; class Use { void run(Body body) {\n body.\n } }"),
+            ("balanced", "package app; class Use { void run(Body body) {\n System.out.println(body.);\n } }"),
+            ("unfinished", "package app; class Use { void run(Body body) {\n System.out.println(body.\n } }"),
+            ("nested calls", "package app; class Use { void run(Body body) {\n System.out.println(wrap(body.\n } }"),
+            ("quoted and commented delimiters", r#"package app; class Use { void run(Body body) {
+ String marker = ") } ; [ ("; char close = ')';
+ /* ) } ; [ ( */
+ // ) } ; [ (
+ System.out.println(body.
+ } }"#),
+            ("prior classic for and anonymous callback", r#"package app; class Use {
+ void enqueue(Callback callback) {}
+ void run() { enqueue(new Callback() {
+  public void onResponse(Body body, Headers responseHeaders) {
+   for (int i = 0, size = responseHeaders.size(); i < size; i++) {
+    System.out.println(responseHeaders.name(i));
+   }
+   System.out.println(body.
+  }
+ }); }
+}"#),
+        ] {
+            let offset = source.find("body.").unwrap() + "body.".len();
+            let (prefix, mut synthetic, synthetic_offset) =
+                complete::dot_recovery(source, offset).unwrap();
+            assert!(prefix.is_empty());
+            synthetic.insert_str(synthetic_offset, "()");
+            let tree = JavaParser::new().parse(&synthetic);
+            let receiver =
+                completion_receiver_at(&tree, synthetic_offset).expect("inner call receiver");
+            assert_eq!(node_text(receiver, &synthetic), "body", "{case}");
+            let source_tree = JavaParser::new().parse(source);
+            let query = completion_query(&index, "Use.java", source, &source_tree, offset, 100).unwrap();
+            let labels: HashSet<_> = query.candidates.iter().map(|item| item.label.as_str()).collect();
+            assert!(labels.contains("string"), "{case}: {labels:?}");
+            assert!(!labels.contains("enqueue"), "{case}: {labels:?}");
+        }
+        for source in [
+            "package app; class Use { void run(Body body) { String text = \"body.\"; } }",
+            "package app; class Use { void run(Body body) { /* body. */ } }",
+            "package app; class Use { void run(Body body) { // body.\n } }",
+        ] {
+            let offset = source.find("body.").unwrap() + "body.".len();
+            let tree = JavaParser::new().parse(source);
+            let query = completion_query(&index, "Use.java", source, &tree, offset, 100).unwrap();
+            assert_ne!(query.context, complete::CompletionContext::AfterDot);
+            assert!(query.candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn java_receiver_field_goto_preserves_identifier_roles_and_local_shadowing() {
+        let type_source = "package app; class Body { public void string() {} } class body {} class Other { Body body; }";
+        let source = r#"package app; class Use {
+ Body body;
+ void body() {}
+ void run(Other other) {
+  /*field*/ body.string();
+  /*method*/ body();
+  /*type*/ body value = null;
+  /*selector*/ other.body.string();
+ }
+ void shadow(Body body) { /*local*/ body.string(); }
+}"#;
+        let tree = JavaParser::new().parse(source);
+        let type_tree = JavaParser::new().parse(type_source);
+        let mut index = Index::new();
+        index.replace_file("Use.java", extract_symbols(&tree, source), Tier::Volatile);
+        index.replace_file(
+            "Types.java",
+            extract_symbols(&type_tree, type_source),
+            Tier::Volatile,
+        );
+        for (marker, file, declaration) in [
+            (
+                "field",
+                "Use.java",
+                source.find("Body body;").unwrap() + "Body ".len(),
+            ),
+            (
+                "method",
+                "Use.java",
+                source.find("void body()").unwrap() + "void ".len(),
+            ),
+            (
+                "type",
+                "Types.java",
+                type_source.find("class body").unwrap() + "class ".len(),
+            ),
+            (
+                "selector",
+                "Types.java",
+                type_source.find("class Other { Body body;").unwrap() + "class Other { Body ".len(),
+            ),
+            (
+                "local",
+                "Use.java",
+                source.find("shadow(Body body)").unwrap() + "shadow(Body ".len(),
+            ),
+        ] {
+            let start = source.find(&format!("/*{marker}*/")).unwrap();
+            let offset = start + source[start..].find("body").unwrap();
+            let definitions = goto_definition(&index, "Use.java", source, &tree, offset);
+            assert_eq!(
+                definitions,
+                vec![Def {
+                    file: file.to_string(),
+                    start_byte: declaration,
+                    end_byte: declaration + "body".len(),
+                }],
+                "{marker}"
+            );
+        }
+    }
+    #[test]
+    fn java_completion_prefix_recovery_preserves_bound_names_only() {
+        let type_source = "package app; class Body { public String string() { return null; } } class body { public static void enqueue() {} }";
+        let type_tree = JavaParser::new().parse(type_source);
+        let mut index = Index::new();
+        index.replace_file(
+            "Types.java",
+            extract_symbols(&type_tree, type_source),
+            Tier::Volatile,
+        );
+        for (case, source, cursor, expected_type) in [
+            ("parameter before broken resource", "package app; class Use { void run(Body supply) {\n supply.string();\n try (Missing body = supply) {\n System.out.println(body.\n } } }", "supply.", Some("Body")),
+            ("local before broken statement", "package app; class Use { void run(Body supply) { Body value = supply;\n value.string();\n System.out.println(value.\n } }", "value.", Some("Body")),
+            ("resource before broken statement", "package app; class Use { void run(Body supply) { try (Body body = supply) {\n body.string();\n System.out.println(body.\n } } }", "body.", Some("Body")),
+            ("explicit missing is never initializer inference", "package app; class Use { void run(Body supply) { try (Missing body = supply) {\n body.string();\n System.out.println(body.\n } } }", "body.", Some("Missing")),
+            ("later field cannot disappear", "package app; class Use { void run() {\n body.string();\n System.out.println(body.\n } Body body; }", "body.", None),
+            ("later local is not yet in scope", "package app; class Use { void run(Body supply) {\n body.string(); Body body = supply;\n System.out.println(body.\n } }", "body.", None),
+            ("type receiver retains full view", "package app; class Use { void run() {\n Body.string();\n System.out.println(body.\n } }", "Body.", None),
+            ("computed receiver retains full view", "package app; class Use { void run() {\n make().string();\n System.out.println(body.\n } Body make() { return null; } }", "make().", None),
+        ] {
+            let offset = source.find(cursor).unwrap() + cursor.len();
+            let (_, mut synthetic, selector_offset) = complete::dot_recovery(source, offset).unwrap();
+            synthetic.insert_str(selector_offset, "()");
+            let tree = JavaParser::new().parse(&synthetic);
+            let delimiters = completion_delimiter_stack(&tree, selector_offset + 2).unwrap();
+            let recovered = completion_prefix_source(&tree, &synthetic, selector_offset, &delimiters);
+            if let Some(expected) = expected_type {
+                let (prefix, prefix_tree) = recovered.unwrap_or_else(|| panic!("{case}"));
+                let receiver = completion_receiver_at(&prefix_tree, selector_offset).unwrap();
+                let declaration = local_declaration_node(&prefix, receiver).unwrap();
+                let ty = type_of_value_declaration(&index, "Use.java", &prefix, &prefix_tree, declaration).unwrap();
+                assert_eq!(ty.name(), Some(expected), "{case}");
+                let source_tree = JavaParser::new().parse(source);
+                let query = completion_query(&index, "Use.java", source, &source_tree, offset, 100).unwrap();
+                let labels: HashSet<_> = query.candidates.iter().map(|item| item.label.as_str()).collect();
+                if expected == "Body" {
+                    assert!(labels.contains("string"), "{case}: {labels:?}");
+                } else {
+                    assert!(!labels.contains("string"), "{case}: {labels:?}");
+                }
+                assert!(!labels.contains("enqueue"), "{case}: {labels:?}");
+            } else {
+                assert!(recovered.is_none(), "{case}");
+            }
+        }
     }
 }

@@ -3230,3 +3230,110 @@ fn qualified_free_named_defaults_follow_unsaved_formal_and_default_changes() {
     );
     assert_eq!(ws.doc_text("Use.kt").as_deref(), Some(source));
 }
+
+fn java_resource_workspace(source: &str) -> Workspace {
+    workspace(&[
+        ("AutoCloseable.java", "package java.lang; public interface AutoCloseable { void close(); }"),
+        ("Body.kt", "package app\nclass Body : AutoCloseable {\n fun string(): String = \"body\"\n override fun close() {}\n}\n"),
+        ("Other.kt", "package app\nclass Other : AutoCloseable {\n fun enqueue() {}\n override fun close() {}\n}\n"),
+        ("body.java", "package app; class body { public static void enqueue() {} }"),
+        ("Use.java", source),
+    ])
+}
+
+#[test]
+fn java_resource_ordinary_local_completion_control() {
+    for line in [
+        "body.",
+        "System.out.println(body.);",
+        "System.out.println(body.",
+    ] {
+        let source = format!("package app; class Use {{ void run(Body supply) {{\n Body body = supply;\n {line}\n }} }}");
+        let mut ws = java_resource_workspace(&source);
+        assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
+    }
+}
+
+#[test]
+fn java_resource_typed_kotlin_receiver_completion() {
+    for line in [
+        "body.",
+        "System.out.println(body.);",
+        "System.out.println(body.",
+    ] {
+        let source = format!("package app; class Use {{ void run(Body supply) {{\n try (Body body = supply) {{\n {line}\n }} }} }}");
+        let mut ws = java_resource_workspace(&source);
+        assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
+    }
+    let source = "package app; class Use { void run(Other supply) { try (Other body = supply) { body.enqueue(); } } }";
+    let mut ws = java_resource_workspace(source);
+    assert_member(&mut ws, "Use.java", "body.", "enqueue", "string");
+    assert_exact_definition(&mut ws, "Use.java", "body.enqueue()", "Other.kt", "enqueue");
+}
+
+#[test]
+fn java_resource_scope_returns_to_the_outer_field_in_catch_finally_and_after() {
+    let source = r#"package app; class Use {
+ Other body;
+ void run(Body supply) {
+  /*before*/ body.enqueue();
+  try (Body body = supply) { /*inside*/ body.string(); }
+  catch (Exception failure) { /*caught*/ body.enqueue(); }
+  finally { /*finished*/ body.enqueue(); }
+  /*after*/ body.enqueue();
+ }
+}"#;
+    let mut ws = java_resource_workspace(source);
+    for marker in ["before", "inside", "caught", "finished", "after"] {
+        let prefix = format!("/*{marker}*/ body.");
+        let (expected, absent, declaration) = if marker == "inside" {
+            (
+                "string",
+                "enqueue",
+                source.find("Body body =").unwrap() + "Body ".len(),
+            )
+        } else {
+            (
+                "enqueue",
+                "string",
+                source.find("Other body;").unwrap() + "Other ".len(),
+            )
+        };
+        assert_member(&mut ws, "Use.java", &prefix, expected, absent);
+        let usage = source.find(&prefix).unwrap() + prefix.find("body").unwrap();
+        let definitions = ws.goto_definition("Use.java", usage);
+        assert_eq!(definitions.len(), 1, "{marker}: {definitions:?}");
+        assert_eq!(definitions[0].file, "Use.java");
+        assert_eq!(definitions[0].start_byte, declaration, "{marker}");
+    }
+}
+
+#[test]
+fn java_resource_unknown_declared_type_does_not_fall_back_to_a_same_named_class() {
+    for line in ["body.", "System.out.println(body."] {
+        let source = format!("package app; class Use {{ void run(Body supply) {{\n supply.string();\n try (Missing body = supply) {{\n {line}\n }} }} }}");
+        let mut ws = java_resource_workspace(&source);
+        assert_member(&mut ws, "Use.java", "supply.", "string", "enqueue");
+        let found = labels(&mut ws, "Use.java", "body.");
+        assert!(
+            !found.contains("string") && !found.contains("enqueue"),
+            "unknown declared type, {line}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn java_resource_completion_recovery_keeps_nested_lexical_scopes() {
+    for (case, source) in [
+        ("resource shadows field", "package app; class Use { Other body; void run(Body supply) {\n try (Body body = supply) {\n System.out.println(body.\n } } }"),
+        ("finished resource cannot shadow field", "package app; class Use { Body body; void run(Other supply) {\n try (Other body = supply) {}\n System.out.println(body.\n } }"),
+        ("nested local shadows field", "package app; class Use { Other body; void run(Body supply) {\n { Body body = supply;\n System.out.println(body.\n } } }"),
+        ("finished nested local cannot shadow field", "package app; class Use { Body body; void run(Other supply) {\n { Other body = supply; }\n System.out.println(body.\n } }"),
+    ] {
+        let mut ws = java_resource_workspace(source);
+        let found = labels(&mut ws, "Use.java", "body.");
+        assert!(found.contains("string"), "{case}: {found:?}");
+        assert!(!found.contains("enqueue"), "{case}: {found:?}");
+        assert_eq!(ws.doc_text("Use.java").as_deref(), Some(source));
+    }
+}
