@@ -79,8 +79,8 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint71 passes1,492 tests,0 failures,4 existing ignored; formatting and release pass, including core126/server450/interop122 | Current finite slices verified; whole-project acceptance remains open | native-workspace-release71-1, receipt4a2dee7180dbbf7eab6137e6dbf99bca5f8015bfb92da51252a3810194cd0157; release ownership tests7 pass/1 existing ignored; useful semantic regressions failed before fixes |
-| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current Java307/312: original72 resource requests, new6 SDK requests and new5 Kotlin array requests match without readiness waits. The five existing diagnostic omissions remain. Earlier basic9/library41 remain historical | Finite completion/navigation evidence;5 existing diagnostic omissions remain | native-java-editor70-4; root-java-kotlin-editor-verification70-4. Server stop still force-requested, exit1/signal15; no graceful-shutdown claim |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint72 passes1,493 tests,0 failures,4 existing ignored; formatting and release pass, including core126/server451/interop122 | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
+| Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Checkpoint70 Java307/312: original72 resource requests, new6 SDK requests and new5 Kotlin array requests match without readiness waits. The five existing diagnostic omissions remain. Earlier basic9/library41 remain historical | Finite completion/navigation evidence;5 existing diagnostic omissions remain | native-java-editor70-4; root-java-kotlin-editor-verification70-4. Server stop still force-requested, exit1/signal15; no graceful-shutdown claim |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned; saved-source identities guarded and ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
 | Ordinary completion | Correct receiver members, annotation names and valid override proposals in Java/Kotlin | Checkpoint62 retains all twelve normal gradle-live expectations in each of three editor starts. All four project completions match on their sole response after the existing project-indexed event | Warmed focused semantics verified; Gradle-blocked startup and broader proposals open | Project readiness is12,233.401ms with uncached model/populated Gradle, then61.875/62.453ms on model reuse. Each condition has one observation, no speedup or distribution claim |
@@ -5471,3 +5471,108 @@ Kotlin2.0.21 ABI/options controls, current six-project editor checks and broader
 diagnostic correctness remain open. No timeout/grace extension or forced-success
 acceptance was introduced. Next: use these actual configured models for the
 existing basic completion/navigation floor while compiler adapter gaps remain explicit.
+
+## Checkpoint72: six-project basic floor and avoiding an unnecessary Gradle refresh
+
+The same immutable release71 binary (SHA09d94c5887515c2a5eb25a95d4061b1974a9727cc120e5b332409ff0d3a05162)
+ran all12 original corpus manifests and60 registered requests, each once after
+the existing explicit indexing barrier. These use populated dependency state and
+copied, current configured MODEL11 caches. They are functional editing checks;
+they do not measure cold startup, popup rendering or a latency distribution.
+
+| Project | Original requests | Matched | Remaining mismatch |
+| --- | --- | --- | --- |
+| CEM, non-Mixin probes | 10 | 9 | HolderGetter getOrThrow returns two overload locations |
+| OkHttp4.12.0 | 10 | 10 | None in these finite cases |
+| Moshi1.15.2 | 9 | 9 | None in these finite cases |
+| Retrofit2.11.0 | 12 | 12 | None in these finite cases |
+| Spring Framework6.2.0 | 10 | 9 | BeanFactory getBeanProvider returns Class<T>/ResolvableType overload locations |
+| Gradle8.14.3, wrapper8.14.2 | 9 | 9 | None in these finite cases |
+
+All41 useful completion responses and6 paired Unknown-receiver controls match.
+Definitions match11/13; neither overload mismatch was excluded or reclassified.
+All12 clients acknowledge shutdown and exit0, with no forced residual cleanup.
+Every original request is observed; final project/source/runtime guards pass and
+all copied model files retain their bound bytes. Controller receipt
+native-basic-floor-remaining71-1/receipt.json
+SHAc3b3df27d360d982ccc3c151467b834d87a675f7c059b8bf4778cb2107fdcab7.
+Root inspection: root-six-project-basic-floor71-1.json
+SHA3867a0787ddcccad52adf38f16abbb4d8cbd7d70600411a349d71f05956a768e.
+
+The CEM incomplete-source audit independently derives and checks all8 complete
+wire text images,8 version-delivery barriers and6 first-request cursor/source
+states. It checks all220 raw snapshot hashes before and after. Manifest hashes
+use readfile lines joined with LF and no final EOL; actual wire uses Neovim's
+fileformat and EOL. The main buffer uses CRLF, while the mixed-EOL peer becomes
+Unix wire text. Observed wire text is compared exactly, without normalizing it.
+The Unknown response is actual JSON null paired with a useful known receiver
+in the same source version. Receipt cem-wire-audit71-2/receipt.json
+SHA01e5f18217f55be775312f7ba7b5549c870c7c13c312b604367607f47295402d.
+This audit adds no semantic requests or passes.
+
+Three preparation failures remain retained: helper initialization shadowed a
+CLI variable before any native launch; recursive copying from a short Windows
+path encountered a long child path; and the initial controller incorrectly
+forbade all model recapture. The CLI name was corrected, extended paths now cover
+recursive copy roots, and recorded recapture is allowed only with unchanged
+bound model bytes/current inputs. The original CEM four golden responses were
+audited and carried forward, not retried. No source or semantic expectation was
+weakened.
+
+### Source-archive watch repair
+
+CEM's initial disk-model run received a Changed event for the selected adjacent
+NeoForge sources.jar and forced an offline29.585599s Gradle dump, despite producing
+the same configured model. That event was the observed trigger; the underlying
+OS access/metadata operation is unproved. Generation2's scan count0 means zero
+changed batches after117 initial installs, not lost model membership.
+
+The shared watcher classifier now ignores a present selected adjacent source
+archive only when its frozen combined binary/source mtime-size origin still
+matches. Binary events, source creation/deletion, changed identities, missing
+sources, unknown JARs and configuration/output policies remain unchanged.
+This retains the existing metadata-identity limitation for content edits which
+preserve both mtime and size; it introduces no new completeness or absence proof.
+
+The new focused regression fails before the fix with Some(true) versus None,
+then passes after it. Native-source-watch-red72-1 records the expected single
+failure, with raw SHAab62a3f00040ff498b33078ae51f859baa3a9370c88bdff0e9efed2ec6d36c8b.
+After the fix,25 watcher tests and the complete workspace pass:
+1,493 passed,0 failed,4 existing ignored. Formatting and release pass.
+Receipt native-source-watch-green-release72-1/receipt.json
+SHA0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe.
+Immutable fixed binary SHA65b65dec363b6677378e4b0a97030ee12056bcfb258a08bbfa9acaeb5abc6626.
+
+The committed CEM lifecycle manifest and existing corpus extra hook send one
+standard Changed notification for that existing archive. A positive exact-path
+DEBUG branch confirms the classifier returned None; an ordinary RPC response
+is not used as a notification barrier. The finalized run contains exactly one
+target notification and one ignored-branch record after the cursor, no Gradle
+dump across its lifetime, unchanged archive bytes/stamps and model bytes, and
+clean shutdown/exit0 with owned cleanup0. Lua syntax also passes. Receipt
+native-cem-source-watch-fixed72-1/receipt.json
+SHA7175204cbbf35c9dd03d5e90941b29900832105beb893369c244bccedfbaf29d.
+This is one separate finite watch case, not an additional basic-corpus request
+or a startup speed distribution. It verifies avoiding this extra model discovery.
+
+The60 basic requests above ran on release71, before the classifier change.
+The fixed release72 has focused/broad Rust and the real-editor watch proof;
+a final same-binary corpus run remains required after further semantic fixes.
+
+### Remaining acceptance work
+
+Original valid authored buffers have observed empty core diagnostic pushes in
+the sampled corpus logs; absence of a canonical compiler result is not a clean
+compilation proof. OkHttp's incomplete case also contains an old-version syntax
+packet arriving after a client restore notification. That alone does not prove
+server processing order or a persistent UI false positive. A prepared existing
+diagnostic hook will read the actual Neovim diagnostic store and await explicit
+current-version clearing while keeping the restored client open.
+
+Source-less binary public fields are absent from the inspected stub renderer.
+A conservative candidate and stale-cache regressions are prepared, using only
+the existing local/Module binary cache tags; native tests and editor validation
+are still unrun. Field-only Module controls and enum coverage remain separate.
+Compiler-plugin/ABI controls, wider diagnostics, live build refresh on the final
+model version, both exact goto mismatches and controlled responsiveness/IDEA
+comparisons remain open. The complete project goal is still in progress.

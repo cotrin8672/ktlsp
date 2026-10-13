@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "project_id": "cem-unchanged-source-watch-finite",
+  "build_tool": "gradle",
+  "scope": "Separate finite watch classifier proof; zero original60 golden requests. Whole actual CEM root/model unchanged.",
+  "probes": [
+    {
+      "id": "watch-lifecycle-only",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": "return super.getBreakSpeed()",
+      "token": "getBreakSpeed",
+      "completion": false,
+      "definition": false
+    }
+  ]
+}

@@ -1606,6 +1606,21 @@ fn project_change(
         return Some(true);
     }
     if let Some(model) = model {
+        if name.ends_with("-sources.jar") && file.is_file() {
+            for binary in model.local_jars() {
+                if binary.is_file()
+                    && classpath::adjacent_sources_jar(&binary)
+                        .is_some_and(|sources| crate::paths::file_key(&sources) == key)
+                {
+                    // shortcut: mtime/size identity, use content origins for metadata-preserving edits.
+                    let current = classpath::file_origin_id(&binary);
+                    if model.artifact_origin(&binary) == Some(current.as_str()) {
+                        tracing::debug!(path = key, "unchanged source archive watch ignored");
+                        return None;
+                    }
+                }
+            }
+        }
         if model.is_output_key(key) || model.has_dependency_key(key) {
             return Some(true);
         }
@@ -5209,6 +5224,63 @@ mod tests {
             "provided-only deepest key cannot hide a genuine output ancestor"
         );
         assert!(!model.is_output_key("/provided.jar/Nested.class"));
+    }
+
+    #[test]
+    fn unchanged_selected_source_jar_watch_does_not_force_model_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_unchanged_source_jar_watch_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("dependency.jar");
+        let sources = root.join("dependency-sources.jar");
+        std::fs::write(&binary, b"binary").unwrap();
+        std::fs::write(&sources, b"sources").unwrap();
+        let root_key = crate::paths::file_key(&root);
+        let source_key = crate::paths::file_key(&sources);
+        let binary_key = crate::paths::file_key(&binary);
+        let snapshot = || {
+            classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{root_key}\nSCP\tmain\t{binary_key}\nEND\t:app\n"
+            )))
+        };
+        let model = snapshot();
+        assert_eq!(project_change(&root, Some(&model), &source_key), None);
+        assert_eq!(
+            project_change(&root, Some(&model), &binary_key),
+            Some(true),
+            "binary events retain their existing policy"
+        );
+
+        std::fs::write(&sources, b"changed sources with a different size").unwrap();
+        assert_eq!(project_change(&root, Some(&model), &source_key), Some(true));
+        let model = snapshot();
+        assert_eq!(project_change(&root, Some(&model), &source_key), None);
+
+        std::fs::remove_file(&sources).unwrap();
+        assert_eq!(project_change(&root, Some(&model), &source_key), Some(true));
+        let absent = snapshot();
+        assert_eq!(
+            project_change(&root, Some(&absent), &source_key),
+            Some(true),
+            "missing selected sources stay relevant"
+        );
+        std::fs::write(&sources, b"created sources").unwrap();
+        assert_eq!(
+            project_change(&root, Some(&absent), &source_key),
+            Some(true)
+        );
+
+        let model = snapshot();
+        std::fs::write(&binary, b"changed binary with a different size").unwrap();
+        assert_eq!(project_change(&root, Some(&model), &source_key), Some(true));
+        assert_eq!(
+            project_change(&root, Some(&model), &format!("{root_key}/new-sources.jar")),
+            Some(true),
+            "an unselected in-project archive keeps the existing discovery policy"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
