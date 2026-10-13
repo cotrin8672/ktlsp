@@ -2534,6 +2534,15 @@ fn resolve_with_subst_unprojected(
     if tr.name.is_empty() {
         return Type::Unknown;
     }
+    if tr.name.ends_with("[]") {
+        let Some(component) = tr.array_component().filter(|_| depth < MAX_DEPTH) else {
+            return Type::Unknown;
+        };
+        return Type::array(
+            resolve_with_subst(index, &component, ctx, tparams, subst, depth + 1),
+            tr.nullable,
+        );
+    }
     if tr.qualification.is_none() {
         if let Some(bound) = subst.get(&tr.name) {
             if !type_head_is_known(index, bound) {
@@ -3897,6 +3906,129 @@ mod tests {
     use crate::symbol::{IndexedSymbol, SymbolKind};
 
     #[test]
+    fn java_array_shapes_keep_components_and_only_prove_intrinsic_use_types() {
+        use crate::members::{java_array_member_type, CallArguments, MemberUse};
+        use crate::types::{Type, TypeParameterBounds, TypeRef};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        let mut index = Index::new();
+        index.replace_file(
+            "Item.kt",
+            vec![IndexedSymbol::new(
+                "Item",
+                SymbolKind::Class,
+                "library",
+                None,
+                0,
+                4,
+            )],
+            Tier::Volatile,
+        );
+        let ctx = super::FileCtx::new("consumer".into(), Vec::new());
+        let item = Type::class("Item", Some("library".into()));
+        let expected = Type::array(Type::array(item.clone(), false), true);
+        let mut reference = TypeRef::simple("Item[][]");
+        reference.qualification = Some("library".into());
+        reference.package_candidates = Arc::new(vec!["library".into()]);
+        reference.nullable = true;
+        assert_eq!(super::declared_type(&index, &reference, &ctx), expected);
+        let component = reference.array_component().unwrap();
+        assert_eq!(component.name, "Item[]");
+        assert_eq!(component.qualification, reference.qualification);
+        assert_eq!(component.package_candidates, reference.package_candidates);
+        assert!(!component.nullable);
+        let mut substituted = TypeRef::simple("T[][]");
+        substituted.nullable = true;
+        assert_eq!(
+            super::resolve_with_subst(
+                &index,
+                &substituted,
+                &ctx,
+                &HashSet::from(["T".into()]),
+                &HashMap::from([("T".into(), item)]),
+                0
+            ),
+            expected
+        );
+        let parameters = [TypeParameterBounds {
+            name: "Item".into(),
+            start_byte: 10,
+            end_byte: 14,
+            scope_start: 0,
+            scope_end: 100,
+            upper_bounds: Vec::new(),
+            complete: true,
+        }];
+        let scoped = super::declared_type_in_scope(
+            &index,
+            &TypeRef::simple("Item[][]"),
+            &ctx.clone().with_file("Use.java"),
+            &parameters,
+        );
+        let Type::Array { component, .. } = scoped else {
+            panic!("missing outer dimension")
+        };
+        let Type::Array { component, .. } = *component else {
+            panic!("missing inner dimension")
+        };
+        let Type::Parameter {
+            definition,
+            upper_bounds,
+            ..
+        } = *component
+        else {
+            panic!("global Item leaked")
+        };
+        assert_eq!(definition.file, "Use.java");
+        assert_eq!(definition.start_byte, 10);
+        assert_eq!(upper_bounds, [Type::Unknown]);
+        let empty = CallArguments {
+            count: Some(0),
+            types: Vec::new(),
+            names: None,
+            has_spread: false,
+            trailing_lambda: false,
+        };
+        assert_eq!(
+            java_array_member_type(&expected, "length", &MemberUse::Value),
+            Some(Type::class("int", None))
+        );
+        assert_eq!(
+            java_array_member_type(&expected, "clone", &MemberUse::Call(empty.clone())),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            java_array_member_type(&expected, "length", &MemberUse::Call(empty.clone())),
+            None
+        );
+        for count in [None, Some(1)] {
+            assert_eq!(
+                java_array_member_type(
+                    &expected,
+                    "clone",
+                    &MemberUse::Call(CallArguments {
+                        count,
+                        ..empty.clone()
+                    })
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            java_array_member_type(&Type::Unknown, "clone", &MemberUse::Call(empty)),
+            None
+        );
+        assert!(!super::type_head_is_known(&index, &expected));
+        assert_eq!(super::direct_supertypes(&index, &expected), [Type::Unknown]);
+        for malformed in ["[]", "Item[[]"] {
+            assert_eq!(
+                super::declared_type(&index, &TypeRef::simple(malformed), &ctx),
+                Type::Unknown
+            );
+        }
+    }
+
+    #[test]
     fn java_string_identity_survives_partial_indexes_without_hiding_shadowing_or_ambiguity() {
         use crate::types::{Type, TypeRef};
         use std::sync::Arc;
@@ -4325,6 +4457,15 @@ fn resolve_type_ref_unprojected(
     if tr.name.is_empty() {
         return Type::Unknown;
     }
+    if tr.name.ends_with("[]") {
+        let Some(component) = tr.array_component().filter(|_| depth < MAX_DEPTH) else {
+            return Type::Unknown;
+        };
+        return Type::array(
+            resolve_type_ref(index, &component, ctx, depth + 1),
+            tr.nullable,
+        );
+    }
     let Some((package, container)) = type_ref_identity(index, tr, ctx) else {
         return Type::Unknown;
     };
@@ -4384,6 +4525,27 @@ pub fn declared_type_in_scope(
         *remaining -= 1;
         if tr.projection == Projection::Star {
             return Type::Star;
+        }
+        if tr.name.ends_with("[]") {
+            let Some(component) = tr.array_component() else {
+                return Type::Unknown;
+            };
+            return Type::projected(
+                tr.projection,
+                Type::array(
+                    resolve(
+                        index,
+                        &component,
+                        ctx,
+                        parameters,
+                        path,
+                        depth + 1,
+                        position,
+                        remaining,
+                    ),
+                    tr.nullable,
+                ),
+            );
         }
         let parameter = tr
             .qualification

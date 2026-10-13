@@ -217,11 +217,13 @@ and outer-field scope before the try, in catch/finally and after it. Valid `var`
 resources and same-file factory initializers require useful `Body.string` completion.
 It also checks a cursor before an authored selector suffix and 32 nested generic
 method results with exact Kotlin navigation. Typed enhanced-for variables and `var`
-elements from rank1 arrays or invariant `java.lang.Iterable<T>` use the same receiver
-inference for Java and Kotlin members. Rank1 array method returns, post-name dimensions,
-array creation and local `var` alias chains preserve the component type. The resource
-probe keeps the original26 first RPCs, adds12 array queries and26 alias queries;
-the alias group has24 useful queries and two rank2 scalar-leakage guards.
+elements from arrays or invariant `java.lang.Iterable<T>` use the same receiver
+inference for Java and Kotlin members. Array method returns, post-name dimensions,
+creation and local `var` aliases preserve rank and component types through `clone()`
+and indexing. Java array rows offer `length` and `clone` in the first response.
+The resource probe keeps the original26 first RPCs,12 array queries and26 alias queries,
+and adds8 rank2 queries (6 completions,2 exact definitions). The two existing rank2
+guards require useful array members as well as excluding scalar members.
 Paired unsaved Java/Kotlin changes check current completion, exact navigation and
 restoration. An initially unknown receiver can use its already-running JDK source
 seed before the first response; useful candidates return without waiting. Set

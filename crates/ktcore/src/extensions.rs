@@ -1245,6 +1245,7 @@ impl ReadSession<'_> {
                 self.resolve_type(&qualified)
             }
             crate::types::Type::Unknown
+            | crate::types::Type::Array { .. }
             | crate::types::Type::Parameter { .. }
             | crate::types::Type::Projected { .. }
             | crate::types::Type::Star => {

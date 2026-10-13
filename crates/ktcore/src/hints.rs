@@ -316,7 +316,7 @@ fn format_type(ty: &Type, syntax: TypeSyntax) -> Option<String> {
             }
             .to_string(),
         ),
-        Type::Unknown => None,
+        Type::Unknown | Type::Array { .. } => None,
         Type::Class {
             name,
             nullable,

@@ -4942,3 +4942,232 @@ fn java_enhanced_for_var_array_aliases_preserve_explicit_arrays_iterables_and_su
         );
     }
 }
+
+const JAVA_RANK_TWO_ARRAY_MEMBERS_USE: &str = r#"package app;
+class ArrayUse<T> {
+    Item[][] matrix(Item[][] input) { return input; }
+    void arrays(Item[][] values, int[] counts, Item postfixed[][]) {
+        for (var row : values) {
+            int length = row.length;
+            int copyLength = row.clone().length;
+            row[0].useful();
+            row.clone()[0].useful();
+            for (var cell : row.clone()) { cell.useful(); }
+        }
+        matrix(values).clone()[0][0].useful();
+        values[0].clone()[0].useful();
+        int count = counts.clone().length;
+        int postLength = postfixed[0].length;
+        var created = new Item[counts[0]][0];
+        created.clone()[0][0].useful();
+    }
+    void shadow(Other[][] values) {
+        for (var shadowRow : values) { shadowRow.clone()[0].usefulWrong(); }
+    }
+    void generic(Box<Item>[][] boxes) {
+        boxes.clone()[0][0].get().useful();
+    }
+}
+"#;
+
+#[test]
+fn java_rank_two_rows_offer_length_clone_and_nested_scalar_members() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Use.java", JAVA_ARRAY_FOREACH_USE),
+        ]);
+        for name in ["declaredRow", "methodRow", "createdRow"] {
+            let found = labels(&mut ws, "Use.java", &format!("{name}."));
+            assert!(
+                found.contains("length") && found.contains("clone"),
+                "array row {name}: {found:?}"
+            );
+            assert!(
+                !found.contains("useful") && !found.contains("usefulWrong"),
+                "scalar leak {name}: {found:?}"
+            );
+        }
+        for name in ["declaredCell", "methodCell", "createdCell"] {
+            assert_member(
+                &mut ws,
+                "Use.java",
+                &format!("{name}."),
+                "useful",
+                "usefulWrong",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "Use.java",
+                &format!("{name}.useful()"),
+                owner,
+                "useful",
+            );
+        }
+    }
+}
+
+#[test]
+fn java_array_clone_index_and_postfixed_chains_keep_rank_and_component_identity() {
+    for (owner, declaration) in [("Item.java", JAVA_ARRAY_ITERABLE_ITEM), ("Item.kt", ITEM)] {
+        let mut ws = workspace(&[
+            (owner, declaration),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Box.java", JAVA_BOX),
+            ("ArrayUse.java", JAVA_RANK_TWO_ARRAY_MEMBERS_USE),
+        ]);
+        for prefix in ["row.", "row.clone().", "counts.clone().", "postfixed[0]."] {
+            let found = labels(&mut ws, "ArrayUse.java", prefix);
+            assert!(
+                found.contains("length") && found.contains("clone"),
+                "{prefix}: {found:?}"
+            );
+            assert!(
+                !found.contains("useful") && !found.contains("usefulWrong"),
+                "scalar leak {prefix}: {found:?}"
+            );
+        }
+        for prefix in [
+            "row[0].",
+            "row.clone()[0].",
+            "cell.",
+            "matrix(values).clone()[0][0].",
+            "values[0].clone()[0].",
+            "created.clone()[0][0].",
+            "boxes.clone()[0][0].get().",
+        ] {
+            assert_member(&mut ws, "ArrayUse.java", prefix, "useful", "usefulWrong");
+            assert_exact_definition(
+                &mut ws,
+                "ArrayUse.java",
+                &format!("{prefix}useful()"),
+                owner,
+                "useful",
+            );
+        }
+        assert_member(
+            &mut ws,
+            "ArrayUse.java",
+            "shadowRow.clone()[0].",
+            "usefulWrong",
+            "useful",
+        );
+    }
+}
+
+#[test]
+fn java_array_members_keep_lexical_parameters_and_invalid_clone_calls_unknown() {
+    let source = r#"package app; class Use<Item> {
+      void run(Item[][] values) {
+        int length = values[0].clone().length;
+        values[0][0].missing();
+      }
+    }"#;
+    let mut ws = workspace(&[("Item.kt", ITEM), ("Use.java", source)]);
+    let found = labels(&mut ws, "Use.java", "values[0].clone().");
+    assert!(
+        found.contains("length") && found.contains("clone"),
+        "{found:?}"
+    );
+    assert!(!labels(&mut ws, "Use.java", "values[0][0].").contains("useful"));
+    for expression in [
+        "values.clone(1)",
+        "values.length()",
+        "values[0L]",
+        "values[\"wrong\"]",
+    ] {
+        let source = format!(
+            "package app; class Use {{ void run(Item[][] values) {{ {expression}.missing(); }} }}"
+        );
+        ws.change("Use.java", source);
+        let found = labels(&mut ws, "Use.java", &format!("{expression}."));
+        assert!(
+            !found.contains("useful") && !found.contains("length") && !found.contains("clone"),
+            "{expression}: {found:?}"
+        );
+    }
+    ws.change("Use.java", "package app; class Use { void run(Item[][] values) { for (var row[] : values) { row.missing(); } } }".into());
+    let found = labels(&mut ws, "Use.java", "row.");
+    assert!(
+        !found.contains("length") && !found.contains("clone") && !found.contains("useful"),
+        "invalid var dimensions: {found:?}"
+    );
+}
+
+#[test]
+fn java_array_clone_chains_follow_unsaved_return_component_and_rank_changes() {
+    let factory = "package app; class Factory { Item[][] matrix() { return null; } }";
+    let original = "package app; class Use { void run(Factory factory) { factory.matrix().clone()[0][0].useful(); } }";
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Factory.java", factory),
+        ("Use.java", original),
+    ]);
+    assert_member(
+        &mut ws,
+        "Use.java",
+        "factory.matrix().clone()[0][0].",
+        "useful",
+        "usefulWrong",
+    );
+    ws.change("Factory.java", factory.replace("Item", "Other"));
+    assert_member(
+        &mut ws,
+        "Use.java",
+        "factory.matrix().clone()[0][0].",
+        "usefulWrong",
+        "useful",
+    );
+    ws.change("Use.java", original.replace(".useful()", ".usefulWrong()"));
+    assert_exact_definition(
+        &mut ws,
+        "Use.java",
+        "factory.matrix().clone()[0][0].usefulWrong()",
+        "Other.kt",
+        "usefulWrong",
+    );
+    ws.change("Factory.java", factory.replace("Item[][]", "Item[]"));
+    let found = labels(&mut ws, "Use.java", "factory.matrix().clone()[0][0].");
+    assert!(
+        !found.contains("useful") && !found.contains("usefulWrong") && !found.contains("length"),
+        "rank leaked: {found:?}"
+    );
+    ws.change("Use.java", original.replace("[0][0]", "[0]"));
+    assert_member(
+        &mut ws,
+        "Use.java",
+        "factory.matrix().clone()[0].",
+        "useful",
+        "usefulWrong",
+    );
+    ws.change("Factory.java", factory.into());
+    ws.change("Use.java", original.into());
+    assert_member(
+        &mut ws,
+        "Use.java",
+        "factory.matrix().clone()[0][0].",
+        "useful",
+        "usefulWrong",
+    );
+}
+
+#[test]
+fn java_array_structure_does_not_offer_java_length_to_kotlin_consumers() {
+    let factory = "package app; public class Factory { public Item[][] matrix() { return null; } }";
+    let source = "package app\nfun use(factory: Factory) { factory.matrix().size }\n";
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Factory.java", factory),
+        ("Use.kt", source),
+    ]);
+    let found = labels(&mut ws, "Use.kt", "factory.matrix().");
+    assert!(
+        !found.contains("length") && !found.contains("useful"),
+        "Java surface leaked: {found:?}"
+    );
+    // Correct Kotlin Array<T>/size projection remains a useful-completion coverage gap.
+}

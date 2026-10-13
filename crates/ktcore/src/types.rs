@@ -87,6 +87,20 @@ pub struct TypeRef {
 }
 
 impl TypeRef {
+    /// Peel one normalized Java dimension, retaining the component's lexical provenance.
+    pub(crate) fn array_component(&self) -> Option<Self> {
+        let name = self.name.strip_suffix("[]")?;
+        let head = name.trim_end_matches("[]");
+        if head.is_empty() || head.contains(['[', ']']) {
+            return None;
+        }
+        let mut component = self.clone();
+        component.name = name.to_string();
+        component.nullable = false;
+        component.projection = Projection::Invariant;
+        Some(component)
+    }
+
     pub fn simple(name: impl Into<String>) -> Self {
         TypeRef {
             name: name.into(),
@@ -115,6 +129,11 @@ pub struct TypeParameterBounds {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
+    /// A Java array has structural rank and a component, without an indexed nominal owner.
+    Array {
+        component: Box<Type>,
+        nullable: bool,
+    },
     Class {
         name: String,
         package: Option<String>,
@@ -157,6 +176,13 @@ impl Type {
         }
     }
 
+    pub fn array(component: Type, nullable: bool) -> Self {
+        Type::Array {
+            component: Box::new(component),
+            nullable,
+        }
+    }
+
     pub fn class(name: impl Into<String>, package: Option<String>) -> Self {
         Type::Class {
             name: name.into(),
@@ -170,39 +196,58 @@ impl Type {
     pub fn name(&self) -> Option<&str> {
         match self {
             Type::Class { name, .. } => Some(name),
-            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
+            Type::Unknown
+            | Type::Array { .. }
+            | Type::Parameter { .. }
+            | Type::Projected { .. }
+            | Type::Star => None,
         }
     }
 
     pub fn package(&self) -> Option<&str> {
         match self {
             Type::Class { package, .. } => package.as_deref(),
-            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
+            Type::Unknown
+            | Type::Array { .. }
+            | Type::Parameter { .. }
+            | Type::Projected { .. }
+            | Type::Star => None,
         }
     }
 
     pub fn container(&self) -> Option<&str> {
         match self {
             Type::Class { container, .. } => container.as_deref(),
-            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => None,
+            Type::Unknown
+            | Type::Array { .. }
+            | Type::Parameter { .. }
+            | Type::Projected { .. }
+            | Type::Star => None,
         }
     }
 
     pub fn is_nullable(&self) -> bool {
         matches!(
             self,
-            Type::Class { nullable: true, .. } | Type::Parameter { nullable: true, .. }
+            Type::Class { nullable: true, .. }
+                | Type::Parameter { nullable: true, .. }
+                | Type::Array { nullable: true, .. }
         )
     }
 
-    /// Parameters expose their bounds through the shared member walk, without a nominal head.
+    /// Parameters and arrays expose useful members without a nominal head.
     pub fn is_member_receiver(&self) -> bool {
-        matches!(self, Type::Class { .. } | Type::Parameter { .. })
+        matches!(
+            self,
+            Type::Class { .. } | Type::Parameter { .. } | Type::Array { .. }
+        )
     }
 
     pub fn with_nullability(mut self, value: bool) -> Self {
         match &mut self {
-            Type::Class { nullable, .. } | Type::Parameter { nullable, .. } => *nullable = value,
+            Type::Class { nullable, .. }
+            | Type::Parameter { nullable, .. }
+            | Type::Array { nullable, .. } => *nullable = value,
             _ => {}
         }
         self
@@ -211,7 +256,11 @@ impl Type {
     pub fn args(&self) -> &[Type] {
         match self {
             Type::Class { args, .. } => args,
-            Type::Unknown | Type::Parameter { .. } | Type::Projected { .. } | Type::Star => &[],
+            Type::Unknown
+            | Type::Array { .. }
+            | Type::Parameter { .. }
+            | Type::Projected { .. }
+            | Type::Star => &[],
         }
     }
 

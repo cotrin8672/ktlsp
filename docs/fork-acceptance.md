@@ -79,7 +79,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint68 passes1,469 tests,0 failures,4 existing ignored; formatting/release, selected-source33 and Spring adapter5 also pass | Current finite slices verified; whole-project acceptance remains open | native-workspace-release68-2; selected-source positive regressions and exact-option rejection failed before their fixes |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint69 passes1,475 tests,0 failures,4 existing ignored; formatting/release and array interop116 also pass; earlier selected-source33 and Spring adapter5 remain recorded | Current finite slices verified; whole-project acceptance remains open | native-workspace-release68-2; selected-source positive regressions and exact-option rejection failed before their fixes |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Current default Java270/275; all64 resource first RPCs match without a readiness wait, including both previously empty Iterable completions. Current basic9/9 and library41/41 pass | Initial SDK completion gap repaired;5 existing Java diagnostic omissions remain | native-java-editor67-2/native-editor-smokes67-2; older semantic142/features78/80 remain historical |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned; saved-source identities guarded and ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -5336,3 +5336,30 @@ real-project breadth, unsaved editing latency and full IDEA parity remain open.
 
 All comparison artifacts above are under
 `C:/Users/gummy/AppData/Local/Temp/ktlsp-mixed-development-20261010`.
+
+
+## Checkpoint69: useful Java array completion; Gradle import remains open
+
+The current user priority is avoiding incorrect diagnostics and missing basic completion.
+Completion ranking and overload-goto precision are deferred; existing mismatches remain visible.
+
+| Case | Expected | Observed / status | Evidence / next action |
+| --- | --- | --- | --- |
+| Java nested arrays | Rows offer length/clone; clone/index chains retain Java or Kotlin element members and exact definitions | Four positive regressions failed before product. After structural shared types and reusing the existing value-binding guard for parentheses, all116 generic-interop tests pass. Invalid clone/index shapes remain guarded | native-array-members-red69-3:112 pass/4 fail; initial green69-1 exposed the existing (Body) negative; green69-2:116 pass. No expectation was weakened |
+| Real Neovim first responses | Useful completion on the same two previously empty row requests; six new completions and two exact definitions succeed | All72 resource requests (26+12+26+8) ran once, with readiness waits unset. All resource checks pass, including both-source unsaved aliases/restoration. Ten rank2 observations have exact current full texts/wires; saved valid source bytes equal the independent compiler controls. Each incomplete Java image is exactly one line edit | native-java-editor69-1 and root-array-editor-verification69-1. No cold-start or broad latency claim; new rank2 cases run after restoration |
+| Broad regression / release | Existing features remain usable | cargo fmt and cargo test --locked --workspace pass:1475 pass/0 fail/4 existing ignored. Release build passes | native-workspace-release69-1; immutable ktlsp SHA43604e2e11506bc2f42e2007514968ff5f8ebda04e643ea9fe30fec1772824c8 |
+| Existing Java diagnostics | Invalid references/calls/arguments receive appropriate errors | The broad Java harness remains exit1:276 assertions pass and the same five diagnostic assertions fail. The client reports server exit1/signal15; graceful shutdown is not claimed. Missing diagnostics are not evidence of whole-project correctness | Preserve java.out and the five failures. Array completion is verified separately; compiler/producer closure remains open |
+| Original Gradle build and fresh model | Real selected problems Java/Kotlin tasks build, and LSP imports their dependencies | Original unchanged Gradle tasks succeed (732 task markers,652.36s). Fresh LSP capture produces no model: offline and online classpath dumps each hit the existing180s deadline. Bench exit0/readiness true with zero indexed files is rejected as acceptance | native-gradle-original-model68-1 final receipt records controller selection failure, both owned cleanups0, stable original inputs. Next: stderr-only stage timing of the exact init script; no deadline-based pass |
+
+Independent array expectations: native-java-array-controls68-1 ran all8 actual Kotlin1.9.23/JDK17
+controls with exit0, no diagnostic lines, real SDK Iterable and owned cleanup0. The compiler
+receipt SHA is45b0480246b60657f50d0192c07fbe53d47c1104619b5f7a349cad1e825e3693.
+Root editor audit SHA is5c16100740fb6dba4315cc101c127cab3dfb75bd22ed71811dcef2cea339a831.
+Artifacts are under the existing Temp/ktlsp-selected-compiler-recipe-20261012-1 root and
+Temp/kl69-java-editor-1/java. Product changes are scoped to shared array representation,
+Java receiver inference and existing completion presentation; serialized TypeRef facts are unchanged.
+
+Remaining basic gaps include Kotlin Array.size projection, compiled array-return factories,
+array Object members and source-less library API discovery. Gradle fresh import, compiler ABI/plugin
+controls and one current binary across all six corpora are still required. The current two-project
+MODEL11 capture is in progress; it has not supplied acceptance evidence yet.

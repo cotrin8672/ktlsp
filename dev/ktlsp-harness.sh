@@ -767,6 +767,19 @@ public class ResourceUse {
         }
     }
 
+    public void arrayMembers(Body[][] kotlinValues, JavaLoopBody[][] javaValues) {
+        for (var kotlinMemberRow : kotlinValues) {
+            System.out.println(kotlinMemberRow.length);
+            System.out.println(kotlinMemberRow.clone().length);
+            System.out.println(kotlinMemberRow.clone()[0].string());
+        }
+        for (var javaMemberRow : javaValues) {
+            System.out.println(javaMemberRow.length);
+            System.out.println(javaMemberRow.clone().length);
+            System.out.println(javaMemberRow.clone()[0].javaOnly());
+        }
+    }
+
 }
 
 class JavaLoopBody {

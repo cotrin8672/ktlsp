@@ -27,6 +27,31 @@ pub enum MemberUse {
     Call(CallArguments),
 }
 
+/// JLS 10.7 array members have no authored declaration span or importable owner.
+pub const JAVA_ARRAY_MEMBERS: [(&str, crate::symbol::SymbolKind, Option<u8>); 2] = [
+    ("length", crate::symbol::SymbolKind::Property, None),
+    ("clone", crate::symbol::SymbolKind::Function, Some(0)),
+];
+
+pub fn java_array_member_type(receiver: &Type, name: &str, usage: &MemberUse) -> Option<Type> {
+    if !matches!(receiver, Type::Array { .. }) {
+        return None;
+    }
+    match (name, usage) {
+        ("length", MemberUse::Value) => Some(Type::class("int", None)),
+        ("clone", MemberUse::Call(arguments))
+            if arguments.count == Some(0)
+                && arguments.types.is_empty()
+                && arguments.names.as_ref().is_none_or(Vec::is_empty)
+                && !arguments.has_spread
+                && !arguments.trailing_lambda =>
+        {
+            Some(receiver.clone())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applicability {
     Applicable,

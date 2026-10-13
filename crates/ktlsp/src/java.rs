@@ -530,17 +530,6 @@ fn with_array_dimensions(mut ty: TypeRef, dimensions: Option<Node<'_>>) -> Optio
     Some(ty)
 }
 
-fn rank_one_array_component(ty: &TypeRef) -> Option<TypeRef> {
-    let name = ty.name.strip_suffix("[]")?;
-    if name.is_empty() || name.ends_with("[]") {
-        // shortcut: array-valued components stay Unknown without a shared array receiver type.
-        return None;
-    }
-    let mut component = ty.clone();
-    component.name = name.to_string();
-    Some(component)
-}
-
 /// A type's qualified identity without generic arguments. Generic outer owners remain in the
 /// path (`Outer<T>.Inner<U>` -> `Outer.Inner`); argument identifiers are never owner segments.
 fn type_path(node: Node<'_>, src: &str) -> Option<String> {
@@ -3425,6 +3414,9 @@ fn receiver_type(
     object: Node<'_>,
     initializer_depth: usize,
 ) -> Option<Type> {
+    if initializer_depth > infer::MAX_DEPTH {
+        return None;
+    }
     match object.kind() {
         "this" | "super" => {
             let receiver = infer::declared_type(
@@ -3467,6 +3459,84 @@ fn receiver_type(
         "object_creation_expression" => {
             let ty = object.child_by_field_name("type")?;
             receiver_type_from_type_node(index, file, src, tree, ty)
+        }
+        "parenthesized_expression" => java_argument_type(
+            index,
+            file,
+            src,
+            tree,
+            object.named_child(0)?,
+            initializer_depth + 1,
+        ),
+        "array_creation_expression" => {
+            if object.has_error() {
+                return None;
+            }
+            let mut cursor = object.walk();
+            let rank = object
+                .children_by_field_name("dimensions", &mut cursor)
+                .try_fold(0usize, |rank, dimensions| {
+                    Some(rank + array_dimensions_rank(dimensions)?)
+                })?;
+            if rank == 0 || rank > infer::MAX_DEPTH {
+                return None;
+            }
+            let mut ty = receiver_type_from_type_node(
+                index,
+                file,
+                src,
+                tree,
+                object.child_by_field_name("type")?,
+            )?;
+            for _ in 0..rank {
+                ty = Type::array(ty, false);
+            }
+            Some(ty)
+        }
+        "array_access" => {
+            if object.has_error() {
+                return None;
+            }
+            let subscript = java_argument_type(
+                index,
+                file,
+                src,
+                tree,
+                object.child_by_field_name("index")?,
+                initializer_depth + 1,
+            )?;
+            if subscript.package().is_some()
+                || !matches!(subscript.name(), Some("int" | "byte" | "short" | "char"))
+            {
+                // shortcut: boxed or unknown subscripts need verified unboxing/integral inference.
+                return None;
+            }
+            match receiver_type(
+                index,
+                file,
+                src,
+                tree,
+                object.child_by_field_name("array")?,
+                initializer_depth + 1,
+            )? {
+                Type::Array { component, .. } => Some(*component),
+                _ => None,
+            }
+        }
+        "field_access" => {
+            let receiver = receiver_type(
+                index,
+                file,
+                src,
+                tree,
+                object.child_by_field_name("object")?,
+                initializer_depth + 1,
+            )?;
+            ktcore::members::java_array_member_type(
+                &receiver,
+                node_text(object.child_by_field_name("field")?, src),
+                &ktcore::members::MemberUse::Value,
+            )
         }
         "method_invocation" => {
             java_method_invocation_return_type(index, file, src, tree, object, initializer_depth)
@@ -3870,35 +3940,27 @@ fn java_method_invocation_return_type(
     call: Node<'_>,
     initializer_depth: usize,
 ) -> Option<Type> {
-    java_method_invocation_projected_return_type(
-        index,
-        file,
-        src,
-        tree,
-        call,
-        initializer_depth,
-        false,
-    )
-    .map(|(ty, _)| ty)
-}
-
-// The flag identifies a proven rank-one array component. Ordinary iterable results reuse the
-// same call selection instead of resolving the method a second time.
-fn java_method_invocation_projected_return_type(
-    index: &dyn InferenceIndex,
-    file: &str,
-    src: &str,
-    tree: &Tree,
-    call: Node<'_>,
-    initializer_depth: usize,
-    array_component: bool,
-) -> Option<(Type, bool)> {
     let name = call.child_by_field_name("name")?;
     let symbol = node_text(name, src);
     if symbol.is_empty() {
         return None;
     }
     let arguments = java_call_arguments(index, file, src, tree, call, initializer_depth);
+    if symbol == "clone" && call.child_by_field_name("type_arguments").is_none() {
+        if let Some(object) = call.child_by_field_name("object") {
+            if let Some(receiver) =
+                receiver_type(index, file, src, tree, object, initializer_depth + 1)
+            {
+                if let Some(result) = ktcore::members::java_array_member_type(
+                    &receiver,
+                    symbol,
+                    &ktcore::members::MemberUse::Call(arguments.clone()),
+                ) {
+                    return Some(result);
+                }
+            }
+        }
+    }
     if let Some(candidates) = java_member_call_candidates_with_arguments(
         index,
         file,
@@ -3938,7 +4000,7 @@ fn java_method_invocation_projected_return_type(
                 *candidate,
                 &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
             )
-            .map(|ty| (ty, false));
+            .filter(|ty| !matches!(ty, Type::Array { .. }));
         }
     }
     let package = package_of(tree, src);
@@ -3977,7 +4039,7 @@ fn java_method_invocation_projected_return_type(
             .unwrap_or(Type::Unknown),
     };
     let ctx = FileCtx::new(package, inference_imports(tree, src));
-    let mut result: Option<(Type, bool)> = None;
+    let mut result: Option<Type> = None;
     for entry in entries {
         let min = entry.sym.min_arity.expect("guarded above") as usize;
         let max = entry.sym.arity.expect("guarded above") as usize;
@@ -3985,29 +4047,18 @@ fn java_method_invocation_projected_return_type(
             continue;
         }
         let declared = entry.sym.return_type.as_ref()?;
-        let component = if array_component && declared.name.ends_with("[]") {
-            Some(rank_one_array_component(declared)?)
-        } else {
-            None
-        };
-        let ty = infer::declared_member_call_type(
-            index,
-            &receiver,
-            &entry,
-            component.as_ref().unwrap_or(declared),
-            &arguments,
-            &ctx,
-        );
-        if ty
-            .name()
-            .is_none_or(|name| name == "void" || is_java_primitive_type(name))
+        let ty =
+            infer::declared_member_call_type(index, &receiver, &entry, declared, &arguments, &ctx);
+        if !matches!(ty, Type::Array { .. })
+            && ty
+                .name()
+                .is_none_or(|name| name == "void" || is_java_primitive_type(name))
         {
             return None;
         }
-        let projected = (ty, component.is_some());
         match &result {
-            None => result = Some(projected),
-            Some(prev) if *prev == projected => {}
+            None => result = Some(ty.clone()),
+            Some(prev) if *prev == ty => {}
             Some(_) => return None,
         }
     }
@@ -4083,12 +4134,6 @@ pub(crate) fn type_of_value_declaration(
     initializer_depth: usize,
 ) -> Option<Type> {
     let parent = decl.parent()?;
-    // shortcut: array loop bindings stay Unknown until shared array receiver inference exists.
-    if parent.kind() == "enhanced_for_statement"
-        && parent.child_by_field_name("dimensions").is_some()
-    {
-        return None;
-    }
     let type_node = value_declaration_type_node(decl)?;
     if type_node.kind() == "type_identifier" && node_text(type_node, src) == "var" {
         if initializer_depth >= infer::MAX_DEPTH {
@@ -4096,6 +4141,9 @@ pub(crate) fn type_of_value_declaration(
             return None;
         }
         if parent.kind() == "enhanced_for_statement" {
+            if parent.child_by_field_name("dimensions").is_some() {
+                return None;
+            }
             let value = parent.child_by_field_name("value")?;
             if value.has_error() {
                 return None;
@@ -4116,7 +4164,17 @@ pub(crate) fn type_of_value_declaration(
         }
         return java_argument_type(index, file, src, tree, initializer, initializer_depth + 1);
     }
-    receiver_type_from_type_node(index, file, src, tree, type_node)
+    let mut ty = receiver_type_from_type_node(index, file, src, tree, type_node)?;
+    if let Some(dimensions) = parent.child_by_field_name("dimensions") {
+        let rank = array_dimensions_rank(dimensions)?;
+        if rank > infer::MAX_DEPTH {
+            return None;
+        }
+        for _ in 0..rank {
+            ty = Type::array(ty, false);
+        }
+    }
+    Some(ty)
 }
 
 fn value_declaration_type_node(declaration: Node<'_>) -> Option<Node<'_>> {
@@ -4144,96 +4202,10 @@ fn enhanced_for_element_type(
     if value.has_error() {
         return None;
     }
-    if value.kind() == "array_creation_expression" {
-        let mut cursor = value.walk();
-        let rank = value
-            .children_by_field_name("dimensions", &mut cursor)
-            .try_fold(0usize, |rank, dimensions| {
-                Some(rank + array_dimensions_rank(dimensions)?)
-            })?;
-        if rank != 1 {
-            // shortcut: rank-two rows stay Unknown without a shared array receiver type.
-            return None;
-        }
-        return receiver_type_from_type_node(
-            index,
-            file,
-            src,
-            tree,
-            value.child_by_field_name("type")?,
-        );
+    let receiver = java_argument_type(index, file, src, tree, value, initializer_depth)?;
+    if let Type::Array { component, .. } = receiver {
+        return Some(*component);
     }
-    if value.kind() == "identifier" {
-        if let Some(declaration) =
-            local_declaration_node(src, value).or_else(|| same_file_field_declaration(src, value))
-        {
-            let ty = value_declaration_type_node(declaration)?;
-            let parent = declaration.parent()?;
-            let post_dimensions = parent.child_by_field_name("dimensions");
-            if ty.kind() == "type_identifier" && node_text(ty, src) == "var" {
-                if initializer_depth >= infer::MAX_DEPTH
-                    || post_dimensions.is_some()
-                    || parent.kind() != "variable_declarator"
-                    || !parent
-                        .parent()
-                        .is_some_and(|local| local.kind() == "local_variable_declaration")
-                {
-                    return None;
-                }
-                let initializer = parent.child_by_field_name("value")?;
-                if initializer.has_error()
-                    || initializer_uses_declaration(src, initializer, declaration)
-                {
-                    return None;
-                }
-                // Project the initializer here so an array alias keeps its component type.
-                return enhanced_for_element_type(
-                    index,
-                    file,
-                    src,
-                    tree,
-                    initializer,
-                    initializer_depth + 1,
-                );
-            }
-            if ty.kind() == "array_type" || post_dimensions.is_some() {
-                let mut rank = 0;
-                for dimensions in [ty.child_by_field_name("dimensions"), post_dimensions]
-                    .into_iter()
-                    .flatten()
-                {
-                    rank += array_dimensions_rank(dimensions)?;
-                }
-                let element = if ty.kind() == "array_type" {
-                    ty.child_by_field_name("element")?
-                } else {
-                    ty
-                };
-                // shortcut: array-valued elements stay Unknown until shared array receiver inference exists.
-                if rank != 1 || element.kind() == "array_type" || element.has_error() {
-                    return None;
-                }
-                return receiver_type_from_type_node(index, file, src, tree, element);
-            }
-        }
-    }
-    let receiver = if value.kind() == "method_invocation" {
-        let (ty, component) = java_method_invocation_projected_return_type(
-            index,
-            file,
-            src,
-            tree,
-            value,
-            initializer_depth,
-            true,
-        )?;
-        if component {
-            return Some(ty);
-        }
-        ty
-    } else {
-        java_argument_type(index, file, src, tree, value, initializer_depth)?
-    };
     let mut result: Option<Type> = None;
     let mut incomplete = false;
     let _ = infer::walk_supertypes(index, &receiver, JAVA_SUPERTYPE_WALK_CAP, |current| {

@@ -516,15 +516,16 @@ pub(crate) fn member_completion_query_for_type_with_ctx(
         });
     }
     // Kotlin recovery already supplies scoped file facts before receiver inference.
-    let source_index = (language == SourceLanguage::Java).then(|| {
-        let mut source = Index::new();
-        source.replace_file(
-            "<completion>",
-            language::symbol_facts(language, tree, src).symbols,
-            Tier::Volatile,
-        );
-        source
-    });
+    let source_index = (language == SourceLanguage::Java && !matches!(ty, Type::Array { .. }))
+        .then(|| {
+            let mut source = Index::new();
+            source.replace_file(
+                "<completion>",
+                language::symbol_facts(language, tree, src).symbols,
+                Tier::Volatile,
+            );
+            source
+        });
     let (candidates, withheld_compiled) = member_candidates(
         index,
         source_index.as_ref(),
@@ -1009,6 +1010,20 @@ fn member_candidates(
     kotlin_ctx: Option<(&infer::FileCtx, usize)>,
     max_candidates: usize,
 ) -> (Vec<ScopeCompletion>, bool) {
+    if language == SourceLanguage::Java && matches!(ty, Type::Array { .. }) {
+        let out = ktcore::members::JAVA_ARRAY_MEMBERS
+            .iter()
+            .filter(|(name, _, _)| name.starts_with(prefix))
+            .take(max_candidates)
+            .map(|(name, kind, arity)| {
+                let mut item = ScopeCompletion::new(*name, *kind);
+                item.arity = *arity;
+                item
+            })
+            .collect();
+        // shortcut: inherited Object members and array subtyping remain unmodeled.
+        return (out, false);
+    }
     let mut out: Vec<ScopeCompletion> = Vec::new();
     let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
     let mut extensions = Vec::new();
@@ -1309,7 +1324,7 @@ fn type_label(ty: &Type) -> Option<String> {
             type_label(bound).map(|bound| format!("{prefix}{bound}"))
         }
         Type::Star => Some("*".to_string()),
-        Type::Unknown => None,
+        Type::Unknown | Type::Array { .. } => None,
     }
 }
 

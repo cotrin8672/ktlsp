@@ -618,8 +618,8 @@ do
   local report = { requests = {}, outbound = {}, expected_probe_count = 26,
     array_requests = {}, expected_array_probe_count = 12,
     alias_requests = {}, expected_alias_probe_count = 26, alias_positive_probe_count = 24,
-    alias_scalar_guard_count = 2,
-    array_coverage_gaps = "rank2 rows/nested cells and Kotlin/compiled array factories remain OPEN",
+    alias_scalar_guard_count = 2, rank2_requests = {}, expected_rank2_probe_count = 8,
+    array_coverage_gaps = "rank2 first-response intrinsics/chains measured separately; Kotlin/compiled array factories remain OPEN",
     original_source_sha256 = original_hash, original_disk_sha256 = original_disk,
     valid_var_status = "OPEN unless the first response offers Body.string; empty is a mismatch" }
   local active_requests = report.requests
@@ -659,13 +659,25 @@ do
     local sha = probe.buffer_sha256(resource_buf)
     local delivered = latest and latest.sent and latest.version == vim.lsp.util.buf_versions[resource_buf]
       and latest.source_sha256 == sha and latest.wire_source_sha256 == sha and not latest.wire_error
-    if active_requests == report.alias_requests then
+    if active_requests == report.alias_requests or active_requests == report.rank2_requests then
       local producer = alias_kotlin.latest
       local producer_sha = probe.buffer_sha256(alias_kotlin.buf)
       delivered = delivered and producer and producer.sent
         and producer.version == vim.lsp.util.buf_versions[alias_kotlin.buf]
         and producer.source_sha256 == producer_sha and producer.wire_source_sha256 == producer_sha
         and not producer.wire_error
+    end
+    local rank2_sources
+    if active_requests == report.rank2_requests or phase:find("alias rank2 scalar guard", 1, true) then
+      rank2_sources = {
+        java = { uri = resource_uri, text = probe.buffer_full_text(resource_buf), wire_text = wire_text,
+          version = vim.lsp.util.buf_versions[resource_buf], tick = vim.api.nvim_buf_get_changedtick(resource_buf),
+          sha256 = sha, wire_sha256 = vim.fn.sha256(wire_text) },
+        kotlin = { uri = alias_kotlin.uri, text = probe.buffer_full_text(alias_kotlin.buf),
+          wire_text = alias_kotlin.wire, sha256 = probe.buffer_sha256(alias_kotlin.buf),
+          wire_sha256 = vim.fn.sha256(alias_kotlin.wire), version = vim.lsp.util.buf_versions[alias_kotlin.buf],
+          tick = vim.api.nvim_buf_get_changedtick(alias_kotlin.buf) },
+      }
     end
     local response, row
     if delivered then
@@ -676,9 +688,12 @@ do
       requests[#requests + 1] = row
     end
     row.resource_phase, row.source_sha256, row.delivery = phase, sha, vim.deepcopy(latest)
+    row.rank2_sources = rank2_sources
     if active_requests == report.array_requests then row.array_phase = phase end
     if active_requests == report.alias_requests then
       row.alias_phase, row.kotlin_delivery = phase, vim.deepcopy(alias_kotlin.latest)
+    elseif active_requests == report.rank2_requests then
+      row.rank2_phase, row.kotlin_delivery = phase, vim.deepcopy(alias_kotlin.latest)
     end
     active_requests[#active_requests + 1] = row
     if text then
@@ -833,6 +848,8 @@ do
       check("Java resource alias rank2 " .. receiver .. " excludes scalar members",
         not probe.completion_has(result, "string") and not probe.completion_has(result, "javaOnly")
           and not probe.completion_has(result, "enqueue"), vim.inspect(result), row)
+      check("Java resource rank2 first response " .. receiver .. " offers length and clone",
+        probe.completion_has(result, "length") and probe.completion_has(result, "clone"), vim.inspect(result), row)
     end
     local kotlin_changed, java_changed = {}, {}
     for i, line in ipairs(alias_kotlin.original) do
@@ -860,6 +877,29 @@ do
     vim.api.nvim_buf_set_lines(resource_buf, 0, -1, false, original)
     flush()
     for _, i in ipairs({ 3, 5, 4 }) do alias_case("restored", initial_cases[i]) end
+    active_requests = report.rank2_requests
+    for _, case in ipairs({
+      { receiver = "kotlinMemberRow", member = "string", excluded = "javaOnly", target = kotlin_path,
+        lines = kotlin_original, declaration = "fun string():" },
+      { receiver = "javaMemberRow", member = "javaOnly", excluded = "string", target = path,
+        lines = original, declaration = "public String javaOnly()" },
+    }) do
+      for _, suffix in ipairs({ "", ".clone()" }) do
+        local anchor = "System.out.println(" .. case.receiver .. suffix .. ".length);"
+        local result, row = once("rank2 intrinsics " .. case.receiver .. suffix, "textDocument/completion",
+          anchor, case.receiver, "            System.out.println(" .. case.receiver .. suffix .. ".")
+        check("Java resource rank2 " .. case.receiver .. suffix .. " offers length and clone without scalar members",
+          probe.completion_has(result, "length") and probe.completion_has(result, "clone")
+            and not probe.completion_has(result, "string") and not probe.completion_has(result, "javaOnly"),
+          vim.inspect(result), row)
+      end
+      local expression = case.receiver .. ".clone()[0]"
+      local anchor = "System.out.println(" .. expression .. "." .. case.member .. "());"
+      completion("rank2 cloned cell " .. case.receiver, anchor, case.receiver,
+        "            System.out.println(" .. expression .. ".", case.member, case.excluded)
+      definition("rank2 cloned cell " .. case.receiver, anchor, case.member, nil,
+        case.target, case.lines, case.declaration)
+    end
     active_requests = report.requests
   end, debug.traceback)
   if not vim.deep_equal(vim.api.nvim_buf_get_lines(resource_buf, 0, -1, false), original) then
@@ -892,6 +932,11 @@ do
   check("Java resource 26 alias requests each run exactly once", alias_once, vim.inspect(report.alias_requests))
   check("Java resource alias both buffers restore exactly without disk edits",
     report.restored and report.alias_kotlin_restored, vim.inspect(report))
+  local rank2_once = #report.rank2_requests == report.expected_rank2_probe_count
+  for _, row in ipairs(report.rank2_requests) do
+    rank2_once = rank2_once and row.attempted and row.attempts == 1
+  end
+  check("Java resource 8 rank2 requests each run exactly once", rank2_once, vim.inspect(report.rank2_requests))
   if not ok then check("Java resource probes execute", false, err) end
   if vim.env.KTLSP_TRACE then
     vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-resource-body.json")
