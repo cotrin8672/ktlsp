@@ -26,6 +26,18 @@ class KtlspSourceSet(
 )
 
 object KtlspCompilerConfiguration {
+    private data class JavaGradleProfile(
+        val version: String,
+        val configurationCacheGetter: String,
+        val incrementalAction: String,
+    )
+
+    private fun javaGradleProfile(task: Task): JavaGradleProfile = when (task.project.gradle.gradleVersion) {
+        "7.4.2" -> JavaGradleProfile("7.4.2", "isConfigurationCache", "IncrementalInputsTaskAction")
+        "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
+        else -> error("Unsupported Java recipe Gradle adapter")
+    }
+
     private fun defaultJavaHome(task: JavaCompile): java.io.File? {
         // shortcut: other Gradle defaults stay unknown; extend after verifying their compiler selector.
         if (task.project.gradle.gradleVersion != "7.4.2" || task.javaClass.name !in listOf(
@@ -64,9 +76,9 @@ object KtlspCompilerConfiguration {
     }
 
     private fun javaCompilerRecipe(task: JavaCompile, selectedHome: java.io.File?): Map<String, Any?> {
-        // shortcut: this ABI is verified only for Gradle 7.4.2/current JDK 17, plain in-process javac.
-        check(task.project.gradle.gradleVersion == "7.4.2") { "Unsupported Java recipe Gradle adapter" }
-        check(read(task.project.gradle.startParameter, "isConfigurationCache") == false) {
+        // shortcut: only these pinned Gradle profiles/current JDK 17 have verified plain javac capture.
+        val profile = javaGradleProfile(task)
+        check(read(task.project.gradle.startParameter, profile.configurationCacheGetter) == false) {
             "Java recipe capture requires configuration cache disabled"
         }
         check(task.javaClass.name in listOf("org.gradle.api.tasks.compile.JavaCompile",
@@ -90,8 +102,11 @@ object KtlspCompilerConfiguration {
         val stableSources = invoke("getStableSources") as? FileCollection
             ?: error("Java stable source inventory is unavailable")
         check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
-        val selected = (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
-            ?: error("Selected Java compiler is unavailable")
+        val selected = when (profile.version) {
+            "7.4.2" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
+            "9.6.1" -> task.javaCompiler.orNull
+            else -> error("Unsupported Java compiler selector")
+        } ?: error("Selected Java compiler is unavailable")
         check(selected.javaClass.name == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler") {
             "Unsupported selected Java compiler"
         }
@@ -146,7 +161,7 @@ object KtlspCompilerConfiguration {
             "Selected Java runtime defaults are empty"
         }
         return linkedMapOf(
-            "adapter" to "gradle-7.4.2-current-jdk17-javac-api-v1",
+            "adapter" to "gradle-${profile.version}-current-jdk17-javac-api-v1",
             "compiler_type" to selected.javaClass.name,
             "java_runtime_version" to runtimeVersion,
             "language_version" to metadata.languageVersion.toString(),
@@ -159,12 +174,12 @@ object KtlspCompilerConfiguration {
         )
     }
 
-    // shortcut: private Gradle 7.4.2 action ABI; an unknown layout never proves producer inactivity.
+    // shortcut: pinned private action ABIs; an unknown layout never proves producer inactivity.
     fun producerActions(task: Task): Map<String, Any?>? = runCatching {
-        check(task.project.gradle.gradleVersion == "7.4.2") { "Unsupported Gradle action adapter" }
+        val profile = javaGradleProfile(task)
         val loader = Task::class.java.classLoader
         val standard = Class.forName("org.gradle.api.internal.project.taskfactory.StandardTaskAction", false, loader)
-        val incremental = Class.forName("org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction", false, loader)
+        val incremental = Class.forName("org.gradle.api.internal.project.taskfactory.${profile.incrementalAction}", false, loader)
         val methodField = standard.getDeclaredField("method").apply { isAccessible = true }
         val rows = task.actions.map { action ->
             val method = if (action.javaClass == incremental)
@@ -176,10 +191,10 @@ object KtlspCompilerConfiguration {
                 "parameterTypes" to method?.parameterTypes?.map { it.name },
             )
         }
-        linkedMapOf("adapter" to "gradle-7.4.2-stock-actions-v1", "actions" to rows)
+        linkedMapOf("adapter" to "gradle-${profile.version}-stock-actions-v1", "actions" to rows)
     }.getOrNull()
 
-    // shortcut: stock Gradle 7.4.2 predicates and the pinned KGP 1.8.21 KAPT predicate only.
+    // shortcut: pinned stock Gradle predicates; only Gradle 7.4.2/KGP 1.8.21 KAPT is verified.
     // Read identity/bytecode, never evaluate a task predicate or a compiler/AP argument provider.
     private fun classEntrySha(type: Class<*>): String {
         val location = type.protectionDomain.codeSource?.location ?: error("Predicate origin unavailable")
@@ -209,7 +224,7 @@ object KtlspCompilerConfiguration {
     }.getOrDefault(false)
 
     fun producerOnlyIf(task: Task): Map<String, Any?>? = runCatching {
-        check(task.project.gradle.gradleVersion == "7.4.2") { "Unsupported Gradle onlyIf adapter" }
+        val profile = javaGradleProfile(task)
         val loader = Task::class.java.classLoader
         val abstractTask = Class.forName("org.gradle.api.internal.AbstractTask", false, loader)
         val factory = abstractTask.getDeclaredMethod("createNewOnlyIfSpec").apply { isAccessible = true }
@@ -221,16 +236,31 @@ object KtlspCompilerConfiguration {
         val defaults = getSpecs.invoke(prototype) as? List<*> ?: error("Stock predicate inventory unavailable")
         check(defaults.size == 1 && defaults[0] != null) { "Stock predicate inventory ambiguous" }
         val enabledType = defaults[0]!!.javaClass
+        fun stockEnabledPredicate(predicate: Any): Boolean {
+            if (predicate.javaClass != enabledType) return false
+            if (profile.version == "7.4.2") return true
+            // Gradle 9.6.1 uses the same wrapper for stock and custom onlyIf predicates.
+            check(enabledType.name == "org.gradle.api.internal.tasks.execution.SelfDescribingSpec") {
+                "Unsupported stock predicate wrapper"
+            }
+            val field = enabledType.getDeclaredField("spec").apply { isAccessible = true }
+            val stock = field.get(defaults[0]) ?: error("Stock predicate delegate unavailable")
+            val delegate = field.get(predicate) ?: return false
+            val source = stock.javaClass.protectionDomain.codeSource?.location
+                ?: error("Stock predicate delegate origin unavailable")
+            return delegate.javaClass == stock.javaClass &&
+                delegate.javaClass.protectionDomain.codeSource?.location == source
+        }
         val predicates = getSpecs.invoke(actual) as? List<*> ?: error("Predicate inventory unavailable")
         val rows = predicates.map { predicate ->
             check(predicate != null) { "Null task predicate" }
             linkedMapOf<String, Any?>(
                 "class" to predicate.javaClass.name,
-                "stockEnabledPredicate" to (predicate.javaClass == enabledType),
-                "stockKaptPredicate" to stockKaptPredicate(predicate),
+                "stockEnabledPredicate" to stockEnabledPredicate(predicate),
+                "stockKaptPredicate" to (profile.version == "7.4.2" && stockKaptPredicate(predicate)),
             )
         }
-        linkedMapOf("adapter" to "gradle-7.4.2-stock-onlyif-v1", "predicates" to rows)
+        linkedMapOf("adapter" to "gradle-${profile.version}-stock-onlyif-v1", "predicates" to rows)
     }.getOrNull()
 
 

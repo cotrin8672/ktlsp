@@ -208,6 +208,10 @@ acceptance log.
 The Gradle reload probe also checks captured Kotlin source/library/JDK inputs. The
 project model records the selected compiler runtime and launch policy separately;
 captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.
+The configured model captures plain Gradle 7.4.2 and 9.6.1/current-JDK17 Java
+recipes and task inventories. The existing library route on the disposable binary
+JAR project validates the new profile in Neovim. MODEL12 refreshes older cached
+models once; this metadata does not expand Java/K2 compiler diagnostic authority.
 On Windows, supported captured tasks also diagnose private overlays of unsaved owned
 Java/Kotlin sources, including new buffers. Their accepted results use the ordinary
 push/pull diagnostic store; unsupported, failed or stale runs cannot clear it.

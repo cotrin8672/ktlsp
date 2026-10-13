@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 11;
+const MODEL_VERSION: u32 = 12;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,9 +148,11 @@ impl CompilerTask {
         }
         let recipe: JavaCompilerRecipe =
             serde_json::from_value(self.options.get("javaCompilerRecipe")?.clone()).ok()?;
-        (recipe.adapter == "gradle-7.4.2-current-jdk17-javac-api-v1"
-            && recipe.compiler_type
-                == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler"
+        (matches!(
+            recipe.adapter.as_str(),
+            "gradle-7.4.2-current-jdk17-javac-api-v1" | "gradle-9.6.1-current-jdk17-javac-api-v1"
+        ) && recipe.compiler_type
+            == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler"
             && recipe.language_version == "17"
             && !recipe.api_options.is_empty()
             && [
@@ -1664,6 +1666,74 @@ mod tests {
     }
 
     #[test]
+    fn java_recipe_gradle_9_6_1_preserves_selected_defaults_and_effective_option_order() {
+        let mut recipe = selected_java_recipe();
+        recipe["adapter"] = serde_json::json!("gradle-9.6.1-current-jdk17-javac-api-v1");
+        recipe["gradle_file_encoding"] = serde_json::json!("UTF-8");
+        recipe["api_options"] = serde_json::json!([
+            "-source",
+            "17",
+            "-target",
+            "17",
+            "-d",
+            "/repo/classes",
+            "-h",
+            "/repo/headers",
+            "-g",
+            "-sourcepath",
+            "",
+            "-proc:none",
+            "-s",
+            "/repo/generated",
+            "-XDuseUnsharedTable=true",
+            "-classpath",
+            "/repo/z.jar;/repo/a.jar"
+        ]);
+        let mut java = plain_java_configuration();
+        java["options"]["javaCompilerRecipe"] = recipe.clone();
+        java["options"]["javaCompilerRecipeProblem"] = serde_json::Value::Null;
+        let model = plain_java_snapshot(&[java]);
+        let entry = CacheEntry {
+            model_version: MODEL_VERSION,
+            mtimes: BTreeMap::new(),
+            modules: model.modules,
+        };
+        let decoded: CacheEntry =
+            serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+        let selected = decoded.modules[0].source_sets[0].compiler_tasks[0]
+            .java_compiler_recipe()
+            .unwrap();
+        assert_eq!(serde_json::to_value(selected).unwrap(), recipe);
+    }
+
+    #[test]
+    fn java_recipe_rejects_unknown_adapter_compiler_type_and_language_version() {
+        for adapter in [
+            "gradle-7.4.2-current-jdk17-javac-api-v1",
+            "gradle-9.6.1-current-jdk17-javac-api-v1",
+        ] {
+            for (field, value) in [
+                ("adapter", "gradle-9.6.2-current-jdk17-javac-api-v1"),
+                ("compiler_type", "custom.JavaCompiler"),
+                ("language_version", "21"),
+            ] {
+                let mut recipe = selected_java_recipe();
+                recipe["adapter"] = serde_json::json!(adapter);
+                recipe[field] = serde_json::json!(value);
+                let mut java = plain_java_configuration();
+                java["options"]["javaCompilerRecipe"] = recipe;
+                let model = plain_java_snapshot(&[java]);
+                let source = &model.modules[0].source_sets[0];
+                assert!(!source.compiler_metadata_incomplete);
+                assert!(source.compiler_tasks[0].java_compiler_recipe().is_none());
+                assert!(model
+                    .plain_java_task("/repo/app/src/main/java/Use.java")
+                    .is_some());
+            }
+        }
+    }
+
+    #[test]
     fn java_recipe_unknown_or_malformed_retains_other_compiler_metadata_and_source_ownership() {
         let mut missing_options = selected_java_recipe();
         missing_options
@@ -2572,6 +2642,13 @@ dependencies {
             serde_json::to_vec(&CacheEntry {
                 // Public bootstrap metadata alone predates the selected Java API recipe.
                 model_version: 10,
+                mtimes: model.mtimes.clone(),
+                modules: model.modules.clone(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&CacheEntry {
+                // The embedded script previously left Gradle 9.6.1 recipes unsupported.
+                model_version: 11,
                 mtimes: model.mtimes.clone(),
                 modules: model.modules.clone(),
             })
