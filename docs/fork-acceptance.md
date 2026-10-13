@@ -94,7 +94,7 @@ a useful known receiver in the same edited state.
 | Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks retain44/44 alongside42 alias and23 ordinary checks. Current semantic total142 includes33 new bound checks; historical109 assertions were previously counted as107 lines | Focused semantics verified; projected/recursive bounded receivers remain coverage gaps | Checkpoints33/39/60: old assertion names all retained. Exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have focused controls; no six-project parity claim |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Actual Retrofit mixed editing matches all 21 first-attempt RPCs and 25 semantic checks, including typed changes in both languages, references, applied renames and restoration. Shared mixed fixture and opened JDK source rename/delete controls also pass | Focused actual-project repair verified; wider corpus open | Checkpoints 43/45/47. The latest release retains all 21 first RPCs and 25 checks. Normal Neovim cross-buffer debounce observation is separate; repeated edit stress across the other roots remains pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Actual Retrofit preserves all four complete expected buffers after applying rename. Tenth-fixed-2 applies the six-site override family and passes independent compilation plus 33 bytecode assertions. JVM facade and external consumer applied renames also pass | Focused actual-project and fixture cases verified; wider corpus and inherited implementation edges pending | Checkpoints 43 and the earlier compiler-backed override-family controls. Ambiguous or read-only family members refuse partial edits |
-| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Configured MODEL11 captures now exist for all six roots. Latest Gradle online retry loads194 modules and indexes11,327 files; offline root exits0 with both output captures complete but is rejected after a2s child shutdown tail. Release71 six-project floor matches58/60; current release74 CEM/Spring20/20 matches | Model acquisition verified; basic library editor cases and wider semantics remain open | Checkpoint71, independent current model audit9659f107...; original historical-path assertion failure retained. Java fork/plugin compiler recipe remains unsupported; no native replay-equivalence claim |
+| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Configured MODEL11 captures now exist for all six roots. Latest Gradle online retry loads194 modules and indexes11,327 files; offline root exits0 with both output captures complete but is rejected after a2s child shutdown tail. Checkpoint77 runs the same current release across all six roots:60/60 original RPCs match (41 useful completions,13 exact definitions,6 Unknown controls); all12 manifests shut down cleanly | Model acquisition verified; basic library editor cases and wider semantics remain open | Checkpoint71, independent current model audit9659f107...; original historical-path assertion failure retained. Java fork/plugin compiler recipe remains unsupported; no native replay-equivalence claim |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Model10 automatic-watching run on binary65-5 passes all86 original checks and four actual builds, including dirty buffers and clean shutdown | Focused model10 automatic-refresh semantics verified; wider transforming cases open | Checkpoint65 native-gradle-reload-model10-65-1; explicit reload false,18 native notifications, one acknowledged shutdown/exit0; separate owned Gradle cleanup1 |
 | Kotlin compiler inputs | Use the task actual sources, ordered libraries, compiler runtime and selected JDK | Current Moshi1.8.21/SDK17 preserves full2-source selection/CP7/runtime9/plugins8, MODEL11 and22 declared inputs. Original/unsaved invalid/restored canonical diagnostics match0/1/0 with current source/store generations | Exact strict-API adapter and finite current diagnostics verified | native-moshi-editor67-1; independent5 compiler controls and original174-file saved build; accepted model SHA is not emitted by server |
 | Compiler plugins and processors | Analyze generated APIs consistently in Java/Kotlin, including unsaved edits | Last unchanged114 KAPT/KSP checks:111 pass,3 obsolete-method Java diagnostics missing. All6 raw disabled-phase javac errors remain;3 proved missing-import errors publish, canonical Kotlin errors preserved | Finite auxiliary import repair verified; method diagnostics/general AP closure remain open | native-java-worker-processor67-1 on prior67-1 binary; no rerun or parity claim for67b |
@@ -5788,3 +5788,43 @@ pointers. Raw logs stay on disk; normal reads retrieve counts and specific failu
 No embedding, new test framework or broad repeated Local corpus run was added.
 Broader compiler/plugin, inherited/generated diagnostic, live refresh, six-project
 same-binary and controlled UX/performance acceptance remains open.
+
+
+## Checkpoint77: same-release six-project floor and modern Gradle metadata
+
+No production changes or repeated Rust suite were needed: immutable checkpoint76
+binary SHA e72823a1c93baf2afed65db162804b43a6c95299579ac97d57615cc31cb88df1
+passes all60 original RPCs across CEM10, OkHttp10, Moshi9, Retrofit12, Spring10 and
+Gradle9. The12 unchanged manifests contain41 useful completions,13 exact
+single-location definitions and6 Unknown negative controls. Independent raw
+request/response auditing confirms first callbacks, complete unsaved delivery,
+restoration, clean shutdown and unchanged source/model inputs. No model recapture
+or extra requests were used. This closes the earlier CEM/Spring finite-floor gaps;
+whole-project diagnostics, plugin fidelity, performance and IDEA parity remain open.
+
+Evidence under the existing Temp base: root-six-floor77-1.json
+SHA418944708feefd25362b24082519f6ec544823a3ea5c03f8d8f77d0ddd12debb;
+native-current-six-floor77-1/receipt.json
+SHA31da367e26f4d264ce709232b3a6d058bcf3a88928494efa3d4a0d47ca8edfca.
+The independent audit source is retained as root-six-floor77-audit.py.
+
+An actual Gradle9.6.1 metadata-only task observes IncrementalTaskAction for Java
+compile and Kotlin execute; stock onlyIf wrappers/delegates match fresh prototypes.
+Java selected JDK17, ordered sources/classpath, arguments and processor path match
+the captured MODEL11. The observer neither creates a compiler spec nor evaluates
+predicates. It exits0 with unchanged guards and no residual/forced cleanup.
+Initial lock-context failure and a corrected controller path-variable error remain
+in their original receipts; neither is classified as an LSP semantic failure.
+Final receipt native-gradle-java-metadata77-3/receipt.json
+SHA13c78a514dc06109469befca2b8fa074d8a5eda8b24f15f5aedca35bc5f41a04;
+independent audit root-gradle-java-metadata77-1.json.
+
+Compiler2.4 lacks the legacy KotlinCodegenFacade entry point. Existing headers use
+resolved K1 descriptors plus KAPT3, not an extractable body-rewrite implementation.
+A bounded K2 observer and private-source boundary investigation are prepared;
+runtime header/signature equivalence and general compiler/plugin support are
+unverified. Do not enable the old bridge by admitting newer version tags.
+
+Continuation now starts from the compact current-state file and bounded scalar
+summaries; raw artifacts stay on disk. Avoid repeated successful checks without
+changed inputs, repeated agent investigations, and full model/guard/log output.

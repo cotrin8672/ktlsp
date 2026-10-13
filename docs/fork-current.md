@@ -1,35 +1,42 @@
 # Current fork state
 
 Read this before the historical [acceptance record](fork-acceptance.md).
-Goal remains in progress. Updated 2026-10-14 (Asia/Tokyo).
+Goal remains in progress. Updated 2026-10-14 (Asia/Tokyo), checkpoint77.
 
-- Current implementation: checkpoint76; binary-fields base d3cb519. Use git log -1
-  for the latest revision.
-- Last complete Rust/release validation: 1,502 passed, 0 failed, 4 ignored.
-- File/Module: actual seven-source Gradle builds. Field/method corpus passes cold/warm
-  on release75; Module12+2 passes cold/warm again on current release76.
-- Current real Neovim: Local library41/41 and Module library41/41. The three earlier
-  Module diagnostic omissions are fixed; six first diagnostic reports match per kind
-  across unsaved owner/caller changes and restoration.
-- Next: final current-binary six-project floor, then remaining diagnostic/compiler/
-  live-refresh gaps and controlled startup/index/completion measurements. Reuse
-  recorded sources/models and the existing harness; do not call older results current.
-- Broader open work: inherited/generated Java diagnostic coverage, compiler/plugin
-  adapter fidelity, newest live Gradle refresh, broader UX/IDEA checks, and a final
-  same-binary six-project correctness/performance run. Enum/generic binary members open.
+- Implementation: checkpoint76, published6d50aa6; no semantic change in checkpoint77.
+- Rust/release: 1,502 passed, 0 failed, 4 ignored; fmt/release pass.
+- Same immutable release: all60 original RPCs across CEM, OkHttp, Moshi, Retrofit,
+  Spring and Gradle match:41 useful completions,13 exact definitions,6 Unknown
+  negative controls. All12 manifests use first responses, restore buffers and
+  shut down cleanly. This is configured-model functional coverage, not IDEA parity.
+- Real Neovim library: Local41/41 and Module41/41; exact selected Java diagnostic
+  reports match through unsaved owner/caller changes and restoration.
+- Gradle9.6.1 metadata probe: Java selected JDK17, source order, classpath order,
+  arguments and processor path match the captured model; task predicates match
+  stock prototypes. No recipe execution or compiler/plugin fidelity claim.
+- Next: bounded Kotlin2.4 observer proof, then compiler/header diagnostic gaps,
+  newest live-refresh checks and controlled startup/index/completion measurements.
+  Current K1/KAPT header bridge cannot be enabled for2.4 by relaxing version checks.
+- Open: inherited/generated Java diagnostics, compiler/plugins, wider UX/IDEA,
+  same-binary performance, enum/generic binary members.
 
 ## Efficient continuation
 
-Keep raw logs on disk. Read counts/status first; retrieve only relevant failure
-snippets or code ranges. Run focused checks during iteration and broad checks after
-a settled semantic change. Reuse existing harness/helpers; report unique cases
-separately from repeated cold/warm observations. Agents return paths, results and
-next action in at most10–15 lines; use sol6.1/high and parallelize independent work.
-Preserve prior successful evidence; rerun only when changed code or unresolved
-concerns justify it. Source/model completeness, compiler fidelity and performance
-are separate claims. Empty results are not successful useful completion.
+Read this file first. Open historical evidence only for a specific unanswered question.
+Keep raw logs on disk. Before printing JSON, select scalar fields and check its shape;
+never print whole models, ABI tables, guard inventories or stage/request arrays.
+Normal output: status, counts, artifact path and the next action. Bound output at
+the producer as well as the tool; on failure retrieve only the relevant code/log range.
 
-Local artifacts: C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
-Current launch state: current-slice76.json. Latest closed private Gradle-home owner:
-native-binary-fields-local-library76-1/receipt.json. No preexisting process adoption
-or global process inventory; only fresh owned descendants. Keep AGENTS.md untouched.
+Run focused checks during iteration and broad checks after a settled semantic change.
+Reuse successful evidence until changed inputs or an unresolved concern justify a rerun.
+Reuse existing harness/helpers; separate unique cases from repeated observations.
+Agents use sol6.1/high and return only changed findings, paths and next action in
+at most10 lines. Do not repeat completed investigations in delegation prompts.
+Persist runnable probes and a short launch state so compaction needs no log replay.
+
+Evidence base: C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
+Launch state: current-slice77.json; no native task active.
+Current audits: root-six-floor77-1.json; root-gradle-java-metadata77-1.json.
+Latest closed private Gradle-home owner: native-gradle-java-metadata77-3/receipt.json.
+No preexisting process adoption or global process inventory. Keep AGENTS.md untouched.
