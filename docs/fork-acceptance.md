@@ -1,6 +1,8 @@
 # Fork acceptance and evidence
 
-Updated: 2026-10-13 (Asia/Tokyo). Goal remains **in progress**.
+Updated: 2026-10-14 (Asia/Tokyo). Goal remains **in progress**.
+
+Start with the compact [current state](fork-current.md); consult historical evidence as needed.
 
 ## Scope
 
@@ -79,7 +81,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint75 passes1,501 tests,0 failures,4 existing ignored; formatting and release pass; source-free public fields and property-only Module publication have focused regressions | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint76 passes1,502 tests,0 failures,4 existing ignored; formatting and release pass; source-free fields and closed Java owner diagnostics have focused regressions | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Checkpoint70 Java307/312: original72 resource requests, new6 SDK requests and new5 Kotlin array requests match without readiness waits. The five existing diagnostic omissions remain. Earlier basic9/library41 remain historical | Finite completion/navigation evidence;5 existing diagnostic omissions remain | native-java-editor70-4; root-java-kotlin-editor-verification70-4. Server stop still force-requested, exit1/signal15; no graceful-shutdown claim |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned; saved-source identities guarded and ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -5740,3 +5742,49 @@ generated-member diagnostic gaps; enum/generic binary members; compiler/plugin
 adapter fidelity; newest live dependency refresh; broader UX/IDEA comparison and
 final controlled same-binary six-project performance. This slice establishes no
 whole-project clean diagnostic result or startup/request latency distribution.
+
+
+## Checkpoint76: closed Java diagnostics with unrelated missing sources (2026-10-14)
+
+A binary-only Module made library_index_complete false. Java call-shape collection
+then stopped globally; the shared certified-owner proof also checked unrelated
+Kotlin default-import packages. A selected plain Java class and its exact SDK Object
+inventory could therefore produce no arity/type errors despite a complete owner.
+The old blanket library-negative fixture expectation is explicitly refined:
+unrelated missing library sources do not add methods to that proven Java owner.
+
+The collector now defers completeness to its per-call proof. The shared owner proof
+checks its own package and java.lang, retaining project/scope, source-owner identity,
+selected SDK/Object inventory, dirty/annotated/generic/supertype and receiver guards.
+Unsupported constructors/inherited owners retain their existing limits. The new
+regression fails with two missing errors before the fix. The first candidate still
+fails because it leaves the outer collector gate; the final candidate passes all39
+diagnostic-absence checks. Workspace1,502 pass,0 fail,4 existing ignored; fmt and
+release pass with106 Rust/workspace source guards stable.
+
+On one immutable release, real Neovim passes Module library41/41 and Local
+library41/41. Module original method corpus12/12 and field corpus2/2 also pass cold
+and warm, with actual symcache decode/restoration and unchanged compressed bytes.
+The Local corpus is retained checkpoint75 evidence and was not redundantly repeated.
+For each dependency variant, all six selected Java diagnostic first reports match:
+counts0,2,1,0,1,0 across original, bad calls, unsaved owner, repaired caller, restored
+owner and restored caller. Exact code/ranges match; buffers and disk are restored.
+This fixes the three failed checkpoint75 Module diagnostic assertions without
+changing their expectations or claiming whole-project clean diagnostics.
+
+Release receipt SHA c79a3a20ddea5bb523737aced7b7424095112897007f4cf1791a8327bee0511a.
+Immutable ktlsp SHA e72823a1c93baf2afed65db162804b43a6c95299579ac97d57615cc31cb88df1.
+Module editor receipt SHA32332bd04416bb64c65bd4a7703083ed23771aceaebf7141722e890d59da8c16.
+Local editor receipt SHA4fe209f27eeb5f7451a2578fbe23504195c980735aa5712ea521219236d72b13.
+Evidence under the existing Temp base: native-module-diagnostic-*76-* receipts;
+native-binary-fields-module-editor76-1; native-binary-fields-local-library76-1;
+root-module-diagnostics-editor76-1.json. Cargo commands finish with their observed
+test/build statuses and zero owned residuals; the workspace/build controllers each
+terminate one remaining fresh owned descendant separately. All six editor stages
+close without forced cleanup or residuals. These are separate observations.
+
+A compact docs/fork-current.md now supplies the continuation state and evidence
+pointers. Raw logs stay on disk; normal reads retrieve counts and specific failures.
+No embedding, new test framework or broad repeated Local corpus run was added.
+Broader compiler/plugin, inherited/generated diagnostic, live refresh, six-project
+same-binary and controlled UX/performance acceptance remains open.

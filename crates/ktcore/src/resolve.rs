@@ -963,13 +963,16 @@ pub fn declaration_surface_status(
                 &Type::class(&owner.sym.name, Some(owner.sym.package.clone())),
                 facts,
             ));
-            reasons.extend(visible_package_reasons_with_ctx(
-                &owner.path,
-                &entry.sym.name,
-                facts,
-                &owner.sym.package,
-                &[],
-            ));
+            for package in [owner.sym.package.as_str(), "java.lang"] {
+                package_world_reasons(
+                    package,
+                    (package == owner.sym.package).then_some(owner),
+                    &owner.path,
+                    &owner.sym.package,
+                    facts,
+                    &mut reasons,
+                );
+            }
             // This owner proof lifts only the producer gap, never another incomplete world.
             reasons.retain(|reason| *reason != IncompletenessReason::CompilerProducerIncomplete);
             dedup_reasons(&mut reasons);

@@ -902,11 +902,7 @@ pub fn diagnostics_with_options(
             &mut out,
         );
     }
-    if facts.project_scan_complete
-        && include_call_shape
-        && index.scope_is_complete()
-        && (facts.compiler_producers_complete || durable_indexes_complete(facts))
-    {
+    if facts.project_scan_complete && include_call_shape && index.scope_is_complete() {
         collect_call_shape_mismatches(
             index,
             file,

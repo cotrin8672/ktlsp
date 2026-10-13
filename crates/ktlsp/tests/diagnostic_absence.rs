@@ -1415,7 +1415,6 @@ fn plain_java_call_shape_authority_preserves_incomplete_world_guards() {
         "sdk",
         "caller",
         "jdk",
-        "library",
         "dirty",
         "annotation",
         "generic",
@@ -1433,7 +1432,6 @@ fn plain_java_call_shape_authority_preserves_incomplete_world_guards() {
             }
             "caller" => index.caller_known = false,
             "jdk" => facts.jdk_index_complete = false,
-            "library" => facts.library_index_complete = false,
             "dirty" => {
                 facts.project_scan_complete = false;
                 facts.project_packages_complete.clear();
@@ -1587,4 +1585,39 @@ fn plain_java_call_shape_authority_does_not_expand_constructor_diagnostics() {
             .all(|item| item.code != Some(DiagnosticCode::CallShapeMismatch)),
         "{diagnostics:?}"
     );
+}
+
+#[test]
+fn plain_java_owner_call_shape_does_not_require_unrelated_library_source_closure() {
+    let index = plain_java_call_shape_inventory();
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    facts.library_index_complete = false;
+    facts.project_packages_complete.insert("app".into());
+    let caller = PLAIN_USE
+        .replace("accept(\"Ada\")", "accept()")
+        .replace("accept(1, 2)", "accept(true)");
+    let tree = ktlsp::java::JavaParser::new().parse(&caller);
+    let expected = ["value.accept()", "value.accept(true)"].map(|call| {
+        let start = caller.find(call).unwrap();
+        (
+            start,
+            start + call.len(),
+            Some(DiagnosticCode::CallShapeMismatch),
+        )
+    });
+    let diagnostics = ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, &caller, &facts);
+    let actual = diagnostics
+        .iter()
+        .map(|item| (item.start_byte, item.end_byte, item.code))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "an unrelated binary-only dependency cannot add methods to this certified owner: {diagnostics:?}");
+    // Relevant owner-world and SDK uncertainty still block the same negative proof.
+    facts.project_scan_complete = false;
+    facts.project_packages_complete.clear();
+    assert!(ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, &caller, &facts).is_empty());
+    facts.project_scan_complete = true;
+    facts.project_packages_complete.insert("app".into());
+    facts.jdk_index_complete = false;
+    assert!(ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, &caller, &facts).is_empty());
 }
