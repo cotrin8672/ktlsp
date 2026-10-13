@@ -5568,3 +5568,48 @@ fun invalid(factory: Factory, unknown: Missing, nominal: Array, index: Other) {
         "{found:?}"
     );
 }
+
+#[test]
+fn projected_mapped_collection_head_remains_possible_without_mapping_proof() {
+    // These are index facts only; compiler control uses the actual JDK/stdlib declarations.
+    let ws = workspace(&[
+        ("JavaList.java", "package java.util; public interface List<E> {}"),
+        ("KotlinList.kt", "package kotlin.collections\ninterface List<out E>\n"),
+        ("MappedResult.java", "package mapped; public final class MappedResult {}"),
+        ("MappedConsumer.java", "package mapped; public final class MappedConsumer { public <T> MappedResult consume(java.util.List<? extends T> values) { return null; } public MappedResult consume(MappedResult value) { return value; } }"),
+    ]);
+    let actual = Type::Class {
+        name: "List".into(),
+        package: Some("kotlin.collections".into()),
+        container: None,
+        nullable: false,
+        args: vec![Type::class("String", Some("kotlin".into()))],
+    };
+    let owner = Type::class("MappedConsumer", Some("mapped".into()));
+    let ctx = FileCtx::new("mapped".into(), Vec::new());
+    let arguments = ktcore::members::CallArguments {
+        count: Some(1),
+        types: vec![actual],
+        names: None,
+        has_spread: false,
+        trailing_lambda: false,
+    };
+    let candidates = ktcore::members::candidates(&ws.index, &owner, "consume", &ctx);
+    let selection = candidates.select(
+        &ws.index,
+        &owner,
+        &ktcore::members::MemberUse::Call(arguments),
+        &ctx,
+    );
+    assert_eq!(
+        selection.applicability,
+        ktcore::members::Applicability::Unknown,
+        "an unmodeled mapped identity cannot prove rejection"
+    );
+    assert_eq!(
+        selection.entries.len(),
+        1,
+        "the java.util.List candidate remains possible"
+    );
+    assert_eq!(selection.entries[0].sym.params[0].name, "List");
+}

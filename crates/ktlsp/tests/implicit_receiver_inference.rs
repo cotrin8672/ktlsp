@@ -1727,3 +1727,132 @@ fun use(payload:Payload,other:OtherPayload) { scope(payload,other) { payloadOnly
     let known = labels(&mut ws, "NamedTrailing.kt", "other.");
     assert!(known.contains("otherOnly"), "{known:?}");
 }
+
+#[test]
+fn spring_static_factory_projection_keeps_fixed_return_without_selecting_an_overload() {
+    let mut ws = spring_workspace();
+    ws.open(
+        "Class.java",
+        "package java.lang; public final class Class<T> {}".into(),
+    );
+    ws.open(
+        "ReflectType.java",
+        "package java.lang.reflect; public interface Type {}".into(),
+    );
+    ws.change("ResolvableType.java", "package oracle; public final class ResolvableType { public static ResolvableType forType(java.lang.reflect.Type type) { return new ResolvableType(); } public static ResolvableType forType(ParameterizedTypeReference<?> type) { return new ResolvableType(); } }".into());
+    let factory = "ResolvableType.forType((object : ParameterizedTypeReference<T>() {}).type)";
+    // The factory's target can remain uncertain; both declarations have this fixed result.
+    assert_eq!(
+        infer_expression(&ws, "BeanFactoryExtensions.kt", factory),
+        Type::class("ResolvableType", Some("oracle".into()))
+    );
+    let expected = ws
+        .index
+        .lookup_by_name("getBeanProvider")
+        .iter()
+        .find(|entry| {
+            entry.path.as_ref() == "BeanFactory.java"
+                && entry
+                    .sym
+                    .params
+                    .first()
+                    .is_some_and(|parameter| parameter.name == "ResolvableType")
+        })
+        .map(|entry| Def {
+            file: entry.path.to_string(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        })
+        .unwrap();
+    let source = ws.doc_text("BeanFactoryExtensions.kt").unwrap();
+    let outer = source
+        .find("getBeanProvider(ResolvableType.forType(")
+        .unwrap();
+    assert_eq!(
+        ws.goto_definition("BeanFactoryExtensions.kt", outer),
+        vec![expected]
+    );
+}
+
+#[test]
+fn spring_known_nominal_argument_rejects_unbounded_class_type_parameter_overload() {
+    let mut ws = spring_workspace();
+    ws.open(
+        "Class.java",
+        "package java.lang; public final class Class<T> {}".into(),
+    );
+    ws.open("Known.kt", "package oracle\nfun BeanFactory.control(required: ResolvableType): ObjectProvider<Payload> = getBeanProvider(required)\n".into());
+    let expected = ws
+        .index
+        .lookup_by_name("getBeanProvider")
+        .iter()
+        .find(|entry| {
+            entry.path.as_ref() == "BeanFactory.java"
+                && entry
+                    .sym
+                    .params
+                    .first()
+                    .is_some_and(|parameter| parameter.name == "ResolvableType")
+        })
+        .map(|entry| Def {
+            file: entry.path.to_string(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        })
+        .unwrap();
+    assert_eq!(
+        goto(
+            &mut ws,
+            "Known.kt",
+            "getBeanProvider(required)",
+            "getBeanProvider"
+        ),
+        vec![expected]
+    );
+}
+
+#[test]
+fn projected_fixed_return_does_not_choose_a_factory_target_or_invent_generic_results() {
+    let mut ws = spring_workspace();
+    ws.open(
+        "ReflectType.java",
+        "package java.lang.reflect; public interface Type {}".into(),
+    );
+    ws.open(
+        "Other.java",
+        "package oracle; public final class Other {}".into(),
+    );
+    ws.change("ResolvableType.java", "package oracle; public final class ResolvableType { public static ResolvableType forType(java.lang.reflect.Type type) { return new ResolvableType(); } public static ResolvableType forType(ParameterizedTypeReference<?> type) { return new ResolvableType(); } public static Other different(ParameterizedTypeReference<?> type) { return null; } public static ResolvableType different(java.lang.reflect.Type type) { return null; } public static <T> T dependent(ParameterizedTypeReference<? extends T> type) { return null; } }".into());
+    ws.open("Unknown.kt", "package oracle\nfun use(value: Missing) { ResolvableType.forType(value); ResolvableType.different(value); ResolvableType.dependent(value) }\n".into());
+    assert_eq!(
+        infer_expression(&ws, "Unknown.kt", "ResolvableType.forType(value)"),
+        Type::class("ResolvableType", Some("oracle".into()))
+    );
+    let definitions = goto(
+        &mut ws,
+        "Unknown.kt",
+        "ResolvableType.forType(value)",
+        "forType",
+    );
+    assert_eq!(
+        definitions.len(),
+        2,
+        "the unknown argument cannot select a factory overload: {definitions:?}"
+    );
+    assert_eq!(
+        infer_expression(&ws, "Unknown.kt", "ResolvableType.different(value)"),
+        Type::Unknown
+    );
+    assert_eq!(
+        infer_expression(&ws, "Unknown.kt", "ResolvableType.dependent(value)"),
+        Type::Unknown
+    );
+    ws.open(
+        "Rejected.kt",
+        "package oracle\nfun use() { ResolvableType.forType(true) }\n".into(),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Rejected.kt", "ResolvableType.forType(true)"),
+        Type::Unknown
+    );
+}

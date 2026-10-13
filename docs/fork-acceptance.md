@@ -79,7 +79,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint72 passes1,493 tests,0 failures,4 existing ignored; formatting and release pass, including core126/server451/interop122 | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint74 passes1,498 tests,0 failures,4 existing ignored; formatting and release pass, including core127/server451/interop123 | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Checkpoint70 Java307/312: original72 resource requests, new6 SDK requests and new5 Kotlin array requests match without readiness waits. The five existing diagnostic omissions remain. Earlier basic9/library41 remain historical | Finite completion/navigation evidence;5 existing diagnostic omissions remain | native-java-editor70-4; root-java-kotlin-editor-verification70-4. Server stop still force-requested, exit1/signal15; no graceful-shutdown claim |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned; saved-source identities guarded and ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -92,7 +92,7 @@ a useful known receiver in the same edited state.
 | Function-local Kotlin extensions | Respect declaration order, lexical scope and typed receiver/overload selection across features and unsaved edits | Real Neovim local checks retain44/44 alongside42 alias and23 ordinary checks. Current semantic total142 includes33 new bound checks; historical109 assertions were previously counted as107 lines | Focused semantics verified; projected/recursive bounded receivers remain coverage gaps | Checkpoints33/39/60: old assertion names all retained. Exact references, applied whole-file rename, signature/hover, type-definition and inlay hints have focused controls; no six-project parity claim |
 | Unsaved cross-language edits | Both languages immediately observe edited declarations and types without saving | Actual Retrofit mixed editing matches all 21 first-attempt RPCs and 25 semantic checks, including typed changes in both languages, references, applied renames and restoration. Shared mixed fixture and opened JDK source rename/delete controls also pass | Focused actual-project repair verified; wider corpus open | Checkpoints 43/45/47. The latest release retains all 21 first RPCs and 25 checks. Normal Neovim cross-buffer debounce observation is separate; repeated edit stress across the other roots remains pending |
 | Rename | Applying workspace edits updates the intended Java/Kotlin declarations and usages only | Actual Retrofit preserves all four complete expected buffers after applying rename. Tenth-fixed-2 applies the six-site override family and passes independent compilation plus 33 bytecode assertions. JVM facade and external consumer applied renames also pass | Focused actual-project and fixture cases verified; wider corpus and inherited implementation edges pending | Checkpoints 43 and the earlier compiler-backed override-family controls. Ambiguous or read-only family members refuse partial edits |
-| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Configured MODEL11 captures now exist for all six roots. Latest Gradle online retry loads194 modules and indexes11,327 files; offline root exits0 with both output captures complete but is rejected after a2s child shutdown tail. Current six-project basic floor matches58/60;41 useful completions and6 Unknown controls match | Model acquisition verified; basic library editor cases and wider semantics remain open | Checkpoint71, independent current model audit9659f107...; original historical-path assertion failure retained. Java fork/plugin compiler recipe remains unsupported; no native replay-equivalence claim |
+| Dependencies and generation | Resolve real Gradle dependencies and generated sources, with correct module visibility | Configured MODEL11 captures now exist for all six roots. Latest Gradle online retry loads194 modules and indexes11,327 files; offline root exits0 with both output captures complete but is rejected after a2s child shutdown tail. Release71 six-project floor matches58/60; current release74 CEM/Spring20/20 matches | Model acquisition verified; basic library editor cases and wider semantics remain open | Checkpoint71, independent current model audit9659f107...; original historical-path assertion failure retained. Java fork/plugin compiler recipe remains unsupported; no native replay-equivalence claim |
 | Live Gradle changes | An already-running client reflects dependency additions, version changes, removals and new build outputs | Model10 automatic-watching run on binary65-5 passes all86 original checks and four actual builds, including dirty buffers and clean shutdown | Focused model10 automatic-refresh semantics verified; wider transforming cases open | Checkpoint65 native-gradle-reload-model10-65-1; explicit reload false,18 native notifications, one acknowledged shutdown/exit0; separate owned Gradle cleanup1 |
 | Kotlin compiler inputs | Use the task actual sources, ordered libraries, compiler runtime and selected JDK | Current Moshi1.8.21/SDK17 preserves full2-source selection/CP7/runtime9/plugins8, MODEL11 and22 declared inputs. Original/unsaved invalid/restored canonical diagnostics match0/1/0 with current source/store generations | Exact strict-API adapter and finite current diagnostics verified | native-moshi-editor67-1; independent5 compiler controls and original174-file saved build; accepted model SHA is not emitted by server |
 | Compiler plugins and processors | Analyze generated APIs consistently in Java/Kotlin, including unsaved edits | Last unchanged114 KAPT/KSP checks:111 pass,3 obsolete-method Java diagnostics missing. All6 raw disabled-phase javac errors remain;3 proved missing-import errors publish, canonical Kotlin errors preserved | Finite auxiliary import repair verified; method diagnostics/general AP closure remain open | native-java-worker-processor67-1 on prior67-1 binary; no rerun or parity claim for67b |
@@ -5605,3 +5605,72 @@ Next: independently establish the structured compiler message expectation, updat
 the existing hook assertion, and retain the first failed run. Extend the existing
 Java diagnostic restore case with actual store readback; do not infer global clean
 analysis from an empty response or this one restored buffer.
+
+## Checkpoint74: shared projected-call inference and exact overload navigation
+
+CEM and Spring's original four manifests now match20/20 sole first responses on
+one immutable release, including both previously ambiguous definition requests.
+CEM getOrThrow and Spring BeanFactory.getBeanProvider return the exact required
+declaration, with all original positive and Unknown controls retained. Four clients
+acknowledge shutdown/exit0 with no forced cleanup. Full project/source/model guards
+pass; copied models retain their bytes. Native receipt:
+native-cem-spring-final74-1/receipt.json
+SHAfe709e3e4dbd25513ee32ee69494f5fe8c3833c769e77463e4b339107088657a.
+Root audit root-cem-spring-final74-1.json
+SHAefba76598e7befcfb0227ffdc698e2aed7611b13afde499292869423ef1c4e90.
+Independent cem-spring-wire-audit74-1/audit.json
+SHA0a6fdba32e7a53230167960d6d4fac58300eb956a16dc9e24be28c22809a42b7
+checks all20 exact RPC params/UTF16 positions/current versions/whole wire images
+and responses,6 didOpen images,16 didChange/flush barriers and restoration.
+CEM peer initially opens its mixed raw EOL bytes; readfile-derived edits and
+restoration later send LF wire text. Both actual images are checked distinctly.
+No extra requests or passes are added.
+This replaces these20 observations only; the other40 original requests still use
+release71 evidence and a final same-binary six-project run remains open.
+
+Three initial regressions reproduce fixed factory returns becoming Unknown and
+known nominal arguments retaining incompatible overloads. The shared infer/members
+fix retains a closed non-generic result independently of uncertain projected
+bindings, while preserving dependent generic Unknown and ambiguous target sets.
+An Unknown candidate can be excluded only with a complete modeled nominal
+hierarchy. Missing parents, cycles, aliases, unsupported bounds/variance, canonical
+Object/Any and unmodeled Kotlin/JVM mappings retain uncertainty. The normal matched
+and rejected projected paths avoid the extra nominal walk.
+
+The initial ordinary-compatibility candidate passed its first focused/full suite,
+but an independent review found it incorrectly rejected Kotlin List passed to Java
+List. That additional integration test fails on the first candidate. Actual JDK
+and stdlib compilation plus javap verify the valid List overload; the corrected
+candidate preserves it. An inference consistency guard withholds a fixed result
+for known incompatible Boolean inputs without inventing unsupported rejection.
+The final focused252 checks pass, then the workspace passes1,498 tests with
+0 failures and4 existing ignored; formatting and release pass.
+Final release receipt SHA956086f5079ca961550a66a13beb13d884a44d9ce208b3a3ebd5e26d828b2307.
+Immutable ktlsp SHA93644be3ce7af5f4f19d5e2bca528e5230cd47cfb4fe67c0419b9c8caba9e7ed.
+
+Independent Spring compiler controls verify both outer ResolvableType descriptors,
+the reflect.Type factory descriptor and rejection of Boolean. The first controller
+retains a format-predicate failure: GradleStyle renders e: rather than error:.
+Native exits0/0/0/1 and bytecode are independently audited, without rerunning or
+reclassifying that failed controller. Root audit:
+root-spring-overload-compiler74-1.json
+SHA6b1955e94662450ff1e772ff1b45d0409fdf06e238957ec3a03aeac6bb96e0ff.
+Mapped positive compiler/descriptor audit:
+root-spring-mapped-compiler74-1.json
+SHAfa5f41da11439de0dbc9e9d9b60e506326f759a30b5055bd4446a5105cd7482b.
+The unchanged nine compiler-control source files are preserved under
+dev/corpus/fixtures/spring-overload-controls. These standalone controls do not
+claim whole-project Java compiler-plugin or Gradle replay equivalence.
+
+Output and verification were kept separate: complete raw logs remain in artifacts;
+normal reads retrieve counts, statuses and specific failing assertions. The editor
+caller reuses the existing native helper and memoizes parent-path checks only within
+a validation pass, clearing the memo around native stages and moves/writes. This
+reduces verification overhead without changing semantic expectations or guard
+freshness boundaries. Preparation failures before any native launch are retained;
+they add no editor observations.
+
+Remaining work: binary-only fields/enum completion, compiler-backed inherited Java
+call diagnostics, compiler/plugin adapter fidelity, latest live dependency refresh,
+broader UX/IDEA comparison and final controlled six-project timing. No whole-project
+parity, canonical diagnostic absence, or speed distribution is inferred here.

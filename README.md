@@ -376,6 +376,10 @@ Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and 
 for Gradle, matching the project's selected main toolchain. This includes completion inside
 braced Kotlin string templates across unsaved Java return-type changes. The focused
 checks pass; broader coverage is tracked in [the acceptance record](docs/fork-acceptance.md).
+The original CEM and Spring corpus manifests also cover projected factory returns
+and exact overload navigation. Standalone compiler reductions are preserved in
+[the overload controls](dev/corpus/fixtures/spring-overload-controls/README.md).
+
 For the pinned CEM source-archive watch case, run `corpus` with
 `dev/corpus/cem-source-watch.json`, `KTLSP_CORPUS_WAIT_INDEX=1`,
 `KTLSP_CORPUS_EXTRA_PROBES=$PWD/dev/nvim_cem_source_watch.lua` and

@@ -1431,6 +1431,21 @@ fn parameters_applicability(
     uncertain |= params.len() != entry.sym.params.len()
         && !infer::call_parameter_templates_known(index, entry);
     if let Some(application) = infer::projected_member_application(index, receiver, entry, bound) {
+        if application.status == crate::solve::ConstraintStatus::Unknown
+            && entry.sym.type_parameter_facts.known_unbounded()
+            && !entry.sym.has_vararg
+            && !args.has_spread
+            && !args.trailing_lambda
+            && args.count == Some(args.types.len())
+            && params.len() == args.types.len()
+            && params.len() == entry.sym.params.len()
+            && params.iter().zip(&args.types).any(|(parameter, actual)| {
+                let formal = infer::declared_member_type(index, receiver, entry, parameter, ctx);
+                infer::nominal_heads_incompatible(index, actual, &formal)
+            })
+        {
+            return Applicability::Rejected;
+        }
         return match application.status {
             crate::solve::ConstraintStatus::Rejected => Applicability::Rejected,
             crate::solve::ConstraintStatus::Unknown => Applicability::Unknown,

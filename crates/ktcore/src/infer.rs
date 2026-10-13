@@ -3160,6 +3160,31 @@ fn declared_member_bound_type(
     let Some(application) = projected_member_application(index, receiver, entry, bound) else {
         return declared_member_type(index, receiver, entry, tr, ctx);
     };
+    if application.status == solve::ConstraintStatus::Unknown
+        && member_type_parameters(index, entry).is_empty()
+        && entry.sym.extension_receiver.is_none()
+        && bound.arguments.count == Some(bound.arguments.types.len())
+        && !bound.arguments.has_spread
+        && !bound.arguments.trailing_lambda
+        && !entry.sym.has_vararg
+        && entry.sym.arity == Some(entry.sym.params.len().min(u8::MAX as usize) as u8)
+        && entry.sym.min_arity.is_some()
+        && tr.args.is_empty()
+        && args_consistent(
+            index,
+            &bound.params,
+            &entry.sym.type_params,
+            &bound.arguments.types,
+            &FileCtx::new(entry.sym.package.clone(), Vec::new()),
+            0,
+        )
+    {
+        // An uncertain parameter binding does not change a closed, fixed return type.
+        let declared = declared_member_type(index, receiver, entry, tr, ctx);
+        if constraint_type_is_known(index, &declared, 0) {
+            return declared;
+        }
+    }
     if application.status != solve::ConstraintStatus::Matched {
         return Type::Unknown;
     }
@@ -3281,6 +3306,61 @@ pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal
         return true;
     }
     is_subtype(index, an, actual.package(), fname)
+}
+
+/// A closed nominal hierarchy can exclude a head without solving its type arguments.
+pub(crate) fn nominal_heads_incompatible(
+    index: &dyn InferenceIndex,
+    actual: &Type,
+    formal: &Type,
+) -> bool {
+    if !matches!((actual, formal), (Type::Class { .. }, Type::Class { .. })) {
+        return false;
+    }
+    let universal = |ty: &Type| {
+        ty.container().is_none()
+            && matches!(
+                (ty.package(), ty.name()),
+                (Some("kotlin"), Some("Any")) | (Some("java.lang"), Some("Object"))
+            )
+    };
+    if universal(formal) || actual.name() == formal.name() {
+        return false;
+    }
+    let modeled = |ty: &Type| {
+        type_declaration(index, ty).is_some_and(|declaration| {
+            declaration.sym.kind != SymbolKind::TypeAlias
+                && declaration.sym.type_parameter_facts.known_unbounded()
+                && declaration.sym.type_parameter_facts.known_invariant()
+        })
+    };
+    if !modeled(formal) {
+        return false;
+    }
+    if !modeled(actual) {
+        return false;
+    }
+    let mut uncertain = false;
+    let mut found = false;
+    let walked = walk_supertypes(index, actual, SUPERTYPE_CAP, |current| {
+        uncertain |= !modeled(current);
+        if current.name() == formal.name() {
+            if current.package() == formal.package() && current.container() == formal.container() {
+                found = true;
+            } else {
+                // Equal names in distinct packages may be a JVM mapped identity.
+                uncertain = true;
+            }
+        }
+        let kotlin_java = |left: Option<&str>, right: Option<&str>| {
+            left.is_some_and(|package| package == "kotlin" || package.starts_with("kotlin."))
+                && right.is_some_and(|package| package.starts_with("java."))
+        };
+        uncertain |= kotlin_java(current.package(), formal.package())
+            || kotlin_java(formal.package(), current.package());
+        std::ops::ControlFlow::Continue(())
+    });
+    walked.is_continue() && !uncertain && !found
 }
 
 /// A symbolic name retained from an incomplete declaration is not evidence of a type mismatch.
@@ -4467,6 +4547,87 @@ mod tests {
                 Type::class(name, Some("java.lang".into())),
                 "legacy context without stamped candidates"
             );
+        }
+    }
+
+    #[test]
+    fn nominal_head_exclusion_requires_closed_unaliased_invariant_hierarchies() {
+        use crate::symbol::TypeParameterFacts;
+        use crate::types::{Type, TypeRef};
+        let ty = |name: &str| Type::class(name, Some("probe".into()));
+        let declaration = |name: &str| {
+            let mut symbol =
+                IndexedSymbol::new(name, SymbolKind::Class, "probe", None, 0, name.len());
+            symbol.type_parameter_facts = TypeParameterFacts::new(true, true);
+            symbol
+        };
+        let mut head = declaration("Head");
+        head.type_params = vec!["T".into()];
+        let mut formal = ty("Head");
+        if let Type::Class { args, .. } = &mut formal {
+            *args = vec![Type::Unknown];
+        }
+        for (case, expected) in [
+            ("closed", true),
+            ("missing", false),
+            ("cycle", false),
+            ("alias", false),
+            ("variance", false),
+            ("bounds", false),
+            ("subtype", false),
+        ] {
+            let mut actual = declaration("Actual");
+            match case {
+                "missing" => actual.supertype_refs = vec![TypeRef::simple("Missing")],
+                "cycle" => actual.supertype_refs = vec![TypeRef::simple("Actual")],
+                "alias" => actual.kind = SymbolKind::TypeAlias,
+                "variance" => actual.type_parameter_facts = TypeParameterFacts::new(true, false),
+                "bounds" => actual.type_parameter_facts = TypeParameterFacts::new(false, true),
+                "subtype" => {
+                    let mut parent = TypeRef::simple("Head");
+                    parent.args = vec![TypeRef::simple("String")];
+                    actual.supertype_refs = vec![parent];
+                }
+                _ => {}
+            }
+            let mut index = Index::new();
+            index.replace_file("Heads.kt", vec![head.clone(), actual], Tier::Volatile);
+            assert_eq!(
+                super::nominal_heads_incompatible(&index, &ty("Actual"), &formal),
+                expected,
+                "{case}"
+            );
+            for universal in [
+                Type::class("Any", Some("kotlin".into())),
+                Type::class("Object", Some("java.lang".into())),
+            ] {
+                assert!(
+                    !super::nominal_heads_incompatible(&index, &ty("Actual"), &universal),
+                    "implicit universal superclass: {case}"
+                );
+            }
+            let mut alias = declaration("Alias");
+            alias.kind = SymbolKind::TypeAlias;
+            index.replace_file("Alias.kt", vec![alias], Tier::Volatile);
+            assert!(!super::nominal_heads_incompatible(
+                &index,
+                &ty("Actual"),
+                &ty("Alias")
+            ));
+        }
+        let mut index = Index::new();
+        index.replace_file("Head.kt", vec![head], Tier::Volatile);
+        assert!(!super::nominal_heads_incompatible(
+            &index,
+            &Type::class("Boolean", Some("kotlin".into())),
+            &formal
+        ));
+        for package in ["java.lang", "kotlin"] {
+            assert!(!super::nominal_heads_incompatible(
+                &index,
+                &Type::Unknown,
+                &Type::class("Object", Some(package.into()))
+            ));
         }
     }
 
