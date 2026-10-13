@@ -302,7 +302,8 @@ impl OwnedNativeCompile {
     ) -> (std::process::ExitStatus, bool, String, bool, String, bool) {
         // A successful Gradle wrapper may precede a short single-use daemon shutdown tail.
         const NATURAL_TREE_EXIT_GRACE: Duration = Duration::from_secs(2);
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         let is_cancelled =
             || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
         let interrupted = loop {
@@ -318,11 +319,31 @@ impl OwnedNativeCompile {
                 }
             }
         };
+        crate::trace::span(
+            "compiler.native_root_observed",
+            "compiler",
+            Instant::now(),
+            serde_json::json!({ "root_exit_observed": !interrupted,
+                "root_status": self.tree.root_status().and_then(|status| status.code()),
+                "elapsed_ms": started.elapsed().as_millis(),
+                "deadline_reached": Instant::now() >= deadline, "cancelled": is_cancelled(),
+                "stdout_worker_finished": self.out.as_ref().is_none_or(|h| h.is_finished()),
+                "stderr_worker_finished": self.err.as_ref().is_none_or(|h| h.is_finished()) }),
+        );
         let grace = (!interrupted).then(|| deadline.min(Instant::now() + NATURAL_TREE_EXIT_GRACE));
         // Wrapper exit alone is insufficient. All assigned processes must be terminal before EOF.
         let (status, forced) = self.tree.cleanup(grace);
         let (out, out_complete) = join_capped(&mut self.out);
         let (err, err_complete) = join_capped(&mut self.err);
+        crate::trace::span(
+            "compiler.native_joined",
+            "compiler",
+            Instant::now(),
+            serde_json::json!({ "root_status": status.code(), "forced": forced,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "stdout_complete": out_complete, "stderr_complete": err_complete,
+                "deadline_reached": Instant::now() >= deadline, "cancelled": is_cancelled() }),
+        );
         let interrupted = interrupted || forced || is_cancelled() || Instant::now() >= deadline;
         (status, interrupted, out, out_complete, err, err_complete)
     }
@@ -580,6 +601,10 @@ mod process_tree {
             Ok(self.status.is_some())
         }
 
+        pub(super) fn root_status(&self) -> Option<ExitStatus> {
+            self.status
+        }
+
         #[cfg(test)]
         pub(super) fn contains(
             &self,
@@ -620,8 +645,10 @@ mod process_tree {
             if self.terminal {
                 return (self.status.expect("terminal root status"), self.forced);
             }
+            let cleanup_started = Instant::now();
             let mut stopping_since = None;
             let mut reported = false;
+            let mut termination_reported = false;
             loop {
                 let root_done = self.root_has_exited().unwrap_or(false);
                 match self.active() {
@@ -639,7 +666,24 @@ mod process_tree {
                         continue;
                     }
                     Ok(0) => {}
-                    _ => {
+                    state => {
+                        if !termination_reported {
+                            crate::trace::span(
+                                "compiler.native_force_requested",
+                                "compiler",
+                                Instant::now(),
+                                serde_json::json!({ "root_done": root_done,
+                                    "root_status": self.status.and_then(|status| status.code()),
+                                    "active": state.as_ref().ok().copied(),
+                                    "active_error": state.as_ref().err().map(ToString::to_string),
+                                    "cleanup_elapsed_ms": cleanup_started.elapsed().as_millis(),
+                                    "reason": if state.is_err() { "active-query-failed" }
+                                        else if natural_deadline.is_some() { "natural-grace-expired" }
+                                        else { "cleanup-without-grace" },
+                                    "natural_deadline_reached": natural_deadline.map(|d| Instant::now() >= d) }),
+                            );
+                            termination_reported = true;
+                        }
                         if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } != 0 {
                             self.forced = true;
                         }
