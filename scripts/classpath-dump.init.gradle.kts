@@ -306,6 +306,52 @@ object KtlspCompilerConfiguration {
         }
     }
 
+    private fun kotlinClasspathSnapshotInputs(task: Task, recipe: Map<String, Any?>): Map<String, Any?>? = runCatching {
+        if (task.project.gradle.gradleVersion != "9.6.1" || recipe["gradle_plugin_version"] != "2.4.0" || recipe["compiler_version"] != "2.4.0" ||
+            recipe["run_via_build_tools_api"] != true || task.javaClass.name !in listOf(
+                "org.jetbrains.kotlin.gradle.tasks.KotlinCompile",
+                "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated")) return@runCatching null
+        // KGP 2.4.0 KotlinCompileConfig fills this @Classpath/@Incremental property from the
+        // snapshot artifact view. BTA passes it only to snapshotBasedIcConfigurationBuilder;
+        // the editor's fresh, nonincremental CLI never configures that operation.
+        val owner = Class.forName("org.jetbrains.kotlin.gradle.tasks.KotlinCompile", false, task.javaClass.classLoader)
+        val propertiesType = Class.forName("org.jetbrains.kotlin.gradle.tasks.KotlinCompile\$ClasspathSnapshotProperties",
+            false, task.javaClass.classLoader)
+        val getter = owner.getDeclaredMethod("getClasspathSnapshotProperties")
+        check(getter.returnType == propertiesType && owner.isInstance(task)) { "Unsupported Kotlin snapshot getter" }
+        val properties = getter.invoke(task) ?: error("Kotlin snapshot properties are unavailable")
+        val snapshots = propertiesType.getDeclaredMethod("getClasspathSnapshot").invoke(properties) as? FileCollection
+            ?: error("Kotlin classpath snapshot inputs are unavailable")
+        val declared = task.inputs.files.files
+        val files = snapshots.files
+        check(files.all { it.isAbsolute && it in declared }) { "Kotlin snapshots are not declared file inputs" }
+        // A plugin can register the same artifact as an additional compiler/config read.
+        // Keep those roles: inspect registrations separately from KGP's annotated snapshot input.
+        val visitorType = Class.forName("org.gradle.internal.properties.PropertyVisitor", false, Task::class.java.classLoader)
+        val registered = linkedSetOf<java.io.File>()
+        val visitor = java.lang.reflect.Proxy.newProxyInstance(visitorType.classLoader, arrayOf(visitorType)) { _, method, args ->
+            when (method.name) {
+                "visitInputFileProperty" -> {
+                    check(method.parameterCount == 8 && method.parameterTypes[6].name == "org.gradle.internal.properties.PropertyValue") {
+                        "Unsupported Gradle input file visitor"
+                    }
+                    val value = method.parameterTypes[6].getMethod("call").invoke(checkNotNull(args?.get(6)))
+                    if (value != null) registered.addAll(task.project.files(value).files)
+                    null
+                }
+                "toString" -> "ktlsp Gradle registered input inventory"
+                "hashCode" -> 0
+                "equals" -> false
+                else -> null
+            }
+        }
+        task.inputs.javaClass.getMethod("visitRegisteredProperties", visitorType).invoke(task.inputs, visitor)
+        check(registered.all { it.isAbsolute }) { "Registered Kotlin input must be absolute" }
+        linkedMapOf("adapter" to "gradle-9.6.1-kgp-2.4.0-classpath-snapshot-inputs-v1",
+            "files" to files.map { it.absolutePath }.sorted(),
+            "registered_inputs" to registered.map { it.absolutePath }.sorted())
+    }.getOrNull()
+
     private fun kotlinCompilerRecipe(task: Task, toolchain: Any, toolchainJavaHome: java.io.File): Map<String, Any?> {
         // This is KGP's actual ordered compiler runtime input, separate from target libraries.
         val compilerClasspath = (read(task, "getDefaultCompilerClasspath\$kotlin_gradle_plugin_common") as? FileCollection)
@@ -481,8 +527,10 @@ object KtlspCompilerConfiguration {
                 check(explicitHome == null || explicitHome.isAbsolute) { "Kotlin compiler JDK argument must be absolute" }
                 record["java_home"] = if ("-no-jdk" in strings) null else (explicitHome ?: javaHome).absolutePath
                 // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
-                record["kotlin_compiler"] = kotlinCompilerRecipe(task, toolchain, javaHome)
+                val recipe = kotlinCompilerRecipe(task, toolchain, javaHome)
+                record["kotlin_compiler"] = recipe
                 record["options"] = linkedMapOf(
+                    "kotlinClasspathSnapshotInputs" to kotlinClasspathSnapshotInputs(task, recipe),
                     "taskActionInventory" to producerActions(task),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
                 )

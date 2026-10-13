@@ -399,6 +399,33 @@ struct DependencyResult {
     local_origin: Option<String>,
 }
 
+impl DependencyResult {
+    // A failed source archive stays failed/incomplete. Only the existing exact selected-module
+    // binary decoder may still contribute positive members; never publish partial source text.
+    fn source_error_binary_fallback(&self) -> bool {
+        let Some(coord) = &self.coord else {
+            return false;
+        };
+        let owner = classpath::maven_origin_id(coord);
+        self.failed
+            && self.missing_source
+            && !self.jdk
+            && !self.local_jar
+            && !self.batches.is_empty()
+            && self.batches.iter().all(|batch| {
+                batch.origin.as_ref().is_some_and(|origin| {
+                    origin.origin_id == owner
+                        && origin.representation == crate::project_model::SourceRepresentation::Stub
+                }) && batch.symbols.iter().any(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        ktcore::symbol::SymbolKind::Function | ktcore::symbol::SymbolKind::Property
+                    )
+                })
+            })
+    }
+}
+
 fn dependency_index_threads() -> usize {
     std::env::var("KTLSP_INDEX_THREADS")
         .ok()
@@ -615,7 +642,7 @@ fn spawn_coordinate_index_worker(
                         return (Vec::new(), true, Vec::new(), false, true);
                     }
                 };
-                let source_missing = source.is_none();
+                let mut source_missing = source.is_none();
                 let skipped = source
                     .as_ref()
                     .map(|source| {
@@ -636,8 +663,22 @@ fn spawn_coordinate_index_worker(
                     match deps::resolve_library_source(&source, &mut kotlin, &mut java) {
                         Ok(batches) => (batches, false),
                         Err(error) => {
-                            tracing::warn!("index {label} failed: {error:#}");
-                            (Vec::new(), true)
+                            tracing::warn!("index {label} source failed: {error:#}");
+                            source_missing = true;
+                            let batches = if authoritative {
+                                match deps::resolve_module_binary_stubs(
+                                    &coord, &selected_binaries, &extract_root, &mut kotlin, &mut java,
+                                ) {
+                                    Ok(batches) => batches,
+                                    Err(binary_error) => {
+                                        tracing::warn!("index {label} binary fallback failed: {binary_error:#}");
+                                        Vec::new()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            (batches, true)
                         }
                     }
                 } else if authoritative {
@@ -964,13 +1005,17 @@ fn index_dependencies(
         }
 
         if result.failed {
-            if result.jdk {
-                tracing::warn!("indexing JDK sources failed; skipping");
-            } else {
-                tracing::warn!("indexing failed for {}; skipping", result.label);
-            }
             stats.failed += 1;
-            continue;
+            if !result.source_error_binary_fallback() {
+                if result.jdk {
+                    tracing::warn!("indexing JDK sources failed; skipping");
+                } else {
+                    tracing::warn!("indexing failed for {}; skipping", result.label);
+                }
+                continue;
+            }
+            tracing::warn!(coordinate = %result.label,
+                "source indexing failed; retaining selected binary members with incomplete source coverage");
         }
         if result.skipped {
             stats.skipped += 1;
@@ -4656,14 +4701,97 @@ mod tests {
             .unwrap()
             .representation
             == crate::project_model::SourceRepresentation::Source));
-        std::fs::write(&source, b"unreadable source archive").unwrap();
-        let invalid_source = resolve(true, vec![(selected.clone(), origin.clone())]);
-        assert!(
-            invalid_source.failed
-                && invalid_source.missing_source
-                && invalid_source.batches.is_empty(),
-            "a present failing source archive cannot silently select binary APIs"
-        );
+        for invalid_utf8 in [false, true] {
+            if invalid_utf8 {
+                write(
+                    &source,
+                    &[(
+                        "arrayfixture/Factory.java",
+                        b"package arrayfixture; // invalid UTF-8 \xff
+public class Factory { public int unsafeSourceOnly() { return 1; } }",
+                    )],
+                );
+            } else {
+                std::fs::write(&source, b"unreadable source archive").unwrap();
+            }
+            for _ in 0..2 {
+                let invalid_source = resolve(true, vec![(selected.clone(), origin.clone())]);
+                assert!(
+                    invalid_source.failed
+                        && invalid_source.missing_source
+                        && !invalid_source.skipped
+                );
+                assert_eq!(invalid_source.batches.len(), 2);
+                assert!(invalid_source.source_error_binary_fallback());
+                assert!(invalid_source.batches.iter().all(|batch| batch
+                    .origin
+                    .as_ref()
+                    .unwrap()
+                    .representation
+                    == crate::project_model::SourceRepresentation::Stub));
+                assert!(
+                    !invalid_source
+                        .batches
+                        .iter()
+                        .flat_map(|batch| &batch.symbols)
+                        .any(|symbol| symbol.name == "sourceOnly"
+                            || symbol.name == "unsafeSourceOnly")
+                );
+                let mut workspace = Workspace::new();
+                assert!(!workspace.dependency_origin_complete(&classpath::maven_origin_id(&coord)));
+                for batch in invalid_source.batches {
+                    assert!(workspace.index_dependency_batch(batch));
+                }
+                workspace.bump_index_revision();
+                for (key, text) in [
+                    ("CorruptSource.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.ro; } }"),
+                    ("CorruptSource.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.ro }\n"),
+                ] {
+                    workspace.open(key, text.to_string());
+                    let query = workspace.completion_query(key, text.find("factory.ro").unwrap() + "factory.ro".len()).unwrap();
+                    assert!(query.candidates.iter().any(|item| item.label == "rows"), "{key}: {} {:?}", query.status_label(), query.reason_labels());
+                }
+                assert!(
+                    !workspace.dependency_origin_complete(&classpath::maven_origin_id(&coord)),
+                    "binary positives do not grant source completeness"
+                );
+                let mut partial_source = resolve(true, vec![(selected.clone(), origin.clone())]);
+                partial_source.batches[0]
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .representation = crate::project_model::SourceRepresentation::Source;
+                assert!(
+                    !partial_source.source_error_binary_fallback(),
+                    "failed partial source cannot pass the installer gate"
+                );
+                partial_source.batches[0]
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .representation = crate::project_model::SourceRepresentation::Stub;
+                partial_source.batches[0].origin.as_mut().unwrap().origin_id = "foreign".into();
+                assert!(
+                    !partial_source.source_error_binary_fallback(),
+                    "foreign stub cannot pass the installer gate"
+                );
+            }
+            let heuristic = resolve(false, vec![(selected.clone(), origin.clone())]);
+            assert!(heuristic.failed && heuristic.missing_source && heuristic.batches.is_empty());
+            let stale = resolve(
+                true,
+                vec![(selected.clone(), "old selected binary identity".into())],
+            );
+            assert!(stale.failed && stale.missing_source && stale.batches.is_empty());
+            let ambiguous = resolve(
+                true,
+                vec![
+                    (selected.clone(), origin.clone()),
+                    (selected.clone(), origin.clone()),
+                ],
+            );
+            assert!(ambiguous.failed && ambiguous.missing_source && ambiguous.batches.is_empty());
+        }
         std::fs::remove_file(&source).unwrap();
         write(&selected, &[]);
         let changed = resolve(true, vec![(selected.clone(), origin)]);

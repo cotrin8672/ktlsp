@@ -3429,6 +3429,110 @@ impl KotlinDiagnosticRequest {
     }
 }
 
+// Gradle IC fingerprints are retained as typed model facts, but are not reads of the
+// fresh nonincremental CLI. Missing/legacy facts retain every declared input.
+fn kotlin_gradle_fingerprint_inputs(
+    request: &KotlinDiagnosticRequest,
+    recipe: &crate::classpath::KotlinCompilerRecipe,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let Some(value) = request
+        .task
+        .options
+        .get("kotlinClasspathSnapshotInputs")
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(Vec::new());
+    };
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Fact {
+        adapter: String,
+        files: Vec<PathBuf>,
+        registered_inputs: Vec<PathBuf>,
+    }
+    let fact: Fact = serde_json::from_value(value.clone())?;
+    anyhow::ensure!(
+        fact.adapter == "gradle-9.6.1-kgp-2.4.0-classpath-snapshot-inputs-v1"
+            && recipe.gradle_plugin_version == "2.4.0"
+            && recipe.compiler_version == "2.4.0"
+            && recipe.run_via_build_tools_api
+            && matches!(
+                request.task.task_type.as_str(),
+                "org.jetbrains.kotlin.gradle.tasks.KotlinCompile"
+                    | "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated"
+            )
+            && fact.files.len() <= 4096
+            && fact.registered_inputs.len() <= 4096
+            && fact.registered_inputs.iter().all(|p| p.is_absolute()),
+        "kotlin-gradle-fingerprint-profile-unhandled"
+    );
+    let declared: std::collections::BTreeSet<_> = request
+        .task
+        .declared_input_files
+        .iter()
+        .map(|p| crate::paths::file_key(p))
+        .collect();
+    let sources: std::collections::BTreeSet<_> = request
+        .task
+        .source_files
+        .iter()
+        .map(|p| crate::paths::file_key(p))
+        .collect();
+    let mut direct: std::collections::BTreeSet<_> = recipe
+        .default_classpath
+        .iter()
+        .chain(recipe.current_jvm_tools_jar.iter())
+        .chain(request.task.classpath.iter())
+        .cloned()
+        .collect();
+    direct.extend(kotlin_plugin_paths(&request.task.arguments)?);
+    let direct: std::collections::BTreeSet<_> =
+        direct.iter().map(|p| crate::paths::file_key(p)).collect();
+    let registered: Vec<_> = fact
+        .registered_inputs
+        .iter()
+        .map(|p| crate::paths::file_key(p))
+        .collect();
+    // Plugin arguments may name a declared read without a separate inputs.file registration.
+    // Conservative substring matching can retain extra inputs; it never erases that read role.
+    let arguments: Vec<_> = request
+        .task
+        .arguments
+        .iter()
+        .map(|arg| kotlin_path_key(arg))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut fingerprints = Vec::new();
+    for path in &fact.files {
+        let key = crate::paths::file_key(path);
+        anyhow::ensure!(
+            path.is_absolute()
+                && declared.contains(&key)
+                && !sources.iter().any(|source| paths_overlap(source, &key))
+                && seen.insert(key.clone()),
+            "kotlin-gradle-fingerprint-membership-differs"
+        );
+        anyhow::ensure!(
+            !direct.iter().any(|read| paths_overlap(read, &key))
+                && !paths_overlap(&crate::paths::file_key(&recipe.gradle_java_home), &key)
+                && !paths_overlap(&crate::paths::file_key(&recipe.toolchain_java_home), &key)
+                && !request
+                    .task
+                    .java_home
+                    .as_ref()
+                    .is_some_and(|home| paths_overlap(&crate::paths::file_key(home), &key)),
+            "kotlin-gradle-fingerprint-overlaps-compiler-read"
+        );
+        let argument_key = kotlin_path_key(&key);
+        if !registered.iter().any(|read| paths_overlap(read, &key))
+            && !arguments.iter().any(|arg| arg.contains(&argument_key))
+        {
+            fingerprints.push(path.clone());
+        }
+    }
+    Ok(fingerprints)
+}
+
 #[derive(Clone, PartialEq, Eq, serde::Serialize)]
 struct KotlinEnvironmentKey {
     project_dir: PathBuf,
@@ -3437,6 +3541,7 @@ struct KotlinEnvironmentKey {
     java_home: Option<PathBuf>,
     recipe: crate::classpath::KotlinCompilerRecipe,
     extra_inputs: Vec<PathBuf>,
+    gradle_fingerprint_inputs: Vec<PathBuf>,
     java_task: Option<crate::classpath::CompilerTask>,
     java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     java_helper_sha256: Option<String>,
@@ -3461,11 +3566,19 @@ impl KotlinEnvironmentKey {
             .iter()
             .map(|p| crate::paths::file_key(p))
             .collect();
+        let gradle_fingerprint_inputs = kotlin_gradle_fingerprint_inputs(request, &recipe)?;
+        let fingerprints: std::collections::BTreeSet<_> = gradle_fingerprint_inputs
+            .iter()
+            .map(|p| crate::paths::file_key(p))
+            .collect();
         let extra_inputs = request
             .task
             .declared_input_files
             .iter()
-            .filter(|p| !sources.contains(&crate::paths::file_key(p)))
+            .filter(|p| {
+                !sources.contains(&crate::paths::file_key(p))
+                    && !fingerprints.contains(&crate::paths::file_key(p))
+            })
             .cloned()
             .collect();
         let java_available = java_diagnostics::configured_recipe(request).is_ok();
@@ -3476,6 +3589,7 @@ impl KotlinEnvironmentKey {
             java_home: request.task.java_home.clone(),
             recipe,
             extra_inputs,
+            gradle_fingerprint_inputs,
             java_task: java_available.then(|| request.java_task.clone()).flatten(),
             java_dependencies: if java_available {
                 request.java_dependencies.clone()
@@ -4860,6 +4974,289 @@ mod kotlin_editor_compile_tests {
                 "{mutation}"
             );
         }
+    }
+
+    fn snapshot_fact(
+        request: &mut KotlinDiagnosticRequest,
+        files: &[PathBuf],
+        registered: &[PathBuf],
+    ) {
+        request.task.options.insert(
+            "kotlinClasspathSnapshotInputs".into(),
+            serde_json::json!({
+                "adapter": "gradle-9.6.1-kgp-2.4.0-classpath-snapshot-inputs-v1",
+                "files": files, "registered_inputs": registered
+            }),
+        );
+    }
+
+    #[test]
+    fn gradle_fingerprint_role_reduces_watch_fanout_without_changing_native_watch_bounds() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let mut files = Vec::new();
+        for n in 0..180 {
+            let path = tree.0.join(format!(
+                "transforms/{n}/isolated/transformed/input.any-name"
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"Gradle IC fingerprint").unwrap();
+            files.push(path);
+        }
+        request.task.declared_input_files.extend(files.clone());
+        let legacy = KotlinEnvironmentKey::new(&request).unwrap();
+        assert!(crate::compiled_watch::WatchPlan::read_inputs(&legacy.extra_inputs).is_err());
+        snapshot_fact(&mut request, &files, &[]);
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        assert_eq!(key.gradle_fingerprint_inputs, files);
+        assert!(key
+            .extra_inputs
+            .iter()
+            .all(|p| !key.gradle_fingerprint_inputs.contains(p)));
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.extra_inputs).unwrap();
+        assert!(!plan.includes_directory_watch(&tree.0.join("transforms/0/isolated/transformed")));
+        assert!(plan.covers_read(
+            &crate::paths::file_key(
+                &request
+                    .task
+                    .kotlin_compiler
+                    .as_ref()
+                    .unwrap()
+                    .default_classpath[0]
+            ),
+            false
+        ));
+    }
+
+    #[test]
+    fn gradle_fingerprint_exclusion_requires_typed_fact_and_preserves_arbitrary_configs() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let snapshot = tree.0.join("unusual/fingerprint.data");
+        let config = tree.0.join("custom/compiler-snapshot.bin");
+        request
+            .task
+            .declared_input_files
+            .extend([snapshot.clone(), config.clone()]);
+        let legacy = KotlinEnvironmentKey::new(&request).unwrap();
+        assert!(legacy.extra_inputs.contains(&snapshot));
+        assert!(legacy.extra_inputs.contains(&config));
+        snapshot_fact(&mut request, &[snapshot.clone()], &[]);
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        assert!(!key.extra_inputs.contains(&snapshot));
+        assert!(key.extra_inputs.contains(&config));
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.extra_inputs).unwrap();
+        assert!(plan.covers_read(&crate::paths::file_key(&config), false));
+    }
+
+    #[test]
+    fn gradle_fingerprint_registered_file_or_directory_read_remains_watched() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let snapshot = tree.0.join("cache/nested/artifact.bin");
+        request.task.declared_input_files.push(snapshot.clone());
+        for registered in [snapshot.clone(), snapshot.parent().unwrap().to_owned()] {
+            snapshot_fact(&mut request, &[snapshot.clone()], &[registered]);
+            let key = KotlinEnvironmentKey::new(&request).unwrap();
+            assert!(key.gradle_fingerprint_inputs.is_empty());
+            assert!(key.extra_inputs.contains(&snapshot));
+            let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.extra_inputs).unwrap();
+            assert!(plan.covers_read(&crate::paths::file_key(&snapshot), false));
+        }
+    }
+
+    #[test]
+    fn gradle_fingerprint_source_classpath_plugin_and_sdk_overlap_are_denied() {
+        let tree = TestDirectory::new();
+        let original = kotlin_test_request(&tree.0);
+        let paths = [
+            original.task.source_files[0].clone(),
+            original.task.classpath[0].clone(),
+            original
+                .task
+                .kotlin_compiler
+                .as_ref()
+                .unwrap()
+                .default_classpath[0]
+                .clone(),
+            tree.0.join("plugins/scripting.jar"),
+            tree.0.join("jdk/lib/modules"),
+        ];
+        for path in paths {
+            let mut request = kotlin_test_request(&tree.0);
+            request.task.declared_input_files.push(path.clone());
+            snapshot_fact(&mut request, &[path], &[]);
+            assert!(KotlinEnvironmentKey::new(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn gradle_fingerprint_source_or_sdk_ancestor_directory_is_denied() {
+        let tree = TestDirectory::new();
+        let original = kotlin_test_request(&tree.0);
+        for directory in [
+            original.task.source_files[0].parent().unwrap().to_owned(),
+            original
+                .task
+                .kotlin_compiler
+                .as_ref()
+                .unwrap()
+                .gradle_java_home
+                .parent()
+                .unwrap()
+                .to_owned(),
+        ] {
+            let mut request = kotlin_test_request(&tree.0);
+            request.task.declared_input_files.push(directory.clone());
+            snapshot_fact(&mut request, &[directory], &[]);
+            assert!(
+                KotlinEnvironmentKey::new(&request).is_err(),
+                "typed ancestor cannot erase source/SDK read coverage"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gradle_fingerprint_windows_sdk_case_alias_is_denied() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let sdk = &request
+            .task
+            .kotlin_compiler
+            .as_ref()
+            .unwrap()
+            .gradle_java_home;
+        let alias = PathBuf::from(crate::paths::file_key(&sdk.join("lib/modules")).to_uppercase());
+        assert_ne!(&alias, &sdk.join("lib/modules"));
+        request.task.declared_input_files.push(alias.clone());
+        snapshot_fact(&mut request, &[alias], &[]);
+        assert!(
+            KotlinEnvironmentKey::new(&request).is_err(),
+            "Windows case alias cannot erase SDK module read coverage"
+        );
+    }
+
+    #[test]
+    fn gradle_fingerprint_explicit_cli_and_plugin_argument_reads_remain_watched() {
+        let tree = TestDirectory::new();
+        let snapshot = tree.0.join("cache/metadata.bin");
+        let text = crate::paths::file_key(&snapshot);
+        for arguments in [
+            vec![text.clone()],
+            vec!["-P".into(), format!("plugin:fixture:metadata={text}")],
+        ] {
+            let mut request = kotlin_test_request(&tree.0);
+            request.task.declared_input_files.push(snapshot.clone());
+            request.task.arguments.extend(arguments);
+            snapshot_fact(&mut request, &[snapshot.clone()], &[]);
+            let key = KotlinEnvironmentKey::new(&request).unwrap();
+            assert!(key.gradle_fingerprint_inputs.is_empty());
+            assert!(key.extra_inputs.contains(&snapshot));
+            let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.extra_inputs).unwrap();
+            assert!(plan.covers_read(&text, false));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gradle_fingerprint_plugin_argument_windows_case_and_slash_alias_remains_watched() {
+        let tree = TestDirectory::new();
+        let snapshot = tree.0.join("cache/metadata.bin");
+        let alias = crate::paths::file_key(&snapshot)
+            .replace('/', "\\")
+            .to_uppercase();
+        let mut request = kotlin_test_request(&tree.0);
+        request.task.declared_input_files.push(snapshot.clone());
+        request
+            .task
+            .arguments
+            .extend(["-P".into(), format!("plugin:fixture:metadata={alias}")]);
+        snapshot_fact(&mut request, &[snapshot.clone()], &[]);
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        assert!(key.gradle_fingerprint_inputs.is_empty());
+        assert!(key.extra_inputs.contains(&snapshot));
+    }
+
+    #[test]
+    fn gradle_fingerprint_unknown_profile_shape_or_membership_cannot_drop_inputs() {
+        let tree = TestDirectory::new();
+        for case in [
+            "adapter",
+            "version",
+            "task",
+            "missing",
+            "relative",
+            "duplicate",
+            "unknown-field",
+        ] {
+            let mut request = kotlin_test_request(&tree.0);
+            let snapshot = tree.0.join("fingerprint");
+            request.task.declared_input_files.push(snapshot.clone());
+            snapshot_fact(&mut request, &[snapshot.clone()], &[]);
+            match case {
+                "adapter" => {
+                    request
+                        .task
+                        .options
+                        .get_mut("kotlinClasspathSnapshotInputs")
+                        .unwrap()["adapter"] = serde_json::json!("unknown")
+                }
+                "version" => {
+                    request
+                        .task
+                        .kotlin_compiler
+                        .as_mut()
+                        .unwrap()
+                        .gradle_plugin_version = "1.8.21".into()
+                }
+                "task" => request.task.task_type = "custom.KotlinCompile".into(),
+                "missing" => {
+                    request.task.declared_input_files.pop();
+                }
+                "relative" => {
+                    request
+                        .task
+                        .options
+                        .get_mut("kotlinClasspathSnapshotInputs")
+                        .unwrap()["files"] = serde_json::json!(["relative.bin"])
+                }
+                "duplicate" => snapshot_fact(&mut request, &[snapshot.clone(), snapshot], &[]),
+                "unknown-field" => {
+                    request
+                        .task
+                        .options
+                        .get_mut("kotlinClasspathSnapshotInputs")
+                        .unwrap()["ignoreAll"] = serde_json::json!(true)
+                }
+                _ => unreachable!(),
+            }
+            assert!(KotlinEnvironmentKey::new(&request).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn gradle_fingerprint_model_role_changes_invalidate_environment_key() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        let snapshot = tree.0.join("fingerprint");
+        request.task.declared_input_files.push(snapshot.clone());
+        snapshot_fact(&mut request, &[snapshot.clone()], &[]);
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        snapshot_fact(&mut request, &[snapshot.clone()], &[snapshot.clone()]);
+        assert!(KotlinEnvironmentKey::new(&request).unwrap() != key);
+        snapshot_fact(&mut request, &[snapshot], &[]);
+        request.overlays.push(KotlinSourceOverlay::new(
+            crate::paths::file_key(&request.task.source_files[0]),
+            "edited body".into(),
+            2,
+        ));
+        assert!(KotlinEnvironmentKey::new(&request).unwrap() == key);
+        request
+            .task
+            .classpath
+            .push(tree.0.join("new-dependency.jar"));
+        assert!(KotlinEnvironmentKey::new(&request).unwrap() != key);
     }
 
     #[test]

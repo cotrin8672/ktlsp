@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 13;
+const MODEL_VERSION: u32 = 14;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2689,6 +2689,13 @@ dependencies {
             serde_json::to_vec(&CacheEntry {
                 // MODEL12 cached the selected JDK21/explicit UTF-8 recipe as unsupported.
                 model_version: 12,
+                mtimes: model.mtimes.clone(),
+                modules: model.modules.clone(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&CacheEntry {
+                // MODEL13 has no typed KGP classpath-snapshot input role.
+                model_version: 13,
                 mtimes: model.mtimes.clone(),
                 modules: model.modules.clone(),
             })

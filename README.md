@@ -127,6 +127,8 @@ stored in the platform cache directory.
 Java source archives support strict UTF-8 and declared ISO-8859-1 through cached published POM
 metadata. Unsupported declarations and undecodable sources are reported as incomplete inputs.
 Kotlin and JDK source archives use strict UTF-8.
+If a selected module source archive cannot be parsed, verified members from its binary
+remain usable; the source indexing failure and incomplete coverage stay reported.
 
 Useful environment variables:
 
