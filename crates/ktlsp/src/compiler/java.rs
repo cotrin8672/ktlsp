@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const HEADER_SOURCE: &str = include_str!("ToolOwnedHeaders.kt");
 const DOMAIN_SOURCE: &str = include_str!("DomainProof.kt");
+const K2_HEADER_SOURCE: &str = include_str!("K2CompleteHeaders.kt");
 const JAVA_SOURCE: &str = include_str!("JavacDiagnostics.java");
 
 pub(super) fn assets_sha256() -> String {
     let mut hash = Sha256::new();
-    for source in [HEADER_SOURCE, DOMAIN_SOURCE, JAVA_SOURCE] {
+    for source in [HEADER_SOURCE, DOMAIN_SOURCE, K2_HEADER_SOURCE, JAVA_SOURCE] {
         hash.update((source.len() as u64).to_be_bytes());
         hash.update(source.as_bytes());
     }
@@ -91,17 +92,53 @@ fn joined_classpath(paths: &[PathBuf]) -> anyhow::Result<String> {
         .map_err(|_| anyhow::anyhow!("java-classpath-encoding"))
 }
 
+fn k2_normal(request: &KotlinDiagnosticRequest) -> bool {
+    request
+        .task
+        .kotlin_compiler
+        .as_ref()
+        .is_some_and(|runtime| {
+            runtime.compiler_version == "2.4.0" && runtime.gradle_plugin_version == "2.4.0"
+        })
+}
+
+fn header_assets(request: &KotlinDiagnosticRequest) -> Vec<(&'static str, &'static str)> {
+    if k2_normal(request) {
+        vec![
+            ("K2CompleteHeaders.kt", K2_HEADER_SOURCE),
+            ("JavacDiagnostics.java", JAVA_SOURCE),
+        ]
+    } else {
+        vec![
+            ("ToolOwnedHeaders.kt", HEADER_SOURCE),
+            ("DomainProof.kt", DOMAIN_SOURCE),
+            ("JavacDiagnostics.java", JAVA_SOURCE),
+        ]
+    }
+}
+
 fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &str) -> bool {
     let Some(fact) = task.options.get("taskActionInventory") else {
         return false;
     };
-    fact.get("adapter").and_then(Value::as_str) == Some("gradle-7.4.2-stock-actions-v1")
-        && fact.get("actions").and_then(Value::as_array).is_some_and(|actions| {
+    let action = match fact.get("adapter").and_then(Value::as_str) {
+        Some("gradle-7.4.2-stock-actions-v1") => {
+            "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
+        }
+        Some("gradle-9.6.1-stock-actions-v1") => {
+            "org.gradle.api.internal.project.taskfactory.IncrementalTaskAction"
+        }
+        _ => return false,
+    };
+    fact.get("actions")
+        .and_then(Value::as_array)
+        .is_some_and(|actions| {
             actions.len() == 1
-                && actions[0].get("class").and_then(Value::as_str) == Some("org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction")
+                && actions[0].get("class").and_then(Value::as_str) == Some(action)
                 && actions[0].get("declaringClass").and_then(Value::as_str) == Some(declaring_class)
                 && actions[0].get("method").and_then(Value::as_str) == Some(method_name)
-                && actions[0].get("parameterTypes") == Some(&serde_json::json!(["org.gradle.work.InputChanges"]))
+                && actions[0].get("parameterTypes")
+                    == Some(&serde_json::json!(["org.gradle.work.InputChanges"]))
         })
 }
 
@@ -109,8 +146,10 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
     let Some(fact) = task.options.get("taskOnlyIfInventory") else {
         return false;
     };
-    if fact.get("adapter").and_then(Value::as_str) != Some("gradle-7.4.2-stock-onlyif-v1") {
-        return false;
+    match fact.get("adapter").and_then(Value::as_str) {
+        Some("gradle-7.4.2-stock-onlyif-v1") => {}
+        Some("gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
+        _ => return false,
     }
     let Some(predicates) = fact.get("predicates").and_then(Value::as_array) else {
         return false;
@@ -215,6 +254,22 @@ pub(super) fn import_dependencies(
             || task.kotlin_compiler.is_some()
             || !stock_task_action(task, "org.gradle.api.tasks.compile.JavaCompile", "compile")
             || !stock_only_if(task, false)
+            || task
+                .options
+                .get("taskActionInventory")
+                .and_then(|fact| fact.get("adapter"))
+                != java
+                    .options
+                    .get("taskActionInventory")
+                    .and_then(|fact| fact.get("adapter"))
+            || task
+                .options
+                .get("taskOnlyIfInventory")
+                .and_then(|fact| fact.get("adapter"))
+                != java
+                    .options
+                    .get("taskOnlyIfInventory")
+                    .and_then(|fact| fact.get("adapter"))
             || task
                 .java_home
                 .as_ref()
@@ -530,8 +585,32 @@ pub(super) fn selected_tasks_supported(
     let Some(runtime) = primary.kotlin_compiler.as_ref() else {
         return false;
     };
-    if runtime.compiler_version != "1.8.21"
-        || runtime.gradle_plugin_version != "1.8.21"
+    let legacy = runtime.compiler_version == "1.8.21" && runtime.gradle_plugin_version == "1.8.21";
+    let complete_k2 =
+        runtime.compiler_version == "2.4.0" && runtime.gradle_plugin_version == "2.4.0";
+    let adapter = if legacy {
+        "gradle-7.4.2-stock-actions-v1"
+    } else {
+        "gradle-9.6.1-stock-actions-v1"
+    };
+    if (!legacy && !complete_k2)
+        || [primary, java].iter().any(|task| {
+            task.options
+                .get("taskActionInventory")
+                .and_then(|fact| fact.get("adapter"))
+                .and_then(Value::as_str)
+                != Some(adapter)
+                || task
+                    .options
+                    .get("taskOnlyIfInventory")
+                    .and_then(|fact| fact.get("adapter"))
+                    .and_then(Value::as_str)
+                    != Some(if legacy {
+                        "gradle-7.4.2-stock-onlyif-v1"
+                    } else {
+                        "gradle-9.6.1-stock-onlyif-v1"
+                    })
+        })
         || !matches!(
             primary.task_type.as_str(),
             "org.jetbrains.kotlin.gradle.tasks.KotlinCompile"
@@ -555,6 +634,9 @@ pub(super) fn selected_tasks_supported(
     if auxiliary.is_empty() {
         return true;
     }
+    if complete_k2 {
+        return false;
+    }
     // The only auxiliary path admitted here is KGP 1.8.21's inactive KAPT pair.
     // KaptWithoutKotlincTask.compile returns before submitWork when both fields are empty,
     // even if includeCompileClasspath=true. An empty AP path alone is insufficient.
@@ -562,6 +644,18 @@ pub(super) fn selected_tasks_supported(
         || auxiliary.iter().any(|task| {
             !task.complete
                 || task.problem.is_some()
+                || task
+                    .options
+                    .get("taskActionInventory")
+                    .and_then(|fact| fact.get("adapter"))
+                    .and_then(Value::as_str)
+                    != Some("gradle-7.4.2-stock-actions-v1")
+                || task
+                    .options
+                    .get("taskOnlyIfInventory")
+                    .and_then(|fact| fact.get("adapter"))
+                    .and_then(Value::as_str)
+                    != Some("gradle-7.4.2-stock-onlyif-v1")
                 || task.language != crate::classpath::CompilerLanguage::Kotlin
                 || !task.annotation_processor_path.is_empty()
         })
@@ -664,7 +758,11 @@ fn replay_options(
     private: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let options = &recipe.api_options;
-    anyhow::ensure!(options.len() == 18, "java-api-options-shape-unhandled");
+    let complete_k2 = recipe.adapter == "gradle-9.6.1-current-jdk17-javac-api-v1";
+    anyhow::ensure!(
+        options.len() == if complete_k2 { 17 } else { 18 },
+        "java-api-options-shape-unhandled"
+    );
     for (index, expected) in [
         (0, "-source"),
         (1, "17"),
@@ -679,13 +777,16 @@ fn replay_options(
         (12, "-s"),
         (14, "-XDuseUnsharedTable=true"),
         (15, "-classpath"),
-        (17, "-proc:none"),
     ] {
         anyhow::ensure!(
             options[index] == expected,
             "java-api-options-unhandled-at-{index}"
         );
     }
+    anyhow::ensure!(
+        complete_k2 || options[17] == "-proc:none",
+        "java-api-options-unhandled-at-17"
+    );
     anyhow::ensure!(
         task.output_roots.len() == 1 && same_path(Path::new(&options[5]), &task.output_roots[0]),
         "java-output-role-unknown"
@@ -756,9 +857,17 @@ pub(super) fn configured_recipe(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("kotlin-recipe-unavailable"))?;
     anyhow::ensure!(
-        kotlin.compiler_version == "1.8.21"
+        ((kotlin.compiler_version == "1.8.21"
             && kotlin.gradle_plugin_version == "1.8.21"
             && !kotlin.run_via_build_tools_api
+            && recipe.adapter == "gradle-7.4.2-current-jdk17-javac-api-v1")
+            || (k2_normal(request)
+                && kotlin.run_via_build_tools_api
+                && matches!(
+                    kotlin.execution_strategy,
+                    crate::classpath::KotlinCompilerExecutionStrategy::InProcess
+                )
+                && recipe.adapter == "gradle-9.6.1-current-jdk17-javac-api-v1"))
             && kotlin.normalized_daemon_jvm_arguments.is_empty(),
         "java-header-compiler-version-unhandled"
     );
@@ -782,7 +891,8 @@ pub(super) fn configured_recipe(
         "java-runtime-or-charset-unhandled"
     );
     anyhow::ensure!(
-        task.annotation_processing_disabled()
+        (task.annotation_processing_disabled()
+            || (k2_normal(request) && task.arguments.is_empty()))
             && task.annotation_processor_path.is_empty()
             && task.options.get("bootstrapClasspath") == Some(&Value::Null)
             && task.options.get("release") == Some(&Value::Null)
@@ -1019,11 +1129,7 @@ impl Tools {
         let source_root = owner.directory.join("assets");
         std::fs::create_dir(&source_root)?;
         let mut inputs = java_inputs(request)?;
-        for (name, text) in [
-            ("ToolOwnedHeaders.kt", HEADER_SOURCE),
-            ("DomainProof.kt", DOMAIN_SOURCE),
-            ("JavacDiagnostics.java", JAVA_SOURCE),
-        ] {
+        for (name, text) in header_assets(request) {
             let path = source_root.join(name);
             write_new(&path, text.as_bytes())?;
             inputs.push(path);
@@ -1076,11 +1182,7 @@ impl Tools {
             );
             stamps.push((input, before));
         }
-        for (name, text) in [
-            ("ToolOwnedHeaders.kt", HEADER_SOURCE),
-            ("DomainProof.kt", DOMAIN_SOURCE),
-            ("JavacDiagnostics.java", JAVA_SOURCE),
-        ] {
+        for (name, text) in header_assets(request) {
             anyhow::ensure!(
                 std::fs::read(source_root.join(name))? == text.as_bytes(),
                 "java-helper-asset-identity-differs"
@@ -1156,7 +1258,15 @@ impl Tools {
             path_text(&plugin_classes)?,
             "-version".into(),
         ];
-        for name in ["ToolOwnedHeaders.kt", "DomainProof.kt"] {
+        if k2_normal(request) {
+            arguments.push("-Xcontext-parameters".into());
+        }
+        let header_names: Vec<_> = header_assets(request)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.ends_with(".kt"))
+            .collect();
+        for name in &header_names {
             arguments.push(path_text(&source_root.join(name))?);
         }
         let (exit, text) = kotlin(
@@ -1166,7 +1276,7 @@ impl Tools {
             environment,
         )?;
         anyhow::ensure!(exit == 0, "java-header-tool-compilation-failed: {text}");
-        let tool_paths: BTreeMap<_, _> = ["ToolOwnedHeaders.kt", "DomainProof.kt"]
+        let tool_paths: BTreeMap<_, _> = header_names
             .into_iter()
             .map(|name| {
                 let path = source_root.join(name);
@@ -1178,7 +1288,14 @@ impl Tools {
             .collect();
         anyhow::ensure!(
             matches!(
-                selected_kotlin_output(&text, "1.8.21", Some(exit), false, true, &tool_paths),
+                selected_kotlin_output(
+                    &text,
+                    &recipe.compiler_version,
+                    Some(exit),
+                    false,
+                    true,
+                    &tool_paths
+                ),
                 KotlinDiagnosticOutcome::Verified { clean: true, .. }
             ),
             "java-header-tool-runtime-unverified"
@@ -1219,7 +1336,11 @@ impl Tools {
         );
         for (name, body) in [
             (
-                "META-INF/services/org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar",
+                if k2_normal(request) {
+                    "META-INF/services/org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar"
+                } else {
+                    "META-INF/services/org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar"
+                },
                 "ktlsp.headers.HeaderRegistrar\n",
             ),
             (
@@ -1409,46 +1530,175 @@ fn known_packages(
     Ok(packages)
 }
 
+// Only fresh owned compiler outputs enter this inventory, never arbitrary project/cache trees.
+fn complete_output_inventory(root: &Path) -> anyhow::Result<BTreeMap<String, (u64, String)>> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "java-k2-output-root-unverified"
+    );
+    let mut files = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        anyhow::ensure!(!entry.file_type().is_symlink(), "java-k2-output-symlink");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        anyhow::ensure!(
+            files.len() < MAX_RECEIPT_INVENTORY_ENTRIES,
+            "java-k2-output-inventory-too-large"
+        );
+        let relative = entry
+            .path()
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let body = std::fs::read(entry.path())?;
+        anyhow::ensure!(
+            files
+                .insert(relative, (body.len() as u64, sha(&body)))
+                .is_none(),
+            "java-k2-output-duplicate"
+        );
+    }
+    anyhow::ensure!(!files.is_empty(), "java-k2-canonical-output-empty");
+    Ok(files)
+}
+
+fn complete_outputs_match(
+    canonical: &Path,
+    observed: &Path,
+    before: &BTreeMap<String, (u64, String)>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        complete_output_inventory(canonical)? == *before,
+        "java-k2-canonical-output-changed"
+    );
+    anyhow::ensure!(
+        complete_output_inventory(observed)? == *before,
+        "java-k2-observer-output-differs"
+    );
+    for relative in before.keys() {
+        anyhow::ensure!(
+            std::fs::read(canonical.join(relative))? == std::fs::read(observed.join(relative))?,
+            "java-k2-observer-output-bytes-differ"
+        );
+    }
+    Ok(())
+}
+
+fn validate_header_stage(
+    request: &KotlinDiagnosticRequest,
+    receipt: &Value,
+    canonical: &[CompileDiagnostic],
+    complete_success: bool,
+) -> anyhow::Result<bool> {
+    let complete_k2 = k2_normal(request);
+    if complete_k2 {
+        anyhow::ensure!(
+            complete_success && canonical.iter().all(|d| d.severity != Severity::Error),
+            "java-k2-normal-compilation-required"
+        );
+        anyhow::ensure!(
+            receipt.get("failure").is_none()
+                && receipt.get("schema").and_then(Value::as_u64) == Some(2)
+                && value_string(receipt, "component")? == "k2-complete-output"
+                && value_string(receipt, "compilerVersion")? == "2.4.0"
+                && receipt.get("callbackCount").and_then(Value::as_u64) == Some(1),
+            "java-k2-complete-stage-unverified"
+        );
+        for name in [
+            "stageCompleted",
+            "factoryDone",
+            "allSelectedSourcesIncluded",
+        ] {
+            require_bool(receipt, name, true)?;
+        }
+        anyhow::ensure!(
+            receipt.get("bindingIdentityPreserved").is_none()
+                && receipt.get("bindingDiagnosticsPreserved").is_none(),
+            "java-k2-fabricated-k1-proof"
+        );
+        let proof = &receipt["packageDomainProof"];
+        anyhow::ensure!(
+            proof.get("schema").and_then(Value::as_u64) == Some(2)
+                && value_string(proof, "basis")? == "original-fir-complete-output",
+            "java-k2-domain-certificate-unavailable"
+        );
+    } else {
+        anyhow::ensure!(
+            receipt.get("failure").is_none()
+                && receipt.get("schema").and_then(Value::as_u64) == Some(1)
+                && value_string(receipt, "compilerVersion")? == "1.8.21"
+                && receipt.get("callbackCount").and_then(Value::as_u64) == Some(1),
+            "java-header-stage-unverified"
+        );
+        for name in [
+            "stageCompleted",
+            "factoryDone",
+            "bindingIdentityPreserved",
+            "bindingDiagnosticsPreserved",
+            "allSelectedSourcesIncluded",
+        ] {
+            require_bool(receipt, name, true)?;
+        }
+        require_bool(receipt, "irDiagnosticErrors", false)?;
+        anyhow::ensure!(
+            receipt
+                .get("incompleteHierarchyCount")
+                .and_then(Value::as_u64)
+                == Some(0)
+                && receipt.get("badJavaSignatureCount").and_then(Value::as_u64) == Some(0)
+                && array(receipt, "extraJvmDiagnostics")?
+                    .iter()
+                    .all(|d| d.as_str().is_some_and(|d| !d.ends_with(":ERROR")))
+                && array(receipt, "irExtensions")?.is_empty()
+                && array(receipt, "classBuilderInterceptors")?.is_empty()
+                && array(receipt, "classFileFinalizers")?.is_empty()
+                && array(receipt, "analysisHandlers")?
+                    == &vec![Value::String("ktlsp.headers.HeaderExtension".into())],
+            "java-header-plugin-or-backend-unverified"
+        );
+    }
+    Ok(complete_k2)
+}
+
+fn k2_empty_sources(
+    receipt: &Value,
+    sources: &BTreeMap<String, String>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut empty = BTreeSet::new();
+    for source in array(&receipt["packageDomainProof"], "sourceDomains")? {
+        require_bool(source, "originalFir", true)?;
+        let path = value_string(source, "source")?;
+        anyhow::ensure!(
+            sources
+                .get(path)
+                .is_some_and(
+                    |digest| source.get("sourceSha256").and_then(Value::as_str) == Some(digest)
+                ),
+            "java-k2-original-fir-source-identity-differs"
+        );
+        let declarations = source
+            .get("declarationCount")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("java-k2-original-fir-declaration-count-unavailable"))?;
+        if declarations == 0 {
+            empty.insert(path.to_owned());
+        }
+    }
+    Ok(empty)
+}
+
 fn validated_lease(
     request: &KotlinDiagnosticRequest,
     overlay: &KotlinEditorOverlay,
     receipt: &Value,
     expected: &BTreeMap<String, String>,
     canonical: &[CompileDiagnostic],
+    complete_success: bool,
 ) -> anyhow::Result<BTreeSet<String>> {
-    anyhow::ensure!(
-        receipt.get("failure").is_none()
-            && receipt.get("schema").and_then(Value::as_u64) == Some(1)
-            && value_string(receipt, "compilerVersion")? == "1.8.21"
-            && receipt.get("callbackCount").and_then(Value::as_u64) == Some(1),
-        "java-header-stage-unverified"
-    );
-    for name in [
-        "stageCompleted",
-        "factoryDone",
-        "bindingIdentityPreserved",
-        "bindingDiagnosticsPreserved",
-        "allSelectedSourcesIncluded",
-    ] {
-        require_bool(receipt, name, true)?;
-    }
-    require_bool(receipt, "irDiagnosticErrors", false)?;
-    anyhow::ensure!(
-        receipt
-            .get("incompleteHierarchyCount")
-            .and_then(Value::as_u64)
-            == Some(0)
-            && receipt.get("badJavaSignatureCount").and_then(Value::as_u64) == Some(0)
-            && array(receipt, "extraJvmDiagnostics")?
-                .iter()
-                .all(|d| d.as_str().is_some_and(|d| !d.ends_with(":ERROR")))
-            && array(receipt, "irExtensions")?.is_empty()
-            && array(receipt, "classBuilderInterceptors")?.is_empty()
-            && array(receipt, "classFileFinalizers")?.is_empty()
-            && array(receipt, "analysisHandlers")?
-                == &vec![Value::String("ktlsp.headers.HeaderExtension".into())],
-        "java-header-plugin-or-backend-unverified"
-    );
+    let complete_k2 = validate_header_stage(request, receipt, canonical, complete_success)?;
     let mut sources = BTreeMap::new();
     let mut expected_kotlin = BTreeSet::new();
     for row in array(receipt, "sourceInventory")? {
@@ -1472,17 +1722,29 @@ fn validated_lease(
     }
     anyhow::ensure!(&sources == expected, "java-header-source-inventory-differs");
     let packages = known_packages(receipt, &expected_kotlin)?;
-    let unknown = receipt
-        .get("unknownSources")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("java-api-unknown-source-inventory-absent"))?;
+    let empty_sources = if complete_k2 {
+        k2_empty_sources(receipt, &sources)?
+    } else {
+        BTreeSet::new()
+    };
+    let empty_unknown = serde_json::Map::new();
+    let unknown = if complete_k2 {
+        &empty_unknown
+    } else {
+        receipt
+            .get("unknownSources")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("java-api-unknown-source-inventory-absent"))?
+    };
     anyhow::ensure!(
         unknown
             .keys()
             .all(|source| expected_kotlin.contains(source)),
         "java-unaccounted-unknown-api"
     );
-    require_bool(receipt, "allApiTypesKnown", unknown.is_empty())?;
+    if !complete_k2 {
+        require_bool(receipt, "allApiTypesKnown", unknown.is_empty())?;
+    }
     let error_sources: BTreeSet<_> = canonical
         .iter()
         .filter(|d| d.severity == Severity::Error)
@@ -1494,6 +1756,7 @@ fn validated_lease(
     let mut recorded = BTreeSet::new();
     let mut class_records = BTreeMap::new();
     let mut represented = BTreeSet::new();
+    let mut metadata_count = 0;
     for output in array(receipt, "outputs")? {
         anyhow::ensure!(
             recorded.len() < MAX_RECEIPT_INVENTORY_ENTRIES,
@@ -1530,14 +1793,36 @@ fn validated_lease(
                     .ok_or_else(|| anyhow::anyhow!("java-header-output-source-invalid"))
             })
             .collect::<anyhow::Result<_>>()?;
+        let metadata_only = complete_k2 && !relative.ends_with(".class");
+        if metadata_only {
+            metadata_count += 1;
+            anyhow::ensure!(metadata_count == 1, "java-k2-metadata-inventory-unhandled");
+        }
         anyhow::ensure!(
-            !source_keys.is_empty()
-                && source_keys
-                    .iter()
-                    .all(|source| expected_kotlin.contains(source)),
+            if metadata_only {
+                value_string(output, "role")? == "k2-module-metadata"
+                    && source_keys.is_subset(&expected_kotlin)
+                    && relative
+                        .strip_prefix("META-INF/")
+                        .and_then(|name| name.strip_suffix(".kotlin_module"))
+                        .is_some_and(|name| {
+                            !name.is_empty()
+                                && name.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric()
+                                        || matches!(byte, b'.' | b'_' | b'-')
+                                })
+                        })
+            } else {
+                !source_keys.is_empty()
+                    && source_keys
+                        .iter()
+                        .all(|source| expected_kotlin.contains(source))
+            },
             "java-header-output-source-unaccounted"
         );
-        let status = if source_keys
+        let status = if complete_k2 {
+            "CompleteCompilation"
+        } else if source_keys
             .iter()
             .any(|source| unknown.contains_key(source))
         {
@@ -1557,7 +1842,7 @@ fn validated_lease(
             represented.extend(source_keys.iter().cloned());
             class_records.insert(relative.to_owned(), (sha(&body), source_keys.clone()));
             // API status and canonical body errors differ: neither can leak an uncertain class.
-            let eligible = status == "SignatureChecked"
+            let eligible = (status == "SignatureChecked" || complete_k2)
                 && source_keys.iter().all(|source| {
                     overlay
                         .paths
@@ -1578,7 +1863,10 @@ fn validated_lease(
         }
     }
     anyhow::ensure!(
-        represented == expected_kotlin,
+        represented.is_subset(&expected_kotlin)
+            && expected_kotlin
+                .difference(&represented)
+                .all(|source| empty_sources.contains(source)),
         "java-raw-header-source-coverage-differs"
     );
     let mut actual = BTreeSet::new();
@@ -1831,6 +2119,17 @@ pub(super) fn run(
 ) -> anyhow::Result<Vec<CompileDiagnostic>> {
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
+    let complete_k2 = k2_normal(request);
+    anyhow::ensure!(!complete_k2 || clean, "java-k2-normal-compilation-required");
+    // run_kotlin_editor_compile creates this fresh output and calls us only after owned/EOF
+    // selected_kotlin_output; clean=true means exit0 with no reported canonical errors.
+    let canonical_outputs = if complete_k2 {
+        Some(complete_output_inventory(
+            &overlay.directory.join("classes"),
+        )?)
+    } else {
+        None
+    };
     let mut cached = environment
         .java_tools
         .lock()
@@ -1877,7 +2176,11 @@ pub(super) fn run(
     let header_receipt = overlay.directory.join("headers.json");
     let mut arguments = kotlin_editor_arguments(
         request,
-        &overlay.directory.join("unused-header-output"),
+        &overlay.directory.join(if complete_k2 {
+            "raw-headers"
+        } else {
+            "unused-header-output"
+        }),
         &[],
     )?;
     let cp_position = arguments
@@ -1928,7 +2231,14 @@ pub(super) fn run(
     let KotlinDiagnosticOutcome::Verified {
         diagnostics,
         clean: header_clean,
-    } = selected_kotlin_output(&text, "1.8.21", Some(exit), false, true, &overlay.paths)
+    } = selected_kotlin_output(
+        &text,
+        &environment.key.recipe.compiler_version,
+        Some(exit),
+        false,
+        true,
+        &overlay.paths,
+    )
     else {
         anyhow::bail!("java-header-canonical-diagnostics-unverified");
     };
@@ -1936,8 +2246,22 @@ pub(super) fn run(
         diagnostics.as_slice() == canonical && header_clean == clean,
         "java-header-changed-canonical-diagnostics"
     );
+    if let Some(before) = &canonical_outputs {
+        complete_outputs_match(
+            &overlay.directory.join("classes"),
+            &overlay.directory.join("raw-headers"),
+            before,
+        )?;
+    }
     let receipt = read_json(&header_receipt)?;
-    let mut packages = validated_lease(request, overlay, &receipt, &expected, canonical)?;
+    let mut packages = validated_lease(
+        request,
+        overlay,
+        &receipt,
+        &expected,
+        canonical,
+        clean && header_clean && exit == 0,
+    )?;
     packages.extend(tools.dependency_packages.iter().cloned());
     tools.check_live()?;
     let task = request.java_task.as_ref().unwrap();
@@ -2027,6 +2351,7 @@ pub(super) fn run(
                 "helper_input_sha256": tools.input_sha256, "header_receipt": receipt, "java_receipt": value,
                 "dependent_source_domains": tools.dependency_domains,
                 "producer_closure": false, "whole_api_authority": false,
+                "k2_normal_output_matches_canonical": complete_k2.then_some(true),
             }),
         );
     }

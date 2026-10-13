@@ -250,11 +250,11 @@ fn incomplete_or_backend_error_headers_cannot_publish_a_lease() {
         "irDiagnosticErrors": false, "incompleteHierarchyCount": 0, "badJavaSignatureCount": 0,
         "extraJvmDiagnostics": ["CONFLICTING_JVM_DECLARATIONS:ERROR"], "irExtensions": [],
         "classBuilderInterceptors": [], "classFileFinalizers": [], "analysisHandlers": ["ktlsp.headers.HeaderExtension"]});
-    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[]).is_err());
+    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[], false).is_err());
     assert!(!overlay.directory.join("lease").exists());
     receipt["extraJvmDiagnostics"] = json!([]);
     receipt["stageCompleted"] = json!(false);
-    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[]).is_err());
+    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[], false).is_err());
     assert!(!overlay.directory.join("lease").exists());
 }
 
@@ -1417,5 +1417,309 @@ fn closed_source_edits_before_owner_watch_cannot_authorize_import_absence_but_wi
             check_closed_sources(&request, &overlay, &expected).is_err(),
             "unreadable closed input is unavailable"
         );
+    }
+}
+
+fn selected_k2(request: &mut KotlinDiagnosticRequest) {
+    let runtime = request.task.kotlin_compiler.as_mut().unwrap();
+    runtime.compiler_version = "2.4.0".into();
+    runtime.gradle_plugin_version = "2.4.0".into();
+    runtime.run_via_build_tools_api = true;
+    runtime.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::InProcess;
+    for task in [&mut request.task, request.java_task.as_mut().unwrap()] {
+        task.options.get_mut("taskActionInventory").unwrap()["adapter"] =
+            json!("gradle-9.6.1-stock-actions-v1");
+        task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] =
+            json!("org.gradle.api.internal.project.taskfactory.IncrementalTaskAction");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] =
+            json!("gradle-9.6.1-stock-onlyif-v1");
+    }
+    let mut recipe = request
+        .java_task
+        .as_ref()
+        .unwrap()
+        .java_compiler_recipe()
+        .unwrap();
+    recipe.adapter = "gradle-9.6.1-current-jdk17-javac-api-v1".into();
+    recipe.api_options.pop();
+    set_recipe(request, recipe);
+    request.java_task.as_mut().unwrap().arguments.clear();
+}
+
+#[test]
+fn k2_normal_profile_reuses_exact_options_and_rejects_auxiliary_and_mixed_profiles() {
+    let (_owner, mut request) = fixture();
+    selected_k2(&mut request);
+    let java = request.java_task.as_ref().unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let private = request.project_dir.join("private");
+    let replayed = replay_options(java, &recipe, &request.task.output_roots[0], &private).unwrap();
+    assert_eq!(replayed.len(), 17);
+    for (position, original) in recipe.api_options.iter().enumerate() {
+        if ![5, 7, 13, 16].contains(&position) {
+            assert_eq!(&replayed[position], original);
+        }
+    }
+    let mut tasks = vec![request.task.clone(), java.clone()];
+    assert!(selected_tasks_supported(&request.task, java, &tasks));
+    tasks.push(java.clone());
+    tasks[2].task = ":unprovedProducer".into();
+    assert!(!selected_tasks_supported(&request.task, java, &tasks));
+    let mut mixed = java.clone();
+    mixed.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] =
+        json!("gradle-7.4.2-stock-onlyif-v1");
+    assert!(!selected_tasks_supported(
+        &request.task,
+        &mixed,
+        &[request.task.clone(), mixed.clone()]
+    ));
+    request
+        .task
+        .kotlin_compiler
+        .as_mut()
+        .unwrap()
+        .run_via_build_tools_api = false;
+    assert!(configured_recipe(&request).is_err());
+}
+
+#[test]
+fn k2_complete_receipt_cannot_borrow_k1_binding_or_error_header_authority() {
+    let (owner, mut request) = fixture();
+    selected_k2(&mut request);
+    let receipt = json!({"schema": 2, "component": "k2-complete-output", "compilerVersion": "2.4.0",
+        "callbackCount": 1, "stageCompleted": true, "factoryDone": true, "allSelectedSourcesIncluded": true,
+        "packageDomainProof": {"schema": 2, "basis": "original-fir-complete-output"}});
+    assert!(validate_header_stage(&request, &receipt, &[], true).unwrap());
+    assert!(validate_header_stage(&request, &receipt, &[], false).is_err());
+    let error = CompileDiagnostic {
+        path: "Use.kt".into(),
+        line: 1,
+        col: 1,
+        severity: Severity::Error,
+        message: "canonical body error".into(),
+    };
+    assert!(validate_header_stage(&request, &receipt, &[error], true).is_err());
+    for (field, value) in [
+        ("schema", json!(1)),
+        ("component", json!("tool-owned-compiler-core-header-probe")),
+        ("compilerVersion", json!("2.4.1")),
+        ("callbackCount", json!(2)),
+        ("bindingIdentityPreserved", json!(true)),
+        ("bindingDiagnosticsPreserved", json!(true)),
+        ("failure", json!("observer failed")),
+        ("stageCompleted", json!(false)),
+    ] {
+        let mut invalid = receipt.clone();
+        invalid[field] = value;
+        assert!(
+            validate_header_stage(&request, &invalid, &[], true).is_err(),
+            "{field}"
+        );
+    }
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let expected = current_sources(&overlay).unwrap();
+    // Stage completion without source/domain/output accounting never creates a lease.
+    assert!(validated_lease(&request, &overlay, &receipt, &expected, &[], true).is_err());
+    assert!(!overlay.directory.join("lease").exists());
+    let (_legacy_owner, legacy) = fixture();
+    assert!(validate_header_stage(&legacy, &receipt, &[], true).is_err());
+}
+
+#[test]
+fn k2_complete_outputs_require_all_canonical_bytes_and_stable_baseline() {
+    let (owner, _) = fixture();
+    let canonical = owner.directory.join("canonical");
+    let observed = owner.directory.join("observed");
+    for root in [&canonical, &observed] {
+        std::fs::create_dir_all(root.join("fixture")).unwrap();
+        std::fs::create_dir_all(root.join("META-INF")).unwrap();
+        std::fs::write(root.join("fixture/Helper.class"), b"synthetic class bytes").unwrap();
+        std::fs::write(
+            root.join("META-INF/main.kotlin_module"),
+            b"synthetic module bytes",
+        )
+        .unwrap();
+    }
+    let before = complete_output_inventory(&canonical).unwrap();
+    complete_outputs_match(&canonical, &observed, &before).unwrap();
+    std::fs::write(
+        observed.join("META-INF/main.kotlin_module"),
+        b"different module bytes",
+    )
+    .unwrap();
+    assert!(complete_outputs_match(&canonical, &observed, &before).is_err());
+    std::fs::write(
+        observed.join("META-INF/main.kotlin_module"),
+        b"synthetic module bytes",
+    )
+    .unwrap();
+    std::fs::write(observed.join("fixture/Extra.class"), b"extra output").unwrap();
+    assert!(complete_outputs_match(&canonical, &observed, &before).is_err());
+    std::fs::remove_file(observed.join("fixture/Extra.class")).unwrap();
+    std::fs::remove_file(observed.join("fixture/Helper.class")).unwrap();
+    assert!(complete_outputs_match(&canonical, &observed, &before).is_err());
+    std::fs::write(observed.join("fixture/Helper.class"), b"changed canonical").unwrap();
+    std::fs::write(canonical.join("fixture/Helper.class"), b"changed canonical").unwrap();
+    assert!(complete_outputs_match(&canonical, &observed, &before).is_err());
+}
+
+#[test]
+fn k2_original_fir_domains_require_current_source_hash_and_identity() {
+    let (owner, mut request) = fixture();
+    selected_k2(&mut request);
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let expected = current_sources(&overlay).unwrap();
+    let inventory: Vec<_> = overlay
+        .sources
+        .iter()
+        .map(|path| {
+            json!({
+                "kind": if path.extension().unwrap() == "kt" { "kotlin" } else { "java" },
+                "path": path, "sha256": expected[&header_key(path)]
+            })
+        })
+        .collect();
+    let source = overlay
+        .sources
+        .iter()
+        .find(|path| path.extension().unwrap() == "kt")
+        .unwrap();
+    let source = header_key(source);
+    let receipt = json!({"schema": 2, "component": "k2-complete-output", "compilerVersion": "2.4.0",
+        "callbackCount": 1, "stageCompleted": true, "factoryDone": true, "allSelectedSourcesIncluded": true,
+        "sourceInventory": inventory,
+        "packageDomainProof": {"schema": 2, "basis": "original-fir-complete-output", "stageCompleted": true,
+            "allPackageDomainsKnown": true, "nameDomainIsWholePackage": true, "globalIssues": [],
+            "sourceDomains": [{"source": source, "package": "fixture", "status": "KnownWholePackage",
+                "issues": [], "originalFir": true, "sourceSha256": expected[&source]}]}});
+    for (field, value, reason) in [
+        ("originalFir", json!(false), "java-receipt-flag-originalFir"),
+        (
+            "sourceSha256",
+            json!("stale-source"),
+            "java-k2-original-fir-source-identity-differs",
+        ),
+        (
+            "source",
+            json!("/unselected.kt"),
+            "java-domain-source-membership-differs",
+        ),
+    ] {
+        let mut invalid = receipt.clone();
+        invalid["packageDomainProof"]["sourceDomains"][0][field] = value;
+        let error =
+            validated_lease(&request, &overlay, &invalid, &expected, &[], true).unwrap_err();
+        assert!(error.to_string().contains(reason), "{field}: {error}");
+        assert!(!overlay.directory.join("lease").exists());
+    }
+}
+
+#[test]
+fn k2_metadata_and_empty_source_lease_enforce_origins_roles_and_current_fir() {
+    for case in [
+        "empty",
+        "kotlin-origin",
+        "named",
+        "changed-hash",
+        "unselected-origin",
+        "java-origin",
+        "unknown-path",
+        "unknown-name",
+        "extra-metadata",
+    ] {
+        let (owner, mut request) = fixture();
+        selected_k2(&mut request);
+        if case != "named" {
+            for source in &mut request.overlays {
+                if source.key.ends_with(".kt") {
+                    *source =
+                        KotlinSourceOverlay::new(source.key.clone(), "package fixture\n".into(), 1);
+                }
+            }
+        }
+        let overlay =
+            KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+        let expected = current_sources(&overlay).unwrap();
+        let inventory: Vec<_> = overlay
+            .sources
+            .iter()
+            .map(|path| {
+                json!({
+                    "kind": if path.extension().unwrap() == "kt" { "kotlin" } else { "java" },
+                    "path": path, "sha256": expected[&header_key(path)]
+                })
+            })
+            .collect();
+        let source = header_key(
+            overlay
+                .sources
+                .iter()
+                .find(|path| path.extension().unwrap() == "kt")
+                .unwrap(),
+        );
+        let raw = overlay.directory.join("raw-headers/META-INF");
+        std::fs::create_dir_all(&raw).unwrap();
+        let metadata = b"synthetic module metadata for lease validation";
+        std::fs::write(raw.join("main.kotlin_module"), metadata).unwrap();
+        let mut receipt = json!({"schema": 2, "component": "k2-complete-output", "compilerVersion": "2.4.0",
+            "callbackCount": 1, "stageCompleted": true, "factoryDone": true, "allSelectedSourcesIncluded": true,
+            "sourceInventory": inventory,
+            "outputs": [{"relativePath": "META-INF/main.kotlin_module", "bytes": metadata.len(), "sha256": sha(metadata),
+                "sources": [], "role": "k2-module-metadata", "apiStatus": "CompleteCompilation"}],
+            "packageDomainProof": {"schema": 2, "basis": "original-fir-complete-output", "stageCompleted": true,
+                "allPackageDomainsKnown": true, "nameDomainIsWholePackage": true, "globalIssues": [], "rawClasses": [],
+                "sourceDomains": [{"source": source, "package": "fixture", "status": "KnownWholePackage", "issues": [],
+                    "originalFir": true, "declarationCount": if case == "named" { 1 } else { 0 },
+                    "sourceSha256": if case == "changed-hash" { "stale".to_owned() } else { expected[&source].clone() }}]}});
+        match case {
+            "kotlin-origin" | "named" => receipt["outputs"][0]["sources"] = json!([source]),
+            "unselected-origin" => receipt["outputs"][0]["sources"] = json!(["/unselected.kt"]),
+            "java-origin" => {
+                let java = overlay
+                    .sources
+                    .iter()
+                    .find(|path| path.extension().unwrap() == "java")
+                    .unwrap();
+                receipt["outputs"][0]["sources"] = json!([header_key(java)]);
+            }
+            "unknown-path" | "unknown-name" => {
+                let relative = if case == "unknown-path" {
+                    "other/main.kotlin_module"
+                } else {
+                    "META-INF/unproved name.kotlin_module"
+                };
+                let path = overlay.directory.join("raw-headers").join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, metadata).unwrap();
+                receipt["outputs"][0]["relativePath"] = json!(relative);
+            }
+            "extra-metadata" => {
+                std::fs::write(raw.join("extra.kotlin_module"), metadata).unwrap();
+                let mut extra = receipt["outputs"][0].clone();
+                extra["relativePath"] = json!("META-INF/extra.kotlin_module");
+                receipt["outputs"].as_array_mut().unwrap().push(extra);
+            }
+            _ => {}
+        }
+        let result = validated_lease(&request, &overlay, &receipt, &expected, &[], true);
+        if matches!(case, "empty" | "kotlin-origin") {
+            assert_eq!(result.unwrap(), BTreeSet::from(["fixture".into()]));
+            assert_eq!(
+                std::fs::read_dir(overlay.directory.join("lease"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        } else {
+            let reason = match case {
+                "named" => "java-raw-header-source-coverage-differs",
+                "changed-hash" => "java-k2-original-fir-source-identity-differs",
+                "extra-metadata" => "java-k2-metadata-inventory-unhandled",
+                _ => "java-header-output-source-unaccounted",
+            };
+            assert!(result.unwrap_err().to_string().contains(reason), "{case}");
+        }
     }
 }

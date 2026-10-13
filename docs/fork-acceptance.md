@@ -5885,3 +5885,64 @@ or erroneous signatures, package/producer closure and bounded body-error headers
 remain open. No automatic rewrite, K1 bindingIdentity claim or general K2/plugin
 authority was added. Current-release six-project correctness/performance, latest
 live refresh and whole-project IDEA parity remain unverified.
+
+
+## 2026-10-14 checkpoint81: verified normal K2 Java bridge
+
+Normal Kotlin2.4.0/Gradle9.6.1/JDK17 now reuses the original clean compilation
+as an independent byte baseline. The K2 collector checks original FIR/source SHA,
+package domains, output roles/origins and every output byte before the existing
+explicit-import Javac selector runs. K1 behavior and the selector remain unchanged.
+File annotations are not blanket-rejected; a source without class output needs
+original-FIR declarationCount0 and its current SHA. Per-file callbacks hash only
+their current source; construction/finalization still check the full inventory.
+
+Actual seven-source and annotated/empty eight-source native cases exposed a real
+gap: .kotlin_module outputs carry selected Kotlin origins. The previous empty-origin
+restriction denied valid metadata (156 checks,152 pass,4 fail). The repair accepts
+selected Kotlin origins only for typed META-INF/*.kotlin_module metadata, keeps
+metadata out of class coverage and rejects Java/unselected origins, unknown names/
+paths and extra metadata. The nine-case lease regression fails before the repair
+with java-header-output-source-unaccounted, then passes. The original failure ledger
+is retained; two unchanged canonical baselines/eight files are reused. Only two
+corrected collectors rerun, with161 checks passing.
+
+Current immutable release passes fmt and cargo test --workspace (1,509 pass,
+0 fail,4 ignored), then release build. Real Neovim passes library41 and the original
+binary corpus12 first requests. The committed dev/nvim_k2_java.lua hook adds four
+checks through the existing corpus route: one unsaved unused missing-package import,
+one correlated diagnostic pull, exact ERROR selector range and full restoration.
+An independent18-check audit binds current source/wire SHA, version/resultId, the
+K2 complete-output receipt and actual com.sun.tools.javac.api.JavacTool raw
+compiler.err.doesnt.exist. Four Java source snapshots remain unchanged during Javac.
+This proves that backend ran; it does not establish general Java error/absence
+authority, arbitrary compiler plugins, body-error headers or IDEA parity.
+
+The copied editor controller's final assertion still expected one stage after two
+clean stages. Its native receipt records both successful, unforced, EOF-closed
+runs and stable guards. The separate audit requires exactly two and preserves the
+original controller/receipt; neither editor run was repeated for this bookkeeping
+error. All current release and editor stages exit naturally with no owned residual
+cleanup. These ownership checks are separate from semantic and speed results.
+
+Prototype evidence retained from checkpoint80: recursive FIR34 checks reject
+nested/signature/inferred errors while preserving original diagnostics/bytes;
+manual body-only control22 checks plus5 JVM API oracle self-checks distinguish
+valid and API-changing controls. Neither is a production source rewriter or
+partial-header implementation.
+
+Evidence under the existing Temp base:
+native-k2-java-red81-1; native-k2-asset-build81-1;
+native-k2-java-release81-1; native-k2-metadata81-1;
+k2-normal-audit80-3/audit.json (old FAIL);
+k2-metadata-recheck80-1/audit.json; root-k2-backend81-1/audit.json;
+native-k2-module-backend81-1; root-k2-recursive80-1.json;
+root-k2-private-body80-2.json. Launch state:current-slice81.json.
+Release receipt SHA25b23e3c11bae245032d32783130443c3d290de65db37072223f503c55c8f7a2;
+binary SHAaed5208d2b0059d08a094feac398d9efc8a8eee423596b94c46762608455d46e.
+Collector audit SHA52d0bf70bec8e4284d83e4ba60f0ba7bc366ad810b36737915b0acf4ec816fd0;
+backend audit SHA2563b2d333117382795554122f3a1684cd4b4f840fc3ac7d7b8a49bd85aed036.
+
+Six-real-project/performance evidence remains on release76. Current CEM compiler
+profile, newest live-refresh, broader compiler/plugin and inherited/generated Java
+coverage remain open. No latency/RSS or whole-project diagnostic claim is added.
