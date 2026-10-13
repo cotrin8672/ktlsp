@@ -16,10 +16,11 @@ Updated2026-10-14 (Asia/Tokyo), checkpoint83.
   match canonical bytes with current eight-source identities/package origins.
 - Current CEM: actual MODEL13, complete source/classpath/task capture, SDK21/
   explicitUTF8/DAEMON, Java19 API options. Original source118/91 nonMixin unchanged.
-  The new editor run preserves six original incomplete-code results but does not
+  The new editor run matches four original golden requests (two completions,
+  two definitions) but does not
   obtain current Java compiler diagnostics: native input watching hits its cap.
   Additional probe: two matched restoration/input assertions, two unmeasured,
-  zero manual pulls. Golden4 was not reached; original floor10/UI31 remain at82.
+  zero manual pulls. Incomplete6 was not reached; original floor10/UI31 remain at82.
   All25 Java sources are Mixin/Accessor files; the91 nonMixin sources are Kotlin.
   A Java unused-import probe there proves only ordinary import diagnostics,
   not Mixin semantics or nonMixin Java coverage.
@@ -58,6 +59,8 @@ Select primitive JSON fields before printing; check dict/list types before listi
 Never print progress arrays; inspect a closed receipt and aggregate its stages instead.
 Do not dump a plan to inspect its command.
 Aggregate test counts across suites and treat zero matching tests as unverified.
+Count original requests from expected_requests and request_outcomes, separately
+from combined matched totals that include auxiliary probe assertions.
 
 Run focused checks during iteration and broad checks after a settled semantic change.
 Reuse successful evidence until changed inputs or an unresolved concern justify a rerun.

@@ -6040,11 +6040,12 @@ All25 CEM Java files are Mixin/Accessor files;91 nonMixin sources are Kotlin.
 The EXTRA hook therefore labels its existing Java target a Mixin-file context
 and checks only an ordinary unused import, without claiming Mixin semantics.
 
-Real Neovim on the new release matched the original six incomplete-code requests,
+Real Neovim on the new release matched the original four golden requests
+(two useful completions/two exact definitions),
 but the extra current-Java acceptance/pull and ERROR assertions are unmeasured
 (zero manual pulls). Buffers/hooks restore and disk guards remain stable. Server
 stderr gives compiler-native-watch-cap before compiler acceptance; the second
-golden4 stage was not reached. Do not interpret the timeout/no diagnostic as a
+incomplete6 stage was not reached. Do not interpret the timeout/no diagnostic as a
 semantic pass. Next: efficient exact input-watch planning, then original10 plus
 the Java probe and SDK17 control. Five current models/live refresh/IDEA and the
 wider outstanding coverage remain open. Existing UI31 numbers are historical82.
