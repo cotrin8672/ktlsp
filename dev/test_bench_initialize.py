@@ -11,13 +11,17 @@ def peer_event(description):
 
 peer_event("Python entry")
 
+import ast
+import ctypes
+import inspect
 import io
 import json
 import queue
 import subprocess
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import bench_initialize as bench
 peer_event("imports ready")
@@ -147,17 +151,63 @@ class BenchmarkChecks(unittest.TestCase):
         self.assertTrue(result["readiness_complete"])
         self.assertEqual(result["time_origin"], "immediately before process spawn")
 
-    def test_memory_reports_native_values_or_explicit_unavailability(self):
-        memory = bench.sample_memory(os.getpid(), True, 0)
-        if os.name == "nt":
-            self.assertTrue(memory["available"], memory)
-            self.assertGreater(memory["steady_working_set_bytes"], 0)
-            self.assertGreaterEqual(memory["peak_working_set_bytes"], memory["steady_working_set_bytes"])
-            incomplete = bench.sample_memory(os.getpid(), False, 0)
-            self.assertIsNone(incomplete["steady_working_set_bytes"])
-        else:
-            self.assertFalse(memory["available"])
-            self.assertTrue(memory["reason"])
+    def test_memory_uses_borrowed_popen_handle_without_pid_apis(self):
+        attributes = {node.attr for node in ast.walk(ast.parse(inspect.getsource(bench.process_memory)))
+                      if isinstance(node, ast.Attribute)}
+        self.assertTrue(attributes.isdisjoint({"OpenProcess", "CloseHandle", "pid"}))
+        proc = SimpleNamespace(_handle=0x1234)
+        def measured(handle, counters, size):
+            self.assertEqual(handle, proc._handle)
+            counters._obj.WorkingSetSize = 4096
+            counters._obj.PeakWorkingSetSize = 8192
+            return True
+        query = Mock(side_effect=measured)
+        def load(name, **kwargs):
+            self.assertEqual(name, "psapi")
+            return SimpleNamespace(GetProcessMemoryInfo=query)
+        with patch.object(bench.os, "name", "nt"), patch.object(ctypes, "WinDLL", side_effect=load, create=True):
+            memory = bench.sample_memory(proc, True, 0)
+        self.assertTrue(memory["available"], memory)
+        self.assertEqual(memory["steady_working_set_bytes"], 4096)
+        self.assertEqual(memory["peak_working_set_bytes"], 8192)
+        self.assertEqual(proc._handle, 0x1234)
+        query.assert_called_once()
+
+    def test_memory_missing_or_closed_handle_is_unavailable_without_dll_calls(self):
+        handles = [SimpleNamespace(), SimpleNamespace(_handle=0), SimpleNamespace(_handle=-1),
+                   SimpleNamespace(_handle=SimpleNamespace(closed=True))]
+        with patch.object(bench.os, "name", "nt"), patch.object(ctypes, "WinDLL", create=True) as load:
+            for proc in handles:
+                with self.subTest(proc=proc):
+                    memory = bench.process_memory(proc)
+                    self.assertFalse(memory["available"])
+                    self.assertTrue(memory["reason"])
+            load.assert_not_called()
+
+    def test_memory_api_failure_and_unsupported_platform_are_unavailable(self):
+        proc = SimpleNamespace(_handle=0x1234)
+        query = Mock(return_value=False)
+        with patch.object(bench.os, "name", "nt"), \
+             patch.object(ctypes, "WinDLL", return_value=SimpleNamespace(GetProcessMemoryInfo=query), create=True), \
+             patch.object(ctypes, "get_last_error", return_value=5, create=True), \
+             patch.object(ctypes, "WinError", return_value=OSError("query denied"), create=True):
+            memory = bench.process_memory(proc)
+        self.assertFalse(memory["available"])
+        self.assertEqual(memory["reason"], "query denied")
+        with patch.object(bench.os, "name", "nt"), \
+             patch.object(ctypes, "WinDLL", return_value=SimpleNamespace(
+                 GetProcessMemoryInfo=Mock(side_effect=ctypes.ArgumentError("query call failed"))), create=True):
+            memory = bench.process_memory(proc)
+        self.assertEqual(memory, {"available": False, "reason": "query call failed"})
+        with patch.object(bench.os, "name", "nt"), \
+             patch.object(ctypes, "WinDLL", side_effect=OSError("API unavailable"), create=True):
+            memory = bench.process_memory(proc)
+        self.assertEqual(memory, {"available": False, "reason": "API unavailable"})
+        with patch.object(bench.os, "name", "posix"), patch.object(ctypes, "WinDLL", create=True) as load:
+            memory = bench.process_memory(proc)
+            load.assert_not_called()
+        self.assertFalse(memory["available"])
+        self.assertTrue(memory["reason"])
 
     def test_live_protocol_child_reports_ready_memory_and_clean_exit(self):
         popen = subprocess.Popen

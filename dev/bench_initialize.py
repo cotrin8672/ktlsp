@@ -108,43 +108,42 @@ def stop_process(proc, messages, stash, timeout_s: float = 15.0) -> Dict[str, An
     return status
 
 
-def process_memory(pid: int) -> Dict[str, Any]:
+def process_memory(proc: subprocess.Popen[bytes]) -> Dict[str, Any]:
     if os.name != "nt":
         return {"available": False, "reason": "working-set measurement is implemented for Windows only"}
-    import ctypes
-    from ctypes import wintypes
-
-    class Counters(ctypes.Structure):
-        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
-            (name, ctypes.c_size_t) for name in (
-                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
-                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
-                "PagefileUsage", "PeakPagefileUsage")]
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel.OpenProcess.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel.CloseHandle.restype = wintypes.BOOL
-    memory = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
-    memory.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
-    memory.restype = wintypes.BOOL
-    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return {"available": False, "reason": str(ctypes.WinError(ctypes.get_last_error()))}
     try:
+        # Borrow the freshly created Popen handle; Popen alone owns its lifetime.
+        handle = getattr(proc, "_handle", None)
+        if handle is None or getattr(handle, "closed", False):
+            return {"available": False, "reason": "fresh Popen process handle is unavailable"}
+        handle = int(handle)
+        if handle <= 0:
+            return {"available": False, "reason": "fresh Popen process handle is unavailable"}
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (name, ctypes.c_size_t) for name in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                    "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage")]
+
+        memory = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+        memory.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+        memory.restype = wintypes.BOOL
         counters = Counters()
         counters.cb = ctypes.sizeof(counters)
         if not memory(handle, ctypes.byref(counters), counters.cb):
             return {"available": False, "reason": str(ctypes.WinError(ctypes.get_last_error()))}
         return {"available": True, "working_set_bytes": counters.WorkingSetSize,
                 "peak_working_set_bytes": counters.PeakWorkingSetSize}
-    finally:
-        kernel.CloseHandle(handle)
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
 
 
-def sample_memory(pid: int, ready: bool, window_s: float) -> Dict[str, Any]:
-    sample = process_memory(pid)
+def sample_memory(proc: subprocess.Popen[bytes], ready: bool, window_s: float) -> Dict[str, Any]:
+    sample = process_memory(proc)
     if not sample["available"]:
         return sample
     start = time.monotonic()
@@ -153,7 +152,7 @@ def sample_memory(pid: int, ready: bool, window_s: float) -> Dict[str, Any]:
     deadline = start + (window_s if ready else 0)
     while time.monotonic() < deadline:
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-        sample = process_memory(pid)
+        sample = process_memory(proc)
         if not sample["available"]:
             break
         samples.append(sample["working_set_bytes"])
@@ -235,7 +234,7 @@ def benchmark(
         stash,
     )
     if init_msg is None or "error" in init_msg or not isinstance(init_msg.get("result"), dict):
-        memory = sample_memory(proc.pid, False, memory_window_s)
+        memory = sample_memory(proc, False, memory_window_s)
         shutdown = stop_process(proc, messages, stash)
         reader.join(timeout=1)
         stderr_thread.join(timeout=1)
@@ -386,7 +385,7 @@ def benchmark(
         if response is not None and "error" in response:
             response_errors[name] = response["error"]
     missing = [name for name, complete in readiness.items() if not complete]
-    memory = sample_memory(proc.pid, not missing, memory_window_s)
+    memory = sample_memory(proc, not missing, memory_window_s)
     shutdown = stop_process(proc, messages, stash)
     reader.join(timeout=1)
     stderr_thread.join(timeout=1)

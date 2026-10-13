@@ -172,7 +172,9 @@ semantic correctness and dependency coverage separately.
 On Windows, `memory` records resident working-set samples every 100 ms for one second after
 readiness (`--steady-memory-seconds`), their median as `steady_working_set_bytes`, and the OS
 `peak_working_set_bytes` through the final pre-shutdown sample. These are server-process values;
-the sampling window does not establish long-term stability. Incomplete readiness has no steady
+sampling borrows the newly spawned server's process handle, whose lifetime remains owned by
+`Popen`. Handle or sampling failures report measurement unavailability.
+The sampling window does not establish long-term stability. Incomplete readiness has no steady
 value, and other platforms report measurement unavailability. The distinction follows the
 [Windows process memory counters](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters).
 Run `python3 -B -W error::ResourceWarning dev/test_bench_initialize.py` for focused shutdown,

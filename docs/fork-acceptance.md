@@ -5946,3 +5946,69 @@ backend audit SHA2563b2d333117382795554122f3a1684cd4b4f840fc3ac7d7b8a49bd85aed03
 Six-real-project/performance evidence remains on release76. Current CEM compiler
 profile, newest live-refresh, broader compiler/plugin and inherited/generated Java
 coverage remain open. No latency/RSS or whole-project diagnostic claim is added.
+
+
+## 2026-10-14 checkpoint82: current CEM baseline and owned benchmark handles
+
+The startup benchmark now passes its freshly spawned Popen object to memory
+sampling and borrows that object's Windows handle. Popen retains handle ownership;
+unsupported/closed handles and sampling errors report unavailable. The PID lookup
+and sampler CloseHandle path are removed. Existing eleven tests pass in an owned
+Job, including the real protocol peer; the README ResourceWarning-error command
+also passes. No Rust behavior changed, so the unchanged1,509 Rust/release results
+remain checkpoint81 evidence rather than a claimed new run.
+
+A current read-only source audit matches all118 original CEM Java/Kotlin source
+files to the complete snapshot (25Java/93Kotlin;91nonMixin). The selected
+PressBehaviour case is nonMixin. Actual fresh MODEL12 capture on JDK21 completes
+with all source/inventory/build-stamp guards stable, no copied MODEL11 or model
+field rewriting. Firstfloor golden4 plus incomplete6 remain unchanged:7 useful
+completions,2 exact definitions,1 Unknown. Ancillary golden4 is separate. Three
+real Neovim stages and26 independent audit checks pass; every original request
+has one matched first response and all source/buffer/shutdown checks pass.
+
+The existing UI Lua runs in Nvim's input loop. One real CEM context produces31
+accepted expected texts, exactly one completion RPC per sample: first-after-ready1
+and warm repetitions30. First input-to-popupmenu_show handoff41.760ms/RPC8.032ms;
+warm handoff median42.531ms, nearest-rank p95=55.615ms/max60.043ms. Warm RPC median
+9.878ms/p95=21.797ms/max26.206ms. This is handoff timing, not physical-screen
+latency,31 unique editing cases or IDEA parity. accept_to_text_ms includes deferred
+text verification and is excluded from insertion-latency claims.
+
+One initial benchmark with an empty ktlsp cache and warm Gradle/dependency caches
+records initialize16ms/project indexing27.969s/library readiness43.532s. Trace
+attributes27.860s to Gradle model capture and15.565s to dependency indexing.
+One later process reuses the exact closed UI cache in place, records project93ms/
+library1500ms, one disk model-cache hit and zero Gradle dump events. Its only
+rebound guard is the private gradle.properties already reset and verified by the
+closed editor owner; it does not run Gradle. No source/model expectation is
+weakened and no benchmark cache is copied just to get this warm observation.
+These are one startup sample per condition, not percentile/acceptance results.
+
+Actual fresh-child-handle sampling reports server-only cold steady1849.4MiB/
+peak1854.6MiB and warm1373.7MiB/peak1373.7MiB over1s/11 samples each. Compiler,
+Gradle, Neovim, tree and host memory are outside this measurement. All native
+benchmark/editor roots close naturally with EOF, owned-live0 and no residual
+termination. The fixed decoder/report summaries keep arrays and raw logs on disk.
+
+Actual nested task facts expose the next CEM gap: Java25/CP102 is source/target/
+SDK21 with explicitUTF8, forkfalse, no fork executable/home/JVM args, release or
+bootstrap, compilerArgs/AP path0. Its recipe is null with the precise source/SDK/
+encoding-policy rejection. Kotlin118(93Kt+25Java)/CP101/runtimeCP14 is2.4.0,
+BTAtrue, DAEMON and daemon JVM args0, selected/host/toolchainSDK21. The current
+bridge is InProcess-only. Provider counts0 follow prior capture guards and are
+not independently exported task fields. A real old CEM compiler oracle reports
+success/155classfiles with source guards; this does not prove current unsaved
+Java diagnostics. The next scope is exact21/UTF8/DAEMON support, not broadening
+unknown fork/release/AP/provider or package/error authority.
+
+Evidence under the existing Temp base:
+native-bench-owned82-1 and82-2; six-selected-profile-audit81-1/scalars.json;
+native-cem-model12-startup82-1; cem-model12-startup82-2 (reviewed raw-ref decoder);
+native-cem-warm-floor-ui82-1; root-cem-acceptance82-1/audit.json;
+native-cem-warm-startup82-1; cem-sdk21-model-facts82-1/facts-summary.json.
+CEM model SHA76cd94345fdf79e243552ac9beeaede6352c4b5572a6d073c4bc2dd6ff532cf4.
+The source-only six successor plan is six-ui-performance-plan81-1; five fresh
+models/editor/performance arms are still unrun. Gradle-labelled8.14.3 actually
+uses wrapper8.14.2; preserve this distinction in the next capture. Last whole
+six-floor evidence remains release76. Goal stays active.
