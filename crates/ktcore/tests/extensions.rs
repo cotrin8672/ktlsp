@@ -1608,3 +1608,188 @@ fn compiled_host_unsupported_shape_is_unknown_and_does_not_certify_source_or_inv
         );
     }
 }
+
+#[test]
+fn selected_compiled_java_array_factories_keep_exact_descriptor_rank_origin_and_no_fake_source() {
+    use ktcore::classfile::decode;
+    use ktcore::infer::FileCtx;
+    use ktcore::jvm::{self, CallableCandidate};
+    use ktcore::types::Type;
+    use std::collections::BTreeMap;
+    const FILE: &str = "/compiled/array/Factory.java";
+    const ITEM_FILE: &str = "/compiled/array/Item.java";
+    const PROVIDER: &str = "compiled-array-contract";
+    const SOURCE: &str = include_str!("fixtures/classfile/sources/arrayfixture/Factory.java");
+    const ITEM_SOURCE: &str = include_str!("fixtures/classfile/sources/arrayfixture/Item.java");
+    // Root must first compile the paired ordinary Java source and preserve its actual class bytes.
+    const BYTES: &[u8] = include_bytes!("fixtures/classfile/arrayfixture/Factory.class");
+    let mut index = Index::new();
+    let scope = ProjectScope {
+        module: "array-owner".into(),
+        source_set: "main".into(),
+    };
+    for (file, text, name) in [(FILE, SOURCE, "Factory"), (ITEM_FILE, ITEM_SOURCE, "Item")] {
+        let start = text.find(name).unwrap();
+        // A class-only index isolates the real binary method surface. Coverage stays Unknown.
+        index.replace_file(
+            file,
+            vec![IndexedSymbol::new(
+                name,
+                SymbolKind::Class,
+                "arrayfixture",
+                None,
+                start,
+                start + name.len(),
+            )],
+            Tier::Volatile,
+        );
+        index.set_file_origin(
+            file,
+            FileOrigin {
+                origin_id: "array-owner".into(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(scope.clone()),
+            },
+        );
+    }
+    index.replace_scope_visibilities(vec![ScopeVisibility {
+        scope,
+        ordered_origins: vec!["array-owner".into()],
+    }]);
+    // A valid Kotlin class named int must not rebind the descriptor's primitive component.
+    const POISON: &str = "package consumer\nclass int\n";
+    let poison_at = POISON.find("int").unwrap();
+    index.replace_file(
+        "/compiled/array/Poison.kt",
+        vec![IndexedSymbol::new(
+            "int",
+            SymbolKind::Class,
+            "consumer",
+            None,
+            poison_at,
+            poison_at + 3,
+        )],
+        Tier::Volatile,
+    );
+    index.set_file_origin(
+        "/compiled/array/Poison.kt",
+        FileOrigin {
+            origin_id: "array-owner".into(),
+            representation: SourceRepresentation::Source,
+            project_scope: Some(ProjectScope {
+                module: "array-owner".into(),
+                source_set: "main".into(),
+            }),
+        },
+    );
+    let mut store = ExtensionStore::default();
+    store.configure_provider(PROVIDER, true, Arc::from("{}"));
+    store
+        .replace_source(
+            &index,
+            FILE,
+            Arc::from(SOURCE),
+            Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),
+            Vec::new(),
+        )
+        .unwrap();
+    let owner = {
+        let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
+        let Knowledge::Found(owner) = read.resolve_type("arrayfixture.Factory") else {
+            panic!("source owner")
+        };
+        owner
+    };
+    let class = Arc::new(decode("array-owner", BYTES).unwrap());
+    assert_eq!(class.identity.internal_name, "arrayfixture/Factory");
+    assert!(class.signature.is_none());
+    store
+        .replace_compiled_input(&index, &owner, Some(class.clone()))
+        .unwrap();
+    let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
+    let Knowledge::Found(handle) = read.compiled_class(&owner).unwrap() else {
+        panic!("exact compiled input")
+    };
+    let handles = read.compiled_methods(&handle).unwrap();
+    for (name, descriptor) in [
+        ("name", "()Ljava/lang/String;"),
+        ("rows", "()[[Larrayfixture/Item;"),
+        ("counts", "()[I"),
+    ] {
+        let position = class
+            .methods
+            .iter()
+            .position(|method| method.name.as_ref() == name)
+            .unwrap();
+        assert_eq!(class.methods[position].descriptor.as_ref(), descriptor);
+        assert!(
+            read.admit_java_method(&handles[position])
+                .unwrap()
+                .is_found(),
+            "{name}: {descriptor}"
+        );
+    }
+    for name in [
+        "generic",
+        "hidden",
+        "annotated",
+        "staticRows",
+        "withArgument",
+    ] {
+        let position = class
+            .methods
+            .iter()
+            .position(|method| method.name.as_ref() == name)
+            .unwrap();
+        assert!(matches!(
+            read.admit_java_method(&handles[position]).unwrap(),
+            Knowledge::Unknown(_)
+        ));
+    }
+    let pending = read.finish();
+    store.commit(pending).unwrap();
+    let mut sets = BTreeMap::new();
+    sets.insert(
+        FILE.into(),
+        vec![store.contributions(PROVIDER, FILE).unwrap().clone()],
+    );
+    index.replace_contributions(sets);
+    let scoped = index.scoped_for_file(FILE);
+    let receiver = Type::class("Factory", Some("arrayfixture".into()));
+    for (name, descriptor, rank, component, package) in [
+        (
+            "rows",
+            "()[[Larrayfixture/Item;",
+            2,
+            "Item",
+            Some("arrayfixture"),
+        ),
+        ("counts", "()[I", 1, "int", None),
+    ] {
+        let candidates = jvm::member_candidates(&scoped, &receiver, name);
+        let [candidate @ CallableCandidate::Jvm { .. }] = candidates.as_slice() else {
+            panic!("one exact compiled candidate")
+        };
+        assert!(
+            candidate.definition().is_none(),
+            "binary method has no authored Def"
+        );
+        let identity = candidate.identity(&scoped).unwrap();
+        assert_eq!(identity.class, class.identity);
+        assert_eq!(identity.descriptor, descriptor);
+        let mut result = jvm::projected_return_type_in_context(
+            &scoped,
+            *candidate,
+            &FileCtx::new("consumer".into(), Vec::new()),
+        )
+        .expect("positive array result");
+        for _ in 0..rank {
+            let Type::Array { component, .. } = result else {
+                panic!("lost array rank: {name}")
+            };
+            result = *component;
+        }
+        assert_eq!(result.name(), Some(component));
+        assert_eq!(result.package(), package);
+    }
+}

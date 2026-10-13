@@ -244,6 +244,24 @@ fn infer_depth_with<R: ChildInfer>(
             Some(ty) => resolve_narrowed_type(index, ty, src, ctx).unwrap_or(Type::Unknown),
             None => Type::Unknown,
         },
+        "index_expression" if !node.has_error() && node.named_child_count() == 2 => {
+            let receiver =
+                child_infer.infer_child(index, node.named_child(0).unwrap(), src, ctx, depth + 1);
+            let argument =
+                child_infer.infer_child(index, node.named_child(1).unwrap(), src, ctx, depth + 1);
+            members::kotlin_java_array_member_type(
+                &receiver,
+                "get",
+                &MemberUse::Call(CallArguments {
+                    count: Some(1),
+                    types: vec![argument],
+                    names: None,
+                    has_spread: false,
+                    trailing_lambda: false,
+                }),
+            )
+            .unwrap_or(Type::Unknown)
+        }
         "call_expression" => infer_call(index, node, src, ctx, depth, child_infer),
         "callable_reference" => infer_class_literal(index, node, src, ctx),
         "navigation_expression" if has_child_token(node, "::") => {
@@ -2504,6 +2522,16 @@ fn substitute_alias_type_ref(
     Some(resolved)
 }
 
+// Normalized [] facts describe Java arrays, whose unqualified primitive components are keywords.
+// Resolve only those components without nominal lookup; ordinary Kotlin classes named int still bind.
+fn java_primitive_array_component(component: &TypeRef) -> Option<Type> {
+    (component.qualification.is_none()
+        && component.args.is_empty()
+        && component.container_candidates.is_empty()
+        && primitive_type_name(&component.name) != component.name)
+        .then(|| Type::class(component.name.clone(), None))
+}
+
 /// Like `resolve_type_ref`, but a name in `tparams` resolves to its binding in `subst` (or `Unknown`
 /// when unbound — never a wrong guess) instead of being looked up as a concrete type.
 fn resolve_with_subst(
@@ -2539,7 +2567,9 @@ fn resolve_with_subst_unprojected(
             return Type::Unknown;
         };
         return Type::array(
-            resolve_with_subst(index, &component, ctx, tparams, subst, depth + 1),
+            java_primitive_array_component(&component).unwrap_or_else(|| {
+                resolve_with_subst(index, &component, ctx, tparams, subst, depth + 1)
+            }),
             tr.nullable,
         );
     }
@@ -2723,6 +2753,9 @@ fn member_type(
     } else {
         MemberUse::Value
     };
+    if let Some(result) = members::kotlin_java_array_member_type(recv_ty, name, &usage) {
+        return result;
+    }
     let group = candidates.select(index, recv_ty, &usage, ctx);
     selected_member_type(
         index,
@@ -3714,6 +3747,15 @@ pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
     if let Type::Parameter { upper_bounds, .. } = ty {
         return upper_bounds.clone();
     }
+    if ty.package().is_none()
+        && ty.container().is_none()
+        && ty
+            .name()
+            .is_some_and(|name| primitive_type_name(name) != name)
+    {
+        // A primitive has no nominal superclass, even when a Kotlin homonym is indexed.
+        return Vec::new();
+    }
     let Some(declaration) = type_declaration(index, ty) else {
         return vec![Type::Unknown];
     };
@@ -3904,6 +3946,228 @@ mod tests {
     use super::named_type_params;
     use crate::index::{Index, Tier};
     use crate::symbol::{IndexedSymbol, SymbolKind};
+
+    #[test]
+    fn java_primitive_arrays_never_bind_kotlin_keyword_homonyms_or_their_ancestors() {
+        use crate::types::{Type, TypeParameterBounds, TypeRef};
+        use std::collections::{HashMap, HashSet};
+        let mut index = Index::new();
+        let mut ancestor =
+            IndexedSymbol::new("Ancestor", SymbolKind::Class, "consumer", None, 0, 8);
+        ancestor.supertypes = Vec::new();
+        let member = IndexedSymbol::new(
+            "poisoned",
+            SymbolKind::Function,
+            "consumer",
+            Some("Ancestor".into()),
+            10,
+            18,
+        );
+        index.replace_file("Ancestor.kt", vec![ancestor, member], Tier::Volatile);
+        let ctx = super::FileCtx::new("consumer".into(), Vec::new()).with_file("Use.java");
+        for name in [
+            "boolean", "byte", "char", "short", "int", "long", "float", "double",
+        ] {
+            let mut head =
+                IndexedSymbol::new(name, SymbolKind::Class, "consumer", None, 0, name.len());
+            let mut parent = TypeRef::simple("Ancestor");
+            parent.qualification = Some("consumer".into());
+            head.supertype_refs = vec![parent];
+            index.replace_file(&format!("{name}.kt"), vec![head], Tier::Volatile);
+            let nominal = Type::class(name, Some("consumer".into()));
+            // Ordinary Kotlin int and an explicitly qualified object-array component stay nominal.
+            assert_eq!(
+                super::declared_type(&index, &TypeRef::simple(name), &ctx),
+                nominal
+            );
+            let mut qualified = TypeRef::simple(format!("{name}[]"));
+            qualified.qualification = Some("consumer".into());
+            assert_eq!(
+                super::declared_type(&index, &qualified, &ctx),
+                Type::array(nominal.clone(), false)
+            );
+            assert_eq!(
+                super::direct_supertypes(&index, &nominal),
+                vec![Type::class("Ancestor", Some("consumer".into()))]
+            );
+            assert!(!crate::jvm::member_candidates(&index, &nominal, "poisoned").is_empty());
+            let primitive = Type::class(name, None);
+            for rank in [1, 2] {
+                let reference = TypeRef::simple(format!("{name}{}", "[]".repeat(rank)));
+                let mut expected = primitive.clone();
+                for _ in 0..rank {
+                    expected = Type::array(expected, false);
+                }
+                assert_eq!(super::declared_type(&index, &reference, &ctx), expected);
+                assert_eq!(
+                    super::resolve_with_subst(
+                        &index,
+                        &reference,
+                        &ctx,
+                        &HashSet::new(),
+                        &HashMap::new(),
+                        0
+                    ),
+                    expected
+                );
+                let parameters = [TypeParameterBounds {
+                    name: "T".into(),
+                    start_byte: 0,
+                    end_byte: 1,
+                    scope_start: 0,
+                    scope_end: 100,
+                    upper_bounds: Vec::new(),
+                    complete: true,
+                }];
+                assert_eq!(
+                    super::declared_type_in_scope(&index, &reference, &ctx, &parameters),
+                    expected
+                );
+            }
+            // Peeling an array or iterating it must not restart lookup at the homonym's parent.
+            assert!(super::direct_supertypes(&index, &primitive).is_empty());
+            assert!(crate::jvm::member_candidates(&index, &primitive, "poisoned").is_empty());
+            assert_eq!(index.lookup_type(name).len(), 1);
+        }
+    }
+
+    #[test]
+    fn kotlin_java_array_read_inference_preserves_rank_nullable_and_primitive_identity() {
+        use crate::types::{Type, TypeRef};
+        let mut index = Index::new();
+        for (name, package) in [
+            ("Item", "library"),
+            ("Factory", "consumer"),
+            ("int", "consumer"),
+        ] {
+            index.replace_file(
+                &format!("{name}.kt"),
+                vec![IndexedSymbol::new(
+                    name,
+                    SymbolKind::Class,
+                    package,
+                    None,
+                    0,
+                    name.len(),
+                )],
+                Tier::Volatile,
+            );
+        }
+        // Normalized Java return facts are also exercised through real Java sources in interop.
+        let scalars = [
+            ("booleans", "boolean"),
+            ("bytes", "byte"),
+            ("chars", "char"),
+            ("shorts", "short"),
+            ("numbers", "int"),
+            ("longs", "long"),
+            ("floats", "float"),
+            ("doubles", "double"),
+        ];
+        let mut returns = Vec::new();
+        for (name, nullable) in [("matrix", false), ("nullable", true)] {
+            let mut reference = TypeRef::simple("Item[][]");
+            reference.qualification = Some("library".into());
+            reference.nullable = nullable;
+            returns.push((name, reference));
+        }
+        let mut nominal = TypeRef::simple("int[]");
+        nominal.qualification = Some("consumer".into());
+        returns.push(("nominal", nominal));
+        for (name, primitive) in scalars {
+            returns.push((name, TypeRef::simple(format!("{primitive}[]"))));
+        }
+        let methods = returns
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, reference))| {
+                let mut method = IndexedSymbol::new(
+                    name,
+                    SymbolKind::Function,
+                    "consumer",
+                    Some("Factory".into()),
+                    100 + i * 20,
+                    100 + i * 20 + name.len(),
+                );
+                method.return_type = Some(reference);
+                method.arity = Some(0);
+                method.min_arity = Some(0);
+                method
+            })
+            .collect();
+        index.replace_file("FactoryMethods.java", methods, Tier::Volatile);
+        let mut src = "package consumer\nfun read(factory: Factory) {\n factory.matrix().size\n factory.matrix()[0]\n factory.matrix().get(0)\n factory.matrix()[0][0]\n factory.matrix()[true]\n factory.nullable().size\n factory.nullable()?.size\n factory.nominal()[0]\n".to_string();
+        for (name, _) in scalars {
+            src.push_str(&format!(" factory.{name}()[0]\n"));
+        }
+        src.push_str(" factory.matrix().clone()\n factory.matrix().clone()[0][0]\n factory.matrix().clone(0)\n factory.matrix().clone { 0 }\n factory.nullable().clone()\n factory.nullable()?.clone()\n factory.nominal().clone()[0]\n");
+        for (name, _) in scalars {
+            src.push_str(&format!(" factory.{name}().clone()[0]\n"));
+        }
+        src.push_str("}\n");
+        let tree = crate::parser::KotlinParser::new().parse(&src);
+        let ctx = super::FileCtx::from_tree_in_file(&tree, &src, "Use.kt");
+        let inferred = |expr: &str| {
+            let start = src.find(expr).unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expr.len())
+                .unwrap();
+            assert_eq!(&src[node.byte_range()], expr);
+            super::infer(&index, node, &src, &ctx)
+        };
+        let item = Type::class("Item", Some("library".into()));
+        let int = Type::class("Int", Some("kotlin".into()));
+        assert_eq!(inferred("factory.matrix().size"), int);
+        assert_eq!(
+            inferred("factory.matrix()[0]"),
+            Type::array(item.clone(), false)
+        );
+        assert_eq!(
+            inferred("factory.matrix().get(0)"),
+            Type::array(item.clone(), false)
+        );
+        assert_eq!(inferred("factory.matrix()[0][0]"), item.clone());
+        assert_eq!(inferred("factory.matrix()[true]"), Type::Unknown);
+        assert_eq!(inferred("factory.nullable().size"), Type::Unknown);
+        assert_eq!(
+            inferred("factory.nullable()?.size"),
+            int.with_nullability(true)
+        );
+        assert_eq!(
+            inferred("factory.nominal()[0]"),
+            Type::class("int", Some("consumer".into()))
+        );
+        assert_eq!(
+            inferred("factory.matrix().clone()"),
+            Type::array(Type::array(item.clone(), false), false)
+        );
+        assert_eq!(inferred("factory.matrix().clone()[0][0]"), item);
+        assert_eq!(inferred("factory.matrix().clone(0)"), Type::Unknown);
+        assert_eq!(inferred("factory.matrix().clone { 0 }"), Type::Unknown);
+        assert_eq!(inferred("factory.nullable().clone()"), Type::Unknown);
+        assert_eq!(
+            inferred("factory.nullable()?.clone()"),
+            Type::array(
+                Type::array(Type::class("Item", Some("library".into())), false),
+                true
+            )
+        );
+        assert_eq!(
+            inferred("factory.nominal().clone()[0]"),
+            Type::class("int", Some("consumer".into()))
+        );
+        for (name, primitive) in scalars {
+            assert_eq!(
+                inferred(&format!("factory.{name}()[0]")),
+                Type::class(super::primitive_type_name(primitive), Some("kotlin".into()))
+            );
+            assert_eq!(
+                inferred(&format!("factory.{name}().clone()[0]")),
+                Type::class(super::primitive_type_name(primitive), Some("kotlin".into()))
+            );
+        }
+    }
 
     #[test]
     fn java_array_shapes_keep_components_and_only_prove_intrinsic_use_types() {
@@ -4462,7 +4726,8 @@ fn resolve_type_ref_unprojected(
             return Type::Unknown;
         };
         return Type::array(
-            resolve_type_ref(index, &component, ctx, depth + 1),
+            java_primitive_array_component(&component)
+                .unwrap_or_else(|| resolve_type_ref(index, &component, ctx, depth + 1)),
             tr.nullable,
         );
     }
@@ -4527,22 +4792,24 @@ pub fn declared_type_in_scope(
             return Type::Star;
         }
         if tr.name.ends_with("[]") {
-            let Some(component) = tr.array_component() else {
+            let Some(component) = tr.array_component().filter(|_| depth < MAX_DEPTH) else {
                 return Type::Unknown;
             };
             return Type::projected(
                 tr.projection,
                 Type::array(
-                    resolve(
-                        index,
-                        &component,
-                        ctx,
-                        parameters,
-                        path,
-                        depth + 1,
-                        position,
-                        remaining,
-                    ),
+                    java_primitive_array_component(&component).unwrap_or_else(|| {
+                        resolve(
+                            index,
+                            &component,
+                            ctx,
+                            parameters,
+                            path,
+                            depth + 1,
+                            position,
+                            remaining,
+                        )
+                    }),
                     tr.nullable,
                 ),
             );

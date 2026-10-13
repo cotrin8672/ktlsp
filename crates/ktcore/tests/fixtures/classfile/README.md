@@ -52,6 +52,30 @@ The decoder is a metadata reader, not a JVM verifier, compiler-producer closure 
 integration. SourceFile attributes are filename hints, never fabricated source ranges. Freshness,
 module visibility, language-specific callability, and source mappings require separate evidence.
 
+## Ordinary Java array methods
+
+`arrayfixture/{Factory,Item}.class` were emitted by Oracle JDK 17.0.7 javac, using
+the complete paired sources in `sources/arrayfixture/`. The root-owned compiler
+also accepted the complete Java binary-only consumer and rejected the three invalid
+Object/array member calls. These controls do not prove whole-library completeness.
+
+Regenerate into an empty directory outside the checkout:
+
+```sh
+mkdir -p /new/temp/empty /new/temp/array
+javac --release 17 -encoding UTF-8 -proc:none -sourcepath "" \
+  -classpath /new/temp/empty -d /new/temp/array \
+  sources/arrayfixture/Factory.java sources/arrayfixture/Item.java
+javap -p -s -v /new/temp/array/arrayfixture/Factory.class
+```
+
+`hashes.json` records the actual classfiles and both sources. The decoder tests
+separate array rank, primitive components, generic Signature and annotations.
+Shared compiled-method projection admits the verified public nongeneric zero-argument
+instance array returns; unsupported methods remain unknown. Binary-only library stubs
+supply positive method facts with Stub provenance, never original source locations
+or a proof that other members are absent.
+
 ## Requires-only module controls
 
 `module-only/` contains 19 small classfiles (3,431 bytes total). Five are exact

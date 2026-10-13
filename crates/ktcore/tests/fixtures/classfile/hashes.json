@@ -128,5 +128,25 @@
     "file": "module-only/zero-requires-version.class",
     "sha256": "4075b787804d271e30822842a35f302e849a2500435d6ab9333d3e2d8f4b191c",
     "bytes": 160
+  },
+  {
+    "file": "arrayfixture/Factory.class",
+    "sha256": "0ecc8fd8a650efa11dc165d5a942db31a62c7342f7a4fb047c24599b597ba30a",
+    "bytes": 917
+  },
+  {
+    "file": "arrayfixture/Item.class",
+    "sha256": "88c44026ae3a0cf304550c117a0ee5eb12ba85fafe0505c6b6b3b5a1763924fa",
+    "bytes": 243
+  },
+  {
+    "file": "sources/arrayfixture/Factory.java",
+    "sha256": "f115e52ad4959efdfea7b11bd211a46836f93ef9ea2fb746f7254290e0e8c7e5",
+    "bytes": 472
+  },
+  {
+    "file": "sources/arrayfixture/Item.java",
+    "sha256": "a067967101b13cba77e67cbbb965e4fdb4e87e9cb327e4d8c304fe2b70ffb8c4",
+    "bytes": 74
   }
 ]

@@ -962,36 +962,34 @@ pub fn coordinate_source(
     repos: &Repos,
     extract_root: &Path,
 ) -> Option<LibrarySource> {
-    if Coordinate::parse(&coord.label()).as_ref() != Some(coord) {
-        return None;
-    }
-    let dest = extract_root
-        .join(&coord.group)
-        .join(&coord.artifact)
-        .join(&coord.version);
+    coordinate_source_checked(coord, repos, extract_root).unwrap_or_else(|error| {
+        tracing::warn!("resolve {} failed: {error}", coord.label());
+        legacy_coordinate_source(coord, extract_root)
+    })
+}
 
-    let jar = match artifacts::selected_sources_jar(repos, coord) {
-        Ok(Some(selected)) => Some(selected),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!("resolve {} failed: {e}", coord.label());
-            None
+/// Preserve source lookup failure separately from absence before selecting a binary fallback.
+pub(crate) fn coordinate_source_checked(
+    coord: &Coordinate,
+    repos: &Repos,
+    extract_root: &Path,
+) -> anyhow::Result<Option<LibrarySource>> {
+    if Coordinate::parse(&coord.label()).as_ref() != Some(coord) {
+        return Ok(None);
+    }
+    let selected = match artifacts::selected_sources_jar(repos, coord) {
+        Ok(selected) => selected,
+        Err(error) => {
+            if let Some(source) = legacy_coordinate_source(coord, extract_root) {
+                tracing::warn!("resolve {} failed: {error}", coord.label());
+                return Ok(Some(source));
+            }
+            return Err(error);
         }
     };
-
-    let Some((selected, jar)) = jar else {
-        // A lazy directory may contain only a marker or a materialized subset, not the library.
-        return (dest.is_dir() && !dest.join(SOURCE_JAR_MARKER).exists()).then_some(
-            LibrarySource {
-                dest,
-                jar: None,
-                fingerprint: None,
-                origin_id: crate::classpath::maven_origin_id(coord),
-                policy: Ok(SourceTextPolicy::default()),
-            },
-        );
+    let Some((selected, jar)) = selected else {
+        return Ok(legacy_coordinate_source(coord, extract_root));
     };
-
     let fingerprint = jar_fingerprint(&jar);
     let policy = SourceTextPolicy::resolve(&selected, |c| artifacts::cached_pom_files(repos, c))
         .map_err(|error| {
@@ -1000,12 +998,30 @@ pub fn coordinate_source(
                 selected.label()
             )
         });
-    Some(LibrarySource {
-        dest,
+    Ok(Some(LibrarySource {
+        dest: extract_root
+            .join(&coord.group)
+            .join(&coord.artifact)
+            .join(&coord.version),
         jar: Some(jar),
         fingerprint,
         origin_id: crate::classpath::maven_origin_id(coord),
         policy,
+    }))
+}
+
+fn legacy_coordinate_source(coord: &Coordinate, extract_root: &Path) -> Option<LibrarySource> {
+    // A lazy directory may contain only a marker or a materialized subset, not the library.
+    let dest = extract_root
+        .join(&coord.group)
+        .join(&coord.artifact)
+        .join(&coord.version);
+    (dest.is_dir() && !dest.join(SOURCE_JAR_MARKER).exists()).then_some(LibrarySource {
+        dest,
+        jar: None,
+        fingerprint: None,
+        origin_id: crate::classpath::maven_origin_id(coord),
+        policy: Ok(SourceTextPolicy::default()),
     })
 }
 
@@ -1119,7 +1135,7 @@ pub fn resolve_coordinate(
 /// Resolve a local binary jar using adjacent sources, or shallow class stubs if absent.
 ///
 /// Local `files("libs/foo.jar")` dependencies have no Maven coordinate and often no source jar.
-/// Stubs let imports and type references resolve to a durable target instead of being invisible.
+/// Stubs let imports, type references and positive Java method facts resolve without sources.
 pub fn resolve_local_jar_stubs(
     jar_path: &Path,
     extract_root: &Path,
@@ -1150,7 +1166,8 @@ pub fn resolve_local_jar_stubs_for_origin(
     }
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|local-jar|");
+    // Old name-only binary stubs must miss; the serialized symbol format is unchanged.
+    hasher.update(b"|local-jar-java-methods-v1|");
     hasher.update(origin_id.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
@@ -1180,6 +1197,60 @@ pub fn resolve_local_jar_stubs_for_origin(
         );
     }
     tag_batches(&mut batches, origin_id, representation);
+    Ok(batches)
+}
+
+/// Positive method facts from one exact Gradle-selected module binary; this is not source closure.
+pub(crate) fn resolve_module_binary_stubs(
+    coord: &Coordinate,
+    selected_binaries: &[(PathBuf, String)],
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> anyhow::Result<Vec<FileSymbols>> {
+    if Coordinate::parse(&coord.label()).as_ref() != Some(coord) {
+        return Ok(Vec::new());
+    }
+    // The existing model supplies no variant precedence for multiple paths of one coordinate.
+    let [(jar_path, expected_origin)] = selected_binaries else {
+        return Ok(Vec::new());
+    };
+    if jar_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("jar")
+    {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        jar_path.is_file() && crate::classpath::file_origin_id(jar_path) == *expected_origin,
+        "selected module artifact changed since project discovery: {}",
+        jar_path.display()
+    );
+    let origin_id = crate::classpath::maven_origin_id(coord);
+    let mut hasher = Sha256::new();
+    hasher.update(SYMCACHE_VERSION);
+    hasher.update(b"|module-jar-java-methods-v1|");
+    hasher.update(origin_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(expected_origin.as_bytes());
+    let fingerprint = format!("{:x}", hasher.finalize());
+    let mut batches =
+        resolve_local_jar_stubs_unowned(jar_path, extract_root, &fingerprint, kotlin, java)?;
+    anyhow::ensure!(
+        crate::classpath::file_origin_id(jar_path) == *expected_origin,
+        "selected module artifact changed while indexing: {}",
+        jar_path.display()
+    );
+    // The old name-only fallback includes malformed/unsupported classes. New module publication
+    // admits only files with positively decoded methods and keeps missing-source status.
+    batches.retain(|batch| {
+        batch
+            .symbols
+            .iter()
+            .any(|symbol| symbol.kind == ktcore::symbol::SymbolKind::Function)
+    });
+    tag_batches(&mut batches, &origin_id, SourceRepresentation::Stub);
     Ok(batches)
 }
 
@@ -1311,6 +1382,7 @@ pub fn resolve_explicit_import_fqn_from_coordinates(
     import_fqn: &str,
     roots: Vec<Coordinate>,
     repos: &Repos,
+    model: Option<&crate::classpath::ProjectSnapshot>,
     extract_root: &Path,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
@@ -1330,7 +1402,21 @@ pub fn resolve_explicit_import_fqn_from_coordinates(
     candidates.dedup();
 
     for coord in candidates.into_iter().take(32) {
-        let matches = resolve_coordinate(&coord, repos, extract_root, kotlin, java)
+        let batches = match coordinate_source_checked(&coord, repos, extract_root) {
+            Ok(Some(source)) => resolve_library_source(&source, kotlin, java),
+            Ok(None) => {
+                let binaries = model
+                    .and_then(|model| model.coordinate_binaries(&coord))
+                    .unwrap_or_default();
+                resolve_module_binary_stubs(&coord, &binaries, extract_root, kotlin, java)
+            }
+            Err(error) => Err(error),
+        }
+        .unwrap_or_else(|error| {
+            tracing::warn!("index {} failed: {error:#}", coord.label());
+            Vec::new()
+        });
+        let matches = batches
             .into_iter()
             .filter(|batch| {
                 batch.symbols.iter().any(|sym| {
@@ -3316,6 +3402,106 @@ public class ParameterUse<Iterable> {
         assert!(repaired
             .iter()
             .all(|batch| Path::new(&batch.file).is_file()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_java_jar_members_reach_cold_and_warm_java_kotlin_completion() {
+        let factory =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class")
+                .as_slice();
+        let item = include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class")
+            .as_slice();
+        let person =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class")
+                .as_slice();
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_binary_member_completion_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let jar = root.join("api.jar");
+        {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            for (name, bytes) in [
+                ("arrayfixture/Factory.class", factory),
+                ("arrayfixture/Item.class", item),
+                ("pluginfixture/Person.class", person),
+            ] {
+                archive
+                    .start_file(name, SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        assert!(!root.join("api-sources.jar").exists());
+        let origin = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let mut previous = None;
+        for _ in 0..2 {
+            let batches = resolve_local_jar_stubs_for_origin(
+                &jar,
+                &origin,
+                &root.join("extract"),
+                &mut kotlin,
+                &mut java,
+            )
+            .unwrap();
+            assert_eq!(batches.len(), 3);
+            assert!(batches.iter().all(|batch| {
+                let owner = batch.origin.as_ref().unwrap();
+                owner.origin_id == origin && owner.representation == SourceRepresentation::Stub
+            }));
+            let encoded = bincode::serialize(&batches).unwrap();
+            if let Some(previous) = &previous {
+                assert_eq!(&encoded, previous);
+            }
+            previous = Some(encoded);
+            let mut workspace = crate::workspace::Workspace::new();
+            for batch in batches {
+                assert!(workspace.index_dependency_batch(batch));
+            }
+            workspace.bump_index_revision();
+            for (key, source, needle, expected, absent) in [
+                ("Use.java", "import pluginfixture.Person; class Use { void f(Person person) { person.ge; } }", "person.ge", "getName", "Person"),
+                ("Use.kt", "import pluginfixture.Person\nfun f(person: Person) { person.ge }\n", "person.ge", "getName", "Person"),
+                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.ro; } }", "factory.ro", "rows", "generic"),
+                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.ro }\n", "factory.ro", "rows", "generic"),
+                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.co; } }", "factory.co", "counts", "hidden"),
+                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.co }\n", "factory.co", "counts", "hidden"),
+                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.an; } }", "factory.an", "annotated", "generic"),
+                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.an }\n", "factory.an", "annotated", "generic"),
+                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.withArg; } }", "factory.withArg", "withArgument", "hidden"),
+                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.withArg }\n", "factory.withArg", "withArgument", "hidden"),
+                ("Use.java", "import arrayfixture.Factory; class Use { void f() { Factory.st; } }", "Factory.st", "staticRows", "Factory"),
+                ("Use.kt", "import arrayfixture.Factory\nfun f() { Factory.st }\n", "Factory.st", "staticRows", "Factory"),
+            ] {
+                workspace.open(key, source.to_string());
+                let offset = source.find(needle).unwrap() + needle.len();
+                let query = workspace.completion_query(key, offset).unwrap();
+                let names: Vec<_> = query.candidates.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&expected), "{key} {needle}: {} {:?} {names:?}", query.status_label(), query.reason_labels());
+                assert!(!names.contains(&absent), "{key} {needle}: {names:?}");
+                assert_eq!(workspace.doc_text(key).as_deref(), Some(source));
+            }
+        }
+        write_sources_jar(&jar, &[("api/Changed.class", "")]);
+        assert!(resolve_local_jar_stubs_for_origin(
+            &jar,
+            &origin,
+            &root.join("extract"),
+            &mut kotlin,
+            &mut java
+        )
+        .is_err());
+        let next =
+            resolve_local_jar_stubs(&jar, &root.join("extract"), &mut kotlin, &mut java).unwrap();
+        assert!(!next
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .any(|symbol| symbol.name == "rows"));
         fs::remove_dir_all(root).unwrap();
     }
 

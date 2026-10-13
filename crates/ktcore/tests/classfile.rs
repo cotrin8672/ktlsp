@@ -585,3 +585,44 @@ fn module_unused_pool_references_and_input_bounds_cannot_prove_emptiness() {
     let error = is_requires_only_module(&repeated).unwrap_err().to_string();
     assert!(error.contains("metadata text budget"), "{error}");
 }
+
+#[test]
+fn erased_method_descriptor_types_keep_java_array_rank_and_qualified_component_identity() {
+    use ktcore::classfile::method_types;
+    let (parameters, returns) =
+        method_types("(I[[Ljava/lang/String;)[[Larrayfixture/Item;").unwrap();
+    assert_eq!(parameters[0].name, "int");
+    assert_eq!(parameters[0].qualification, None);
+    assert_eq!(parameters[1].name, "String[][]");
+    assert_eq!(parameters[1].qualification.as_deref(), Some("java.lang"));
+    let returns = returns.unwrap();
+    assert_eq!(returns.name, "Item[][]");
+    assert_eq!(returns.qualification.as_deref(), Some("arrayfixture"));
+    assert!(returns.args.is_empty());
+    for (descriptor, name) in [
+        ("()[Z", "boolean[]"),
+        ("()[B", "byte[]"),
+        ("()[S", "short[]"),
+        ("()[I", "int[]"),
+        ("()[J", "long[]"),
+        ("()[F", "float[]"),
+        ("()[D", "double[]"),
+        ("()[C", "char[]"),
+    ] {
+        let result = method_types(descriptor).unwrap().1.unwrap();
+        assert_eq!(result.name, name);
+        assert_eq!(result.qualification, None);
+    }
+    let default_package = method_types("()[LItem;").unwrap().1.unwrap();
+    assert_eq!(default_package.qualification.as_deref(), Some(""));
+    assert_eq!(method_types("()V").unwrap(), (Vec::new(), None));
+    for unsupported in [
+        "()",
+        "()[V",
+        "()Igarbage",
+        "()[Lmissing//Item;",
+        "()[Lpkg/Outer$Inner;",
+    ] {
+        assert!(method_types(unsupported).is_none(), "{unsupported}");
+    }
+}

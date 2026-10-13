@@ -344,6 +344,45 @@ pub fn member_candidates<'a>(
     receiver: &Type,
     prefix: &str,
 ) -> Vec<CallableCandidate<'a>> {
+    if matches!(receiver, Type::Array { .. }) {
+        use crate::extensions::{Dispatch, Visibility};
+        let owners: Vec<_> = index
+            .lookup_type("Object")
+            .into_iter()
+            .filter(|entry| entry.sym.package == "java.lang" && entry.sym.container.is_none())
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return Vec::new();
+        };
+        if owner.sym.kind != SymbolKind::Class {
+            return Vec::new();
+        }
+        let object = Type::class("Object", Some("java.lang".into()));
+        // JLS 10.7 inherits only public Object methods; clone retains its array intrinsic.
+        return crate::members::matching_candidates(
+            index,
+            &object,
+            crate::members::MemberName::Prefix(prefix),
+            &FileCtx::new("java.lang".into(), Vec::new()),
+        )
+        .members
+        .into_iter()
+        .filter(|entry| {
+            entry.path == owner.path
+                && entry.sym.package == "java.lang"
+                && entry.sym.container.as_deref() == Some("Object")
+                && entry.sym.kind == SymbolKind::Function
+                && entry.sym.source_member.visibility() == Some(Visibility::Public)
+                && entry.sym.source_member.dispatch() == Some(Dispatch::Instance)
+                && entry.sym.source_member.implementation()
+                    != Some(crate::symbol::MemberImplementation::Constructor)
+                && !entry.sym.source_member.jvm_restricted()
+                && entry.sym.ext_receiver.is_none()
+                && entry.sym.extension_receiver.is_none()
+        })
+        .map(CallableCandidate::Authored)
+        .collect();
+    }
     let mut out: Vec<_> = crate::members::matching_candidates(
         index,
         receiver,
@@ -819,6 +858,19 @@ pub fn projected_return_type_in_context(
         facts,
     } = candidate
     {
+        let component = facts.return_type.name.trim_end_matches("[]");
+        if facts.return_type.qualification.is_none()
+            && component != facts.return_type.name
+            && infer::primitive_type_name(component) != component
+        {
+            // Exact Java primitive descriptors cannot bind a Kotlin class with the same spelling.
+            let rank = (facts.return_type.name.len() - component.len()) / 2;
+            let mut result = Type::class(component, None);
+            for _ in 0..rank {
+                result = Type::array(result, false);
+            }
+            return Some(result);
+        }
         let result = infer::declared_type(index, &facts.return_type, ctx);
         return (!matches!(result, Type::Unknown)).then_some(result);
     }

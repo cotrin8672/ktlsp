@@ -1083,12 +1083,32 @@ impl ReadSession<'_> {
             || method.access_flags & PUBLIC == 0
             || method.access_flags & UNSUPPORTED != 0
             || method.name.starts_with('<')
-            || method.descriptor.as_ref() != "()Ljava/lang/String;"
             || method.signature.is_some()
         {
             return Ok(unknown(IncompleteReason::UnsupportedSource));
         }
-        let signature = MemberSignature::method(&[], &JvmType::String)?;
+        let Some((parameters, Some(return_type))) =
+            crate::classfile::method_types(&method.descriptor)
+        else {
+            return Ok(unknown(IncompleteReason::UnsupportedSource));
+        };
+        let array = return_type.name.ends_with("[]");
+        if !parameters.is_empty()
+            || !array && method.descriptor.as_ref() != "()Ljava/lang/String;"
+            || array
+                && class
+                    .attribute_names
+                    .iter()
+                    .chain(&method.attribute_names)
+                    .any(|name| name.starts_with("Runtime") && name.ends_with("Annotations"))
+        {
+            return Ok(unknown(IncompleteReason::UnsupportedSource));
+        }
+        // The raw descriptor was validated above. Nominal array components do not become JvmType::String.
+        let signature = MemberSignature {
+            kind: MemberKind::Method,
+            descriptor: method.descriptor.to_string(),
+        };
         let (authored, _) = self.declared_members(&handle.class.owner)?;
         // A known same source declaration is already represented by the ordinary authored path.
         // Unknown homonyms remain in the shared candidate pool rather than being erased.
@@ -1113,11 +1133,7 @@ impl ReadSession<'_> {
             facts: crate::jvm::CallableFacts {
                 name: method.name.to_string(),
                 params: Vec::new(),
-                return_type: {
-                    let mut ty = crate::types::TypeRef::simple("String");
-                    ty.qualification = Some("java.lang".into());
-                    ty
-                },
+                return_type,
                 type_params: Vec::new(),
                 definition: None,
                 fixed_name: None,

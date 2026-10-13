@@ -5171,3 +5171,400 @@ fn java_array_structure_does_not_offer_java_length_to_kotlin_consumers() {
     );
     // Correct Kotlin Array<T>/size projection remains a useful-completion coverage gap.
 }
+
+const ARRAY_OBJECT_USE: &str = r#"package app;
+class ArrayObjectUse {
+    void run(Item[][] matrix, int[] numbers) {
+        String rowText = matrix[0].toString();
+        int rowTextLength = matrix[0].toString().length();
+        String arrayText = matrix.toString();
+        int arrayHash = matrix.hashCode();
+        int primitiveHash = numbers.hashCode();
+        Item[] rowCopy = matrix[0].clone();
+    }
+}
+"#;
+
+#[test]
+fn java_array_rows_keep_public_object_completion_navigation_and_string_results() {
+    // Minimal parsed JDK declarations isolate member routing. Native controls use the actual SDK.
+    const OBJECT: &str = "package java.lang; public class Object { public String toString() { return null; } public native int hashCode(); protected void finalize() {} }";
+    const STRING: &str =
+        "package java.lang; public final class String { public int length() { return 0; } }";
+    for (item_file, item_source) in [
+        (
+            "Item.java",
+            "package app; public final class Item { public void useful() {} }",
+        ),
+        ("Item.kt", ITEM),
+    ] {
+        let mut ws = workspace(&[
+            ("jdk/Object.java", OBJECT),
+            ("jdk/String.java", STRING),
+            (
+                "app/Object.java",
+                "package app; class Object { public void poisonedObject() {} }",
+            ),
+            (item_file, item_source),
+            ("ArrayObjectUse.java", ARRAY_OBJECT_USE),
+        ]);
+        let expected = ktlsp::symbol::Def {
+            file: "jdk/Object.java".into(),
+            start_byte: OBJECT.find("toString").unwrap(),
+            end_byte: OBJECT.find("toString").unwrap() + "toString".len(),
+        };
+        for prefix in ["matrix[0].", "matrix.", "numbers."] {
+            let got = labels(&mut ws, "ArrayObjectUse.java", prefix);
+            for name in ["length", "clone", "toString", "hashCode"] {
+                assert!(
+                    got.contains(name),
+                    "{item_file} {prefix}: missing {name}: {got:?}"
+                );
+            }
+            for name in ["useful", "poisonedObject", "finalize"] {
+                assert!(
+                    !got.contains(name),
+                    "{item_file} {prefix}: leaked {name}: {got:?}"
+                );
+            }
+        }
+        assert_member(
+            &mut ws,
+            "ArrayObjectUse.java",
+            "matrix[0].toString().",
+            "length",
+            "useful",
+        );
+        let use_at = ARRAY_OBJECT_USE.find("matrix[0].toString").unwrap() + "matrix[0].".len();
+        assert_eq!(
+            ws.goto_definition("ArrayObjectUse.java", use_at),
+            vec![expected]
+        );
+    }
+}
+
+#[test]
+fn java_array_object_members_require_the_selected_object_head_and_valid_call_shape() {
+    const OBJECT: &str = "package java.lang; public class Object { public String toString() { return null; } protected void finalize() {} }";
+    const STRING: &str =
+        "package java.lang; public final class String { public int length() { return 0; } }";
+    const USE: &str = "package app; class Use { void run(Item[][] matrix) { matrix[0].toString().length(); matrix[0].toString(1).length(); matrix[0].finalize(); } }";
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Use.java", USE),
+        ("jdk/String.java", STRING),
+    ]);
+    assert!(ws
+        .goto_definition("Use.java", USE.find("toString").unwrap())
+        .is_empty());
+    assert!(!labels(&mut ws, "Use.java", "matrix[0].toString(1).").contains("length"));
+    ws.open("jdk/Object.java", OBJECT.into());
+    let at = OBJECT.find("toString").unwrap();
+    assert_eq!(
+        ws.goto_definition("Use.java", USE.find("toString").unwrap()),
+        vec![ktlsp::symbol::Def {
+            file: "jdk/Object.java".into(),
+            start_byte: at,
+            end_byte: at + "toString".len(),
+        }]
+    );
+    assert!(labels(&mut ws, "Use.java", "matrix[0].toString().").contains("length"));
+    assert!(!labels(&mut ws, "Use.java", "matrix[0].toString(1).").contains("length"));
+    assert!(ws
+        .goto_definition("Use.java", USE.find("finalize").unwrap())
+        .is_empty());
+    ws.open("duplicate/Object.java", OBJECT.into());
+    assert!(ws
+        .goto_definition("Use.java", USE.find("toString").unwrap())
+        .is_empty());
+    assert!(!labels(&mut ws, "Use.java", "matrix[0].toString().").contains("length"));
+    for intrinsic in ["length", "clone"] {
+        assert!(labels(&mut ws, "Use.java", "matrix[0].").contains(intrinsic));
+    }
+}
+
+#[test]
+fn java_primitive_array_elements_do_not_inherit_kotlin_keyword_homonym_members() {
+    const POISON: &str = "package consumer\nopen class Ancestor { fun poisoned() {} }\nclass int : Ancestor() { val poisonedField: Int = 0 }\n";
+    const COUNTS: &str =
+        "package consumer; public class Counts { public int[] counts() { return new int[0]; } }";
+    const USE: &str = r#"package consumer;
+class Use<T> {
+ void run(int[] values, int[][] matrix, Counts counts) {
+  values[0].poisoned(); int direct = values[0].poisonedField;
+  for (var fromArray : values) { fromArray.poisoned(); int field = fromArray.poisonedField; }
+  counts.counts()[0].poisoned(); int count = counts.counts().length;
+  for (var fromMethod : counts.counts()) { fromMethod.poisoned(); int field = fromMethod.poisonedField; }
+  matrix[0].clone(); int width = matrix[0].length;
+ }
+}
+"#;
+    let mut ws = workspace(&[
+        ("Poison.kt", POISON),
+        ("Counts.java", COUNTS),
+        (
+            "Item.java",
+            "package consumer; public class Item { public void useful() {} }",
+        ),
+        ("Use.java", USE),
+        (
+            "Use.kt",
+            "package consumer\nfun use(value: int) { value.poisoned(); value.poisonedField }\n",
+        ),
+    ]);
+    for prefix in [
+        "values[0].",
+        "fromArray.",
+        "counts.counts()[0].",
+        "fromMethod.",
+    ] {
+        let found = labels(&mut ws, "Use.java", prefix);
+        assert!(
+            !found.contains("poisoned") && !found.contains("poisonedField"),
+            "{prefix}: {found:?}"
+        );
+        for name in ["poisoned", "poisonedField"] {
+            let expression = format!("{prefix}{name}");
+            if let Some(at) = USE.find(&expression) {
+                assert!(
+                    ws.goto_definition("Use.java", at + prefix.len()).is_empty(),
+                    "{expression}"
+                );
+            }
+        }
+    }
+    for prefix in ["matrix[0].", "counts.counts()."] {
+        let found = labels(&mut ws, "Use.java", prefix);
+        assert!(
+            found.contains("length") && found.contains("clone"),
+            "{prefix}: {found:?}"
+        );
+        assert!(!found.contains("poisoned"));
+    }
+    assert_member(&mut ws, "Use.kt", "value.", "poisoned", "useful");
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "value.poisoned()",
+        "Poison.kt",
+        "poisoned",
+    );
+    assert!(labels(&mut ws, "Use.kt", "value.").contains("poisonedField"));
+    let changed = COUNTS
+        .replace("int[]", "Item[]")
+        .replace("new int[0]", "new Item[0]");
+    ws.change("Counts.java", changed);
+    for prefix in ["counts.counts()[0].", "fromMethod."] {
+        assert_member(&mut ws, "Use.java", prefix, "useful", "poisoned");
+        assert!(!labels(&mut ws, "Use.java", prefix).contains("poisonedField"));
+    }
+    ws.change("Counts.java", COUNTS.into());
+    for prefix in ["counts.counts()[0].", "fromMethod."] {
+        let found = labels(&mut ws, "Use.java", prefix);
+        assert!(
+            !found.contains("useful")
+                && !found.contains("poisoned")
+                && !found.contains("poisonedField")
+        );
+    }
+}
+
+const KOTLIN_JAVA_ARRAY_READS: &str = r#"package app
+fun read(factory: Factory, index: Int) {
+    val size: Int = factory.matrix().size
+    val row = factory.matrix()[index]
+    val rowSize: Int = row.size
+    factory.matrix()[index][0].useful()
+    factory.matrix().get(index).get(0).useful()
+    val count: Int = factory.numbers()[0]
+    val booleanValue: Boolean = factory.booleans()[0]
+    val byteValue: Byte = factory.bytes()[0]
+    val charValue: Char = factory.chars()[0]
+    val shortValue: Short = factory.shorts()[0]
+    val longValue: Long = factory.longs()[0]
+    val floatValue: Float = factory.floats()[0]
+    val doubleValue: Double = factory.doubles()[0]
+    val copy = factory.matrix().clone()
+    val copySize: Int = copy.size
+    copy[index][0].useful()
+    factory.matrix().clone().get(index)[0].useful()
+    val booleansClone: Boolean = factory.booleans().clone()[0]
+    val bytesClone: Byte = factory.bytes().clone()[0]
+    val charsClone: Char = factory.chars().clone()[0]
+    val shortsClone: Short = factory.shorts().clone()[0]
+    val numbersClone: Int = factory.numbers().clone()[0]
+    val longsClone: Long = factory.longs().clone()[0]
+    val floatsClone: Float = factory.floats().clone()[0]
+    val doublesClone: Double = factory.doubles().clone()[0]
+}
+"#;
+
+const KOTLIN_ARRAY_FACTORY: &str = r#"package app;
+public class Factory {
+    public Item[][] matrix() { return null; }
+    public int[] numbers() { return null; }
+    public boolean[] booleans() { return null; }
+    public byte[] bytes() { return null; }
+    public char[] chars() { return null; }
+    public short[] shorts() { return null; }
+    public long[] longs() { return null; }
+    public float[] floats() { return null; }
+    public double[] doubles() { return null; }
+}
+"#;
+
+#[test]
+fn kotlin_reads_java_array_size_and_each_index_dimension_without_java_members() {
+    for (item_file, item_source) in [
+        (
+            "Item.java",
+            "package app; public class Item { public void useful() {} }",
+        ),
+        ("Item.kt", ITEM),
+    ] {
+        let mut ws = workspace(&[
+            (item_file, item_source),
+            ("Other.kt", OTHER),
+            ("Factory.java", KOTLIN_ARRAY_FACTORY),
+            ("Use.kt", KOTLIN_JAVA_ARRAY_READS),
+        ]);
+        for prefix in ["factory.matrix().", "row."] {
+            let found = labels(&mut ws, "Use.kt", prefix);
+            assert!(
+                found.contains("size") && found.contains("get") && found.contains("clone"),
+                "{prefix}: {found:?}"
+            );
+            for absent in ["length", "wait", "getClass", "useful", "usefulWrong"] {
+                assert!(
+                    !found.contains(absent),
+                    "{prefix} leaked {absent}: {found:?}"
+                );
+            }
+        }
+        for prefix in [
+            "factory.matrix()[index][0].",
+            "factory.matrix().get(index).get(0).",
+            "copy[index][0].",
+            "factory.matrix().clone().get(index)[0].",
+        ] {
+            assert_member(&mut ws, "Use.kt", prefix, "useful", "usefulWrong");
+            assert_exact_definition(
+                &mut ws,
+                "Use.kt",
+                &format!("{prefix}useful()"),
+                item_file,
+                "useful",
+            );
+        }
+        let item = Type::class("Item", Some("app".into()));
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", "factory.matrix()[index]"),
+            Type::array(item.clone(), false)
+        );
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", "factory.matrix().get(index)"),
+            Type::array(item, false)
+        );
+        for expr in [
+            "factory.matrix().size",
+            "row.size",
+            "factory.numbers()[0]",
+            "copy.size",
+            "factory.numbers().clone()[0]",
+        ] {
+            assert_eq!(
+                infer_expression(&ws, "Use.kt", expr),
+                Type::class("Int", Some("kotlin".into())),
+                "{expr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn kotlin_java_array_reads_follow_unsaved_component_and_rank_edits() {
+    let original = KOTLIN_JAVA_ARRAY_READS;
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Factory.java", KOTLIN_ARRAY_FACTORY),
+        ("Use.kt", original),
+    ]);
+    let prefix = "factory.matrix()[index][0].";
+    assert_member(&mut ws, "Use.kt", prefix, "useful", "usefulWrong");
+    ws.change(
+        "Factory.java",
+        KOTLIN_ARRAY_FACTORY.replace("Item[][]", "Other[][]"),
+    );
+    assert_member(&mut ws, "Use.kt", prefix, "usefulWrong", "useful");
+    ws.change("Use.kt", original.replace("useful()", "usefulWrong()"));
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        &format!("{prefix}usefulWrong()"),
+        "Other.kt",
+        "usefulWrong",
+    );
+    ws.change(
+        "Factory.java",
+        KOTLIN_ARRAY_FACTORY.replace("Item[][]", "Item[]"),
+    );
+    let found = labels(&mut ws, "Use.kt", prefix);
+    assert!(
+        !found.contains("useful") && !found.contains("usefulWrong") && !found.contains("size"),
+        "{found:?}"
+    );
+    ws.change("Factory.java", KOTLIN_ARRAY_FACTORY.into());
+    ws.change("Use.kt", original.into());
+    assert_member(&mut ws, "Use.kt", prefix, "useful", "usefulWrong");
+}
+
+#[test]
+fn kotlin_java_array_reads_preserve_unknown_indices_and_lexical_nominal_receivers() {
+    let src = r#"package app
+class Array { fun nominalOnly() {} }
+fun invalid(factory: Factory, unknown: Missing, nominal: Array, index: Other) {
+    factory.matrix()[true].missing()
+    factory.matrix()[0, 1].missing()
+    factory.matrix()[unknown].missing()
+    factory.matrix()[index].missing()
+    factory.matrix().get().missing()
+    factory.matrix().get("bad").missing()
+    factory.matrix().get(0, 1).missing()
+    factory.matrix().clone(0).missing()
+    factory.matrix().clone { 0 }.missing()
+    factory.matrix()[0][0][0].missing()
+    nominal.nominalOnly()
+}
+"#;
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Factory.java", KOTLIN_ARRAY_FACTORY),
+        ("Use.kt", src),
+    ]);
+    for prefix in [
+        "factory.matrix()[true].",
+        "factory.matrix()[0, 1].",
+        "factory.matrix()[unknown].",
+        "factory.matrix()[index].",
+        "factory.matrix().get().",
+        "factory.matrix().get(\"bad\").",
+        "factory.matrix().get(0, 1).",
+        "factory.matrix()[0][0][0].",
+        "factory.matrix().clone(0).",
+        "factory.matrix().clone { 0 }.",
+    ] {
+        let found = labels(&mut ws, "Use.kt", prefix);
+        assert!(
+            !found.contains("useful") && !found.contains("size") && !found.contains("get"),
+            "{prefix}: {found:?}"
+        );
+    }
+    let found = labels(&mut ws, "Use.kt", "nominal.");
+    assert!(found.contains("nominalOnly"), "{found:?}");
+    assert!(
+        !found.contains("size") && !found.contains("get"),
+        "{found:?}"
+    );
+}

@@ -1010,8 +1010,16 @@ fn member_candidates(
     kotlin_ctx: Option<(&infer::FileCtx, usize)>,
     max_candidates: usize,
 ) -> (Vec<ScopeCompletion>, bool) {
-    if language == SourceLanguage::Java && matches!(ty, Type::Array { .. }) {
-        let out = ktcore::members::JAVA_ARRAY_MEMBERS
+    if language == SourceLanguage::Kotlin
+        && matches!(
+            ty,
+            Type::Array {
+                nullable: false,
+                ..
+            }
+        )
+    {
+        let out = ktcore::members::KOTLIN_JAVA_ARRAY_MEMBERS
             .iter()
             .filter(|(name, _, _)| name.starts_with(prefix))
             .take(max_candidates)
@@ -1021,7 +1029,31 @@ fn member_candidates(
                 item
             })
             .collect();
-        // shortcut: inherited Object members and array subtyping remain unmodeled.
+        // shortcut: Kotlin array extensions, writes and general Array<T> projection need separate proof.
+        return (out, false);
+    }
+    if language == SourceLanguage::Java && matches!(ty, Type::Array { .. }) {
+        let mut out: Vec<_> = ktcore::members::JAVA_ARRAY_MEMBERS
+            .iter()
+            .filter(|(name, _, _)| name.starts_with(prefix))
+            .take(max_candidates)
+            .map(|(name, kind, arity)| {
+                let mut item = ScopeCompletion::new(*name, *kind);
+                item.arity = *arity;
+                item
+            })
+            .collect();
+        let mut seen = out
+            .iter()
+            .map(|item| (item.label.clone(), item.kind))
+            .collect();
+        for candidate in ktcore::jvm::member_candidates(index, ty, prefix) {
+            if let ktcore::jvm::CallableCandidate::Authored(entry) = candidate {
+                push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
+            }
+        }
+        out.truncate(max_candidates);
+        // shortcut: array subtyping and Kotlin array presentation remain unmodeled.
         return (out, false);
     }
     let mut out: Vec<ScopeCompletion> = Vec::new();

@@ -525,38 +525,66 @@ pub fn collect_sources(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Synthesize minimal Java source stubs for top-level `.class` entries in a binary jar.
+/// Materialize declaration stubs for top-level binary classes without a source artifact.
 ///
-/// This is intentionally shallow: it gives ktlsp parseable class declarations for goto/import
-/// targets when a local Gradle jar has no source artifact. Members are not decompiled.
+/// Ordinary Java methods are positive API facts only. Unsupported declarations keep the old
+/// name-only fallback; these stubs never certify a complete source/API surface.
 pub fn extract_class_stubs(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut archive = open_archive(jar)?;
+    anyhow::ensure!(
+        archive.len() <= MAX_SOURCE_FILES,
+        "too many binary jar entries"
+    );
+    let versioned: BTreeSet<_> = archive
+        .file_names()
+        .filter_map(|name| {
+            let normalized = name.replace('\\', "/");
+            let (version, owner) = normalized
+                .strip_prefix("META-INF/versions/")?
+                .split_once('/')?;
+            (!version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| owner.strip_suffix(".class").map(str::to_owned))
+                .flatten()
+        })
+        .collect();
+    let origin = crate::classpath::file_origin_id(jar);
     let mut classes = BTreeSet::new();
-
+    let mut declarations = std::collections::BTreeMap::new();
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
         let Some(rel) = entry.enclosed_name() else {
             continue;
         };
-        if rel.extension().and_then(|e| e.to_str()) != Some("class") {
+        if entry.is_dir() || rel.extension().and_then(|e| e.to_str()) != Some("class") {
             continue;
         }
         let normalized = rel.to_string_lossy().replace('\\', "/");
         let Some(class_path) = normalized.strip_suffix(".class") else {
             continue;
         };
-        if class_path == "module-info" || class_path.ends_with("/module-info") {
+        if class_path.starts_with("META-INF/") || !class_path.split('/').all(is_java_identifier) {
             continue;
         }
-        if class_path == "package-info" || class_path.ends_with("/package-info") {
+        let leaf = class_path.rsplit('/').next().unwrap_or(class_path);
+        let top_level = &class_path
+            [..class_path.len() - leaf.len() + leaf.split('$').next().unwrap_or(leaf).len()];
+        if !top_level.rsplit('/').next().is_some_and(is_java_identifier) {
             continue;
         }
-        let top_level = class_path.split('$').next().unwrap_or(class_path);
-        if top_level.rsplit('/').next().is_some_and(is_java_identifier) {
-            classes.insert(top_level.to_string());
+        classes.insert(top_level.to_string());
+        if class_path != top_level || versioned.contains(class_path) {
+            continue;
+        }
+        // Normalized duplicate base entries cannot select one member surface by archive order.
+        match declarations.entry(class_path.to_string()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(i));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
         }
     }
-
     fs::create_dir_all(out_dir)?;
     let mut out = Vec::new();
     for class_path in classes {
@@ -564,26 +592,257 @@ pub fn extract_class_stubs(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<Pat
         let name = parts.next().unwrap_or_default();
         let package_path = parts.next().unwrap_or_default();
         let package = package_path.replace('/', ".");
-        let rel_path = format!("{}.java", class_path);
-        let path = out_dir.join(rel_path);
+        let path = out_dir.join(format!("{class_path}.java"));
         if !path.starts_with(out_dir) {
             continue;
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let src = if package.is_empty() {
-            format!("public class {name} {{\n}}\n")
+        // Decode one bounded class at a time; a later error prevents the caller parsing/caching
+        // any partial extraction. Atomic stub files can be repaired by the existing cache miss.
+        let declaration = if let Some(index) = declarations.remove(&class_path).flatten() {
+            let mut entry = archive.by_index(index)?;
+            let limit = ktcore::classfile::MAX_CLASS_FILE_BYTES;
+            if entry.size() > limit as u64 {
+                None
+            } else {
+                let mut bytes = Vec::with_capacity(entry.size().min(8192) as usize);
+                entry
+                    .by_ref()
+                    .take(limit as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > limit || bytes.len() as u64 != entry.size() {
+                    None
+                } else {
+                    ktcore::classfile::decode(&origin, &bytes)
+                        .ok()
+                        .filter(|facts| facts.identity.internal_name == class_path)
+                        .and_then(|facts| java_class_stub(&facts))
+                }
+            }
         } else {
-            format!("package {package};\n\npublic class {name} {{\n}}\n")
+            None
         };
-        fs::write(&path, src)?;
+        let src = declaration.unwrap_or_else(|| {
+            if package.is_empty() {
+                format!("public class {name} {{\n}}\n")
+            } else {
+                format!("package {package};\n\npublic class {name} {{\n}}\n")
+            }
+        });
+        write_source_text(&path, &src)?;
         out.push(path);
     }
     Ok(out)
 }
 
+fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> {
+    const PUBLIC: u16 = 0x0001;
+    let (package, name) = class
+        .identity
+        .internal_name
+        .rsplit_once('/')
+        .unwrap_or(("", &class.identity.internal_name));
+    if class.access_flags & PUBLIC == 0
+        || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | 0x0400) != 0
+        || class.access_flags & 0x0410 == 0x0410
+        || class.signature.is_some()
+        || class.source_file.as_deref() != Some(format!("{name}.java").as_str())
+        || class.attribute_names.iter().any(|attribute| {
+            matches!(
+                attribute.as_ref(),
+                "RuntimeVisibleAnnotations"
+                    | "RuntimeInvisibleAnnotations"
+                    | "RuntimeVisibleTypeAnnotations"
+                    | "RuntimeInvisibleTypeAnnotations"
+                    | "Synthetic"
+                    | "Record"
+                    | "EnclosingMethod"
+            )
+        })
+    {
+        return None;
+    }
+    // Reject public return-only overloads before unsupported descriptors/signatures are filtered.
+    // A normal Java covariant bridge is not an additional source-callable overload.
+    let mut shapes = std::collections::BTreeMap::new();
+    for method in &class.methods {
+        if method.access_flags & PUBLIC != 0
+            && method.access_flags & (0x0040 | 0x1000) == 0
+            && !method
+                .attribute_names
+                .iter()
+                .any(|name| name.as_ref() == "Synthetic")
+        {
+            let key = (method.name.as_ref(), method.descriptor.split_once(')')?.0);
+            *shapes.entry(key).or_insert(0usize) += 1;
+        }
+    }
+    let mut methods = std::collections::BTreeMap::new();
+    for method in &class.methods {
+        if method.access_flags & PUBLIC == 0
+            || method.access_flags & !(PUBLIC | 0x0008 | 0x0010 | 0x0020 | 0x0800) != 0
+            || method.signature.is_some()
+            || !is_java_identifier(&method.name)
+            || method
+                .attribute_names
+                .iter()
+                .any(|name| name.as_ref() == "Synthetic")
+        {
+            continue;
+        }
+        let key = (method.name.as_ref(), method.descriptor.split_once(')')?.0);
+        if shapes.get(&key) != Some(&1) {
+            continue;
+        }
+        let Some((parameters, returns)) = ktcore::classfile::method_types(&method.descriptor)
+        else {
+            continue;
+        };
+        // A named Java package cannot spell an unnamed-package nominal type without rebinding it.
+        if !package.is_empty()
+            && parameters
+                .iter()
+                .chain(returns.iter())
+                .any(|ty| ty.qualification.as_deref() == Some(""))
+        {
+            continue;
+        }
+        let Some(parameters) = parameters
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| Some(format!("{} p{i}", java_descriptor_type(ty)?)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let returns = match returns {
+            Some(ty) => match java_descriptor_type(&ty) {
+                Some(ty) => ty,
+                None => continue,
+            },
+            None => "void".to_string(),
+        };
+        let static_ = if method.access_flags & 0x0008 != 0 {
+            "static "
+        } else {
+            ""
+        };
+        let final_ = if method.access_flags & 0x0010 != 0 {
+            "final "
+        } else {
+            ""
+        };
+        let declaration = format!(
+            "    public {static_}{final_}{returns} {}({}) {{ throw null; }}\n",
+            method.name,
+            parameters.join(", ")
+        );
+        methods.insert(key, declaration);
+    }
+    let mut source = "// Binary declaration stub; method bodies are placeholders.\n".to_string();
+    if !package.is_empty() {
+        source.push_str(&format!("package {};\n\n", package.replace('/', ".")));
+    }
+    let modifier = if class.access_flags & 0x0010 != 0 {
+        "final "
+    } else if class.access_flags & 0x0400 != 0 {
+        "abstract "
+    } else {
+        ""
+    };
+    source.push_str(&format!("public {modifier}class {name} {{\n"));
+    for method in methods.into_values() {
+        source.push_str(&method);
+    }
+    source.push_str("}\n");
+    Some(source)
+}
+
+fn java_descriptor_type(ty: &ktcore::types::TypeRef) -> Option<String> {
+    let base = ty.name.trim_end_matches("[]");
+    match ty.qualification.as_deref() {
+        None if matches!(
+            base,
+            "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+        ) =>
+        {
+            Some(ty.name.clone())
+        }
+        Some(package)
+            if is_java_identifier(base)
+                && (package.is_empty() || package.split('.').all(is_java_identifier)) =>
+        {
+            Some(if package.is_empty() {
+                ty.name.clone()
+            } else {
+                format!("{package}.{}", ty.name)
+            })
+        }
+        _ => None,
+    }
+}
+
 fn is_java_identifier(name: &str) -> bool {
+    if matches!(
+        name,
+        "_" | "abstract"
+            | "assert"
+            | "boolean"
+            | "break"
+            | "byte"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "extends"
+            | "false"
+            | "final"
+            | "finally"
+            | "float"
+            | "for"
+            | "goto"
+            | "if"
+            | "implements"
+            | "import"
+            | "instanceof"
+            | "int"
+            | "interface"
+            | "long"
+            | "native"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "short"
+            | "static"
+            | "strictfp"
+            | "super"
+            | "switch"
+            | "synchronized"
+            | "this"
+            | "throw"
+            | "throws"
+            | "transient"
+            | "true"
+            | "try"
+            | "void"
+            | "volatile"
+            | "while"
+    ) {
+        return false;
+    }
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -615,6 +874,278 @@ mod tests {
             zip.write_all(body).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn binary_java_stub_withholds_return_only_groups_before_unsupported_members_are_filtered() {
+        // Deliberately injected JVM metadata tests rendering, not a javac-produced source API.
+        let mut class = ktcore::classfile::decode(
+            "fixture",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class"),
+        )
+        .unwrap();
+        let prototype = class
+            .methods
+            .iter()
+            .find(|method| method.name.as_ref() == "getName")
+            .unwrap()
+            .clone();
+        for (name, descriptor, signature, flags, synthetic) in [
+            (
+                "nestedCollision",
+                "()Ljava/lang/String;",
+                None,
+                0x0001,
+                false,
+            ),
+            (
+                "nestedCollision",
+                "()Lpkg/Outer$Inner;",
+                None,
+                0x0001,
+                false,
+            ),
+            (
+                "genericCollision",
+                "()Ljava/lang/String;",
+                None,
+                0x0001,
+                false,
+            ),
+            (
+                "genericCollision",
+                "()Ljava/lang/Object;",
+                Some("<T:Ljava/lang/Object;>()TT;"),
+                0x0001,
+                false,
+            ),
+            ("bridgeSafe", "()Ljava/lang/String;", None, 0x0001, false),
+            ("bridgeSafe", "()Ljava/lang/Object;", None, 0x1041, false),
+            ("attributeSafe", "()Ljava/lang/String;", None, 0x0001, false),
+            ("attributeSafe", "()Ljava/lang/Object;", None, 0x0001, true),
+        ] {
+            let mut method = prototype.clone();
+            method.name = name.into();
+            method.descriptor = descriptor.into();
+            method.signature = signature.map(Into::into);
+            method.access_flags = flags;
+            if synthetic {
+                method.attribute_names.push("Synthetic".into());
+            }
+            class.methods.push(method);
+        }
+        let source = java_class_stub(&class).unwrap();
+        assert!(source.contains("java.lang.String getName("), "{source}");
+        assert!(
+            !source.contains("nestedCollision(") && !source.contains("genericCollision("),
+            "{source}"
+        );
+        assert_eq!(
+            source.matches("java.lang.String bridgeSafe(").count(),
+            1,
+            "{source}"
+        );
+        assert_eq!(
+            source.matches("java.lang.String attributeSafe(").count(),
+            1,
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn binary_java_stub_preserves_unnamed_nominal_identity_at_the_rendering_boundary() {
+        // Descriptor metadata is injected here to test spelling; this is not a javac-produced API.
+        let mut class = ktcore::classfile::decode(
+            "fixture",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class"),
+        )
+        .unwrap();
+        class.identity.internal_name = "named/Factory".into();
+        class.source_file = Some("Factory.java".into());
+        let prototype = class
+            .methods
+            .iter()
+            .find(|method| method.name.as_ref() == "getName")
+            .unwrap()
+            .clone();
+        for (name, descriptor) in [("take", "(LItem;)V"), ("give", "()[LItem;")] {
+            let mut method = prototype.clone();
+            method.name = name.into();
+            method.descriptor = descriptor.into();
+            class.methods.push(method);
+        }
+        let named = java_class_stub(&class).unwrap();
+        assert!(named.contains("java.lang.String getName("), "{named}");
+        assert!(
+            !named.contains("take(") && !named.contains("give("),
+            "{named}"
+        );
+        class.identity.internal_name = "Factory".into();
+        let unnamed = java_class_stub(&class).unwrap();
+        assert!(unnamed.contains("void take(Item p0)"), "{unnamed}");
+        assert!(unnamed.contains("Item[] give()"), "{unnamed}");
+    }
+
+    #[test]
+    fn binary_java_stubs_keep_public_method_types_without_lowered_kotlin_or_constructors() {
+        let factory =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class");
+        let item = include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class");
+        let person =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let model =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Model.class");
+        let noarg =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/noarg-on/NeedsLabel.class");
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_binary_method_stubs_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let jar = root.join("api.jar");
+        write_binary_jar(
+            &jar,
+            &[
+                ("arrayfixture/Factory.class", factory),
+                ("arrayfixture/Item.class", item),
+                ("pluginfixture/Person.class", person),
+                ("pluginfixture/Model.class", model),
+                ("noargfixture/NeedsLabel.class", noarg),
+                ("other/Factory.class", factory),
+                ("broken/Only.class", b"not a classfile"),
+                ("../Escaped.class", factory),
+                ("arrayfixture/Factory.java", b"public class Poison {}"),
+            ],
+        );
+        let output = root.join("stubs");
+        let files = extract_class_stubs(&jar, &output).unwrap();
+        assert!(!root.join("Escaped.java").exists());
+        let mut parser = crate::java::JavaParser::new();
+        for path in files {
+            let text = fs::read_to_string(&path).unwrap();
+            let tree = parser.parse(&text);
+            assert!(!tree.root_node().has_error(), "{}: {text}", path.display());
+            let symbols = crate::java::extract_symbols(&tree, &text);
+            let methods: Vec<_> = symbols
+                .iter()
+                .filter(|symbol| symbol.kind == ktcore::symbol::SymbolKind::Function)
+                .collect();
+            if path.ends_with("arrayfixture/Factory.java") {
+                let rows = methods.iter().find(|method| method.name == "rows").unwrap();
+                assert_eq!(rows.return_type.as_ref().unwrap().name, "Item[][]");
+                assert_eq!(
+                    rows.return_type.as_ref().unwrap().qualification.as_deref(),
+                    Some("arrayfixture")
+                );
+                let counts = methods
+                    .iter()
+                    .find(|method| method.name == "counts")
+                    .unwrap();
+                assert_eq!(counts.return_type.as_ref().unwrap().name, "int[]");
+                let annotated = methods
+                    .iter()
+                    .find(|method| method.name == "annotated")
+                    .unwrap();
+                assert_eq!(annotated.return_type.as_ref().unwrap().name, "Item[]");
+                let static_rows = methods
+                    .iter()
+                    .find(|method| method.name == "staticRows")
+                    .unwrap();
+                assert_eq!(
+                    static_rows.source_member.dispatch(),
+                    Some(ktcore::extensions::Dispatch::Static)
+                );
+                let with_argument = methods
+                    .iter()
+                    .find(|method| method.name == "withArgument")
+                    .unwrap();
+                assert_eq!(with_argument.params[0].name, "int");
+                assert_eq!(with_argument.min_arity, Some(1));
+                assert!(!methods.iter().any(|method| matches!(
+                    method.name.as_str(),
+                    "generic" | "hidden" | "Factory"
+                )));
+                assert!(!symbols.iter().any(|symbol| symbol.name == "Poison"));
+            } else if path.ends_with("pluginfixture/Person.java") {
+                assert_eq!(
+                    methods
+                        .iter()
+                        .map(|method| method.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["getName"]
+                );
+            } else if path.ends_with("arrayfixture/Item.java") {
+                assert_eq!(
+                    methods
+                        .iter()
+                        .map(|method| method.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["useful"]
+                );
+            } else {
+                assert!(methods.is_empty(), "{}: {text}", path.display());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_java_stubs_withhold_versioned_alias_and_corrupt_member_inputs() {
+        let factory =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class")
+                .as_slice();
+        let item = include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class")
+            .as_slice();
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_binary_stub_selection_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let jar = root.join("api.jar");
+        for (label, extra) in [
+            (
+                "versioned",
+                ("META-INF/versions/17/arrayfixture/Factory.class", factory),
+            ),
+            ("aliased", ("arrayfixture\\Factory.class", factory)),
+        ] {
+            write_binary_jar(
+                &jar,
+                &[
+                    ("arrayfixture/Factory.class", factory),
+                    ("arrayfixture/Item.class", item),
+                    extra,
+                ],
+            );
+            let output = root.join(label);
+            extract_class_stubs(&jar, &output).unwrap();
+            assert!(
+                !fs::read_to_string(output.join("arrayfixture/Factory.java"))
+                    .unwrap()
+                    .contains("rows(")
+            );
+            assert!(fs::read_to_string(output.join("arrayfixture/Item.java"))
+                .unwrap()
+                .contains("useful("));
+        }
+        write_binary_jar(
+            &jar,
+            &[
+                ("arrayfixture/Item.class", item),
+                ("arrayfixture/Factory.class", factory),
+            ],
+        );
+        let mut bytes = fs::read(&jar).unwrap();
+        let at = bytes
+            .windows(factory.len())
+            .position(|window| window == factory)
+            .unwrap();
+        bytes[at + factory.len() - 1] ^= 1;
+        fs::write(&jar, bytes).unwrap();
+        let output = root.join("corrupt");
+        assert!(
+            extract_class_stubs(&jar, &output).is_err(),
+            "CRC failure cannot publish member facts"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

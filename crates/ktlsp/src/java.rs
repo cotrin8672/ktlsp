@@ -1948,6 +1948,12 @@ pub(crate) fn referenced_java_lang_fqns(tree: &Tree, src: &str) -> Vec<String> {
     let mut names = HashSet::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "array_type" | "array_creation_expression" | "dimensions"
+        ) {
+            names.insert("java.lang.Object".to_string());
+        }
         if node.kind() == "type_identifier"
             && node.parent().is_some_and(|parent| {
                 !matches!(parent.kind(), "scoped_type_identifier" | "type_parameter")
@@ -3309,6 +3315,12 @@ fn java_member_entries(
     name: &str,
     expected_kind: SymbolKind,
 ) -> Vec<Entry> {
+    if recv.package().is_none()
+        && recv.container().is_none()
+        && recv.name().is_some_and(is_java_primitive_type)
+    {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let _ = infer::walk_supertypes(index, recv, JAVA_SUPERTYPE_WALK_CAP, |current| {
         let Some(cur) =
@@ -3994,13 +4006,22 @@ fn java_method_invocation_return_type(
             {
                 return None;
             }
-            // Compiled/lowered array mappings are outside the currently admitted JVM slice.
+            // Only exact admitted Java descriptors may supply arrays; source-JVM lowering stays unknown.
             return ktcore::jvm::projected_return_type_in_context(
                 index,
                 *candidate,
                 &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
             )
-            .filter(|ty| !matches!(ty, Type::Array { .. }));
+            .filter(|ty| {
+                !matches!(ty, Type::Array { .. })
+                    || matches!(
+                        candidate,
+                        ktcore::jvm::CallableCandidate::Jvm {
+                            owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                            ..
+                        }
+                    )
+            });
         }
     }
     let package = package_of(tree, src);
@@ -5125,6 +5146,18 @@ class Seed<OnlyDeclared> {
             referenced_java_lang_fqns(&tree, src),
             ["java.lang.Iterable", "java.lang.Long", "java.lang.String"]
         );
+    }
+
+    #[test]
+    fn java_array_syntax_seeds_real_object_even_with_a_local_homonym() {
+        for src in [
+            "package app; class Object {} class Use { int[] values; }",
+            "package app; class Use { int values()[] { return null; } }",
+            "package app; class Use { void run() { var values = new int[0]; } }",
+        ] {
+            let tree = JavaParser::new().parse(src);
+            assert_eq!(referenced_java_lang_fqns(&tree, src), ["java.lang.Object"]);
+        }
     }
 
     #[test]

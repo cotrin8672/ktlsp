@@ -787,6 +787,43 @@ class JavaLoopBody {
 }
 JAVA
 
+  cat > "$project/resourcecase/ArraySdkUse.java" <<'JAVA'
+package resourcecase;
+
+import java.io.File;
+import java.lang.Object;
+
+public class ArraySdkUse {
+    public void run(Body[][] rows, File directory) {
+        Object[] objects = rows[0];
+        String rowText = rows[0].toString();
+        int rowHash = rows[0].hashCode();
+        boolean same = rows[0].equals(objects);
+        String cellText = rows[0].clone()[0].string();
+        int entryCount = directory.listFiles().length;
+        int clonedEntryCount = directory.listFiles().clone().length;
+        String name = directory.listFiles().clone()[0].getName();
+    }
+}
+JAVA
+
+  cat > "$project/resourcecase/KotlinArrayFactory.java" <<'JAVA'
+package resourcecase;
+public class KotlinArrayFactory {
+    public Body[][] matrix() { return null; }
+}
+JAVA
+  cat > "$project/resourcecase/KotlinArrayUse.kt" <<'KOTLIN'
+package resourcecase
+fun kotlinArrayReads(factory: KotlinArrayFactory) {
+    val total: Int = factory.matrix().size
+    val row = factory.matrix()[0]
+    val rowSize: Int = row.size
+    factory.matrix()[0][0].string()
+    factory.matrix().clone().get(0).get(0).string()
+}
+KOTLIN
+
   mkdir -p "$project/hints"
   cp "$repo/dev/corpus/fixtures/java-inlay-hints/HintUse.java" \
     "$repo/dev/corpus/fixtures/java-inlay-hints/Hints.kt" "$project/hints/"

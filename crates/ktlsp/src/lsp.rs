@@ -608,7 +608,13 @@ fn spawn_coordinate_index_worker(
 
             let label = coord.label();
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let source = deps::coordinate_source(&coord, &repos, &extract_root);
+                let source = match deps::coordinate_source_checked(&coord, &repos, &extract_root) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tracing::warn!("resolve {label} failed: {error:#}");
+                        return (Vec::new(), true, Vec::new(), false, true);
+                    }
+                };
                 let source_missing = source.is_none();
                 let skipped = source
                     .as_ref()
@@ -631,6 +637,22 @@ fn spawn_coordinate_index_worker(
                         Ok(batches) => (batches, false),
                         Err(error) => {
                             tracing::warn!("index {label} failed: {error:#}");
+                            (Vec::new(), true)
+                        }
+                    }
+                } else if authoritative {
+                    let mut kotlin = KotlinParser::new();
+                    let mut java = JavaParser::new();
+                    match deps::resolve_module_binary_stubs(
+                        &coord,
+                        &selected_binaries,
+                        &extract_root,
+                        &mut kotlin,
+                        &mut java,
+                    ) {
+                        Ok(batches) => (batches, false),
+                        Err(error) => {
+                            tracing::warn!("index {label} binary failed: {error:#}");
                             (Vec::new(), true)
                         }
                     }
@@ -1716,6 +1738,7 @@ fn resolve_import_source_batches(
             &import_fqn,
             coords,
             &repos,
+            model,
             &extract_root,
             &mut kotlin,
             &mut java,
@@ -4474,6 +4497,162 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_module_binary_methods_are_positive_only_and_sources_keep_precedence() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_module_method_fallback_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let repos = crate::artifacts::Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "https://example.invalid".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let coord = crate::coords::Coordinate::parse("arrayfixture:binary-api:1").unwrap();
+        let selected = root.join("selected-api.jar");
+        let write = |path: &Path, entries: &[(&str, &[u8])]| {
+            let mut jar = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            for (name, bytes) in entries {
+                jar.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                jar.write_all(bytes).unwrap();
+            }
+            jar.finish().unwrap();
+        };
+        write(
+            &selected,
+            &[
+                (
+                    "arrayfixture/Factory.class",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class"
+                    ),
+                ),
+                (
+                    "arrayfixture/Item.class",
+                    include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class"),
+                ),
+                ("broken/Only.class", b"not a classfile"),
+            ],
+        );
+        let artifact_dir = repos.m2.join("arrayfixture/binary-api/1");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let source = artifact_dir.join("binary-api-1-sources.jar");
+        // A guessed default binary is deliberately not the selected classpath input.
+        write(
+            &artifact_dir.join("binary-api-1.jar"),
+            &[(
+                "pluginfixture/Person.class",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class"),
+            )],
+        );
+        let origin = classpath::file_origin_id(&selected);
+        let resolve = |authoritative, binaries: Vec<(std::path::PathBuf, String)>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            spawn_coordinate_index_worker(
+                coord.clone(),
+                repos.clone(),
+                root.join("extracted"),
+                Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                authoritative,
+                binaries,
+                tx,
+            );
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        };
+        let mut previous = None;
+        for _ in 0..2 {
+            let result = resolve(true, vec![(selected.clone(), origin.clone())]);
+            assert!(!result.failed && !result.skipped && result.missing_source);
+            assert_eq!(result.batches.len(), 2);
+            assert!(result.batches.iter().all(|batch| {
+                let origin = batch.origin.as_ref().unwrap();
+                origin.origin_id == classpath::maven_origin_id(&coord)
+                    && origin.representation == crate::project_model::SourceRepresentation::Stub
+            }));
+            assert!(result
+                .batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|symbol| symbol.name == "rows"));
+            assert!(!result
+                .batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|symbol| symbol.name == "getName" || symbol.name == "Only"));
+            let bytes = bincode::serialize(&result.batches).unwrap();
+            if let Some(previous) = &previous {
+                assert_eq!(&bytes, previous);
+            }
+            previous = Some(bytes);
+            let mut workspace = Workspace::new();
+            for batch in result.batches {
+                assert!(workspace.index_dependency_batch(batch));
+            }
+            workspace.bump_index_revision();
+            for (key, source) in [
+                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.ro; } }"),
+                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.ro }\n"),
+            ] {
+                workspace.open(key, source.to_string());
+                let offset = source.find("factory.ro").unwrap() + "factory.ro".len();
+                let query = workspace.completion_query(key, offset).unwrap();
+                assert!(query.candidates.iter().any(|item| item.label == "rows"),
+                    "{key}: {} {:?}", query.status_label(), query.reason_labels());
+            }
+        }
+        let heuristic = resolve(false, vec![(selected.clone(), origin.clone())]);
+        assert!(heuristic.missing_source && heuristic.batches.is_empty() && !heuristic.failed);
+        let ambiguous = resolve(
+            true,
+            vec![
+                (selected.clone(), origin.clone()),
+                (
+                    artifact_dir.join("binary-api-1.jar"),
+                    classpath::file_origin_id(&artifact_dir.join("binary-api-1.jar")),
+                ),
+            ],
+        );
+        assert!(ambiguous.missing_source && ambiguous.batches.is_empty() && !ambiguous.failed);
+        write(&source, &[("arrayfixture/Factory.java",
+            b"package arrayfixture; public class Factory { public int sourceOnly() { return 1; } }")]);
+        let preferred = resolve(true, vec![(selected.clone(), origin.clone())]);
+        assert!(!preferred.failed && !preferred.missing_source);
+        assert!(preferred
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .any(|symbol| symbol.name == "sourceOnly"));
+        assert!(!preferred
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .any(|symbol| symbol.name == "rows"));
+        assert!(preferred.batches.iter().all(|batch| batch
+            .origin
+            .as_ref()
+            .unwrap()
+            .representation
+            == crate::project_model::SourceRepresentation::Source));
+        std::fs::write(&source, b"unreadable source archive").unwrap();
+        let invalid_source = resolve(true, vec![(selected.clone(), origin.clone())]);
+        assert!(
+            invalid_source.failed
+                && invalid_source.missing_source
+                && invalid_source.batches.is_empty(),
+            "a present failing source archive cannot silently select binary APIs"
+        );
+        std::fs::remove_file(&source).unwrap();
+        write(&selected, &[]);
+        let changed = resolve(true, vec![(selected.clone(), origin)]);
+        assert!(changed.failed && changed.missing_source && changed.batches.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 

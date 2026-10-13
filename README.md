@@ -224,6 +224,14 @@ and indexing. Java array rows offer `length` and `clone` in the first response.
 The resource probe keeps the original26 first RPCs,12 array queries and26 alias queries,
 and adds8 rank2 queries (6 completions,2 exact definitions). The two existing rank2
 guards require useful array members as well as excluding scalar members.
+The same scenario adds six first-response SDK checks: array row Object methods,
+cloned element members, File array members, and exact Object/File source definitions.
+These are recorded separately in `java-array-sdk.json`. Whole compiler controls
+cover valid uses and reject protected methods, wrong arity and scalar calls on arrays.
+Five separate first responses check Kotlin reads of Java arrays: matrix/row `size`,
+`get` and `clone`, indexed/cloned element members, and exact Kotlin member navigation.
+Both new buffers retain their current outbound source/version and restore exactly;
+`java-array-kotlin.json` records them alongside an unchanged owner snapshot.
 Paired unsaved Java/Kotlin changes check current completion, exact navigation and
 restoration. An initially unknown receiver can use its already-running JDK source
 seed before the first response; useful candidates return without waiting. Set
@@ -290,6 +298,9 @@ slice covers public zero-argument primitive/String/Unit methods in validated ord
 contracts; broader implementation/override support remains in progress.
 `artifacts/library-interface-implementations.json` retains the first responses, exact wire
 sources and three compiler snapshots, including the actual applied edits.
+The [binary-only Java JAR corpus fixture](dev/corpus/README.md#binary-only-java-jar-members)
+uses the same library generator and corpus runner for public method completion from
+both Java and Kotlin, with local File and Maven Module dependency variants.
 
 Declared Java source encoding is also exercised through the `corpus` route with incomplete/full
 library-member probes and exact materialized source positions; see the

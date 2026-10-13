@@ -943,6 +943,317 @@ do
   end
 end
 
+-- Actual SDK Object members and File array returns: six additional first responses after the old 72.
+do
+  local path = project .. "/resourcecase/ArraySdkUse.java"
+  local buffer = vim.fn.bufadd(path)
+  vim.fn.bufload(buffer)
+  vim.bo[buffer].filetype = "java"
+  local original = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+  local modified, original_hash = vim.bo[buffer].modified, probe.buffer_sha256(buffer)
+  local function disk_sha() return vim.fn.sha256(table.concat(vim.fn.readfile(path, "b"), "\n")) end
+  local disk_hash, sdk_uri = disk_sha(), vim.uri_from_bufnr(buffer)
+  local wire, latest = probe.buffer_full_text(buffer), nil
+  local owner_buffer = vim.fn.bufnr(project .. "/resourcecase/Bodies.kt")
+  assert(owner_buffer > 0, "existing Bodies fixture was not loaded")
+  local function owner_snapshot()
+    return { uri = vim.uri_from_bufnr(owner_buffer), text = probe.buffer_full_text(owner_buffer),
+      sha256 = probe.buffer_sha256(owner_buffer), version = vim.lsp.util.buf_versions[owner_buffer],
+      tick = vim.api.nvim_buf_get_changedtick(owner_buffer) }
+  end
+  local owner_original = owner_snapshot()
+  local report = { requests = {}, outbound = {}, expected_requests = 6,
+    original_text = probe.buffer_full_text(buffer), original_source_sha256 = original_hash,
+    original_disk_sha256 = disk_hash, owner_source = owner_original,
+    fileformat = vim.bo[buffer].fileformat, eol = vim.bo[buffer].eol, expected_sdk_sources = { Object = { entry = "java.base/java/lang/Object.java", sha256 = "e24cde0af9928806e4c883c64a9bd863a173359bd95ad3f071ff8ae794e0b50f" }, File = { entry = "java.base/java/io/File.java", sha256 = "b38295d5d60d449292a85e4720698d02b7485a54dac315dbbcbbbbd586de5ae7" } } }
+  local notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    if params.textDocument and params.textDocument.uri == sdk_uri
+      and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
+      local current, err
+      if method == "textDocument/didOpen" then current = params.textDocument.text
+      else current, err = probe.apply_content_changes(wire, params.contentChanges, client.offset_encoding or "utf-16") end
+      if sent and current then wire = current end
+      latest = { sent = not not sent, version = params.textDocument.version,
+        source_sha256 = probe.buffer_sha256(buffer), wire_source_sha256 = current and vim.fn.sha256(current),
+        wire_error = err }
+      report.outbound[#report.outbound + 1] = vim.deepcopy(latest)
+    end
+    return sent
+  end
+  local function flush() require("vim.lsp._changetracking").flush(client) end
+  local function once(phase, method, anchor, token, text)
+    local position = probe.find(original, anchor, token)
+    if text then
+      vim.api.nvim_buf_set_lines(buffer, position.line, position.line + 1, false, { text })
+      flush()
+      position.character = vim.str_utfindex(text, "utf-16")
+    end
+    local before = { uri = sdk_uri, text = probe.buffer_full_text(buffer), wire_text = wire,
+      sha256 = probe.buffer_sha256(buffer), wire_sha256 = vim.fn.sha256(wire),
+      version = vim.lsp.util.buf_versions[buffer], tick = vim.api.nvim_buf_get_changedtick(buffer) }
+    local delivered = latest and latest.sent and latest.version == before.version
+      and latest.source_sha256 == before.sha256 and latest.wire_source_sha256 == before.sha256
+      and not latest.wire_error
+    local params = { textDocument = { uri = sdk_uri }, position = position }
+    local response, row
+    if delivered then response, row = request_rpc(method, params, buffer)
+    else
+      row = { method = method, params = params, attempted = false, attempts = 0,
+        availability = "not-run", delivery_error = "SDK-array source was not observed outbound" }
+      requests[#requests + 1] = row
+    end
+    row.sdk_array_phase, row.source, row.delivery = phase, before, vim.deepcopy(latest)
+    row.owner_source = owner_snapshot()
+    row.after = { sha256 = probe.buffer_sha256(buffer), version = vim.lsp.util.buf_versions[buffer],
+      tick = vim.api.nvim_buf_get_changedtick(buffer) }
+    row.stable = before.sha256 == row.after.sha256 and before.version == row.after.version
+      and before.tick == row.after.tick and vim.deep_equal(row.owner_source, owner_original)
+    report.requests[#report.requests + 1] = row
+    check("Java SDK array " .. phase .. " keeps current source throughout the first response", row.stable,
+      vim.inspect(row.after), row)
+    if text then
+      vim.api.nvim_buf_set_lines(buffer, position.line, position.line + 1, false, { original[position.line + 1] })
+      flush()
+    end
+    local result = response and response.result
+    if result == vim.NIL then result = nil end
+    return result, row
+  end
+  local ok, err = xpcall(function()
+    assert(vim.lsp.buf_attach_client(buffer, id), "SDK array fixture did not attach")
+    flush()
+    for _, case in ipairs({
+      { phase = "row public Object", anchor = "int rowHash = rows[0].hashCode();", token = "rows",
+        text = "        rows[0].", expected = { "length", "clone", "toString", "hashCode", "equals" },
+        excluded = { "finalize", "string", "getName" } },
+      { phase = "cloned row element", anchor = "String cellText = rows[0].clone()[0].string();", token = "rows",
+        text = "        rows[0].clone()[0].", expected = { "string" }, excluded = { "length", "getName" } },
+      { phase = "File listFiles array", anchor = "int entryCount = directory.listFiles().length;", token = "directory",
+        text = "        directory.listFiles().", expected = { "length", "clone", "toString", "hashCode", "equals" },
+        excluded = { "finalize", "getName", "string" } },
+      { phase = "File cloned array element", anchor = "String name = directory.listFiles().clone()[0].getName();", token = "directory",
+        text = "        directory.listFiles().clone()[0].", expected = { "getName", "length" }, excluded = { "string", "finalize" } },
+    }) do
+      local result, row = once(case.phase, "textDocument/completion", case.anchor, case.token, case.text)
+      local matched = row.stable
+      for _, name in ipairs(case.expected) do matched = matched and probe.completion_has(result, name) end
+      for _, name in ipairs(case.excluded) do matched = matched and not probe.completion_has(result, name) end
+      if case.phase == "File cloned array element" then
+        local file_length = false
+        for _, item in ipairs((result or {}).items or result or {}) do
+          file_length = file_length or (item.label == "length" and item.kind == 3)
+        end
+        matched = matched and file_length
+      end
+      row.expected, row.excluded = case.expected, case.excluded
+      check("Java SDK array " .. case.phase .. " offers required members without unrelated/protected members",
+        matched, vim.inspect(result), row)
+    end
+    for _, case in ipairs({
+      { phase = "actual Object toString", anchor = "String rowText = rows[0].toString();", token = "toString",
+        suffix = "java/lang/Object.java", range = { start = { line = 254, character = 18 }, ["end"] = { line = 254, character = 26 } } },
+      { phase = "actual File getName", anchor = "String name = directory.listFiles().clone()[0].getName();", token = "getName",
+        suffix = "java/io/File.java", range = { start = { line = 454, character = 18 }, ["end"] = { line = 454, character = 25 } } },
+    }) do
+      local result, row = once(case.phase, "textDocument/definition", case.anchor, case.token)
+      row.expected_source_suffix, row.expected_range = case.suffix, case.range
+      check("Java SDK array " .. case.phase .. " goes to the exact SDK identifier",
+        row.stable and probe.exact_definition(result, nil, { case.range }, case.suffix), vim.inspect(result), row)
+    end
+  end, debug.traceback)
+  local cleanup_ok, cleanup_error = pcall(function()
+    if not vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), original) then
+      vim.api.nvim_buf_set_lines(buffer, 0, -1, false, original)
+      flush()
+    end
+  end)
+  client.rpc.notify = notify
+  local modified_ok, modified_error = pcall(function() vim.bo[buffer].modified = modified end)
+  report.restored = probe.buffer_sha256(buffer) == original_hash
+  report.restored_text, report.restored_wire_text = probe.buffer_full_text(buffer), wire
+  report.restored_wire_sha256, report.restored_version = vim.fn.sha256(wire), vim.lsp.util.buf_versions[buffer]
+  report.wire_restored = latest and latest.sent and latest.version == report.restored_version
+    and latest.source_sha256 == original_hash and latest.wire_source_sha256 == original_hash
+    and not latest.wire_error and report.restored_wire_sha256 == original_hash
+  report.owner_restored = vim.deep_equal(owner_snapshot(), owner_original)
+  report.disk_unchanged, report.modified_restored = disk_sha() == disk_hash, vim.bo[buffer].modified == modified
+  report.notify_restored, report.error = client.rpc.notify == notify, not ok and err or nil
+  report.cleanup_error = not cleanup_ok and cleanup_error or not modified_ok and modified_error or nil
+  check("Java SDK array source, wire, owner, disk, modified flag and notification hook restore exactly",
+    cleanup_ok and modified_ok and report.restored and report.wire_restored and report.owner_restored
+      and report.disk_unchanged and report.modified_restored and report.notify_restored, vim.inspect(report))
+  local each_once = #report.requests == report.expected_requests
+  for _, row in ipairs(report.requests) do each_once = each_once and row.attempted and row.attempts == 1 end
+  check("Java SDK array six requests each run exactly once", each_once, vim.inspect(report.requests))
+  if not ok then check("Java SDK array probes execute", false, err) end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-array-sdk.json")
+  end
+end
+
+-- Kotlin reads of Java arrays: five additional first responses after old 72 and SDK 6.
+do
+  local files, names = {}, { "factory", "kotlin" }
+  for name, relative in pairs({ factory = "resourcecase/KotlinArrayFactory.java", kotlin = "resourcecase/KotlinArrayUse.kt" }) do
+    local path = project .. "/" .. relative
+    local buffer = vim.fn.bufadd(path)
+    vim.fn.bufload(buffer)
+    vim.bo[buffer].filetype = name == "factory" and "java" or "kotlin"
+    files[name] = { path = path, buf = buffer, uri = vim.uri_from_bufnr(buffer),
+      original = vim.api.nvim_buf_get_lines(buffer, 0, -1, false), hash = probe.buffer_sha256(buffer),
+      modified = vim.bo[buffer].modified, wire = probe.buffer_full_text(buffer),
+      disk = vim.fn.sha256(table.concat(vim.fn.readfile(path, "b"), "\n")) }
+  end
+  local body_path = project .. "/resourcecase/Bodies.kt"
+  local body_buf = vim.fn.bufnr(body_path)
+  assert(body_buf > 0, "existing Bodies fixture was not loaded")
+  local function body_snapshot()
+    return { uri = vim.uri_from_bufnr(body_buf), text = probe.buffer_full_text(body_buf),
+      sha256 = probe.buffer_sha256(body_buf), version = vim.lsp.util.buf_versions[body_buf],
+      tick = vim.api.nvim_buf_get_changedtick(body_buf), modified = vim.bo[body_buf].modified,
+      disk_sha256 = vim.fn.sha256(table.concat(vim.fn.readfile(body_path, "b"), "\n")) }
+  end
+  local body_original = body_snapshot()
+  local report = { requests = {}, outbound = {}, expected_requests = 5, original = {},
+    owner_source = body_original, owner_wire_observed_by_this_block = false }
+  for _, name in ipairs(names) do
+    local file = files[name]
+    report.original[name] = { text = file.wire, sha256 = file.hash, disk_sha256 = file.disk,
+      fileformat = vim.bo[file.buf].fileformat, eol = vim.bo[file.buf].eol, modified = file.modified }
+  end
+  local notify = client.rpc.notify
+  client.rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    for _, name in ipairs(names) do
+      local file = files[name]
+      if params.textDocument and params.textDocument.uri == file.uri
+        and (method == "textDocument/didOpen" or method == "textDocument/didChange") then
+        local wire, err
+        if method == "textDocument/didOpen" then wire = params.textDocument.text
+        else wire, err = probe.apply_content_changes(file.wire, params.contentChanges, client.offset_encoding or "utf-16") end
+        if sent and wire then file.wire = wire end
+        file.latest = { sent = not not sent, version = params.textDocument.version,
+          source_sha256 = probe.buffer_sha256(file.buf), wire_source_sha256 = wire and vim.fn.sha256(wire), error = err }
+        report.outbound[#report.outbound + 1] = { file = name, delivery = vim.deepcopy(file.latest) }
+      end
+    end
+    return sent
+  end
+  local function flush() require("vim.lsp._changetracking").flush(client) end
+  local function sources()
+    local out = { body = body_snapshot() }
+    for _, name in ipairs(names) do
+      local file = files[name]
+      out[name] = { uri = file.uri, text = probe.buffer_full_text(file.buf), wire_text = file.wire,
+        sha256 = probe.buffer_sha256(file.buf), wire_sha256 = vim.fn.sha256(file.wire),
+        version = vim.lsp.util.buf_versions[file.buf], tick = vim.api.nvim_buf_get_changedtick(file.buf) }
+    end
+    return out
+  end
+  local function once(phase, method, anchor, token, text)
+    local file = files.kotlin
+    local position = probe.find(file.original, anchor, token)
+    if text then
+      vim.api.nvim_buf_set_lines(file.buf, position.line, position.line + 1, false, { text })
+      flush()
+      position.character = vim.str_utfindex(text, "utf-16")
+    end
+    local before, delivery, delivered = sources(), {}, true
+    for _, name in ipairs(names) do
+      local current, latest = before[name], files[name].latest
+      delivered = delivered and latest ~= nil and latest.sent and not latest.error
+        and latest.version == current.version and latest.source_sha256 == current.sha256
+        and latest.wire_source_sha256 == current.sha256 and current.wire_sha256 == current.sha256
+      delivery[name] = vim.deepcopy(latest)
+    end
+    local params = { textDocument = { uri = file.uri }, position = position }
+    local response, row
+    if delivered then response, row = request_rpc(method, params, file.buf)
+    else
+      row = { method = method, params = params, attempted = false, attempts = 0,
+        availability = "not-run", delivery_error = "current Java/Kotlin array sources were not observed outbound" }
+      requests[#requests + 1] = row
+    end
+    row.kotlin_array_phase, row.source, row.delivery = phase, before, delivery
+    row.after = sources()
+    row.stable = vim.deep_equal(before, row.after) and vim.deep_equal(before.body, body_original)
+    report.requests[#report.requests + 1] = row
+    check("Kotlin Java-array " .. phase .. " keeps both current sources and owner stable for first response",
+      delivered and row.stable, vim.inspect(row.after), row)
+    if text then
+      vim.api.nvim_buf_set_lines(file.buf, position.line, position.line + 1, false, { file.original[position.line + 1] })
+      flush()
+    end
+    local result = response and response.result
+    if result == vim.NIL then result = nil end
+    return result, row
+  end
+  local ok, err = xpcall(function()
+    for _, name in ipairs(names) do assert(vim.lsp.buf_attach_client(files[name].buf, id), "Kotlin array fixture did not attach") end
+    flush()
+    for _, case in ipairs({
+      { phase = "matrix size get clone", anchor = "val total: Int = factory.matrix().size", token = "factory",
+        text = "    factory.matrix().", expected = { "size", "get", "clone" }, excluded = { "length", "wait", "getClass", "string" } },
+      { phase = "indexed row size get clone", anchor = "val rowSize: Int = row.size", token = "row",
+        text = "    row.", expected = { "size", "get", "clone" }, excluded = { "length", "wait", "getClass", "string" } },
+      { phase = "indexed element", anchor = "factory.matrix()[0][0].string()", token = "factory",
+        text = "    factory.matrix()[0][0].", expected = { "string" }, excluded = { "length", "size", "get", "enqueue" } },
+      { phase = "cloned get element", anchor = "factory.matrix().clone().get(0).get(0).string()", token = "factory",
+        text = "    factory.matrix().clone().get(0).get(0).", expected = { "string" }, excluded = { "length", "size", "get", "enqueue" } },
+    }) do
+      local result, row = once(case.phase, "textDocument/completion", case.anchor, case.token, case.text)
+      local matched = row.stable and row.attempted and row.attempts == 1 and row.availability == "responded"
+      for _, name in ipairs(case.expected) do matched = matched and probe.completion_has(result, name) end
+      for _, name in ipairs(case.excluded) do matched = matched and not probe.completion_has(result, name) end
+      row.expected, row.excluded = case.expected, case.excluded
+      check("Kotlin Java-array " .. case.phase .. " offers useful members without Java-only/scalar leakage",
+        matched, vim.inspect(result), row)
+    end
+    local result, row = once("exact indexed Body member", "textDocument/definition", "factory.matrix()[0][0].string()", "string")
+    local _, range = probe.find(vim.api.nvim_buf_get_lines(body_buf, 0, -1, false), "fun string", "string")
+    row.expected_uri, row.expected_range = vim.uri_from_bufnr(body_buf), range
+    check("Kotlin Java-array indexed element goes to exact authored Body.string",
+      row.stable and row.attempted and row.attempts == 1 and row.availability == "responded"
+        and probe.exact_definition(result, body_path, { range }), vim.inspect(result), row)
+  end, debug.traceback)
+  report.restored, report.wire_restored, report.disk_unchanged, report.modified_restored = true, true, true, true
+  report.final, report.cleanup_errors = {}, {}
+  for _, name in ipairs(names) do
+    local file = files[name]
+    local cleanup_ok, cleanup_error = pcall(function()
+      if not vim.deep_equal(vim.api.nvim_buf_get_lines(file.buf, 0, -1, false), file.original) then
+        vim.api.nvim_buf_set_lines(file.buf, 0, -1, false, file.original)
+        flush()
+      end
+      vim.bo[file.buf].modified = file.modified
+    end)
+    if not cleanup_ok then report.cleanup_errors[name] = cleanup_error end
+    local hash, latest = probe.buffer_sha256(file.buf), file.latest
+    report.restored = report.restored and cleanup_ok and hash == file.hash
+    report.wire_restored = report.wire_restored and latest ~= nil and latest.sent and not latest.error
+      and latest.version == vim.lsp.util.buf_versions[file.buf] and latest.source_sha256 == file.hash
+      and latest.wire_source_sha256 == file.hash and vim.fn.sha256(file.wire) == file.hash
+    report.disk_unchanged = report.disk_unchanged
+      and vim.fn.sha256(table.concat(vim.fn.readfile(file.path, "b"), "\n")) == file.disk
+    report.modified_restored = report.modified_restored and vim.bo[file.buf].modified == file.modified
+  end
+  client.rpc.notify = notify
+  report.final, report.owner_restored = sources(), vim.deep_equal(body_snapshot(), body_original)
+  report.notify_restored, report.error = client.rpc.notify == notify, not ok and err or nil
+  check("Kotlin Java-array buffers, current wire, owner, disks, flags and notify hook restore exactly",
+    report.restored and report.wire_restored and report.disk_unchanged and report.modified_restored
+      and report.owner_restored and report.notify_restored, vim.inspect(report))
+  local each_once = #report.requests == report.expected_requests
+  for _, row in ipairs(report.requests) do each_once = each_once and row.attempted and row.attempts == 1 end
+  check("Kotlin Java-array five requests each run exactly once", each_once, vim.inspect(report.requests))
+  if not ok then check("Kotlin Java-array probes execute", false, err) end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-array-kotlin.json")
+  end
+end
+
 -- Hints must use the same contextual types as completion, including unsaved Kotlin producers.
 do
   local files = {

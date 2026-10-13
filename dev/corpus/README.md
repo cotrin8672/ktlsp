@@ -31,6 +31,50 @@ Run the pure boundary checks with:
 rtk proxy nvim --headless -l dev/corpus_matcher_test.lua
 ```
 
+## Binary-only Java JAR members
+
+The twelve cases in `binary-java-jar.json` require public Java method completion
+in both languages, including generated `Person.getName`, array returns, an
+annotated method, a parameter and a static method. The complete consumers stay
+in `fixtures/binary-java-jar/binaryuse`. The helper reuses the existing library
+generator and packages only three compiler-produced classfiles already pinned
+under `crates/ktcore/tests/fixtures/classfile`. It copies no producer source or
+sources JAR and starts no Gradle, compiler or LSP.
+
+From this checkout in Bash (Git Bash on Windows), choose a new disposable directory, an isolated
+`GRADLE_USER_HOME`/owned registries, JDK17 and the existing prerequisites:
+
+```sh
+fixture_bash=("$BASH")
+if [[ "${OS:-}" == Windows_NT ]]; then fixture_bash+=(-o igncr); fi
+rtk proxy python dev/binary_java_jar_project.py /new/temp/binary-local local
+cd /new/temp/binary-local/projects/library
+rtk proxy "${fixture_bash[@]}" ./gradlew classes prepareLibrarySources --console=plain --no-daemon
+cd /path/to/ktlsp
+rtk proxy "${fixture_bash[@]}" dev/ktlsp-harness.sh library --root /new/temp/binary-local/projects/library --bin /path/to/immutable/ktlsp --release --no-build --run-dir /new/temp/binary-local/library-check
+KTLSP_CORPUS_WAIT_INDEX=1 rtk proxy "${fixture_bash[@]}" dev/ktlsp-harness.sh corpus --root /new/temp/binary-local/projects/library --file "$PWD/dev/corpus/binary-java-jar.json" --bin /path/to/immutable/ktlsp --release --no-build --run-dir /new/temp/binary-local/corpus-run
+```
+
+On Windows, the helper resolves Git Bash from Git exec-path ancestors; Unix uses
+the installed Bash. Windows alone adds -o igncr. Use a
+different new destination and `module` instead of `local` to create the same
+project with `arrayfixture:binary-api:1` in a private file Maven repository.
+It contains only the same class bytes and minimal POM. The ZIP is repacked
+deterministically; record its actual container hash in `preparation.json`
+rather than reusing a historical whole-JAR hash. Keep the original library
+checks and twelve corpus cases as separate counts. The manifest checks the
+first response after explicit indexing readiness.
+
+For a warm run, close the first owned server, retain its artifacts and xdg-state,
+then repeat the identical corpus command/run-dir with a new server and existing
+cache. The harness sets `<run-dir>/cache`; two run-dirs do not share a cache.
+Verify actual symcache decode and fresh accepted MODEL11 artifact/task/source
+identities. One run implies no latency distribution. Module source absence must
+be the resolver's normal absence, not transient failure; private-repository
+absence alone is insufficient. Stub completions supply positive facts, not
+canonical clean diagnostics or whole-library completeness. Preserve unavailable
+results as such.
+
 ## Spring provider-chain regressions
 
 `spring-provider-reduction.json` and `spring-provider-reduction-incomplete.json` use

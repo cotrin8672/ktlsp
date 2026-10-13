@@ -1,0 +1,125 @@
+{
+    "build_tool":  "gradle",
+    "probes":  [
+                   {
+                       "id":  "binary-jar-java-getName",
+                       "source":  "src/main/java/binaryuse/JavaUse.java",
+                       "source_sha256":  "2c4b19838c2b1c1242b6e79c042c7db16aab4a54b424c170bc686f9eee894363",
+                       "anchor":  "person.getName",
+                       "token":  "getName",
+                       "completion_prefix":  "ge",
+                       "completion_token":  "getName",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-java-rows",
+                       "source":  "src/main/java/binaryuse/JavaUse.java",
+                       "source_sha256":  "2c4b19838c2b1c1242b6e79c042c7db16aab4a54b424c170bc686f9eee894363",
+                       "anchor":  "factory.rows",
+                       "token":  "rows",
+                       "completion_prefix":  "ro",
+                       "completion_token":  "rows",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-java-counts",
+                       "source":  "src/main/java/binaryuse/JavaUse.java",
+                       "source_sha256":  "2c4b19838c2b1c1242b6e79c042c7db16aab4a54b424c170bc686f9eee894363",
+                       "anchor":  "factory.counts",
+                       "token":  "counts",
+                       "completion_prefix":  "co",
+                       "completion_token":  "counts",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-java-annotated",
+                       "source":  "src/main/java/binaryuse/JavaUse.java",
+                       "source_sha256":  "2c4b19838c2b1c1242b6e79c042c7db16aab4a54b424c170bc686f9eee894363",
+                       "anchor":  "factory.annotated",
+                       "token":  "annotated",
+                       "completion_prefix":  "an",
+                       "completion_token":  "annotated",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-java-withArgument",
+                       "source":  "src/main/java/binaryuse/JavaUse.java",
+                       "source_sha256":  "2c4b19838c2b1c1242b6e79c042c7db16aab4a54b424c170bc686f9eee894363",
+                       "anchor":  "factory.withArgument",
+                       "token":  "withArgument",
+                       "completion_prefix":  "withArg",
+                       "completion_token":  "withArgument",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-java-staticRows",
+                       "source":  "src/main/java/binaryuse/JavaUse.java",
+                       "source_sha256":  "2c4b19838c2b1c1242b6e79c042c7db16aab4a54b424c170bc686f9eee894363",
+                       "anchor":  "Factory.staticRows",
+                       "token":  "staticRows",
+                       "completion_prefix":  "st",
+                       "completion_token":  "staticRows",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-kotlin-getName",
+                       "source":  "src/main/kotlin/binaryuse/KotlinUse.kt",
+                       "source_sha256":  "08ec8419d0b7ec76eec6455ba00cfb1cca55624543ab5cf758f393ff035264f9",
+                       "anchor":  "person.getName",
+                       "token":  "getName",
+                       "completion_prefix":  "ge",
+                       "completion_token":  "getName",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-kotlin-rows",
+                       "source":  "src/main/kotlin/binaryuse/KotlinUse.kt",
+                       "source_sha256":  "08ec8419d0b7ec76eec6455ba00cfb1cca55624543ab5cf758f393ff035264f9",
+                       "anchor":  "factory.rows",
+                       "token":  "rows",
+                       "completion_prefix":  "ro",
+                       "completion_token":  "rows",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-kotlin-counts",
+                       "source":  "src/main/kotlin/binaryuse/KotlinUse.kt",
+                       "source_sha256":  "08ec8419d0b7ec76eec6455ba00cfb1cca55624543ab5cf758f393ff035264f9",
+                       "anchor":  "factory.counts",
+                       "token":  "counts",
+                       "completion_prefix":  "co",
+                       "completion_token":  "counts",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-kotlin-annotated",
+                       "source":  "src/main/kotlin/binaryuse/KotlinUse.kt",
+                       "source_sha256":  "08ec8419d0b7ec76eec6455ba00cfb1cca55624543ab5cf758f393ff035264f9",
+                       "anchor":  "factory.annotated",
+                       "token":  "annotated",
+                       "completion_prefix":  "an",
+                       "completion_token":  "annotated",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-kotlin-withArgument",
+                       "source":  "src/main/kotlin/binaryuse/KotlinUse.kt",
+                       "source_sha256":  "08ec8419d0b7ec76eec6455ba00cfb1cca55624543ab5cf758f393ff035264f9",
+                       "anchor":  "factory.withArgument",
+                       "token":  "withArgument",
+                       "completion_prefix":  "withArg",
+                       "completion_token":  "withArgument",
+                       "definition":  false
+                   },
+                   {
+                       "id":  "binary-jar-kotlin-staticRows",
+                       "source":  "src/main/kotlin/binaryuse/KotlinUse.kt",
+                       "source_sha256":  "08ec8419d0b7ec76eec6455ba00cfb1cca55624543ab5cf758f393ff035264f9",
+                       "anchor":  "Factory.staticRows",
+                       "token":  "staticRows",
+                       "completion_prefix":  "st",
+                       "completion_token":  "staticRows",
+                       "definition":  false
+                   }
+               ]
+}

@@ -52,6 +52,59 @@ pub fn java_array_member_type(receiver: &Type, name: &str, usage: &MemberUse) ->
     }
 }
 
+/// Kotlin's finite read surface on a structurally known Java array.
+/// These intrinsics have no authored span; other Kotlin Array APIs remain unmodeled.
+pub const KOTLIN_JAVA_ARRAY_MEMBERS: [(&str, crate::symbol::SymbolKind, Option<u8>); 3] = [
+    ("size", crate::symbol::SymbolKind::Property, None),
+    ("get", crate::symbol::SymbolKind::Function, Some(1)),
+    ("clone", crate::symbol::SymbolKind::Function, Some(0)),
+];
+
+pub fn kotlin_java_array_member_type(
+    receiver: &Type,
+    name: &str,
+    usage: &MemberUse,
+) -> Option<Type> {
+    let Type::Array {
+        component,
+        nullable: false,
+    } = receiver
+    else {
+        return None;
+    };
+    match (name, usage) {
+        ("size", MemberUse::Value) => Some(Type::class("Int", Some("kotlin".into()))),
+        ("clone", MemberUse::Call(_)) => java_array_member_type(receiver, name, usage),
+        ("get", MemberUse::Call(arguments))
+            if arguments.count == Some(1)
+                && arguments.types.len() == 1
+                && matches!(&arguments.types[0], Type::Class {
+                    name, package: Some(package), container: None, nullable: false, args,
+                } if name == "Int" && package == "kotlin" && args.is_empty())
+                && arguments.names.as_ref().is_none_or(Vec::is_empty)
+                && !arguments.has_spread
+                && !arguments.trailing_lambda =>
+        {
+            // A Java primitive array reads as the corresponding Kotlin scalar, never a homonym.
+            if let Type::Class {
+                name,
+                package: None,
+                container: None,
+                nullable: false,
+                args,
+            } = &**component
+            {
+                let scalar = infer::primitive_type_name(name);
+                if args.is_empty() && scalar != name.as_str() {
+                    return Some(Type::class(scalar, Some("kotlin".into())));
+                }
+            }
+            Some((**component).clone())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applicability {
     Applicable,
