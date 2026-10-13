@@ -1,0 +1,26 @@
+{
+  "build_tool": "gradle",
+  "project_id": "binary-java-fields",
+  "probes": [
+    {
+      "id": "binary-fields-java-constant",
+      "source": "src/main/java/binaryfields/JavaFields.java",
+      "source_sha256": "c0a74473838d22c78635a0a76b6004e7cd388e995212279fc6d1cc6ac9538800",
+      "anchor": "JavaCompilerArgumentsBuilder.EMPTY_SOURCE_PATH_REF_DIR",
+      "token": "EMPTY_SOURCE_PATH_REF_DIR",
+      "completion_prefix": "EMPTY_SOURCE",
+      "completion_token": "EMPTY_SOURCE_PATH_REF_DIR",
+      "definition": false
+    },
+    {
+      "id": "binary-fields-kotlin-constant",
+      "source": "src/main/kotlin/binaryfields/KotlinFields.kt",
+      "source_sha256": "71947976d293fc6d918a5d591080be5cf89de6b313a4b061abf132219d38c167",
+      "anchor": "JavaCompilerArgumentsBuilder.EMPTY_SOURCE_PATH_REF_DIR",
+      "token": "EMPTY_SOURCE_PATH_REF_DIR",
+      "completion_prefix": "EMPTY_SOURCE",
+      "completion_token": "EMPTY_SOURCE_PATH_REF_DIR",
+      "definition": false
+    }
+  ]
+}

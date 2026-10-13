@@ -148,5 +148,15 @@
     "file": "sources/arrayfixture/Item.java",
     "sha256": "a067967101b13cba77e67cbbb965e4fdb4e87e9cb327e4d8c304fe2b70ffb8c4",
     "bytes": 74
+  },
+  {
+    "file": "gradle8142/JavaCompilerArgumentsBuilder.class",
+    "sha256": "f54c7903fbac624cd44ca7b2214e98f2fd7d00a84e4c6f8dade213a4f641e401",
+    "bytes": 10848
+  },
+  {
+    "file": "fieldfixture/FieldOnly.class",
+    "sha256": "bfaf22b97a5e004a9bbf6f50033ae27ddac0097249f93c02d11c5f36e319025d",
+    "bytes": 272
   }
 ]

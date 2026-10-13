@@ -626,3 +626,29 @@ fn erased_method_descriptor_types_keep_java_array_rank_and_qualified_component_i
         assert!(method_types(unsupported).is_none(), "{unsupported}");
     }
 }
+
+#[test]
+fn erased_field_descriptor_types_preserve_nominal_identity_and_array_rank() {
+    use ktcore::classfile::field_type;
+    for (descriptor, name, package) in [
+        ("I", "int", None),
+        ("[[I", "int[][]", None),
+        ("Ljava/lang/String;", "String", Some("java.lang")),
+        ("[[Larrayfixture/Item;", "Item[][]", Some("arrayfixture")),
+        ("LItem;", "Item", Some("")),
+    ] {
+        let ty = field_type(descriptor).unwrap();
+        assert_eq!(ty.name, name);
+        assert_eq!(ty.qualification.as_deref(), package);
+    }
+    for descriptor in [
+        "",
+        "V",
+        "[V",
+        "Igarbage",
+        "Lpkg/Outer$Inner;",
+        "Lmissing//Item;",
+    ] {
+        assert!(field_type(descriptor).is_none(), "{descriptor}");
+    }
+}

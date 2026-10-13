@@ -35,25 +35,33 @@ else:
     bash_argv = [bash]
 project = destination / "projects/library"
 fixture = repo / "dev/corpus/fixtures/binary-java-jar/binaryuse"
+fields_fixture = fixture.parent / "binaryfields"
 classes = repo / "crates/ktcore/tests/fixtures/classfile"
-names = ("arrayfixture/Factory.class", "arrayfixture/Item.class", "pluginfixture/Person.class")
+names = ("arrayfixture/Factory.class", "arrayfixture/Item.class", "pluginfixture/Person.class",
+         "gradle8142/JavaCompilerArgumentsBuilder.class", "fieldfixture/FieldOnly.class")
 pins = {entry["file"]: entry for entry in json.loads((classes / "hashes.json").read_text(encoding="utf-8"))}
 binary = {}
 for name in names:
     raw = (classes / name).read_bytes()
     assert (len(raw), hashlib.sha256(raw).hexdigest()) == (pins[name]["bytes"], pins[name]["sha256"])
-    binary[name] = raw
+    entry = "org/gradle/api/internal/tasks/compile/JavaCompilerArgumentsBuilder.class" if name.startswith("gradle8142/") else name
+    binary[entry] = raw
 
 sources = {
     "src/main/java/binaryuse/JavaUse.java": (fixture / "JavaUse.java").read_bytes(),
     "src/main/kotlin/binaryuse/KotlinUse.kt": (fixture / "KotlinUse.kt").read_bytes(),
+    "src/main/java/binaryfields/JavaFields.java": (fields_fixture / "JavaFields.java").read_bytes(),
+    "src/main/kotlin/binaryfields/KotlinFields.kt": (fields_fixture / "KotlinFields.kt").read_bytes(),
 }
 manifest_path = repo / "dev/corpus/binary-java-jar.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-assert len(manifest["probes"]) == 12
-for case in manifest["probes"]:
-    text = "\n".join(sources[case["source"]].decode("utf-8").splitlines())
-    assert hashlib.sha256(text.encode("utf-8")).hexdigest() == case["source_sha256"]
+fields_manifest_path = repo / "dev/corpus/binary-java-fields.json"
+fields_manifest = json.loads(fields_manifest_path.read_text(encoding="utf-8"))
+assert len(manifest["probes"]) == 12 and len(fields_manifest["probes"]) == 2
+for selected in (manifest, fields_manifest):
+    for case in selected["probes"]:
+        text = "\n".join(sources[case["source"]].decode("utf-8").splitlines())
+        assert hashlib.sha256(text.encode("utf-8")).hexdigest() == case["source_sha256"]
 harness_path = repo / "dev/ktlsp-harness.sh"
 harness = harness_path.read_text(encoding="utf-8")
 start = re.search(r"(?m)^write_library_project\(\) \{$", harness)
@@ -98,7 +106,8 @@ receipt = {
     "mode": sys.argv[2], "project": project.as_posix(), "binary": identity(jar),
     "module_pom": identity(jar.with_suffix(".pom")) if sys.argv[2] == "module" else None,
     "class_inputs": [identity(classes / name) for name in names],
-    "harness": identity(harness_path), "manifest": identity(manifest_path), "bash_argv": bash_argv,
+    "harness": identity(harness_path), "manifest": identity(manifest_path),
+    "fields_manifest": identity(fields_manifest_path), "bash_argv": bash_argv,
     "library_function_sha256": hashlib.sha256(function.encode("utf-8")).hexdigest(),
     "project_files": [identity(path) for path in sorted(project.rglob("*")) if path.is_file()],
     "native_Gradle_Nvim_JVM_started": False,

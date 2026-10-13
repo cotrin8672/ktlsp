@@ -132,3 +132,28 @@ inconclusive. In particular, legal zero version indexes must work, while trailin
 must not become an emptiness proof. Tests need no installed JVM. This classification establishes
 ordinary declaration absence for a verified selected artifact; it supplies no module graph or
 compiler-plugin closure proof.
+
+## Ordinary Java binary constants
+
+`gradle8142/JavaCompilerArgumentsBuilder.class` is the unchanged entry
+`org/gradle/api/internal/tasks/compile/JavaCompilerArgumentsBuilder.class` from
+the original Gradle8.14.2 binary distribution's `gradle-language-java-8.14.2.jar`.
+The full upstream8.14.2 source is paired in `sources/gradle8142/`; its original
+Apache2 license notice is retained. This fixture was not rebuilt for these tests.
+Both `USE_UNSHARED_COMPILER_TABLE_OPTION` and `EMPTY_SOURCE_PATH_REF_DIR` are
+public static final String declarations in that source and in the distributed
+class. Constant values are not interpreted or fabricated by analysis stubs.
+Tests check field metadata and Java/Kotlin positive completion, not source
+navigation, compiler-plugin support, enum completeness or negative closure.
+Independent whole Java/Kotlin consumer compilation remains a separate control.
+
+
+## Field-only public member fixture
+
+fieldfixture/FieldOnly.class is actual Oracle javac17.0.7 output from the paired
+sources/fieldfixture/FieldOnly.java. Reproduce with javac --release 17 -encoding
+UTF-8 -g:source -d OUTPUT sources/fieldfixture/FieldOnly.java. It contains public static-final String LABEL and public int
+count, with only the implicit constructor. Native class size272B, major61,
+SHAbfaf22b97a5e004a9bbf6f50033ae27ddac0097249f93c02d11c5f36e319025d.
+It guards Property-only local/Module publication and Java/Kotlin cold/warm
+completion; it does not establish source closure or constant-value semantics.

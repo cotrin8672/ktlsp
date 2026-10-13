@@ -37,9 +37,18 @@ The twelve cases in `binary-java-jar.json` require public Java method completion
 in both languages, including generated `Person.getName`, array returns, an
 annotated method, a parameter and a static method. The complete consumers stay
 in `fixtures/binary-java-jar/binaryuse`. The helper reuses the existing library
-generator and packages only three compiler-produced classfiles already pinned
-under `crates/ktcore/tests/fixtures/classfile`. It copies no producer source or
-sources JAR and starts no Gradle, compiler or LSP.
+generator and packages five compiler-produced classfiles already pinned
+under `crates/ktcore/tests/fixtures/classfile`: the original three, the actual Gradle
+`JavaCompilerArgumentsBuilder`, and a field-only `FieldOnly` class. It copies no
+producer source or sources JAR and starts no Gradle, compiler or LSP. The default
+project has seven source files; the original five remain unchanged.
+
+The separate two cases in `binary-java-fields.json` require Java and Kotlin
+completion of the actual public String constant `EMPTY_SOURCE_PATH_REF_DIR`.
+Complete field consumers live in `fixtures/binary-java-jar/binaryfields`.
+Its `invalid` subfolder contains isolated Java/Kotlin controls assigning that
+String constant to an integer; these must fail compilation and are excluded
+from the generated project's normal sources.
 
 From this checkout in Bash (Git Bash on Windows), choose a new disposable directory, an isolated
 `GRADLE_USER_HOME`/owned registries, JDK17 and the existing prerequisites:
@@ -53,6 +62,7 @@ rtk proxy "${fixture_bash[@]}" ./gradlew classes prepareLibrarySources --console
 cd /path/to/ktlsp
 rtk proxy "${fixture_bash[@]}" dev/ktlsp-harness.sh library --root /new/temp/binary-local/projects/library --bin /path/to/immutable/ktlsp --release --no-build --run-dir /new/temp/binary-local/library-check
 KTLSP_CORPUS_WAIT_INDEX=1 rtk proxy "${fixture_bash[@]}" dev/ktlsp-harness.sh corpus --root /new/temp/binary-local/projects/library --file "$PWD/dev/corpus/binary-java-jar.json" --bin /path/to/immutable/ktlsp --release --no-build --run-dir /new/temp/binary-local/corpus-run
+KTLSP_CORPUS_WAIT_INDEX=1 rtk proxy "${fixture_bash[@]}" dev/ktlsp-harness.sh corpus --root /new/temp/binary-local/projects/library --file "$PWD/dev/corpus/binary-java-fields.json" --bin /path/to/immutable/ktlsp --release --no-build --run-dir /new/temp/binary-local/fields-corpus-run
 ```
 
 On Windows, the helper resolves Git Bash from Git exec-path ancestors; Unix uses
@@ -62,7 +72,7 @@ project with `arrayfixture:binary-api:1` in a private file Maven repository.
 It contains only the same class bytes and minimal POM. The ZIP is repacked
 deterministically; record its actual container hash in `preparation.json`
 rather than reusing a historical whole-JAR hash. Keep the original library
-checks and twelve corpus cases as separate counts. The manifest checks the
+checks, twelve original method probes and two field probes as separate counts. The manifest checks the
 first response after explicit indexing readiness.
 
 For a warm run, close the first owned server, retain its artifacts and xdg-state,

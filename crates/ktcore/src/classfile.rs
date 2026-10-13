@@ -151,53 +151,60 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
     })
 }
 
+fn descriptor_type_ref(ty: TypeDescriptor<'_>) -> Option<crate::types::TypeRef> {
+    let mut result = match ty.base {
+        BaseType::Object(name) => {
+            let internal = name
+                .chars()
+                .collect::<std::result::Result<String, _>>()
+                .ok()?;
+            if !internal_name(&internal) || internal.contains('$') {
+                return None;
+            }
+            let (package, simple) = internal.rsplit_once('/').unwrap_or(("", &internal));
+            let mut result = crate::types::TypeRef::simple(simple);
+            // Even the default package is explicit; the consumer's package cannot rebind it.
+            result.qualification = Some(package.replace('/', "."));
+            result
+        }
+        base => crate::types::TypeRef::simple(match base {
+            BaseType::Boolean => "boolean",
+            BaseType::Byte => "byte",
+            BaseType::Short => "short",
+            BaseType::Integer => "int",
+            BaseType::Long => "long",
+            BaseType::Float => "float",
+            BaseType::Double => "double",
+            BaseType::Char => "char",
+            BaseType::Object(_) => unreachable!(),
+        }),
+    };
+    result
+        .name
+        .push_str(&"[]".repeat(usize::from(ty.dimensions)));
+    Some(result)
+}
+
+/// Normalize an erased field descriptor with the same nominal/array policy as methods.
+pub fn field_type(descriptor: &str) -> Option<crate::types::TypeRef> {
+    let encoded = noak::MString::from(descriptor);
+    descriptor_type_ref(TypeDescriptor::parse(&encoded).ok()?)
+}
+
 /// Normalize an erased method descriptor; this establishes neither source callability nor
 /// generic arguments. Nested binary names need InnerClasses identity and remain unsupported.
 pub fn method_types(
     descriptor: &str,
 ) -> Option<(Vec<crate::types::TypeRef>, Option<crate::types::TypeRef>)> {
-    fn type_ref(ty: TypeDescriptor<'_>) -> Option<crate::types::TypeRef> {
-        let mut result = match ty.base {
-            BaseType::Object(name) => {
-                let internal = name
-                    .chars()
-                    .collect::<std::result::Result<String, _>>()
-                    .ok()?;
-                if !internal_name(&internal) || internal.contains('$') {
-                    return None;
-                }
-                let (package, simple) = internal.rsplit_once('/').unwrap_or(("", &internal));
-                let mut result = crate::types::TypeRef::simple(simple);
-                // Even the default package is explicit; the consumer's package cannot rebind it.
-                result.qualification = Some(package.replace('/', "."));
-                result
-            }
-            base => crate::types::TypeRef::simple(match base {
-                BaseType::Boolean => "boolean",
-                BaseType::Byte => "byte",
-                BaseType::Short => "short",
-                BaseType::Integer => "int",
-                BaseType::Long => "long",
-                BaseType::Float => "float",
-                BaseType::Double => "double",
-                BaseType::Char => "char",
-                BaseType::Object(_) => unreachable!(),
-            }),
-        };
-        result
-            .name
-            .push_str(&"[]".repeat(usize::from(ty.dimensions)));
-        Some(result)
-    }
     let encoded = noak::MString::from(descriptor);
     let method = MethodDescriptor::parse(&encoded).ok()?;
     Some((
         method
             .parameters()
-            .map(type_ref)
+            .map(descriptor_type_ref)
             .collect::<Option<Vec<_>>>()?,
         match method.return_type() {
-            Some(ty) => Some(type_ref(ty)?),
+            Some(ty) => Some(descriptor_type_ref(ty)?),
             None => None,
         },
     ))

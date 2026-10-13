@@ -679,6 +679,70 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
             *shapes.entry(key).or_insert(0usize) += 1;
         }
     }
+    let mut field_names = std::collections::BTreeMap::new();
+    for field in &class.fields {
+        if field.access_flags & PUBLIC != 0
+            && field.access_flags & 0x1000 == 0
+            && !field
+                .attribute_names
+                .iter()
+                .any(|name| name.as_ref() == "Synthetic")
+        {
+            *field_names.entry(field.name.as_ref()).or_insert(0usize) += 1;
+        }
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for field in &class.fields {
+        if field.access_flags & PUBLIC == 0
+            || field.access_flags & !(PUBLIC | 0x0008 | 0x0010 | 0x0040 | 0x0080) != 0
+            || field.access_flags & 0x0050 == 0x0050
+            || field.signature.is_some()
+            || !is_java_identifier(&field.name)
+            || field_names.get(field.name.as_ref()) != Some(&1)
+            || field
+                .attribute_names
+                .iter()
+                .any(|name| name.as_ref() == "Synthetic")
+        {
+            continue;
+        }
+        let Some(ty) = ktcore::classfile::field_type(&field.descriptor) else {
+            continue;
+        };
+        if !package.is_empty() && ty.qualification.as_deref() == Some("") {
+            continue;
+        }
+        let Some(ty) = java_descriptor_type(&ty) else {
+            continue;
+        };
+        let static_ = if field.access_flags & 0x0008 != 0 {
+            "static "
+        } else {
+            ""
+        };
+        let final_ = if field.access_flags & 0x0010 != 0 {
+            "final "
+        } else {
+            ""
+        };
+        let volatile = if field.access_flags & 0x0040 != 0 {
+            "volatile "
+        } else {
+            ""
+        };
+        let transient = if field.access_flags & 0x0080 != 0 {
+            "transient "
+        } else {
+            ""
+        };
+        fields.insert(
+            field.name.as_ref(),
+            format!(
+                "    public {static_}{final_}{volatile}{transient}{ty} {};\n",
+                field.name
+            ),
+        );
+    }
     let mut methods = std::collections::BTreeMap::new();
     for method in &class.methods {
         if method.access_flags & PUBLIC == 0
@@ -741,7 +805,8 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
         );
         methods.insert(key, declaration);
     }
-    let mut source = "// Binary declaration stub; method bodies are placeholders.\n".to_string();
+    let mut source =
+        "// Binary declaration stub; initializers and method bodies are unavailable.\n".to_string();
     if !package.is_empty() {
         source.push_str(&format!("package {};\n\n", package.replace('/', ".")));
     }
@@ -753,6 +818,9 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
         ""
     };
     source.push_str(&format!("public {modifier}class {name} {{\n"));
+    for field in fields.into_values() {
+        source.push_str(&field);
+    }
     for method in methods.into_values() {
         source.push_str(&method);
     }
@@ -874,6 +942,88 @@ mod tests {
             zip.write_all(body).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn binary_java_stub_keeps_actual_public_constants_and_withholds_unsupported_fields() {
+        let class = ktcore::classfile::decode(
+            "fixture",
+            include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/gradle8142/JavaCompilerArgumentsBuilder.class"
+        ),
+        )
+        .unwrap();
+        let source = java_class_stub(&class).unwrap();
+        let mut parser = crate::java::JavaParser::new();
+        let tree = parser.parse(&source);
+        assert!(!tree.root_node().has_error(), "{source}");
+        let symbols = crate::java::extract_symbols(&tree, &source);
+        assert!(!symbols
+            .iter()
+            .any(|symbol| symbol.kind == ktcore::symbol::SymbolKind::Property
+                && matches!(
+                    symbol.name.as_str(),
+                    "spec" | "includeLauncherOptions" | "args"
+                )));
+        for name in [
+            "USE_UNSHARED_COMPILER_TABLE_OPTION",
+            "EMPTY_SOURCE_PATH_REF_DIR",
+        ] {
+            let field = symbols.iter().find(|symbol| symbol.name == name).unwrap();
+            assert_eq!(field.kind, ktcore::symbol::SymbolKind::Property);
+            assert_eq!(field.value_type.as_ref().unwrap().name, "String");
+            assert_eq!(
+                field.value_type.as_ref().unwrap().qualification.as_deref(),
+                Some("java.lang")
+            );
+            assert_eq!(
+                field.source_member.dispatch(),
+                Some(ktcore::extensions::Dispatch::Static)
+            );
+            assert!(source.contains(&format!("public static final java.lang.String {name};")));
+        }
+        let prototype = class
+            .fields
+            .iter()
+            .find(|field| field.name.as_ref() == "EMPTY_SOURCE_PATH_REF_DIR")
+            .unwrap();
+        for case in [
+            "private",
+            "protected",
+            "synthetic-flag",
+            "synthetic-attribute",
+            "generic",
+            "nested",
+            "unnamed",
+            "duplicate-name",
+            "final-volatile",
+        ] {
+            // Injected malformed/unsupported metadata tests conservatism, not javac callability.
+            let mut altered = class.clone();
+            let mut field = prototype.clone();
+            field.name = "withheld".into();
+            match case {
+                "private" => field.access_flags = 0x0002,
+                "protected" => field.access_flags = 0x0004,
+                "synthetic-flag" => field.access_flags |= 0x1000,
+                "synthetic-attribute" => field.attribute_names.push("Synthetic".into()),
+                "generic" => field.signature = Some("TT;".into()),
+                "nested" => field.descriptor = "Lpkg/Outer$Inner;".into(),
+                "unnamed" => field.descriptor = "LItem;".into(),
+                "duplicate-name" => {
+                    let mut duplicate = field.clone();
+                    duplicate.descriptor = "I".into();
+                    altered.fields.push(duplicate);
+                }
+                "final-volatile" => field.access_flags |= 0x0040,
+                _ => unreachable!(),
+            }
+            altered.fields.push(field);
+            assert!(
+                !java_class_stub(&altered).unwrap().contains("withheld"),
+                "{case}"
+            );
+        }
     }
 
     #[test]

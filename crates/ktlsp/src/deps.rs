@@ -1167,7 +1167,7 @@ pub fn resolve_local_jar_stubs_for_origin(
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
     // Old name-only binary stubs must miss; the serialized symbol format is unchanged.
-    hasher.update(b"|local-jar-java-methods-v1|");
+    hasher.update(b"|local-jar-java-members-v2|");
     hasher.update(origin_id.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
@@ -1200,7 +1200,7 @@ pub fn resolve_local_jar_stubs_for_origin(
     Ok(batches)
 }
 
-/// Positive method facts from one exact Gradle-selected module binary; this is not source closure.
+/// Positive member facts from one exact Gradle-selected module binary; this is not source closure.
 pub(crate) fn resolve_module_binary_stubs(
     coord: &Coordinate,
     selected_binaries: &[(PathBuf, String)],
@@ -1230,7 +1230,7 @@ pub(crate) fn resolve_module_binary_stubs(
     let origin_id = crate::classpath::maven_origin_id(coord);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|module-jar-java-methods-v1|");
+    hasher.update(b"|module-jar-java-members-v2|");
     hasher.update(origin_id.as_bytes());
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
@@ -1243,12 +1243,14 @@ pub(crate) fn resolve_module_binary_stubs(
         jar_path.display()
     );
     // The old name-only fallback includes malformed/unsupported classes. New module publication
-    // admits only files with positively decoded methods and keeps missing-source status.
+    // admits only files with positively decoded members and keeps missing-source status.
     batches.retain(|batch| {
-        batch
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == ktcore::symbol::SymbolKind::Function)
+        batch.symbols.iter().any(|symbol| {
+            matches!(
+                symbol.kind,
+                ktcore::symbol::SymbolKind::Function | ktcore::symbol::SymbolKind::Property
+            )
+        })
     });
     tag_batches(&mut batches, &origin_id, SourceRepresentation::Stub);
     Ok(batches)
@@ -3406,6 +3408,166 @@ public class ParameterUse<Iterable> {
     }
 
     #[test]
+    fn field_only_binary_class_reaches_local_and_module_cold_and_warm_publication() {
+        let bytes =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class");
+        let facts = ktcore::classfile::decode("field-only-fixture", bytes).unwrap();
+        assert_eq!(facts.identity.internal_name, "fieldfixture/FieldOnly");
+        assert_eq!(facts.access_flags, 0x0031);
+        assert_eq!(facts.source_file.as_deref(), Some("FieldOnly.java"));
+        assert_eq!(facts.fields.len(), 2);
+        for (name, descriptor, flags) in [
+            ("LABEL", "Ljava/lang/String;", 0x0019),
+            ("count", "I", 0x0001),
+        ] {
+            let field = facts
+                .fields
+                .iter()
+                .find(|field| field.name.as_ref() == name)
+                .unwrap();
+            assert_eq!(field.descriptor.as_ref(), descriptor);
+            assert_eq!(field.access_flags, flags);
+            assert!(field.signature.is_none());
+        }
+        assert_eq!(facts.methods.len(), 1);
+        assert_eq!(facts.methods[0].name.as_ref(), "<init>");
+        assert_eq!(facts.methods[0].descriptor.as_ref(), "()V");
+
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_field_only_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("fields.jar");
+        {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            archive
+                .start_file("fieldfixture/FieldOnly.class", SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+            archive.finish().unwrap();
+        }
+        assert!(!root.join("fields-sources.jar").exists());
+        let origin = crate::classpath::file_origin_id(&jar);
+        let coord = Coordinate::parse("fixture:field-only:1").unwrap();
+        let module_origin = crate::classpath::maven_origin_id(&coord);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for (is_module, owner, tag) in [
+            (
+                false,
+                origin.as_str(),
+                b"|local-jar-java-members-v2|".as_slice(),
+            ),
+            (
+                true,
+                module_origin.as_str(),
+                b"|module-jar-java-members-v2|".as_slice(),
+            ),
+        ] {
+            let mut hasher = Sha256::new();
+            hasher.update(SYMCACHE_VERSION);
+            hasher.update(tag);
+            hasher.update(owner.as_bytes());
+            if is_module {
+                hasher.update(b"|");
+                hasher.update(origin.as_bytes());
+            }
+            let fingerprint = format!("{:x}", hasher.finalize());
+            let extract = root.join(if is_module { "module" } else { "local" });
+            let dest = extract.join("local-jars").join(&fingerprint);
+            assert!(
+                symcache_load(&fingerprint, &dest).is_none(),
+                "cold cache must be absent"
+            );
+            let mut previous = None;
+            for warm in [false, true] {
+                if warm {
+                    let cached =
+                        symcache_load(&fingerprint, &dest).expect("warm cache must be usable");
+                    assert_eq!(cached.len(), 1);
+                    assert!(cached[0].symbols.iter().any(|symbol| {
+                        symbol.name == "LABEL"
+                            && symbol.kind == ktcore::symbol::SymbolKind::Property
+                    }));
+                }
+                let batches = if is_module {
+                    resolve_module_binary_stubs(
+                        &coord,
+                        &[(jar.clone(), origin.clone())],
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                    .unwrap()
+                } else {
+                    resolve_local_jar_stubs_for_origin(
+                        &jar,
+                        &origin,
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                    .unwrap()
+                };
+                assert_eq!(
+                    batches.len(),
+                    1,
+                    "field-only class must survive publication"
+                );
+                let batch = &batches[0];
+                let provenance = batch.origin.as_ref().unwrap();
+                assert_eq!(provenance.origin_id, owner);
+                assert_eq!(provenance.representation, SourceRepresentation::Stub);
+                assert!(!batch
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.kind == ktcore::symbol::SymbolKind::Function));
+                for (name, ty, dispatch) in [
+                    ("LABEL", "String", ktcore::extensions::Dispatch::Static),
+                    ("count", "int", ktcore::extensions::Dispatch::Instance),
+                ] {
+                    let field = batch
+                        .symbols
+                        .iter()
+                        .find(|symbol| symbol.name == name)
+                        .unwrap();
+                    assert_eq!(field.kind, ktcore::symbol::SymbolKind::Property);
+                    assert_eq!(field.value_type.as_ref().unwrap().name, ty);
+                    assert_eq!(field.source_member.dispatch(), Some(dispatch));
+                }
+                let encoded = bincode::serialize(&batches).unwrap();
+                if let Some(previous) = &previous {
+                    assert_eq!(&encoded, previous);
+                }
+                previous = Some(encoded);
+                let mut workspace = crate::workspace::Workspace::new();
+                for batch in batches {
+                    assert!(workspace.index_dependency_batch(batch));
+                }
+                workspace.bump_index_revision();
+                for (key, source, needle, expected) in [
+                    ("Fields.java", "import fieldfixture.FieldOnly; class Fields { void f() { FieldOnly.LA; } }", "FieldOnly.LA", "LABEL"),
+                    ("Fields.kt", "import fieldfixture.FieldOnly\nfun f() { FieldOnly.LA }\n", "FieldOnly.LA", "LABEL"),
+                    ("Fields.java", "import fieldfixture.FieldOnly; class Fields { void f(FieldOnly value) { value.co; } }", "value.co", "count"),
+                    ("Fields.kt", "import fieldfixture.FieldOnly\nfun f(value: FieldOnly) { value.co }\n", "value.co", "count"),
+                ] {
+                    workspace.open(key, source.to_string());
+                    let query = workspace.completion_query(key, source.find(needle).unwrap() + needle.len()).unwrap();
+                    assert!(query.candidates.iter().any(|item| item.label == expected),
+                        "module={is_module} warm={warm} {key} {needle}: {} {:?}", query.status_label(), query.reason_labels());
+                    assert_eq!(workspace.doc_text(key).as_deref(), Some(source));
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn binary_java_jar_members_reach_cold_and_warm_java_kotlin_completion() {
         let factory =
             include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class")
@@ -3415,6 +3577,10 @@ public class ParameterUse<Iterable> {
         let person =
             include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class")
                 .as_slice();
+        let constants = include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/gradle8142/JavaCompilerArgumentsBuilder.class"
+        )
+        .as_slice();
         let root = std::env::temp_dir().join(format!(
             "ktlsp_binary_member_completion_{}",
             std::process::id()
@@ -3427,6 +3593,10 @@ public class ParameterUse<Iterable> {
                 ("arrayfixture/Factory.class", factory),
                 ("arrayfixture/Item.class", item),
                 ("pluginfixture/Person.class", person),
+                (
+                    "org/gradle/api/internal/tasks/compile/JavaCompilerArgumentsBuilder.class",
+                    constants,
+                ),
             ] {
                 archive
                     .start_file(name, SimpleFileOptions::default())
@@ -3439,6 +3609,47 @@ public class ParameterUse<Iterable> {
         let origin = crate::classpath::file_origin_id(&jar);
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
+        // Seed readable v28/methods-v1 caches with the old field-free normalized facts.
+        // Existing source files make these valid cache hits unless the binary key changes.
+        let legacy_dir = root.join("legacy-stubs");
+        jar::extract_class_stubs(&jar, &legacy_dir).unwrap();
+        let mut legacy = parse_dir(&legacy_dir, &mut kotlin, &mut java).unwrap();
+        for batch in &mut legacy {
+            batch
+                .symbols
+                .retain(|symbol| symbol.kind != ktcore::symbol::SymbolKind::Property);
+        }
+        let coord = Coordinate::parse("fixture:constants:1").unwrap();
+        let module_origin = crate::classpath::maven_origin_id(&coord);
+        for (tag, key_origin, selected_binary) in [
+            (
+                b"|local-jar-java-methods-v1|".as_slice(),
+                origin.as_str(),
+                None,
+            ),
+            (
+                b"|module-jar-java-methods-v1|".as_slice(),
+                module_origin.as_str(),
+                Some(origin.as_str()),
+            ),
+        ] {
+            let mut old = Sha256::new();
+            old.update(b"v28-java-array-components");
+            old.update(tag);
+            old.update(key_origin.as_bytes());
+            if let Some(binary) = selected_binary {
+                old.update(b"|");
+                old.update(binary.as_bytes());
+            }
+            let fingerprint = format!("{:x}", old.finalize());
+            symcache_store(&fingerprint, &legacy);
+            let cached = symcache_load(&fingerprint, &legacy_dir).unwrap();
+            assert_eq!(cached.len(), 4);
+            assert!(!cached
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|symbol| { symbol.name == "EMPTY_SOURCE_PATH_REF_DIR" }));
+        }
         let mut previous = None;
         for _ in 0..2 {
             let batches = resolve_local_jar_stubs_for_origin(
@@ -3449,7 +3660,28 @@ public class ParameterUse<Iterable> {
                 &mut java,
             )
             .unwrap();
-            assert_eq!(batches.len(), 3);
+            assert_eq!(batches.len(), 4);
+            let coord = Coordinate::parse("fixture:constants:1").unwrap();
+            let module = resolve_module_binary_stubs(
+                &coord,
+                &[(jar.clone(), origin.clone())],
+                &root.join("module-extract"),
+                &mut kotlin,
+                &mut java,
+            )
+            .unwrap();
+            assert!(module.iter().all(|batch| {
+                let owner = batch.origin.as_ref().unwrap();
+                owner.origin_id == crate::classpath::maven_origin_id(&coord)
+                    && owner.representation == SourceRepresentation::Stub
+            }));
+            assert!(module
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|symbol| {
+                    symbol.name == "EMPTY_SOURCE_PATH_REF_DIR"
+                        && symbol.kind == ktcore::symbol::SymbolKind::Property
+                }));
             assert!(batches.iter().all(|batch| {
                 let owner = batch.origin.as_ref().unwrap();
                 owner.origin_id == origin && owner.representation == SourceRepresentation::Stub
@@ -3465,6 +3697,8 @@ public class ParameterUse<Iterable> {
             }
             workspace.bump_index_revision();
             for (key, source, needle, expected, absent) in [
+                ("Use.java", "import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder; class Use { void f() { JavaCompilerArgumentsBuilder.EMPTY_SOURCE; } }", "JavaCompilerArgumentsBuilder.EMPTY_SOURCE", "EMPTY_SOURCE_PATH_REF_DIR", "withheld"),
+                ("Use.kt", "import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder\nfun f() { JavaCompilerArgumentsBuilder.EMPTY_SOURCE }\n", "JavaCompilerArgumentsBuilder.EMPTY_SOURCE", "EMPTY_SOURCE_PATH_REF_DIR", "withheld"),
                 ("Use.java", "import pluginfixture.Person; class Use { void f(Person person) { person.ge; } }", "person.ge", "getName", "Person"),
                 ("Use.kt", "import pluginfixture.Person\nfun f(person: Person) { person.ge }\n", "person.ge", "getName", "Person"),
                 ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.ro; } }", "factory.ro", "rows", "generic"),

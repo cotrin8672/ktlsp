@@ -299,8 +299,9 @@ contracts; broader implementation/override support remains in progress.
 `artifacts/library-interface-implementations.json` retains the first responses, exact wire
 sources and three compiler snapshots, including the actual applied edits.
 The [binary-only Java JAR corpus fixture](dev/corpus/README.md#binary-only-java-jar-members)
-uses the same library generator and corpus runner for public method completion from
-both Java and Kotlin, with local File and Maven Module dependency variants.
+uses the same library generator and corpus runner for public methods and fields from
+both Java and Kotlin, with local File and Maven Module dependency variants. The original
+twelve method probes and separate two constant probes retain their own counts.
 
 Declared Java source encoding is also exercised through the `corpus` route with incomplete/full
 library-member probes and exact materialized source positions; see the

@@ -79,7 +79,7 @@ a useful known receiver in the same edited state.
 
 | Case | Expected result | Observed result | Status | Evidence / next action |
 | --- | --- | --- | --- | --- |
-| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint74 passes1,498 tests,0 failures,4 existing ignored; formatting and release pass, including core127/server451/interop123 | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
+| Rust baseline / current slices | Workspace tests pass with useful regression expectations | Current checkpoint75 passes1,501 tests,0 failures,4 existing ignored; formatting and release pass; source-free public fields and property-only Module publication have focused regressions | Current finite slices verified; whole-project acceptance remains open | native-source-watch-green-release72-1, receipt0fa933499b56002abd526b4706c16090590a6375ba479669b65f9749fa5799fe; focused watcher25 pass. Ownership release7 remains checkpoint71 evidence; new regression fails before the fix |
 | Real Neovim baseline | Starts server, sees capabilities, resolves asserted targets | Checkpoint70 Java307/312: original72 resource requests, new6 SDK requests and new5 Kotlin array requests match without readiness waits. The five existing diagnostic omissions remain. Earlier basic9/library41 remain historical | Finite completion/navigation evidence;5 existing diagnostic omissions remain | native-java-editor70-4; root-java-kotlin-editor-verification70-4. Server stop still force-requested, exit1/signal15; no graceful-shutdown claim |
 | CEM project model | Minecraft, NeoForge, Create and Kotlin classpaths and sources are visible | Complete unchanged220-file snapshot captures actual Gradle9.6.1/KGP2.4.0 inputs and compiles Kotlin/Java. Actual three-where-bound member lookup improves0/2 to2/2, matching IDEA. Both engines accept31/31 exact whole buffers; actual Gradle SDK21 agrees | Focused compiler/model, repaired bounds and native UI verified; whole-project acceptance open | Checkpoint60. ktlsp RPC/UI shutdown exits0; IDEA31 UI matches remain separate from unobserved clean exit and fresh-owned-wrapper cleanup |
 | Corpus selection | Five additional real, diverse mixed Java/Kotlin repositories with pinned revisions | OkHttp, Moshi, Retrofit, Spring Framework and Gradle pinned; saved-source identities guarded and ordinary Java/Kotlin edges identified | Discovery complete | [fork-corpus.md](fork-corpus.md); semantic and performance acceptance still pending |
@@ -5674,3 +5674,69 @@ Remaining work: binary-only fields/enum completion, compiler-backed inherited Ja
 call diagnostics, compiler/plugin adapter fidelity, latest live dependency refresh,
 broader UX/IDEA comparison and final controlled six-project timing. No whole-project
 parity, canonical diagnostic absence, or speed distribution is inferred here.
+
+
+## Checkpoint75: source-free Java public fields (2026-10-14)
+
+Public erased Java fields now enter the same shared symbol facts as binary methods.
+Java and Kotlin completion see the actual Gradle8.14.2 String constants; a compiled
+field-only class also survives Module publication. Private/protected, synthetic,
+generic/nested, malformed, duplicate-name and final-volatile fields remain withheld.
+Enum support and general generic binary members remain open. No initializer,
+ConstantValue interpretation or library source completeness is inferred.
+
+The renderer and local/Module cache regressions reproduce missing fields before
+the fix. A separate control removes only Property from the Module retention branch
+and reproduces the field-only publication failure. Focused22 checks pass; final
+workspace1,501 pass,0 fail,4 existing ignored; formatting and release pass.
+Release receipt: native-binary-fields-release75-1/receipt.json,
+SHAaa990a198e7a4eca2ecde851f94dacd948f1ab0e54709bded9c0d49c1537ff2e.
+Immutable ktlsp SHAdcdae451a0a3a6d369c86ee9b005c5dc9595bebbf8f406bdfeaa1df171e13562.
+
+Both disposable Gradle projects compile all seven Java/Kotlin source inputs and
+capture actual complete MODEL11 Java/Kotlin tasks with selected JDK17 and ordered
+classpaths. The selected five-class JAR is identical in both projects; one artifact
+is File and the other arrayfixture:binary-api:1 Module. Actual selected compiler
+controls reject the String constant as int/Int in both variants, at the expected
+source locations. These isolated controls do not prove general Gradle task replay
+or compiler-plugin fidelity.
+
+| Existing editor route | Local File | Maven Module |
+| --- | --- | --- |
+| Original library assertions | 41/41 | 38/41; three Java call-shape diagnostic reports empty |
+| Original method corpus | Cold12/12, warm12/12 | Cold12/12, warm12/12 |
+| Separate constant corpus | Cold2/2, warm2/2 | Cold2/2, warm2/2 |
+
+The two unique field cases produce eight first completion responses across these
+four configurations. Their actual didOpen source images, version0, UTF16 cursor
+positions and first received results match the captured reports. No content retry
+or additional semantic request was used. Every editor process closed with zero
+owned residuals and no forced cleanup; the Module library harness exits1 for the
+three missing diagnostics. Source/build/model guards remain stable.
+
+Actual warm traces decode and restore the exact selected binary symcache, with its
+compressed bytes unchanged and positive LABEL/count field-only stubs retained.
+Only binary-member cache partitions change to members-v2; the global serialized
+cache version remains v28-java-array-components. The local partition also names
+companion-source extraction/cache entries, so those have a one-time local miss.
+
+The Module diagnostic omissions are a reproduced coverage gap: a missing unrelated
+dependency source makes the library world incomplete and currently suppresses
+closed project Java owner checks through Kotlin default-import package guards.
+They are retained as failures; passing indexed completion does not reclassify them.
+
+Evidence under ktlsp-selected-compiler-recipe-20261012-1:
+native-binary-fields-local75-1 and native-binary-fields-module75-1 receipts/model
+audits; native-binary-fields-local-editor75-2, native-binary-fields-module-editor75-1
+and native-binary-fields-module-corpus75-1 receipts; binary-fields-wire-audit75-1.json;
+binary-fields-compiler75-1/audit.json. The existing portable generator and corpus
+routes now preserve five pinned classfiles, the unchanged12 method cases and the
+separate2 field cases. Actual generator checks reproduce the same JAR and original
+five source bytes; two new fixtures have checkout CRLF rather than the tested LF,
+with unchanged normalized manifest identities. Raw EOL differences are recorded.
+
+Remaining: the three Module Java diagnostic omissions and earlier inherited-owner/
+generated-member diagnostic gaps; enum/generic binary members; compiler/plugin
+adapter fidelity; newest live dependency refresh; broader UX/IDEA comparison and
+final controlled same-binary six-project performance. This slice establishes no
+whole-project clean diagnostic result or startup/request latency distribution.
