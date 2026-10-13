@@ -285,7 +285,10 @@ fn java_receipt(path: &Path, text: &str, recipe: &JavaCompilerRecipe) -> Value {
     let source =
         json!({"path": path, "uri": uri, "bytes": text.len(), "sha256": sha(text.as_bytes())});
     json!({"compileCompleted": true, "failure": null, "success": false, "options": recipe.api_options,
-        "gradleFileEncoding": recipe.gradle_file_encoding, "gradleEffectiveDefaultCharset": recipe.effective_charset,
+        "gradleFileEncoding": recipe.gradle_file_encoding,
+        "gradleConfiguredEncodingNull": recipe.language_version != "21",
+        "gradleConfiguredEncoding": if recipe.language_version == "21" { json!("UTF-8") } else { Value::Null },
+        "gradleEffectiveDefaultCharset": recipe.effective_charset,
         "gradleEffectiveDefaultLocale": recipe.locale, "explicitFileManagerCharset": recipe.effective_charset,
         "explicitDiagnosticLocale": recipe.locale, "runtime": {"javaVersion": recipe.gradle_java_version,
             "javaRuntimeVersion": recipe.java_runtime_version, "defaultCharset": "windows-31j"},
@@ -1720,6 +1723,273 @@ fn k2_metadata_and_empty_source_lease_enforce_origins_roles_and_current_fir() {
                 _ => "java-header-output-source-unaccounted",
             };
             assert!(result.unwrap_err().to_string().contains(reason), "{case}");
+        }
+    }
+}
+
+fn selected_k2_jdk21(request: &mut KotlinDiagnosticRequest) {
+    selected_k2(request);
+    request
+        .task
+        .kotlin_compiler
+        .as_mut()
+        .unwrap()
+        .execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+    let mut recipe = request
+        .java_task
+        .as_ref()
+        .unwrap()
+        .java_compiler_recipe()
+        .unwrap();
+    recipe.adapter = "gradle-9.6.1-current-jdk21-utf8-javac-api-v1".into();
+    recipe.language_version = "21".into();
+    recipe.gradle_java_version = "21.0.3".into();
+    recipe.java_runtime_version = "21.0.3+7-LTS-152".into();
+    recipe.gradle_file_encoding = "UTF-8".into();
+    recipe.api_options[1] = "21".into();
+    recipe.api_options[3] = "21".into();
+    recipe
+        .api_options
+        .splice(6..6, ["-encoding".into(), "UTF-8".into()]);
+    set_recipe(request, recipe);
+    let task = request.java_task.as_mut().unwrap();
+    task.options.insert("encoding".into(), json!("UTF-8"));
+    task.options
+        .insert("sourceCompatibility".into(), json!("21"));
+    task.options
+        .insert("targetCompatibility".into(), json!("21"));
+}
+
+#[test]
+fn k2_jdk21_daemon_recipe_preserves_ordered_explicit_utf8_and_output_roles() {
+    let (_owner, mut request) = fixture();
+    selected_k2_jdk21(&mut request);
+    let task = request.java_task.as_ref().unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let private = request.project_dir.join("private");
+    let replayed = replay_options(task, &recipe, &request.task.output_roots[0], &private).unwrap();
+    assert_eq!(replayed.len(), 19);
+    assert_eq!(&replayed[6..8], &["-encoding", "UTF-8"]);
+    assert_eq!(replayed[1], "21");
+    assert_eq!(replayed[3], "21");
+    for (position, original) in recipe.api_options.iter().enumerate() {
+        if ![5, 9, 15, 18].contains(&position) {
+            assert_eq!(&replayed[position], original);
+        }
+    }
+    assert_eq!(
+        replayed[5],
+        path_text(&private.join("java-classes")).unwrap()
+    );
+    assert_eq!(
+        replayed[9],
+        path_text(&private.join("java-headers")).unwrap()
+    );
+    assert_eq!(
+        replayed[15],
+        path_text(&private.join("java-generated")).unwrap()
+    );
+    assert_eq!(
+        replayed[18],
+        joined_classpath(&[task.classpath[0].clone(), private.join("lease")]).unwrap()
+    );
+    assert!(selected_tasks_supported(
+        &request.task,
+        task,
+        &[request.task.clone(), task.clone()]
+    ));
+}
+
+#[test]
+fn k2_jdk21_rejects_unproved_strategy_encoding_runtime_and_options() {
+    let (_owner, original) = fixture();
+    for kind in [
+        "in-process",
+        "out-of-process",
+        "daemon-args",
+        "encoding-null",
+        "encoding-other",
+        "runtime17",
+        "gradle17",
+        "source17",
+        "target17",
+        "missing-encoding",
+        "option-encoding",
+        "adapter",
+        "ap",
+        "release",
+        "charset",
+    ] {
+        let mut request = request(&original.project_dir);
+        selected_k2_jdk21(&mut request);
+        let mut recipe = request
+            .java_task
+            .as_ref()
+            .unwrap()
+            .java_compiler_recipe()
+            .unwrap();
+        match kind {
+            "in-process" => {
+                request
+                    .task
+                    .kotlin_compiler
+                    .as_mut()
+                    .unwrap()
+                    .execution_strategy =
+                    crate::classpath::KotlinCompilerExecutionStrategy::InProcess
+            }
+            "out-of-process" => {
+                request
+                    .task
+                    .kotlin_compiler
+                    .as_mut()
+                    .unwrap()
+                    .execution_strategy =
+                    crate::classpath::KotlinCompilerExecutionStrategy::OutOfProcess
+            }
+            "daemon-args" => request
+                .task
+                .kotlin_compiler
+                .as_mut()
+                .unwrap()
+                .normalized_daemon_jvm_arguments
+                .push("-Dopaque=true".into()),
+            "encoding-null" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("encoding".into(), Value::Null);
+            }
+            "encoding-other" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("encoding".into(), json!("MS932"));
+            }
+            "runtime17" => recipe.java_runtime_version = "17.0.7+8-LTS-224".into(),
+            "gradle17" => recipe.gradle_java_version = "17.0.7".into(),
+            "source17" => recipe.api_options[1] = "17".into(),
+            "target17" => recipe.api_options[3] = "17".into(),
+            "missing-encoding" => {
+                recipe.api_options.drain(6..8);
+            }
+            "option-encoding" => recipe.api_options[7] = "MS932".into(),
+            "adapter" => recipe.adapter = "gradle-9.6.2-current-jdk21-utf8-javac-api-v1".into(),
+            "ap" => request
+                .java_task
+                .as_mut()
+                .unwrap()
+                .annotation_processor_path
+                .push(request.project_dir.join("processor.jar")),
+            "release" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("release".into(), json!(21));
+            }
+            "charset" => recipe.effective_charset = "windows-31j".into(),
+            _ => unreachable!(),
+        }
+        set_recipe(&mut request, recipe);
+        assert!(configured_recipe(&request).is_err(), "{kind}");
+    }
+}
+
+#[test]
+fn k2_jdk17_retains_in_process_and_null_encoding_policy() {
+    let (_owner, mut request) = fixture();
+    selected_k2(&mut request);
+    assert!(configured_recipe(&request).is_ok());
+    request
+        .task
+        .kotlin_compiler
+        .as_mut()
+        .unwrap()
+        .execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+    assert!(configured_recipe(&request).is_err());
+    request
+        .task
+        .kotlin_compiler
+        .as_mut()
+        .unwrap()
+        .execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::InProcess;
+    request
+        .java_task
+        .as_mut()
+        .unwrap()
+        .options
+        .insert("encoding".into(), json!("UTF-8"));
+    assert!(configured_recipe(&request).is_err());
+}
+
+#[test]
+fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() {
+    for sdk21 in [false, true] {
+        let (owner, mut request) = fixture();
+        if sdk21 {
+            selected_k2_jdk21(&mut request);
+        }
+        let overlay =
+            KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+        let path = overlay
+            .sources
+            .iter()
+            .find(|p| p.extension().unwrap() == "java")
+            .unwrap();
+        let recipe = configured_recipe(&request).unwrap();
+        let receipt = java_receipt(path, JAVA, &recipe);
+        let expected = vec![(path.clone(), sha(JAVA.as_bytes()))];
+        let packages = BTreeSet::from(["fixture".into()]);
+        assert_eq!(
+            import_diagnostics(
+                &receipt,
+                &recipe.api_options,
+                &recipe,
+                &expected,
+                &overlay,
+                &packages,
+                1
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+        for field in [
+            "gradleConfiguredEncodingNull",
+            "gradleConfiguredEncoding",
+            "gradleEffectiveDefaultCharset",
+        ] {
+            let mut wrong = receipt.clone();
+            wrong[field] = match field {
+                "gradleConfiguredEncodingNull" => json!(sdk21),
+                "gradleConfiguredEncoding" => {
+                    if sdk21 {
+                        Value::Null
+                    } else {
+                        json!("UTF-8")
+                    }
+                }
+                _ => json!("windows-31j"),
+            };
+            assert!(
+                import_diagnostics(
+                    &wrong,
+                    &recipe.api_options,
+                    &recipe,
+                    &expected,
+                    &overlay,
+                    &packages,
+                    1
+                )
+                .is_err(),
+                "sdk21={sdk21} {field}"
+            );
         }
     }
 }

@@ -1,8 +1,25 @@
--- Temp EXTRA probe: ordinary corpus12 remain unchanged; root audits the raw backend trace.
+-- EXTRA probe: original manifest requests remain unchanged; root audits the raw backend trace.
 return function(ctx)
   local probe = dofile(ctx.repo .. '/dev/nvim_lsp_probe.lua')
   local client = ctx.client
-  local target_path = ctx.project .. '/src/main/java/binaryuse/JavaUse.java'
+  local cem = false
+  local cem_prefix = probe.path_key(ctx.project .. '/src/main/kotlin/io/github/cotrin8672/cem') .. '/'
+  for path in pairs(ctx.sources) do
+    cem = cem or probe.path_key(path):sub(1, #cem_prefix) == cem_prefix
+  end
+  local relative = cem and 'src/main/java/io/github/cotrin8672/cem/mixin/ServerGamePacketListenerImplMixin.java'
+    or 'src/main/java/binaryuse/JavaUse.java'
+  local target_path = vim.fs.abspath(ctx.project .. '/' .. relative)
+  if not ctx.sources[target_path] then
+    assert(cem, 'original binary corpus JavaUse buffer is required')
+    assert(vim.fn.filereadable(target_path) == 1, 'existing CEM Java source is required')
+    local buf = vim.fn.bufadd(target_path)
+    vim.fn.bufload(buf)
+    vim.bo[buf].filetype = 'java'
+    local lines = vim.fn.readfile(target_path)
+    ctx.sources[target_path] = { buf = buf, disk = lines, sha256 = vim.fn.sha256(table.concat(lines, '\n')) }
+    assert(vim.lsp.buf_attach_client(buf, client.id), 'existing CEM Java source attachment failed')
+  end
   local target, originals = nil, {}
   local function disk(path)
     local file = assert(io.open(path, 'rb'))
@@ -16,21 +33,24 @@ return function(ctx)
       version = vim.lsp.util.buf_versions[source.buf], tick = vim.api.nvim_buf_get_changedtick(source.buf) }
     if probe.path_key(path) == probe.path_key(target_path) then target = originals[path] end
   end
-  assert(target, 'original corpus JavaUse buffer is required')
+  assert(target, 'selected existing Java buffer is required')
   local previous_notify, previous_publish = client.rpc.notify, client.handlers['textDocument/publishDiagnostics']
   local report = { expected = { import = 'import ktlsp_missing_native_control.Absent;',
     severity = vim.diagnostic.severity.ERROR, message_contains = 'ktlsp_missing_native_control' },
-    assertions = {}, originals = originals, original_corpus_cases = 12, producer_closure_complete = false,
+    assertions = {}, originals = originals, original_corpus_requests = #ctx.request_outcomes, producer_closure_complete = false,
+    target_path = target_path, target_context = cem and 'Mixin-file context; unused-import diagnostic only' or 'ordinary binary library',
+    mixin_semantics_claimed = false,
     backend_audit = 'root must correlate compiler.java.editor and the complete raw javac receipt' }
   local result, observation, edited_source
   local unchanged, expected_position = true, nil
   local executed, failure = xpcall(function()
     require('vim.lsp._changetracking').flush(client)
     assert(not target.source:find('ktlsp_missing_native_control', 1, true), 'control name already exists')
-    assert(target.lines[1] == 'package binaryuse;', 'unexpected JavaUse package')
+    local package = cem and 'package io.github.cotrin8672.cem.mixin;' or 'package binaryuse;'
+    assert(target.lines[1] == package, 'unexpected selected Java package')
     result, observation = probe.canonical_kotlin_diagnostics(client, target.buf, {
       observation_timeout_ms = 120000, request_timeout_ms = 5000, require_complete = false,
-      edit_label = 'one unsaved unused missing-package import in original JavaUse',
+      edit_label = 'one unsaved unused missing-package import in the selected existing Java source',
       mutate = function()
         vim.api.nvim_buf_set_lines(target.buf, 1, 1, false, { report.expected.import })
         edited_source = probe.buffer_full_text(target.buf)

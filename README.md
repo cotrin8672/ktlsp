@@ -212,17 +212,26 @@ project model records the selected compiler runtime and launch policy separately
 captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.
 The configured model captures plain Gradle 7.4.2 and 9.6.1/current-JDK17 Java
 recipes and task inventories. The existing library route on the disposable binary
-JAR project validates the new profile in Neovim. MODEL12 refreshes older cached
+JAR project validates the new profile in Neovim. MODEL13 refreshes older cached
 models once. On Kotlin 2.4.0 / Gradle 9.6.1 / JDK 17, the Java diagnostic bridge
 requires a successful original compilation and byte-for-byte matching output from
 its K2 collector before checking explicit missing-package imports with Javac.
 Original FIR source identities also cover file annotations and declaration-free
 Kotlin files. Body-error headers and general Java diagnostic coverage remain open.
+The bridge also recognizes the current JDK 21 / explicit UTF-8 profile with
+Kotlin 2.4.0 / Gradle 9.6.1 and selected Kotlin BTA DAEMON execution. Its standalone
+CLI collector must match the successful canonical output; it does not replay
+the Gradle daemon. Large input graphs can still exceed native watcher limits,
+leaving compiler diagnostics unavailable.
 The existing `corpus` route with `dev/corpus/binary-java-jar.json` and
 `KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_k2_java.lua"` checks one unsaved Java
 import error, its current compiler result and buffer restoration. Prepare its
 Module fixture with `dev/binary_java_jar_project.py NEW_TEMP_DIRECTORY module`
 and pass the printed project path as `--root`.
+The same EXTRA probe selects CEM's existing `ServerGamePacketListenerImplMixin.java`
+when CEM sources are present. That probe tests an ordinary unused-import error;
+it does not establish Mixin semantic support. Its current gap is tracked in
+`docs/fork-current.md`.
 On Windows, supported captured tasks also diagnose private overlays of unsaved owned
 Java/Kotlin sources, including new buffers. Their accepted results use the ordinary
 push/pull diagnostic store; unsupported, failed or stale runs cannot clear it.

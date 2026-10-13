@@ -1,16 +1,28 @@
 # Current fork state
 
 Read this before the historical acceptance record. Goal remains in progress.
-Updated2026-10-14 (Asia/Tokyo), checkpoint82.
+Updated2026-10-14 (Asia/Tokyo), checkpoint83.
 
-- Implementation81: verified normal Kotlin2.4.0/Gradle9.6.1/JDK17 Java bridge.
-  Original clean compilation and collector output bytes must match. K1 retained.
-  Rust1,509 pass/0 fail/4 ignored and release passed at81; unchanged this slice.
-- Change82: existing startup benchmark samples its fresh Popen handle on Windows.
-  Full11 Python tests pass, also with ResourceWarning errors; actual CEM RSS works.
-- Current CEM: actual MODEL12, complete source/classpath/task capture. Original
-  user/snapshot source118 hashes match;91 nonMixin. Existing firstfloor10 pass
-  (7 useful completions,2 exact definitions,1 Unknown control), ancillary4 separate.
+- Implementation83: exact current SDK21/explicitUTF8 Java recipe with selected
+  Kotlin2.4.0/Gradle9.6.1 BTA DAEMON facts; SDK17/K1 retained. The collector remains
+  a standalone CLI: original clean compilation and every output byte must match.
+  Configured encoding and actual JVM default charset are recorded separately.
+  MODEL13 refreshes previous captures once. Five regressions failed before the
+  implementation; focused checks, fmt, Rust1,514 pass/0 fail/4 ignored and release pass.
+- Private SDK21 native proof: independent actual Gradle API options match all19
+  captured options; five Java class files match every byte/major65, valid compile
+  succeeds and unused import produces exactly one missing-package ERROR.
+  Actual Gradle DAEMON marker/no fallback; all four Kotlin collector outputs
+  match canonical bytes with current eight-source identities/package origins.
+- Current CEM: actual MODEL13, complete source/classpath/task capture, SDK21/
+  explicitUTF8/DAEMON, Java19 API options. Original source118/91 nonMixin unchanged.
+  The new editor run preserves six original incomplete-code results but does not
+  obtain current Java compiler diagnostics: native input watching hits its cap.
+  Additional probe: two matched restoration/input assertions, two unmeasured,
+  zero manual pulls. Golden4 was not reached; original floor10/UI31 remain at82.
+  All25 Java sources are Mixin/Accessor files; the91 nonMixin sources are Kotlin.
+  A Java unused-import probe there proves only ordinary import diagnostics,
+  not Mixin semantics or nonMixin Java coverage.
 - Real Neovim UI31: one unique CEM context, first1/warm30; all31 accepted exact
   text with one completion request each. Warm menu handoff p50=42.531ms,
   p95=55.615ms (nearest rank); RPC p50=9.878ms/p95=21.797ms.
@@ -20,14 +32,14 @@ Updated2026-10-14 (Asia/Tokyo), checkpoint82.
   project27.969s/library43.532s; closed UI cache reuse project93ms/library1500ms.
   Warm run has one disk model hit and zero Gradle dumps. Server RSS only:
   cold steady/peak1849.4/1854.6MiB; warm1373.7/1373.7MiB,1s/11 samples each.
-- Reproduced CEM Java compiler gap: SDK/source/target21 + explicitUTF8 recipe
-  is null/Unsupported Java source/SDK/encoding policy. Kotlin2.4 BTA uses DAEMON,
-  also outside current InProcess-only bridge. Java25 ASCII/AP0/compilerArgs0/
-  forkfalse/release null; broader provider claims are not independently exported.
-- Next implementation: exact CEM SDK21/UTF8/DAEMON support and real compiler/editor
-  evidence; preserve canonical bytes/source/domain/error boundaries. Then latest
-  five other projects and live Gradle refresh. Avoid recapturing five MODEL12s if
-  the next producer change requires a cache version bump.
+- Reproduced current blocker: compiler-native-watch-cap before compiler acceptance,
+  not an empty successful diagnostic result. Bounded audit:225 selected inputs
+  require628 distinct nonrecursive directories against cap512; declared inputs
+  include101 Gradle classpath snapshot artifacts. Do not just raise the cap or
+  drop inputs by filename: preserve exact source/config/dependency invalidation.
+- Next: fix input watch planning, rerun original10 plus Java probe and SDK17 editor
+  control, then latest five projects/live Gradle refresh. No current CEM Java
+  diagnostic parity claim. Keep existing timings historical until remeasured.
 - Last complete six-project floor remains release76/checkpoint77 (60 RPCs).
   Only CEM is current at82. Other5/IDEA comparison/broader plugins/inherited and
   generated Java coverage/wider UX remain open. Goal is not complete.
@@ -39,6 +51,9 @@ Keep raw logs on disk. Before printing JSON, select scalar fields and check its 
 never print whole models, ABI tables, guard inventories or stage/request arrays.
 Normal output: status, counts, artifact path and the next action. Bound output at
 the producer as well as the tool; on failure retrieve only the relevant code/log range.
+Default read budget: at most80 lines/4,000 characters per call. Search for the
+symbol first, then read its relevant range. If more is needed, narrow the question
+and request another range; tool truncation is not an output filter.
 Select primitive JSON fields before printing; check dict/list types before listing keys.
 Never print progress arrays; inspect a closed receipt and aggregate its stages instead.
 Do not dump a plan to inspect its command.
@@ -56,9 +71,12 @@ Stop dependent tool calls when preparation fails. Rebind intentionally changed
 fixture/common-input guards explicitly to the tested release before editor launch.
 
 Evidence base: C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
-Launch state: current-slice82.json; no native task active.
-Audits: root-cem-acceptance82-1/audit.json (26 checks);
-cem-sdk21-model-facts82-1/facts-summary.json.
-Runtime binary/release remain native-k2-java-release81-1 (aed5208d...).
-Latest closed private Gradle-home owner: native-cem-warm-startup82-1/receipt.json.
+Launch state: current-slice83.json; no native task active.
+Proofs: native-k2-java-release83-1; native-sdk21-public83-3;
+native-sdk21-collector83-1; root-cem-model13-audit83-1/audit.json;
+native-cem-java-floor83-1/receipt.json (diagnostic coverage gap).
+Runtime: native-k2-java-release83-1/bin/ktlsp.exe (e1740b2a...).
+Latest closed private Gradle-home owner: native-cem-java-floor83-1/receipt.json.
+Its semantic probe failed; native exit1/error null/EOF/owned0 and stable guards
+prove closed ownership only. Read controller_error for semantic status.
 No preexisting process adoption/global process inventory. Keep AGENTS.md untouched.

@@ -249,6 +249,7 @@ pub(super) fn import_dependencies(
             return None;
         };
         let candidate = model.plain_java_task(&crate::paths::file_key(first))?;
+        let recipe = task.java_compiler_recipe()?;
         if !std::ptr::eq(task, candidate)
             || !task.annotation_processor_path.is_empty()
             || task.kotlin_compiler.is_some()
@@ -277,7 +278,11 @@ pub(super) fn import_dependencies(
                 .is_none_or(|(a, b)| !same_path(a, b))
             || task.options.get("bootstrapClasspath") != Some(&Value::Null)
             || task.options.get("release") != Some(&Value::Null)
-            || task.options.get("encoding") != Some(&Value::Null)
+            || if recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1" {
+                task.options.get("encoding").and_then(Value::as_str) != Some("UTF-8")
+            } else {
+                task.options.get("encoding") != Some(&Value::Null)
+            }
             || task.output_roots.len() != 1
             || intersecting
                 .iter()
@@ -287,7 +292,6 @@ pub(super) fn import_dependencies(
             // covers only the exact plain Java classes directory; unrelated source sets are ignored.
             return None;
         }
-        let recipe = task.java_compiler_recipe()?;
         if recipe.effective_charset != "UTF-8"
             || !recipe.api_options.iter().any(|arg| arg == "-proc:none")
             || recipe
@@ -758,16 +762,27 @@ fn replay_options(
     private: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let options = &recipe.api_options;
-    let complete_k2 = recipe.adapter == "gradle-9.6.1-current-jdk17-javac-api-v1";
+    let explicit_utf8_jdk21 = recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1";
+    let complete_k2 =
+        explicit_utf8_jdk21 || recipe.adapter == "gradle-9.6.1-current-jdk17-javac-api-v1";
+    let encoding_slots = if explicit_utf8_jdk21 { 2 } else { 0 };
+    let level = if explicit_utf8_jdk21 { "21" } else { "17" };
     anyhow::ensure!(
-        options.len() == if complete_k2 { 17 } else { 18 },
+        options.len()
+            == if explicit_utf8_jdk21 {
+                19
+            } else if complete_k2 {
+                17
+            } else {
+                18
+            },
         "java-api-options-shape-unhandled"
     );
     for (index, expected) in [
         (0, "-source"),
-        (1, "17"),
+        (1, level),
         (2, "-target"),
-        (3, "17"),
+        (3, level),
         (4, "-d"),
         (6, "-h"),
         (8, "-g"),
@@ -778,11 +793,20 @@ fn replay_options(
         (14, "-XDuseUnsharedTable=true"),
         (15, "-classpath"),
     ] {
+        let index = if index >= 6 {
+            index + encoding_slots
+        } else {
+            index
+        };
         anyhow::ensure!(
             options[index] == expected,
             "java-api-options-unhandled-at-{index}"
         );
     }
+    anyhow::ensure!(
+        !explicit_utf8_jdk21 || (options[6] == "-encoding" && options[7] == "UTF-8"),
+        "java-api-encoding-options-differ"
+    );
     anyhow::ensure!(
         complete_k2 || options[17] == "-proc:none",
         "java-api-options-unhandled-at-17"
@@ -791,7 +815,7 @@ fn replay_options(
         task.output_roots.len() == 1 && same_path(Path::new(&options[5]), &task.output_roots[0]),
         "java-output-role-unknown"
     );
-    for position in [7, 13] {
+    for position in [7 + encoding_slots, 13 + encoding_slots] {
         anyhow::ensure!(
             task.declared_output_roots
                 .iter()
@@ -800,7 +824,7 @@ fn replay_options(
         );
     }
     anyhow::ensure!(
-        options[16] == joined_classpath(&task.classpath)?,
+        options[16 + encoding_slots] == joined_classpath(&task.classpath)?,
         "java-captured-classpath-differs"
     );
     let slots: Vec<_> = task
@@ -826,12 +850,12 @@ fn replay_options(
     let mut result = options.clone();
     for (index, directory) in [
         (5, "java-classes"),
-        (7, "java-headers"),
-        (13, "java-generated"),
+        (7 + encoding_slots, "java-headers"),
+        (13 + encoding_slots, "java-generated"),
     ] {
         result[index] = path_text(&private.join(directory))?;
     }
-    result[16] = joined_classpath(&classpath)?;
+    result[16 + encoding_slots] = joined_classpath(&classpath)?;
     Ok(result)
 }
 
@@ -856,6 +880,7 @@ pub(super) fn configured_recipe(
         .kotlin_compiler
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("kotlin-recipe-unavailable"))?;
+    let explicit_utf8_jdk21 = recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1";
     anyhow::ensure!(
         ((kotlin.compiler_version == "1.8.21"
             && kotlin.gradle_plugin_version == "1.8.21"
@@ -864,10 +889,15 @@ pub(super) fn configured_recipe(
             || (k2_normal(request)
                 && kotlin.run_via_build_tools_api
                 && matches!(
-                    kotlin.execution_strategy,
-                    crate::classpath::KotlinCompilerExecutionStrategy::InProcess
-                )
-                && recipe.adapter == "gradle-9.6.1-current-jdk17-javac-api-v1"))
+                    (recipe.adapter.as_str(), &kotlin.execution_strategy),
+                    (
+                        "gradle-9.6.1-current-jdk17-javac-api-v1",
+                        crate::classpath::KotlinCompilerExecutionStrategy::InProcess
+                    ) | (
+                        "gradle-9.6.1-current-jdk21-utf8-javac-api-v1",
+                        crate::classpath::KotlinCompilerExecutionStrategy::Daemon
+                    )
+                )))
             && kotlin.normalized_daemon_jvm_arguments.is_empty(),
         "java-header-compiler-version-unhandled"
     );
@@ -884,9 +914,10 @@ pub(super) fn configured_recipe(
             && same_path(&kotlin.gradle_java_home, sdk),
         "java-kotlin-sdk-selection-differs"
     );
+    let version_prefix = if explicit_utf8_jdk21 { "21." } else { "17." };
     anyhow::ensure!(
-        recipe.gradle_java_version.starts_with("17.")
-            && recipe.java_runtime_version.starts_with("17.")
+        recipe.gradle_java_version.starts_with(version_prefix)
+            && recipe.java_runtime_version.starts_with(version_prefix)
             && recipe.effective_charset == "UTF-8",
         "java-runtime-or-charset-unhandled"
     );
@@ -896,7 +927,11 @@ pub(super) fn configured_recipe(
             && task.annotation_processor_path.is_empty()
             && task.options.get("bootstrapClasspath") == Some(&Value::Null)
             && task.options.get("release") == Some(&Value::Null)
-            && task.options.get("encoding") == Some(&Value::Null),
+            && if explicit_utf8_jdk21 {
+                task.options.get("encoding").and_then(Value::as_str) == Some("UTF-8")
+            } else {
+                task.options.get("encoding") == Some(&Value::Null)
+            },
         "java-custom-compiler-options-unhandled"
     );
     anyhow::ensure!(
@@ -1960,6 +1995,19 @@ fn import_diagnostics(
     exit: i32,
 ) -> anyhow::Result<Vec<CompileDiagnostic>> {
     require_bool(value, "compileCompleted", true)?;
+    let explicit_utf8_jdk21 = recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1";
+    require_bool(value, "gradleConfiguredEncodingNull", !explicit_utf8_jdk21)?;
+    anyhow::ensure!(
+        if explicit_utf8_jdk21 {
+            value
+                .get("gradleConfiguredEncoding")
+                .and_then(Value::as_str)
+                == Some("UTF-8")
+        } else {
+            value.get("gradleConfiguredEncoding") == Some(&Value::Null)
+        },
+        "java-structured-encoding-differs"
+    );
     anyhow::ensure!(
         value.get("failure") == Some(&Value::Null)
             && value.get("options") == Some(&serde_json::to_value(options)?)
@@ -2306,6 +2354,10 @@ pub(super) fn run(
         (
             "expected.javaRuntimeVersion".into(),
             recipe.java_runtime_version.clone(),
+        ),
+        (
+            "gradle.configuredEncodingNull".into(),
+            (task.options.get("encoding") == Some(&Value::Null)).to_string(),
         ),
         ("effective.charset".into(), recipe.effective_charset.clone()),
         ("effective.locale".into(), recipe.locale.clone()),

@@ -6012,3 +6012,47 @@ The source-only six successor plan is six-ui-performance-plan81-1; five fresh
 models/editor/performance arms are still unrun. Gradle-labelled8.14.3 actually
 uses wrapper8.14.2; preserve this distinction in the next capture. Last whole
 six-floor evidence remains release76. Goal stays active.
+
+## 2026-10-14 checkpoint83: selected SDK21 profile and the next CEM blocker
+
+The Java bridge now captures/replays the exact current SDK21/source21/target21,
+explicitUTF8, Gradle9.6.1/Kotlin2.4 BTA DAEMON profile. SDK17/K1 remain admitted
+under their previous policies. The standalone CLI collector is not daemon/task
+replay; complete original output bytes remain its required authority. Configured
+encoding, actual default charset and file-manager charset have distinct receipts.
+MODEL13 invalidates old captures once. Five regressions failed before the fix;
+focused checks, fmt, all1,514 Rust tests (0 failed/4 ignored) and release passed.
+
+Private SDK21 fixture: actual independent Gradle builder options equal all19
+model recipe entries; public Javac replay produces five byte-identical major65
+classes, while an unused missing-package import produces exactly one ERROR.
+Valid source succeeds. Real Gradle DAEMON evidence has no fallback marker.
+All four Kotlin collector outputs equal the actual canonical bytes, with eight
+current source identities, original FIR package domains and typed metadata.
+This proves the finite profile/fixture, not whole-project Java diagnostic parity
+or non-ASCII LSP diagnostic support. Native SDK17 editor revalidation is pending.
+
+CEM fresh MODEL13 captures the genuine SDK21/UTF8 recipe (19 options), Java25,
+Kotlin task118, BTA DAEMON and unchanged source/build inventories. A retained
+controller's final literal12 assertion was wrong; the actual model/closed native
+receipt were independently audited as13 without another capture or model rewrite.
+All25 CEM Java files are Mixin/Accessor files;91 nonMixin sources are Kotlin.
+The EXTRA hook therefore labels its existing Java target a Mixin-file context
+and checks only an ordinary unused import, without claiming Mixin semantics.
+
+Real Neovim on the new release matched the original six incomplete-code requests,
+but the extra current-Java acceptance/pull and ERROR assertions are unmeasured
+(zero manual pulls). Buffers/hooks restore and disk guards remain stable. Server
+stderr gives compiler-native-watch-cap before compiler acceptance; the second
+golden4 stage was not reached. Do not interpret the timeout/no diagnostic as a
+semantic pass. Next: efficient exact input-watch planning, then original10 plus
+the Java probe and SDK17 control. Five current models/live refresh/IDEA and the
+wider outstanding coverage remain open. Existing UI31 numbers are historical82.
+
+Evidence in the existing Temp base: cem-sdk21-candidate83-2;
+native-k2-java-red83-1; native-k2-java-focused83-2; native-k2-java-release83-1;
+native-sdk21-public83-3 (root-reviewed capture charset correction retained);
+native-sdk21-collector83-1; root-cem-model13-audit83-1/audit.json;
+native-cem-java-floor83-1/receipt.json; cem-native-watch84-1/input-scope.json.
+Latest native roots are closed naturally with EOF/owned0; semantic failure is
+recorded separately from private-home ownership. Goal remains active.

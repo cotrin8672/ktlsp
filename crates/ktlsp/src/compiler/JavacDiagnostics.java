@@ -176,6 +176,10 @@ public final class JavacDiagnostics {
         try (Reader reader = Files.newBufferedReader(spec, StandardCharsets.UTF_8)) { p.load(reader); }
         Locale locale = Locale.forLanguageTag(require(p, "effective.locale"));
         Charset charset = Charset.forName(require(p, "effective.charset"));
+        String encodingNull = require(p, "gradle.configuredEncodingNull");
+        if (!encodingNull.equals("true") && !encodingNull.equals("false"))
+            throw new IllegalArgumentException("Invalid configured encoding flag");
+        boolean configuredEncodingNull = Boolean.parseBoolean(encodingNull);
         List<String> options = new ArrayList<>();
         for (int i = 0; i < Integer.parseInt(require(p, "option.count")); i++)
             options.add(require(p, "option." + i));
@@ -193,7 +197,8 @@ public final class JavacDiagnostics {
         out.put("inputSpecSha256", sha(spec));
         out.put("runtime", runtime());
         out.put("gradleFileEncoding", require(p, "gradle.fileEncoding"));
-        out.put("gradleConfiguredEncodingNull", true);
+        out.put("gradleConfiguredEncodingNull", configuredEncodingNull);
+        out.put("gradleConfiguredEncoding", configuredEncodingNull ? null : charset.name());
         out.put("gradleEffectiveDefaultCharset", require(p, "effective.charset"));
         out.put("gradleEffectiveDefaultLocale", require(p, "effective.locale"));
         out.put("explicitFileManagerCharset", charset.name());

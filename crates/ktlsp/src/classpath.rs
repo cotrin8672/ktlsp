@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 12;
+const MODEL_VERSION: u32 = 13;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,11 +149,15 @@ impl CompilerTask {
         let recipe: JavaCompilerRecipe =
             serde_json::from_value(self.options.get("javaCompilerRecipe")?.clone()).ok()?;
         (matches!(
-            recipe.adapter.as_str(),
-            "gradle-7.4.2-current-jdk17-javac-api-v1" | "gradle-9.6.1-current-jdk17-javac-api-v1"
+            (recipe.adapter.as_str(), recipe.language_version.as_str()),
+            (
+                "gradle-7.4.2-current-jdk17-javac-api-v1"
+                    | "gradle-9.6.1-current-jdk17-javac-api-v1",
+                "17"
+            ) | ("gradle-9.6.1-current-jdk21-utf8-javac-api-v1", "21")
         ) && recipe.compiler_type
             == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler"
-            && recipe.language_version == "17"
+            && (recipe.language_version != "21" || recipe.effective_charset == "UTF-8")
             && !recipe.api_options.is_empty()
             && [
                 &recipe.java_runtime_version,
@@ -1625,6 +1629,35 @@ mod tests {
     }
 
     #[test]
+    fn java_recipe_jdk21_utf8_requires_exact_adapter_language_and_charset() {
+        let mut java = plain_java_configuration();
+        let mut recipe = selected_java_recipe();
+        recipe["adapter"] = serde_json::json!("gradle-9.6.1-current-jdk21-utf8-javac-api-v1");
+        recipe["language_version"] = serde_json::json!("21");
+        recipe["java_runtime_version"] = serde_json::json!("21.0.3+7-LTS-152");
+        recipe["gradle_java_version"] = serde_json::json!("21.0.3");
+        recipe["api_options"] =
+            serde_json::json!(["-source", "21", "-target", "21", "-encoding", "UTF-8"]);
+        java["options"]["javaCompilerRecipeProblem"] = serde_json::Value::Null;
+        java["options"]["javaCompilerRecipe"] = recipe.clone();
+        let task: CompilerTask = serde_json::from_value(java.clone()).unwrap();
+        assert_eq!(task.java_compiler_recipe().unwrap().language_version, "21");
+        for (field, value) in [
+            ("adapter", "gradle-9.6.2-current-jdk21-utf8-javac-api-v1"),
+            ("adapter", "gradle-9.6.1-current-jdk17-javac-api-v1"),
+            ("language_version", "17"),
+            ("language_version", "22"),
+            ("effective_charset", "MS932"),
+        ] {
+            let mut wrong = recipe.clone();
+            wrong[field] = serde_json::json!(value);
+            java["options"]["javaCompilerRecipe"] = wrong;
+            let task: CompilerTask = serde_json::from_value(java.clone()).unwrap();
+            assert!(task.java_compiler_recipe().is_none(), "{field}={value}");
+        }
+    }
+
+    #[test]
     fn java_recipe_preserves_effective_defaults_and_full_option_order_in_model_cache() {
         let mut java = plain_java_configuration();
         java["options"]["javaCompilerRecipe"] = selected_java_recipe();
@@ -2649,6 +2682,13 @@ dependencies {
             serde_json::to_vec(&CacheEntry {
                 // The embedded script previously left Gradle 9.6.1 recipes unsupported.
                 model_version: 11,
+                mtimes: model.mtimes.clone(),
+                modules: model.modules.clone(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&CacheEntry {
+                // MODEL12 cached the selected JDK21/explicit UTF-8 recipe as unsupported.
+                model_version: 12,
                 mtimes: model.mtimes.clone(),
                 modules: model.modules.clone(),
             })

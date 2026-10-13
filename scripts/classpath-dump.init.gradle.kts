@@ -76,7 +76,7 @@ object KtlspCompilerConfiguration {
     }
 
     private fun javaCompilerRecipe(task: JavaCompile, selectedHome: java.io.File?): Map<String, Any?> {
-        // shortcut: only these pinned Gradle profiles/current JDK 17 have verified plain javac capture.
+        // shortcut: pinned Gradle/current-SDK profiles; other policies remain unavailable.
         val profile = javaGradleProfile(task)
         check(read(task.project.gradle.startParameter, profile.configurationCacheGetter) == false) {
             "Java recipe capture requires configuration cache disabled"
@@ -84,6 +84,8 @@ object KtlspCompilerConfiguration {
         check(task.javaClass.name in listOf("org.gradle.api.tasks.compile.JavaCompile",
             "org.gradle.api.tasks.compile.JavaCompile_Decorated")) { "Unsupported Java recipe task type" }
         val o = task.options
+        val explicitUtf8Jdk21 = profile.version == "9.6.1" &&
+            task.sourceCompatibility == "21" && task.targetCompatibility == "21" && o.encoding == "UTF-8"
         // allJvmArgs invokes providers even when fork=false; reject before reading it.
         check(o.forkOptions.jvmArgumentProviders.isEmpty()) { "Java JVM argument providers are unhandled" }
         check(!o.isFork && o.forkOptions.executable == null && o.forkOptions.jvmArgs.isNullOrEmpty() &&
@@ -93,7 +95,7 @@ object KtlspCompilerConfiguration {
         check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none")) { "Opaque Java compiler arguments are unhandled" }
         check(o.annotationProcessorPath?.files?.isEmpty() != false) { "Java annotation processing is unhandled" }
         check(o.sourcepath == null && o.bootstrapClasspath == null && o.extensionDirs == null &&
-            o.release.orNull == null && o.encoding == null) { "Unsupported Java source/SDK/encoding policy" }
+            o.release.orNull == null && (o.encoding == null || explicitUtf8Jdk21)) { "Unsupported Java source/SDK/encoding policy" }
         check(o.javaModuleVersion.orNull == null && o.javaModuleMainClass.orNull == null &&
             task.source.files.none { it.name == "module-info.java" }) { "Java modules are unhandled" }
         fun invoke(name: String): Any = JavaCompile::class.java.getDeclaredMethod(name).apply {
@@ -112,10 +114,10 @@ object KtlspCompilerConfiguration {
         }
         val metadata = selected.metadata
         val home = metadata.installationPath.asFile
-        check(metadata.languageVersion.asInt() == 17 && home.isAbsolute && selectedHome != null &&
+        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
             home.canonicalFile == selectedHome.canonicalFile &&
             home.canonicalFile == java.io.File(System.getProperty("java.home")).canonicalFile) {
-            "Java recipe requires the selected current JDK 17"
+            "Java recipe requires the selected current SDK profile"
         }
         check(o.forkOptions.javaHome == null || o.forkOptions.javaHome?.canonicalFile == home.canonicalFile) {
             "Java compiler home selection differs"
@@ -143,7 +145,8 @@ object KtlspCompilerConfiguration {
         }
         check(read(spec, "getCompileClasspath") == task.classpath.toList() &&
             read(spec, "getDestinationDir") == task.destinationDirectory.orNull?.asFile &&
-            read(compileOptions, "getCompilerArgs") == o.allCompilerArgs.toList()) {
+            read(compileOptions, "getCompilerArgs") == o.allCompilerArgs.toList() &&
+            read(compileOptions, "getEncoding") == o.encoding) {
             "Java effective compiler inputs differ from the recorded task"
         }
         val builderType = Class.forName("org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder",
@@ -161,7 +164,8 @@ object KtlspCompilerConfiguration {
             "Selected Java runtime defaults are empty"
         }
         return linkedMapOf(
-            "adapter" to "gradle-${profile.version}-current-jdk17-javac-api-v1",
+            "adapter" to if (explicitUtf8Jdk21) "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
+                else "gradle-${profile.version}-current-jdk17-javac-api-v1",
             "compiler_type" to selected.javaClass.name,
             "java_runtime_version" to runtimeVersion,
             "language_version" to metadata.languageVersion.toString(),
