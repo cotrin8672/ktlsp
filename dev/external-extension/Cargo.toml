@@ -1,0 +1,21 @@
+[package]
+name = "ktlsp-external-shadow-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This fixture is an independent consumer, not a member of ktlsp's Cargo workspace.
+[workspace]
+
+[dependencies]
+ktlsp = { path = "../../crates/ktlsp" }
+ktcore = { path = "../../crates/ktcore" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tower-lsp-server = "0.23"
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Match the host's existing dependency fixes; Cargo only reads patches from this root.
+[patch.crates-io]
+ls-types = { path = "../../vendor/ls-types" }
+notify = { path = "../../vendor/notify" }

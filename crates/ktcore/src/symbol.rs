@@ -17,6 +17,20 @@ pub enum MemberImplementation {
 pub struct SourceMemberFlags(u8);
 
 impl SourceMemberFlags {
+    pub(crate) fn for_visibility(
+        visibility: crate::extensions::Visibility,
+        internal: bool,
+    ) -> Self {
+        let flags = Self::new(
+            MemberImplementation::Concrete,
+            crate::extensions::Dispatch::Instance,
+            visibility,
+            internal,
+            false,
+        );
+        Self(flags.0 & 0x70)
+    }
+
     pub(crate) fn new(
         implementation: MemberImplementation,
         dispatch: crate::extensions::Dispatch,
@@ -171,6 +185,13 @@ pub struct IndexedSymbol {
     /// Declared superclass/interface types, including arguments and declaration-file visibility.
     #[serde(default)]
     pub supertype_refs: Vec<TypeRef>,
+    /// A decoded binary inventory; unavailable source-call shapes still shadow ancestors by name.
+    /// `Some(empty)` certifies a decoded declaration without blockers, unlike a name-only fallback.
+    /// Method arity is an exact descriptor count; absent counts conservatively include varargs.
+    #[serde(default)]
+    pub unavailable_members: Option<Box<Vec<(String, SymbolKind, Option<u8>)>>>,
+    #[serde(default)]
+    pub is_annotation: bool,
     #[serde(default)]
     pub ext_receiver: Option<String>,
     /// The declaration-scoped receiver template; keep absent facts out of line.
@@ -232,6 +253,8 @@ impl IndexedSymbol {
             documentation: None,
             supertypes: Vec::new(),
             supertype_refs: Vec::new(),
+            unavailable_members: None,
+            is_annotation: false,
             ext_receiver: None,
             extension_receiver: None,
             arity: None,

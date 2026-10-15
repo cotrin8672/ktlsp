@@ -203,6 +203,10 @@ that exact document version. Workspace pull reports also retain the client versi
 unsaved changes and close/reopen. A versionless notification from another server has an
 explicit correlation assumption; neither it nor a first empty push proves that asynchronous
 compiler diagnostics are final.
+The `java` scenario also records first-response completion for unfinished plain
+and qualified Java/Kotlin annotation names. It checks unknown-package and
+ordinary-class exclusions, exact unsaved document delivery, and buffer/disk
+restoration; raw requests are retained in `annotation-snapshots.json`.
 The library scenario also compiles a plain Java owner/caller pair and checks six
 first diagnostic pulls through unsaved edits in both buffers. It covers exact overload
 error ranges, valid Object/generic/varargs calls, delivery identity and restoration.
@@ -434,6 +438,11 @@ For example, `KTLSP_CORPUS_EXTRA_PROBES=/tmp/provider/probes.lua dev/ktlsp-harne
 --root /tmp/project --file /tmp/provider/manifest.json --bin /tmp/provider/server --no-build`.
 This hook enables shared completion, diagnostics, navigation, references and applied-rename
 checks; provider behavior requires an actual run and is not established by registration alone.
+The [external provider fixture](dev/external-extension/README.md) uses this route
+with a separate Rust executable and actual Mixin annotation sources. It covers
+primitive Shadow binding, configuration and unsaved-edit invalidation, and an
+applied rename that preserves the authored prefix. Nominal reference signatures
+and production Mixin integration remain outside that fixture's verified coverage.
 
 `dev/jvm_projection_project.lua` generates a disposable four-buffer Kotlin/JVM fixture for
 this route. Its `dev/corpus/jvm-projections.json` manifest checks the Java exported suspend

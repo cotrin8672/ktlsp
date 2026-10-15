@@ -2022,6 +2022,8 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         documentation: Option<String>,
         supertypes: Vec<String>,
         supertype_refs: Vec<TypeRef>,
+        unavailable_members: Option<Vec<(String, SymbolKind, Option<u8>)>>,
+        is_annotation: bool,
         ext_receiver: Option<String>,
         extension_receiver: Option<ExtensionReceiverFacts>,
         arity: Option<u8>,
@@ -2057,6 +2059,8 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     rich.documentation = Some("receiver metadata".into());
     rich.supertypes = vec!["Base".into()];
     rich.supertype_refs = vec![receiver.clone()];
+    rich.unavailable_members = Some(Box::new(vec![("f".into(), SymbolKind::Function, Some(0))]));
+    rich.is_annotation = true;
     rich.ext_receiver = Some("Owner".into());
     rich.extension_receiver = Some(Box::new(ExtensionReceiverFacts {
         ty: receiver.clone(),

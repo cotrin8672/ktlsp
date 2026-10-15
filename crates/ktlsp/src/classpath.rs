@@ -184,6 +184,11 @@ pub struct SourceSetClasspath {
     pub provided_artifacts: Vec<PathBuf>,
     pub entries: Vec<PathBuf>,
     pub artifacts: Vec<ResolvedArtifact>,
+    /// Exact Gradle source selections; absent until the background source query completes.
+    #[serde(default)]
+    pub source_artifacts: Option<Vec<ResolvedArtifact>>,
+    #[serde(default)]
+    pub source_artifacts_incomplete: bool,
     pub unresolved: Vec<String>,
     pub classpath_incomplete: bool,
     #[serde(default)]
@@ -301,7 +306,14 @@ impl ProjectSnapshot {
             .modules
             .iter()
             .flat_map(|m| &m.source_sets)
-            .flat_map(|s| &s.entries)
+            .flat_map(|s| {
+                s.entries.iter().chain(
+                    s.source_artifacts
+                        .iter()
+                        .flatten()
+                        .map(|artifact| &artifact.path),
+                )
+            })
         {
             model
                 .file_origins
@@ -508,6 +520,52 @@ impl ProjectSnapshot {
             .map(|paths| paths.into_iter().collect())
     }
 
+    pub(crate) fn coordinate_sources(
+        &self,
+        coord: &Coordinate,
+    ) -> anyhow::Result<Option<Vec<(PathBuf, String)>>> {
+        let selected = |component: &ComponentId| {
+            matches!(component, ComponentId::Module { group, name, version }
+                if group == &coord.group && name == &coord.artifact && version == &coord.version)
+        };
+        let mut queried = false;
+        let mut paths = BTreeMap::new();
+        for source in self.modules.iter().flat_map(|module| &module.source_sets) {
+            if !source
+                .artifacts
+                .iter()
+                .any(|artifact| selected(&artifact.component))
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                !source.source_artifacts_incomplete,
+                "Gradle source selection is incomplete for {}",
+                coord.label()
+            );
+            let Some(artifacts) = &source.source_artifacts else {
+                return Ok(None);
+            };
+            queried = true;
+            for artifact in artifacts
+                .iter()
+                .filter(|artifact| selected(&artifact.component))
+            {
+                let origin = self.artifact_origin(&artifact.path).ok_or_else(|| {
+                    anyhow::anyhow!("Gradle source artifact identity is unavailable")
+                })?;
+                paths.insert(artifact.path.clone(), origin.to_string());
+            }
+        }
+        // Different repository/variant selections cannot share one coordinate's source facts.
+        anyhow::ensure!(
+            paths.len() <= 1,
+            "ambiguous Gradle sources for {}",
+            coord.label()
+        );
+        Ok(queried.then(|| paths.into_iter().collect()))
+    }
+
     pub fn coordinates_for_file(&self, file: &Path) -> Option<Vec<Coordinate>> {
         let (_, source) = self.owner_for(file)?;
         Some(
@@ -580,7 +638,11 @@ impl ProjectSnapshot {
     pub fn artifact_revisions(&self) -> BTreeMap<String, std::collections::BTreeSet<String>> {
         let mut revisions: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
         for source in self.modules.iter().flat_map(|module| &module.source_sets) {
-            for artifact in &source.artifacts {
+            for artifact in source
+                .artifacts
+                .iter()
+                .chain(source.source_artifacts.iter().flatten())
+            {
                 if !self.file_origins.contains_key(&path_key(&artifact.path)) {
                     continue;
                 }
@@ -783,6 +845,8 @@ fn parse_dump_reader(
                 | "PROVIDES"
                 | "SCP"
                 | "ARTIFACT"
+                | "SOURCEARTIFACT"
+                | "SOURCEQUERY"
                 | "SUNRESOLVED"
                 | "INCOMPLETE"
                 | "COMPILER"
@@ -801,6 +865,12 @@ fn parse_dump_reader(
                             cur.source_sets.len() - 1
                         });
                     let source = &mut cur.source_sets[idx];
+                    if record == "SOURCEQUERY" {
+                        source.source_artifacts_incomplete |=
+                            source.source_artifacts.replace(Vec::new()).is_some()
+                                || parts.next() != Some("complete");
+                        continue;
+                    }
                     if record == "KOTLIN_COMPILE_TASK" {
                         let selection = parts
                             .next()
@@ -856,7 +926,7 @@ fn parse_dump_reader(
                             "OUTPUT" => source.output_roots.push(path),
                             "PROVIDES" => source.provided_artifacts.push(path),
                             "SCP" => source.entries.push(path),
-                            "ARTIFACT" => {
+                            "ARTIFACT" | "SOURCEARTIFACT" => {
                                 let component = match parts.next() {
                                     Some("MODULE") => {
                                         match (parts.next(), parts.next(), parts.next()) {
@@ -883,11 +953,30 @@ fn parse_dump_reader(
                                     _ => None,
                                 };
                                 if let Some(component) = component {
-                                    source.artifacts.push(ResolvedArtifact { path, component });
+                                    let artifact = ResolvedArtifact { path, component };
+                                    if record == "SOURCEARTIFACT" {
+                                        if !matches!(
+                                            &artifact.component,
+                                            ComponentId::Module { .. }
+                                        ) {
+                                            source.source_artifacts_incomplete = true;
+                                        } else if let Some(artifacts) = &mut source.source_artifacts
+                                        {
+                                            artifacts.push(artifact);
+                                        } else {
+                                            source.source_artifacts_incomplete = true;
+                                        }
+                                    } else {
+                                        source.artifacts.push(artifact);
+                                    }
+                                } else if record == "SOURCEARTIFACT" {
+                                    source.source_artifacts_incomplete = true;
                                 }
                             }
                             _ => {}
                         }
+                    } else if record == "SOURCEARTIFACT" {
+                        source.source_artifacts_incomplete = true;
                     }
                 }
             }
@@ -1021,6 +1110,56 @@ pub fn load_snapshot(root: &Path, force: bool) -> anyhow::Result<Arc<ProjectSnap
     load_snapshot_with(root, force, || {
         dump_with_fallback(root, "ktlspDumpClasspath")
     })
+}
+
+/// Enrich an accepted model after project sources are usable; source downloads do not delay it.
+pub(crate) fn load_source_snapshot(
+    root: &Path,
+    accepted: &Arc<ProjectSnapshot>,
+) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    if accepted
+        .modules
+        .iter()
+        .flat_map(|module| &module.source_sets)
+        .all(|source| source.source_artifacts.is_some() && !source.source_artifacts_incomplete)
+    {
+        return Ok(accepted.clone());
+    }
+    let start = std::time::Instant::now();
+    let result = run_dump(root, "ktlspDumpSources", false);
+    crate::trace::span(
+        "classpath.source_query",
+        "classpath",
+        start,
+        serde_json::json!({"root": root.to_string_lossy(), "ok": result.is_ok()}),
+    );
+    source_snapshot(root, accepted, result?)
+}
+
+fn source_snapshot(
+    root: &Path,
+    accepted: &ProjectSnapshot,
+    modules: Vec<ModuleClasspath>,
+) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    let without_sources = |modules: &[ModuleClasspath]| {
+        let mut modules = modules.to_vec();
+        for source in modules
+            .iter_mut()
+            .flat_map(|module| &mut module.source_sets)
+        {
+            source.source_artifacts = None;
+            source.source_artifacts_incomplete = false;
+        }
+        modules
+    };
+    anyhow::ensure!(
+        without_sources(&modules) == without_sources(&accepted.modules)
+            && accepted.mtimes == build_file_mtimes(root, &accepted.modules),
+        "Gradle model changed during source resolution"
+    );
+    let mut enriched = ProjectSnapshot::new(modules);
+    enriched.mtimes = accepted.mtimes.clone();
+    Ok(Arc::new(enriched))
 }
 
 fn load_snapshot_with(
@@ -1232,6 +1371,28 @@ fn log_unresolved(modules: &[ModuleClasspath]) {
     );
 }
 
+fn create_dump_script() -> anyhow::Result<PathBuf> {
+    let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "ktlsp-classpath-{}-{nonce}-{sequence}.init.gradle.kts",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    if let Err(error) = file.write_all(INIT_SCRIPT.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error.into());
+    }
+    Ok(path)
+}
+
 /// Run the init script via the project's gradle wrapper and parse the dump. Inherits the parent's
 /// environment (so repo-specific flags like SKIP_* are honored when ktlsp is launched with them).
 /// `offline` passes `--offline`: resolution then depends only on the local Gradle cache, which is
@@ -1248,11 +1409,7 @@ fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<Module
     }))
     .map_err(|_| anyhow::anyhow!("no gradle wrapper under {}", gradle.display()))?;
     // Write the embedded init script to a temp file (avoids depending on ktlsp's install layout).
-    let script = std::env::temp_dir().join(format!(
-        "ktlsp-classpath-{}.init.gradle.kts",
-        std::process::id()
-    ));
-    std::fs::write(&script, INIT_SCRIPT)?;
+    let script = create_dump_script()?;
     let _guard = TempFile(&script);
 
     let mut command = Command::new(&gradlew);
@@ -2203,6 +2360,148 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn source_queries_use_independent_complete_init_scripts() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(create_dump_script))
+            .collect();
+        let scripts: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            scripts
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            8
+        );
+        for script in &scripts {
+            assert_eq!(std::fs::read(script).unwrap(), INIT_SCRIPT.as_bytes());
+        }
+        let first = TempFile(&scripts[0]);
+        drop(first);
+        assert!(!scripts[0].exists());
+        for script in scripts.iter().skip(1) {
+            assert_eq!(std::fs::read(script).unwrap(), INIT_SCRIPT.as_bytes());
+            std::fs::remove_file(script).unwrap();
+        }
+    }
+
+    #[test]
+    fn source_cache_written_after_config_change_cannot_restore_stale_selection() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp-stale-source-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let build = root.join("build.gradle");
+        std::fs::write(&build, "plugins { id 'java' }\n").unwrap();
+        let old_time = std::fs::metadata(&build).unwrap().modified().unwrap();
+        let modules = parse_dump(&format!(
+            "PROJECT\t:\t{}\nSOURCESET\tmain\nEND\t:\n",
+            root.display()
+        ));
+        let mut accepted = ProjectSnapshot::new(modules.clone());
+        accepted.mtimes = build_file_mtimes(&root, &accepted.modules);
+        accepted.modules[0].source_sets[0].source_artifacts = Some(Vec::new());
+        std::fs::write(&build, "plugins { id 'java-library' }\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&build)
+            .unwrap()
+            .set_modified(old_time + std::time::Duration::from_secs(2))
+            .unwrap();
+        // Simulate the generation changing between the worker's check and its disk write.
+        store_snapshot(&root, &accepted);
+        let reloaded = std::cell::Cell::new(false);
+        let fresh = load_snapshot_with(&root, false, || {
+            reloaded.set(true);
+            Ok(modules)
+        })
+        .unwrap();
+        assert!(reloaded.get());
+        assert!(fresh.modules[0].source_sets[0].source_artifacts.is_none());
+        std::fs::remove_file(cache_path(&root)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_query_preserves_exact_selection_absence_failure_and_ambiguity() {
+        let coord = Coordinate::parse("vendor:api:1").unwrap();
+        let prefix = "PROJECT\t:app\t/repo/app\nSOURCESET\tmain\nARTIFACT\tmain\t/repo/api.jar\tMODULE\tvendor\tapi\t1\n";
+        let model =
+            |extra: &str| ProjectSnapshot::new(parse_dump(&format!("{prefix}{extra}END\t:app\n")));
+        assert_eq!(model("").coordinate_sources(&coord).unwrap(), None);
+        assert_eq!(
+            model("SOURCEQUERY\tmain\tcomplete\n")
+                .coordinate_sources(&coord)
+                .unwrap(),
+            Some(Vec::new())
+        );
+        assert!(model("SOURCEQUERY\tmain\tfailed\n")
+            .coordinate_sources(&coord)
+            .is_err());
+        let selected = "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t/repo/settings/api-1-sources.jar\tMODULE\tvendor\tapi\t1\n";
+        let snapshot = model(selected);
+        assert_ne!(
+            snapshot.artifact_revisions(),
+            model("").artifact_revisions(),
+            "source selection changes must invalidate completed coordinate facts"
+        );
+        let sources = snapshot.coordinate_sources(&coord).unwrap().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].0,
+            PathBuf::from("/repo/settings/api-1-sources.jar")
+        );
+        assert_eq!(
+            sources[0].1,
+            snapshot.artifact_origin(&sources[0].0).unwrap()
+        );
+        for invalid in [
+            "SOURCEQUERY\tmain\tcomplete\n",
+            "SOURCEARTIFACT\tmain\t/repo/project/api-1-sources.jar\tMODULE\tvendor\tapi\t1\n",
+            "SOURCEARTIFACT\tmain\t/repo/bad.jar\tPROJECT\t:\t:other\n",
+            "SOURCEARTIFACT\tmain\n",
+        ] {
+            assert!(model(&format!("{selected}{invalid}"))
+                .coordinate_sources(&coord)
+                .is_err());
+        }
+        let other_source_set = "SOURCESET\ttest\nARTIFACT\ttest\t/repo/other-api.jar\tMODULE\tvendor\tapi\t1\nSOURCEQUERY\ttest\tcomplete\nSOURCEARTIFACT\ttest\t/repo/project/api-1-sources.jar\tMODULE\tvendor\tapi\t1\n";
+        assert!(model(&format!("{selected}{other_source_set}"))
+            .coordinate_sources(&coord)
+            .is_err());
+        let serialized = serde_json::to_value(&snapshot.modules[0].source_sets[0]).unwrap();
+        let mut previous = serialized.as_object().unwrap().clone();
+        previous.remove("source_artifacts");
+        previous.remove("source_artifacts_incomplete");
+        let previous: SourceSetClasspath = serde_json::from_value(previous.into()).unwrap();
+        assert_eq!(
+            previous.source_artifacts, None,
+            "MODEL14 remains valid before enrichment"
+        );
+        assert!(!previous.source_artifacts_incomplete);
+    }
+
+    #[test]
+    fn source_snapshot_rejects_changed_binary_model_or_build_inputs() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp-source-snapshot-{}", std::process::id()));
+        let modules = parse_dump(
+            "PROJECT\t:app\t/repo/app\nSOURCESET\tmain\nARTIFACT\tmain\t/repo/api.jar\tMODULE\tvendor\tapi\t1\nEND\t:app\n",
+        );
+        let mut accepted = ProjectSnapshot::new(modules.clone());
+        accepted.mtimes = build_file_mtimes(&root, &accepted.modules);
+        let mut enriched = modules;
+        enriched[0].source_sets[0].source_artifacts = Some(Vec::new());
+        assert!(source_snapshot(&root, &accepted, enriched.clone()).is_ok());
+        let mut changed = enriched.clone();
+        changed[0].source_sets[0].artifacts[0].path = PathBuf::from("/repo/changed.jar");
+        assert!(source_snapshot(&root, &accepted, changed).is_err());
+        accepted.mtimes.insert("changed-build-input".into(), 1);
+        assert!(source_snapshot(&root, &accepted, enriched).is_err());
+    }
     #[test]
     fn parse_single_module() {
         let dump = "PROJECT\t:lib\t/abs/lib\nCP\t/jars/a.jar\nCP\t/jars/b.jar\nEND\t:lib\n";
@@ -2627,7 +2926,8 @@ dependencies {
         });
         let modules = parse_dump(&format!(
             "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nKOTLIN_COMPILE_TASK\tmain\t\":app:compileKotlin\"\nCOMPILER\tmain\t{compiler}\nEND\t:app\n",
-            root.join("mapped-module").display(), root.join("custom-kotlin").display(),
+            root.join("mapped-module").display(),
+            root.join("custom-kotlin").display(),
             root.join("custom-output").display()
         ));
         let mut model = ProjectSnapshot::new(modules);
@@ -3088,9 +3388,12 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
         std::fs::write(root.join("build.gradle"), "plugins { id 'java' }").unwrap();
         let modules = |version| {
             parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t{version}\nEND\t:app\n",
-            root.join("modules/editing").display(), root.join("custom-generated").display(),
-            root.join("api.jar").display(), root.join("api.jar").display()))
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t{version}\nEND\t:app\n",
+                root.join("modules/editing").display(),
+                root.join("custom-generated").display(),
+                root.join("api.jar").display(),
+                root.join("api.jar").display()
+            ))
         };
         let original = modules("1");
         let old = publish(&root, original.clone(), build_file_mtimes(&root, &original));

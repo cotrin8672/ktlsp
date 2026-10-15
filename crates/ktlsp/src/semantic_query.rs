@@ -322,6 +322,38 @@ pub fn completion_query(
         tree
     };
     let context = complete::completion_context(&tree, src, offset);
+    if context != complete::CompletionContext::None {
+        let package = crate::parser::package_of(&tree, src);
+        let imports = crate::parser::imports_of(&tree, src);
+        let visibility = Visibility::new(&package, &imports);
+        let scope = language::source_type_scope(file, &tree, src);
+        let ctx = infer::FileCtx::from_tree_in_file(&tree, src, file);
+        if let Some((prefix, mut candidates)) = complete::annotation_candidates(
+            &ScopedIndex::new(index, file),
+            file,
+            src,
+            &tree,
+            offset,
+            &scope,
+            &ctx,
+            |entry| visibility.is_symbol_visible(&entry.sym),
+        ) {
+            candidates.truncate(max_candidates);
+            return Some(CompletionQuery {
+                context: complete::CompletionContext::ScopeName,
+                prefix,
+                status: if candidates.is_empty() {
+                    CompletionStatus::Unknown(vec![
+                        CompletionIncompletenessReason::QueryScopeIncomplete,
+                    ])
+                } else {
+                    CompletionStatus::Found(())
+                },
+                candidates,
+                layout: imports::import_layout(&tree, src),
+            });
+        }
+    }
     match context {
         complete::CompletionContext::ScopeName => scope_name_query(
             &ScopedIndex::new(index, file),
@@ -1068,6 +1100,16 @@ fn member_candidates(
         Some(recovered) => recovered,
         None => index,
     };
+    let fallback_ctx =
+        infer::FileCtx::new(ty.package().unwrap_or_default().to_string(), Vec::new());
+    let (member_ctx, position) = kotlin_ctx.unwrap_or((&fallback_ctx, 0));
+    let shared_members = ktcore::members::completion_candidates_at(
+        inference_index,
+        ty,
+        prefix,
+        member_ctx,
+        position,
+    );
     // Prefer the accepted generated declaration's presentation to an inherited homonym.
     // Recovery still supplies authored members; exact call selection remains in ktcore::jvm.
     let mut java_callables = (language == SourceLanguage::Java)
@@ -1101,44 +1143,20 @@ fn member_candidates(
             }
         }
     }
+    for entry in &shared_members.members {
+        push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
+    }
     let _ = infer::walk_supertypes(inference_index, ty, 32, |current| {
         let Some(cur) = infer::receiver_root_key(inference_index, current) else {
             return ControlFlow::Continue(());
         };
-        let cur_pkg = current.package();
-        let members_index = source_index
-            .filter(|source| {
-                let (container, simple) = match cur.rsplit_once('.') {
-                    Some((container, simple)) => (Some(container), simple),
-                    None => (None, cur.as_str()),
-                };
-                cur_pkg.is_some_and(|pkg| {
-                    source.lookup_type(simple).iter().any(|entry| {
-                        entry.sym.package == pkg && entry.sym.container.as_deref() == container
-                    })
-                })
-            })
-            .map(|source| source as &dyn InferenceIndex)
-            .unwrap_or(index);
-        for e in members_index.members_of(&cur) {
-            if !ktcore::members::receiver_member_accessible(ty, e) {
-                continue;
-            }
-            if let Some(p) = cur_pkg {
-                if e.sym.package != p {
-                    continue;
-                }
-            }
-            push_member_candidate(&mut out, &mut seen, e, &e.sym.name, prefix, None);
-        }
         if kotlin_ctx.is_some() {
             extensions.extend(index.extensions_for(&cur));
         }
         ControlFlow::Continue(())
     });
-    if let Some((ctx, position)) = kotlin_ctx {
-        let locals = ktcore::members::completion_candidates_at(index, ty, prefix, ctx, position);
-        for entry in locals.known_local_extensions() {
+    if let Some((ctx, _)) = kotlin_ctx {
+        for entry in shared_members.known_local_extensions() {
             push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
         }
         for entry in extensions {
@@ -1150,9 +1168,13 @@ fn member_candidates(
             let mut visible = false;
             for name in resolve::visible_extension_names(entry, &ctx.imports, &ctx.package) {
                 visible = true;
-                push_member_candidate(&mut out, &mut seen, entry, name, prefix, None);
+                if !shared_members.member_name_is_unavailable(name, entry.sym.kind) {
+                    push_member_candidate(&mut out, &mut seen, entry, name, prefix, None);
+                }
             }
-            if !visible {
+            if !visible
+                && !shared_members.member_name_is_unavailable(&entry.sym.name, entry.sym.kind)
+            {
                 push_member_candidate(
                     &mut out,
                     &mut seen,
@@ -1174,6 +1196,9 @@ fn member_candidates(
             for entry in
                 resolve::generic_receiver_extensions(index, alias, &ctx.imports, &ctx.package)
             {
+                if shared_members.member_name_is_unavailable(alias, entry.sym.kind) {
+                    continue;
+                }
                 if ktcore::members::extension_receiver_applicability(inference_index, ty, entry)
                     != ktcore::members::Applicability::Applicable
                 {
@@ -1210,7 +1235,10 @@ fn member_candidates(
         }
     }
     out.truncate(max_candidates);
-    (out, withheld_compiled)
+    (
+        out,
+        withheld_compiled || shared_members.has_uncertain_receivers(),
+    )
 }
 
 fn argument_type_mismatch_query(
@@ -1544,6 +1572,336 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn annotation_completion_uses_exact_types_and_qualified_owners_across_languages() {
+        let mut ws = Workspace::new();
+        ws.open(
+            "Marks.java",
+            "package marks; public @interface OverrideMark {} class OverrideClass {}".into(),
+        );
+        ws.open("Outer.java", "package marks; public class Outer { public @interface OverrideNested {} private @interface OverrideHidden {} }".into());
+        ws.open("Marks.kt", "package marks\nannotation class DeprecatedMark\nclass DeprecatedClass\nfun DeprecatedFunction() {}".into());
+        for (file, src, needle, expected) in [
+            (
+                "Use.java",
+                "class Use { @Over public String toString() { return \"\"; } }",
+                "@Over",
+                "OverrideMark",
+            ),
+            (
+                "Use.java",
+                "class Use { @marks.Over public String toString() { return \"\"; } }",
+                "@marks.Over",
+                "OverrideMark",
+            ),
+            (
+                "Use.java",
+                "@marks.Depre class Use {}",
+                "@marks.Depre",
+                "DeprecatedMark",
+            ),
+            (
+                "Use.java",
+                "@marks.Outer.Over class Use {}",
+                "@marks.Outer.Over",
+                "OverrideNested",
+            ),
+            (
+                "Use.java",
+                "import marks.Outer; @Outer.Over class Use {}",
+                "@Outer.Over",
+                "OverrideNested",
+            ),
+            ("Use.kt", "@Depre class Use", "@Depre", "DeprecatedMark"),
+            (
+                "Use.kt",
+                "import marks.DeprecatedMark as RenamedMark\n@Rena class Use",
+                "@Rena",
+                "RenamedMark",
+            ),
+            (
+                "Use.kt",
+                "@marks.Depre class Use",
+                "@marks.Depre",
+                "DeprecatedMark",
+            ),
+            (
+                "Use.kt",
+                "@marks.Over class Use",
+                "@marks.Over",
+                "OverrideMark",
+            ),
+            (
+                "Use.kt",
+                "import marks.Outer as Alias\n@Alias.Over class Use",
+                "@Alias.Over",
+                "OverrideNested",
+            ),
+            (
+                "Use.kt",
+                "@get:marks.Depre val value = 1",
+                "@get:marks.Depre",
+                "DeprecatedMark",
+            ),
+        ] {
+            ws.open(file, src.into());
+            let offset = src.find(needle).unwrap() + needle.len();
+            let result = ws
+                .complete(file, offset, false)
+                .unwrap_or_else(|| panic!("empty {file}: {src}"));
+            assert!(
+                result.items.iter().any(|item| item.label == expected),
+                "{file}: {src}: {result:?}"
+            );
+            assert!(result.items.iter().all(|item| !matches!(
+                item.label.as_str(),
+                "OverrideClass" | "OverrideHidden" | "DeprecatedClass" | "DeprecatedFunction"
+            )));
+            if needle.contains('.') || expected == "RenamedMark" {
+                assert!(result.items.iter().all(|item| item.auto_import.is_none()));
+            }
+        }
+        for (file, src, needle) in [
+            ("Use.java", "@missing.Over class Use {}", "@missing.Over"),
+            ("Use.kt", "@missing.Depre class Use", "@missing.Depre"),
+            (
+                "Use.java",
+                "@marks.Outer.OverrideH class Use {}",
+                "@marks.Outer.OverrideH",
+            ),
+            (
+                "Use.kt",
+                "@marks.Outer.OverrideH class Use",
+                "@marks.Outer.OverrideH",
+            ),
+            (
+                "Use.java",
+                "class Use { String s = \"@marks.Over\"; }",
+                "@marks.Over",
+            ),
+            ("Use.kt", "val s = \"@marks.Depre\"", "@marks.Depre"),
+            ("Use.java", "// @marks.Over", "@marks.Over"),
+            ("Use.kt", "// @marks.Depre", "@marks.Depre"),
+            (
+                "Use.kt",
+                "@marks.DeprecatedMark(value = other.Depre) class Use",
+                "other.Depre",
+            ),
+        ] {
+            ws.open(file, src.into());
+            assert!(
+                ws.complete(file, src.find(needle).unwrap() + needle.len(), false)
+                    .is_none(),
+                "{file}: {src}"
+            );
+        }
+        let src = "package marks; public class Outer { private @interface OverrideHidden {} } @Outer.OverrideH class Other {}";
+        ws.open("Outer.java", src.into());
+        assert!(
+            ws.complete(
+                "Outer.java",
+                src.find("@Outer.OverrideH").unwrap() + "@Outer.OverrideH".len(),
+                false
+            )
+            .is_none(),
+            "same file does not grant a different top-level nest private access"
+        );
+    }
+
+    #[test]
+    fn annotation_completion_retracts_unsaved_java_and_kotlin_type_changes() {
+        for (producer, annotation, ordinary, consumer) in [
+            (
+                "Marks.java",
+                "package marks; public @interface OverrideMark {}",
+                "package marks; public interface OverrideMark {}",
+                "@marks.Over class Use",
+            ),
+            (
+                "Marks.kt",
+                "package marks\nannotation class OverrideMark",
+                "package marks\nclass OverrideMark",
+                "@marks.Over class Use",
+            ),
+        ] {
+            let mut ws = Workspace::new();
+            for file in ["Use.java", "Use.kt"] {
+                ws.open(file, consumer.into());
+            }
+            for source in [annotation, ordinary, annotation] {
+                ws.open(producer, source.into());
+                for file in ["Use.java", "Use.kt"] {
+                    let result = ws.complete(file, "@marks.Over".len(), false);
+                    assert_eq!(
+                        result.is_some(),
+                        source == annotation,
+                        "{producer} -> {file}: {source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn annotation_completion_preserves_language_specific_private_nests() {
+        for (file, src, needle, available) in [
+            ("Outer.java", "public class Outer { static class Inner { private @interface Hidden {} } @Inner.Hid static class Other {} }", "@Inner.Hid", true),
+            ("Outer.java", "public class Outer { private @interface Hidden {} } @Outer.Hid class Other {}", "@Outer.Hid", false),
+            ("Outer.java", "public class Outer { static class Inner { public @interface Hidden {} } static class Other { static class Inner {} @Inner.Hid void run() {} } }", "@Inner.Hid", false),
+            ("Outer.kt", "class Outer { private annotation class Hidden\n @Hid class Inner }", "@Hid", true),
+            ("Outer.kt", "class Outer { class Inner { private annotation class Hidden }\n @Inner.Hid class Other }", "@Inner.Hid", false),
+            ("Outer.kt", "private annotation class Hidden\n@Hid class Other", "@Hid", true),
+        ] {
+            let mut ws = Workspace::new();
+            ws.open(file, src.into());
+            let result = ws.complete(file, src.find(needle).unwrap() + needle.len(), false);
+            assert_eq!(result.as_ref().is_some_and(|result| result.items.iter().any(|item| item.label == "Hidden")), available, "{file}: {src}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn annotation_completion_imports_nested_types_only_when_legal_and_needed() {
+        let mut ws = Workspace::new();
+        ws.open("Outer.java", "package marks; public class Outer { public @interface NestedMark {} private @interface PrivateMark {} static class Inner { private @interface HiddenMark {} } @Hid void use() {} }".into());
+        for (file, src, import) in [
+            ("Use.java", "package marks; @Nes class Use {}", true),
+            ("Use.kt", "package marks\n@Nes class Use", true),
+            (
+                "Use.java",
+                "package marks; import marks.Outer.NestedMark; @Nes class Use {}",
+                false,
+            ),
+            (
+                "Use.kt",
+                "package marks\nimport marks.Outer.NestedMark\n@Nes class Use",
+                false,
+            ),
+            (
+                "Use.java",
+                "package marks; import marks.Outer.*; @Nes class Use {}",
+                false,
+            ),
+        ] {
+            ws.open(file, src.into());
+            let result = ws
+                .complete(file, src.find("@Nes").unwrap() + "@Nes".len(), false)
+                .expect(src);
+            let item = result
+                .items
+                .iter()
+                .find(|item| item.label == "NestedMark")
+                .unwrap();
+            assert_eq!(
+                item.auto_import.is_some(),
+                import,
+                "{file}: {src}: {item:?}"
+            );
+            if import {
+                assert!(item
+                    .auto_import
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .contains("marks.Outer.NestedMark"));
+            }
+        }
+        let src = "package marks; public class Outer { public @interface NestedMark {} @Nes void use() {} }";
+        ws.open("Outer.java", src.into());
+        let result = ws
+            .complete(
+                "Outer.java",
+                src.find("@Nes").unwrap() + "@Nes".len(),
+                false,
+            )
+            .unwrap();
+        assert!(result
+            .items
+            .iter()
+            .find(|item| item.label == "NestedMark")
+            .unwrap()
+            .auto_import
+            .is_none());
+        let src = "public class Outer { static class Inner { private @interface HiddenMark {} } @Hid void use() {} }";
+        ws.open("Outer.java", src.into());
+        assert!(
+            ws.complete(
+                "Outer.java",
+                src.find("@Hid").unwrap() + "@Hid".len(),
+                false
+            )
+            .is_none(),
+            "private import cannot make an out-of-scope nested annotation usable"
+        );
+    }
+
+    #[test]
+    fn annotation_completion_and_ordinary_types_apply_language_correct_imports() {
+        let mut ws = Workspace::new();
+        ws.open(
+            "Types.kt",
+            "package marks\nannotation class Marker\nclass Other".into(),
+        );
+        for (file, src, prefix, label, expected) in [
+            (
+                "Use.java",
+                "package use;\n\n@Mar class Use {}\n",
+                "Mar",
+                "Marker",
+                "package use;\nimport marks.Marker;\n\n@Marker class Use {}\n",
+            ),
+            (
+                "Use.kt",
+                "package use\n\n@Mar class Use\n",
+                "Mar",
+                "Marker",
+                "package use\nimport marks.Marker\n\n@Marker class Use\n",
+            ),
+            (
+                "Use.java",
+                "package use;\n\nclass Use { Oth value; }\n",
+                "Oth",
+                "Other",
+                "package use;\nimport marks.Other;\n\nclass Use { Other value; }\n",
+            ),
+            (
+                "Use.kt",
+                "package use\n\nval value: Oth? = null\n",
+                "Oth",
+                "Other",
+                "package use\nimport marks.Other\n\nval value: Other? = null\n",
+            ),
+        ] {
+            ws.open(file, src.into());
+            let start = src.find(prefix).unwrap();
+            let result = ws.complete(file, start + prefix.len(), false).expect(src);
+            let item = result
+                .items
+                .iter()
+                .find(|item| item.label == label)
+                .unwrap();
+            let import = item
+                .auto_import
+                .as_ref()
+                .expect("out-of-package type needs import");
+            let offset = crate::imports::import_insert_offset(src, import.line);
+            let applied = crate::edit::apply_to_text(
+                file,
+                src,
+                &[
+                    crate::edit::TextEdit::new(
+                        file,
+                        start,
+                        start + prefix.len(),
+                        &item.insert_text,
+                    ),
+                    crate::edit::TextEdit::new(file, offset, offset, format!("{}\n", import.text)),
+                ],
+            )
+            .unwrap();
+            assert_eq!(applied, expected, "{file}: {src}");
+        }
+    }
+
     fn call_at<'t>(tree: &'t Tree, src: &str, needle: &str) -> Node<'t> {
         tree.root_node()
             .named_descendant_for_byte_range(src.find(needle).unwrap(), src.find(needle).unwrap())
@@ -1636,6 +1994,8 @@ mod tests {
                 documentation: None,
                 supertypes: Vec::new(),
                 supertype_refs: Vec::new(),
+                unavailable_members: None,
+                is_annotation: false,
                 ext_receiver: Some("Dog".into()),
                 extension_receiver: None,
                 arity: Some(1),

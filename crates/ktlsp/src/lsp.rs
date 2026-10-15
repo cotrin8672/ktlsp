@@ -622,6 +622,7 @@ fn spawn_coordinate_index_worker(
     indexed_sources: std::sync::Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>,
     authoritative: bool,
     selected_binaries: Vec<(std::path::PathBuf, String)>,
+    model: Option<Arc<classpath::ProjectSnapshot>>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
@@ -635,11 +636,11 @@ fn spawn_coordinate_index_worker(
 
             let label = coord.label();
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let source = match deps::coordinate_source_checked(&coord, &repos, &extract_root) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        tracing::warn!("resolve {label} failed: {error:#}");
-                        return (Vec::new(), true, Vec::new(), false, true);
+                let (source, source_failed) = match deps::coordinate_source_for_model(&coord, &repos, &extract_root, model.as_deref()) {
+                    Ok(source) => (source, false),
+                    Err(_) => {
+                        tracing::warn!("source selection for {label} is unavailable");
+                        (None, true)
                     }
                 };
                 let mut source_missing = source.is_none();
@@ -700,6 +701,7 @@ fn spawn_coordinate_index_worker(
                 } else {
                     (Vec::new(), false)
                 };
+                failed |= source_failed;
                 let empty_input = source_missing || (!skipped && batches.is_empty());
                 let verified_empty_binary = if empty_input && authoritative && !failed {
                     match verified_empty_binaries(&selected_binaries) {
@@ -776,15 +778,44 @@ fn index_dependencies(
         coords.extend(deps::coordinates_from_build_files(root, &repos));
     }
     let mut local_jars = VecDeque::new();
-    let authoritative = model
-        .as_ref()
-        .is_some_and(|m| m.modules.iter().any(|m| !m.source_sets.is_empty()));
+    let authoritative = gradle
+        && model
+            .as_ref()
+            .is_some_and(|m| m.modules.iter().any(|m| !m.source_sets.is_empty()));
     if gradle && !authoritative {
         return DepStats {
             incomplete_classpath: true,
             ..Default::default()
         };
     }
+    let model = if let Some(accepted) = model.filter(|_| authoritative) {
+        let enriched = match classpath::load_source_snapshot(root, &accepted) {
+            Ok(enriched) => enriched,
+            Err(_) => {
+                tracing::warn!("Gradle source selection enrichment is unavailable");
+                accepted.clone()
+            }
+        };
+        {
+            let mut guard = ws.lock();
+            if !guard.is_current_generation(generation) {
+                return DepStats {
+                    incomplete_classpath: true,
+                    ..Default::default()
+                };
+            }
+            if !Arc::ptr_eq(&accepted, &enriched) {
+                guard.set_project_model(enriched.clone());
+                classpath::publish_snapshot(root, enriched.clone());
+            }
+        }
+        if !Arc::ptr_eq(&accepted, &enriched) && ws.lock().is_current_generation(generation) {
+            classpath::store_snapshot(root, &enriched);
+        }
+        Some(enriched)
+    } else {
+        None
+    };
     if authoritative {
         let model = model.as_ref().unwrap();
         coords = model.coordinates();
@@ -948,6 +979,7 @@ fn index_dependencies(
                     .as_ref()
                     .and_then(|model| model.coordinate_binaries(&coord))
                     .unwrap_or_default(),
+                model.clone(),
                 tx.clone(),
             );
             active += 1;
@@ -1328,6 +1360,10 @@ async fn index_workspace(
         }
     }
     let stats = handle.await.unwrap_or_default();
+    if gradle {
+        let enriched = classpath::snapshot(&root);
+        register_project_watches(&client, &root, enriched.as_deref(), &watches).await;
+    }
     if !ws.lock().is_current_generation(generation) {
         if let Some(p) = ongoing {
             p.finish_with_message("superseded by project changes").await;
@@ -1511,19 +1547,29 @@ fn project_watchers(
                 }
             }
         }
-        for jar in model.local_jars() {
-            for artifact in
+        let archives = model
+            .local_jars()
+            .into_iter()
+            .flat_map(|jar| {
                 std::iter::once(jar.clone()).chain(classpath::adjacent_sources_jar(&jar))
-            {
-                if path_is_under(&crate::paths::file_key(&artifact), &root_key) {
-                    continue;
-                }
-                if let (Some(parent), Some(name)) = (
-                    artifact.parent(),
-                    artifact.file_name().and_then(|name| name.to_str()),
-                ) {
-                    patterns.insert((crate::paths::file_key(parent), glob_literal(name)));
-                }
+            })
+            .chain(
+                model
+                    .modules
+                    .iter()
+                    .flat_map(|module| &module.source_sets)
+                    .flat_map(|source| source.source_artifacts.iter().flatten())
+                    .map(|artifact| artifact.path.clone()),
+            );
+        for artifact in archives {
+            if path_is_under(&crate::paths::file_key(&artifact), &root_key) {
+                continue;
+            }
+            if let (Some(parent), Some(name)) = (
+                artifact.parent(),
+                artifact.file_name().and_then(|name| name.to_str()),
+            ) {
+                patterns.insert((crate::paths::file_key(parent), glob_literal(name)));
             }
         }
         if workspace_files {
@@ -1652,6 +1698,10 @@ fn project_change(
     }
     if let Some(model) = model {
         if name.ends_with("-sources.jar") && file.is_file() {
+            let current = classpath::file_origin_id(file);
+            if model.artifact_origin(file) == Some(current.as_str()) {
+                return None;
+            }
             for binary in model.local_jars() {
                 if binary.is_file()
                     && classpath::adjacent_sources_jar(&binary)
@@ -4111,6 +4161,35 @@ fn def_to_range(ws: &Workspace, d: &Def) -> Option<Range> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_gradle_source_archives_are_watched_and_changes_force_refresh() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-selected-source-watch-{}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        let repository = root.join("external repository");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&repository).unwrap();
+        let source = repository.join("api [policy]-sources.jar");
+        std::fs::write(&source, b"source-v1").unwrap();
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nSOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nEND\t:app\n",
+            project.display(), repository.join("api.jar").display(), source.display())));
+        let key = crate::paths::file_key(&source);
+        let expected = glob_literal(&key);
+        assert!(project_watchers(&project, Some(&model), false)
+            .iter()
+            .any(|watcher| {
+                matches!(&watcher.glob_pattern, GlobPattern::String(pattern) if pattern==&expected)
+            }));
+        assert_eq!(project_change(&project, Some(&model), &key), None);
+        std::fs::write(&source, b"changed-source-v2").unwrap();
+        assert_eq!(project_change(&project, Some(&model), &key), Some(true));
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(project_change(&project, Some(&model), &key), Some(true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use serde_json::json;
 
@@ -4238,6 +4317,7 @@ mod tests {
                     Arc::new(Mutex::new(std::collections::BTreeSet::new())),
                     true,
                     vec![(binary.clone(), classpath::file_origin_id(&binary))],
+                    None,
                     tx,
                 );
                 rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -4342,6 +4422,7 @@ mod tests {
                 Arc::new(Mutex::new(std::collections::BTreeSet::new())),
                 true,
                 binaries,
+                None,
                 tx,
             );
             rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -4439,6 +4520,7 @@ mod tests {
                         artifact_dir.join("empty-1.jar"),
                         classpath::file_origin_id(&artifact_dir.join("empty-1.jar")),
                     )],
+                    None,
                     tx,
                 );
                 let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4525,6 +4607,7 @@ mod tests {
                         Arc::new(Mutex::new(std::collections::BTreeSet::new())),
                         true,
                         vec![(binary.clone(), classpath::file_origin_id(&binary))],
+                        None,
                         tx,
                     );
                     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4623,6 +4706,7 @@ mod tests {
                 Arc::new(Mutex::new(std::collections::BTreeSet::new())),
                 authoritative,
                 binaries,
+                None,
                 tx,
             );
             rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -4865,6 +4949,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 } else {
                     vec![(binary.clone(), classpath::file_origin_id(&binary))]
                 },
+                None,
                 tx,
             );
             let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();

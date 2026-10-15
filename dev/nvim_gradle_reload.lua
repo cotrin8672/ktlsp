@@ -237,7 +237,7 @@ local function check_kotlin_metadata(phase, version)
   local task = selected and selected.task or {}
   local prefix = 'phase ' .. phase .. ' Kotlin compiler metadata '
   check(prefix .. 'selects complete model11 :app/main public primary task', selected ~= nil
-    and selected.model_version == 11 and selected.kotlin_compile_task == task.task
+    and selected.model_version == 14 and selected.kotlin_compile_task == task.task
     and task.complete == true, capture)
 
   local sources, missing = {}, {}

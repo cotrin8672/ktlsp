@@ -610,7 +610,7 @@ fn download_sources(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<Path
             Err(failure @ DownloadFailure::Transient(_)) => return Err(failure.into_error()),
         }
     }
-    // Every repository definitively answered 4xx: no sources available — memoize the absence.
+    // Every repository definitively answered 404/410: no sources available — memoize the absence.
     tracing::debug!("no sources jar for {}: {}", c.label(), errors.join("; "));
     remember_no_sources(&marker);
     Ok(None)
@@ -692,7 +692,8 @@ fn no_artifact_marker(download_dir: &Path, c: &Coordinate, name: &str) -> PathBu
         .join(c.group_path())
         .join(&c.artifact)
         .join(&c.version)
-        .join(format!("{name}.missing"))
+        // Older markers also memoized authorization and throttling failures.
+        .join(format!("{name}.missing-v2"))
 }
 
 fn artifact_url(repos: &Repos, c: &Coordinate, name: &str) -> String {
@@ -713,8 +714,8 @@ fn remember_no_sources(marker: &Path) {
     let _ = fs::write(marker, b"missing\n");
 }
 
-/// Classification of a failed artifact GET. Only a 4xx proves the artifact is absent; everything
-/// else (5xx, timeout, connection reset) is a moment in time. Memoizing a transient failure with a
+/// Classification of a failed artifact GET. Only 404/410 prove the artifact is absent; everything
+/// else (auth failure, throttling, timeout) is a moment in time. Memoizing a transient failure with a
 /// `.missing` marker would shrink the dependency closure for the whole cache lifetime, so the two
 /// kinds take different paths: definitive failures may be memoized, transient ones surface as
 /// errors and are retried on the next run.
@@ -733,7 +734,7 @@ impl DownloadFailure {
 
 fn classify_http_failure(url: &str, err: ureq::Error) -> DownloadFailure {
     match err {
-        ureq::Error::StatusCode(code) if (400..500).contains(&code) => {
+        ureq::Error::StatusCode(code) if matches!(code, 404 | 410) => {
             DownloadFailure::Definitive(anyhow::anyhow!("HTTP {code} for {url}"))
         }
         other => DownloadFailure::Transient(anyhow::anyhow!("GET {url}: {other}")),
@@ -741,7 +742,7 @@ fn classify_http_failure(url: &str, err: ureq::Error) -> DownloadFailure {
 }
 
 /// Blocking HTTPS GET to a file (ureq + rustls). Follows redirects. Transient failures get
-/// bounded retries with backoff; a 4xx fails immediately as definitive.
+/// bounded retries with backoff; only 404/410 immediately prove artifact absence.
 fn http_download(url: &str, dest: &Path) -> Result<(), DownloadFailure> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut backoff = Duration::from_millis(150);
@@ -774,7 +775,7 @@ fn http_download_once(url: &str, dest: &Path) -> Result<(), DownloadFailure> {
         .map_err(|error| classify_http_failure(url, error))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
-        return Err(if (400..500).contains(&status) {
+        return Err(if matches!(status, 404 | 410) {
             DownloadFailure::Definitive(anyhow::anyhow!("HTTP {status} for {url}"))
         } else {
             DownloadFailure::Transient(anyhow::anyhow!("HTTP {status} for {url}"))
@@ -1254,14 +1255,18 @@ mod tests {
 
     #[test]
     fn http_failures_classify_definitive_vs_transient() {
-        assert!(matches!(
-            classify_http_failure("http://x", ureq::Error::StatusCode(404)),
-            DownloadFailure::Definitive(_)
-        ));
-        assert!(matches!(
-            classify_http_failure("http://x", ureq::Error::StatusCode(500)),
-            DownloadFailure::Transient(_)
-        ));
+        for code in [404, 410] {
+            assert!(matches!(
+                classify_http_failure("http://x", ureq::Error::StatusCode(code)),
+                DownloadFailure::Definitive(_)
+            ));
+        }
+        for code in [400, 401, 403, 408, 409, 425, 429, 451, 500, 502, 503] {
+            assert!(matches!(
+                classify_http_failure("http://x", ureq::Error::StatusCode(code)),
+                DownloadFailure::Transient(_)
+            ));
+        }
         assert!(matches!(
             classify_http_failure("http://x", ureq::Error::HostNotFound),
             DownloadFailure::Transient(_)
@@ -1710,6 +1715,13 @@ mod tests {
             download_dir: tmp.join("dl"),
             allow_download: true,
         };
+
+        for candidate in source_candidates(&c) {
+            let old = no_sources_marker(&repos.download_dir, &candidate)
+                .with_file_name(format!("{}.missing", candidate.sources_jar_name()));
+            fs::create_dir_all(old.parent().unwrap()).unwrap();
+            fs::write(old, b"missing\n").unwrap();
+        }
 
         assert!(sources_jar(&repos, &c).is_err());
         assert!(!no_sources_marker(&repos.download_dir, &c).is_file());

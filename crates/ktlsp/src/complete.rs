@@ -12,6 +12,7 @@ use std::collections::HashSet;
 
 use tree_sitter::{Node, Tree};
 
+use crate::imports::ImportStyle;
 use crate::index::{Entry, InferenceIndex, Tier};
 use crate::parser::{child_of_kind, class_kind, first_ident, identifier_at, name_field, node_text};
 use crate::resolve::{use_kind, UseKind};
@@ -259,6 +260,7 @@ pub fn shape(
     prefix: &str,
     candidates: Vec<ScopeCompletion>,
     snippets_supported: bool,
+    import_style: ImportStyle,
 ) -> ShapedCompletions {
     let mut items: Vec<ShapedItem> = Vec::with_capacity(candidates.len());
     for c in candidates {
@@ -275,7 +277,9 @@ pub fn shape(
         } else {
             c.import_path.map(|path| ImportEdit {
                 line: 0,
-                text: format!("import {path}"),
+                text: crate::imports::format_import(import_style, &path)
+                    .trim_end_matches('\n')
+                    .to_string(),
             })
         };
         items.push(ShapedItem {
@@ -351,7 +355,11 @@ pub fn resolve_auto_import_lines(
 ) {
     for item in &mut shaped.items {
         if let Some(import) = item.auto_import.as_mut() {
-            let fqn = import.text.strip_prefix("import ").unwrap_or(&import.text);
+            let fqn = import
+                .text
+                .strip_prefix("import ")
+                .unwrap_or(&import.text)
+                .trim_end_matches(';');
             import.line = resolve_import_line(fqn, sorted_imports, anchor);
         }
     }
@@ -363,6 +371,251 @@ fn fqn(package: &str, name: &str) -> String {
     } else {
         format!("{package}.{name}")
     }
+}
+
+/// Annotation names denote types, including when an unfinished qualified name has a dot.
+pub(crate) fn annotation_candidates<F>(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+    scope: &crate::indexer::TypeScope,
+    ctx: &crate::infer::FileCtx,
+    mut is_visible: F,
+) -> Option<(String, Vec<ScopeCompletion>)>
+where
+    F: FnMut(&Entry) -> bool,
+{
+    let (_, path) = line_prefix(src, offset).rsplit_once('@')?;
+    let path = if let Some((target, path)) = path.split_once(':') {
+        if !matches!(
+            target,
+            "file"
+                | "field"
+                | "property"
+                | "get"
+                | "set"
+                | "receiver"
+                | "param"
+                | "setparam"
+                | "delegate"
+        ) {
+            return None;
+        }
+        path
+    } else {
+        path
+    };
+    if !path
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.'))
+    {
+        return None;
+    }
+    let (qualifier, prefix) = path
+        .rsplit_once('.')
+        .map_or((None, path), |(owner, prefix)| (Some(owner), prefix));
+    let mut enclosing = Vec::new();
+    let mut node = node_at(tree, offset);
+    while let Some(current) = node {
+        if matches!(
+            current.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "annotation_type_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "object_declaration"
+        ) {
+            if let Some(name) = name_field(current) {
+                enclosing.push(node_text(name, src));
+            }
+        }
+        node = current.parent();
+    }
+    enclosing.reverse();
+    let enclosing = enclosing.join(".");
+    let qualified_owner = qualifier.and_then(|qualifier| {
+        let mut paths = Vec::new();
+        let mut lexical = enclosing.as_str();
+        while !lexical.is_empty() {
+            paths.push(fqn(&fqn(&ctx.package, lexical), qualifier));
+            lexical = lexical.rsplit_once('.').map_or("", |(parent, _)| parent);
+        }
+        paths.push(qualifier.to_string());
+        paths.into_iter().find_map(|path| {
+            let reference = scope.type_ref(&path, false, Vec::new());
+            match crate::infer::declared_type(index, &reference, ctx) {
+                crate::types::Type::Class {
+                    name,
+                    package: Some(package),
+                    container,
+                    ..
+                } => Some(fqn(
+                    &package,
+                    &container.map_or(name.clone(), |container| fqn(&container, &name)),
+                )),
+                _ => None,
+            }
+        })
+    });
+    let mut candidates = Vec::new();
+    let mut entries: Vec<_> = index.entries_with_prefix(prefix, false).collect();
+    if qualifier.is_none() {
+        for import in &ctx.imports {
+            if import
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias.starts_with(prefix))
+            {
+                let name = import.path.rsplit('.').next().unwrap_or(&import.path);
+                for entry in index.lookup_type(name) {
+                    let owner = entry.sym.container.as_deref().map_or_else(
+                        || entry.sym.package.clone(),
+                        |container| fqn(&entry.sym.package, container),
+                    );
+                    if fqn(&owner, &entry.sym.name) == import.path
+                        && !entries.iter().any(|existing| {
+                            existing.path == entry.path
+                                && existing.sym.start_byte == entry.sym.start_byte
+                        })
+                    {
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+    }
+    for entry in entries {
+        if !entry.sym.is_annotation
+            || !annotation_type_accessible(index, entry, file, &ctx.package, &enclosing)
+        {
+            continue;
+        }
+        let owner = entry.sym.container.as_deref().map_or_else(
+            || entry.sym.package.clone(),
+            |container| fqn(&entry.sym.package, container),
+        );
+        if qualified_owner
+            .as_ref()
+            .is_some_and(|qualified_owner| *qualified_owner != owner)
+        {
+            continue;
+        }
+        if let Some(qualifier) = qualifier {
+            let reference = scope.type_ref(&fqn(qualifier, &entry.sym.name), false, Vec::new());
+            if qualified_owner.is_none()
+                && !matches!(crate::infer::declared_type(index, &reference, ctx),
+                crate::types::Type::Class { ref package, ref container, .. }
+                    if package.as_deref() == Some(entry.sym.package.as_str()) && *container == entry.sym.container)
+            {
+                continue;
+            }
+        }
+        let alias = if qualifier.is_none() {
+            ctx.imports.iter().find_map(|import| {
+                import.alias.as_deref().filter(|alias| {
+                    alias.starts_with(prefix) && import.path == fqn(&owner, &entry.sym.name)
+                })
+            })
+        } else {
+            None
+        };
+        let mut candidate = ScopeCompletion::new(alias.unwrap_or(&entry.sym.name), entry.sym.kind);
+        candidate.tier = entry.tier;
+        candidate.package = entry.sym.package.clone();
+        candidate.container = entry.sym.container.clone();
+        let visible = alias.is_some()
+            || if let Some(container) = entry.sym.container.as_deref() {
+                (entry.path.as_ref() == file
+                    && (enclosing == container || enclosing.starts_with(&format!("{container}."))))
+                    || ctx.imports.iter().any(|import| {
+                        (import.wildcard && import.path == owner)
+                            || (!import.wildcard
+                                && import.alias.is_none()
+                                && import.path == fqn(&owner, &entry.sym.name))
+                    })
+            } else {
+                is_visible(entry)
+            };
+        if qualifier.is_none() && !visible {
+            if !annotation_type_accessible(index, entry, file, &ctx.package, "") {
+                continue;
+            }
+            candidate.import_path = Some(fqn(&owner, &entry.sym.name));
+        }
+        candidates.push(candidate);
+    }
+    Some((prefix.to_string(), candidates))
+}
+
+fn annotation_type_accessible(
+    index: &dyn InferenceIndex,
+    entry: &Entry,
+    file: &str,
+    package: &str,
+    enclosing: &str,
+) -> bool {
+    use ktcore::extensions::Visibility;
+    let mut current = entry;
+    for _ in 0..SUPERTYPE_DEPTH_CAP {
+        let flags = current.sym.source_member;
+        if flags.is_internal() {
+            let same_scope = index.origin_facts().is_some_and(|facts| {
+                let caller = facts
+                    .file_origin(file)
+                    .and_then(|origin| origin.project_scope.as_ref());
+                let declaration = facts
+                    .file_origin(&current.path)
+                    .and_then(|origin| origin.project_scope.as_ref());
+                caller.is_some() && caller == declaration
+            });
+            if !same_scope && current.path.as_ref() != file {
+                return false;
+            }
+        } else if !match flags.visibility() {
+            Some(Visibility::Public) => true,
+            Some(Visibility::Package | Visibility::Protected) => current.sym.package == package,
+            Some(Visibility::Private) => {
+                current.path.as_ref() == file
+                    && match crate::language::SourceLanguage::for_key(file) {
+                        crate::language::SourceLanguage::Java => {
+                            current.sym.container.as_deref().is_some_and(|owner| {
+                                owner.split('.').next() == enclosing.split('.').next()
+                            })
+                        }
+                        crate::language::SourceLanguage::Kotlin => {
+                            current.sym.container.as_deref().is_none_or(|owner| {
+                                enclosing == owner || enclosing.starts_with(&format!("{owner}."))
+                            })
+                        }
+                    }
+            }
+            // shortcut: protected subclasses/friend modules need a shared access proof before offering their types.
+            None => false,
+        } {
+            return false;
+        }
+        let Some(container) = current.sym.container.as_deref() else {
+            return true;
+        };
+        let (parent_container, parent_name) = container
+            .rsplit_once('.')
+            .map_or((None, container), |(owner, name)| (Some(owner), name));
+        let mut parents = index.lookup_type(parent_name).into_iter().filter(|parent| {
+            parent.sym.package == current.sym.package
+                && parent.sym.container.as_deref() == parent_container
+        });
+        let Some(parent) = parents.next() else {
+            return false;
+        };
+        if parents.next().is_some() {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Resolve the alphabetically-correct insertion line for a new `import {fqn}` given the file's
@@ -1383,7 +1636,13 @@ mod tests {
             cand("greeting", SymbolKind::Property),
             cand("abgreet", SymbolKind::Function),
         ];
-        let out = shape(CompletionContext::ScopeName, "gr", cands, true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "gr",
+            cands,
+            true,
+            ImportStyle::Kotlin,
+        );
         let labels: Vec<&str> = out.items.iter().map(|i| i.label.as_str()).collect();
         // `abgreet` does not start with `gr` (case-insensitively either) -> dropped.
         assert!(
@@ -1405,7 +1664,13 @@ mod tests {
             cand("green", SymbolKind::Property),
             cand("Green", SymbolKind::Class),
         ];
-        let out = shape(CompletionContext::ScopeName, "Gr", cands, true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "Gr",
+            cands,
+            true,
+            ImportStyle::Kotlin,
+        );
         let labels: Vec<&str> = out.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -1421,7 +1686,13 @@ mod tests {
         proj.tier = Tier::Volatile;
         let mut lib = cand("foo", SymbolKind::Function);
         lib.tier = Tier::Durable;
-        let out = shape(CompletionContext::ScopeName, "f", vec![lib, proj], true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "f",
+            vec![lib, proj],
+            true,
+            ImportStyle::Kotlin,
+        );
         // Volatile's sort_text must sort before Durable's.
         assert_eq!(out.items.len(), 2);
         assert!(
@@ -1446,6 +1717,7 @@ mod tests {
             "",
             vec![zero, one, unknown, prop, class, obj],
             true,
+            ImportStyle::Kotlin,
         );
         let by = |label: &str| out.items.iter().find(|i| i.label == label).unwrap().clone();
         assert_eq!(
@@ -1479,12 +1751,24 @@ mod tests {
         let mut f = cand("f", SymbolKind::Function);
         f.arity = Some(2);
         // No snippet support -> bare name, no `$0`.
-        let out = shape(CompletionContext::ScopeName, "", vec![f.clone()], false);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "",
+            vec![f.clone()],
+            false,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(out.items[0].insert_text, "f");
         assert!(!out.items[0].is_snippet);
         assert!(!out.items[0].insert_text.contains("$0"));
         // Import context -> plain regardless of arity (even with snippet support).
-        let out = shape(CompletionContext::Import, "", vec![f], true);
+        let out = shape(
+            CompletionContext::Import,
+            "",
+            vec![f],
+            true,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(out.items[0].insert_text, "f");
         assert!(!out.items[0].is_snippet);
     }
@@ -1494,14 +1778,26 @@ mod tests {
         let mut member = cand("greet", SymbolKind::Function);
         member.container = Some("Greeter".into());
         member.package = "demo".into();
-        let out = shape(CompletionContext::ScopeName, "gr", vec![member], true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "gr",
+            vec![member],
+            true,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(
             out.items[0].detail.as_deref(),
             Some("fun greet in Greeter (demo)")
         );
         // A keyword has no detail.
         let kw = ScopeCompletion::keyword("while");
-        let out = shape(CompletionContext::ScopeName, "wh", vec![kw], true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "wh",
+            vec![kw],
+            true,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(out.items[0].detail, None);
     }
 
@@ -1512,7 +1808,13 @@ mod tests {
         for i in 0..(RESULT_CAP + 50) {
             cands.push(cand(&format!("f{i:05}"), SymbolKind::Property));
         }
-        let out = shape(CompletionContext::ScopeName, "f", cands, true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "f",
+            cands,
+            true,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(out.items.len(), RESULT_CAP);
         assert!(out.is_incomplete, "truncation must flag incomplete");
         assert_sort_monotone(&out);
@@ -1525,7 +1827,13 @@ mod tests {
         let mut b = cand("Foo", SymbolKind::Class);
         b.package = "b".into();
         // Pass in reverse order; ranking must put package `a` before `b`.
-        let out = shape(CompletionContext::ScopeName, "Fo", vec![b, a], true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "Fo",
+            vec![b, a],
+            true,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(out.items.len(), 2);
         // Both share label/tier/length; only the trailing package differs.
         assert!(out.items[0].sort_text < out.items[1].sort_text);
@@ -1537,14 +1845,26 @@ mod tests {
     fn shape_auto_import_carried() {
         let mut c = cand("Helper", SymbolKind::Class);
         c.import_path = Some("lib.Helper".into());
-        let out = shape(CompletionContext::ScopeName, "He", vec![c.clone()], true);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "He",
+            vec![c.clone()],
+            true,
+            ImportStyle::Kotlin,
+        );
         let imp = out.items[0]
             .auto_import
             .as_ref()
             .expect("auto_import present");
         assert_eq!(imp.text, "import lib.Helper");
         // Import context suppresses auto-import.
-        let out = shape(CompletionContext::Import, "He", vec![c], true);
+        let out = shape(
+            CompletionContext::Import,
+            "He",
+            vec![c],
+            true,
+            ImportStyle::Kotlin,
+        );
         assert_eq!(out.items[0].auto_import, None);
     }
 

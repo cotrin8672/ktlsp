@@ -1,0 +1,19 @@
+{
+    "schema_version":  1,
+    "project_id":  "external-shadow-provider",
+    "scope":  "Test-only separate Rust executable consuming public provider APIs and real normalized @Mixin/@Shadow source annotations. No game runtime or dynamic loader claim.",
+    "probes":  [
+                   {
+                       "id":  "external-shadow-target",
+                       "source":  "fixture/CaseMixin.java",
+                       "anchor":  "public abstract int shadow$twice",
+                       "token":  "shadow$twice",
+                       "target_file":  "fixture/Target.java",
+                       "target_anchor":  "public int twice",
+                       "target_token":  "twice",
+                       "completion_token":  "shadow$twice",
+                       "source_sha256":  "2cbea6b02017ab99a0b301034ae75cc0d473d8df2abbd649e4e19b622f7bb4f1",
+                       "target_sha256":  "d78edb77c04d2fce2e1a9678cca76fd78fa78c973da627305103eceae6dc5595"
+                   }
+               ]
+}

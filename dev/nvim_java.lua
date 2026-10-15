@@ -412,11 +412,32 @@ end
 -- Observe one fresh notification; empty diagnostics are measured mismatches, not missing responses.
 do
   local observation, finish = probe.observe_diagnostics(client, bufnr)
-  diagnostic_probes[#diagnostic_probes + 1] = observation
+  local ready_before_edit = index_state.project and index_state.libraries
+    and index_state.failed == 0 and index_state.missing_sources == 0
   local count = vim.api.nvim_buf_line_count(bufnr)
   vim.api.nvim_buf_set_lines(bufnr, count, count, false, { "" })
   require("vim.lsp._changetracking").flush(client)
   local result = finish(5000)
+  if not ready_before_edit then
+    if vim.env.KTLSP_TRACE then
+      vim.fn.writefile({ vim.json.encode({ observation = observation, index = vim.deepcopy(index_state),
+        classification = "early notification; semantic expectations not inferred before index readiness" }) },
+        vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/java-early-diagnostics.json")
+    end
+    local ready = vim.wait(30000, function()
+      return index_state.project and index_state.libraries and index_state.failed == 0 and index_state.missing_sources == 0
+    end, 50)
+    check("Java diagnostic precondition observes complete project/library indexing", ready, vim.inspect(index_state))
+    if ready then
+      observation, finish = probe.observe_diagnostics(client, bufnr)
+      vim.api.nvim_buf_set_lines(bufnr, count + 1, count + 1, false, { "" })
+      require("vim.lsp._changetracking").flush(client)
+      result = finish(5000)
+    else
+      observation, result = { attempted = false, error = "project/library readiness not observed" }, nil
+    end
+  end
+  diagnostic_probes[#diagnostic_probes + 1] = observation
   for _, expected in ipairs({
     { "publishes Java unused-import diagnostic", "Unused import: List" },
     { "publishes Java unresolved-reference diagnostic", "Unresolved reference: missingCall" },
@@ -962,10 +983,37 @@ do
       tick = vim.api.nvim_buf_get_changedtick(owner_buffer) }
   end
   local owner_original = owner_snapshot()
+  local function sdk_source(entry, token)
+    local selected = {}
+    for _, marker_path in ipairs(vim.fn.globpath(vim.env.KTLSP_CACHE_DIR .. "/extracted/jdk", "*/.ktlsp-source-jar", false, true)) do
+      local root = vim.fs.dirname(marker_path)
+      local path = root .. "/" .. entry
+      local marker = vim.json.decode(table.concat(vim.fn.readfile(marker_path), "\n"))
+      if not vim.env.JAVA_HOME or vim.fs.normalize(marker.jar) == vim.fs.normalize(vim.env.JAVA_HOME .. "/lib/src.zip") then
+        local extracted = vim.system({ "unzip", "-p", marker.jar, entry }):wait()
+        assert(extracted.code == 0, "selected SDK archive cannot be read: " .. entry)
+        local lines, ranges = vim.split(extracted.stdout, "\n", { plain = true }), {}
+        for line, text in ipairs(lines) do
+          if text:match("^%s*public%s+String%s+" .. token .. "%s*%(") then
+            local column = assert(text:find(token, 1, true)) - 1
+            ranges[#ranges + 1] = { start = { line = line - 1, character = column },
+              ["end"] = { line = line - 1, character = column + #token } }
+          end
+        end
+        assert(#ranges == 1, "SDK declaration is not unique: " .. entry)
+        selected[#selected + 1] = { entry = entry, path = path, jar = marker.jar, range = ranges[1],
+          sha256 = vim.fn.sha256(extracted.stdout) }
+      end
+    end
+    assert(#selected == 1, "selected SDK source is not unique: " .. entry)
+    return selected[1]
+  end
   local report = { requests = {}, outbound = {}, expected_requests = 6,
     original_text = probe.buffer_full_text(buffer), original_source_sha256 = original_hash,
     original_disk_sha256 = disk_hash, owner_source = owner_original,
-    fileformat = vim.bo[buffer].fileformat, eol = vim.bo[buffer].eol, expected_sdk_sources = { Object = { entry = "java.base/java/lang/Object.java", sha256 = "e24cde0af9928806e4c883c64a9bd863a173359bd95ad3f071ff8ae794e0b50f" }, File = { entry = "java.base/java/io/File.java", sha256 = "b38295d5d60d449292a85e4720698d02b7485a54dac315dbbcbbbbd586de5ae7" } } }
+    fileformat = vim.bo[buffer].fileformat, eol = vim.bo[buffer].eol, expected_sdk_sources = {
+      Object = sdk_source("java.base/java/lang/Object.java", "toString"),
+      File = sdk_source("java.base/java/io/File.java", "getName") } }
   local notify = client.rpc.notify
   client.rpc.notify = function(method, params)
     local sent = notify(method, params)
@@ -1053,14 +1101,14 @@ do
     end
     for _, case in ipairs({
       { phase = "actual Object toString", anchor = "String rowText = rows[0].toString();", token = "toString",
-        suffix = "java/lang/Object.java", range = { start = { line = 254, character = 18 }, ["end"] = { line = 254, character = 26 } } },
+        suffix = "java/lang/Object.java", source = report.expected_sdk_sources.Object },
       { phase = "actual File getName", anchor = "String name = directory.listFiles().clone()[0].getName();", token = "getName",
-        suffix = "java/io/File.java", range = { start = { line = 454, character = 18 }, ["end"] = { line = 454, character = 25 } } },
+        suffix = "java/io/File.java", source = report.expected_sdk_sources.File },
     }) do
       local result, row = once(case.phase, "textDocument/definition", case.anchor, case.token)
-      row.expected_source_suffix, row.expected_range = case.suffix, case.range
+      row.expected_source_suffix, row.expected_range = case.suffix, case.source.range
       check("Java SDK array " .. case.phase .. " goes to the exact SDK identifier",
-        row.stable and probe.exact_definition(result, nil, { case.range }, case.suffix), vim.inspect(result), row)
+        row.stable and probe.exact_definition(result, case.source.path, { case.source.range }), vim.inspect(result), row)
     end
   end, debug.traceback)
   local cleanup_ok, cleanup_error = pcall(function()
@@ -1780,6 +1828,152 @@ for _, case in ipairs({
   client.rpc.notify = original_notify
   if arg[3] then
     vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/" .. case.snapshot)
+  end
+end
+
+-- Annotation names must remain completable before their declarations are finished.
+do
+  local function watch_changes(buffer)
+    local notify, wire, delivery = client.rpc.notify, probe.buffer_full_text(buffer), nil
+    client.rpc.notify = function(method, params)
+      local sent = notify(method, params)
+      if method == "textDocument/didChange" and params.textDocument.uri == vim.uri_from_bufnr(buffer) then
+        local next_wire, err = probe.apply_content_changes(wire, params.contentChanges,
+          client.offset_encoding or "utf-16")
+        if sent and next_wire then wire = next_wire end
+        delivery = { sent = not not sent, version = params.textDocument.version, error = err,
+          text = wire, source_sha256 = probe.buffer_sha256(buffer), wire_source_sha256 = vim.fn.sha256(wire) }
+      end
+      return sent
+    end
+    return function() client.rpc.notify = notify; return delivery end
+  end
+  local kotlin_buf = vim.fn.bufadd(project .. "/app/KotlinHelper.kt")
+  vim.fn.bufload(kotlin_buf)
+  vim.bo[kotlin_buf].filetype = "kotlin"
+  assert(vim.lsp.buf_attach_client(kotlin_buf, id), "annotation Kotlin buffer did not attach")
+  local snapshots = {}
+  for _, case in ipairs({
+    { "Java plain annotation", bufnr, "@Over", "Override" },
+    { "Java qualified annotation", bufnr, "@java.lang.Over", "Override" },
+    { "Java unknown annotation package", bufnr, "@missing.annotation.Over", false },
+    { "Kotlin plain annotation", kotlin_buf, "@Depre", "Deprecated" },
+    { "Kotlin qualified annotation", kotlin_buf, "@java.lang.Depre", "Deprecated" },
+    { "Kotlin unknown annotation package", kotlin_buf, "@missing.annotation.Depre", false },
+  }) do
+    local name, buffer, partial, expected = unpack(case)
+    local original = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+    local original_modified = vim.bo[buffer].modified
+    local disk = vim.fn.readfile(vim.api.nvim_buf_get_name(buffer))
+    local lines, line = vim.deepcopy(original), nil
+    for i, text in ipairs(lines) do
+      if buffer == bufnr and text:find("public void runAgain()", 1, true) then
+        lines[i] = "    public String toString() { return \"annotation\"; }"
+        table.insert(lines, i, "    " .. partial)
+        line = i - 1
+        break
+      elseif buffer == kotlin_buf and text:find("class KotlinHelper", 1, true) then
+        table.insert(lines, i, partial)
+        line = i - 1
+        break
+      end
+    end
+    assert(line, "annotation declaration anchor not found")
+    local finish_delivery = watch_changes(buffer)
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, lines)
+    require("vim.lsp._changetracking").flush(client)
+    local delivery = finish_delivery()
+    local version = vim.lsp.util.buf_versions[buffer]
+    check(name .. " current exact unsaved text is outbound", delivery and delivery.sent
+      and not delivery.error and delivery.version == version
+      and delivery.source_sha256 == delivery.wire_source_sha256)
+    local params = { textDocument = { uri = vim.uri_from_bufnr(buffer) },
+      position = { line = line, character = #lines[line + 1] } }
+    local response, row = request_rpc("textDocument/completion", params, buffer)
+    local result = response and response.result
+    local items = result and result ~= vim.NIL and (result.items or result) or {}
+    local matched = expected and probe.completion_has(result, expected)
+      or (not expected and #items == 0)
+    check(name .. (expected and " offers " .. expected or " excludes known annotations"),
+      matched, vim.inspect(result), row)
+    check(name .. " excludes ordinary classes", not probe.completion_has(result, "OverlayLayout")
+      and not probe.completion_has(result, "DeprecatedTree"), vim.inspect(result), row)
+    snapshots[#snapshots + 1] = { name = name, text = lines, expected = expected,
+      version = version, delivery = delivery, request = row,
+      unsaved = vim.bo[buffer].modified and vim.deep_equal(disk,
+        vim.fn.readfile(vim.api.nvim_buf_get_name(buffer))) }
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, original)
+    vim.bo[buffer].modified = original_modified
+    require("vim.lsp._changetracking").flush(client)
+    check(name .. " restores exact buffer and disk", vim.deep_equal(original,
+      vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) and snapshots[#snapshots].unsaved)
+  end
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/annotation-snapshots.json")
+  end
+  local applied_snapshots = {}
+  vim.fn.mkdir(project .. "/annotationcase", "p")
+  for _, case in ipairs({
+    { name = "Java annotation auto-import", file = "Imported.java", label = "Documented", prefix = "Docu",
+      original = { "package annotationcase;", "", "@java.lang.annotation.Documented", "public @interface Imported {}" },
+      edited = { "package annotationcase;", "", "@Docu", "public @interface Imported {}" },
+      expected = "package annotationcase;\nimport java.lang.annotation.Documented;\n\n@Documented\npublic @interface Imported {}\n" },
+    { name = "Java ordinary auto-import", file = "Ordinary.java", label = "ArrayList", prefix = "ArrayLis",
+      original = { "package annotationcase;", "", "class Ordinary { java.util.ArrayList values; }" },
+      edited = { "package annotationcase;", "", "class Ordinary { ArrayLis values; }" },
+      expected = "package annotationcase;\nimport java.util.ArrayList;\n\nclass Ordinary { ArrayList values; }\n" },
+  }) do
+    local path = project .. "/annotationcase/" .. case.file
+    vim.fn.writefile(case.original, path)
+    local buffer = vim.fn.bufadd(path)
+    vim.fn.bufload(buffer)
+    vim.bo[buffer].filetype = "java"
+    assert(vim.lsp.buf_attach_client(buffer, id), "import buffer did not attach")
+    local finish_delivery = watch_changes(buffer)
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, case.edited)
+    require("vim.lsp._changetracking").flush(client)
+    local delivery = finish_delivery()
+    local version = vim.lsp.util.buf_versions[buffer]
+    local start = assert(case.edited[3]:find(case.prefix, 1, true)) - 1
+    local params = { textDocument = { uri = vim.uri_from_bufnr(buffer) },
+      position = { line = 2, character = start + #case.prefix } }
+    local response, row = request_rpc("textDocument/completion", params, buffer)
+    local result = response and response.result
+    local item
+    for _, candidate in ipairs(result and result ~= vim.NIL and (result.items or result) or {}) do
+      if candidate.label == case.label then item = candidate; break end
+    end
+    check(case.name .. " offers exact type on first response", item ~= nil, vim.inspect(result), row)
+    local applied, message = false, nil
+    if item then
+      local edits = vim.deepcopy(item.additionalTextEdits or {})
+      edits[#edits + 1] = item.textEdit or { newText = item.insertText or item.label,
+        range = { start = { line = 2, character = start }, ["end"] = params.position } }
+      applied, message = pcall(vim.lsp.util.apply_text_edits, edits, buffer, client.offset_encoding)
+    end
+    local actual = probe.buffer_full_text(buffer)
+    local current_wire = delivery and delivery.sent and not delivery.error
+      and delivery.version == version
+      and delivery.source_sha256 == delivery.wire_source_sha256
+      and delivery.text == table.concat(case.edited, "\n") .. "\n"
+    check(case.name .. " exact unsaved text is outbound", current_wire)
+    check(case.name .. " applies exact complete Java source", applied and actual == case.expected,
+      message or actual, row)
+    check(case.name .. " keeps disk source unchanged", vim.deep_equal(vim.fn.readfile(path), case.original))
+    local artifact = arg[3] and arg[3] .. "/annotation-applied/" .. case.file
+    if artifact then
+      vim.fn.mkdir(vim.fs.dirname(artifact), "p")
+      vim.fn.writefile(vim.split(actual, "\n", { plain = true }), artifact, "b")
+    end
+    applied_snapshots[#applied_snapshots + 1] = { name = case.name, request = row, delivery = delivery, version = version,
+      applied = applied, text = actual, expected = case.expected, artifact = artifact,
+      exact_current_wire = not not current_wire, unchanged_disk = vim.deep_equal(vim.fn.readfile(path), case.original) }
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, case.original)
+    vim.bo[buffer].modified = false
+    require("vim.lsp._changetracking").flush(client)
+  end
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode(applied_snapshots) }, arg[3] .. "/annotation-import-snapshots.json")
   end
 end
 

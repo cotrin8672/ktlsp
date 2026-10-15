@@ -681,7 +681,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v28-java-array-components";
+const SYMCACHE_VERSION: &[u8] = b"v29-binary-shadow-annotation-facts";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -990,15 +990,31 @@ pub(crate) fn coordinate_source_checked(
     let Some((selected, jar)) = selected else {
         return Ok(legacy_coordinate_source(coord, extract_root));
     };
+    Ok(Some(selected_coordinate_source(
+        coord,
+        &selected,
+        jar,
+        repos,
+        extract_root,
+    )))
+}
+
+fn selected_coordinate_source(
+    coord: &Coordinate,
+    selected: &Coordinate,
+    jar: PathBuf,
+    repos: &Repos,
+    extract_root: &Path,
+) -> LibrarySource {
     let fingerprint = jar_fingerprint(&jar);
-    let policy = SourceTextPolicy::resolve(&selected, |c| artifacts::cached_pom_files(repos, c))
+    let policy = SourceTextPolicy::resolve(selected, |c| artifacts::cached_pom_files(repos, c))
         .map_err(|error| {
             format!(
                 "source encoding metadata for {}: {error:#}",
                 selected.label()
             )
         });
-    Ok(Some(LibrarySource {
+    LibrarySource {
         dest: extract_root
             .join(&coord.group)
             .join(&coord.artifact)
@@ -1007,7 +1023,40 @@ pub(crate) fn coordinate_source_checked(
         fingerprint,
         origin_id: crate::classpath::maven_origin_id(coord),
         policy,
-    }))
+    }
+}
+
+pub(crate) fn coordinate_source_for_model(
+    coord: &Coordinate,
+    repos: &Repos,
+    extract_root: &Path,
+    model: Option<&crate::classpath::ProjectSnapshot>,
+) -> anyhow::Result<Option<LibrarySource>> {
+    if Coordinate::parse(&coord.label()).as_ref() != Some(coord) {
+        return Ok(None);
+    }
+    let Some(model) = model else {
+        return coordinate_source_checked(coord, repos, extract_root);
+    };
+    let selections = model.coordinate_sources(coord)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Gradle source selection is unavailable for {}",
+            coord.label()
+        )
+    })?;
+    let [(jar, expected)] = selections.as_slice() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        jar.is_file() && crate::classpath::file_origin_id(jar) == *expected,
+        "selected Gradle source artifact changed since project discovery"
+    );
+    let source = selected_coordinate_source(coord, coord, jar.clone(), repos, extract_root);
+    anyhow::ensure!(
+        crate::classpath::file_origin_id(jar) == *expected,
+        "selected Gradle source artifact changed during source resolution"
+    );
+    Ok(Some(source))
 }
 
 fn legacy_coordinate_source(coord: &Coordinate, extract_root: &Path) -> Option<LibrarySource> {
@@ -1166,8 +1215,8 @@ pub fn resolve_local_jar_stubs_for_origin(
     }
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    // Old name-only binary stubs must miss; the serialized symbol format is unchanged.
-    hasher.update(b"|local-jar-java-members-v2|");
+    // Binary stubs without hierarchy and shadow facts must miss.
+    hasher.update(b"|local-jar-java-members-v5|");
     hasher.update(origin_id.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
@@ -1230,7 +1279,7 @@ pub(crate) fn resolve_module_binary_stubs(
     let origin_id = crate::classpath::maven_origin_id(coord);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|module-jar-java-members-v2|");
+    hasher.update(b"|module-jar-java-members-v5|");
     hasher.update(origin_id.as_bytes());
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
@@ -1242,14 +1291,15 @@ pub(crate) fn resolve_module_binary_stubs(
         "selected module artifact changed while indexing: {}",
         jar_path.display()
     );
-    // The old name-only fallback includes malformed/unsupported classes. New module publication
-    // admits only files with positively decoded members and keeps missing-source status.
+    // Name-only fallbacks are classes; a decoded marker interface has useful exact type facts.
     batches.retain(|batch| {
         batch.symbols.iter().any(|symbol| {
             matches!(
                 symbol.kind,
-                ktcore::symbol::SymbolKind::Function | ktcore::symbol::SymbolKind::Property
-            )
+                ktcore::symbol::SymbolKind::Function
+                    | ktcore::symbol::SymbolKind::Property
+                    | ktcore::symbol::SymbolKind::Interface
+            ) || symbol.kind.is_type_like() && symbol.unavailable_members.is_some()
         })
     });
     tag_batches(&mut batches, &origin_id, SourceRepresentation::Stub);
@@ -1273,9 +1323,23 @@ fn resolve_local_jar_stubs_unowned(
     }
 
     // A previous interrupted extraction can leave a directory without a complete cache.
-    jar::extract_class_stubs(jar_path, &dest)?;
+    let mut extracted: std::collections::BTreeMap<_, _> =
+        jar::extract_class_stubs(jar_path, &dest)?
+            .into_iter()
+            .collect();
 
-    let symbols = parse_dir(&dest, kotlin, java)?;
+    let mut symbols = parse_dir(&dest, kotlin, java)?;
+    for batch in &mut symbols {
+        if let Some(unavailable) = extracted.remove(Path::new(&batch.file)).flatten() {
+            if let Some(owner) = batch
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.kind.is_type_like() && symbol.container.is_none())
+            {
+                owner.unavailable_members = Some(Box::new(unavailable));
+            }
+        }
+    }
     symcache_store(&fingerprint, &symbols);
     Ok(symbols)
 }
@@ -1404,9 +1468,15 @@ pub fn resolve_explicit_import_fqn_from_coordinates(
     candidates.dedup();
 
     for coord in candidates.into_iter().take(32) {
-        let batches = match coordinate_source_checked(&coord, repos, extract_root) {
+        let batches = match coordinate_source_for_model(&coord, repos, extract_root, model) {
             Ok(Some(source)) => resolve_library_source(&source, kotlin, java),
             Ok(None) => {
+                let binaries = model
+                    .and_then(|model| model.coordinate_binaries(&coord))
+                    .unwrap_or_default();
+                resolve_module_binary_stubs(&coord, &binaries, extract_root, kotlin, java)
+            }
+            Err(_) if model.is_some() => {
                 let binaries = model
                     .and_then(|model| model.coordinate_binaries(&coord))
                     .unwrap_or_default();
@@ -2188,6 +2258,160 @@ fn parse_java_source_file(path: &Path, java: &mut JavaParser) -> Option<FileSymb
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_gradle_source_query_keeps_exact_binary_import_facts_available() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-pending-source-import-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("api-1.jar");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&binary).unwrap());
+        zip.start_file("fieldfixture/FieldOnly.class", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class"
+        ))
+        .unwrap();
+        zip.finish().unwrap();
+        let coord = Coordinate::parse("fieldfixture:api:1").unwrap();
+        let repos = Repos {
+            gradle_cache: root.join("gradle"),
+            m2: root.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        for state in ["", "SOURCEQUERY\tmain\tfailed\n"] {
+            let model = crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n{state}END\t:app\n", root.display(), binary.display(), binary.display())));
+            assert_eq!(model.coordinate_binaries(&coord).unwrap().len(), 1);
+            let batches = resolve_explicit_import_fqn_from_coordinates(
+                "fieldfixture.FieldOnly",
+                vec![coord.clone()],
+                &repos,
+                Some(&model),
+                &root.join("extract"),
+                &mut KotlinParser::new(),
+                &mut JavaParser::new(),
+            );
+            assert!(batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|symbol| symbol.name == "count"));
+            assert!(batches
+                .iter()
+                .all(|batch| batch.origin.as_ref().unwrap().representation
+                    == SourceRepresentation::Stub));
+            assert!(
+                !matches!(model.coordinate_sources(&coord), Ok(Some(_))),
+                "binary facts do not invent source availability"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn gradle_selected_sources_ignore_competing_cache_and_preserve_failure_or_absence() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_selected_gradle_sources_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let coord = Coordinate::parse("example:api:1").unwrap();
+        let repos = Repos {
+            gradle_cache: root.join("gradle/caches"),
+            m2: root.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let wrong = repos
+            .gradle_cache
+            .join("modules-2/files-2.1/example/api/1/wrong/api-1-sources.jar");
+        let selected = root.join("settings-repository/api-1-sources.jar");
+        let binary = root.join("api-1.jar");
+        write_sources_jar(&wrong, &[("example/api/Policy.java", "package example.api; public class Policy { public int wrongRepository() { return 1; } }")]);
+        write_sources_jar(&selected, &[("example/api/Policy.java", "package example.api; public class Policy { public int chosenRepository() { return 2; } }")]);
+        write_sources_jar(&binary, &[]);
+        let prefix = format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\n",
+            root.display(),
+            binary.display()
+        );
+        let snapshot = |records: &str| {
+            crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
+                "{prefix}{records}END\t:app\n"
+            )))
+        };
+        let records = format!(
+            "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\n",
+            selected.display()
+        );
+        let model = snapshot(&records);
+        let extract = root.join("extract");
+        assert_eq!(
+            coordinate_source_checked(&coord, &repos, &extract)
+                .unwrap()
+                .unwrap()
+                .jar,
+            Some(wrong)
+        );
+        let source = coordinate_source_for_model(&coord, &repos, &extract, Some(&model))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.jar, Some(selected.clone()));
+        let warm = coordinate_source_for_model(&coord, &repos, &extract, Some(&model))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.identity(), warm.identity());
+        let batches =
+            resolve_library_source(&source, &mut KotlinParser::new(), &mut JavaParser::new())
+                .unwrap();
+        let names: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert!(names.contains(&"chosenRepository"));
+        assert!(!names.contains(&"wrongRepository"));
+        let absent = snapshot("SOURCEQUERY\tmain\tcomplete\n");
+        assert!(
+            coordinate_source_for_model(&coord, &repos, &extract, Some(&absent))
+                .unwrap()
+                .is_none()
+        );
+        for unavailable in ["", "SOURCEQUERY\tmain\tfailed\n"] {
+            assert!(coordinate_source_for_model(
+                &coord,
+                &repos,
+                &extract,
+                Some(&snapshot(unavailable))
+            )
+            .is_err());
+        }
+        write_sources_jar(&selected, &[("example/api/Policy.java", "package example.api; public class Policy { public long replacementRepository() { return 3; } }")]);
+        assert!(coordinate_source_for_model(&coord, &repos, &extract, Some(&model)).is_err());
+        let changed = snapshot(&records);
+        let replacement = coordinate_source_for_model(&coord, &repos, &extract, Some(&changed))
+            .unwrap()
+            .unwrap();
+        assert_ne!(source.identity(), replacement.identity());
+        let batches = resolve_library_source(
+            &replacement,
+            &mut KotlinParser::new(),
+            &mut JavaParser::new(),
+        )
+        .unwrap();
+        let names: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert!(names.contains(&"replacementRepository"));
+        assert!(!names.contains(&"chosenRepository"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -3461,12 +3685,12 @@ public class ParameterUse<Iterable> {
             (
                 false,
                 origin.as_str(),
-                b"|local-jar-java-members-v2|".as_slice(),
+                b"|local-jar-java-members-v5|".as_slice(),
             ),
             (
                 true,
                 module_origin.as_str(),
-                b"|module-jar-java-members-v2|".as_slice(),
+                b"|module-jar-java-members-v5|".as_slice(),
             ),
         ] {
             let mut hasher = Sha256::new();
@@ -3568,6 +3792,467 @@ public class ParameterUse<Iterable> {
     }
 
     #[test]
+    fn binary_java_shadow_facts_and_marker_reach_local_module_cold_warm_queries() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_shadow_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("shadows.jar");
+        {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            for (name, bytes) in [
+                (
+                    "Base",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/shadowfixture/Base.class"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "Mid",
+                    include_bytes!("../../ktcore/tests/fixtures/classfile/shadowfixture/Mid.class")
+                        .as_slice(),
+                ),
+                (
+                    "GenericMid",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/shadowfixture/GenericMid.class"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "PublicMid",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/shadowfixture/PublicMid.class"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "Marker",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/shadowfixture/Marker.class"
+                    )
+                    .as_slice(),
+                ),
+            ] {
+                archive
+                    .start_file(
+                        format!("shadowfixture/{name}.class"),
+                        SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        let coord = Coordinate::parse("fixture:shadow-api:1").unwrap();
+        let origin = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for is_module in [false, true] {
+            let extract = root.join(if is_module { "module" } else { "local" });
+            for warm in [false, true] {
+                let batches = if is_module {
+                    resolve_module_binary_stubs(
+                        &coord,
+                        &[(jar.clone(), origin.clone())],
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                } else {
+                    resolve_local_jar_stubs_for_origin(
+                        &jar,
+                        &origin,
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                }
+                .unwrap();
+                assert!(
+                    batches
+                        .iter()
+                        .flat_map(|b| &b.symbols)
+                        .any(|s| s.name == "Marker"
+                            && s.kind == ktcore::symbol::SymbolKind::Interface),
+                    "marker module={is_module} warm={warm}"
+                );
+                let mut workspace = crate::workspace::Workspace::new();
+                for batch in batches {
+                    assert!(workspace.index_dependency_batch(batch));
+                }
+                workspace.open("KnownChild.java", "package shadowfixture; public class KnownChild extends GenericMid { public Object f(int value) { return null; } }".to_string());
+                for (file, source, selector, expected_owner) in [
+                    ("Use.kt", "import shadowfixture.Mid\nfun use(value: Mid) = value.f()\n", "value.f", Some("Mid.java")),
+                    ("Use.java", "import shadowfixture.Mid; class Use { Object use(Mid value) { return value.f(); } }", "value.f", Some("Mid.java")),
+                    ("Use.kt", "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.f()\n", "value.f", None),
+                    ("Use.java", "import shadowfixture.GenericMid; class Use { Object use(GenericMid value) { return value.f(); } }", "value.f", None),
+                    ("Use.kt", "import shadowfixture.KnownChild\nfun use(value: KnownChild) = value.f()\n", "value.f", None),
+                    ("Use.java", "import shadowfixture.KnownChild; class Use { Object use(KnownChild value) { return value.f(); } }", "value.f", None),
+                    ("Use.kt", "import shadowfixture.KnownChild\nfun use(value: KnownChild) = value.f(1)\n", "value.f", Some("KnownChild.java")),
+                    ("Use.java", "import shadowfixture.KnownChild; class Use { Object use(KnownChild value) { return value.f(1); } }", "value.f", Some("KnownChild.java")),
+                    ("Use.kt", "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.value\n", "value.value", None),
+                    ("Use.java", "import shadowfixture.GenericMid; class Use { Object use(GenericMid value) { return value.value; } }", "value.value", None),
+                    ("Use.kt", "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.value()\n", "value.value", Some("Base.java")),
+                    ("Use.java", "import shadowfixture.GenericMid; class Use { void use(GenericMid value) { value.value(); } }", "value.value", Some("Base.java")),
+                    ("Use.kt", "import shadowfixture.PublicMid\nfun use(value: PublicMid) = value.value\n", "value.value", Some("PublicMid.java")),
+                    ("Use.java", "import shadowfixture.PublicMid; class Use { Object use(PublicMid value) { return value.value; } }", "value.value", Some("PublicMid.java")),
+                ] {
+                    workspace.open(file, source.to_string());
+                    let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
+                    let targets = workspace.goto_definition(file, at);
+                    if let Some(owner) = expected_owner {
+                        assert_eq!(targets.len(), 1, "{file} {selector} module={is_module} warm={warm}: {targets:?}");
+                        assert!(targets[0].file.ends_with(owner), "{file} {selector}: {targets:?}");
+                        if owner == "KnownChild.java" {
+                            let query = workspace.completion_query(file, at + 1).unwrap();
+                            assert!(query.candidates.iter().any(|item| item.label == "f"));
+                        }
+                    } else {
+                        assert!(targets.is_empty(), "must not borrow an ancestor: {file} {selector} module={is_module} warm={warm}: {targets:?}");
+                        if selector == "value.f" && !source.contains("KnownChild") {
+                            let query = workspace.completion_query(file, at + 1).unwrap();
+                            assert!(query.candidates.iter().all(|item| item.label != "f"), "unavailable override: {file} module={is_module} warm={warm}");
+                        }
+                    }
+                }
+                let source = "import shadowfixture.Mid\nclass Leaf : Mid() { override fun f(): String = \"\"; fun test() { super.f() } }\n";
+                workspace.open("Leaf.kt", source.to_string());
+                let at = source.find("super.f").unwrap() + "super.f".len();
+                let query = workspace.completion_query("Leaf.kt", at).unwrap();
+                assert!(query.candidates.iter().all(|item| item.label != "f"));
+                assert!(workspace.goto_definition("Leaf.kt", at - 1).is_empty());
+                workspace.open(
+                    "Extensions.kt",
+                    "package exts\nfun shadowfixture.GenericMid.f(): String = \"safe\"\n"
+                        .to_string(),
+                );
+                let source = "import shadowfixture.GenericMid\nimport exts.f as safeAlias\nfun use(value: GenericMid) { value. }\n";
+                workspace.open("Alias.kt", source.to_string());
+                let at = source.find("value.").unwrap() + "value.".len();
+                let query = workspace.completion_query("Alias.kt", at).unwrap();
+                assert!(
+                    query
+                        .candidates
+                        .iter()
+                        .any(|item| item.label == "safeAlias"),
+                    "aliased extension module={is_module} warm={warm}"
+                );
+                assert!(query.candidates.iter().all(|item| item.label != "f"));
+                let call = source.replace("value. }", "value.safeAlias() }");
+                workspace.open("Alias.kt", call.clone());
+                let targets = workspace.goto_definition(
+                    "Alias.kt",
+                    call.find("value.safeAlias").unwrap() + "value.".len(),
+                );
+                assert_eq!(targets.len(), 1, "{targets:?}");
+                assert_eq!(targets[0].file, "Extensions.kt");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_java_actual_ponder_interface_reaches_cold_warm_super_and_extension_queries() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_ponder_interface_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("ponder.jar");
+        {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            archive
+                .start_file(
+                    "net/createmod/ponder/api/VirtualBlockEntity.class",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive
+                .write_all(include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/ponder1087/VirtualBlockEntity.class"
+                ))
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        let coord = Coordinate::parse("fixture:ponder:1").unwrap();
+        let binary_origin = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let legacy_dir = root.join("legacy");
+        fs::create_dir(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join("VirtualBlockEntity.java"),
+            "package net.createmod.ponder.api; public class VirtualBlockEntity {}",
+        )
+        .unwrap();
+        let legacy = parse_dir(&legacy_dir, &mut kotlin, &mut java).unwrap();
+        for is_module in [true, false] {
+            let extract = root.join(if is_module { "module" } else { "local" });
+            let owner = if is_module {
+                crate::classpath::maven_origin_id(&coord)
+            } else {
+                binary_origin.clone()
+            };
+            let fingerprint = |version| {
+                let mut hash = Sha256::new();
+                hash.update(SYMCACHE_VERSION);
+                hash.update(format!(
+                    "|{}-jar-java-members-v{version}|",
+                    if is_module { "module" } else { "local" }
+                ));
+                hash.update(owner.as_bytes());
+                if is_module {
+                    hash.update(b"|");
+                    hash.update(binary_origin.as_bytes());
+                }
+                format!("{:x}", hash.finalize())
+            };
+            let old_key = fingerprint(3);
+            symcache_store(&old_key, &legacy);
+            assert!(
+                symcache_load(&old_key, &legacy_dir).is_some(),
+                "legacy placeholder cache must exist"
+            );
+            let current_key = fingerprint(5);
+            let dest = extract.join("local-jars").join(&current_key);
+            for warm in [false, true] {
+                assert_eq!(
+                    symcache_load(&current_key, &dest).is_some(),
+                    warm,
+                    "cold/warm cache not exercised"
+                );
+                let batches = if is_module {
+                    resolve_module_binary_stubs(
+                        &coord,
+                        &[(jar.clone(), binary_origin.clone())],
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                } else {
+                    resolve_local_jar_stubs_for_origin(
+                        &jar,
+                        &binary_origin,
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                }
+                .unwrap();
+                assert!(
+                    batches
+                        .iter()
+                        .flat_map(|batch| &batch.symbols)
+                        .any(|symbol| symbol.name == "VirtualBlockEntity"
+                            && symbol.kind == ktcore::symbol::SymbolKind::Interface),
+                    "interface missing: module={is_module} warm={warm}"
+                );
+                assert!(batches.iter().all(|batch| batch
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.representation == SourceRepresentation::Stub)));
+                let mut workspace = crate::workspace::Workspace::new();
+                for batch in batches {
+                    assert!(workspace.index_dependency_batch(batch));
+                }
+                for (file, text) in [
+                    ("Base.java", "package probe; public class Base implements net.createmod.ponder.api.VirtualBlockEntity { public void markVirtual() {} public boolean isVirtual() { return false; } protected float getBreakSpeed() { return 1f; } }"),
+                    ("Key.java", "package probe; public class Key<T> {}"),
+                    ("Lookup.java", "package probe; public class Lookup<T> { public T getOrThrow(Key<T> key) { return null; } }"),
+                    ("Use.kt", "package probe\ninterface Marker\nclass MarkerImpl : Marker\nfun <T> Base.holderLookup(key: Key<T>): Lookup<T> = TODO()\nclass Drill : Base(), Marker by MarkerImpl() {\n override fun getBreakSpeed(): Float = super.getBreakSpeed()\n fun work(key: Key<String>) = holderLookup(key).getOrThrow(key)\n}\n"),
+                ] { workspace.open(file, text.to_string()); }
+                let source = workspace.doc_text("Use.kt").unwrap();
+                for (expression, member, target_file) in [
+                    ("super.getBreakSpeed", "getBreakSpeed", "Base.java"),
+                    ("holderLookup(key).getOrThrow", "getOrThrow", "Lookup.java"),
+                ] {
+                    let start = source.find(expression).unwrap();
+                    let query = workspace
+                        .completion_query("Use.kt", start + expression.len())
+                        .unwrap();
+                    assert!(
+                        query.candidates.iter().any(|item| item.label == member),
+                        "{member} module={is_module} warm={warm}: {} {:?}",
+                        query.status_label(),
+                        query.reason_labels()
+                    );
+                    let targets = workspace
+                        .goto_definition("Use.kt", start + expression.rfind(member).unwrap());
+                    assert_eq!(
+                        targets.len(),
+                        1,
+                        "{member} module={is_module} warm={warm}: {targets:?}"
+                    );
+                    assert_eq!(targets[0].file, target_file);
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_java_actual_create_hierarchy_survives_local_module_and_v2_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_actual_create_hierarchy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("create-api.jar");
+        {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            for (name, bytes) in [
+                ("com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.class", include_bytes!("../../ktcore/tests/fixtures/classfile/create6010/BlockBreakingKineticBlockEntity.class").as_slice()),
+                ("com/simibubi/create/content/kinetics/base/KineticBlockEntity.class", include_bytes!("../../ktcore/tests/fixtures/classfile/create6010/KineticBlockEntity.class").as_slice()),
+            ] {
+                archive.start_file(name, SimpleFileOptions::default()).unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        let coord = Coordinate::parse("fixture:create-api:1").unwrap();
+        let binary_origin = crate::classpath::file_origin_id(&jar);
+        let module_origin = crate::classpath::maven_origin_id(&coord);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let legacy_dir = root.join("legacy");
+        jar::extract_class_stubs(&jar, &legacy_dir).unwrap();
+        let mut legacy = parse_dir(&legacy_dir, &mut kotlin, &mut java).unwrap();
+        for batch in &mut legacy {
+            for symbol in &mut batch.symbols {
+                symbol.supertypes.clear();
+                symbol.supertype_refs.clear();
+            }
+        }
+        for (is_module, owner, tag) in [
+            (
+                false,
+                binary_origin.as_str(),
+                b"|local-jar-java-members-v2|".as_slice(),
+            ),
+            (
+                true,
+                module_origin.as_str(),
+                b"|module-jar-java-members-v2|".as_slice(),
+            ),
+        ] {
+            let mut hash = Sha256::new();
+            hash.update(SYMCACHE_VERSION);
+            hash.update(tag);
+            hash.update(owner.as_bytes());
+            if is_module {
+                hash.update(b"|");
+                hash.update(binary_origin.as_bytes());
+            }
+            let old_key = format!("{:x}", hash.finalize());
+            symcache_store(&old_key, &legacy);
+            assert!(symcache_load(&old_key, &legacy_dir)
+                .unwrap()
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .all(|symbol| symbol.supertype_refs.is_empty()));
+            let mut hash = Sha256::new();
+            hash.update(SYMCACHE_VERSION);
+            hash.update(if is_module {
+                b"|module-jar-java-members-v5|".as_slice()
+            } else {
+                b"|local-jar-java-members-v5|".as_slice()
+            });
+            hash.update(owner.as_bytes());
+            if is_module {
+                hash.update(b"|");
+                hash.update(binary_origin.as_bytes());
+            }
+            let fingerprint = format!("{:x}", hash.finalize());
+            let extract = root.join(if is_module { "module" } else { "local" });
+            let dest = extract.join("local-jars").join(&fingerprint);
+            assert!(
+                symcache_load(&fingerprint, &dest).is_none(),
+                "v5 cold cache must be absent"
+            );
+            for warm in [false, true] {
+                if warm {
+                    let cached =
+                        symcache_load(&fingerprint, &dest).expect("v5 warm cache must be usable");
+                    let child = cached
+                        .iter()
+                        .flat_map(|batch| &batch.symbols)
+                        .find(|symbol| symbol.name == "BlockBreakingKineticBlockEntity")
+                        .unwrap();
+                    assert!(child
+                        .supertype_refs
+                        .iter()
+                        .any(|parent| parent.name == "KineticBlockEntity"
+                            && parent.qualification.as_deref()
+                                == Some("com.simibubi.create.content.kinetics.base")));
+                }
+                let batches = if is_module {
+                    resolve_module_binary_stubs(
+                        &coord,
+                        &[(jar.clone(), binary_origin.clone())],
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                } else {
+                    resolve_local_jar_stubs_for_origin(
+                        &jar,
+                        &binary_origin,
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                }
+                .unwrap();
+                let child = batches
+                    .iter()
+                    .flat_map(|batch| &batch.symbols)
+                    .find(|symbol| symbol.name == "BlockBreakingKineticBlockEntity")
+                    .unwrap();
+                assert!(child
+                    .supertype_refs
+                    .iter()
+                    .any(|parent| parent.name == "KineticBlockEntity"
+                        && parent.qualification.as_deref()
+                            == Some("com.simibubi.create.content.kinetics.base")));
+                assert!(batches.iter().all(|batch| batch
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.origin_id == owner
+                        && origin.representation == SourceRepresentation::Stub)));
+                let mut workspace = crate::workspace::Workspace::new();
+                for batch in batches {
+                    assert!(workspace.index_dependency_batch(batch));
+                }
+                workspace.bump_index_revision();
+                for (file, text) in [
+                    ("Use.java", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; class Use { void f(BlockBreakingKineticBlockEntity value) { value.getSpe; } }"),
+                    ("Use.kt", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nfun f(value: BlockBreakingKineticBlockEntity) { value.getSpe }\n"),
+                ] {
+                    workspace.open(file, text.to_string());
+                    let query = workspace.completion_query(file, text.find("value.getSpe").unwrap()+"value.getSpe".len()).unwrap();
+                    assert!(query.candidates.iter().any(|item| item.label == "getSpeed"), "{file} module={is_module}: {} {:?}", query.status_label(), query.reason_labels());
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn binary_java_jar_members_reach_cold_and_warm_java_kotlin_completion() {
         let factory =
             include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class")
@@ -3634,7 +4319,7 @@ public class ParameterUse<Iterable> {
             ),
         ] {
             let mut old = Sha256::new();
-            old.update(b"v28-java-array-components");
+            old.update(b"v29-binary-shadow-annotation-facts");
             old.update(tag);
             old.update(key_origin.as_bytes());
             if let Some(binary) = selected_binary {
@@ -4766,6 +5451,12 @@ worktree = "com.example:worktree:9.9"
         };
         assert!(Coordinate::parse(&unsafe_coordinate.label()).is_none());
         assert!(coordinate_source(&unsafe_coordinate, &repos, &extract).is_none());
+        let model = crate::classpath::ProjectSnapshot::new(Vec::new());
+        assert!(
+            coordinate_source_for_model(&unsafe_coordinate, &repos, &extract, Some(&model))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "must remain intact");
         // This probe never passes the returned location to resolve_library_source or removes it.
         fs::remove_file(&sentinel).unwrap();

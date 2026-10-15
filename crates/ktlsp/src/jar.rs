@@ -529,7 +529,15 @@ pub fn collect_sources(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 ///
 /// Ordinary Java methods are positive API facts only. Unsupported declarations keep the old
 /// name-only fallback; these stubs never certify a complete source/API surface.
-pub fn extract_class_stubs(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub fn extract_class_stubs(
+    jar: &Path,
+    out_dir: &Path,
+) -> anyhow::Result<
+    Vec<(
+        PathBuf,
+        Option<Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>>,
+    )>,
+> {
     let mut archive = open_archive(jar)?;
     anyhow::ensure!(
         archive.len() <= MAX_SOURCE_FILES,
@@ -618,34 +626,51 @@ pub fn extract_class_stubs(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<Pat
                     ktcore::classfile::decode(&origin, &bytes)
                         .ok()
                         .filter(|facts| facts.identity.internal_name == class_path)
-                        .and_then(|facts| java_class_stub(&facts))
+                        .and_then(|facts| java_class_stub_facts(&facts))
+                        .map(|(source, unavailable)| (source, Some(unavailable)))
                 }
             }
         } else {
             None
         };
-        let src = declaration.unwrap_or_else(|| {
+        let (src, unavailable) = declaration.unwrap_or_else(|| {
             if package.is_empty() {
-                format!("public class {name} {{\n}}\n")
+                (format!("public class {name} {{\n}}\n"), None)
             } else {
-                format!("package {package};\n\npublic class {name} {{\n}}\n")
+                (
+                    format!("package {package};\n\npublic class {name} {{\n}}\n"),
+                    None,
+                )
             }
         });
         write_source_text(&path, &src)?;
-        out.push(path);
+        out.push((path, unavailable));
     }
     Ok(out)
 }
 
+#[cfg(test)]
 fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> {
+    java_class_stub_facts(class).map(|(source, _)| source)
+}
+
+fn java_class_stub_facts(
+    class: &ktcore::classfile::ClassFileFacts,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
     const PUBLIC: u16 = 0x0001;
+    const INTERFACE: u16 = 0x0200;
+    const ABSTRACT: u16 = 0x0400;
+    let is_interface = class.access_flags & INTERFACE != 0;
     let (package, name) = class
         .identity
         .internal_name
         .rsplit_once('/')
         .unwrap_or(("", &class.identity.internal_name));
     if class.access_flags & PUBLIC == 0
-        || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | 0x0400) != 0
+        || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | INTERFACE | ABSTRACT) != 0
         || class.access_flags & 0x0410 == 0x0410
         || class.signature.is_some()
         || class.source_file.as_deref() != Some(format!("{name}.java").as_str())
@@ -661,6 +686,48 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
                     | "EnclosingMethod"
             )
         })
+    {
+        return None;
+    }
+    // A partial interface surface could hide a competing default super implementation.
+    // Start with exact public abstract methods; other interface forms remain unavailable.
+    if is_interface
+        && (class.access_flags != PUBLIC | INTERFACE | ABSTRACT
+            || class.super_name.as_deref() != Some("java/lang/Object")
+            || !class.fields.is_empty()
+            || class.methods.iter().any(|method| {
+                method.access_flags != PUBLIC | ABSTRACT
+                    || method.signature.is_some()
+                    || !method.attribute_names.is_empty()
+            }))
+    {
+        return None;
+    }
+    // A non-generic Java class has exact nominal superclass/interface names in its classfile.
+    // Generic signatures remain unsupported; never replace their arguments with raw guesses.
+    let hierarchy_type = |internal: &str| -> Option<String> {
+        if internal == class.identity.internal_name.as_str() || internal.contains('$') {
+            return None;
+        }
+        let ty = ktcore::classfile::field_type(&format!("L{internal};"))?;
+        if !package.is_empty() && ty.qualification.as_deref() == Some("") {
+            return None;
+        }
+        java_descriptor_type(&ty)
+    };
+    let superclass = match class.super_name.as_deref() {
+        Some("java/lang/Object") | None => None,
+        Some(parent) => Some(hierarchy_type(parent)?),
+    };
+    let interfaces = class
+        .interfaces
+        .iter()
+        .map(|interface| hierarchy_type(interface))
+        .collect::<Option<Vec<_>>>()?;
+    let mut unique_interfaces = std::collections::BTreeSet::new();
+    if interfaces
+        .iter()
+        .any(|interface| !unique_interfaces.insert(interface))
     {
         return None;
     }
@@ -746,7 +813,9 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
     let mut methods = std::collections::BTreeMap::new();
     for method in &class.methods {
         if method.access_flags & PUBLIC == 0
-            || method.access_flags & !(PUBLIC | 0x0008 | 0x0010 | 0x0020 | 0x0800) != 0
+            || method.access_flags & !(PUBLIC | 0x0008 | 0x0010 | 0x0020 | 0x0800 | ABSTRACT) != 0
+            || method.access_flags & ABSTRACT != 0
+                && (class.access_flags & ABSTRACT == 0 || method.access_flags & 0x0938 != 0)
             || method.signature.is_some()
             || !is_java_identifier(&method.name)
             || method
@@ -798,13 +867,64 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
         } else {
             ""
         };
-        let declaration = format!(
-            "    public {static_}{final_}{returns} {}({}) {{ throw null; }}\n",
-            method.name,
-            parameters.join(", ")
-        );
+        let declaration = if method.access_flags & ABSTRACT != 0 {
+            format!(
+                "    public abstract {returns} {}({});\n",
+                method.name,
+                parameters.join(", ")
+            )
+        } else {
+            format!(
+                "    public {static_}{final_}{returns} {}({}) {{ throw null; }}\n",
+                method.name,
+                parameters.join(", ")
+            )
+        };
         methods.insert(key, declaration);
     }
+    if is_interface && methods.len() != class.methods.len() {
+        return None;
+    }
+    let mut unavailable_fields = std::collections::BTreeSet::new();
+    for field in &class.fields {
+        if is_java_identifier(&field.name)
+            && field.access_flags & 0x1000 == 0
+            && !fields.contains_key(field.name.as_ref())
+        {
+            unavailable_fields.insert(field.name.to_string());
+        }
+    }
+    let mut unavailable_methods = std::collections::BTreeSet::new();
+    for method in &class.methods {
+        if is_java_identifier(&method.name)
+            && method.access_flags & (0x0002 | 0x0040 | 0x1000) == 0
+            && !method
+                .attribute_names
+                .iter()
+                .any(|name| name.as_ref() == "Synthetic")
+            && !method
+                .descriptor
+                .split_once(')')
+                .is_some_and(|(parameters, _)| {
+                    methods.contains_key(&(method.name.as_ref(), parameters))
+                })
+        {
+            let arity = (method.access_flags & 0x0080 == 0)
+                .then(|| ktcore::classfile::method_types(&method.descriptor))
+                .flatten()
+                .and_then(|(parameters, _)| u8::try_from(parameters.len()).ok());
+            unavailable_methods.insert((method.name.to_string(), arity));
+        }
+    }
+    let unavailable = unavailable_methods
+        .into_iter()
+        .map(|(name, arity)| (name, ktcore::symbol::SymbolKind::Function, arity))
+        .chain(
+            unavailable_fields
+                .into_iter()
+                .map(|name| (name, ktcore::symbol::SymbolKind::Property, None)),
+        )
+        .collect();
     let mut source =
         "// Binary declaration stub; initializers and method bodies are unavailable.\n".to_string();
     if !package.is_empty() {
@@ -817,7 +937,23 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
     } else {
         ""
     };
-    source.push_str(&format!("public {modifier}class {name} {{\n"));
+    if is_interface {
+        source.push_str(&format!("public interface {name}"));
+    } else {
+        source.push_str(&format!("public {modifier}class {name}"));
+    }
+    if let Some(parent) = superclass {
+        source.push_str(&format!(" extends {parent}"));
+    }
+    if !interfaces.is_empty() {
+        let relation = if is_interface {
+            "extends"
+        } else {
+            "implements"
+        };
+        source.push_str(&format!(" {relation} {}", interfaces.join(", ")));
+    }
+    source.push_str(" {\n");
     for field in fields.into_values() {
         source.push_str(&field);
     }
@@ -825,7 +961,7 @@ fn java_class_stub(class: &ktcore::classfile::ClassFileFacts) -> Option<String> 
         source.push_str(&method);
     }
     source.push_str("}\n");
-    Some(source)
+    Some((source, unavailable))
 }
 
 fn java_descriptor_type(ty: &ktcore::types::TypeRef) -> Option<String> {
@@ -942,6 +1078,140 @@ mod tests {
             zip.write_all(body).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn binary_java_hierarchy_preserves_abstract_shadows_and_withholds_unknown_overrides() {
+        // Injected metadata isolates shadowing; the Ponder fixture supplies a valid method shape.
+        let mut class = ktcore::classfile::decode(
+            "fixture",
+            include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/ponder1087/VirtualBlockEntity.class"
+            ),
+        )
+        .unwrap();
+        class.identity.internal_name = "binaryhierarchy/Mid".into();
+        class.source_file = Some("Mid.java".into());
+        class.access_flags = 0x0421;
+        class.super_name = Some("binaryhierarchy/Base".into());
+        class.methods.truncate(1);
+        class.methods[0].name = "f".into();
+        class.methods[0].descriptor = "()Ljava/lang/String;".into();
+        let source = java_class_stub(&class).unwrap();
+        assert!(
+            source.contains("public abstract java.lang.String f();"),
+            "{source}"
+        );
+        let mut workspace = crate::workspace::Workspace::new();
+        workspace.open(
+            "Base.java",
+            "package binaryhierarchy; public class Base { public Object f() { return null; } }"
+                .to_string(),
+        );
+        workspace.open("Mid.java", source);
+        let kotlin = "package binaryhierarchy\nclass Leaf : Mid() { override fun f(): String = \"\"; fun test() { super.f() } }\nfun ordinary(value: Mid) { value.f() }\n";
+        workspace.open("Use.kt", kotlin.to_string());
+        let query = workspace
+            .completion_query("Use.kt", kotlin.find("value.f").unwrap() + "value.f".len())
+            .unwrap();
+        assert!(query.candidates.iter().any(|item| item.label == "f"));
+        let targets =
+            workspace.goto_definition("Use.kt", kotlin.find("value.f").unwrap() + "value.".len());
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].file, "Mid.java");
+        let query = workspace
+            .completion_query("Use.kt", kotlin.find("super.f").unwrap() + "super.f".len())
+            .unwrap();
+        assert!(query.candidates.iter().all(|item| item.label != "f"));
+        assert!(workspace
+            .goto_definition("Use.kt", kotlin.find("super.f").unwrap() + "super.".len())
+            .is_empty());
+        for invalid in [0x0008, 0x0010, 0x0020, 0x0100, 0x0800] {
+            class.methods[0].access_flags = 0x0401 | invalid;
+            let (source, unavailable) = java_class_stub_facts(&class).unwrap();
+            assert!(!source.contains(" f("), "{source}");
+            assert!(unavailable.iter().any(|(name, kind, arity)| name == "f"
+                && *kind == ktcore::symbol::SymbolKind::Function
+                && *arity == Some(0)));
+        }
+        class.access_flags = 0x0021;
+        class.methods[0].access_flags = 0x0001;
+        class.methods[0].descriptor = "()Ljava/util/List;".into();
+        class.methods[0].signature = Some("()Ljava/util/List<Ljava/lang/String;>;".into());
+        let (source, unavailable) = java_class_stub_facts(&class).unwrap();
+        assert!(source.contains("extends binaryhierarchy.Base") && !source.contains(" f("));
+        assert!(unavailable.iter().any(|(name, kind, arity)| name == "f"
+            && *kind == ktcore::symbol::SymbolKind::Function
+            && *arity == Some(0)));
+        class.methods[0].access_flags |= 0x0080;
+        class.methods[0].descriptor = "([Ljava/lang/Object;)Ljava/util/List;".into();
+        let (_, unavailable) = java_class_stub_facts(&class).unwrap();
+        assert!(unavailable.iter().any(|(name, kind, arity)| name == "f"
+            && *kind == ktcore::symbol::SymbolKind::Function
+            && arity.is_none()));
+    }
+
+    #[test]
+    fn binary_java_actual_ponder_interface_keeps_abstract_methods() {
+        let class = ktcore::classfile::decode(
+            "fixture:ponder-neoforge:1.0.87+mc1.21.1",
+            include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/ponder1087/VirtualBlockEntity.class"
+            ),
+        )
+        .unwrap();
+        assert_eq!(class.access_flags, 0x0601);
+        assert_eq!(class.methods.len(), 2);
+        for (name, descriptor) in [("markVirtual", "()V"), ("isVirtual", "()Z")] {
+            let method = class
+                .methods
+                .iter()
+                .find(|method| method.name.as_ref() == name)
+                .unwrap();
+            assert_eq!(method.descriptor.as_ref(), descriptor);
+            assert_eq!(method.access_flags, 0x0401);
+        }
+        let source = java_class_stub(&class).expect("verified public Java interface");
+        assert!(
+            source.contains("public interface VirtualBlockEntity"),
+            "{source}"
+        );
+        assert!(source.contains("void markVirtual();"), "{source}");
+        assert!(source.contains("boolean isVirtual();"), "{source}");
+        let tree = crate::java::JavaParser::new().parse(&source);
+        assert!(!tree.root_node().has_error(), "{source}");
+        let symbols = crate::java::extract_symbols(&tree, &source);
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol.name == "VirtualBlockEntity"
+                && symbol.kind == ktcore::symbol::SymbolKind::Interface));
+        for name in ["markVirtual", "isVirtual"] {
+            assert_eq!(
+                symbols
+                    .iter()
+                    .find(|symbol| symbol.name == name)
+                    .unwrap()
+                    .source_member
+                    .implementation(),
+                Some(ktcore::symbol::MemberImplementation::Abstract)
+            );
+        }
+        let mut inherited = class.clone();
+        inherited.interfaces = vec!["fixture/Parent".into()];
+        assert!(java_class_stub(&inherited)
+            .unwrap()
+            .contains("interface VirtualBlockEntity extends fixture.Parent"));
+        for flags in [0x0201, 0x0611] {
+            let mut invalid = class.clone();
+            invalid.access_flags = flags;
+            assert!(java_class_stub(&invalid).is_none());
+        }
+        for (flags, signature) in [(0x0001, None), (0x0401, Some("()TT;"))] {
+            let mut unsupported = class.clone();
+            unsupported.methods[0].access_flags = flags;
+            unsupported.methods[0].signature = signature.map(Into::into);
+            assert!(java_class_stub(&unsupported).is_none());
+        }
     }
 
     #[test]
@@ -1103,6 +1373,43 @@ mod tests {
     }
 
     #[test]
+    fn binary_java_stub_preserves_nominal_hierarchy_and_withholds_unspellable_parents() {
+        let class = ktcore::classfile::decode(
+            "fixture",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/create6010/BlockBreakingKineticBlockEntity.class"),
+        )
+        .unwrap();
+        let source = java_class_stub(&class).unwrap();
+        assert!(
+            source.contains("extends com.simibubi.create.content.kinetics.base.KineticBlockEntity")
+        );
+        let mut parser = crate::java::JavaParser::new();
+        assert!(!parser.parse(&source).root_node().has_error(), "{source}");
+
+        // Injected descriptor metadata tests the rendering boundary, not a javac-produced API.
+        let mut interfaces = class.clone();
+        interfaces.interfaces = vec!["other/Readable".into(), "other/Writable".into()];
+        assert!(java_class_stub(&interfaces)
+            .unwrap()
+            .contains("implements other.Readable, other.Writable"));
+        interfaces.interfaces.push("other/Readable".into());
+        assert!(java_class_stub(&interfaces).is_none());
+        for parent in [
+            class.identity.internal_name.as_ref(),
+            "other/Outer$Nested",
+            "Unnamed",
+            "other/class",
+        ] {
+            let mut altered = class.clone();
+            altered.super_name = Some(parent.into());
+            assert!(java_class_stub(&altered).is_none(), "{parent}");
+        }
+        let mut generic = class;
+        generic.signature = Some("Ljava/lang/Object;".into());
+        assert!(java_class_stub(&generic).is_none());
+    }
+
+    #[test]
     fn binary_java_stub_preserves_unnamed_nominal_identity_at_the_rendering_boundary() {
         // Descriptor metadata is injected here to test spelling; this is not a javac-produced API.
         let mut class = ktcore::classfile::decode(
@@ -1169,7 +1476,7 @@ mod tests {
         let files = extract_class_stubs(&jar, &output).unwrap();
         assert!(!root.join("Escaped.java").exists());
         let mut parser = crate::java::JavaParser::new();
-        for path in files {
+        for (path, _) in files {
             let text = fs::read_to_string(&path).unwrap();
             let tree = parser.parse(&text);
             assert!(!tree.root_node().has_error(), "{}: {text}", path.display());

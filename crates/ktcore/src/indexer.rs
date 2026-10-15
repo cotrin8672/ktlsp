@@ -386,7 +386,19 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
         node.kind(),
         "property_declaration" | "class_parameter" | "field_declaration"
     );
-    if !value && !matches!(node.kind(), "function_declaration" | "method_declaration") {
+    let type_declaration = matches!(
+        node.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "annotation_type_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "object_declaration"
+    );
+    if !value
+        && !type_declaration
+        && !matches!(node.kind(), "function_declaration" | "method_declaration")
+    {
         return SourceMemberFlags::default();
     }
     if java && crate::extensions::source::has_post_name_dimensions(node) {
@@ -409,7 +421,16 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
             } else if node.kind() == "field_declaration" {
                 child.kind() != "variable_declarator"
             } else {
-                !matches!(child.kind(), "function_body" | "block")
+                !matches!(
+                    child.kind(),
+                    "function_body"
+                        | "block"
+                        | "class_body"
+                        | "interface_body"
+                        | "annotation_type_body"
+                        | "enum_body"
+                        | "enum_class_body"
+                )
             }
         })
         .any(|child| child.has_error() || child.is_missing())
@@ -496,6 +517,13 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     } else {
         Visibility::Package
     };
+    if type_declaration {
+        return if conflicting_access {
+            SourceMemberFlags::default()
+        } else {
+            SourceMemberFlags::for_visibility(visibility, internal)
+        };
+    }
     if value {
         let getter = child_of_kind(node, "getter");
         let getter_body =
@@ -839,6 +867,20 @@ fn push_type(
 ) {
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
+        is_annotation: name_node
+            .parent()
+            .and_then(|decl| child_of_kind(decl, "modifiers"))
+            .is_some_and(|modifiers| {
+                let mut cursor = modifiers.walk();
+                let annotation = modifiers.named_children(&mut cursor).any(|modifier| {
+                    modifier.kind() == "class_modifier" && node_text(modifier, src) == "annotation"
+                });
+                annotation
+            }),
+        source_member: name_node
+            .parent()
+            .map(|decl| source_member_flags(decl, src, false))
+            .unwrap_or_default(),
         supertypes: supertype_refs.iter().map(|ty| ty.name.clone()).collect(),
         supertype_refs,
         type_parameter_facts: name_node
@@ -1472,6 +1514,8 @@ fn push_synthetic_member(
         documentation: None,
         supertypes: Vec::new(),
         supertype_refs: Vec::new(),
+        unavailable_members: None,
+        is_annotation: false,
         ext_receiver: None,
         extension_receiver: None,
         arity,

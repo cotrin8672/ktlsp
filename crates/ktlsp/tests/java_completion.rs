@@ -236,7 +236,7 @@ public class Main {
         .expect("Helper should be offered");
     assert_eq!(
         helper.auto_import.as_ref().map(|i| i.text.as_str()),
-        Some("import other.Helper")
+        Some("import other.Helper;")
     );
 }
 

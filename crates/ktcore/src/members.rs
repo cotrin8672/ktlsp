@@ -129,6 +129,7 @@ pub struct Candidates<'a> {
     local_scopes: Vec<Vec<&'a Entry>>,
     uncertain_receivers: BTreeSet<(&'a str, usize, usize)>,
     hierarchy_complete: bool,
+    unavailable_members: Vec<(&'a str, crate::symbol::SymbolKind, Option<u8>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -183,6 +184,7 @@ pub fn super_member_candidates<'a>(
             local_scopes: Vec::new(),
             uncertain_receivers: BTreeSet::new(),
             hierarchy_complete: !selected.incomplete,
+            unavailable_members: Vec::new(),
         },
     ))
 }
@@ -406,6 +408,13 @@ fn matching_candidates_at<'a>(
         if applicability == Applicability::Rejected {
             continue;
         }
+        if result
+            .unavailable_members
+            .iter()
+            .any(|(name, kind, _)| *name == local.entry.sym.name && *kind == local.entry.sym.kind)
+        {
+            continue;
+        }
         if applicability == Applicability::Unknown {
             result.uncertain_receivers.insert((
                 local.entry.path.as_ref(),
@@ -516,11 +525,30 @@ fn collect_candidates<'a>(
     let mut members = Vec::new();
     let mut extensions = Vec::new();
     let mut hierarchy_complete = true;
+    let mut blockers = Vec::new();
+    let mut unavailable_members = Vec::new();
     let _ = infer::walk_supertypes(index, receiver, 32, |current| {
         let Some(root) = infer::receiver_root_key(index, current) else {
             hierarchy_complete = false;
             return ControlFlow::Continue(());
         };
+        for owner in index.lookup_type(&root).into_iter().filter(|owner| {
+            current.package().is_none_or(|pkg| owner.sym.package == pkg)
+                && current.container() == owner.sym.container.as_deref()
+        }) {
+            if let Some(names) = owner.sym.unavailable_members.as_deref() {
+                if names.iter().any(|(written, _, _)| name.matches(written)) {
+                    blockers.push((current.clone(), names));
+                    unavailable_members.extend(
+                        names
+                            .iter()
+                            .filter(|(written, _, _)| name.matches(written))
+                            .map(|(written, kind, arity)| (written.as_str(), *kind, *arity)),
+                    );
+                    hierarchy_complete = false;
+                }
+            }
+        }
         members.extend(index.members_of(&root).into_iter().filter(|entry| {
             name.matches(&entry.sym.name)
                 && current.package().is_none_or(|pkg| entry.sym.package == pkg)
@@ -534,6 +562,35 @@ fn collect_candidates<'a>(
         }
         ControlFlow::Continue(())
     });
+    for (owner, names) in blockers {
+        let mut shadowed_owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let _ = infer::walk_supertypes(index, &owner, 32, |current| {
+            if let (Some(package), Some(root)) =
+                (current.package(), infer::receiver_root_key(index, current))
+            {
+                shadowed_owners
+                    .entry(package.to_string())
+                    .or_default()
+                    .insert(root);
+            }
+            ControlFlow::Continue(())
+        });
+        // shortcut: same-arity unknown overloads block ancestors until exact signature facts exist.
+        members.retain(|entry| {
+            !names.iter().any(|(written, kind, arity)| {
+                *written == entry.sym.name
+                    && *kind == entry.sym.kind
+                    && (*kind != crate::symbol::SymbolKind::Function
+                        || arity.is_none()
+                        || entry.sym.arity.is_none()
+                        || entry.sym.arity == *arity)
+            }) || !entry.sym.container.as_ref().is_some_and(|container| {
+                shadowed_owners
+                    .get(entry.sym.package.as_str())
+                    .is_some_and(|owners| owners.contains(container))
+            })
+        });
+    }
     if let (true, MemberName::Exact(name)) = (include_extensions, name) {
         extensions.extend(resolve::generic_receiver_extensions(
             index,
@@ -542,6 +599,13 @@ fn collect_candidates<'a>(
             &ctx.package,
         ));
     }
+    extensions.retain(|entry| {
+        !unavailable_members.iter().any(|(name, kind, _)| {
+            *kind == entry.sym.kind
+                && resolve::visible_extension_names(entry, &ctx.imports, &ctx.package)
+                    .any(|visible| visible == *name)
+        })
+    });
     // A diamond or a generic extension reached through several supertypes is still one declaration.
     for entries in [&mut members, &mut extensions] {
         entries.sort_by_key(|entry| {
@@ -576,6 +640,7 @@ fn collect_candidates<'a>(
         local_scopes: Vec::new(),
         uncertain_receivers,
         hierarchy_complete,
+        unavailable_members,
     }
 }
 
@@ -634,8 +699,7 @@ fn remove_overridden_members(
             {
                 return false;
             }
-            let mut relation = if source_super
-                && nearer.sym.kind == crate::symbol::SymbolKind::Property
+            let mut relation = if nearer.sym.kind == crate::symbol::SymbolKind::Property
                 && inherited.sym.kind == crate::symbol::SymbolKind::Property
             {
                 value_inheritance_relation(index, nearer, inherited)
@@ -1106,6 +1170,19 @@ fn owner_inheritance(
 }
 
 impl<'a> Candidates<'a> {
+    pub fn member_name_is_unavailable(&self, name: &str, kind: crate::symbol::SymbolKind) -> bool {
+        self.unavailable_members
+            .iter()
+            .any(|(written, unavailable_kind, _)| *written == name && *unavailable_kind == kind)
+    }
+
+    pub fn has_unavailable_call(&self, count: Option<usize>) -> bool {
+        self.unavailable_members.iter().any(|(_, kind, arity)| {
+            *kind == crate::symbol::SymbolKind::Function
+                && (arity.is_none() || count.is_none() || arity.map(usize::from) == count)
+        })
+    }
+
     pub fn known_extensions(&self) -> impl Iterator<Item = &'a Entry> + '_ {
         self.extensions
             .iter()
@@ -1114,7 +1191,7 @@ impl<'a> Candidates<'a> {
     }
 
     pub fn has_uncertain_receivers(&self) -> bool {
-        !self.uncertain_receivers.is_empty()
+        !self.uncertain_receivers.is_empty() || !self.unavailable_members.is_empty()
     }
 
     pub fn has_local_extensions(&self) -> bool {
@@ -1168,6 +1245,12 @@ impl<'a> Candidates<'a> {
         usage: &MemberUse,
         ctx: &FileCtx,
     ) -> Selection<'a> {
+        if matches!(usage, MemberUse::Call(args) if self.has_unavailable_call(args.count)) {
+            return Selection {
+                entries: Vec::new(),
+                applicability: Applicability::Unknown,
+            };
+        }
         match usage {
             MemberUse::Value => {
                 for entries in self.groups() {
@@ -1245,7 +1328,11 @@ impl<'a> Candidates<'a> {
         }
         Selection {
             entries: Vec::new(),
-            applicability: Applicability::Rejected,
+            applicability: if self.unavailable_members.is_empty() {
+                Applicability::Rejected
+            } else {
+                Applicability::Unknown
+            },
         }
     }
 }
@@ -1264,6 +1351,7 @@ pub(crate) fn select_functions<'a>(
         local_scopes: Vec::new(),
         uncertain_receivers: BTreeSet::new(),
         hierarchy_complete: true,
+        unavailable_members: Vec::new(),
     }
     .select(index, &Type::Unknown, usage, ctx)
 }

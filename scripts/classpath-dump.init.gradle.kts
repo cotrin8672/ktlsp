@@ -10,6 +10,9 @@ import org.gradle.api.artifacts.component.BuildIdentifier
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.component.ProjectComponentIdentifier
 import org.gradle.api.artifacts.result.ResolvedComponentResult
+import org.gradle.api.artifacts.result.ResolvedArtifactResult
+import org.gradle.jvm.JvmLibrary
+import org.gradle.language.base.artifact.SourcesArtifact
 import org.gradle.api.artifacts.result.ResolvedDependencyResult
 import org.gradle.api.artifacts.result.UnresolvedDependencyResult
 import org.gradle.api.file.SourceDirectorySet
@@ -612,6 +615,7 @@ class KtlspDumpClasspathAction(
 
         val pending = ArrayDeque<ResolvedComponentResult>()
         val visited = mutableSetOf<ComponentIdentifier>()
+        val sourceModules = linkedMapOf<String, Set<ModuleComponentIdentifier>>()
         val unresolved = linkedSetOf<String>()
         pending.add(resolutionRoot.get())
         while (pending.isNotEmpty()) {
@@ -656,6 +660,37 @@ class KtlspDumpClasspathAction(
                 }
             }
             failures.forEach { out.append(it).append('\n') }
+            sourceModules[sourceSet.name] = seen.filterIsInstance<ModuleComponentIdentifier>().toSet()
+        }
+        if (task.name == "ktlspDumpSources") {
+            try {
+                val selected = sourceModules.values.flatten().toSet()
+                val sources = if (selected.isEmpty()) null else task.project.dependencies.createArtifactResolutionQuery()
+                    .forComponents(selected)
+                    .withArtifacts(JvmLibrary::class.java, SourcesArtifact::class.java)
+                    .execute()
+                val resolved = sources?.resolvedComponents.orEmpty()
+                val failed = selected - resolved.map { it.id }.toSet()
+                sourceModules.forEach { (name, members) ->
+                    val components = resolved.filter { it.id in members }
+                    val incomplete = members.any { it in failed } || components.any { component ->
+                        component.getArtifacts(SourcesArtifact::class.java).any { it !is ResolvedArtifactResult }
+                    }
+                    out.append("SOURCEQUERY\t${name}\t${if (incomplete) "failed" else "complete"}\n")
+                    components.forEach componentLoop@ { component ->
+                        val id = component.id as? ModuleComponentIdentifier ?: return@componentLoop
+                        component.getArtifacts(SourcesArtifact::class.java).filterIsInstance<ResolvedArtifactResult>().forEach { artifact ->
+                            out.append("SOURCEARTIFACT\t${name}\t${artifact.file.absolutePath}\tMODULE\t${id.group}\t${id.module}\t${id.version}\n")
+                        }
+                    }
+                }
+            } catch (failure: Exception) {
+                if (failure is InterruptedException || failure is org.gradle.api.BuildCancelledException ||
+                    Thread.currentThread().isInterrupted) throw failure
+                sourceModules.keys.forEach { out.append("SOURCEQUERY\t${it}\tfailed\n") }
+                // Resolution exceptions may contain repository credentials; export only state.
+                task.logger.info("ktlsp source query unavailable")
+            }
         }
         out.append("END\t${projectPath}")
         System.out.println(out.toString())
@@ -794,12 +829,14 @@ allprojects {
         }.files
         val resolutionRoot = incoming.resolutionResult.rootComponent
 
-        tasks.register("ktlspDumpClasspath") {
+        listOf("ktlspDumpClasspath", "ktlspDumpSources").forEach { taskName ->
+          tasks.register(taskName) {
             // Gradle 7 serializes enclosing Kotlin DSL closures, including their Project receiver.
             doLast(KtlspDumpClasspathAction(
                 projectPath, projectDirPath, currentBuildRoot, includedBuildRoots,
                 classpathFiles, resolutionRoot, sourceSets,
             ))
+          }
         }
     }
 }

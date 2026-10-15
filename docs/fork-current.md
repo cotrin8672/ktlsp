@@ -1,8 +1,144 @@
 # Current fork state
 
 Read this before the historical acceptance record. Goal remains in progress.
-Updated2026-10-14 (Asia/Tokyo), checkpoint85.
+Updated2026-10-15 (Asia/Tokyo), checkpoint86 base verified; goal incomplete.
 
+Latest verified checkpoint86 result: fmt, the serialized-symbol wire regression,
+the full workspace suite (1,542 passed, zero failed, four ignored), and release
+build pass. All four owned stages close with EOF, zero residual cleanup and
+stable input guards. The root reviewer independently checked receipt stages,
+aggregated raw test results and the immutable binary (19,216,896 bytes, SHA-256
+cf9ebc7655eb2450b9168181e5954cd3edc651d14ead4bcda1a7afa154a3bb78).
+Evidence: native-binary-shadow-release86-3/{receipt,binary-reference}.json.
+This supersedes the pending combined Rust checks below. Latest CEM passes the
+unchanged original10 requests plus all8 separate Java assertions, split between
+ordinary and incomplete-code stages. Both stages exit zero with EOF, stable
+source guards, no forced cleanup and no live owned process. The root checked
+both result counts and artifact hashes against this exact immutable binary.
+Evidence: native-cem-shadow-editor86-1/receipt.json. Broad Java editor acceptance
+remains pending; CEM18 does not establish whole-project IDEA parity or latency.
+
+The separate Rust extension fixture now passes its actual Mixin-artifact javac
+control, crate test/build and real-Neovim corpus proof: two original and fourteen
+additional RPCs match, including applied prefix-preserving rename, unsaved
+target changes, configuration and disable/re-enable invalidation. All six native
+stages exit zero with EOF, no forced cleanup and stable input guards. The root
+reviewer inspected saved renamed buffers: both shadow$doubled uses retain their
+prefix and the unrelated target stays unchanged. Evidence:
+external-shadow86-1/{receipt,editor/artifacts/external-shadow-proof}.json;
+portable reproduction: dev/external-extension/README.md.
+This proves primitive-member executable composition. Nominal reference types
+such as BlockPos, production Mixin support and IDEA parity remain unproved.
+
+The production Gradle init script passes PREFER_SETTINGS and PREFER_PROJECT
+with the same GAV under different repositories and an isolated shared Gradle
+home, preserving exact selected source paths for main/test source sets. This
+does not prove editor refresh or compiler-plugin behavior. Evidence:
+native-gradle-product-source-policy86-1/receipt.json. Latest annotation/import
+editor verification closes with six matching first responses (four useful
+Java/Kotlin plain/qualified annotation completions and two unknown-package
+negative controls), and two applied Java imports whose exact returned source
+texts compile with javac. Alias compiler and selected-SDK archive-byte/range
+controls also pass. The root independently checked these artifacts. The broad
+Java scenario still fails five diagnostic expectations after library readiness:
+unresolved member, call shape, argument type, and two changed-superclass cases.
+Its editor stage exits1; the passing annotation subset does not make the scenario
+pass. All stages close with EOF and no residual termination. Evidence:
+native-annotation-editor86-3/receipt.json. Actual
+dependency/generated-source AUTO-WATCH refresh closes at84/86 checks: the updated
+Java caller's stale member has no expected diagnostic, and same-client shutdown
+times out. The owned job records one residual termination and no live process;
+this is a failed run, not clean shutdown or full refresh acceptance. The model
+does contain queried, complete exact source selections for all four source sets.
+Evidence: native-gradle-reload-editor86-1/receipt.json. Next: fix current Java
+diagnostic invalidation and inspect the shutdown failure; preserve both failed
+expectations. KAPT/KSP refresh has not run on this release. The next implementation
+must also publish useful selected binary facts before slow online source queries,
+retain a resolved source when an unrelated component fails, and certify the POM
+origin used for source encoding. These are open correctness/performance gaps,
+not acceptance of the current Gradle integration as complete.
+
+The remaining checkpoint86 notes below retain earlier observations and gaps;
+the verified results above supersede their pending-check descriptions.
+
+Keep tool output bounded: read this record and changed fields first, retain full
+logs on disk, and inspect failure excerpts only. Reuse successful checks until
+relevant inputs change; agent handoffs contain only delta, result, evidence and
+next command. Do not re-read full guard inventories or historical log files.
+
+The public Gradle source query passes PREFER_SETTINGS, PREFER_PROJECT and the
+actual CEM Create component (three native stages, exit0/EOF/owned0). The Create
+source archive is13,014,998 bytes and its expected source entry matches. This
+proves repository resolution. An all-module probe selects107 components and
+obtains100 source artifacts: query51.987s, process84.172s, one partly-cached
+sample (source jars21 to118), not a cold/warm latency distribution. Seven
+components have no source artifact; this is distinct from query errors. An
+eager query would delay initial project publication. The product integration
+must also preserve exact Gradle-selected source paths: cache lookup by GAV can
+pick another repository's source, and file repositories need not populate the
+Gradle modules cache. Deferred resolution and warm controls are under review;
+The exact-source model/helper changes are being implemented; worker hookup and
+editor validation are pending. Evidence:
+native-gradle-source-query85-2/receipt.json;
+native-gradle-source-query-all86-1/{receipt,cost-audit}.json.
+Commons1.26.0 real-Neovim completion returns putArchiveEntry on the first request.
+The selected POM policy is ISO-8859-1 and source parsing succeeds (zero failures),
+so the archive's non-UTF8 bytes do not establish a source-error fallback case.
+That editor proof remains open; do not count the intended-error assertion as
+product failure or fallback acceptance. The valid build/model are reused.
+Evidence: root-commons-source85-audit.json; native-commons-binary-fallback85-4.
+Spring/Gradle temporary corpus checkouts are clean after enabling local Git
+longpaths; source files and revisions are unchanged. Evidence:
+five-project-next84-1/root-longpaths85.json.
+Latest CEM editor86 passes the unchanged original10 requests and all8 separate
+Java assertions. Each original request receives a matching first response;
+both stages exit0/EOF/owned0 with clean shutdown, zero forced terminations and
+stable source guards. The root reviewer checked artifact hashes and result
+counts. The missing hierarchy fact was Ponder's actual VirtualBlockEntity
+interface; preserving its two abstract methods plus Create's nominal hierarchy
+restores super-member and generic-extension completion/navigation. Focused
+binary10, fields-only1 and implicit-receiver66 checks pass; full Rust1,528 pass/
+0 fail/4 ignored, fmt and release pass. Workspace/release cleanup each records
+one owned residual termination; these are retained separately from editor
+shutdown evidence. Evidence: native-cem-ponder-{focused,release,editor}86-1.
+Independent review found another safety gap: omitted abstract or unsupported
+overrides can expose a concrete ancestor after binary hierarchy publication.
+That case is reproduced and fixed with normalized per-owner/per-kind unavailable
+member facts, exact abstract declarations and shared completion/navigation
+filtering. The actual javac-produced hierarchy regression passes both languages,
+local/module and cold/warm routes. Focused86-4 passes binary12, fields-only1,
+annotation3, source-model3 and HTTP/cache2; the core members filter matched zero
+tests and is not counted as validation. Both the root and independent reviewer
+checked closed receipts. Global symbol cache is29 and binary cache schema v5;
+Gradle model remains14. Full and editor checks of the combined slice are pending.
+Latest five-project50, repository-source integration,
+live dependency/plugin refresh and updated performance comparisons remain open.
+Fresh Moshi MODEL14 exposes a missing main classpath JAR and an incomplete
+Kotlin task snapshot. The exact :moshi:jar task regenerates it successfully;
+model recapture and editor acceptance remain pending. Retrofit capture fails
+on an empty private Gradle Groovy-DSL cache leaf; only that generated leaf is
+quarantined with a receipt, preserving the rest of the cache. Evidence:
+native-five-moshi-{model,jar}86-1; retrofit-groovy-cache-repair86-1/receipt.json.
+An annotation editor baseline reproduces empty completion for Java
+@java.lang.Over despite useful @Over completion. Unknown-package controls stay
+empty. Kotlin @kotlin.Depre lacks a stdlib input in that fixture and is not RED
+evidence; a JDK-backed Kotlin annotation control is being established. The broad
+Java harness also exposes six diagnostic/navigation failures; its run is not
+accepted. Audit identifies an obsolete SDK source hash/range assertion (the
+returned range matches the actual SDK) and three diagnostic probes sent before
+library readiness, which cannot prove ready-world diagnostic behavior. Correct
+SDK-derived expectations and post-readiness edits are pending. Two superclass
+diagnostic cases fail after readiness and remain unattributed. Evidence:
+native-annotation-editor86-1 and its captured SDK/resource artifacts.
+Independent annotation compiler controls pass15/15, including Java/Kotlin
+private-nesting distinctions; the corrected editor run is pending. Evidence:
+native-annotation-compiler86-1/receipt.json.
+Extension API supports a separate Rust executable through public Backend
+provider registration. An external fixture is being verified; stock executable
+runtime loading is absent. JvmType currently lacks nominal reference types,
+so primitive-only extension tests cannot prove Minecraft member signatures.
+Reference-type support and external enabled/disabled/edit/config/rename proof
+remain required. Production Mixin support stays outside this project.
 
 Checkpoint85 implementation: typed Gradle input roles and source-error binary fallback. Typed KGP snapshot roles remove
 only Gradle IC fingerprints from fresh-CLI reads; registered and explicit CLI/

@@ -205,6 +205,8 @@ fn type_decl<'tree>(
         return;
     };
     let mut sym = indexed_symbol(name, src, kind, package, container);
+    sym.is_annotation = node.kind() == "annotation_type_declaration";
+    sym.source_member = crate::indexer::source_member_flags(node, src, true);
     let declaration_scope = java_declaration_scope(node, src, scope);
     let scope = declaration_scope.as_ref().unwrap_or(scope);
     sym.supertype_refs = supertype_refs(node, src, scope);
@@ -3317,27 +3319,13 @@ fn java_member_entries(
     {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let _ = infer::walk_supertypes(index, recv, JAVA_SUPERTYPE_WALK_CAP, |current| {
-        let Some(cur) =
-            infer::receiver_root_key(index, current).or_else(|| current.name().map(str::to_string))
-        else {
-            return ControlFlow::Continue(());
-        };
-        let cur_pkg = current.package();
-        out.extend(
-            index
-                .members_of(&cur)
-                .iter()
-                .filter(|entry| entry.sym.container.as_deref() == Some(cur.as_str()))
-                .filter(|entry| entry.sym.name == name)
-                .filter(|entry| java_member_kind_matches(entry.sym.kind, expected_kind))
-                .filter(|entry| cur_pkg.is_none_or(|pkg| entry.sym.package == pkg))
-                .filter(|entry| ktcore::members::receiver_member_accessible(recv, entry))
-                .cloned(),
-        );
-        ControlFlow::Continue(())
-    });
+    let ctx = FileCtx::new(recv.package().unwrap_or_default().to_string(), Vec::new());
+    let mut out: Vec<_> = ktcore::members::candidates(index, recv, name, &ctx)
+        .members
+        .into_iter()
+        .filter(|entry| java_member_kind_matches(entry.sym.kind, expected_kind))
+        .cloned()
+        .collect();
     out.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -4580,6 +4568,7 @@ pub fn completion(
         &query.prefix,
         query.candidates,
         snippets_supported,
+        ImportStyle::Java,
     );
     if let Some((sorted_imports, anchor)) = query.layout.as_ref() {
         complete::resolve_auto_import_lines(&mut shaped, sorted_imports, *anchor);
@@ -4597,6 +4586,32 @@ pub fn completion_query(
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
     let context = completion_context(tree, src, offset);
+    if context != complete::CompletionContext::None {
+        let package = package_of(tree, src);
+        let imports = imports_of(tree, src);
+        let scope = type_scope(tree, src);
+        let ctx = FileCtx::new(package.clone(), inference_imports(tree, src)).with_file(file);
+        if let Some((prefix, mut candidates)) =
+            complete::annotation_candidates(index, file, src, tree, offset, &scope, &ctx, |entry| {
+                is_visible(&package, &imports, &entry.sym)
+            })
+        {
+            candidates.truncate(max_candidates);
+            return Some(CompletionQuery {
+                context: complete::CompletionContext::ScopeName,
+                prefix,
+                status: if candidates.is_empty() {
+                    CompletionStatus::Unknown(vec![
+                        CompletionIncompletenessReason::QueryScopeIncomplete,
+                    ])
+                } else {
+                    CompletionStatus::Found(())
+                },
+                candidates,
+                layout: imports::import_layout_with_style(ImportStyle::Java, tree, src),
+            });
+        }
+    }
     if context == complete::CompletionContext::AfterDot {
         let (prefix, mut synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
         let selector_end = syn_offset

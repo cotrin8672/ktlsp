@@ -1111,7 +1111,7 @@ impl Workspace {
             return Some(completions);
         }
         let query = self.completion_query(key, offset)?;
-        Self::shape_completion_query(query, snippets_supported)
+        Self::shape_completion_query(key, query, snippets_supported)
     }
 
     /// Keep the LSP trace summary and rendered items from one ordinary query.
@@ -1134,12 +1134,13 @@ impl Workspace {
             )
         });
         let shaped = self.contributed_completion(key, offset).or_else(|| {
-            query.and_then(|query| Self::shape_completion_query(query, snippets_supported))
+            query.and_then(|query| Self::shape_completion_query(key, query, snippets_supported))
         });
         (shaped, semantic)
     }
 
     fn shape_completion_query(
+        key: &str,
         query: semantic_query::CompletionQuery,
         snippets_supported: bool,
     ) -> Option<ShapedCompletions> {
@@ -1155,6 +1156,10 @@ impl Workspace {
             &query.prefix,
             query.candidates,
             snippets_supported,
+            match language::SourceLanguage::for_key(key) {
+                language::SourceLanguage::Java => crate::imports::ImportStyle::Java,
+                language::SourceLanguage::Kotlin => crate::imports::ImportStyle::Kotlin,
+            },
         );
         // Resolve each surviving item's auto-import line from the file's import layout. `shape`
         // leaves `ImportEdit.line` at 0 (the text is set); the line depends on the live tree, so it

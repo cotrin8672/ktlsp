@@ -768,6 +768,13 @@ pub fn select_call<'a>(
     ctx: &FileCtx,
 ) -> CallSelection<'a> {
     use crate::members::{self, Applicability, CallMode};
+    if members::candidates(index, receiver, name, ctx).has_unavailable_call(args.count) {
+        return CallSelection {
+            candidates: Vec::new(),
+            applicability: Applicability::Unknown,
+            compiled_dispatch_blocked: false,
+        };
+    }
     let named: Vec<_> = candidates
         .into_iter()
         .filter(|candidate| candidate.name() == name)

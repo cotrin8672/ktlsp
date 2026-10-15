@@ -136,7 +136,7 @@ pub fn annotated_type_owners(
     ktcore::extensions::source::annotated_type_owners(index, key, tree, text, &scope)
 }
 
-fn source_type_scope(key: &str, tree: &Tree, text: &str) -> ktcore::indexer::TypeScope {
+pub(crate) fn source_type_scope(key: &str, tree: &Tree, text: &str) -> ktcore::indexer::TypeScope {
     let scope = match SourceLanguage::for_key(key) {
         SourceLanguage::Java => java::type_scope(tree, text),
         SourceLanguage::Kotlin => indexer::TypeScope::with_default_imports(
