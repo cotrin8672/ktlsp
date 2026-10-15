@@ -189,6 +189,10 @@ pub struct SourceSetClasspath {
     pub source_artifacts: Option<Vec<ResolvedArtifact>>,
     #[serde(default)]
     pub source_artifacts_incomplete: bool,
+    #[serde(default)]
+    pub source_poms: Option<Vec<ResolvedArtifact>>,
+    #[serde(default)]
+    pub source_poms_incomplete: bool,
     pub unresolved: Vec<String>,
     pub classpath_incomplete: bool,
     #[serde(default)]
@@ -311,6 +315,7 @@ impl ProjectSnapshot {
                     s.source_artifacts
                         .iter()
                         .flatten()
+                        .chain(s.source_poms.iter().flatten())
                         .map(|artifact| &artifact.path),
                 )
             })
@@ -349,6 +354,30 @@ impl ProjectSnapshot {
                 })
             })
             .collect();
+        let mut sdk_features = BTreeMap::new();
+        for (visibility, source) in model
+            .visibilities
+            .iter_mut()
+            .zip(model.modules.iter().flat_map(|module| &module.source_sets))
+        {
+            if let Some(source_zip) = source_set_jdk_source(source, &mut sdk_features) {
+                visibility.ordered_origins.push(jdk_origin_id(&source_zip));
+            }
+        }
+        for source_zip in model.selected_jdk_sources() {
+            let home = crate::deps::jdk_home_for_source_archive(&source_zip)
+                .expect("selected SDK source archive home");
+            for input in [
+                &source_zip,
+                &home.join("release"),
+                &home.join("jmods/java.base.jmod"),
+                &home.join("jre/lib/rt.jar"),
+            ] {
+                model
+                    .file_origins
+                    .insert(path_key(input), file_origin_id(input));
+            }
+        }
         model.local_source_keys = model
             .local_jars()
             .iter()
@@ -457,12 +486,41 @@ impl ProjectSnapshot {
         let mut visibilities = self.visibilities.clone();
         for visibility in &mut visibilities {
             for origin in global_origins {
+                // Model-owned SDKs are scoped above; a host SDK must never leak into another target.
+                if origin.starts_with("jdk:") {
+                    continue;
+                }
                 if !visibility.ordered_origins.contains(origin) {
                     visibility.ordered_origins.push(origin.clone());
                 }
             }
         }
         visibilities
+    }
+
+    pub(crate) fn selected_jdk_sources(&self) -> Vec<PathBuf> {
+        self.visibilities
+            .iter()
+            .flat_map(|visibility| &visibility.ordered_origins)
+            .filter_map(|origin| origin.strip_prefix("jdk:").map(PathBuf::from))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn selected_jdk_source_for_file(&self, file: &Path) -> Option<PathBuf> {
+        let (module, source) = self.owner_for(file)?;
+        let scope = project_scope(module, source?);
+        let visibility = self
+            .visibilities
+            .iter()
+            .find(|visibility| visibility.scope == scope)?;
+        let mut origins = visibility
+            .ordered_origins
+            .iter()
+            .filter_map(|origin| origin.strip_prefix("jdk:"));
+        let selected = PathBuf::from(origins.next()?);
+        origins.next().is_none().then_some(selected)
     }
 
     fn origins_for_entry(&self, entry: &Path, component: Option<&ComponentId>) -> Vec<String> {
@@ -524,6 +582,21 @@ impl ProjectSnapshot {
         &self,
         coord: &Coordinate,
     ) -> anyhow::Result<Option<Vec<(PathBuf, String)>>> {
+        self.coordinate_source_artifacts(coord, false)
+    }
+
+    pub(crate) fn coordinate_source_poms(
+        &self,
+        coord: &Coordinate,
+    ) -> anyhow::Result<Option<Vec<(PathBuf, String)>>> {
+        self.coordinate_source_artifacts(coord, true)
+    }
+
+    fn coordinate_source_artifacts(
+        &self,
+        coord: &Coordinate,
+        poms: bool,
+    ) -> anyhow::Result<Option<Vec<(PathBuf, String)>>> {
         let selected = |component: &ComponentId| {
             matches!(component, ComponentId::Module { group, name, version }
                 if group == &coord.group && name == &coord.artifact && version == &coord.version)
@@ -535,22 +608,35 @@ impl ProjectSnapshot {
                 .artifacts
                 .iter()
                 .any(|artifact| selected(&artifact.component))
+                && !(poms
+                    && source
+                        .source_poms
+                        .iter()
+                        .flatten()
+                        .any(|artifact| selected(&artifact.component)))
             {
                 continue;
             }
-            anyhow::ensure!(
-                !source.source_artifacts_incomplete,
-                "Gradle source selection is incomplete for {}",
-                coord.label()
-            );
-            let Some(artifacts) = &source.source_artifacts else {
+            let (artifacts, incomplete) = if poms {
+                (&source.source_poms, source.source_poms_incomplete)
+            } else {
+                (&source.source_artifacts, source.source_artifacts_incomplete)
+            };
+            let Some(artifacts) = artifacts else {
+                anyhow::ensure!(!incomplete, "Gradle source metadata records are invalid");
                 return Ok(None);
             };
             queried = true;
-            for artifact in artifacts
+            let selected_artifacts = artifacts
                 .iter()
                 .filter(|artifact| selected(&artifact.component))
-            {
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                !incomplete || !selected_artifacts.is_empty(),
+                "Gradle source metadata selection is incomplete for {}",
+                coord.label()
+            );
+            for artifact in selected_artifacts {
                 let origin = self.artifact_origin(&artifact.path).ok_or_else(|| {
                     anyhow::anyhow!("Gradle source artifact identity is unavailable")
                 })?;
@@ -564,6 +650,18 @@ impl ProjectSnapshot {
             coord.label()
         );
         Ok(queried.then(|| paths.into_iter().collect()))
+    }
+
+    pub(crate) fn source_enrichment_needed(&self) -> bool {
+        self.modules
+            .iter()
+            .flat_map(|module| &module.source_sets)
+            .any(|source| {
+                source.source_artifacts.is_none()
+                    || source.source_artifacts_incomplete
+                    || source.source_poms.is_none()
+                    || source.source_poms_incomplete
+            })
     }
 
     pub fn coordinates_for_file(&self, file: &Path) -> Option<Vec<Coordinate>> {
@@ -638,26 +736,302 @@ impl ProjectSnapshot {
     pub fn artifact_revisions(&self) -> BTreeMap<String, std::collections::BTreeSet<String>> {
         let mut revisions: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
         for source in self.modules.iter().flat_map(|module| &module.source_sets) {
+            let pom_revisions = source
+                .source_poms
+                .iter()
+                .flatten()
+                .filter_map(|artifact| self.file_origins.get(&path_key(&artifact.path)).cloned())
+                .collect::<std::collections::BTreeSet<_>>();
             for artifact in source
                 .artifacts
                 .iter()
                 .chain(source.source_artifacts.iter().flatten())
+                .chain(source.source_poms.iter().flatten())
             {
                 if !self.file_origins.contains_key(&path_key(&artifact.path)) {
                     continue;
                 }
                 for origin in self.origins_for_entry(&artifact.path, Some(&artifact.component)) {
                     if let Some(revision) = self.file_origins.get(&path_key(&artifact.path)) {
-                        revisions
-                            .entry(origin)
-                            .or_default()
-                            .insert(revision.clone());
+                        let versions = revisions.entry(origin).or_default();
+                        versions.insert(revision.clone());
+                        // A declared parent POM can change a child's source decoding policy.
+                        if matches!(artifact.component, ComponentId::Module { .. }) {
+                            versions.extend(pom_revisions.iter().cloned());
+                        }
                     }
+                }
+            }
+        }
+        for source_zip in self.selected_jdk_sources() {
+            let home = crate::deps::jdk_home_for_source_archive(&source_zip)
+                .expect("selected SDK source archive home");
+            let inputs = [
+                &source_zip,
+                &home.join("release"),
+                &home.join("jmods/java.base.jmod"),
+                &home.join("jre/lib/rt.jar"),
+            ];
+            revisions
+                .entry(jdk_origin_id(&source_zip))
+                .or_default()
+                .extend(
+                    inputs
+                        .into_iter()
+                        .filter_map(|input| self.file_origins.get(&path_key(input)).cloned()),
+                );
+        }
+        revisions
+    }
+
+    pub(crate) fn binary_artifact_revisions(
+        &self,
+    ) -> BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut revisions: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+        for artifact in self
+            .modules
+            .iter()
+            .flat_map(|module| &module.source_sets)
+            .flat_map(|source| &source.artifacts)
+        {
+            if let Some(revision) = self.artifact_origin(&artifact.path) {
+                for origin in self.origins_for_entry(&artifact.path, Some(&artifact.component)) {
+                    revisions
+                        .entry(origin)
+                        .or_default()
+                        .insert(revision.to_string());
                 }
             }
         }
         revisions
     }
+}
+
+fn sdk_feature_version(release: &str) -> Option<u16> {
+    let mut versions = release
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("JAVA_VERSION="));
+    let value = versions.next()?.strip_prefix('"')?.strip_suffix('"')?;
+    if versions.next().is_some()
+        || value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+    {
+        return None;
+    }
+    if value.ends_with(['.', '_', '+', '-']) || value.contains("..") {
+        return None;
+    }
+    if value.split(['+', '-']).any(str::is_empty)
+        || value
+            .split(['+', '-'])
+            .next()?
+            .split(['.', '_'])
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let mut numbers = value.split(['.', '_', '+', '-']);
+    let first = numbers.next()?.parse::<u16>().ok()?;
+    let feature = if first == 1 {
+        let legacy = numbers.next()?.parse::<u16>().ok()?;
+        if legacy != 8 {
+            return None;
+        }
+        legacy
+    } else {
+        first
+    };
+    (feature >= 8).then_some(feature)
+}
+
+fn source_set_jdk_source(
+    source: &SourceSetClasspath,
+    features: &mut BTreeMap<String, Option<u16>>,
+) -> Option<PathBuf> {
+    if source.compiler_metadata_incomplete
+        || source.kotlin_compile_task.is_none()
+            && source
+                .compiler_tasks
+                .iter()
+                .any(|task| task.language == CompilerLanguage::Kotlin)
+    {
+        return None;
+    }
+    let mut home = None;
+    let mut selected_kotlin = 0;
+    for task in &source.compiler_tasks {
+        if task.language == CompilerLanguage::Kotlin
+            && source.kotlin_compile_task.as_deref() != Some(task.task.as_str())
+        {
+            continue;
+        }
+        if !task.complete || task.problem.is_some() {
+            return None;
+        }
+        let selected = task.java_home.as_deref()?;
+        if !selected.is_absolute() {
+            return None;
+        }
+        let feature = *features.entry(path_key(selected)).or_insert_with(|| {
+            let bytes = std::fs::read(selected.join("release")).ok()?;
+            (bytes.len() <= 64 * 1024).then_some(())?;
+            sdk_feature_version(std::str::from_utf8(&bytes).ok()?)
+        });
+        let feature = feature?;
+        match task.language {
+            CompilerLanguage::Java => {
+                if !matches!(
+                    task.task_type.as_str(),
+                    "org.gradle.api.tasks.compile.JavaCompile"
+                        | "org.gradle.api.tasks.compile.JavaCompile_Decorated"
+                ) || task.options.get("bootstrapClasspath") != Some(&serde_json::Value::Null)
+                {
+                    return None;
+                }
+                if task.options.get("forkJavaHome").is_some_and(|home| {
+                    !home.is_null()
+                        && home
+                            .as_str()
+                            .is_none_or(|home| path_key(Path::new(home)) != path_key(selected))
+                }) || task
+                    .options
+                    .get("forkExecutable")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    return None;
+                }
+                match task.options.get("release") {
+                    Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::Number(release))
+                        if release.as_u64() == Some(u64::from(feature)) => {}
+                    _ => return None,
+                }
+                if task
+                    .options
+                    .get("javaCompilerRecipe")
+                    .is_some_and(|recipe| !recipe.is_null())
+                {
+                    let recorded = task
+                        .options
+                        .get("javaCompilerRecipe")?
+                        .get("language_version")?
+                        .as_str()?
+                        .parse::<u16>()
+                        .ok()?;
+                    if recorded != feature {
+                        return None;
+                    }
+                    let options: Vec<String> = serde_json::from_value(
+                        task.options
+                            .get("javaCompilerRecipe")?
+                            .get("api_options")?
+                            .clone(),
+                    )
+                    .ok()?;
+                    if !sdk_java_arguments_match(&options, feature) {
+                        return None;
+                    }
+                }
+                if !sdk_java_arguments_match(&task.arguments, feature) {
+                    return None;
+                }
+            }
+            CompilerLanguage::Kotlin => {
+                selected_kotlin += 1;
+                if !matches!(
+                    task.task_type.as_str(),
+                    "org.jetbrains.kotlin.gradle.tasks.KotlinCompile"
+                        | "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated"
+                ) {
+                    return None;
+                }
+                let mut arguments = task.arguments.iter();
+                while let Some(argument) = arguments.next() {
+                    if argument == "-no-jdk"
+                        || argument.starts_with('@')
+                        || argument.starts_with("-Xbuild-file")
+                        || argument == "-module"
+                        || argument.starts_with("-module=")
+                    {
+                        return None;
+                    }
+                    if argument == "-jdk-home"
+                        && path_key(Path::new(arguments.next()?)) != path_key(selected)
+                    {
+                        return None;
+                    }
+                    if let Some(home) = argument.strip_prefix("-jdk-home=") {
+                        if path_key(Path::new(home)) != path_key(selected) {
+                            return None;
+                        }
+                    }
+                    if let Some(release) = argument.strip_prefix("-Xjdk-release=") {
+                        if release.parse::<u16>().ok() != Some(feature) {
+                            return None;
+                        }
+                    } else if argument.starts_with("-Xjdk-release") {
+                        return None;
+                    }
+                }
+            }
+        }
+        if home
+            .as_ref()
+            .is_some_and(|previous: &PathBuf| path_key(previous) != path_key(selected))
+        {
+            return None;
+        }
+        home = Some(selected.to_path_buf());
+    }
+    if source.kotlin_compile_task.is_some() && selected_kotlin != 1 {
+        return None;
+    }
+    crate::deps::src_zip_for_home(home?)
+}
+
+fn sdk_java_arguments_match(arguments: &[String], feature: u16) -> bool {
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--release" {
+            if arguments
+                .next()
+                .and_then(|release| release.parse::<u16>().ok())
+                != Some(feature)
+            {
+                return false;
+            }
+        } else if let Some(release) = argument.strip_prefix("--release=") {
+            if release.parse::<u16>().ok() != Some(feature) {
+                return false;
+            }
+        } else if argument.starts_with('@')
+            || argument.starts_with("-J")
+            || argument.starts_with("-Xbootclasspath")
+            || [
+                "--system",
+                "--patch-module",
+                "--upgrade-module-path",
+                "--module-path",
+                "--limit-modules",
+                "-bootclasspath",
+                "--boot-class-path",
+                "-endorseddirs",
+                "-extdirs",
+                "-profile",
+            ]
+            .iter()
+            .any(|flag| {
+                argument == flag
+                    || argument.starts_with(&format!("{flag}="))
+                    || argument.starts_with(&format!("{flag}:"))
+            })
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn project_scope(module: &ModuleClasspath, source: &SourceSetClasspath) -> ProjectScope {
@@ -795,6 +1169,10 @@ fn parse_dump_reader(
                             | "PROVIDES"
                             | "SCP"
                             | "ARTIFACT"
+                            | "SOURCEARTIFACT"
+                            | "SOURCEQUERY"
+                            | "POMARTIFACT"
+                            | "POMQUERY"
                             | "SUNRESOLVED"
                             | "INCOMPLETE"
                             | "COMPILER"
@@ -847,6 +1225,8 @@ fn parse_dump_reader(
                 | "ARTIFACT"
                 | "SOURCEARTIFACT"
                 | "SOURCEQUERY"
+                | "POMARTIFACT"
+                | "POMQUERY"
                 | "SUNRESOLVED"
                 | "INCOMPLETE"
                 | "COMPILER"
@@ -865,10 +1245,22 @@ fn parse_dump_reader(
                             cur.source_sets.len() - 1
                         });
                     let source = &mut cur.source_sets[idx];
-                    if record == "SOURCEQUERY" {
-                        source.source_artifacts_incomplete |=
-                            source.source_artifacts.replace(Vec::new()).is_some()
-                                || parts.next() != Some("complete");
+                    if record == "SOURCEQUERY" || record == "POMQUERY" {
+                        let (artifacts, incomplete) = if record == "POMQUERY" {
+                            (&mut source.source_poms, &mut source.source_poms_incomplete)
+                        } else {
+                            (
+                                &mut source.source_artifacts,
+                                &mut source.source_artifacts_incomplete,
+                            )
+                        };
+                        if artifacts.is_some() || *incomplete {
+                            *artifacts = None;
+                            *incomplete = true;
+                        } else {
+                            *artifacts = Some(Vec::new());
+                            *incomplete = parts.next() != Some("complete");
+                        }
                         continue;
                     }
                     if record == "KOTLIN_COMPILE_TASK" {
@@ -926,7 +1318,7 @@ fn parse_dump_reader(
                             "OUTPUT" => source.output_roots.push(path),
                             "PROVIDES" => source.provided_artifacts.push(path),
                             "SCP" => source.entries.push(path),
-                            "ARTIFACT" | "SOURCEARTIFACT" => {
+                            "ARTIFACT" | "SOURCEARTIFACT" | "POMARTIFACT" => {
                                 let component = match parts.next() {
                                     Some("MODULE") => {
                                         match (parts.next(), parts.next(), parts.next()) {
@@ -954,29 +1346,48 @@ fn parse_dump_reader(
                                 };
                                 if let Some(component) = component {
                                     let artifact = ResolvedArtifact { path, component };
-                                    if record == "SOURCEARTIFACT" {
+                                    if record == "SOURCEARTIFACT" || record == "POMARTIFACT" {
+                                        let (artifacts, incomplete) = if record == "POMARTIFACT" {
+                                            (
+                                                &mut source.source_poms,
+                                                &mut source.source_poms_incomplete,
+                                            )
+                                        } else {
+                                            (
+                                                &mut source.source_artifacts,
+                                                &mut source.source_artifacts_incomplete,
+                                            )
+                                        };
                                         if !matches!(
                                             &artifact.component,
                                             ComponentId::Module { .. }
                                         ) {
-                                            source.source_artifacts_incomplete = true;
-                                        } else if let Some(artifacts) = &mut source.source_artifacts
-                                        {
+                                            *incomplete = true;
+                                            *artifacts = None;
+                                        } else if let Some(artifacts) = artifacts {
                                             artifacts.push(artifact);
                                         } else {
-                                            source.source_artifacts_incomplete = true;
+                                            *incomplete = true;
                                         }
                                     } else {
                                         source.artifacts.push(artifact);
                                     }
                                 } else if record == "SOURCEARTIFACT" {
                                     source.source_artifacts_incomplete = true;
+                                    source.source_artifacts = None;
+                                } else if record == "POMARTIFACT" {
+                                    source.source_poms_incomplete = true;
+                                    source.source_poms = None;
                                 }
                             }
                             _ => {}
                         }
                     } else if record == "SOURCEARTIFACT" {
                         source.source_artifacts_incomplete = true;
+                        source.source_artifacts = None;
+                    } else if record == "POMARTIFACT" {
+                        source.source_poms_incomplete = true;
+                        source.source_poms = None;
                     }
                 }
             }
@@ -1107,8 +1518,16 @@ pub fn resolve_snapshot(root: &Path) -> anyhow::Result<Arc<ProjectSnapshot>> {
 
 /// Background-only preparation. Build/output events force Gradle even when metadata is unchanged.
 pub fn load_snapshot(root: &Path, force: bool) -> anyhow::Result<Arc<ProjectSnapshot>> {
-    load_snapshot_with(root, force, || {
-        dump_with_fallback(root, "ktlspDumpClasspath")
+    load_snapshot_cancellable(root, force, None)
+}
+
+pub(crate) fn load_snapshot_cancellable(
+    root: &Path,
+    force: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    load_snapshot_with_cancellable(root, force, cancelled, || {
+        dump_with_fallback_cancellable(root, "ktlspDumpClasspath", cancelled)
     })
 }
 
@@ -1116,17 +1535,13 @@ pub fn load_snapshot(root: &Path, force: bool) -> anyhow::Result<Arc<ProjectSnap
 pub(crate) fn load_source_snapshot(
     root: &Path,
     accepted: &Arc<ProjectSnapshot>,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<Arc<ProjectSnapshot>> {
-    if accepted
-        .modules
-        .iter()
-        .flat_map(|module| &module.source_sets)
-        .all(|source| source.source_artifacts.is_some() && !source.source_artifacts_incomplete)
-    {
+    if !accepted.source_enrichment_needed() {
         return Ok(accepted.clone());
     }
     let start = std::time::Instant::now();
-    let result = run_dump(root, "ktlspDumpSources", false);
+    let result = run_dump_cancellable(root, "ktlspDumpSources", false, Some(cancelled));
     crate::trace::span(
         "classpath.source_query",
         "classpath",
@@ -1149,6 +1564,8 @@ fn source_snapshot(
         {
             source.source_artifacts = None;
             source.source_artifacts_incomplete = false;
+            source.source_poms = None;
+            source.source_poms_incomplete = false;
         }
         modules
     };
@@ -1167,10 +1584,33 @@ fn load_snapshot_with(
     force: bool,
     dump: impl FnOnce() -> anyhow::Result<Vec<ModuleClasspath>>,
 ) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    load_snapshot_with_cancellable(root, force, None, dump)
+}
+
+fn load_snapshot_with_cancellable(
+    root: &Path,
+    force: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    dump: impl FnOnce() -> anyhow::Result<Vec<ModuleClasspath>>,
+) -> anyhow::Result<Arc<ProjectSnapshot>> {
+    let check_cancelled = || -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !cancelled.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)),
+            "Gradle model resolution cancelled"
+        );
+        Ok(())
+    };
     let lock_start = std::time::Instant::now();
-    let _guard = RESOLUTION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = loop {
+        check_cancelled()?;
+        match RESOLUTION_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+        }
+    };
     crate::trace::span(
         "classpath.model_lock",
         "classpath",
@@ -1189,6 +1629,7 @@ fn load_snapshot_with(
     if let Some(model) = snapshot(root).filter(|_| !force) {
         if model.mtimes == build_file_mtimes(root, &model.modules) {
             trace_cache("memory");
+            check_cancelled()?;
             return Ok(model);
         }
     }
@@ -1201,12 +1642,14 @@ fn load_snapshot_with(
                 let mut model = ProjectSnapshot::new(entry.modules);
                 model.mtimes = entry.mtimes;
                 trace_cache("disk");
+                check_cancelled()?;
                 return Ok(Arc::new(model));
             }
         }
     }
     trace_cache("miss");
     let modules = dump()?;
+    check_cancelled()?;
     let mtimes = build_file_mtimes(root, &modules);
     log_unresolved(&modules);
     let mut model = ProjectSnapshot::new(modules);
@@ -1325,9 +1768,17 @@ fn module_cache_path(root: &Path, module: &str) -> PathBuf {
 /// state, immune to repository flakiness. An empty or failed offline dump means the cache isn't
 /// populated (fresh machine) — fall back to the online run for completeness.
 fn dump_with_fallback(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClasspath>> {
+    dump_with_fallback_cancellable(root, task, None)
+}
+
+fn dump_with_fallback_cancellable(
+    root: &Path,
+    task: &str,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Vec<ModuleClasspath>> {
     let run = |offline| {
         let start = std::time::Instant::now();
-        let result = run_dump(root, task, offline);
+        let result = run_dump_cancellable(root, task, offline, cancelled);
         crate::trace::span(
             "classpath.gradle_dump",
             "classpath",
@@ -1343,8 +1794,12 @@ fn dump_with_fallback(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClass
             tracing::info!("offline classpath dump resolved no entries; retrying online");
             run(false)
         }
-        Err(offline_err) => {
-            tracing::info!("offline classpath dump failed ({offline_err:#}); retrying online");
+        Err(_) => {
+            anyhow::ensure!(
+                !cancelled.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)),
+                "Gradle model resolution cancelled"
+            );
+            tracing::info!("offline classpath dump failed; retrying online");
             run(false)
         }
     }
@@ -1398,6 +1853,19 @@ fn create_dump_script() -> anyhow::Result<PathBuf> {
 /// `offline` passes `--offline`: resolution then depends only on the local Gradle cache, which is
 /// stable across runs — online runs drop entries nondeterministically under repository flakiness.
 fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<ModuleClasspath>> {
+    run_dump_cancellable(root, task, offline, None)
+}
+
+fn run_dump_cancellable(
+    root: &Path,
+    task: &str,
+    offline: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Vec<ModuleClasspath>> {
+    anyhow::ensure!(
+        !cancelled.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)),
+        "Gradle resolution cancelled before launch"
+    );
     let gradle = crate::deps::gradle_root(root)
         .ok_or_else(|| anyhow::anyhow!("{} is not a Gradle project", root.display()))?;
     // Absolute wrapper path: with current_dir(root) set, a relative program path resolves against
@@ -1444,7 +1912,12 @@ fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<Module
         .open(&stdout_path)?;
     let _stdout_guard = TempFile(&stdout_path);
     let (status, interrupted, stdout_failure, stdout_complete, stderr, stderr_complete) =
-        crate::compile::run_with_stdout_file(&mut command, stdout.try_clone()?)?;
+        crate::compile::run_with_stdout_file_cancellable(
+            &mut command,
+            stdout.try_clone()?,
+            std::time::Duration::from_secs(60 * 60),
+            cancelled,
+        )?;
     if interrupted {
         anyhow::bail!(
             "gradle classpath dump interrupted by deadline or owned-tree cleanup:\n{stderr}"
@@ -1783,6 +2256,236 @@ mod tests {
             "api_options": ["-source", "17", "-target", "17", "-sourcepath", "",
                 "-proc:none", "-XDuseUnsharedTable=true", "-classpath", "/repo/z.jar;/repo/a.jar", "-proc:none"]
         })
+    }
+
+    #[test]
+    fn selected_sdk_release_features_use_the_standard_bounded_version_key() {
+        for (text, expected) in [
+            ("JAVA_VERSION=\"17.0.7\"", Some(17)),
+            ("JAVA_VERSION=\"21.0.3+9-LTS\"", Some(21)),
+            ("JAVA_VERSION=\"1.8.0_402\"", Some(8)),
+            ("JAVA_VERSION=\"25-ea\"", Some(25)),
+            ("JAVA_VERSION=\"17foo\"", None),
+            ("JAVA_VERSION=\"17.foo\"", None),
+            ("JAVA_VERSION=\"17..0\"", None),
+            ("JAVA_VERSION=17", None),
+            ("JAVA_VERSION=\"17\"\nJAVA_VERSION=\"21\"", None),
+            ("JAVA_VERSION_DATE=\"2023-01-01\"", None),
+        ] {
+            assert_eq!(sdk_feature_version(text), expected, "{text}");
+        }
+    }
+
+    fn sdk_selection_fixture() -> (PathBuf, Vec<ModuleClasspath>) {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-sdk-selection-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut modules = Vec::new();
+        for feature in [17, 21] {
+            let home = root.join(format!("jdk{feature}"));
+            std::fs::create_dir_all(home.join("lib")).unwrap();
+            std::fs::write(home.join("lib/src.zip"), "explicit SDK source stamp").unwrap();
+            std::fs::write(
+                home.join("release"),
+                format!("JAVA_VERSION=\"{feature}.0.1\"\n"),
+            )
+            .unwrap();
+            let mut java = plain_java_configuration();
+            java["java_home"] = serde_json::json!(home);
+            java["options"]["release"] = if feature == 17 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(21)
+            };
+            java["options"]["bootstrapClasspath"] = serde_json::Value::Null;
+            java["options"]["javaCompilerRecipe"] = selected_java_recipe();
+            java["options"]["javaCompilerRecipe"]["language_version"] = feature.to_string().into();
+            modules.push(ModuleClasspath {
+                module: format!(":sdk{feature}"),
+                project_dir: root.join(format!("module{feature}")),
+                build: String::new(),
+                entries: Vec::new(),
+                unresolved: Vec::new(),
+                source_sets: vec![SourceSetClasspath {
+                    name: "main".into(),
+                    source_roots: vec![root.join(format!("module{feature}/src"))],
+                    compiler_tasks: vec![serde_json::from_value(java).unwrap()],
+                    ..Default::default()
+                }],
+            });
+        }
+        (root, modules)
+    }
+
+    #[test]
+    fn selected_sdk_legacy_root_source_archive_uses_its_own_home_and_revisions() {
+        let (root, modules) = sdk_selection_fixture();
+        let home = root.join("jdk8");
+        std::fs::create_dir_all(home.join("jre/lib")).unwrap();
+        let source = home.join("src.zip");
+        std::fs::write(&source, "selected legacy SDK archive").unwrap();
+        std::fs::write(home.join("release"), "JAVA_VERSION=\"1.8.0_352\"\n").unwrap();
+        std::fs::write(home.join("jre/lib/rt.jar"), "selected legacy runtime").unwrap();
+        let mut module = modules[0].clone();
+        let task = &mut module.source_sets[0].compiler_tasks[0];
+        task.java_home = Some(home.clone());
+        task.options.get_mut("javaCompilerRecipe").unwrap()["language_version"] = "8".into();
+        let model = ProjectSnapshot::new(vec![module.clone()]);
+        assert_eq!(model.selected_jdk_sources(), [source.clone()]);
+        assert_eq!(
+            crate::deps::jdk_home_for_source_archive(&source),
+            Some(home.as_path())
+        );
+        assert_eq!(
+            model.selected_jdk_source_for_file(
+                &module.source_sets[0].source_roots[0].join("Use.java")
+            ),
+            Some(source.clone())
+        );
+        let origin = jdk_origin_id(&source);
+        let revisions = &model.artifact_revisions()[&origin];
+        assert!(revisions.contains(&file_origin_id(&home.join("release"))));
+        assert!(revisions.contains(&file_origin_id(&home.join("jre/lib/rt.jar"))));
+        std::fs::write(home.join("release"), "JAVA_VERSION=\"1.8.0_353\"\n").unwrap();
+        let updated = ProjectSnapshot::new(vec![module]);
+        assert_ne!(
+            model.artifact_revisions()[&origin],
+            updated.artifact_revisions()[&origin]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_sdk_sources_are_scoped_and_same_feature_release_is_accepted() {
+        let (root, modules) = sdk_selection_fixture();
+        let model = ProjectSnapshot::new(modules.clone());
+        assert_eq!(model.selected_jdk_sources().len(), 2);
+        let visibilities = model.scope_visibilities(&["jdk:/unrelated/host/lib/src.zip".into()]);
+        for (module, visibility) in modules.iter().zip(visibilities) {
+            let source = module.source_sets[0].compiler_tasks[0]
+                .java_home
+                .as_ref()
+                .unwrap()
+                .join("lib/src.zip");
+            let sdks = visibility
+                .ordered_origins
+                .iter()
+                .filter(|origin| origin.starts_with("jdk:"))
+                .collect::<Vec<_>>();
+            assert_eq!(sdks, [&jdk_origin_id(&source)]);
+            for name in ["Unsaved.java", "Unsaved.kt"] {
+                assert_eq!(
+                    model.selected_jdk_source_for_file(
+                        &module.source_sets[0].source_roots[0].join(name)
+                    ),
+                    Some(source.clone())
+                );
+            }
+        }
+        let mut cem = modules[1].clone();
+        cem.source_sets[0].compiler_tasks[0]
+            .options
+            .insert("release".into(), serde_json::Value::Null);
+        assert_eq!(
+            ProjectSnapshot::new(vec![cem]).selected_jdk_sources().len(),
+            1,
+            "CEM21 null release remains selected"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_sdk_sources_refuse_cross_feature_ambiguous_or_unverified_inputs() {
+        let (root, modules) = sdk_selection_fixture();
+        let mut source = modules[1].source_sets[0].clone();
+        for field in ["release", "javaCompilerRecipe"] {
+            let mut changed = source.clone();
+            if field == "release" {
+                changed.compiler_tasks[0]
+                    .options
+                    .insert(field.into(), serde_json::json!(17));
+            } else {
+                changed.compiler_tasks[0].options.get_mut(field).unwrap()["language_version"] =
+                    "17".into();
+            }
+            assert!(
+                source_set_jdk_source(&changed, &mut BTreeMap::new()).is_none(),
+                "{field}"
+            );
+        }
+        source.compiler_tasks[0].arguments = vec!["--release=17".into()];
+        assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_none());
+        source.compiler_tasks[0].arguments = vec!["--release=21".into()];
+        assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_some());
+        for argument in [
+            "-Xbootclasspath/p:/foreign-sdk",
+            "--system=/foreign-sdk",
+            "@opaque.args",
+        ] {
+            source.compiler_tasks[0].arguments = vec![argument.into()];
+            assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_none());
+        }
+        source.compiler_tasks[0].arguments = vec!["--release=21".into()];
+        for options in [
+            serde_json::json!(["--system", "/foreign-sdk"]),
+            serde_json::json!(["--release=17"]),
+            serde_json::json!(["-Xbootclasspath/p:/foreign-sdk"]),
+            serde_json::json!({}),
+        ] {
+            let mut changed = source.clone();
+            changed.compiler_tasks[0]
+                .options
+                .get_mut("javaCompilerRecipe")
+                .unwrap()["api_options"] = options;
+            assert!(
+                source_set_jdk_source(&changed, &mut BTreeMap::new()).is_none(),
+                "effective compiler options cannot select foreign SDK APIs"
+            );
+        }
+        let mut dangling = source.clone();
+        dangling.compiler_tasks[0].arguments = vec!["--release".into()];
+        dangling.compiler_tasks[0]
+            .options
+            .get_mut("javaCompilerRecipe")
+            .unwrap()["api_options"] = serde_json::json!(["21"]);
+        assert!(
+            source_set_jdk_source(&dangling, &mut BTreeMap::new()).is_none(),
+            "independent argument streams cannot complete each other's dangling options"
+        );
+        let mut kotlin = source.compiler_tasks[0].clone();
+        kotlin.language = CompilerLanguage::Kotlin;
+        kotlin.task = ":compileKotlin".into();
+        kotlin.task_type = "org.jetbrains.kotlin.gradle.tasks.KotlinCompile".into();
+        kotlin.arguments.clear();
+        kotlin.java_home = modules[0].source_sets[0].compiler_tasks[0]
+            .java_home
+            .clone();
+        source.kotlin_compile_task = Some(kotlin.task.clone());
+        source.compiler_tasks.push(kotlin);
+        assert!(
+            source_set_jdk_source(&source, &mut BTreeMap::new()).is_none(),
+            "two homes in one source set cannot use a first winner"
+        );
+        source.compiler_tasks[1].java_home = source.compiler_tasks[0].java_home.clone();
+        assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_some());
+        for arguments in [
+            vec!["@opaque.args".into()],
+            vec!["-Xbuild-file=opaque.xml".into()],
+            vec!["-module=opaque.xml".into()],
+        ] {
+            source.compiler_tasks[1].arguments = arguments;
+            assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_none());
+        }
+        source.compiler_tasks.pop();
+        source.kotlin_compile_task = None;
+        source.compiler_metadata_incomplete = true;
+        assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2422,6 +3125,89 @@ mod tests {
         assert!(reloaded.get());
         assert!(fresh.modules[0].source_sets[0].source_artifacts.is_none());
         std::fs::remove_file(cache_path(&root)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_model_cancellation_does_not_wait_for_another_gradle_resolution_lock() {
+        let guard = RESOLUTION_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let (started, entered) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            load_snapshot_with_cancellable(
+                Path::new("/cancelled-model-lock"),
+                true,
+                Some(&worker_cancelled),
+                || panic!("cancelled model import must not launch Gradle"),
+            )
+        });
+        entered.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cancelled.store(true, AtomicOrdering::Release);
+        let started = std::time::Instant::now();
+        while !worker.is_finished() && started.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let cancelled_while_locked = worker.is_finished();
+        drop(guard);
+        assert!(worker.join().unwrap().is_err());
+        assert!(
+            cancelled_while_locked,
+            "shutdown must not wait for another workspace's Gradle process"
+        );
+    }
+
+    #[test]
+    fn source_query_keeps_resolved_artifacts_and_parent_poms_when_another_module_fails() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp-partial-source-query-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("api.jar");
+        let sources = root.join("api-sources.jar");
+        let pom = root.join("api.pom");
+        let parent = root.join("parent.pom");
+        for path in [&binary, &sources, &pom, &parent] {
+            std::fs::write(path, b"v1").unwrap();
+        }
+        let modules = parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nARTIFACT\tmain\t{}\tMODULE\tvendor\tmissing\t1\nSOURCEQUERY\tmain\tfailed\nSOURCEARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nPOMQUERY\tmain\tfailed\nPOMARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nPOMARTIFACT\tmain\t{}\tMODULE\tvendor\tparent\t1\nEND\t:app\n",
+            root.display(), binary.display(), binary.display(), root.join("missing.jar").display(),
+            sources.display(), pom.display(), parent.display()));
+        let selected = ProjectSnapshot::new(modules.clone());
+        let api = Coordinate::parse("vendor:api:1").unwrap();
+        let missing = Coordinate::parse("vendor:missing:1").unwrap();
+        let parent_coord = Coordinate::parse("vendor:parent:1").unwrap();
+        assert_eq!(
+            selected.coordinate_sources(&api).unwrap().unwrap()[0].0,
+            sources
+        );
+        assert!(selected.coordinate_sources(&missing).is_err());
+        assert_eq!(
+            selected.coordinate_source_poms(&api).unwrap().unwrap()[0].0,
+            pom
+        );
+        assert_eq!(
+            selected
+                .coordinate_source_poms(&parent_coord)
+                .unwrap()
+                .unwrap()[0]
+                .0,
+            parent
+        );
+        assert!(selected.coordinate_source_poms(&missing).is_err());
+        assert!(selected.source_enrichment_needed());
+        std::fs::write(&parent, b"changed parent encoding").unwrap();
+        let changed = ProjectSnapshot::new(modules);
+        let child = maven_origin_id(&api);
+        assert_ne!(
+            selected.artifact_revisions()[&child],
+            changed.artifact_revisions()[&child],
+            "a parent POM edit must invalidate the selected child's source policy"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3277,7 +4063,6 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
                 model
                     .artifact_origin(Path::new("/repo/libs/local.jar"))
                     .unwrap(),
-                "jdk:chosen",
             ]
         );
         assert_eq!(
@@ -3286,9 +4071,12 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
                 "project:gradle::|:app#test",
                 "project:gradle::|:app#main",
                 "maven:vendor:api:1",
-                "jdk:chosen",
             ]
         );
+        assert!(visibilities.iter().all(|scope| !scope
+            .ordered_origins
+            .iter()
+            .any(|origin| origin == "jdk:chosen")));
         assert_eq!(
             model
                 .coordinates_for_file(Path::new("/repo/modules/editing/src/test/java/Use.java"))

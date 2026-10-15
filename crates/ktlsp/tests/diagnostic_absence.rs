@@ -661,7 +661,7 @@ struct BinaryInventoryIndex {
 }
 
 impl ktlsp::index::InferenceIndex for BinaryInventoryIndex {
-    fn java_source_members_complete(&self, owner: &ktlsp::index::Entry) -> bool {
+    fn source_members_complete(&self, owner: &ktlsp::index::Entry) -> bool {
         self.source_owners.contains(owner.path.as_ref())
     }
     fn lookup_by_name(&self, name: &str) -> ktlsp::index::LookupEntries<'_> {
@@ -1167,8 +1167,7 @@ fn plain_java_source_authority_diagnoses_only_its_owner_without_global_producer_
             .is_definitely_absent()
     );
     assert!(
-        !source_member_status(&index, "Use.kt", "Current", "removed", &facts)
-            .is_definitely_absent()
+        source_member_status(&index, "Use.kt", "Current", "removed", &facts).is_definitely_absent()
     );
     let text =
         "package app; class Use { void run(Current value) { value.current(); value.removed(); } }";
@@ -1210,7 +1209,6 @@ fn plain_java_source_authority_keeps_dirty_unknown_sdk_annotation_and_hierarchy_
         "dirty",
         "annotation",
         "hierarchy",
-        "kotlin",
     ] {
         let mut index = source_member_inventory();
         let mut facts = ktlsp::resolve::CompletenessFacts::complete();
@@ -1244,17 +1242,6 @@ fn plain_java_source_authority_keeps_dirty_unknown_sdk_annotation_and_hierarchy_
                     Tier::Volatile,
                 );
             }
-            "kotlin" => {
-                index.index.remove_file("Current.java");
-                let source = "package app\nclass Current";
-                let tree = ktlsp::parser::KotlinParser::new().parse(source);
-                index.index.replace_file(
-                    "Current.kt",
-                    ktlsp::indexer::extract_symbols(&tree, source, "app"),
-                    Tier::Volatile,
-                );
-                index.source_owners.insert("Current.kt".into()); // Even an over-broad adapter cannot close a Kotlin owner.
-            }
             _ => unreachable!(),
         }
         assert!(
@@ -1263,6 +1250,33 @@ fn plain_java_source_authority_keeps_dirty_unknown_sdk_annotation_and_hierarchy_
             "{gap}"
         );
     }
+}
+
+#[test]
+fn certified_plain_kotlin_owner_closes_missing_members_for_both_callers() {
+    let mut index = source_member_inventory();
+    index.index.remove_file("Current.java");
+    let source = "package app\nclass Current";
+    let tree = ktlsp::parser::KotlinParser::new().parse(source);
+    index.index.replace_file(
+        "Current.kt",
+        ktlsp::indexer::extract_symbols(&tree, source, "app"),
+        Tier::Volatile,
+    );
+    index.source_owners.insert("Current.kt".into());
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    for caller in ["Use.java", "Use.kt"] {
+        assert!(
+            source_member_status(&index, caller, "Current", "removed", &facts)
+                .is_definitely_absent()
+        );
+    }
+    index.source_owners.clear();
+    assert!(
+        !source_member_status(&index, "Use.java", "Current", "removed", &facts)
+            .is_definitely_absent()
+    );
 }
 
 const PLAIN_OWNER: &str =
@@ -1472,15 +1486,60 @@ fn plain_java_call_shape_authority_preserves_incomplete_world_guards() {
             "{gap}"
         );
         let tree = ktlsp::java::JavaParser::new().parse(&caller);
+        if matches!(gap, "generic" | "explicit-super") {
+            let receiver = ktlsp::types::Type::class("PlainOwner", Some("app".into()));
+            assert!(
+                ktlsp::resolve::source_hierarchy_member_surface_complete(
+                    &index, &receiver, "accept", &facts
+                ),
+                "{gap}: {:?}",
+                ktlsp::infer::direct_supertypes(&index, &receiver)
+            );
+        }
         let diagnostics = ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, &caller, &facts);
-        assert!(
-            diagnostics
+        let mismatches: Vec<_> = diagnostics
+            .iter()
+            .filter(|item| item.code == Some(DiagnosticCode::CallShapeMismatch))
+            .collect();
+        if matches!(gap, "generic" | "explicit-super") {
+            assert_eq!(mismatches.len(), 2, "{gap}: {diagnostics:?}");
+            assert!(mismatches
                 .iter()
-                .all(|item| item.code != Some(DiagnosticCode::CallShapeMismatch)),
-            "{gap}: {diagnostics:?}"
-        );
+                .any(|item| item.message == "No overload of accept accepts 0 arguments"));
+            assert!(mismatches.iter().any(
+                |item| item.message == "No overload of accept accepts argument type (boolean)"
+            ));
+        } else {
+            assert!(mismatches.is_empty(), "{gap}: {diagnostics:?}");
+        }
         assert!(!facts.compiler_producers_complete);
     }
+}
+
+#[test]
+fn certified_generic_owner_does_not_fabricate_type_parameter_mismatch() {
+    let mut index = plain_java_call_shape_inventory();
+    let owner = "package app; public class PlainOwner<T> { public void accept(T value) {} }";
+    let caller =
+        "package app; class PlainUse { void run(PlainOwner value) { value.accept(true); } }";
+    for (file, source) in [("PlainOwner.java", owner), ("PlainUse.java", caller)] {
+        let tree = ktlsp::java::JavaParser::new().parse(source);
+        index.index.replace_file(
+            file,
+            ktlsp::java::extract_symbols(&tree, source),
+            Tier::Volatile,
+        );
+    }
+    let mut facts = ktlsp::resolve::CompletenessFacts::complete();
+    facts.compiler_producers_complete = false;
+    let tree = ktlsp::java::JavaParser::new().parse(caller);
+    let diagnostics = ktlsp::java::diagnostics(&index, "PlainUse.java", &tree, caller, &facts);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|item| item.code != Some(DiagnosticCode::CallShapeMismatch)),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]

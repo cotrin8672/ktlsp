@@ -76,6 +76,22 @@ impl SourceTextPolicy {
         selected: &Coordinate,
         mut cached_poms: impl FnMut(&Coordinate) -> Vec<PathBuf>,
     ) -> anyhow::Result<Self> {
+        Self::resolve_with(selected, |coordinate| Ok(cached_poms(coordinate)), true)
+    }
+
+    /// Gradle metadata must come from its selected repository, including every declared parent.
+    pub(crate) fn resolve_certified(
+        selected: &Coordinate,
+        selected_poms: impl FnMut(&Coordinate) -> anyhow::Result<Vec<PathBuf>>,
+    ) -> anyhow::Result<Self> {
+        Self::resolve_with(selected, selected_poms, false)
+    }
+
+    fn resolve_with(
+        selected: &Coordinate,
+        mut poms: impl FnMut(&Coordinate) -> anyhow::Result<Vec<PathBuf>>,
+        allow_absent_root: bool,
+    ) -> anyhow::Result<Self> {
         safe_coordinate(selected)?;
         let mut result = Self {
             selected_gav: Some(selected.label()),
@@ -91,14 +107,14 @@ impl SourceTextPolicy {
                 "POM parent chain exceeds {MAX_PARENTS}"
             );
             ensure!(seen.insert(current.label()), "POM parent cycle");
-            let mut paths = cached_poms(&current);
+            let mut paths = poms(&current)?;
             paths.sort();
             paths.dedup();
             ensure!(paths.len() <= 3, "too many cached POM candidates");
             if paths.is_empty() {
                 ensure!(
-                    chain.is_empty(),
-                    "declared parent POM {} unavailable",
+                    chain.is_empty() && allow_absent_root,
+                    "source encoding POM {} unavailable",
                     current.label()
                 );
                 break; // No published metadata: retain strict UTF8, never guess another encoding.
@@ -840,6 +856,34 @@ mod tests {
             ("interpolated compiler identity", pom("<build><plugins><plugin><artifactId>${compiler}</artifactId><configuration><encoding>UTF8</encoding></configuration></plugin></plugins></build>")),
             ("disabled plugin inheritance", pom("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><inherited>false</inherited><configuration><encoding>UTF8</encoding></configuration></plugin></plugins></build>")),
         ] { assert!(parse(text.as_bytes()).and_then(|p| encoding(&[p])).is_err(), "{name}"); }
+    }
+
+    #[test]
+    fn certified_metadata_requires_root_and_preserves_parent_encoding() {
+        let temp = Temp::new();
+        let root = Coordinate::parse("example:child:1").unwrap();
+        let child = temp.write("child.pom", "<project><groupId>example</groupId><artifactId>child</artifactId><version>1</version><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent></project>");
+        let parent = temp.write("parent.pom", "<project><groupId>example</groupId><artifactId>parent</artifactId><version>1</version><properties><project.build.sourceEncoding>ISO-8859-1</project.build.sourceEncoding></properties></project>");
+        assert!(SourceTextPolicy::resolve_certified(&root, |_| Ok(Vec::new())).is_err());
+        assert!(SourceTextPolicy::resolve_certified(&root, |coordinate| Ok(
+            if coordinate == &root {
+                vec![child.clone()]
+            } else {
+                Vec::new()
+            }
+        ))
+        .is_err());
+        let policy = SourceTextPolicy::resolve_certified(&root, |coordinate| {
+            Ok(vec![if coordinate == &root {
+                child.clone()
+            } else {
+                parent.clone()
+            }])
+        })
+        .unwrap();
+        assert_eq!(policy.java.decode(b"caf\xe9".to_vec()).unwrap(), "café");
+        fs::write(parent, "changed selected parent").unwrap();
+        assert!(policy.validate().is_err());
     }
 
     #[test]

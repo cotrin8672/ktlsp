@@ -618,9 +618,18 @@ fn existing_src_zip(path: OsString) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn src_zip_for_home(home: PathBuf) -> Option<PathBuf> {
+pub(crate) fn src_zip_for_home(home: PathBuf) -> Option<PathBuf> {
     let candidates = [home.join("lib/src.zip"), home.join("src.zip")];
     candidates.into_iter().find(|p| p.is_file())
+}
+
+pub(crate) fn jdk_home_for_source_archive(source: &Path) -> Option<&Path> {
+    let parent = source.parent()?;
+    if parent.file_name().is_some_and(|name| name == "lib") {
+        parent.parent()
+    } else {
+        Some(parent)
+    }
 }
 
 fn macos_java_home_src_zip() -> Option<PathBuf> {
@@ -990,30 +999,28 @@ pub(crate) fn coordinate_source_checked(
     let Some((selected, jar)) = selected else {
         return Ok(legacy_coordinate_source(coord, extract_root));
     };
-    Ok(Some(selected_coordinate_source(
-        coord,
-        &selected,
-        jar,
-        repos,
-        extract_root,
-    )))
-}
-
-fn selected_coordinate_source(
-    coord: &Coordinate,
-    selected: &Coordinate,
-    jar: PathBuf,
-    repos: &Repos,
-    extract_root: &Path,
-) -> LibrarySource {
-    let fingerprint = jar_fingerprint(&jar);
-    let policy = SourceTextPolicy::resolve(selected, |c| artifacts::cached_pom_files(repos, c))
+    let policy = SourceTextPolicy::resolve(&selected, |c| artifacts::cached_pom_files(repos, c))
         .map_err(|error| {
             format!(
                 "source encoding metadata for {}: {error:#}",
                 selected.label()
             )
         });
+    Ok(Some(selected_coordinate_source(
+        coord,
+        jar,
+        extract_root,
+        policy,
+    )))
+}
+
+fn selected_coordinate_source(
+    coord: &Coordinate,
+    jar: PathBuf,
+    extract_root: &Path,
+    policy: Result<SourceTextPolicy, String>,
+) -> LibrarySource {
+    let fingerprint = jar_fingerprint(&jar);
     LibrarySource {
         dest: extract_root
             .join(&coord.group)
@@ -1051,7 +1058,36 @@ pub(crate) fn coordinate_source_for_model(
         jar.is_file() && crate::classpath::file_origin_id(jar) == *expected,
         "selected Gradle source artifact changed since project discovery"
     );
-    let source = selected_coordinate_source(coord, coord, jar.clone(), repos, extract_root);
+    let mut metadata_origins = BTreeMap::new();
+    let policy = SourceTextPolicy::resolve_certified(coord, |current| {
+        let poms = model.coordinate_source_poms(current)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Gradle POM selection is unavailable for {}",
+                current.label()
+            )
+        })?;
+        let mut paths = Vec::with_capacity(poms.len());
+        for (path, expected) in poms {
+            anyhow::ensure!(
+                path.is_file() && crate::classpath::file_origin_id(&path) == expected,
+                "selected Gradle POM changed since project discovery"
+            );
+            paths.push(path.clone());
+            metadata_origins.insert(path, expected);
+        }
+        Ok(paths)
+    })
+    .and_then(|policy| {
+        for (path, expected) in &metadata_origins {
+            anyhow::ensure!(
+                crate::classpath::file_origin_id(path) == *expected,
+                "selected Gradle POM changed during source resolution"
+            );
+        }
+        Ok(policy)
+    })
+    .map_err(|error| format!("source encoding metadata for {}: {error:#}", coord.label()));
+    let source = selected_coordinate_source(coord, jar.clone(), extract_root, policy);
     anyhow::ensure!(
         crate::classpath::file_origin_id(jar) == *expected,
         "selected Gradle source artifact changed during source resolution"
@@ -2037,7 +2073,7 @@ pub fn resolve_jdk_imports(
     resolve_jdk_imports_from_zip(&src_zip, extract_root, fqns, java)
 }
 
-fn resolve_jdk_imports_from_zip(
+pub(crate) fn resolve_jdk_imports_from_zip(
     src_zip: &Path,
     extract_root: &Path,
     fqns: &[String],
@@ -2311,6 +2347,149 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn gradle_selected_pom_ignores_foreign_cached_encoding() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_selected_pom_encoding_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let coord = Coordinate::parse("example:encoding:1").unwrap();
+        let repos = Repos {
+            gradle_cache: root.join("gradle/caches"),
+            m2: root.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".into(),
+            download_dir: root.join("downloads"),
+            allow_download: false,
+        };
+        let selected = root.join("selected/encoding-1-sources.jar");
+        let selected_pom = root.join("selected/encoding-1.pom");
+        let binary = root.join("encoding-1.jar");
+        write_sources_jar(
+            &selected,
+            &[(
+                "example/Policy.java",
+                "package example; public class Policy { public int café() { return 1; } }",
+            )],
+        );
+        write_sources_jar(&binary, &[]);
+        let pom = |encoding: &str| {
+            format!("<project><groupId>example</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")
+        };
+        fs::write(&selected_pom, pom("UTF-8")).unwrap();
+        let foreign = repos.m2.join("example/encoding/1/encoding-1.pom");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(&foreign, pom("ISO-8859-1")).unwrap();
+        let snapshot = |parent_record: &str| {
+            crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\nSOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\n{parent_record}END\t:app\n",
+            root.display(), binary.display(), selected.display(), selected_pom.display()
+        )))
+        };
+        let model = snapshot("");
+        let source =
+            coordinate_source_for_model(&coord, &repos, &root.join("extract"), Some(&model))
+                .unwrap()
+                .unwrap();
+        let batches =
+            resolve_library_source(&source, &mut KotlinParser::new(), &mut JavaParser::new())
+                .unwrap();
+        let names = batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"café"),
+            "selected UTF-8 member missing: {names:?}"
+        );
+        // A foreign cache edit cannot change either decoded names or the selected cache identity.
+        fs::write(&foreign, "malformed foreign metadata").unwrap();
+        let warm = coordinate_source_for_model(&coord, &repos, &root.join("extract"), Some(&model))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.identity(), warm.identity());
+        let warm_batches =
+            resolve_library_source(&warm, &mut KotlinParser::new(), &mut JavaParser::new())
+                .unwrap();
+        assert!(warm_batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .any(|symbol| symbol.name == "café"));
+        // A selected metadata edit retires both an issued source and the old project snapshot.
+        fs::write(&selected_pom, pom("ISO-8859-1")).unwrap();
+        assert!(
+            resolve_library_source(&source, &mut KotlinParser::new(), &mut JavaParser::new())
+                .is_err()
+        );
+        let stale =
+            coordinate_source_for_model(&coord, &repos, &root.join("extract"), Some(&model))
+                .unwrap()
+                .unwrap();
+        assert!(
+            resolve_library_source(&stale, &mut KotlinParser::new(), &mut JavaParser::new())
+                .is_err()
+        );
+        // A parent contributes encoding only when Gradle also certifies that exact artifact.
+        fs::write(&selected_pom, "<project><groupId>example</groupId><artifactId>encoding</artifactId><version>1</version><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent></project>").unwrap();
+        let parent = root.join("selected/parent-1.pom");
+        fs::write(&parent, "<project><groupId>example</groupId><artifactId>parent</artifactId><version>1</version><properties><project.build.sourceEncoding>ISO-8859-1</project.build.sourceEncoding></properties></project>").unwrap();
+        let mut archive = zip::ZipWriter::new(fs::File::create(&selected).unwrap());
+        archive
+            .start_file(
+                "example/Policy.java",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(
+                b"package example; public class Policy { public int caf\xe9() { return 1; } }",
+            )
+            .unwrap();
+        archive.finish().unwrap();
+        let uncertified =
+            coordinate_source_for_model(&coord, &repos, &root.join("extract"), Some(&snapshot("")))
+                .unwrap()
+                .unwrap();
+        assert!(resolve_library_source(
+            &uncertified,
+            &mut KotlinParser::new(),
+            &mut JavaParser::new()
+        )
+        .is_err());
+        let parent_record = format!(
+            "POMARTIFACT\tmain\t{}\tMODULE\texample\tparent\t1\n",
+            parent.display()
+        );
+        let certified = snapshot(&parent_record);
+        let inherited =
+            coordinate_source_for_model(&coord, &repos, &root.join("extract"), Some(&certified))
+                .unwrap()
+                .unwrap();
+        let inherited_batches =
+            resolve_library_source(&inherited, &mut KotlinParser::new(), &mut JavaParser::new())
+                .unwrap();
+        assert!(inherited_batches
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .any(|symbol| symbol.name == "café"));
+        fs::write(&parent, "changed selected parent metadata").unwrap();
+        assert!(resolve_library_source(
+            &inherited,
+            &mut KotlinParser::new(),
+            &mut JavaParser::new()
+        )
+        .is_err());
+        let refreshed = snapshot(&parent_record);
+        let origin = crate::classpath::maven_origin_id(&coord);
+        assert_ne!(
+            certified.artifact_revisions()[&origin],
+            refreshed.artifact_revisions()[&origin],
+            "parent edits must invalidate child source facts"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gradle_selected_sources_ignore_competing_cache_and_preserve_failure_or_absence() {
         let root = std::env::temp_dir().join(format!(
             "ktlsp_selected_gradle_sources_{}",
@@ -2329,9 +2508,11 @@ mod tests {
             .gradle_cache
             .join("modules-2/files-2.1/example/api/1/wrong/api-1-sources.jar");
         let selected = root.join("settings-repository/api-1-sources.jar");
+        let selected_pom = root.join("settings-repository/api-1.pom");
         let binary = root.join("api-1.jar");
         write_sources_jar(&wrong, &[("example/api/Policy.java", "package example.api; public class Policy { public int wrongRepository() { return 1; } }")]);
         write_sources_jar(&selected, &[("example/api/Policy.java", "package example.api; public class Policy { public int chosenRepository() { return 2; } }")]);
+        fs::write(&selected_pom, "<project><groupId>example</groupId><artifactId>api</artifactId><version>1</version></project>").unwrap();
         write_sources_jar(&binary, &[]);
         let prefix = format!(
             "PROJECT\t:app\t{}\nSOURCESET\tmain\nARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\n",
@@ -2344,8 +2525,8 @@ mod tests {
             )))
         };
         let records = format!(
-            "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\n",
-            selected.display()
+            "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\n",
+            selected.display(), selected_pom.display()
         );
         let model = snapshot(&records);
         let extract = root.join("extract");

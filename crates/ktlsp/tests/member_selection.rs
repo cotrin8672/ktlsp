@@ -2129,3 +2129,193 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         );
     }
 }
+
+fn assert_known_leaf_binary_override(java_caller: bool) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    let decoded = ktcore::classfile::decode(
+        "fixture:shadow",
+        include_bytes!("../../ktcore/tests/fixtures/classfile/shadowfixture/GenericMid.class"),
+    )
+    .unwrap();
+    let unknown = decoded
+        .methods
+        .iter()
+        .find(|method| method.name.as_ref() == "f" && method.access_flags & 0x1040 == 0)
+        .unwrap();
+    assert_eq!(unknown.descriptor.as_ref(), "()Ljava/util/List;");
+    assert!(unknown.signature.is_some());
+    assert_eq!(unknown.access_flags, 0x0001);
+    let root = std::env::temp_dir().join(format!(
+        "ktlsp-known-leaf-{}-{java_caller}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let jar = root.join("shadow.jar");
+    let mut archive = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+    for (name, bytes) in [
+        (
+            "Base",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/shadowfixture/Base.class")
+                .as_slice(),
+        ),
+        (
+            "GenericMid",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/shadowfixture/GenericMid.class")
+                .as_slice(),
+        ),
+    ] {
+        archive
+            .start_file(
+                format!("shadowfixture/{name}.class"),
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    archive.finish().unwrap();
+    const LEAF: &str = "/selection/shadow/KnownLeaf.java";
+    // This exact source is accepted by the JDK21 javac/javap compiler control.
+    const LEAF_SOURCE: &str = r#"package shadowfixture;
+public final class KnownLeaf extends GenericMid {
+    @Override public TypedList<String> f() { return new TypedList<>(); }
+}
+"#;
+    // Real fixture-owned covariance keeps the return type indexed without inventing SDK facts.
+    const TYPED: &str = "/selection/shadow/TypedList.java";
+    const TYPED_SOURCE: &str = r#"package shadowfixture;
+public final class TypedList<T> extends java.util.AbstractList<T> {
+    @Override public T get(int index) { throw new IndexOutOfBoundsException(); }
+    @Override public int size() { return 0; }
+    public int ownSize() { return size(); }
+}
+"#;
+    let mut observed = Vec::new();
+    for ancestor in ["none", "Base", "GenericMid"] {
+        for repeated_load in [false, true] {
+            let batches = ktlsp::deps::resolve_local_jar_stubs(
+                &jar,
+                &root.join("extract"),
+                &mut KotlinParser::new(),
+                &mut JavaParser::new(),
+            )
+            .unwrap();
+            assert!(batches
+                .iter()
+                .all(|batch| batch.origin.as_ref().unwrap().representation
+                    == SourceRepresentation::Stub));
+            assert!(batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|owner| owner.name == "GenericMid"
+                    && owner
+                        .unavailable_members
+                        .as_deref()
+                        .is_some_and(|names| names.iter().any(|(name, kind, arity)| name == "f"
+                            && *kind == SymbolKind::Function
+                            && *arity == Some(0)))));
+            let base_owner = batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .find(|symbol| symbol.name == "Base" && symbol.kind.is_type_like())
+                .unwrap();
+            let base_f_unavailable = base_owner
+                .unavailable_members
+                .as_deref()
+                .unwrap()
+                .iter()
+                .any(|(name, kind, _)| name == "f" && *kind == SymbolKind::Function);
+            let base_f_supported = batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .any(|symbol| {
+                    symbol.name == "f"
+                        && symbol.kind == SymbolKind::Function
+                        && symbol.container.as_deref() == Some("Base")
+                });
+            assert!(base_f_supported && !base_f_unavailable,
+                "actual Base facts: f supported={base_f_supported}, unavailable={base_f_unavailable}");
+            let binary_origin = batches[0].origin.as_ref().unwrap().origin_id.clone();
+            let mut ws = Workspace::new();
+            for batch in batches {
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.open(
+                LEAF,
+                match ancestor {
+                    "none" => LEAF_SOURCE
+                        .replace(" extends GenericMid", "")
+                        .replace("@Override ", ""),
+                    "Base" => LEAF_SOURCE.replace("extends GenericMid", "extends Base"),
+                    _ => LEAF_SOURCE.to_string(),
+                },
+            );
+            let (caller, source) = if java_caller {
+                ("/selection/shadow/Use.java", "package shadowfixture; class Use { void use(KnownLeaf value) { var result = value.f(); value.f().size(); } }")
+            } else {
+                (
+                    "/selection/shadow/Use.kt",
+                    "package shadowfixture
+fun use(value: KnownLeaf) { val result = value.f(); value.f().size }
+",
+                )
+            };
+            ws.open(caller, source.into());
+            ws.open(TYPED, TYPED_SOURCE.into());
+            for path in [LEAF, caller, TYPED] {
+                ws.index.set_file_origin(path, origin("app", Some("app")));
+            }
+            ws.index.replace_scope_visibilities(vec![ScopeVisibility {
+                scope: origin("app", Some("app")).project_scope.unwrap(),
+                ordered_origins: vec!["app".into(), binary_origin],
+            }]);
+            ws.bump_index_revision();
+            let expected = target(&ws, LEAF, "f", SymbolKind::Function);
+            let completion = labels(&mut ws, caller, "value.f");
+            let definitions = ws.goto_definition(caller, source.find("f()").unwrap());
+            let hint_labels: Vec<_> = ws
+                .inlay_hints(caller, 0, source.len())
+                .iter()
+                .map(|hint| hint.label.clone())
+                .collect();
+            let chain = labels(&mut ws, caller, "value.f().size");
+            let raw_type = if java_caller {
+                None
+            } else {
+                Some(infer_expression(&ws, caller, "value.f()"))
+            };
+            observed.push((
+                ancestor,
+                repeated_load,
+                completion.contains("f"),
+                definitions == vec![expected],
+                hint_labels
+                    .iter()
+                    .any(|label| label == ": TypedList<String>"),
+                definitions,
+                hint_labels,
+                chain.contains("size"),
+                raw_type,
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(
+        observed.iter().all(
+            |(_, _, completion, target, inference, _, _, chain, _)| *completion
+                && *target
+                && *inference
+                && *chain
+        ),
+        "known nearest override and no-ancestry control must remain useful on initial/repeated loads: {observed:?}"
+    );
+}
+
+#[test]
+fn binary_known_leaf_override_java() {
+    assert_known_leaf_binary_override(true);
+}
+#[test]
+fn binary_known_leaf_override_kotlin() {
+    assert_known_leaf_binary_override(false);
+}

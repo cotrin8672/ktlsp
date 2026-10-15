@@ -931,9 +931,8 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
             .flatten()
     }
 
-    fn java_source_members_complete(&self, owner: &Entry) -> bool {
-        self.replaced_file != Some(owner.path.as_ref())
-            && self.index.java_source_members_complete(owner)
+    fn source_members_complete(&self, owner: &Entry) -> bool {
+        self.replaced_file != Some(owner.path.as_ref()) && self.index.source_members_complete(owner)
     }
 
     fn may_have_compiled_callables(&self) -> bool {

@@ -11,8 +11,12 @@ import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.component.ProjectComponentIdentifier
 import org.gradle.api.artifacts.result.ResolvedComponentResult
 import org.gradle.api.artifacts.result.ResolvedArtifactResult
+import org.gradle.api.component.Component
+import org.gradle.api.component.Artifact
 import org.gradle.jvm.JvmLibrary
 import org.gradle.language.base.artifact.SourcesArtifact
+import org.gradle.maven.MavenModule
+import org.gradle.maven.MavenPomArtifact
 import org.gradle.api.artifacts.result.ResolvedDependencyResult
 import org.gradle.api.artifacts.result.UnresolvedDependencyResult
 import org.gradle.api.file.SourceDirectorySet
@@ -663,34 +667,114 @@ class KtlspDumpClasspathAction(
             sourceModules[sourceSet.name] = seen.filterIsInstance<ModuleComponentIdentifier>().toSet()
         }
         if (task.name == "ktlspDumpSources") {
-            try {
-                val selected = sourceModules.values.flatten().toSet()
-                val sources = if (selected.isEmpty()) null else task.project.dependencies.createArtifactResolutionQuery()
-                    .forComponents(selected)
-                    .withArtifacts(JvmLibrary::class.java, SourcesArtifact::class.java)
-                    .execute()
-                val resolved = sources?.resolvedComponents.orEmpty()
-                val failed = selected - resolved.map { it.id }.toSet()
-                sourceModules.forEach { (name, members) ->
-                    val components = resolved.filter { it.id in members }
-                    val incomplete = members.any { it in failed } || components.any { component ->
-                        component.getArtifacts(SourcesArtifact::class.java).any { it !is ResolvedArtifactResult }
+            fun parentCoordinate(file: java.io.File): Triple<String, String, String>? {
+                require(file.length() in 1..(1L shl 20))
+                val factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                factory.isNamespaceAware = true
+                factory.setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true)
+                factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+                factory.setFeature("http://xml.org/sax/features/external-general-entities", false)
+                factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                factory.isXIncludeAware = false
+                factory.isExpandEntityReferences = false
+                factory.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD, "")
+                factory.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_SCHEMA, "")
+                val builder = factory.newDocumentBuilder()
+                builder.setErrorHandler(org.xml.sax.helpers.DefaultHandler())
+                val bytes = file.inputStream().use { it.readNBytes((1 shl 20) + 1) }
+                require(bytes.size <= (1 shl 20))
+                val root = builder.parse(java.io.ByteArrayInputStream(bytes)).documentElement
+                val namespace = root.namespaceURI.orEmpty()
+                require((root.localName ?: root.tagName) == "project" &&
+                    namespace in listOf("", "http://maven.apache.org/POM/4.0.0"))
+                fun direct(element: org.w3c.dom.Element, name: String): org.w3c.dom.Element? {
+                    val children = element.childNodes
+                    val matches = (0 until children.length).mapNotNull { children.item(it) as? org.w3c.dom.Element }
+                        .filter { (it.localName ?: it.tagName) == name }
+                    require(matches.size <= 1 && matches.all { it.namespaceURI.orEmpty() == namespace })
+                    return matches.firstOrNull()
+                }
+                val parent = direct(root, "parent") ?: return null
+                val values = listOf("groupId", "artifactId", "version").map { name ->
+                    val value = direct(parent, name)
+                    require(value != null && (0 until value.childNodes.length).none { value.childNodes.item(it) is org.w3c.dom.Element })
+                    value.textContent.trim()
+                }
+                require(values.all { it !in listOf(".", "..") && it.matches(Regex("[A-Za-z0-9_.+\\-]+")) })
+                return Triple(values[0], values[1], values[2])
+            }
+            fun <C : Component, A : Artifact> exportArtifacts(prefix: String, componentType: Class<C>, artifactType: Class<A>) {
+                try {
+                    val selected = sourceModules.values.flatten().toSet()
+                    val query = if (selected.isEmpty()) null else task.project.dependencies.createArtifactResolutionQuery()
+                        .forComponents(selected).withArtifacts(componentType, artifactType).execute()
+                    val resolved = query?.resolvedComponents.orEmpty().toMutableList()
+                    val membersByName = sourceModules.mapValues { (_, members) ->
+                        mutableSetOf<ComponentIdentifier>().apply { addAll(members) }
                     }
-                    out.append("SOURCEQUERY\t${name}\t${if (incomplete) "failed" else "complete"}\n")
-                    components.forEach componentLoop@ { component ->
-                        val id = component.id as? ModuleComponentIdentifier ?: return@componentLoop
-                        component.getArtifacts(SourcesArtifact::class.java).filterIsInstance<ResolvedArtifactResult>().forEach { artifact ->
-                            out.append("SOURCEARTIFACT\t${name}\t${artifact.file.absolutePath}\tMODULE\t${id.group}\t${id.module}\t${id.version}\n")
+                    val metadataFailures = mutableSetOf<String>()
+                    if (prefix == "POM") {
+                        val checked = mutableSetOf<Pair<String, ComponentIdentifier>>()
+                        fun key(id: ComponentIdentifier): Triple<String, String, String>? =
+                            (id as? ModuleComponentIdentifier)?.let { Triple(it.group, it.module, it.version) }
+                        // Discovery only: Rust validates the exported GAVs, properties and encoding.
+                        repeat(8) {
+                            val parents = linkedMapOf<Triple<String, String, String>, MutableSet<String>>()
+                            membersByName.forEach { (name, members) ->
+                                resolved.filter { it.id in members && checked.add(name to it.id) }.forEach { component ->
+                                    component.getArtifacts(artifactType).filterIsInstance<ResolvedArtifactResult>().forEach { artifact ->
+                                        try {
+                                            parentCoordinate(artifact.file)?.let { parents.getOrPut(it) { mutableSetOf() }.add(name) }
+                                        } catch (failure: Exception) {
+                                            if (failure is InterruptedException || failure is org.gradle.api.BuildCancelledException ||
+                                                Thread.currentThread().isInterrupted) throw failure
+                                            metadataFailures.add(name)
+                                        }
+                                    }
+                                }
+                            }
+                            val missing = parents.keys.filter { parent -> resolved.none { key(it.id) == parent } }
+                            if (missing.isNotEmpty()) {
+                                val parentQuery = task.project.dependencies.createArtifactResolutionQuery()
+                                    .withArtifacts(componentType, artifactType)
+                                missing.forEach { parent -> parentQuery.forModule(parent.first, parent.second, parent.third) }
+                                resolved.addAll(parentQuery.execute().resolvedComponents)
+                            }
+                            parents.forEach { (parent, owners) ->
+                                val components = resolved.filter { key(it.id) == parent }
+                                owners.forEach { name ->
+                                    if (components.isEmpty()) metadataFailures.add(name)
+                                    membersByName.getValue(name).addAll(components.map { it.id })
+                                }
+                            }
+                        }
+                        membersByName.forEach { (name, members) ->
+                            if (members.any { (name to it) !in checked }) metadataFailures.add(name)
                         }
                     }
+                    val failed = selected - resolved.map { it.id }.toSet()
+                    membersByName.forEach { (name, members) ->
+                        val components = resolved.filter { it.id in members }
+                        val incomplete = name in metadataFailures || members.any { it in failed } || components.any { component ->
+                            component.getArtifacts(artifactType).any { it !is ResolvedArtifactResult }
+                        }
+                        out.append("${prefix}QUERY\t${name}\t${if (incomplete) "failed" else "complete"}\n")
+                        components.forEach componentLoop@ { component ->
+                            val id = component.id as? ModuleComponentIdentifier ?: return@componentLoop
+                            component.getArtifacts(artifactType).filterIsInstance<ResolvedArtifactResult>().forEach { artifact ->
+                                out.append("${prefix}ARTIFACT\t${name}\t${artifact.file.absolutePath}\tMODULE\t${id.group}\t${id.module}\t${id.version}\n")
+                            }
+                        }
+                    }
+                } catch (failure: Exception) {
+                    if (failure is InterruptedException || failure is org.gradle.api.BuildCancelledException ||
+                        Thread.currentThread().isInterrupted) throw failure
+                    sourceModules.keys.forEach { out.append("${prefix}QUERY\t${it}\tfailed\n") }
+                    task.logger.info("ktlsp artifact metadata query unavailable")
                 }
-            } catch (failure: Exception) {
-                if (failure is InterruptedException || failure is org.gradle.api.BuildCancelledException ||
-                    Thread.currentThread().isInterrupted) throw failure
-                sourceModules.keys.forEach { out.append("SOURCEQUERY\t${it}\tfailed\n") }
-                // Resolution exceptions may contain repository credentials; export only state.
-                task.logger.info("ktlsp source query unavailable")
             }
+            exportArtifacts("SOURCE", JvmLibrary::class.java, SourcesArtifact::class.java)
+            exportArtifacts("POM", MavenModule::class.java, MavenPomArtifact::class.java)
         }
         out.append("END\t${projectPath}")
         System.out.println(out.toString())

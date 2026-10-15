@@ -364,9 +364,18 @@ pub(crate) fn run_with_stdout_file(
     command: &mut Command,
     stdout: std::fs::File,
 ) -> std::io::Result<(std::process::ExitStatus, bool, String, bool, String, bool)> {
+    run_with_stdout_file_cancellable(command, stdout, COMPILE_TIMEOUT, None)
+}
+
+pub(crate) fn run_with_stdout_file_cancellable(
+    command: &mut Command,
+    stdout: std::fs::File,
+    timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<(std::process::ExitStatus, bool, String, bool, String, bool)> {
     #[cfg(windows)]
     {
-        Ok(OwnedNativeCompile::spawn_to_file(command, stdout)?.wait(COMPILE_TIMEOUT, None))
+        Ok(OwnedNativeCompile::spawn_to_file(command, stdout)?.wait(timeout, cancelled))
     }
     #[cfg(not(windows))]
     {
@@ -398,7 +407,7 @@ pub(crate) fn run_with_stdout_file(
             let _ = join_capped(&mut err);
             return Err(error);
         }
-        let interrupted = wait_with_timeout(&mut child, COMPILE_TIMEOUT);
+        let interrupted = wait_with_timeout_cancelled(&mut child, timeout, cancelled);
         let status = child.wait();
         let (out, out_complete) = join_capped(&mut out);
         let (err, err_complete) = join_capped(&mut err);
@@ -494,12 +503,23 @@ fn join_capped(reader: &mut Option<std::thread::JoinHandle<(String, bool)>>) -> 
 #[cfg(not(windows))]
 /// Legacy wrapper-only timeout. Unix descendant ownership is not proved by this helper.
 fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> bool {
+    wait_with_timeout_cancelled(child, timeout, None)
+}
+
+#[cfg(not(windows))]
+fn wait_with_timeout_cancelled(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return false,
             Ok(None) => {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline
+                    || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                {
                     let _ = child.kill();
                     return true;
                 }
@@ -1460,6 +1480,35 @@ mod native_compile_ownership_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_file_backed_gradle_query_cancellation_drains_pipes_and_terminates_owned_descendants()
+    {
+        let fixture = Fixture::new();
+        let mut command = fixture_command(&fixture.0, "cancel");
+        let stdout = std::fs::File::create(fixture.0.join("classpath.stdout")).unwrap();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            run_with_stdout_file_cancellable(
+                &mut command,
+                stdout,
+                Duration::from_secs(60),
+                Some(&worker_cancelled),
+            )
+            .unwrap()
+        });
+        let leaf = fixture.hold_leaf();
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        let started = Instant::now();
+        let (_, interrupted, _, stdout_complete, _, stderr_complete) = worker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(interrupted && stdout_complete && stderr_complete);
+        assert_eq!(
+            unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
+            WAIT_OBJECT_0
+        );
     }
 
     #[test]

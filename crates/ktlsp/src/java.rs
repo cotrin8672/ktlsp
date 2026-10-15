@@ -1028,7 +1028,6 @@ fn collect_unresolved_references(
                     })
             } else {
                 !is_java_builtin_type(name)
-                    && facts.compiler_surface_status(None).is_found()
                     && !ctx.static_imports.may_resolve(name)
                     && !java_synthetic_member_resolves(name, name_node, src)
                     && missing_java_reference_is_project_local_proof(name_node, &ctx.static_imports)
@@ -1043,6 +1042,15 @@ fn collect_unresolved_references(
                             && entries.iter().all(|entry| {
                                 crate::resolve::declaration_surface_status(index, entry, facts)
                                     .is_found()
+                                    || crate::resolve::source_hierarchy_member_surface_complete(
+                                        index,
+                                        &Type::class(
+                                            &entry.sym.name,
+                                            Some(entry.sym.package.clone()),
+                                        ),
+                                        name,
+                                        facts,
+                                    )
                             })
                     })
             };
@@ -1257,43 +1265,24 @@ fn java_call_shape_query(
     if symbol.is_empty() {
         return None;
     }
-    let proven_receiver = if facts.compiler_producers_complete {
-        None
-    } else {
+    if !facts.compiler_producers_complete {
         // shortcut: selected-source proof is method-only, widen after constructor proof and coverage.
         if call.kind() != "method_invocation" {
             return None;
         }
         let (receiver, kind) = java_member_receiver(index, file, src, tree, call, 0)?;
-        if kind != ktcore::jvm::ReceiverKind::Value || receiver.container().is_some() {
+        if kind != ktcore::jvm::ReceiverKind::Value {
             return None;
         }
-        let owner_complete = {
-            let package = receiver.package()?;
-            let mut owners = index
-                .lookup_type(receiver.name()?)
-                .into_iter()
-                .filter(|owner| owner.sym.package == package && owner.sym.container.is_none());
-            let owner = owners.next()?;
-            owners.next().is_none() && index.java_source_members_complete(owner)
-        };
-        if !owner_complete {
+        if !crate::resolve::source_hierarchy_member_surface_complete(
+            index, &receiver, &symbol, facts,
+        ) {
             return None;
         }
-        Some(receiver)
-    };
+    }
     let entries = java_call_entries_with_imports(
         index, file, src, tree, call, name, &symbol, package, imports,
     );
-    // A certified base declaration cannot close overloads on an unproven child receiver.
-    if proven_receiver.is_some_and(|receiver| {
-        entries.iter().any(|entry| {
-            receiver.name() != entry.sym.container.as_deref()
-                || receiver.package() != Some(entry.sym.package.as_str())
-        })
-    }) {
-        return None;
-    }
     if entries
         .iter()
         .any(|entry| !crate::resolve::declaration_surface_status(index, entry, facts).is_found())

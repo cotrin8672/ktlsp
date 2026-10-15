@@ -562,18 +562,9 @@ pub fn member_name_status_for_receiver(
         &ctx.imports,
     ));
     if !facts.compiler_producers_complete
-        && reasons
-            .iter()
-            .all(|reason| matches!(reason, IncompletenessReason::CompilerProducerIncomplete))
-        && file.ends_with(".java")
-        && recv_ty.container().is_none()
-        && binary_owner(index, &format!("{}/{}", root_pkg.replace('.', "/"), root)).is_some_and(
-            |owner| plain_java_source_member_surface_complete(index, owner, name, facts),
-        )
+        && source_hierarchy_member_surface_complete(index, recv_ty, name, facts)
     {
-        // A selected plain javac source closes this owner's own names, and the exact SDK
-        // inventory closes its implicit Object ancestor. Keep every other proof obligation.
-        reasons.retain(|reason| *reason != IncompletenessReason::CompilerProducerIncomplete);
+        clear_certified_source_hierarchy_reasons(index, &mut reasons);
     }
     dedup_reasons(&mut reasons);
     if reasons.is_empty() {
@@ -607,20 +598,50 @@ pub fn member_name_status_for_receiver(
     }
 }
 
-fn plain_java_source_member_surface_complete(
+/// Close only this queried member's source hierarchy, including the selected SDK's implicit root.
+/// An unknown owner, missing edge, annotation producer, or binary-only blocker keeps the proof open.
+pub fn source_hierarchy_member_surface_complete(
     index: &dyn InferenceIndex,
-    owner: &Entry,
+    receiver: &Type,
     name: &str,
     facts: &CompletenessFacts,
 ) -> bool {
-    owner.tier == crate::index::Tier::Volatile
-        && owner.path.ends_with(".java")
-        && owner.sym.kind == SymbolKind::Class
-        && owner.sym.container.is_none()
-        && owner.sym.type_params.is_empty()
-        && owner.sym.supertypes.is_empty()
-        && owner.sym.supertype_refs.is_empty()
-        && index.java_source_members_complete(owner)
+    if !index.scope_is_complete() || !facts.project_scan_complete || !facts.jdk_index_complete {
+        return false;
+    }
+    let mut complete = true;
+    let _ = infer::walk_supertypes(index, receiver, 32, |current| {
+        let Some(name) = current.name() else {
+            complete = false;
+            return ControlFlow::Break(());
+        };
+        let Some(package) = current.package() else {
+            complete = false;
+            return ControlFlow::Break(());
+        };
+        if name == "Object" && package == "java.lang" && current.container().is_none() {
+            // The selected SDK inventory below certifies this explicit root edge.
+            return ControlFlow::Continue(());
+        }
+        let mut owners = index.lookup_type(name).into_iter().filter(|owner| {
+            owner.sym.package == package && owner.sym.container.as_deref() == current.container()
+        });
+        let Some(owner) = owners.next() else {
+            complete = false;
+            return ControlFlow::Break(());
+        };
+        if owners.next().is_some()
+            || owner.tier != crate::index::Tier::Volatile
+            || facts.member_surfaces_unknown.contains(&to_def(owner))
+            || !index.source_members_complete(owner)
+        {
+            complete = false;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    complete
+        && index.scope_is_complete()
         && java_binary_member_status(
             index,
             &Type::class("Object", Some("java.lang".into())),
@@ -628,6 +649,18 @@ fn plain_java_source_member_surface_complete(
             facts,
         )
         .is_some_and(|status| status.is_definitely_absent())
+}
+
+fn clear_certified_source_hierarchy_reasons(
+    index: &dyn InferenceIndex,
+    reasons: &mut Vec<IncompletenessReason>,
+) {
+    let object = binary_owner(index, "java/lang/Object").map(to_def);
+    reasons.retain(|reason| match reason {
+        IncompletenessReason::CompilerProducerIncomplete => false,
+        IncompletenessReason::MemberSurfaceIncomplete(def) => object.as_ref() != Some(def),
+        _ => true,
+    });
 }
 
 fn java_binary_member_status(
@@ -954,7 +987,12 @@ pub fn declaration_surface_status(
                 || !reasons
                     .iter()
                     .all(|reason| *reason == IncompletenessReason::CompilerProducerIncomplete)
-                || !plain_java_source_member_surface_complete(index, owner, &entry.sym.name, facts)
+                || !source_hierarchy_member_surface_complete(
+                    index,
+                    &Type::class(&owner.sym.name, Some(owner.sym.package.clone())),
+                    &entry.sym.name,
+                    facts,
+                )
             {
                 return ResolutionStatus::Unknown(reasons);
             }
@@ -973,8 +1011,8 @@ pub fn declaration_surface_status(
                     &mut reasons,
                 );
             }
-            // This owner proof lifts only the producer gap, never another incomplete world.
-            reasons.retain(|reason| *reason != IncompletenessReason::CompilerProducerIncomplete);
+            // Only the certified source hierarchy and exact SDK Object surface are closed.
+            clear_certified_source_hierarchy_reasons(index, &mut reasons);
             dedup_reasons(&mut reasons);
             if !reasons.is_empty() {
                 return ResolutionStatus::Unknown(reasons);
@@ -1079,6 +1117,9 @@ pub fn member_call_completeness_reasons(
 
     let mut reasons = hierarchy_package_reasons(index, &recv_ty, facts);
     reasons.extend(visible_package_reasons(file, tree, src, name, facts));
+    if source_hierarchy_member_surface_complete(index, &recv_ty, name, facts) {
+        clear_certified_source_hierarchy_reasons(index, &mut reasons);
+    }
     dedup_reasons(&mut reasons);
     reasons
 }
@@ -1137,6 +1178,9 @@ pub(crate) fn member_call_completeness_reasons_in(
         &ctx.package,
         &ctx.imports,
     ));
+    if source_hierarchy_member_surface_complete(index, &recv_ty, name, facts) {
+        clear_certified_source_hierarchy_reasons(index, &mut reasons);
+    }
     dedup_reasons(&mut reasons);
     reasons
 }

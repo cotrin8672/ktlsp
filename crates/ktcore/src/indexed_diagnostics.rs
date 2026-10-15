@@ -146,7 +146,7 @@ fn call_shape_query(
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> Option<CallShapeQuery> {
-    if call.kind() != "call_expression" || !facts.compiler_surface_status(None).is_found() {
+    if call.kind() != "call_expression" {
         return None;
     }
     let (normalized, normalized_ancestors) =
@@ -157,16 +157,18 @@ fn call_shape_query(
     let (callee, callee_ancestors) =
         infer::callable_callee_with_path(normalized, normalized_ancestors)?;
     match callee.kind() {
-        "identifier" => top_level_call_shape_query(
-            index,
-            file,
-            src,
-            normalized,
-            callee,
-            &callee_ancestors,
-            facts,
-            ctx,
-        ),
+        "identifier" if facts.compiler_surface_status(None).is_found() => {
+            top_level_call_shape_query(
+                index,
+                file,
+                src,
+                normalized,
+                callee,
+                &callee_ancestors,
+                facts,
+                ctx,
+            )
+        }
         "navigation_expression" => {
             member_call_shape_query(index, file, src, normalized, callee, facts, ctx)
         }

@@ -27,6 +27,23 @@ struct CachedClass {
 }
 
 impl ClassInventoryCache {
+    /// The SDK already selected and source-indexed for a source-only workspace.
+    pub(crate) fn object_for_source_origin(&mut self, origin: &str) -> Option<Arc<ClassFileFacts>> {
+        let source = Path::new(origin.strip_prefix("jdk:")?);
+        if !source.is_absolute()
+            || source.file_name()? != "src.zip"
+            || source.parent()?.file_name()? != "lib"
+        {
+            return None;
+        }
+        self.read(
+            &crate::deps::jdk_home_for_source_archive(source)?.join("jmods/java.base.jmod"),
+            "classes/java/lang/Object.class",
+            origin,
+        )
+        .ok()?
+    }
+
     pub(crate) fn clear(&mut self) {
         self.classes.clear();
         self.services.clear();
@@ -357,7 +374,7 @@ pub(crate) struct BinaryDiagnostics<'a> {
 }
 
 impl InferenceIndex for BinaryDiagnostics<'_> {
-    fn java_source_members_complete(&self, owner: &Entry) -> bool {
+    fn source_members_complete(&self, owner: &Entry) -> bool {
         (self.source_members)(owner)
     }
     fn java_class_inventory(&self, owner: &Entry) -> Option<Arc<ClassFileFacts>> {

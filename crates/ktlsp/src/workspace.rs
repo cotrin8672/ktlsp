@@ -255,6 +255,12 @@ impl Workspace {
             .map(|model| model.artifact_revisions())
             .unwrap_or_default();
         let revisions = model.artifact_revisions();
+        self.global_origins.retain(|origin| {
+            !origin.starts_with("jdk:")
+                || active.contains(origin)
+                    && (self.project_model.is_none()
+                        || previous_revisions.get(origin) == revisions.get(origin))
+        });
         let changed_origins: BTreeSet<_> = previous_revisions
             .iter()
             .filter(|(origin, revision)| {
@@ -262,15 +268,31 @@ impl Workspace {
             })
             .map(|(origin, _)| origin.clone())
             .collect();
+        let previous_binaries = self
+            .project_model
+            .as_ref()
+            .map(|model| model.binary_artifact_revisions())
+            .unwrap_or_default();
+        let binaries = model.binary_artifact_revisions();
+        let unchanged_binaries: BTreeSet<_> = changed_origins
+            .iter()
+            .filter(|origin| {
+                binaries.contains_key(*origin)
+                    && previous_binaries.get(*origin) == binaries.get(*origin)
+            })
+            .cloned()
+            .collect();
         self.live_dependency_origins = active.clone();
         let removed: Vec<_> = self
             .index
             .file_origins()
             .filter(|(key, origin)| {
                 is_dependency_origin(&origin.origin_id)
-                    && !origin.origin_id.starts_with("jdk:")
                     && (!active.contains(&origin.origin_id)
-                        || changed_origins.contains(&origin.origin_id))
+                        || changed_origins.contains(&origin.origin_id)
+                            && !(origin.representation
+                                == crate::project_model::SourceRepresentation::Stub
+                                && unchanged_binaries.contains(&origin.origin_id)))
                     && !self.open_docs.contains_key(*key)
             })
             .map(|(key, _)| key.to_string())
@@ -440,13 +462,22 @@ impl Workspace {
         if self.project_model.is_some()
             && batch.origin.as_ref().is_some_and(|origin| {
                 is_dependency_origin(&origin.origin_id)
-                    && !origin.origin_id.starts_with("jdk:")
                     && !self.live_dependency_origins.contains(&origin.origin_id)
             })
         {
             return false;
         }
         let mut metadata_changed = false;
+        if self.project_model.is_none() {
+            if let Some(origin) = batch
+                .origin
+                .as_ref()
+                .filter(|origin| origin.origin_id.starts_with("jdk:"))
+            {
+                self.global_origins.insert(origin.origin_id.clone());
+                metadata_changed |= self.index.set_file_origin(&batch.file, origin.clone());
+            }
+        }
         if let Some(model) = &self.project_model {
             if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
                 if let Some(origin) = batch.origin {
@@ -2332,7 +2363,30 @@ impl Workspace {
             .and_then(|model| model.plain_java_task(key))
             .filter(|_| is_java_path(key));
         let services = OnceCell::new();
+        let source_only = model.is_none() && self.source_only_caller(key);
         let inventory = |owner: &crate::index::Entry| {
+            if source_only {
+                let origin = self.index.file_origin(&owner.path)?;
+                if owner.tier == Tier::Durable
+                    && !self.open_docs.contains_key(owner.path.as_ref())
+                    && owner.sym.package == "java.lang"
+                    && owner.sym.name == "Object"
+                    && owner.sym.container.is_none()
+                    && self.global_origins.contains(&origin.origin_id)
+                    && self
+                        .global_origins
+                        .iter()
+                        .filter(|origin| origin.starts_with("jdk:"))
+                        .count()
+                        == 1
+                {
+                    return self
+                        .class_inventory
+                        .borrow_mut()
+                        .object_for_source_origin(&origin.origin_id);
+                }
+                return None;
+            }
             let (model, task) = (model?, caller?);
             if owner.tier != Tier::Durable
                 || self.open_docs.contains_key(owner.path.as_ref())
@@ -2345,19 +2399,26 @@ impl Workspace {
                 .borrow_mut()
                 .inventory(model, task, key, owner, &origin.origin_id)
         };
-        let source_proofs: RefCell<BTreeMap<Arc<str>, bool>> = RefCell::new(BTreeMap::new());
+        let source_proofs = RefCell::new(BTreeMap::new());
         let source_members = |owner: &crate::index::Entry| {
-            if let Some(complete) = source_proofs.borrow().get(owner.path.as_ref()) {
+            let identity = (owner.path.clone(), owner.sym.start_byte);
+            if let Some(complete) = source_proofs.borrow().get(&identity) {
                 return *complete;
             }
-            let (Some(model), Some(task)) = (model, caller) else {
-                return false;
+            let complete = if source_only {
+                self.standalone_source_members_complete(owner)
+            } else {
+                match (model, caller) {
+                    (Some(model), Some(task)) => {
+                        self.plain_java_source_members_complete(model, task, key, owner)
+                            && *services.get_or_init(|| {
+                                self.class_inventory.borrow_mut().plain_caller(task)
+                            })
+                    }
+                    _ => false,
+                }
             };
-            let complete = self.plain_java_source_members_complete(model, task, key, owner)
-                && *services.get_or_init(|| self.class_inventory.borrow_mut().plain_caller(task));
-            source_proofs
-                .borrow_mut()
-                .insert(owner.path.clone(), complete);
+            source_proofs.borrow_mut().insert(identity, complete);
             complete
         };
         let index = crate::binary_diagnostics::BinaryDiagnostics {
@@ -2385,6 +2446,147 @@ impl Workspace {
             .member_surfaces_unknown
             .extend(self.annotated_type_owners.values().flatten().cloned());
         facts
+    }
+
+    fn source_only_caller(&self, key: &str) -> bool {
+        if self.project_model.is_some()
+            || self.project_refresh_pending
+            || !self.project_scan_initialized
+            || !self
+                .project_file_meta
+                .get(key)
+                .is_some_and(|meta| meta.clean && meta.scope.is_none())
+        {
+            return false;
+        }
+        let path = Path::new(key);
+        path.is_absolute()
+            && path.ancestors().skip(1).all(|ancestor| {
+                [
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                    "settings.gradle.kts",
+                    "gradlew",
+                    "gradlew.bat",
+                    "pom.xml",
+                ]
+                .iter()
+                .all(|name| matches!(ancestor.join(name).try_exists(), Ok(false)))
+            })
+    }
+
+    fn standalone_source_members_complete(&self, owner: &crate::index::Entry) -> bool {
+        if owner.tier != Tier::Volatile
+            || owner.sym.container.is_some()
+            || !matches!(owner.sym.kind, SymbolKind::Class | SymbolKind::Interface)
+            || !owner.sym.type_params.is_empty()
+            || !self.source_only_caller(&owner.path)
+            || self.analysis_extensions.needs_source(&owner.path)
+            || !self
+                .annotated_type_owners
+                .get(owner.path.as_ref())
+                .is_some_and(|owners| !owners.contains(&rename_definition(owner)))
+        {
+            return false;
+        }
+        let closed;
+        let (text, tree) = if let Some(doc) = self.open_docs.get(owner.path.as_ref()) {
+            (doc.text.as_str(), &doc.tree)
+        } else {
+            let Some(mut batch) =
+                parse_project_file(Path::new(owner.path.as_ref()), &mut LanguageParsers::new())
+            else {
+                return false;
+            };
+            if self.source_stamps.get(owner.path.as_ref()) != batch.stamp.as_ref()
+                || !batch.clean
+                || batch.package != owner.sym.package
+            {
+                return false;
+            }
+            batch.symbols.sort_by(|a, b| {
+                a.start_byte
+                    .cmp(&b.start_byte)
+                    .then(a.end_byte.cmp(&b.end_byte))
+                    .then(a.name.cmp(&b.name))
+            });
+            if !self
+                .index
+                .entries_for_file(&owner.path)
+                .iter()
+                .map(|entry| entry.sym.as_ref())
+                .eq(batch.symbols.iter())
+            {
+                return false;
+            }
+            closed = batch.source;
+            (closed.0.as_ref(), &closed.1)
+        };
+        if tree.root_node().has_error() {
+            return false;
+        }
+        let Some(name) = self.identifier_at_key(&owner.path, tree, owner.sym.start_byte) else {
+            return false;
+        };
+        if name.start_byte() != owner.sym.start_byte
+            || name.end_byte() != owner.sym.end_byte
+            || &text[name.byte_range()] != owner.sym.name
+        {
+            return false;
+        }
+        let Some(declaration) = name.parent() else {
+            return false;
+        };
+        if !matches!(
+            declaration.kind(),
+            "class_declaration" | "interface_declaration"
+        ) {
+            return false;
+        }
+        let kotlin = !is_java_path(&owner.path);
+        if kotlin
+            && self
+                .index
+                .entries_for_file(&owner.path)
+                .iter()
+                .any(|entry| {
+                    entry.sym.container.as_deref() == Some(owner.sym.name.as_str())
+                        && entry.sym.ext_receiver.is_some()
+                })
+        {
+            return false;
+        }
+        let mut pending = vec![declaration];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "annotation" | "marker_annotation")
+                || kotlin
+                    && (matches!(
+                        node.kind(),
+                        "property_declaration"
+                            | "object_declaration"
+                            | "companion_object"
+                            | "class_parameter"
+                    ) || matches!(
+                        &text[node.byte_range()],
+                        "data"
+                            | "enum"
+                            | "annotation"
+                            | "value"
+                            | "expect"
+                            | "external"
+                            | "inline"
+                            | "suspend"
+                            | "by"
+                            | "context"
+                    ))
+            {
+                return false;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+        true
     }
 
     /// A current Java owner under the caller's selected javac task. This does not close project
@@ -4912,6 +5114,292 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn runtime_ready_standalone_java_reports_authored_call_errors() {
+        let root = unique_tmp("runtime-java-diagnostics");
+        std::fs::create_dir_all(&root).unwrap();
+        let helper = "package app; interface Worker { void assist(); } public class Helper extends Base implements Worker { public void assist() {} public void combine(String name, int count) {} public void adopt(Cat cat) {} } class Base {} class Cat {} class Dog {}";
+        let main = "package app; public class Main { void run(Helper helper) { helper.combine(\"Ada\"); helper.adopt(new Dog()); missingCall(); } }";
+        std::fs::write(root.join("Helper.java"), helper).unwrap();
+        std::fs::write(root.join("Main.java"), main).unwrap();
+        let mut ws = Workspace::new();
+        ws.scan(&root);
+        runtime_ready_source_diagnostic_fixture(&mut ws, &root);
+        assert!(ws.completeness.project_scan_complete);
+        assert!(!ws.effective_completeness().compiler_producers_complete);
+        let key = crate::paths::file_key(&root.join("Main.java"));
+        ws.open(&key, main.into());
+        let diagnostics = ws.diagnostics(&key);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "Unresolved reference: missingCall"));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code
+                    == Some(crate::diagnostics::DiagnosticCode::CallShapeMismatch))
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_sdk_model_switch_retires_foreign_symbols_and_rejects_late_batches() {
+        let root = unique_tmp("sdk-model-switch");
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let key = crate::paths::file_key(&project.join("src/Use.java"));
+        let source = "package app; class Use { void use(Thread thread) { thread.th; } }";
+        std::fs::write(&key, source).unwrap();
+        for feature in [17, 21] {
+            let home = root.join(format!("jdk{feature}"));
+            std::fs::create_dir_all(home.join("lib")).unwrap();
+            std::fs::write(home.join("lib/src.zip"), "explicit SDK source stamp").unwrap();
+            std::fs::write(
+                home.join("release"),
+                format!("JAVA_VERSION=\"{feature}.0.1\"\n"),
+            )
+            .unwrap();
+        }
+        let model = |feature| {
+            let task = serde_json::from_value(serde_json::json!({
+                "task": ":compileJava", "language": "java", "task_type": "org.gradle.api.tasks.compile.JavaCompile",
+                "java_home": root.join(format!("jdk{feature}")), "arguments": [], "annotation_processor_path": [],
+                "source_files": [&key], "classpath": [], "output_roots": [], "complete": true, "problem": null,
+                "options": {"release": null, "bootstrapClasspath": null, "fork": false, "forkJavaHome": null, "forkExecutable": null, "forkJvmArgs": []}
+            })).unwrap();
+            Arc::new(crate::classpath::ProjectSnapshot::new(vec![
+                crate::classpath::ModuleClasspath {
+                    module: ":".into(),
+                    project_dir: project.clone(),
+                    build: String::new(),
+                    entries: Vec::new(),
+                    unresolved: Vec::new(),
+                    source_sets: vec![crate::classpath::SourceSetClasspath {
+                        name: "main".into(),
+                        source_roots: vec![project.join("src")],
+                        compiler_tasks: vec![task],
+                        ..Default::default()
+                    }],
+                },
+            ]))
+        };
+        let batch = |feature| {
+            let text = if feature == 21 {
+                "package java.lang; public class Thread { public long threadId() { return 1; } public String getName() { return null; } }"
+            } else {
+                "package java.lang; public class Thread { public String getName() { return null; } }"
+            };
+            let path = root.join(format!("cache{feature}/Thread.java"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            let mut parsers = LanguageParsers::new();
+            let tree = parsers.parse(SourceLanguage::Java, text);
+            crate::deps::FileSymbols {
+                file: crate::paths::file_key(&path),
+                symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
+                jvm: None,
+                origin: Some(crate::project_model::FileOrigin {
+                    origin_id: crate::classpath::jdk_origin_id(
+                        &root.join(format!("jdk{feature}/lib/src.zip")),
+                    ),
+                    representation: crate::project_model::SourceRepresentation::Source,
+                    project_scope: None,
+                }),
+            }
+        };
+        let mut ws = Workspace::new();
+        ws.scan(&project);
+        ws.set_project_model(model(21));
+        ws.open(&key, source.into());
+        assert!(ws.index_dependency_batch(batch(21)));
+        let offset = source.find("thread.th").unwrap() + "thread.th".len();
+        assert!(
+            completion_labels(&ws.completion_query(&key, offset).unwrap())
+                .contains(&"threadId".into())
+        );
+        ws.set_project_model(model(17));
+        assert!(
+            ws.index
+                .scoped_for_file(&key)
+                .lookup_type("Thread")
+                .is_empty(),
+            "old SDK is retired before replacement, without host fallback"
+        );
+        assert!(
+            !ws.index_dependency_batch(batch(21)),
+            "a late foreign SDK batch cannot restore stale APIs"
+        );
+        assert!(ws.index_dependency_batch(batch(17)));
+        assert!(
+            !completion_labels(&ws.completion_query(&key, offset).unwrap())
+                .contains(&"threadId".into())
+        );
+        let current = source.replace("thread.th", "thread.getName()");
+        ws.open(&key, current.clone());
+        let definitions = ws.goto_definition(&key, current.find("getName").unwrap());
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0].file,
+            crate::paths::file_key(&root.join("cache17/Thread.java"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_ready_standalone_superclass_diagnostics_follow_unsaved_imports() {
+        let root = unique_tmp("runtime-super-diagnostics");
+        std::fs::create_dir_all(root.join("support")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let java_child = "package app; import support.ImportedBase; public class ImportedChild extends ImportedBase {}";
+        let kotlin_child =
+            "package app\nimport support.ImportedBase\nclass KotlinImportedChild : ImportedBase()";
+        let java_use = "package app; class SuperUse { void run(ImportedChild child, KotlinImportedChild kotlin) { child.accept(\"ok\"); kotlin.accept(\"ok\"); } }";
+        let kotlin_use = "package app\nfun use(child: ImportedChild, kotlin: KotlinImportedChild) { child.accept(\"ok\"); kotlin.accept(\"ok\") }";
+        for (path, text) in [
+            ("support/ImportedBase.java", "package support; public class ImportedBase { public void accept(String value) {} }"),
+            ("app/ImportedBase.java", "package app; public class ImportedBase { public void accept(int value) {} }"),
+            ("app/ImportedChild.java", java_child), ("app/KotlinImportedChild.kt", kotlin_child),
+            ("app/SuperUse.java", java_use), ("app/SuperUse.kt", kotlin_use),
+        ] { std::fs::write(root.join(path), text).unwrap(); }
+        let mut ws = Workspace::new();
+        ws.scan(&root);
+        runtime_ready_source_diagnostic_fixture(&mut ws, &root);
+        assert!(!ws.effective_completeness().compiler_producers_complete);
+        for (path, text) in [
+            ("app/SuperUse.java", java_use),
+            ("app/SuperUse.kt", kotlin_use),
+        ] {
+            let key = crate::paths::file_key(&root.join(path));
+            ws.open(&key, text.into());
+            assert!(ws.diagnostics(&key).is_empty(), "valid {path}");
+        }
+        for (path, text) in [
+            ("app/ImportedChild.java", java_child),
+            ("app/KotlinImportedChild.kt", kotlin_child),
+        ] {
+            ws.open(
+                &crate::paths::file_key(&root.join(path)),
+                text.replace("support.ImportedBase", "app.ImportedBase"),
+            );
+        }
+        for path in ["app/SuperUse.java", "app/SuperUse.kt"] {
+            let diagnostics = ws.diagnostics(&crate::paths::file_key(&root.join(path)));
+            assert_eq!(diagnostics.len(), 2, "{path}: {diagnostics:?}");
+            assert!(
+                diagnostics.iter().all(|diagnostic| diagnostic.code
+                    == Some(crate::diagnostics::DiagnosticCode::CallShapeMismatch)),
+                "{diagnostics:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_ready_standalone_source_proofs_refuse_uncertain_owners() {
+        let root = unique_tmp("runtime-source-proof-guards");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Owners.java"),
+            "package app; class Plain {} @Marker class Generated {} @interface Marker {}",
+        )
+        .unwrap();
+        std::fs::write(root.join("Shapes.kt"), "package app\nclass KotlinPlain\nclass PropertyOwner(val value: Int)\ndata class DataOwner(val value: Int)").unwrap();
+        let source = "package app; class Use { void run(Plain plain, Generated generated, KotlinPlain kotlin, PropertyOwner property, DataOwner data) { plain.absent(); generated.absent(); kotlin.absent(); property.absent(); data.absent(); } }";
+        std::fs::write(root.join("Use.java"), source).unwrap();
+        let kotlin_source = "package app\nfun use(plain: Plain, generated: Generated, kotlin: KotlinPlain, property: PropertyOwner, data: DataOwner) { plain.absent(); generated.absent(); kotlin.absent(); property.absent(); data.absent() }";
+        std::fs::write(root.join("Use.kt"), kotlin_source).unwrap();
+        let mut ws = Workspace::new();
+        ws.scan(&root);
+        runtime_ready_source_diagnostic_fixture(&mut ws, &root);
+        let keys = [
+            crate::paths::file_key(&root.join("Use.java")),
+            crate::paths::file_key(&root.join("Use.kt")),
+        ];
+        for (key, text) in keys.iter().zip([source, kotlin_source]) {
+            ws.open(key, text.into());
+        }
+        let check = |ws: &mut Workspace, count| {
+            for key in &keys {
+                let diagnostics = ws.diagnostics(key);
+                assert_eq!(diagnostics.len(), count, "{key}: {diagnostics:?}");
+                assert!(diagnostics.iter().all(|diagnostic| diagnostic.code
+                    == Some(crate::diagnostics::DiagnosticCode::UnresolvedReference)));
+            }
+        };
+        check(&mut ws, 2);
+        ws.set_jdk_index_complete(false);
+        check(&mut ws, 0);
+        ws.set_jdk_index_complete(true);
+        std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
+        check(&mut ws, 0);
+        std::fs::remove_file(root.join("build.gradle.kts")).unwrap();
+        check(&mut ws, 2);
+        let owners = crate::paths::file_key(&root.join("Owners.java"));
+        ws.open(
+            &owners,
+            "package app; @Marker class Plain {} @Marker class Generated {} @interface Marker {}"
+                .into(),
+        );
+        check(&mut ws, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn runtime_ready_source_diagnostic_fixture(ws: &mut Workspace, root: &Path) {
+        // Model the normal source-indexed SDK, without closing compiler producers.
+        let home = root.join("sdk");
+        std::fs::create_dir_all(home.join("jmods")).unwrap();
+        std::fs::create_dir_all(home.join("lib")).unwrap();
+        std::fs::write(
+            home.join("jmods/java.base.jmod"),
+            "explicit SDK inventory stamp",
+        )
+        .unwrap();
+        let origin = crate::classpath::jdk_origin_id(&home.join("lib/src.zip"));
+        for (key, text) in [
+            ("sdk/java/lang/Object.java", "package java.lang; public class Object { public String toString() { return null; } }"),
+            ("sdk/java/lang/String.java", "package java.lang; public final class String {}"),
+        ] {
+            let mut parsers = LanguageParsers::new();
+            let tree = parsers.parse(SourceLanguage::Java, text);
+            assert!(ws.index_dependency_batch(crate::deps::FileSymbols {
+                file: key.into(), symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
+                jvm: None, origin: Some(crate::project_model::FileOrigin {
+                    origin_id: origin.clone(), representation: crate::project_model::SourceRepresentation::Source,
+                    project_scope: None,
+                }),
+            }));
+            assert_eq!(ws.index.file_origin(key).unwrap().origin_id, origin);
+            assert!(ws.global_origins.contains(&origin));
+        }
+        ws.class_inventory.get_mut().inject_object_for_tests(
+            &home,
+            ktcore::classfile::ClassFileFacts {
+                identity: ktcore::jvm::ClassIdentity {
+                    origin_id: origin,
+                    internal_name: "java/lang/Object".into(),
+                    input: ktcore::jvm::InputIdentity::Binary {
+                        content_sha256: [1; 32],
+                    },
+                },
+                major_version: 61,
+                minor_version: 0,
+                access_flags: 1,
+                super_name: None,
+                interfaces: Vec::new(),
+                signature: None,
+                source_file: None,
+                attribute_names: Vec::new(),
+                fields: Vec::new(),
+                methods: Vec::new(),
+            },
+        );
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+    }
+
     fn unique_tmp(prefix: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5241,6 +5729,130 @@ mod tests {
         ws.close(&kotlin_key);
         assert!(ws.index.lookup_type("KotlinDirty").is_empty());
         assert_eq!(ws.index.lookup_type("KotlinDiskChanged").len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_enrichment_preserves_unchanged_binary_completion_until_sources_replace_it() {
+        use crate::project_model::{FileOrigin, SourceRepresentation};
+        use std::io::Write;
+        let root = unique_tmp("source-enrichment-continuity");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let binary = root.join("api.jar");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+        archive
+            .start_file(
+                "fieldfixture/FieldOnly.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class"
+            ))
+            .unwrap();
+        archive.finish().unwrap();
+        let source_jar = root.join("api-sources.jar");
+        let pom = root.join("api.pom");
+        std::fs::write(&source_jar, b"source revision").unwrap();
+        std::fs::write(&pom, b"encoding revision").unwrap();
+        let model = |extra: &str| {
+            Arc::new(crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n{extra}END\t:app\n",
+            root.display(), root.join("src").display(), binary.display(), binary.display()))))
+        };
+        let accepted = model("");
+        let coord = crate::coords::Coordinate::parse("fieldfixture:api:1").unwrap();
+        let origin = crate::classpath::maven_origin_id(&coord);
+        let mut ws = Workspace::new();
+        ws.set_project_model(accepted.clone());
+        let mut kotlin = crate::parser::KotlinParser::new();
+        let mut java = crate::java::JavaParser::new();
+        for batch in crate::deps::resolve_module_binary_stubs(
+            &coord,
+            &accepted.coordinate_binaries(&coord).unwrap(),
+            &root.join("extract"),
+            &mut kotlin,
+            &mut java,
+        )
+        .unwrap()
+        {
+            ws.index_dependency_batch(batch);
+        }
+        let mut parsers = LanguageParsers::new();
+        let source_batch = |parsers: &mut LanguageParsers, path: &Path, text: &str| {
+            let key = crate::paths::file_key(path);
+            let tree = parsers.parse_for_key(&key, text);
+            crate::deps::FileSymbols {
+                jvm: None,
+                file: key,
+                symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
+                origin: Some(FileOrigin {
+                    origin_id: origin.clone(),
+                    representation: SourceRepresentation::Source,
+                    project_scope: None,
+                }),
+            }
+        };
+        ws.index_dependency_batch(source_batch(
+            &mut parsers,
+            &root.join("Obsolete.java"),
+            "package fieldfixture; public class Obsolete {}",
+        ));
+        ws.complete_dependency_origin(origin.clone());
+        let useful = |ws: &mut Workspace| {
+            for (name, text) in [
+                (
+                    "Use.java",
+                    "package fieldfixture; class Use { void f(FieldOnly value) { value.co; } }",
+                ),
+                (
+                    "Use.kt",
+                    "package fieldfixture\nfun f(value: FieldOnly) { value.co }\n",
+                ),
+            ] {
+                let key = crate::paths::file_key(&root.join("src").join(name));
+                ws.open(key.clone(), text.to_string());
+                let query = ws
+                    .completion_query(&key, text.find("value.co").unwrap() + "value.co".len())
+                    .unwrap();
+                assert_eq!(
+                    query
+                        .candidates
+                        .iter()
+                        .filter(|item| item.label == "count")
+                        .count(),
+                    1,
+                    "{name}: {} {:?}",
+                    query.status_label(),
+                    query.reason_labels()
+                );
+            }
+        };
+        useful(&mut ws);
+        ws.set_project_model(model(&format!(
+            "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n",
+            source_jar.display(), pom.display())));
+        assert!(
+            ws.index.lookup_type("Obsolete").is_empty(),
+            "old source facts must retire"
+        );
+        assert!(!ws.dependency_origin_complete(&origin));
+        useful(&mut ws); // Accepted enrichment has published, but source parsing has not finished.
+        let source = root.join("FieldOnly.java");
+        let text = include_str!(
+            "../../ktcore/tests/fixtures/classfile/sources/fieldfixture/FieldOnly.java"
+        );
+        std::fs::write(&source, text).unwrap();
+        ws.index_dependency_batch(source_batch(&mut parsers, &source, text));
+        ws.bump_index_revision();
+        useful(&mut ws); // Existing canonical source preference must avoid duplicate ambiguity.
+        std::fs::write(&binary, b"different selected binary").unwrap();
+        ws.set_project_model(model(""));
+        assert!(
+            ws.index.lookup_type("FieldOnly").is_empty(),
+            "changed binaries must retire their stubs too"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

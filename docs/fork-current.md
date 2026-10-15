@@ -1,9 +1,9 @@
 # Current fork state
 
 Read this before the historical acceptance record. Goal remains in progress.
-Updated2026-10-15 (Asia/Tokyo), checkpoint86 base verified; goal incomplete.
+Updated2026-10-16 (Asia/Tokyo), checkpoint86 base verified; goal incomplete.
 
-Latest verified checkpoint86 result: fmt, the serialized-symbol wire regression,
+Previous checkpoint86 result: fmt, the serialized-symbol wire regression,
 the full workspace suite (1,542 passed, zero failed, four ignored), and release
 build pass. All four owned stages close with EOF, zero residual cleanup and
 stable input guards. The root reviewer independently checked receipt stages,
@@ -17,6 +17,15 @@ source guards, no forced cleanup and no live owned process. The root checked
 both result counts and artifact hashes against this exact immutable binary.
 Evidence: native-cem-shadow-editor86-1/receipt.json. Broad Java editor acceptance
 remains pending; CEM18 does not establish whole-project IDEA parity or latency.
+The CEM timing audit records project scan completion at89.738/104.510ms,
+dependency indexing at51.415/42.111s, and the first useful original completion
+request starting at51.437/42.123s, with server spans4.024-6.361ms. These runs
+use fresh analysis caches, a copied disk model and warm Gradle downloads. The
+harness waits for dependency readiness before sending original requests, so
+these timings do not prove the earliest usable completion or display latency.
+The dependency spans include source queries34.791/26.038s. Measure requests
+while a source query is pending before and after the publication-order fix.
+Evidence: native-cem-shadow-editor86-1/timing-summary.json.
 
 The separate Rust extension fixture now passes its actual Mixin-artifact javac
 control, crate test/build and real-Neovim corpus proof: two original and fourteen
@@ -57,6 +66,76 @@ must also publish useful selected binary facts before slow online source queries
 retain a resolved source when an unrelated component fails, and certify the POM
 origin used for source encoding. These are open correctness/performance gaps,
 not acceptance of the current Gradle integration as complete.
+
+Checkpoint87 is in progress after publishing checkpoint86 as775cf4e. An actual
+token-level regression reproduces selected UTF-8 sources being decoded using a
+foreign same-GAV ISO-8859-1 POM: the expected `café` member disappears
+and a corrupted identifier is indexed. The test compiles and fails semantically
+(one failed test, exit101, EOF/owned0/stable guards). Evidence:
+native-pom-origin-red87-1/receipt.json. Runtime-faithful Java tests also reproduce
+missing local and inherited argument errors without the test-only completeness
+override; the independent javac/Kotlin controls confirm the expected errors.
+Evidence: native-java-diagnostic-compiler86-1/receipt.json.
+Implementations are assigned for exact POM provenance, early binary publication
+and source-query cancellation, and bounded current-source hierarchy certainty.
+These changes have not yet passed combined checks.
+
+Focused87-2 passes23 tests and fails two, with fmt separate: the certified POM
+selection/encoding filters pass17 tests; Kotlin inherited-call diagnostics and
+an unchanged in-root POM watch expectation fail. The watch predicate was fixed
+without weakening its unchanged/changed/deleted expectations. Kotlin's global
+producer gate now delegates member calls to the bounded owner/hierarchy proof;
+unqualified top-level calls retain the global gate. Actual no-model JDK batches
+also retain their provenance, rather than relying on injected test origins.
+Focused87-4 then passes seven tests: runtime Java/Kotlin diagnostics and uncertain
+owner controls, exact source/POM watches, useful Java/Kotlin completion while a
+source query is pending, continuity after model enrichment, and owned native
+child cancellation. The root checked each raw result and stage. Those stages
+close with EOF, no forced cleanup and no live owned process. A separate actual
+binary override reduction in the same recipe still fails two inferred-result
+expectations; completion and exact definition already pass. Its final native
+stage records one residual termination, so the overall recipe is not accepted
+as wholly green or clean. Evidence: native-combined-diagnostic-focus87-{2,4}.
+The reduction needs a control without the unsupported ancestor and a return-chain
+completion check before attributing the failure or changing binary metadata.
+
+The actual Gradle reload failure has a selected-SDK mismatch: phase2's compiler
+recipe uses JDK17, while the indexed SDK source origin is JDK21. Shared selected
+SDK indexing/retirement is in progress; substituting an Object-only adapter would
+leave navigation/completion inconsistent. Preserve CEM's selected SDK21 and
+same-feature release settings; multiple SDKs need source-set scope, not a first
+winner or a host-JDK fallback. Latest broad Java and Gradle editor reruns remain
+required after the combined release.
+
+Actual parent-POM discovery passes both repository policies in an isolated SDK21
+Gradle home. Six owned stages (javac/javap controls plus production source tasks)
+exit zero with EOF, no forced cleanup and stable guards. The project policy
+exports the actual ISO-8859-1 encoding parent even though it is absent from the
+runtime dependency graph; the settings policy selects the competing UTF-8 root.
+The root checked exact SOURCEARTIFACT/POMARTIFACT rows as well as the receipt.
+An earlier attempt stopped at a javap stdout-encoding assertion before Gradle;
+it is retained as a control/tool failure. Evidence:
+native-gradle-parent-policy87-2/receipt.json; pinned production init script
+67064938663fcfe4a231ec8ebbdc72374ca68dc73c2512a8996d298a04174b59.
+This establishes public Gradle selection and compiler oracles. Host consumption
+through a fresh Neovim process and the portable fixture remain pending.
+
+Actual fresh MODEL14 captures now succeed for Retrofit, Moshi and OkHttp, with
+their original source bytes retained. Moshi's regenerated required JAR is present
+and its Java/Kotlin task snapshots are complete. OkHttp's three absent Java output
+directories belong to Kotlin-only tasks with zero Java sources; they are not
+missing required compiled artifacts. Spring is still operationally unmeasured
+because its private Gradle8.10.2 immutable cache lacks metadata. Batch repair of
+only proven invalid generated workspaces is authorized; accepted models remain
+valid. Latest five-project editor acceptance is still unrun. Evidence:
+native-five-{retrofit-current-model86-2,moshi-current-model86-1,okhttp-current-model86-1,spring-current-model86-1}/receipt.json.
+
+The processor-refresh attempt stops before LSP startup: the offline Gradle cache
+lacks the pinned Kotlin JVM1.8.21 plugin marker. This is operationally unmeasured,
+not evidence for or against KAPT/KSP editor semantics. The owned stage closes
+exit1/EOF/owned0 with no forced cleanup. Bootstrap the exact pinned dependencies
+online, then rerun the unchanged offline probe. Evidence:
+native-gradle-processor-editor86-1/receipt.json.
 
 The remaining checkpoint86 notes below retain earlier observations and gaps;
 the verified results above supersede their pending-check descriptions.
@@ -267,14 +346,91 @@ Stop dependent tool calls when preparation fails. Rebind intentionally changed
 fixture/common-input guards explicitly to the tested release before editor launch.
 
 Evidence base: C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
-Launch state: current-slice84.json; no native task active.
-Proofs: native-k2-java-release83-1; native-sdk21-public83-3;
-native-sdk21-collector83-1; root-cem-model13-audit83-1/audit.json;
-native-cem-java-floor83-1/receipt.json (diagnostic coverage gap).
-Working runtime: native-k2-java-release85-1/bin/ktlsp.exe (fe83f1ab...).
-Published/native-proven runtime: native-k2-java-release83-1/bin/ktlsp.exe (e1740b2a...).
-Latest closed private Gradle-home owner: native-cem-java-floor84-1/receipt.json.
-Both stages exit1 for original semantic mismatches, EOF/owned0/unforced, stable
-guards. controller_error and final_guard_error are null; these prove completed
-observation and closed ownership, not a passing semantic floor.
+Current functional gaps confirmed on2026-10-16: accepted Moshi Java compiles
+with SDK17 and release8, which the selected SDK view currently refuses; this is
+an API-view coverage gap, not SDK completion acceptance. Retrofit actually uses
+SDK8, whose selected source archive is home/src.zip rather than home/lib/src.zip;
+the current selector needs that same-home layout support. Gradle launcher SDK17
+does not establish the compilation SDK of every module. Five retained the four
+actual source-set combinations in accepted-four-sdk-targets86.json.
+The actual IDEA server263.6379.0 ran both portable source-policy imports through
+Neovim: seven of eight semantic expectations matched; inherited ISO source cafe
+navigation used the selected class instead of the expected source location.
+Both imports completed, but each comparator shutdown exceeded the harness
+observation window and required one child cleanup. Tooling/daemon SDK22 was
+observed despite requested21; project SDK is unproved. This is a limited oracle,
+not stock-ktlsp comparison or general IDEA parity. Evidence:
+native-gradle-parent-idea87-3/receipt.json. Stock comparison awaits new release.
+
+Checkpoint87 release is now verified: native-editing-sdk-release87-4 has fmt,
+full no-fail-fast workspace1,563 passed/zero failed/four ignored, and release
+success. Root audited raw counts/hashes, stable guards and all three owned stages
+with EOF, no residual cleanup and no live child. Immutable binary:19,299,840 bytes,
+SHA-256 d1d133307da739327d6b6cbf08bfd3b16e64ea2fb176dd58427c81b897b31d61.
+Real Neovim Java editing passes345/345, plus six exact annotation first responses
+and two actually applied import edits whose full texts compile. Evidence:
+native-java-editing-editor87-1/receipt.json. Its Lua uses forced client stop, so
+this proves semantics, not graceful LSP shutdown; that harness correction and
+clean shutdown verification remain pending. New CEM/reload/processor/five-project
+and performance observations are still pending, so this checkpoint is not goal
+completion. The stock source-policy baseline also answers all eight semantic
+requests correctly, including inherited ISO source navigation; its separate
+parent-edit extra probe needed an exact-URI fixture correction and rerun.
+
+Latest combined focused check is native-diagnostic-sdk-focus87-3:51 passed,
+zero failed/ignored (SDK7, diagnostic contracts41, runtime3), fmt passes. Root
+verified aggregate raw counts, every raw hash, stable guards, EOF and zero
+residual cleanup. This includes the same-selected-home SDK8 source layout fix
+and certified Object hierarchy handling; SDK8 binary Object inventory remains
+Unknown. The next full no-fail-fast workspace run (native-editing-sdk-release87-3)
+reports1,561 passes, two failures and four ignored tests; it produces no release.
+The remaining late-open extension fixtures rely on an unselected synthetic SDK
+becoming globally visible, which the new SDK scope correctly forbids. Fix the
+fixture to exercise accepted dependency ownership and actual model scope change,
+retaining unknown-to-known results, stale-generation rejection and open-buffer
+truth. Then rerun its target and full workspace/release. Native Java345, CEM18,
+live reload/KAPT/KSP and stock source-policy comparison await the immutable copy.
+The shared private Gradle home is free after the successful configuration-only
+Gradle help bootstrap (native-five-gradle-bootstrap86-1; no full project build).
+Grade has the CEM21 then reload/processor17 queue; Five captures the fifth model
+on the new binary after those owned stages close. Core nominal reference work
+starts after successful release-copy, preserving immutable editor provenance.
+
+Latest focused checkpoint87 checks: selected SDK six tests and known-leaf
+Java/Kotlin override two tests pass with unchanged semantic assertions. Root
+verified raw hashes, test counts, stable guards and EOF. Each test Cargo stage
+required one residual child cleanup; this is not proof of clean LSP shutdown.
+Evidence: native-selected-sdk-focus87-4 and native-known-leaf-causal87-5.
+The known-leaf comparison passes with no ancestor, Base and GenericMid when
+fixture-owned nominal return facts are present. No binary-dispatch metadata
+change is justified; the previous unindexed SDK List case remains an input
+coverage gap. Loads are labelled initial/repeated, not an unproven warm hit.
+The first combined workspace attempt stops at697 passes, two failures and two
+ignored tests; no new release exists. One old test incorrectly expected a
+synthetic host SDK for a model with no certified SDK. The other uses a persistent
+running marker that may survive legitimate subprocess cancellation. Exact
+contract/liveness test corrections and a fresh combined check are pending.
+Evidence: native-editing-sdk-release87-1/receipt.json.
+
+Latest published runtime: native-binary-shadow-release86-3/bin/ktlsp.exe
+(cf9ebc7655eb2450b9168181e5954cd3edc651d14ead4bcda1a7afa154a3bb78).
+Checkpoint87 SDK, diagnostics and source-query changes await the combined release.
+The focused selected-SDK suite is assigned to UX, the sole current Cargo owner.
+Core is checking a no-binary-ancestor positive control before attributing return
+inference failures to binary hierarchy metadata; no cache-version change yet.
+Five owns the task-private Gradle home for its final real model capture; four
+project models are accepted, but the unchanged original50 editor probes await
+this release. The last Gradle capture closed without a model because a private
+Gradle dependency-accessor cache lacked metadata. Its closed receipt is
+native-five-gradle-current-model86-2/receipt.json; a bounded retained repair and
+one new capture are authorized. This is an operational blocker, not a semantic
+pass or failure. Grade runs actual reload and offline KAPT/KSP editor checks
+after Five releases the shared home and the new immutable binary is available.
+Reviewer is assigned the installed IDEA server oracle in an isolated home.
+These are assignments; agent API running does not establish active execution.
+Root independently audited native-gradle-parent-guards87-1/receipt.json: seven
+malformed/unsupported parent cases preserve the root source records and fail
+POM certification without discovering a parent. Both native stages exit zero
+with EOF, no residual termination, stable inputs and matching raw-log hashes.
+This verifies model guards, not the portable fixture's pending editor behavior.
 No preexisting process adoption/global process inventory. Keep AGENTS.md untouched.

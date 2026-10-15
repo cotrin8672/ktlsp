@@ -195,24 +195,35 @@ local function wait_for(condition, timeout)
 end
 -- Read each published model after the existing useful v1/v2 requests, without extra readiness gates.
 local function check_kotlin_metadata(phase, version)
-  local capture = { matches = {}, read_errors = {} }
+  local capture = { matches = {}, read_errors = {}, model_exports = {}, jdk_selections = {},
+    identity_limit = 'cache bytes and completed SDK-selection traces observed after phase requests; not an atomic model/request snapshot' }
   local cache = vim.env.KTLSP_CACHE_DIR
   local files = cache and vim.fn.globpath(cache .. '/classpath', '*.json', false, true) or {}
   table.sort(files)
   for _, path in ipairs(files) do
+    local raw
     local ok, model = pcall(function()
-      return vim.json.decode(table.concat(vim.fn.readfile(path, 'b'), '\n'))
+      local file = assert(io.open(path, 'rb'))
+      raw = file:read('*a')
+      file:close()
+      return vim.json.decode(raw)
     end)
     if ok and type(model) == 'table' then
       for _, item in ipairs(model.modules or {}) do
         if item.module == ':app' and type(item.project_dir) == 'string'
           and probe.path_key(item.project_dir) == probe.path_key(module) then
+          local export = artifacts .. '/gradle-phase-' .. phase .. '-model-' .. (#capture.model_exports + 1) .. '.json'
+          local output = assert(io.open(export, 'wb'))
+          assert(output:write(raw))
+          output:close()
+          capture.model_exports[#capture.model_exports + 1] = { path = export, bytes = #raw, sha256 = vim.fn.sha256(raw) }
           for _, source_set in ipairs(item.source_sets or {}) do
             if source_set.name == 'main' then
-              local java_home
+              local java_home, java_task
               for _, task in ipairs(source_set.compiler_tasks or {}) do
                 if task.task == ':app:compileJava' and task.language == 'java' and task.complete then
                   java_home = task.java_home
+                  java_task = task
                 end
               end
               for _, task in ipairs(source_set.compiler_tasks or {}) do
@@ -221,7 +232,7 @@ local function check_kotlin_metadata(phase, version)
                     model_version = model.model_version, module = item.module, build = item.build,
                     project_dir = item.project_dir, source_set = source_set.name, task = task,
                     kotlin_compile_task = source_set.kotlin_compile_task,
-                    java_compile_home = java_home }
+                    java_compile_home = java_home, java_compile_task = java_task }
                 end
               end
             end
@@ -231,6 +242,16 @@ local function check_kotlin_metadata(phase, version)
     else
       capture.read_errors[#capture.read_errors + 1] = { path = path, error = tostring(model) }
     end
+  end
+  local trace = io.open(vim.env.KTLSP_TRACE or artifacts .. '/trace-events.jsonl', 'rb')
+  if trace then
+    for line in trace:lines() do
+      local ok, event = pcall(vim.json.decode, line)
+      if ok and event.name == 'deps.jdk_selection' then
+        capture.jdk_selections[#capture.jdk_selections + 1] = { ts = event.ts, args = event.args }
+      end
+    end
+    trace:close()
   end
   report.compiler_metadata[tostring(phase)] = capture
   local selected = #capture.matches == 1 and capture.matches[1] or nil

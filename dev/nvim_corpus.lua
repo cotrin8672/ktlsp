@@ -148,6 +148,7 @@ if mode == 'ktlsp' then
 end
 vim.api.nvim_set_current_buf(prepared[1].buf)
 local shutdown_state = probe.observe_shutdown(config)
+local client_started_ns = vim.uv.hrtime()
 local id = vim.lsp.start(config, { bufnr = prepared[1].buf })
 local client, import_state
 local sent_versions, outbound_changes, delivery_records = {}, {}, {}
@@ -225,6 +226,44 @@ operational('one client initializes', initialized, mode)
 if not initialized then finish() end
 for _, source in pairs(sources) do vim.lsp.buf_attach_client(source.buf, id) end
 print('SERVER ' .. vim.inspect(client.server_info))
+if vim.env.KTLSP_CORPUS_FIRST_USE == '1' then
+  local prep = prepared[1]
+  assert(mode == 'ktlsp' and wait_index and not prep.has_edits,
+    'first-use measurement requires an unchanged ktlsp case and normal indexing readiness')
+  assert(prep.case.completion ~= false and prep.case.completion_token ~= false,
+    'first-use measurement requires a positive completion')
+  local token = prep.case.completion_token or prep.case.token
+  local params = { textDocument = { uri = vim.uri_from_bufnr(prep.buf) },
+    position = prep.completion_position, context = { triggerKind = 1 } }
+  local measurement = { case = prep.case.id, token = token, params = params,
+    polling_interval_ms = 500, request_count = 0, attempts = {},
+    meaning = 'earliest observed useful completion response since LSP start; excludes completion-menu display' }
+  local deadline = vim.uv.hrtime() + (tonumber(vim.env.KTLSP_CORPUS_READY_TIMEOUT_MS) or 600000) * 1000000
+  repeat
+    local seconds, micros = vim.uv.gettimeofday()
+    local started = vim.uv.hrtime()
+    local response, err = client:request_sync('textDocument/completion', params, 5000, prep.buf)
+    local outcome = probe.request_outcome(response, err, function(value)
+      if not probe.completion_has(value, token) then return false end
+      for _, excluded in ipairs(prep.case.completion_excludes or {}) do
+        if probe.completion_has(value, excluded) then return false end
+      end
+      return true
+    end)
+    local observed_ms = (vim.uv.hrtime() - client_started_ns) / 1000000
+    measurement.request_count = measurement.request_count + 1
+    measurement.attempts[#measurement.attempts + 1] = {
+      started_epoch_us = seconds * 1000000 + micros, observed_ms = observed_ms,
+      request_elapsed_ms = (vim.uv.hrtime() - started) / 1000000, outcome = outcome,
+      project_ready = index_state.project, libraries_ready = index_state.libraries }
+    if outcome == 'matched' and not measurement.first_useful_ms then
+      measurement.first_useful_ms, measurement.first_useful_result = observed_ms, response.result
+    end
+    measurement.libraries_ready = index_state.libraries
+    write('corpus-first-use.json', measurement)
+    if not index_state.libraries then vim.wait(measurement.polling_interval_ms) end
+  until index_state.libraries or vim.uv.hrtime() >= deadline
+end
 if mode == 'intellij' then
   local imported
   imported, import_state = probe.import_ready(client, manifest.build_tool or 'gradle',
