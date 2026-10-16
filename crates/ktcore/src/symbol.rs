@@ -83,11 +83,22 @@ impl SourceMemberFlags {
         use crate::extensions::Visibility;
         match self.0 >> 4 & 7 {
             1 => Some(Visibility::Public),
-            2 => Some(Visibility::Protected),
+            2 | 6 => Some(Visibility::Protected),
             3 => Some(Visibility::Package),
             4 => Some(Visibility::Private),
             _ => None,
         }
+    }
+
+    pub(crate) fn with_java_protected(mut self, java: bool) -> Self {
+        if java && self.visibility() == Some(crate::extensions::Visibility::Protected) {
+            self.0 = (self.0 & !0x70) | 0x60;
+        }
+        self
+    }
+
+    pub fn protected_package_access(self) -> bool {
+        self.0 >> 4 & 7 == 6
     }
 
     pub fn is_internal(self) -> bool {

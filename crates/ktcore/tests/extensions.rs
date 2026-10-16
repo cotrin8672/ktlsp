@@ -1792,4 +1792,342 @@ fn selected_compiled_java_array_factories_keep_exact_descriptor_rank_origin_and_
         assert_eq!(result.name(), Some(component));
         assert_eq!(result.package(), package);
     }
+
+    let factory = (*index.entries_for_file(FILE)[0].sym).clone();
+    let at = SOURCE.find("rows()").unwrap();
+    let mut rows = IndexedSymbol::new(
+        "rows",
+        SymbolKind::Function,
+        "arrayfixture",
+        Some("Factory".into()),
+        at,
+        at + 4,
+    );
+    rows.arity = Some(0);
+    rows.return_type = Some(ktcore::types::TypeRef::simple("Item[][]"));
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(SOURCE, None).unwrap();
+    let node = tree
+        .root_node()
+        .descendant_for_byte_range(at, at + 4)
+        .unwrap()
+        .parent()
+        .unwrap();
+    rows.source_member = ktcore::indexer::source_member_flags(node, SOURCE, true);
+    index.replace_file(FILE, vec![factory, rows], Tier::Volatile);
+    store
+        .replace_source(
+            &index,
+            ITEM_FILE,
+            Arc::from(ITEM_SOURCE),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    let type_scope = ktcore::indexer::TypeScope::with_default_imports(
+        "arrayfixture",
+        Vec::new(),
+        &["java.lang"],
+    );
+    let declarations =
+        ktcore::extensions::source::extract(&index, FILE, &tree, SOURCE, &type_scope);
+    store
+        .replace_source_declarations(
+            &index,
+            FILE,
+            Arc::from(SOURCE),
+            Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),
+            declarations,
+        )
+        .unwrap();
+    let owner = {
+        let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
+        let Knowledge::Found(owner) = read.resolve_type("arrayfixture.Factory") else {
+            panic!("authored owner")
+        };
+        let (members, _) = read.declared_members(&owner).unwrap();
+        assert!(
+            matches!(&members[0].signature, Knowledge::Found(signature) if signature.descriptor() == "()[[Larrayfixture/Item;")
+        );
+        owner
+    };
+    store
+        .replace_compiled_input(&index, &owner, Some(class.clone()))
+        .unwrap();
+    let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
+    let Knowledge::Found(handle) = read.compiled_class(&owner).unwrap() else {
+        panic!("authored compiled input")
+    };
+    let position = class
+        .methods
+        .iter()
+        .position(|method| method.name.as_ref() == "rows")
+        .unwrap();
+    let handles = read.compiled_methods(&handle).unwrap();
+    assert!(read
+        .admit_java_method(&handles[position])
+        .unwrap()
+        .is_found());
+    let pending = read.finish();
+    store.commit(pending).unwrap();
+    assert_eq!(
+        store.contributions(PROVIDER, FILE).unwrap(),
+        &ContributionSet::default(),
+        "an authored nominal-array method needs no duplicate compiled contribution"
+    );
+}
+
+#[test]
+fn nominal_signature_provenance_does_not_change_canonical_string_descriptor_equality() {
+    let (mut index, mut store) = fixture();
+    let file = "/sdk/String.kt";
+    let text = "package java.lang\nclass String\n";
+    index_source(&mut index, file, text, "java.lang");
+    store
+        .replace_source(
+            &index,
+            file,
+            Arc::from(text),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("java.lang.String") else {
+        panic!("String owner")
+    };
+    let Knowledge::Found(reference) = read.reference_type(&owner).unwrap() else {
+        panic!("String reference")
+    };
+    let expected = method(&[], &JvmType::String);
+    let nominal = method(&[], &reference);
+    assert_eq!(expected.descriptor(), nominal.descriptor());
+    assert_eq!(
+        expected, nominal,
+        "provenance validates handles, not JVM descriptor identity"
+    );
+    assert_eq!(
+        MemberSignature::field(&JvmType::Array(Box::new(JvmType::String))).unwrap(),
+        MemberSignature::field(&JvmType::Array(Box::new(reference))).unwrap()
+    );
+}
+
+#[test]
+fn nominal_reference_identities_are_canonical_and_cannot_cross_hosts_or_revisions() {
+    let (mut index, mut store) = fixture();
+    let nested_file = "/oracle/Nested.kt";
+    let nested = "package oracle\nclass Outer { class Inner }\n";
+    index_source(&mut index, nested_file, nested, "oracle");
+    store
+        .replace_source(
+            &index,
+            nested_file,
+            Arc::from(nested),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("oracle.Outer.Inner") else {
+        panic!("nested owner");
+    };
+    let Knowledge::Found(reference) = read.reference_type(&owner).unwrap() else {
+        panic!("nested reference");
+    };
+    let signature = method(&[JvmType::Array(Box::new(reference.clone()))], &reference);
+    assert_eq!(
+        signature.descriptor(),
+        "([Loracle/Outer$Inner;)Loracle/Outer$Inner;"
+    );
+    let req = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(signature.clone()),
+        Dispatch::Instance,
+    );
+    read.require(req).unwrap();
+    let pending = read.finish();
+    let changed = nested.replace("class Inner", "class Inner { fun added(): Int = 1 }");
+    index_source(&mut index, nested_file, &changed, "oracle");
+    store
+        .replace_source(
+            &index,
+            nested_file,
+            Arc::from(changed),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(store.commit(pending), Err(ContractError::Stale));
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let req = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(signature.clone()),
+        Dispatch::Instance,
+    );
+    assert_eq!(read.require(req), Err(ContractError::Stale));
+    drop(read);
+    let (foreign_index, mut foreign_store) = fixture();
+    let mut foreign = foreign_store
+        .begin(&foreign_index, "mixin-consumer", MIXIN_FILE)
+        .unwrap();
+    let Knowledge::Found(owner) = foreign.resolve_type("oracle.Target") else {
+        panic!("owner");
+    };
+    let Knowledge::Found(reference) = foreign.reference_type(&owner).unwrap() else {
+        panic!("reference");
+    };
+    drop(foreign);
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let req = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(method(&[reference], &JvmType::Int)),
+        Dispatch::Instance,
+    );
+    assert_eq!(read.require(req), Err(ContractError::ForeignIdentity));
+}
+
+#[test]
+fn nominal_source_signatures_resolve_references_and_keep_boxing_generics_and_missing_types_unknown()
+{
+    let (mut index, mut store) = fixture();
+    let file = "/oracle/References.kt";
+    let text = "package oracle\nclass References {\n fun exact(value: Target): Target = value\n fun refs(value: Array<Target>): Array<Target> = value\n fun boxed(value: Array<Int>): Array<Int> = value\n fun <T> generic(value: T): T = value\n fun missing(value: Missing): Missing = value\n}\n";
+    let tree = KotlinParser::new().parse(text);
+    assert!(
+        !tree.root_node().has_error(),
+        "valid nominal fixture: {text}"
+    );
+    let symbols = extract_symbols(&tree, text, "oracle");
+    index.replace_file(file, symbols, Tier::Volatile);
+    let scope = ktcore::indexer::TypeScope::with_default_imports(
+        "oracle",
+        Vec::new(),
+        &["kotlin", "java.lang"],
+    );
+    let declarations = ktcore::extensions::source::extract(&index, file, &tree, text, &scope);
+    store
+        .replace_source_declarations(
+            &index,
+            file,
+            Arc::from(text),
+            Knowledge::Found(()),
+            declarations,
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("oracle.References") else {
+        panic!("owner");
+    };
+    let (members, _) = read.declared_members(&owner).unwrap();
+    for (name, descriptor) in [
+        ("exact", "(Loracle/Target;)Loracle/Target;"),
+        ("refs", "([Loracle/Target;)[Loracle/Target;"),
+    ] {
+        let member = members.iter().find(|member| member.name == name).unwrap();
+        assert!(
+            matches!(&member.signature, Knowledge::Found(signature) if signature.descriptor() == descriptor),
+            "{name}: {:?}",
+            member.signature
+        );
+    }
+    for name in ["boxed", "generic", "missing"] {
+        assert!(
+            matches!(
+                &members
+                    .iter()
+                    .find(|member| member.name == name)
+                    .unwrap()
+                    .signature,
+                Knowledge::Unknown(_)
+            ),
+            "{name}"
+        );
+    }
+    drop(read);
+    let shadow_file = "/oracle/Array.kt";
+    let shadow = "package oracle\nclass Array<T>\n";
+    index_source(&mut index, shadow_file, shadow, "oracle");
+    store
+        .replace_source(
+            &index,
+            shadow_file,
+            Arc::from(shadow),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("oracle.References") else {
+        panic!("owner");
+    };
+    let (members, _) = read.declared_members(&owner).unwrap();
+    assert!(
+        matches!(
+            &members
+                .iter()
+                .find(|member| member.name == "refs")
+                .unwrap()
+                .signature,
+            Knowledge::Unknown(_)
+        ),
+        "user Array must not become a JVM array"
+    );
+}
+
+#[test]
+fn nominal_value_generic_and_ambiguous_reference_owners_stay_unknown() {
+    let (mut index, mut store) = fixture();
+    for (file, text) in [
+        ("/oracle/Generic.kt", "package oracle\nclass Generic<T>\n"),
+        (
+            "/oracle/Value.kt",
+            "package oracle\n@JvmInline value class Inline(val raw: Int)\n",
+        ),
+    ] {
+        index_source(&mut index, file, text, "oracle");
+        store
+            .replace_source(
+                &index,
+                file,
+                Arc::from(text),
+                Knowledge::Found(()),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for name in ["oracle.Generic", "oracle.Inline"] {
+        let Knowledge::Found(owner) = read.resolve_type(name) else {
+            panic!("{name}");
+        };
+        assert!(
+            matches!(read.reference_type(&owner).unwrap(), Knowledge::Unknown(_)),
+            "{name}"
+        );
+    }
+    let Knowledge::Found(owner) = read.resolve_type("oracle.Target") else {
+        panic!("Target");
+    };
+    drop(read);
+    let duplicate = "package oracle\nclass Target\n";
+    index_source(&mut index, "/oracle/Duplicate.kt", duplicate, "oracle");
+    store
+        .replace_source(
+            &index,
+            "/oracle/Duplicate.kt",
+            Arc::from(duplicate),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    assert!(
+        matches!(read.reference_type(&owner).unwrap(), Knowledge::Unknown(reasons) if reasons.contains(&IncompleteReason::AmbiguousType))
+    );
 }

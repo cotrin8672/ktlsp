@@ -45,7 +45,7 @@ vim.bo[bufnr].filetype = "java"
 local index_state = { project = false, libraries = false, messages = {} }
 local wait_java_index = vim.env.KTLSP_JAVA_WAIT_INDEX == "1"
 local log_handler = vim.lsp.handlers["window/logMessage"]
-local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project,
+local client_config = { name = "ktlsp", cmd = { bin }, root_dir = project,
   handlers = { ["window/logMessage"] = function(err, params, ctx, config)
     local message = params and params.message or ""
     local project_files = message:match("^ktlsp indexed (%d+) project files")
@@ -61,8 +61,9 @@ local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project,
       index_state.failed, index_state.missing_sources = tonumber(failed), tonumber(missing)
     end
     if log_handler then return log_handler(err, params, ctx, config) end
-  end },
-  on_exit = function(code, signal) shutdown.exit = { code = code, signal = signal } end })
+  end } }
+shutdown = probe.observe_shutdown(client_config)
+local id = vim.lsp.start(client_config)
 assert(id, "vim.lsp.start returned nil")
 vim.wait(8000, function()
   local c = vim.lsp.get_client_by_id(id)
@@ -1977,6 +1978,59 @@ do
   end
 end
 
+-- A valid default JVM extension must coexist with provable missing-member errors.
+do
+  local path = project .. "/app/KotlinHelper.kt"
+  assert(vim.fn.filereadable(path) == 1, "universal-property probe requires the scanned Kotlin fixture")
+  local buffer = vim.fn.bufadd(path)
+  vim.fn.bufload(buffer)
+  local original = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+  local original_disk = vim.fn.readfile(path, "b")
+  local original_modified = vim.bo[buffer].modified
+  vim.bo[buffer].filetype = "kotlin"
+  vim.bo[buffer].eol = true
+  assert(vim.lsp.buf_attach_client(buffer, id), "universal-property buffer did not attach")
+  local valid = { "package app", "class UniversalPlain",
+    "fun universalName(value: UniversalPlain) = value.javaClass.name" }
+  local invalid = { valid[1], valid[2],
+    "fun universalName(value: UniversalPlain) = value.missingUniversal" }
+  local report = { phases = {} }
+  for _, phase in ipairs({ { name = "valid", source = valid, missing = false },
+      { name = "missing", source = invalid, missing = true },
+      { name = "restored", source = valid, missing = false } }) do
+    local observation, finish = probe.observe_diagnostics(client, buffer)
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, phase.source)
+    require("vim.lsp._changetracking").flush(client)
+    local result = finish(5000)
+    local diagnostics = result and result.diagnostics or nil
+    local expected = diagnostics ~= nil and #diagnostics == (phase.missing and 1 or 0)
+    if phase.missing and expected then
+      expected = diagnostics[1].code == "unresolved_reference"
+        and diagnostics[1].message:find("missingUniversal", 1, true) ~= nil
+    end
+    check("Kotlin universal JVM property " .. phase.name .. " has exact diagnostics",
+      expected, vim.inspect(result), observation)
+    check("Kotlin universal JVM property " .. phase.name .. " observes exact unsaved source",
+      observation.generation_certified and observation.wire_matches_snapshot
+        and observation.source_sha256 == probe.buffer_sha256(buffer)
+        and vim.bo[buffer].modified and vim.deep_equal(vim.fn.readfile(path, "b"), original_disk),
+      vim.inspect(observation))
+    report.phases[#report.phases + 1] = { name = phase.name,
+      text = probe.buffer_full_text(buffer), observation = observation }
+  end
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode(report) },
+      vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/kotlin-universal-property.json")
+  end
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, original)
+  require("vim.lsp._changetracking").flush(client)
+  check("Kotlin universal JVM property cleanup restores the buffer and untouched disk",
+    vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), original)
+      and vim.deep_equal(vim.fn.readfile(path, "b"), original_disk))
+  vim.bo[buffer].modified = original_modified
+end
+
+
 -- Java parser diagnostics should be published for syntax errors.
 do
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -2014,9 +2068,10 @@ end
 check("diagnostic notifications use exact edited document versions", versions_match,
   vim.inspect(diagnostic_probes))
 
-shutdown.force_requested = true
-shutdown.stop_ok, shutdown.stop_error = pcall(function() client:stop(true) end)
-vim.wait(300)
+
+probe.shutdown(client, shutdown, 10000)
+check("graceful shutdown receives null then exit with zero process status", shutdown.clean,
+  vim.inspect(shutdown))
 if vim.env.KTLSP_TRACE then
   vim.fn.writefile({ vim.json.encode({ checks = checks, requests = requests,
     diagnostic_probes = diagnostic_probes, shutdown = shutdown, failures = failures,

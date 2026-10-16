@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "project_id": "spring-framework-6.2.0-shared-edit",
+  "revision": "5024bb72279188f1d0dcfe19e8abdd4bdb9887c8",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "getObject",
+      "target": "spring-beans/src/main/java/org/springframework/beans/factory/ObjectProvider.java",
+      "target_anchor": "default T getObject()",
+      "target_token": "getObject",
+      "expected": "Completion/getObject definition select Java zero-argument ObjectProvider<T>.getObject, with reified extension's T preserved.",
+      "source_sha256": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2",
+      "target_sha256": "730971e9b689acf5753a97250c861e3f9588481d443fb6dc401c05e9b0312174",
+      "compiler_status": "focused spring-beans main compilation passed",
+      "module": ":spring-beans",
+      "id": "spring-reified-provider-chain",
+      "source": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+      "anchor": "getBeanProvider<T>().getObject()"
+    }
+  ],
+  "shared_edit": {
+    "producer": "spring-beans/src/main/java/org/springframework/beans/factory/ObjectProvider.java",
+    "consumer": "spring-beans/src/main/kotlin/org/springframework/beans/factory/BeanFactoryExtensions.kt",
+    "source_sha256": {
+      "producer": "730971e9b689acf5753a97250c861e3f9588481d443fb6dc401c05e9b0312174",
+      "consumer": "62c8370d6e9d688691a515dd6a6b79b0a4543f3d1b2bc789a7dc523b5649b8a2"
+    },
+    "control": "getObject",
+    "recipes": {
+      "text": {
+        "producer": "  default String ktlspSliceText() { return \"slice\"; }",
+        "consumer": "private fun ktlspConsumerSlice(provider: ObjectProvider<Any>): String {\n  return provider.ktlspSliceText().substring(0)\n}"
+      },
+      "counter": {
+        "producer": "  default java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() { return new java.util.concurrent.atomic.AtomicInteger(); }",
+        "consumer": "private fun ktlspConsumerSlice(provider: ObjectProvider<Any>): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}"
+      }
+    },
+    "additional_request_count": 14,
+    "consumer_insertion": "file",
+    "stages": {
+      "text": {
+        "producer": {
+          "sha256": "fd22402af965893fb8923fb7afbdc87f0eb57d50690c532b06028363a1ef90fe"
+        },
+        "consumer": {
+          "sha256": "b633d648a35ad2351e4f43c0544ccc0ab97caf708532e544709c2df1b063f9b2"
+        }
+      },
+      "counter": {
+        "producer": {
+          "sha256": "47bafc1e5cdf340d953f0b0a18070610c3cf77ade6dc081eae4c17a856d71c3d"
+        },
+        "consumer": {
+          "sha256": "991dff2775f86b03421ae5b02f8fc1d82df38d38a76d5243e9d28811cab6614e"
+        }
+      },
+      "renamed": {
+        "producer": {
+          "sha256": "cb2df7ff79612a58f1eae6d9878078053ecd461b87b2d5596ce63429f2a2503a"
+        },
+        "consumer": {
+          "sha256": "1b2b053fdd9ea1a4a493b2197106c690daaa443385f30728d8a5472f5219f771"
+        }
+      },
+      "retracted": {
+        "producer": {
+          "sha256": "730971e9b689acf5753a97250c861e3f9588481d443fb6dc401c05e9b0312174"
+        },
+        "consumer": {
+          "sha256": "991dff2775f86b03421ae5b02f8fc1d82df38d38a76d5243e9d28811cab6614e"
+        }
+      }
+    },
+    "oracle_status": "VERIFIED: three whole-file pairs compile with captured JDK17/Kotlin1.9.25/jvm17 and ErrorProne/NullAway checks; retraction gives sole missing-member error. Standalone ErrorProne JVM module access and structured classpath supplied; independent UTF-8 source check, not unsupported Java Gradle-policy certification.",
+    "compiler_oracle_receipt_sha256": "1c0200ec09edd8ed1e511b897619407840e6655bf1b599db15c47fc8f863464b"
+  }
+}

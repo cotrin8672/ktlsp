@@ -529,7 +529,7 @@ pub(crate) fn member_completion_query_for_type_with_ctx(
     receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: String,
     max_candidates: usize,
-    kotlin_ctx: Option<(&infer::FileCtx, usize)>,
+    file_ctx: Option<(&infer::FileCtx, usize)>,
 ) -> Option<CompletionQuery> {
     let style = match language {
         SourceLanguage::Kotlin => ImportStyle::Kotlin,
@@ -552,7 +552,9 @@ pub(crate) fn member_completion_query_for_type_with_ctx(
         .then(|| {
             let mut source = Index::new();
             source.replace_file(
-                "<completion>",
+                file_ctx
+                    .and_then(|(ctx, _)| ctx.file())
+                    .unwrap_or("<completion>"),
                 language::symbol_facts(language, tree, src).symbols,
                 Tier::Volatile,
             );
@@ -565,7 +567,7 @@ pub(crate) fn member_completion_query_for_type_with_ctx(
         &ty,
         receiver_kind,
         &prefix,
-        kotlin_ctx,
+        file_ctx,
         max_candidates,
     );
     Some(CompletionQuery {
@@ -1038,7 +1040,7 @@ fn member_candidates(
     ty: &Type,
     receiver_kind: ktcore::jvm::ReceiverKind,
     prefix: &str,
-    kotlin_ctx: Option<(&infer::FileCtx, usize)>,
+    file_ctx: Option<(&infer::FileCtx, usize)>,
     max_candidates: usize,
 ) -> (Vec<ScopeCompletion>, bool) {
     if language == SourceLanguage::Kotlin
@@ -1099,20 +1101,22 @@ fn member_candidates(
         Some(recovered) => recovered,
         None => index,
     };
-    let fallback_ctx =
-        infer::FileCtx::new(ty.package().unwrap_or_default().to_string(), Vec::new());
-    let (member_ctx, position) = kotlin_ctx.unwrap_or((&fallback_ctx, 0));
+    let fallback_ctx = infer::FileCtx::new(String::new(), Vec::new());
+    let (member_ctx, position) = file_ctx.unwrap_or((&fallback_ctx, 0));
     let shared_members = ktcore::members::completion_candidates_at(
         inference_index,
         ty,
         prefix,
         member_ctx,
         position,
+        language == SourceLanguage::Kotlin,
     );
     // Prefer the accepted generated declaration's presentation to an inherited homonym.
     // Recovery still supplies authored members; exact call selection remains in ktcore::jvm.
     let mut java_callables = (language == SourceLanguage::Java)
-        .then(|| ktcore::jvm::member_candidates(index, ty, prefix))
+        .then(|| {
+            ktcore::jvm::member_candidates_at(inference_index, ty, prefix, member_ctx, position)
+        })
         .unwrap_or_default();
     let mut withheld_compiled = false;
     java_callables.retain(|candidate| {
@@ -1149,12 +1153,13 @@ fn member_candidates(
         let Some(cur) = infer::receiver_root_key(inference_index, current) else {
             return ControlFlow::Continue(());
         };
-        if kotlin_ctx.is_some() {
+        if language == SourceLanguage::Kotlin && file_ctx.is_some() {
             extensions.extend(index.extensions_for(&cur));
         }
         ControlFlow::Continue(())
     });
-    if let Some((ctx, _)) = kotlin_ctx {
+    if let Some((ctx, _)) = file_ctx.filter(|_| language == SourceLanguage::Kotlin) {
+        extensions.extend(shared_members.extensions.iter().copied());
         for entry in shared_members.known_local_extensions() {
             push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
         }
@@ -3309,6 +3314,15 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             "package oracle; public class Base { private String getName() { return null; } }"
                 .into(),
         );
+        assert!(ws
+            .index
+            .entries_for_file(COMPILED_BASE)
+            .iter()
+            .any(|entry| {
+                entry.sym.name == "getName"
+                    && entry.sym.source_member.visibility()
+                        == Some(ktcore::extensions::Visibility::Private)
+            }));
         let offset = compiled_usage(&mut ws, COMPILED_USE, "p.getName()");
         let targets = {
             let source = ws.doc_text(COMPILED_USE).unwrap();
@@ -3321,13 +3335,13 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
                 selected.applicability,
                 ktcore::members::Applicability::Applicable
             );
-            assert_eq!(selected.candidates.len(), 2);
-            assert!(selected.candidates.iter().any(|candidate| matches!(
-                candidate,
-                ktcore::jvm::CallableCandidate::Authored(entry)
-                    if entry.sym.source_member.visibility()
-                        == Some(ktcore::extensions::Visibility::Private)
-            )));
+            assert!(matches!(
+                selected.candidates.as_slice(),
+                [ktcore::jvm::CallableCandidate::Jvm {
+                    owner: ktcore::jvm::JvmOwner::Compiled { .. },
+                    ..
+                }]
+            ));
             selected
                 .navigation_candidates()
                 .iter()
@@ -3343,9 +3357,31 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
         assert!(ws.prepare_rename(COMPILED_USE, offset).is_none());
         assert!(ws.rename(COMPILED_USE, offset, "changed").is_none());
         let resolved = ws.resolved_symbol_query(COMPILED_USE, offset).unwrap();
-        assert_eq!(resolved.reference().status_label(), "unknown");
+        assert_eq!(resolved.reference().status_label(), "ok");
         assert!(resolved.targets.is_empty());
-        assert!(resolved.hover_markdown().is_none());
+        assert!(resolved.entry.is_none());
+        assert_eq!(
+            resolved.hover_markdown().as_deref(),
+            Some("```java\ngetName(): String\n```")
+        );
+        let completion = ws
+            .completion_query(COMPILED_USE, offset + "getName".len())
+            .unwrap();
+        let items: Vec<_> = completion
+            .candidates
+            .iter()
+            .filter(|item| item.label == "getName")
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].container.as_deref(), Some("Person"));
+        let source = ws.doc_text(COMPILED_USE).unwrap();
+        let chain = source.find("p.getName().length()").unwrap() + "p.getName().le".len();
+        let result_completion = ws.completion_query(COMPILED_USE, chain).unwrap();
+        assert_eq!(result_completion.status_label(), "ok");
+        assert!(result_completion
+            .candidates
+            .iter()
+            .any(|item| item.label == "length"));
     }
 
     #[test]

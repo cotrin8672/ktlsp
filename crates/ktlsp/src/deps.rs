@@ -469,17 +469,17 @@ fn is_catalog_excluded(entry: &DirEntry) -> bool {
     false
 }
 
-/// Pinned fallback when a project's Kotlin version can't be derived from its catalog.
+/// Pinned standalone default and fallback when a project's Kotlin version is unavailable.
 const DEFAULT_KOTLIN_VERSION: &str = "2.1.20";
 
 /// Add a `org.jetbrains.kotlin:kotlin-stdlib` coordinate if absent and this is a Gradle project,
 /// versioned from an existing `org.jetbrains.kotlin` coordinate when possible (e.g. kotlin-reflect),
 /// else the pinned fallback. The gating avoids indexing ~10s of stdlib for an unrelated directory of
 /// loose `.kt` files. Pure (no filesystem) so it is unit-testable.
-fn inject_stdlib(coords: &mut Vec<Coordinate>, gradle_project: bool) {
+pub(crate) fn inject_stdlib(coords: &mut Vec<Coordinate>, kotlin_project: bool) {
     const GROUP: &str = "org.jetbrains.kotlin";
     const ARTIFACT: &str = "kotlin-stdlib";
-    if !gradle_project
+    if !kotlin_project
         || coords
             .iter()
             .any(|c| c.group == GROUP && c.artifact == ARTIFACT)
@@ -690,7 +690,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v29-binary-shadow-annotation-facts";
+const SYMCACHE_VERSION: &[u8] = b"v30-java-protected-access";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1252,7 +1252,7 @@ pub fn resolve_local_jar_stubs_for_origin(
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
     // Binary stubs without hierarchy and shadow facts must miss.
-    hasher.update(b"|local-jar-java-members-v5|");
+    hasher.update(b"|local-jar-java-members-v6|");
     hasher.update(origin_id.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
@@ -1315,7 +1315,7 @@ pub(crate) fn resolve_module_binary_stubs(
     let origin_id = crate::classpath::maven_origin_id(coord);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|module-jar-java-members-v5|");
+    hasher.update(b"|module-jar-java-members-v6|");
     hasher.update(origin_id.as_bytes());
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
@@ -3866,12 +3866,12 @@ public class ParameterUse<Iterable> {
             (
                 false,
                 origin.as_str(),
-                b"|local-jar-java-members-v5|".as_slice(),
+                b"|local-jar-java-members-v6|".as_slice(),
             ),
             (
                 true,
                 module_origin.as_str(),
-                b"|module-jar-java-members-v5|".as_slice(),
+                b"|module-jar-java-members-v6|".as_slice(),
             ),
         ] {
             let mut hasher = Sha256::new();
@@ -4205,14 +4205,21 @@ public class ParameterUse<Iterable> {
                 symcache_load(&old_key, &legacy_dir).is_some(),
                 "legacy placeholder cache must exist"
             );
-            let current_key = fingerprint(5);
+            let current_key = fingerprint(6);
             let dest = extract.join("local-jars").join(&current_key);
+            let cache = symcache_dir().join(format!("{current_key}.zst"));
             for warm in [false, true] {
                 assert_eq!(
                     symcache_load(&current_key, &dest).is_some(),
                     warm,
                     "cold/warm cache not exercised"
                 );
+                let before = warm.then(|| {
+                    (
+                        fs::metadata(&cache).unwrap().modified().unwrap(),
+                        fs::read(&cache).unwrap(),
+                    )
+                });
                 let batches = if is_module {
                     resolve_module_binary_stubs(
                         &coord,
@@ -4231,6 +4238,16 @@ public class ParameterUse<Iterable> {
                     )
                 }
                 .unwrap();
+                if let Some(before) = before {
+                    assert_eq!(
+                        before,
+                        (
+                            fs::metadata(&cache).unwrap().modified().unwrap(),
+                            fs::read(&cache).unwrap()
+                        ),
+                        "accepted Ponder cache must be consumed without rewriting it"
+                    );
+                }
                 assert!(
                     batches
                         .iter()
@@ -4280,6 +4297,304 @@ public class ParameterUse<Iterable> {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_java_protected_members_use_caller_access_context() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_protected_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("protected.jar");
+        {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            for (name, bytes) in [
+                (
+                    "ProtectedApi",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/protectedfixture/ProtectedApi.class"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "Position",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/protectedfixture/Position.class"
+                    )
+                    .as_slice(),
+                ),
+            ] {
+                archive
+                    .start_file(
+                        format!("protectedfixture/{name}.class"),
+                        SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        let coord = Coordinate::parse("fixture:protected-api:1").unwrap();
+        let origin = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        for module in [false, true] {
+            let extract = root.join(if module { "module" } else { "local" });
+            let mut hash = Sha256::new();
+            hash.update(SYMCACHE_VERSION);
+            hash.update(if module {
+                b"|module-jar-java-members-v6|".as_slice()
+            } else {
+                b"|local-jar-java-members-v6|".as_slice()
+            });
+            if module {
+                hash.update(crate::classpath::maven_origin_id(&coord).as_bytes());
+                hash.update(b"|");
+            }
+            hash.update(origin.as_bytes());
+            let fingerprint = format!("{:x}", hash.finalize());
+            let cache = symcache_dir().join(format!("{fingerprint}.zst"));
+            let destination = extract.join("local-jars").join(&fingerprint);
+            for warm in [false, true] {
+                let before = if warm {
+                    assert!(
+                        symcache_load(&fingerprint, &destination).is_some(),
+                        "cache must be accepted before the repeated consumer load"
+                    );
+                    let metadata = fs::metadata(&cache).unwrap();
+                    Some((
+                        metadata.modified().unwrap(),
+                        metadata.created().ok(),
+                        fs::read(&cache).unwrap(),
+                    ))
+                } else {
+                    assert!(symcache_load(&fingerprint, &destination).is_none());
+                    None
+                };
+                let batches = if module {
+                    resolve_module_binary_stubs(
+                        &coord,
+                        &[(jar.clone(), origin.clone())],
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                } else {
+                    resolve_local_jar_stubs_for_origin(
+                        &jar,
+                        &origin,
+                        &extract,
+                        &mut kotlin,
+                        &mut java,
+                    )
+                }
+                .unwrap();
+                if let Some(before) = before {
+                    let metadata = fs::metadata(&cache).unwrap();
+                    assert_eq!(
+                        before,
+                        (
+                            metadata.modified().unwrap(),
+                            metadata.created().ok(),
+                            fs::read(&cache).unwrap()
+                        ),
+                        "warm consumer must return the accepted cache without rewriting it"
+                    );
+                }
+                let mut ws = crate::workspace::Workspace::new();
+                for batch in batches {
+                    assert!(ws.index_dependency_batch(batch));
+                }
+                for (file, source, selector, member, allowed) in [
+                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(){return super.getBreakSpeed();} }", "super.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed() = super.getBreakSpeed() }", "super.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { Position pass(Position p){return super.transform(p);} }", "super.transform", "transform", true),
+                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun pass(p: Position) = super.transform(p) }", "super.transform", "transform", true),
+                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { Position pass(ProtectedApi base, Position p){return super.transform(base.transform(p));} }", "base.transform", "transform", false),
+                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun pass(base: ProtectedApi, p: Position) = super.transform(base.transform(p)) }", "base.transform", "transform", false),
+                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(){return this.getBreakSpeed();} }", "this.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed() = this.getBreakSpeed() }", "this.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(JavaCaller p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed(p: KotlinCaller) = p.getBreakSpeed() }", "p.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.java", "package other; import protectedfixture.*; class Caller { float speed(ProtectedApi p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", false),
+                    ("Caller.kt", "package other\nimport protectedfixture.*\nfun speed(p: ProtectedApi) = p.getBreakSpeed()", "p.getBreakSpeed", "getBreakSpeed", false),
+                    ("Caller.java", "package protectedfixture; class Caller { float speed(ProtectedApi p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.kt", "package protectedfixture\nfun speed(p: ProtectedApi) = p.getBreakSpeed()", "p.getBreakSpeed", "getBreakSpeed", true),
+                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(ProtectedApi p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", false),
+                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed(p: ProtectedApi) = p.getBreakSpeed() }", "p.getBreakSpeed", "getBreakSpeed", false),
+                    ("Caller.java", "package other; import protectedfixture.*; class Caller { int value(ProtectedApi p){return p.known();} }", "p.known", "known", true),
+                    ("Caller.kt", "package other\nimport protectedfixture.*\nfun value(p: ProtectedApi) = p.known()", "p.known", "known", true),
+                    ("Caller.java", "package other; import protectedfixture.*; class Caller { int value(ProtectedApi p){return p.hiddenControl();} }", "p.hiddenControl", "hiddenControl", false),
+                    ("Caller.kt", "package other\nimport protectedfixture.*\nfun value(p: ProtectedApi) = p.hiddenControl()", "p.hiddenControl", "hiddenControl", false),
+                ] {
+                    for authored in [false, true] {
+                    let source = source.replace("class Caller", if file.ends_with(".java") { "class JavaCaller" } else { "class KotlinCaller" });
+                    let source = if authored {
+                        ws.open("SourceApi.java", include_str!("../../ktcore/tests/fixtures/classfile/sources/protectedfixture/ProtectedApi.java").replace("ProtectedApi", "SourceApi"));
+                        source.replace("ProtectedApi", "SourceApi")
+                    } else { source };
+                    ws.open(file, source.clone());
+                    let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
+                    let targets = ws.goto_definition(file, at);
+                    let query = ws.completion_query(file, at + member.len()).unwrap();
+                    assert_eq!(query.candidates.iter().any(|item| item.label == member), allowed,
+                        "completion {file} {selector} module={module} warm={warm} authored={authored}: {:?}", query.reason_labels());
+                    assert_eq!(!targets.is_empty(), allowed, "navigation {file} {selector} module={module} warm={warm} authored={authored}: {targets:?}");
+                    if !allowed && matches!(member, "getBreakSpeed" | "transform") {
+                        let tree = if file.ends_with(".java") { java.parse(&source) } else { kotlin.parse(&source) };
+                        let mut ctx = ktcore::infer::FileCtx::from_tree_in_file(&tree, &source, file);
+                        if file.ends_with(".java") { ctx.package = crate::java::package_of(&tree, &source); }
+                        let receiver = ktcore::types::Type::class(if authored { "SourceApi" } else { "ProtectedApi" }, Some("protectedfixture".into()));
+                        let status = ktcore::resolve::member_name_status_for_receiver(
+                            &ws.index.scoped_for_file(file), file, &receiver, member,
+                            &ktcore::resolve::CompletenessFacts::default(), &ctx, at,
+                        );
+                        assert!(!status.is_found(), "denied protected member cannot be Found: {file} {selector} authored={authored}");
+                    }
+                    if allowed {
+                        assert_eq!(targets.len(), 1);
+                        assert!(targets[0].file.ends_with(if authored { "SourceApi.java" } else { "protectedfixture/ProtectedApi.java" }), "{targets:?}");
+                    }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kotlin_java_primitive_call_results_use_kotlin_scalars() {
+        fn expression_type(
+            ws: &crate::workspace::Workspace,
+            source: &str,
+            expression: &str,
+        ) -> ktcore::types::Type {
+            let tree = KotlinParser::new().parse(source);
+            let start = source.rfind(expression).unwrap();
+            let node = tree
+                .root_node()
+                .named_descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            let ctx = ktcore::infer::FileCtx::from_tree_in_file(&tree, source, "Use.kt");
+            ktcore::infer::infer(&ws.index.scoped_for_file("Use.kt"), node, source, &ctx)
+        }
+        let mut ws = crate::workspace::Workspace::new();
+        for (raw, kotlin, value) in [
+            ("boolean", "Boolean", "false"),
+            ("byte", "Byte", "0"),
+            ("char", "Char", "'a'"),
+            ("short", "Short", "0"),
+            ("int", "Int", "0"),
+            ("long", "Long", "0L"),
+            ("float", "Float", "0f"),
+            ("double", "Double", "0d"),
+        ] {
+            ws.open("Api.java", format!("package app; public class Api {{ public {raw} number; public {raw} value() {{ return {value}; }} }}"));
+            for (source, expression, nullable) in [
+                (
+                    "import app.Api\nfun use(api: Api) = api.value()",
+                    "api.value()",
+                    false,
+                ),
+                (
+                    "import app.Api\nclass Caller : Api() { fun use() = super.value() }",
+                    "super.value()",
+                    false,
+                ),
+                (
+                    "import app.Api\nclass Caller : Api() { fun use() = value() }",
+                    "value()",
+                    false,
+                ),
+                (
+                    "import app.Api\nfun use(api: Api) = api.number",
+                    "api.number",
+                    false,
+                ),
+                (
+                    "import app.Api\nfun use(api: Api?) = api?.value()",
+                    "api?.value()",
+                    true,
+                ),
+            ] {
+                ws.open("Use.kt", source.into());
+                assert_eq!(
+                    expression_type(&ws, source, expression),
+                    ktcore::types::Type::class(kotlin, Some("kotlin".into()))
+                        .with_nullability(nullable),
+                    "{raw} {expression}"
+                );
+            }
+            let java_source = "import app.Api; class Use { void run(Api api) { api.value(); } }";
+            ws.open("Use.java", java_source.into());
+            let help = ws
+                .signature_help(
+                    "Use.java",
+                    java_source.find("api.value(").unwrap() + "api.value(".len(),
+                )
+                .unwrap();
+            assert!(
+                help.signatures
+                    .iter()
+                    .any(|signature| signature.label == format!("value(): {raw}")),
+                "{raw}: {help:?}"
+            );
+        }
+        for name in ["float", "int"] {
+            ws.open("Nominal.kt", format!("class {name}"));
+            let source = format!("fun use(value: {name}) = value");
+            ws.open("Use.kt", source.clone());
+            assert_eq!(
+                expression_type(&ws, &source, "value"),
+                ktcore::types::Type::class(name, Some("".into()))
+            );
+            ws.open(
+                "Api.java",
+                format!(
+                    "package app; public class Api {{ public {name} value() {{ return {}; }} }}",
+                    if name == "float" { "0f" } else { "0" }
+                ),
+            );
+            let call = "import app.Api\nfun use(api: Api) = api.value()";
+            ws.open("Use.kt", call.into());
+            assert_eq!(
+                expression_type(&ws, call, "api.value()"),
+                ktcore::types::Type::class(
+                    if name == "float" { "Float" } else { "Int" },
+                    Some("kotlin".into())
+                )
+            );
+            ws.change("Nominal.kt", String::new());
+            ws.open("Use.kt", source.clone());
+            assert_eq!(
+                expression_type(&ws, &source, "value"),
+                ktcore::types::Type::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn kotlin_protected_members_do_not_gain_java_package_access() {
+        let mut ws = crate::workspace::Workspace::new();
+        ws.open(
+            "Api.kt",
+            "package access\nopen class Api { protected fun speed(): Int = 1 }".into(),
+        );
+        for (source, selector, allowed) in [
+            ("package access\nfun use(p: Api) = p.speed()", "p.speed", false),
+            ("package access\nclass Caller : Api() { fun use() = this.speed() }", "this.speed", true),
+            ("package other\nimport access.Api\nclass Caller : Api() { fun use(p: Api) = p.speed() }", "p.speed", false),
+        ] {
+            ws.open("Use.kt", source.into());
+            let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
+            assert_eq!(ws.completion_query("Use.kt", at + 5).unwrap().candidates.iter().any(|item| item.label == "speed"), allowed, "{source}");
+            assert_eq!(!ws.goto_definition("Use.kt", at).is_empty(), allowed, "{source}");
+        }
     }
 
     #[test]
@@ -4349,9 +4664,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if is_module {
-                b"|module-jar-java-members-v5|".as_slice()
+                b"|module-jar-java-members-v6|".as_slice()
             } else {
-                b"|local-jar-java-members-v5|".as_slice()
+                b"|local-jar-java-members-v6|".as_slice()
             });
             hash.update(owner.as_bytes());
             if is_module {
@@ -4363,12 +4678,12 @@ public class ParameterUse<Iterable> {
             let dest = extract.join("local-jars").join(&fingerprint);
             assert!(
                 symcache_load(&fingerprint, &dest).is_none(),
-                "v5 cold cache must be absent"
+                "v6 cold cache must be absent"
             );
             for warm in [false, true] {
                 if warm {
                     let cached =
-                        symcache_load(&fingerprint, &dest).expect("v5 warm cache must be usable");
+                        symcache_load(&fingerprint, &dest).expect("v6 warm cache must be usable");
                     let child = cached
                         .iter()
                         .flat_map(|batch| &batch.symbols)
@@ -4420,13 +4735,25 @@ public class ParameterUse<Iterable> {
                     assert!(workspace.index_dependency_batch(batch));
                 }
                 workspace.bump_index_revision();
-                for (file, text) in [
-                    ("Use.java", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; class Use { void f(BlockBreakingKineticBlockEntity value) { value.getSpe; } }"),
-                    ("Use.kt", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nfun f(value: BlockBreakingKineticBlockEntity) { value.getSpe }\n"),
+                for (file, text, selector, member) in [
+                    ("Use.java", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; class Use { void f(BlockBreakingKineticBlockEntity value) { value.getSpe; } }", "value.getSpe", "getSpeed"),
+                    ("Use.kt", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nfun f(value: BlockBreakingKineticBlockEntity) { value.getSpe }\n", "value.getSpe", "getSpeed"),
+                    ("Use.java", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; abstract class Use extends BlockBreakingKineticBlockEntity { float f() { return super.getBreakSpeed(); } }", "super.getBreakSpeed", "getBreakSpeed"),
+                    ("Use.kt", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nabstract class Use : BlockBreakingKineticBlockEntity() { fun f() = super.getBreakSpeed() }\n", "super.getBreakSpeed", "getBreakSpeed"),
                 ] {
                     workspace.open(file, text.to_string());
-                    let query = workspace.completion_query(file, text.find("value.getSpe").unwrap()+"value.getSpe".len()).unwrap();
-                    assert!(query.candidates.iter().any(|item| item.label == "getSpeed"), "{file} module={is_module}: {} {:?}", query.status_label(), query.reason_labels());
+                    let query = workspace.completion_query(file, text.find(selector).unwrap()+selector.len()).unwrap();
+                    assert!(query.candidates.iter().any(|item| item.label == member), "{file} {member} module={is_module}: {} {:?}", query.status_label(), query.reason_labels());
+                    if file.ends_with(".kt") && member == "getBreakSpeed" {
+                        let tree = kotlin.parse(text);
+                        let start = text.find(selector).unwrap();
+                        let call = tree.root_node().named_descendant_for_byte_range(start, start + selector.len() + 2).unwrap();
+                        assert_eq!(call.kind(), "call_expression");
+                        let ctx = ktcore::infer::FileCtx::from_tree_in_file(&tree, text, file);
+                        assert_eq!(ktcore::infer::infer(&workspace.index.scoped_for_file(file), call, text, &ctx),
+                            ktcore::types::Type::class("Float", Some("kotlin".into())),
+                            "actual Create protected ()F call must infer Kotlin Float: module={is_module} warm={warm}");
+                    }
                 }
             }
         }

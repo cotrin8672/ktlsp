@@ -290,7 +290,7 @@ fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
         let selected = ktcore::jvm::select_call(
             &ws.index,
             &receiver,
-            ktcore::jvm::member_candidates(&ws.index, &receiver, name),
+            ktcore::jvm::member_candidates_at(&ws.index, &receiver, name, &ctx, 0),
             name,
             &args,
             &ctx,

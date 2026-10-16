@@ -43,6 +43,8 @@ pub struct FileCtx {
     pub package: String,
     pub imports: Vec<Import>,
     file: Option<Arc<str>>,
+    lexical_types: Vec<(std::ops::Range<usize>, String, usize, usize)>,
+    super_accesses: Vec<std::ops::Range<usize>>,
     pub local_extensions: Option<Arc<Vec<crate::indexer::LocalExtension>>>,
     inference_cache: RefCell<FxHashMap<(usize, usize, u16), Type>>,
     /// Per-node implicit-receiver contributions, keyed by the boundary node's position + kind +
@@ -58,6 +60,8 @@ impl FileCtx {
             package,
             imports,
             file: None,
+            lexical_types: Vec::new(),
+            super_accesses: Vec::new(),
             local_extensions: None,
             inference_cache: RefCell::new(FxHashMap::default()),
             receiver_cache: RefCell::new(FxHashMap::default()),
@@ -65,7 +69,86 @@ impl FileCtx {
     }
 
     pub fn from_tree(tree: &Tree, src: &str) -> Self {
-        FileCtx::new(package_of(tree, src), imports_of(tree, src))
+        let mut ctx = FileCtx::new(package_of(tree, src), imports_of(tree, src));
+        fn collect(node: Node<'_>, src: &str, ctx: &mut FileCtx) {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "object_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) {
+                if let Some(name) = name_field(node).filter(|name| !name.is_missing()) {
+                    ctx.lexical_types.push((
+                        node.byte_range(),
+                        node_text(name, src).into(),
+                        name.start_byte(),
+                        name.end_byte(),
+                    ));
+                }
+            }
+            let access = match node.kind() {
+                "navigation_expression" => node.named_child(0).zip(node.named_child(1)),
+                "method_invocation" => node
+                    .child_by_field_name("object")
+                    .zip(node.child_by_field_name("name")),
+                "field_access" => node
+                    .child_by_field_name("object")
+                    .zip(node.child_by_field_name("field")),
+                _ => None,
+            };
+            if let Some((receiver, selector)) = access
+                .filter(|(receiver, _)| matches!(receiver.kind(), "super" | "super_expression"))
+            {
+                // Arguments cannot inherit their outer call's super access.
+                ctx.super_accesses
+                    .push(receiver.start_byte()..selector.end_byte());
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect(child, src, ctx);
+            }
+        }
+        collect(tree.root_node(), src, &mut ctx);
+        ctx
+    }
+
+    /// Bind access to the exact current lexical declaration, never a same-spelled class.
+    pub fn caller_type(&self, index: &dyn InferenceIndex, position: usize) -> Option<Type> {
+        let (_, name, start, end) = self
+            .lexical_types
+            .iter()
+            .filter(|(range, _, _, _)| range.contains(&position))
+            .min_by_key(|(range, _, _, _)| range.len())?;
+        let file = self.file.as_deref()?;
+        let owners: Vec<_> = index
+            .lookup_type(name)
+            .into_iter()
+            .filter(|entry| {
+                entry.path.as_ref() == file
+                    && entry.sym.package == self.package
+                    && entry.sym.start_byte == *start
+                    && entry.sym.end_byte == *end
+            })
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        Some(Type::Class {
+            name: owner.sym.name.clone(),
+            package: Some(owner.sym.package.clone()),
+            container: owner.sym.container.clone(),
+            nullable: false,
+            args: Vec::new(),
+        })
+    }
+
+    pub(crate) fn super_access_at(&self, position: usize) -> bool {
+        self.super_accesses
+            .iter()
+            .any(|range| range.contains(&position))
     }
 
     pub fn with_file(mut self, file: &str) -> Self {
@@ -73,6 +156,10 @@ impl FileCtx {
         self.inference_cache.get_mut().clear();
         self.receiver_cache.get_mut().clear();
         self
+    }
+
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_deref()
     }
 
     pub fn from_tree_in_file(tree: &Tree, src: &str, file: &str) -> Self {
@@ -1029,9 +1116,18 @@ fn cached_class_receiver_contribution(
     if let Some(hit) = receiver_cache_lookup(ctx, declaration, 0) {
         return hit;
     }
-    let ty = name_field(declaration)
-        .map(|name_node| node_text(name_node, src))
-        .map(|name| resolve_type_name(index, name, ctx, false));
+    let ty = name_field(declaration).and_then(|name_node| {
+        if ctx.file.is_some() {
+            ctx.caller_type(index, name_node.start_byte())
+        } else {
+            Some(resolve_type_name(
+                index,
+                node_text(name_node, src),
+                ctx,
+                false,
+            ))
+        }
+    });
     receiver_cache_store(ctx, declaration, 0, ty)
 }
 
@@ -1584,52 +1680,43 @@ fn decl_type(
     let Some(parent) = decl.parent() else {
         return Type::Unknown;
     };
-    match parent.kind() {
-        "variable_declaration" => {
-            if let Some(t) = destructured_decl_type(index, decl, src, ctx, depth, child_infer) {
-                return t;
-            }
-            // Explicit annotation (`val x: T`, `val x: T?`, `val x: List<T>`).
-            if let Some(tr) = crate::indexer::value_type_of(parent, src) {
-                return declared_type_in_scope(
-                    index,
-                    &tr,
-                    ctx,
-                    &crate::indexer::type_parameters_in_scope(
-                        parent,
-                        src,
-                        &ctx.package,
-                        &ctx.imports,
-                    ),
-                );
-            }
-            // Initializer: `val x = <expr>` — the expression is a sibling under property_declaration.
-            if let Some(prop) = parent.parent() {
-                if prop.kind() == "property_declaration" {
-                    if let Some(init) = initializer_expr(prop, parent) {
-                        return child_infer.infer_child(index, init, src, ctx, depth + 1);
-                    }
-                }
-            }
-            Type::Unknown
+    if parent.kind() == "variable_declaration" {
+        if let Some(t) = destructured_decl_type(index, decl, src, ctx, depth, child_infer) {
+            return t;
         }
-        "parameter" | "class_parameter" => crate::indexer::value_type_of(parent, src)
-            .map(|tr| {
-                declared_type_in_scope(
-                    index,
-                    &tr,
-                    ctx,
-                    &crate::indexer::type_parameters_in_scope(
-                        parent,
-                        src,
-                        &ctx.package,
-                        &ctx.imports,
-                    ),
-                )
-            })
-            .unwrap_or(Type::Unknown),
-        _ => Type::Unknown,
     }
+    if matches!(
+        parent.kind(),
+        "variable_declaration" | "parameter" | "class_parameter"
+    ) {
+        let parameters =
+            crate::indexer::type_parameters_in_scope(parent, src, &ctx.package, &ctx.imports);
+        let scope = crate::indexer::TypeScope::with_default_imports(
+            &ctx.package,
+            ctx.imports.clone(),
+            crate::defaults::DEFAULT_IMPORT_PACKAGES,
+        );
+        let names = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>();
+        let scope = scope.without_shadowed_imports(&names).unwrap_or(scope);
+        if let Some(tr) = crate::indexer::value_type_of_scoped(parent, src, Some(&scope)) {
+            return declared_type_in_scope(index, &tr, ctx, &parameters);
+        }
+    }
+    // Initializers are siblings of their variable declarations.
+    if parent.kind() == "variable_declaration" {
+        if let Some(prop) = parent
+            .parent()
+            .filter(|prop| prop.kind() == "property_declaration")
+        {
+            if let Some(init) = initializer_expr(prop, parent) {
+                return child_infer.infer_child(index, init, src, ctx, depth + 1);
+            }
+        }
+    }
+    Type::Unknown
 }
 
 fn destructured_decl_type(
@@ -2804,6 +2891,26 @@ fn selected_member_type(
         let tr = match member_type_ref(e, want_function) {
             Some(tr) => tr,
             None => return Type::Unknown,
+        };
+        let scalar = primitive_type_name(&tr.name);
+        let normalized;
+        let tr = if scalar != tr.name
+            && tr.qualification.is_none()
+            && tr.projection == Projection::Invariant
+            && tr.args.is_empty()
+            && tr.package_candidates.is_empty()
+            && tr.container_candidates.is_empty()
+        {
+            // Java keyword facts have no nominal lookup scope; Kotlin user types do.
+            normalized = TypeRef {
+                name: scalar.into(),
+                qualification: Some("kotlin".into()),
+                nullable: tr.nullable,
+                ..TypeRef::default()
+            };
+            &normalized
+        } else {
+            tr
         };
         let t = if semantic_entry.is_some() {
             if let Some(arguments) = arguments.filter(|arguments| arguments.names.is_some()) {
@@ -5105,6 +5212,15 @@ fn type_ref_identity(
             }
             package
         };
+        if package.is_none()
+            && primitive_type_name(&tr.name) != tr.name
+            && tr
+                .package_candidates
+                .iter()
+                .any(|package| package == "kotlin")
+        {
+            return None;
+        }
         Some((package, resolve_type_ref_container(index, tr, ctx)))
     }
 }

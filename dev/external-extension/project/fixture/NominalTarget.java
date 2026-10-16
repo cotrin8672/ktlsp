@@ -1,0 +1,1 @@
+package fixture; public class NominalTarget { public BlockPos anchor; public BlockState lookup(BlockPos pos) { return new BlockState(); } public BlockPos[] positions(BlockState state) { return new BlockPos[0]; } }

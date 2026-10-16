@@ -1161,6 +1161,186 @@ fn imported_superclass_receiver_lambdas_use_the_declaration_context() {
 const REFLECTION_CLASS: &str = "package java.lang; public final class Class<T> { public T cast(Object value) { return null; } }";
 const REFLECTION_KCLASS: &str = "package kotlin.reflect\ninterface KClass<out T>\n";
 const CLASS_MAPPING: &str = "package kotlin.jvm\nimport kotlin.reflect.KClass\npublic val <T> KClass<T>.java: Class<T> get() = error(\"fixture\")\n";
+
+#[test]
+fn generic_java_class_property_shares_lookup_inference_navigation_and_completion() {
+    // Authored declaration from kotlin-stdlib's JvmClassMapping.kt.
+    const MAPPING: &str = "package kotlin.jvm\npublic inline val <T : Any> T.javaClass: Class<T>\n get() = (this as java.lang.Object).getClass() as Class<T>\n";
+    let source = "package app\nfun run(item: Item) { item.javaClass.cast(item).useful() }\n";
+    let mut ws = workspace(&[
+        ("Item.kt", ITEM),
+        ("Class.java", REFLECTION_CLASS),
+        ("Object.java", "package java.lang; public class Object {}"),
+        ("Any.kt", "package kotlin\nopen class Any\n"),
+        ("JvmClassMapping.kt", MAPPING),
+        ("Use.kt", source),
+    ]);
+    ws.assume_index_complete_for_tests();
+    {
+        use ktlsp::index::{Entry, Index, InferenceIndex, LookupEntries};
+        struct PrefixIndex<'a> {
+            index: &'a Index,
+            prefixes: std::cell::RefCell<Vec<String>>,
+        }
+        impl InferenceIndex for PrefixIndex<'_> {
+            fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::lookup_by_name(self.index, name)
+            }
+            fn members_of(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::members_of(self.index, name)
+            }
+            fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::extensions_for(self.index, name)
+            }
+            fn entries_with_prefix<'a>(
+                &'a self,
+                prefix: &'a str,
+                top_level_only: bool,
+            ) -> Box<dyn Iterator<Item = &'a Entry> + 'a> {
+                self.prefixes.borrow_mut().push(prefix.into());
+                Box::new(self.index.entries_with_prefix(prefix, top_level_only))
+            }
+        }
+        let index = PrefixIndex {
+            index: &ws.index,
+            prefixes: Default::default(),
+        };
+        let context = FileCtx::new("app".into(), Vec::new());
+        let receiver = Type::class("Item", Some("app".into()));
+        let java_candidates = ktcore::members::completion_candidates_at(
+            &index, &receiver, "javaC", &context, 0, false,
+        );
+        assert!(java_candidates.extensions.is_empty());
+        assert!(
+            index.prefixes.borrow().is_empty(),
+            "Java queries do not scan Kotlin extensions"
+        );
+        let candidates = ktcore::members::completion_candidates_at(
+            &index, &receiver, "javaC", &context, 0, true,
+        );
+        assert!(candidates
+            .extensions
+            .iter()
+            .any(|entry| entry.sym.name == "javaClass"));
+        assert_eq!(
+            *index.prefixes.borrow(),
+            ["javaC"],
+            "filter names before scoped ownership lookup"
+        );
+    }
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.javaClass"),
+        Type::Class {
+            name: "Class".into(),
+            package: Some("java.lang".into()),
+            container: None,
+            nullable: false,
+            args: vec![Type::class("Item", Some("app".into()))],
+        }
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "item.javaClass",
+        "JvmClassMapping.kt",
+        "javaClass",
+    );
+    assert!(labels(&mut ws, "Use.kt", "item.javaC").contains("javaClass"));
+    assert!(
+        ws.diagnostics("Use.kt").is_empty(),
+        "{:?}",
+        ws.diagnostics("Use.kt")
+    );
+    ws.change("Use.kt", "package app\nimport kotlin.jvm.javaClass as runtimeClass\nfun run(item: Item) { item.runtimeClass; item.javaClass }\n".into());
+    assert!(labels(&mut ws, "Use.kt", "item.runtimeC").contains("runtimeClass"));
+    assert!(!labels(&mut ws, "Use.kt", "item.javaC").contains("javaClass"));
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.runtimeClass").args(),
+        &[Type::class("Item", Some("app".into()))]
+    );
+    ws.change("Use.kt", source.into());
+    ws.change(
+        "Item.kt",
+        "package app\nclass Item { val javaClass: Other = TODO() }\nclass Other\n".into(),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.javaClass"),
+        Type::class("Other", Some("app".into()))
+    );
+    assert_exact_definition(&mut ws, "Use.kt", "item.javaClass", "Item.kt", "javaClass");
+    ws.change("Item.kt", ITEM.into());
+    ws.change(
+        "Use.kt",
+        "package app\nfun run(item: Item?) { item.javaClass }\n".into(),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.javaClass"),
+        Type::Unknown
+    );
+    assert!(!labels(&mut ws, "Use.kt", "item.javaC").contains("javaClass"));
+    ws.change("Use.kt", source.into());
+    ws.change("JvmClassMapping.kt", "package kotlin.jvm\n".into());
+    ws.set_library_index_complete(false);
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.javaClass"),
+        Type::Unknown
+    );
+    assert!(
+        ws.diagnostics("Use.kt").is_empty(),
+        "missing stdlib cannot prove absence"
+    );
+    ws.open(
+        "Left.kt",
+        MAPPING.replace("package kotlin.jvm", "package left"),
+    );
+    ws.open(
+        "Right.kt",
+        MAPPING.replace("package kotlin.jvm", "package right"),
+    );
+    ws.change("Use.kt", "package app\nimport left.javaClass\nimport right.javaClass\nfun run(item: Item) { item.javaClass }\n".into());
+    // Both candidates agree on the type; selection and navigation must retain their ambiguity.
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.javaClass").args(),
+        &[Type::class("Item", Some("app".into()))]
+    );
+    let text = ws.doc_text("Use.kt").unwrap();
+    let tree = KotlinParser::new().parse(&text);
+    let context = FileCtx::from_tree_in_file(&tree, &text, "Use.kt");
+    let receiver = Type::class("Item", Some("app".into()));
+    let candidates = ktcore::members::candidates(&ws.index, &receiver, "javaClass", &context);
+    assert_eq!(
+        candidates
+            .select(
+                &ws.index,
+                &receiver,
+                &ktcore::members::MemberUse::Value,
+                &context
+            )
+            .entries
+            .len(),
+        2
+    );
+    let definitions = ws.goto_definition("Use.kt", text.find("item.javaClass").unwrap() + 5);
+    assert_ne!(
+        definitions.len(),
+        1,
+        "ambiguous properties cannot navigate to an arbitrary declaration"
+    );
+    assert!(definitions
+        .iter()
+        .all(|definition| matches!(definition.file.as_str(), "Left.kt" | "Right.kt")));
+    eprintln!("ambiguous same-return property: two selected candidates, {} navigation targets, unanimous Class<Item>; compiler rejects access", definitions.len());
+    ws.open("Other.kt", "package app\nclass Other\n".into());
+    ws.change(
+        "Right.kt",
+        "package right\nimport app.Other\nval <T : Any> T.javaClass: Other get() = TODO()\n".into(),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "item.javaClass"),
+        Type::Unknown,
+        "competing return types cannot choose one declaration"
+    );
+}
 const INVOCATION: &str =
     "package probe; public class Invocation { public Class<?> service() { return null; } }";
 const OTHER_INVOCATION: &str = "package probe; public class Other { public String body() { return \"fixture\"; } public void serviceWrong() {} }";

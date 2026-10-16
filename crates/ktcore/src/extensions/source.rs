@@ -503,27 +503,23 @@ fn signature(
         return unsupported();
     }
     let ctx = FileCtx::new(symbol.package.clone(), Vec::new());
-    let mut type_parameters = symbol.type_params.clone();
-    // The same owner lookup used by the index supplies enclosing type parameters.
-    if let Some(container) = &symbol.container {
-        for entry in index.entries_for_file(file) {
-            if entry.sym.kind.is_type_like()
-                && entry.sym.package == symbol.package
-                && container_name(&entry.sym) == *container
-            {
-                type_parameters.extend(entry.sym.type_params.iter().cloned());
-            }
+    let type_parameters = member_type_parameters(index, file, symbol);
+    let mut unsupported_types = Vec::new();
+    let mut convert = |ty: &TypeRef| {
+        let value = jvm_type(index, ty, &ctx, scope, java, &type_parameters);
+        if value.is_none() {
+            unsupported_types.push(IncompleteReason::UnsupportedType(ty.name.clone()));
         }
-    }
-    let convert = |ty: &TypeRef| jvm_type(index, ty, &ctx, scope, java, &type_parameters);
+        value
+    };
     let result = if symbol.kind == SymbolKind::Property {
         symbol
             .value_type
             .as_ref()
-            .and_then(convert)
+            .and_then(&mut convert)
             .and_then(|ty| MemberSignature::field(&ty).ok())
     } else {
-        let params: Option<Vec<_>> = symbol.params.iter().map(convert).collect();
+        let params: Option<Vec<_>> = symbol.params.iter().map(&mut convert).collect();
         let returns = match &symbol.return_type {
             Some(ty) => convert(ty),
             None if !java
@@ -545,7 +541,131 @@ fn signature(
             _ => None,
         }
     };
-    result.map(Knowledge::Found).unwrap_or_else(unsupported)
+    result.map(Knowledge::Found).unwrap_or_else(|| {
+        if unsupported_types.is_empty() {
+            unsupported()
+        } else {
+            Knowledge::Unknown(unsupported_types)
+        }
+    })
+}
+
+pub(super) fn member_type_parameters(
+    index: &dyn InferenceIndex,
+    file: &str,
+    symbol: &IndexedSymbol,
+) -> Vec<String> {
+    let mut parameters = symbol.type_params.clone();
+    if let Some(container) = &symbol.container {
+        for entry in index.entries_for_file(file) {
+            let owner = container_name(&entry.sym);
+            if entry.sym.kind.is_type_like()
+                && entry.sym.package == symbol.package
+                && (container == &owner || container.starts_with(&format!("{owner}.")))
+            {
+                parameters.extend(entry.sym.type_params.iter().cloned());
+            }
+        }
+    }
+    parameters
+}
+
+#[cfg(test)]
+thread_local! {
+    static REFERENCE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reference_parse_count() -> usize {
+    REFERENCE_PARSES.with(std::cell::Cell::get)
+}
+
+pub(super) fn ordinary_reference_types(
+    index: &dyn InferenceIndex,
+    file: &str,
+    text: &str,
+) -> std::collections::BTreeSet<(usize, usize)> {
+    let entries: Vec<_> = index
+        .entries_for_file(file)
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.sym.kind, SymbolKind::Class | SymbolKind::Interface)
+                && entry.sym.type_params.is_empty()
+        })
+        .collect();
+    if entries.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+    #[cfg(test)]
+    REFERENCE_PARSES.with(|count| count.set(count.get() + 1));
+    let tree = if file.ends_with(".java") {
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .is_err()
+        {
+            return std::collections::BTreeSet::new();
+        }
+        let Some(tree) = parser.parse(text, None) else {
+            return std::collections::BTreeSet::new();
+        };
+        tree
+    } else {
+        crate::parser::KotlinParser::new().parse(text)
+    };
+    entries
+        .into_iter()
+        .filter(|entry| ordinary_reference_type(entry, text, &tree))
+        .map(|entry| (entry.sym.start_byte, entry.sym.end_byte))
+        .collect()
+}
+
+fn ordinary_reference_type(entry: &crate::index::Entry, text: &str, tree: &Tree) -> bool {
+    if entry
+        .sym
+        .name
+        .trim_matches('`')
+        .contains(['.', '/', ';', '[', ']', '<', '>'])
+        || !entry.sym.type_params.is_empty()
+    {
+        return false;
+    }
+    let java = entry.path.ends_with(".java");
+    let Some(node) = declaration_node(tree, &entry.sym, java) else {
+        return false;
+    };
+    if !matches!(node.kind(), "class_declaration" | "interface_declaration") {
+        return false;
+    }
+    if child_of_kind(node, "modifiers").is_some_and(|modifiers| {
+        node_text(modifiers, text)
+            .split_whitespace()
+            .any(|word| matches!(word, "value" | "inline"))
+    }) {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if child_of_kind(parent, "type_parameters").is_some() {
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "block"
+                | "function_body"
+                | "function_declaration"
+                | "method_declaration"
+                | "lambda_literal"
+        ) {
+            return false;
+        }
+        ancestor = parent.parent();
+    }
+    let clean = node
+        .children(&mut node.walk())
+        .filter(|child| !matches!(child.kind(), "class_body" | "interface_body"))
+        .all(|child| !child.has_error() && !child.is_missing());
+    clean
 }
 
 pub(crate) fn has_post_name_dimensions(node: Node<'_>) -> bool {

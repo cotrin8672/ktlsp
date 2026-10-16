@@ -735,7 +735,7 @@ fn java_class_stub_facts(
     // A normal Java covariant bridge is not an additional source-callable overload.
     let mut shapes = std::collections::BTreeMap::new();
     for method in &class.methods {
-        if method.access_flags & PUBLIC != 0
+        if method.access_flags & (PUBLIC | 0x0004) != 0
             && method.access_flags & (0x0040 | 0x1000) == 0
             && !method
                 .attribute_names
@@ -748,7 +748,7 @@ fn java_class_stub_facts(
     }
     let mut field_names = std::collections::BTreeMap::new();
     for field in &class.fields {
-        if field.access_flags & PUBLIC != 0
+        if field.access_flags & (PUBLIC | 0x0004) != 0
             && field.access_flags & 0x1000 == 0
             && !field
                 .attribute_names
@@ -760,8 +760,9 @@ fn java_class_stub_facts(
     }
     let mut fields = std::collections::BTreeMap::new();
     for field in &class.fields {
-        if field.access_flags & PUBLIC == 0
-            || field.access_flags & !(PUBLIC | 0x0008 | 0x0010 | 0x0040 | 0x0080) != 0
+        if field.access_flags & (PUBLIC | 0x0004) == 0
+            || field.access_flags & 0x0005 == 0x0005
+            || field.access_flags & !(PUBLIC | 0x0004 | 0x0008 | 0x0010 | 0x0040 | 0x0080) != 0
             || field.access_flags & 0x0050 == 0x0050
             || field.signature.is_some()
             || !is_java_identifier(&field.name)
@@ -805,15 +806,23 @@ fn java_class_stub_facts(
         fields.insert(
             field.name.as_ref(),
             format!(
-                "    public {static_}{final_}{volatile}{transient}{ty} {};\n",
+                "    {} {static_}{final_}{volatile}{transient}{ty} {};\n",
+                if field.access_flags & PUBLIC != 0 {
+                    "public"
+                } else {
+                    "protected"
+                },
                 field.name
             ),
         );
     }
     let mut methods = std::collections::BTreeMap::new();
     for method in &class.methods {
-        if method.access_flags & PUBLIC == 0
-            || method.access_flags & !(PUBLIC | 0x0008 | 0x0010 | 0x0020 | 0x0800 | ABSTRACT) != 0
+        if method.access_flags & (PUBLIC | 0x0004) == 0
+            || method.access_flags & 0x0005 == 0x0005
+            || method.access_flags
+                & !(PUBLIC | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0800 | ABSTRACT)
+                != 0
             || method.access_flags & ABSTRACT != 0
                 && (class.access_flags & ABSTRACT == 0 || method.access_flags & 0x0938 != 0)
             || method.signature.is_some()
@@ -867,15 +876,20 @@ fn java_class_stub_facts(
         } else {
             ""
         };
+        let access = if method.access_flags & PUBLIC != 0 {
+            "public"
+        } else {
+            "protected"
+        };
         let declaration = if method.access_flags & ABSTRACT != 0 {
             format!(
-                "    public abstract {returns} {}({});\n",
+                "    {access} abstract {returns} {}({});\n",
                 method.name,
                 parameters.join(", ")
             )
         } else {
             format!(
-                "    public {static_}{final_}{returns} {}({}) {{ throw null; }}\n",
+                "    {access} {static_}{final_}{returns} {}({}) {{ throw null; }}\n",
                 method.name,
                 parameters.join(", ")
             )
@@ -1257,9 +1271,39 @@ mod tests {
             .iter()
             .find(|field| field.name.as_ref() == "EMPTY_SOURCE_PATH_REF_DIR")
             .unwrap();
+        let mut protected = class.clone();
+        let mut field = prototype.clone();
+        field.name = "retained".into();
+        field.access_flags = 0x0004;
+        protected.fields.push(field);
+        let source = java_class_stub(&protected).unwrap();
+        assert!(source.contains("protected java.lang.String retained;"));
+        let tree = parser.parse(&source);
+        let symbols = crate::java::extract_symbols(&tree, &source);
+        let field = symbols
+            .iter()
+            .find(|symbol| symbol.name == "retained")
+            .unwrap();
+        assert_eq!(
+            field.source_member.visibility(),
+            Some(ktcore::extensions::Visibility::Protected)
+        );
+        assert!(field.source_member.protected_package_access());
+        let owner = symbols
+            .iter()
+            .find(|symbol| symbol.kind == ktcore::symbol::SymbolKind::Class)
+            .unwrap();
+        let receiver = ktcore::types::Type::class(&owner.name, Some(owner.package.clone()));
+        let mut index = ktcore::index::Index::new();
+        index.replace_file("Gradle.java", symbols, ktcore::index::Tier::Durable);
+        let unrelated = ktcore::infer::FileCtx::new("outside".into(), Vec::new());
+        assert!(ktcore::members::completion_candidates_at(
+            &index, &receiver, "retained", &unrelated, 0, false
+        )
+        .members
+        .is_empty());
         for case in [
             "private",
-            "protected",
             "synthetic-flag",
             "synthetic-attribute",
             "generic",
@@ -1274,7 +1318,6 @@ mod tests {
             field.name = "withheld".into();
             match case {
                 "private" => field.access_flags = 0x0002,
-                "protected" => field.access_flags = 0x0004,
                 "synthetic-flag" => field.access_flags |= 0x1000,
                 "synthetic-attribute" => field.attribute_names.push("Synthetic".into()),
                 "generic" => field.signature = Some("TT;".into()),
@@ -1516,10 +1559,36 @@ mod tests {
                     .unwrap();
                 assert_eq!(with_argument.params[0].name, "int");
                 assert_eq!(with_argument.min_arity, Some(1));
-                assert!(!methods.iter().any(|method| matches!(
-                    method.name.as_str(),
-                    "generic" | "hidden" | "Factory"
-                )));
+                assert!(!methods
+                    .iter()
+                    .any(|method| matches!(method.name.as_str(), "generic" | "Factory")));
+                let hidden = methods
+                    .iter()
+                    .find(|method| method.name == "hidden")
+                    .unwrap();
+                assert_eq!(
+                    hidden.source_member.visibility(),
+                    Some(ktcore::extensions::Visibility::Protected)
+                );
+                assert!(hidden.source_member.protected_package_access());
+                let receiver = ktcore::types::Type::class("Factory", Some("arrayfixture".into()));
+                let mut index = ktcore::index::Index::new();
+                index.replace_file(
+                    "Factory.java",
+                    symbols.clone(),
+                    ktcore::index::Tier::Durable,
+                );
+                let unrelated = ktcore::infer::FileCtx::new("outside".into(), Vec::new());
+                assert!(ktcore::members::completion_candidates_at(
+                    &index, &receiver, "hidden", &unrelated, 0, false
+                )
+                .members
+                .is_empty());
+                assert!(!ktcore::members::completion_candidates_at(
+                    &index, &receiver, "rows", &unrelated, 0, false
+                )
+                .members
+                .is_empty());
                 assert!(!symbols.iter().any(|symbol| symbol.name == "Poison"));
             } else if path.ends_with("pluginfixture/Person.java") {
                 assert_eq!(

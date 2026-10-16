@@ -567,12 +567,13 @@ fn normalized_absence_query_retains_unknown_producer_and_dirty_package_reasons()
         "generated",
         &facts,
         &ctx,
+        0,
     );
     assert!(
         matches!(status, resolve::ResolutionStatus::Unknown(reasons) if reasons.contains(&IncompletenessReason::CompilerProducerIncomplete))
     );
     assert!(resolve::member_name_status_for_receiver(
-        &ws.index, "Use.java", &receiver, "current", &facts, &ctx
+        &ws.index, "Use.java", &receiver, "current", &facts, &ctx, 0
     )
     .is_found());
     facts.compiler_producers_complete = true;
@@ -584,6 +585,7 @@ fn normalized_absence_query_retains_unknown_producer_and_dirty_package_reasons()
         "generated",
         &facts,
         &ctx,
+        0,
     );
     assert!(
         matches!(status, resolve::ResolutionStatus::Unknown(reasons) if reasons.contains(&IncompletenessReason::ProjectPackageIncomplete("generated".into())))
@@ -1010,6 +1012,7 @@ fn inventory_status(
         name,
         facts,
         &ktlsp::infer::FileCtx::new("app".into(), Vec::new()),
+        0,
     )
 }
 
@@ -1148,6 +1151,7 @@ fn source_member_status(
         name,
         facts,
         &ktlsp::infer::FileCtx::new("app".into(), Vec::new()),
+        0,
     )
 }
 

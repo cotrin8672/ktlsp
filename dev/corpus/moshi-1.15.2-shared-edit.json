@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "project_id": "moshi-1.15.2-shared-edit",
+  "revision": "7f957b18ea123b7bb2ffc9d3c079e680eecf15e1",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "beginObject",
+      "target": "moshi/src/main/java/com/squareup/moshi/JsonReader.java",
+      "target_anchor": "public abstract void beginObject()",
+      "target_token": "beginObject",
+      "expected": "Completion contains beginObject; definition is Java JsonReader.beginObject, not a Javadoc occurrence or unrelated overload.",
+      "source_sha256": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef",
+      "target_sha256": "70bc4047e5e02b95cad573864828793ab98f03d1bfde405a6557ac1283f0179a",
+      "compiler_status": "focused main compilation passed",
+      "module": ":moshi-kotlin",
+      "id": "moshi-jsonreader-member",
+      "source": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+      "anchor": "reader.beginObject()"
+    }
+  ],
+  "shared_edit": {
+    "producer": "moshi/src/main/java/com/squareup/moshi/JsonReader.java",
+    "consumer": "moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt",
+    "source_sha256": {
+      "producer": "70bc4047e5e02b95cad573864828793ab98f03d1bfde405a6557ac1283f0179a",
+      "consumer": "56968c5b716dc228aba01066caf1e9b1055e30afd91c92bee6c93141ac7eefef"
+    },
+    "control": "beginObject",
+    "recipes": {
+      "text": {
+        "producer": "  public String ktlspSliceText() { return \"slice\"; }",
+        "consumer": "private fun ktlspConsumerSlice(provider: JsonReader): String {\n  return provider.ktlspSliceText().substring(0)\n}"
+      },
+      "counter": {
+        "producer": "  public java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() { return new java.util.concurrent.atomic.AtomicInteger(); }",
+        "consumer": "private fun ktlspConsumerSlice(provider: JsonReader): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}"
+      }
+    },
+    "additional_request_count": 14,
+    "consumer_insertion": "file",
+    "stages": {
+      "text": {
+        "producer": {
+          "sha256": "4eed0fc8f4f99467f5a628a97a7ac8ecd44102da7bb47338ec01cc81a74addaa"
+        },
+        "consumer": {
+          "sha256": "aa8c470a3bd456e574218adb362eec0a0993ce16d429d0340bb415766897da02"
+        }
+      },
+      "counter": {
+        "producer": {
+          "sha256": "7c94201d579aada1340ac506c218aa2f34e2cb32b65658e6b029abd84118631e"
+        },
+        "consumer": {
+          "sha256": "c08674cb1327112697895f77b45f229513af2e7e3bba4abb84cea397c7b81539"
+        }
+      },
+      "renamed": {
+        "producer": {
+          "sha256": "c30bf58bad3706bbf4443f4991cc514a73f0b2a7059074e86bf9bf4b94db91f0"
+        },
+        "consumer": {
+          "sha256": "ca6ee6ee3f855ca751799eb47e336db604ee5e7be38fd75b7f2e3b05c0ae0396"
+        }
+      },
+      "retracted": {
+        "producer": {
+          "sha256": "70bc4047e5e02b95cad573864828793ab98f03d1bfde405a6557ac1283f0179a"
+        },
+        "consumer": {
+          "sha256": "c08674cb1327112697895f77b45f229513af2e7e3bba4abb84cea397c7b81539"
+        }
+      }
+    },
+    "oracle_status": "VERIFIED: text/counter/renamed whole-file pairs compile; producer retraction yields sole missing-member error. javac17 --release8 and captured Kotlin1.8.21/jvm1.8; explicit UTF-8 independent source check, not unsupported Java Gradle-policy certification.",
+    "compiler_oracle_receipt_sha256": "b39628d08b677f58e0daa6ba6d6cb8f57eb5250aa40d9090d65438238fec827a"
+  }
+}

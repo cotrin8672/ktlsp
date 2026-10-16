@@ -878,7 +878,9 @@ pub fn diagnostics_with_options(
 ) -> Vec<crate::diagnostics::Diagnostic> {
     let mut out = Vec::new();
     let ctx = JavaDiagnosticContext::new(tree, src);
-    let inference_ctx = FileCtx::new(ctx.package.clone(), inference_imports(tree, src));
+    let mut inference_ctx = FileCtx::from_tree_in_file(tree, src, file);
+    inference_ctx.package = ctx.package.clone();
+    inference_ctx.imports = inference_imports(tree, src);
     for import in &ctx.diagnostic_imports {
         if !ctx.name_used_outside_imports(&import.name) {
             out.push(crate::diagnostics::unused_import_diagnostic(
@@ -1023,6 +1025,7 @@ fn collect_unresolved_references(
                             name,
                             facts,
                             inference_ctx,
+                            name_node.start_byte(),
                         )
                         .is_definitely_absent()
                     })
@@ -3265,8 +3268,13 @@ fn receiver_member_defs(
         return Some(Vec::new());
     };
     let members = java_member_entries(index, &recv, name, SymbolKind::Property);
+    let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
+    ctx.package = package_of(tree, src);
     let mut defs = members
         .iter()
+        .filter(|entry| {
+            ktcore::members::member_accessible_at(index, &recv, entry, &ctx, usage.start_byte())
+        })
         .map(|entry| Def {
             file: entry.path.to_string(),
             start_byte: entry.sym.start_byte,
@@ -3404,15 +3412,9 @@ fn receiver_type(
     }
     match object.kind() {
         "this" | "super" => {
-            let receiver = infer::declared_type(
-                index,
-                &type_scope(tree, src).type_ref(
-                    &enclosing_type_name(object, src)?,
-                    false,
-                    Vec::new(),
-                ),
-                &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
-            );
+            let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
+            ctx.package = package_of(tree, src);
+            let receiver = ctx.caller_type(index, object.start_byte())?;
             if object.kind() == "this" {
                 return Some(receiver);
             }
@@ -3745,8 +3747,11 @@ fn java_member_call_candidates_with_arguments<'a>(
     let receiver = receiver.or_else(|| {
         java_member_receiver(index, file, src, tree, call, initializer_depth).map(|(ty, _)| ty)
     })?;
-    let mut candidates = ktcore::jvm::member_candidates(index, &receiver, name);
-    let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
+    let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
+    ctx.package = package_of(tree, src);
+    ctx.imports = inference_imports(tree, src);
+    let mut candidates =
+        ktcore::jvm::member_candidates_at(index, &receiver, name, &ctx, call.start_byte());
     let selection = if candidates.iter().any(|candidate| {
         matches!(
             candidate,
@@ -3759,7 +3764,13 @@ fn java_member_call_candidates_with_arguments<'a>(
         let (verified_receiver, kind) =
             java_member_receiver(index, file, src, tree, call, initializer_depth)?;
         if verified_receiver != receiver {
-            candidates = ktcore::jvm::member_candidates(index, &verified_receiver, name);
+            candidates = ktcore::jvm::member_candidates_at(
+                index,
+                &verified_receiver,
+                name,
+                &ctx,
+                call.start_byte(),
+            );
         }
         ktcore::jvm::select_call_for_receiver_kind(
             index,
@@ -4702,7 +4713,10 @@ pub fn completion_query(
                 ktcore::jvm::ReceiverKind::Unknown,
             )
         };
-        return semantic_query::member_completion_query_for_type(
+        let mut ctx = FileCtx::from_tree_in_file(&synthetic_tree, &synthetic, file);
+        ctx.package = package_of(&synthetic_tree, &synthetic);
+        ctx.imports = inference_imports(&synthetic_tree, &synthetic);
+        return semantic_query::member_completion_query_for_type_with_ctx(
             index,
             language::SourceLanguage::Java,
             &synthetic_tree,
@@ -4711,6 +4725,7 @@ pub fn completion_query(
             receiver_kind,
             prefix,
             max_candidates,
+            Some((&ctx, receiver.map_or(syn_offset, |node| node.start_byte()))),
         );
     }
     let (prefix, candidates, status) = if context == complete::CompletionContext::ScopeName {

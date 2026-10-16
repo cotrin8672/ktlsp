@@ -515,7 +515,7 @@ fn member_name_status_a(
             return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
         }
     }
-    member_name_status_for_receiver(index, file, &recv_ty, name, facts, ctx)
+    member_name_status_for_receiver(index, file, &recv_ty, name, facts, ctx, usage.start_byte())
 }
 
 /// Shared negative member proof after a language adapter has inferred the receiver. A known
@@ -527,8 +527,9 @@ pub fn member_name_status_for_receiver(
     name: &str,
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
+    position: usize,
 ) -> ResolutionStatus<()> {
-    let candidates = members::candidates(index, recv_ty, name, ctx);
+    let candidates = members::candidates_at(index, recv_ty, name, ctx, position);
     if !candidates.members.is_empty() || candidates.known_extensions().next().is_some() {
         return ResolutionStatus::Found(());
     }

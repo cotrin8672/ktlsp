@@ -521,7 +521,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
         return if conflicting_access {
             SourceMemberFlags::default()
         } else {
-            SourceMemberFlags::for_visibility(visibility, internal)
+            SourceMemberFlags::for_visibility(visibility, internal).with_java_protected(java)
         };
     }
     if value {
@@ -592,7 +592,8 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
             visibility,
             internal,
             jvm_restricted,
-        );
+        )
+        .with_java_protected(java);
     }
     let implicit_abstract = interface && !body && !native && !static_ && !private && !default_;
     if expect
@@ -621,6 +622,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
         internal,
         jvm_restricted,
     )
+    .with_java_protected(java)
 }
 
 /// Push a `Function` symbol, stamping `ext_receiver`, `arity` (the count of value parameters,
@@ -1413,7 +1415,11 @@ pub fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
     value_type_of_scoped(var_decl, src, None)
 }
 
-fn value_type_of_scoped(var_decl: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
+pub(crate) fn value_type_of_scoped(
+    var_decl: Node,
+    src: &str,
+    scope: Option<&TypeScope>,
+) -> Option<TypeRef> {
     let mut cursor = var_decl.walk();
     for child in var_decl.named_children(&mut cursor) {
         if matches!(

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "project_id": "okhttp-4.12.0-shared-edit",
+  "revision": "4984568367caaf359b82c452bd28b5e192824d1c",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "newCall",
+      "target": "okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt",
+      "target_anchor": "override fun newCall(request: Request): Call",
+      "target_token": "newCall",
+      "expected": "Java receiver OkHttpClient resolves concrete Kotlin newCall override, returning shared Call type.",
+      "source_sha256": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2",
+      "target_sha256": "7dd4feb07f40501aff1d95fba9b93a9ca91122515c011ae7bebde0611566ad6c",
+      "compiler_status": "guide Java+Kotlin and required core compilation passed",
+      "module": ":samples:guide",
+      "id": "okhttp-java-kotlin-newcall",
+      "source": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+      "anchor": "client.newCall(request).enqueue("
+    }
+  ],
+  "shared_edit": {
+    "producer": "okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt",
+    "consumer": "samples/guide/src/main/java/okhttp3/recipes/AsynchronousGet.java",
+    "source_sha256": {
+      "producer": "7dd4feb07f40501aff1d95fba9b93a9ca91122515c011ae7bebde0611566ad6c",
+      "consumer": "8bb0eb12043bd41c889b990fbbf66557f0b898065bc1f2d6fa502b17be8e14f2"
+    },
+    "control": "newCall",
+    "recipes": {
+      "text": {
+        "producer": "  public fun ktlspSliceText(): String = \"slice\"",
+        "consumer": "  private String ktlspConsumerSlice(OkHttpClient provider) {\n    return provider.ktlspSliceText().substring(0);\n  }"
+      },
+      "counter": {
+        "producer": "  public fun ktlspSliceCounter(): java.util.concurrent.atomic.AtomicInteger = java.util.concurrent.atomic.AtomicInteger()",
+        "consumer": "  private int ktlspConsumerSlice(OkHttpClient provider) {\n    return provider.ktlspSliceCounter().incrementAndGet();\n  }"
+      }
+    },
+    "additional_request_count": 14,
+    "consumer_insertion": "class",
+    "stages": {
+      "text": {
+        "producer": {
+          "sha256": "eccd806235a6fac76a2b4b582ddf87f0fcd8d8e869b416761309a96a7778a699"
+        },
+        "consumer": {
+          "sha256": "a6c8c386a5c6a61321e33469adf0d2b7c80400b77b695058b3c6959eaca5fda2"
+        }
+      },
+      "counter": {
+        "producer": {
+          "sha256": "8ca6d922dd56251c2194401a72a690ce94d572d9d14090b85aaefae0be6b41e7"
+        },
+        "consumer": {
+          "sha256": "c0b4cb8b438285b4ebc9795dcb02c93836acba8a40d7e9c11a2ffe5d13d0fdc6"
+        }
+      },
+      "renamed": {
+        "producer": {
+          "sha256": "2fb464e392ccbe05ca65a080c24d1ef80140ef034ac9584d88a01280563f0ba9"
+        },
+        "consumer": {
+          "sha256": "9f3a6634613cdf4c62ad1cb4cff15c4a497bcaffc5f956ce46fa9e0dacf9c37c"
+        }
+      },
+      "retracted": {
+        "producer": {
+          "sha256": "7dd4feb07f40501aff1d95fba9b93a9ca91122515c011ae7bebde0611566ad6c"
+        },
+        "consumer": {
+          "sha256": "c0b4cb8b438285b4ebc9795dcb02c93836acba8a40d7e9c11a2ffe5d13d0fdc6"
+        }
+      }
+    },
+    "oracle_status": "VERIFIED: six prior text/counter/renamed whole-file compiler closures retained; retracted Kotlin producer and Java consumer rechecked with English javac output, yielding the sole missing-member error. All 317 producer class hashes match the preserved output. Captured Kotlin1.8.21/jvm1.8 and explicit javac17 source oracle; unsupported Java Gradle-policy authority remains uncertified.",
+    "compiler_oracle_receipt_sha256": "2cbe933f909b217d0a3127ccb50744b20307d7226257c302aa352cd78fec9f5c"
+  }
+}

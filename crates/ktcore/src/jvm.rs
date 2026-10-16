@@ -344,6 +344,22 @@ pub fn member_candidates<'a>(
     receiver: &Type,
     prefix: &str,
 ) -> Vec<CallableCandidate<'a>> {
+    member_candidates_at(
+        index,
+        receiver,
+        prefix,
+        &FileCtx::new(String::new(), Vec::new()),
+        0,
+    )
+}
+
+pub fn member_candidates_at<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    prefix: &str,
+    ctx: &FileCtx,
+    position: usize,
+) -> Vec<CallableCandidate<'a>> {
     if matches!(receiver, Type::Array { .. }) {
         use crate::extensions::{Dispatch, Visibility};
         let owners: Vec<_> = index
@@ -364,6 +380,7 @@ pub fn member_candidates<'a>(
             &object,
             crate::members::MemberName::Prefix(prefix),
             &FileCtx::new("java.lang".into(), Vec::new()),
+            false,
         )
         .members
         .into_iter()
@@ -387,14 +404,15 @@ pub fn member_candidates<'a>(
         index,
         receiver,
         crate::members::MemberName::Prefix(prefix),
-        &FileCtx::new(
-            receiver.package().unwrap_or_default().to_string(),
-            Vec::new(),
-        ),
+        ctx,
+        false,
     )
     .members
     .into_iter()
-    .filter(|entry| entry.sym.kind == SymbolKind::Function)
+    .filter(|entry| {
+        entry.sym.kind == SymbolKind::Function
+            && crate::members::member_accessible_at(index, receiver, entry, ctx, position)
+    })
     .map(CallableCandidate::Authored)
     .collect();
     if let (Some(name), Some(package)) = (receiver.name(), receiver.package()) {

@@ -677,8 +677,9 @@ class KtlspDumpClasspathAction(
                 factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
                 factory.isXIncludeAware = false
                 factory.isExpandEntityReferences = false
-                factory.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD, "")
-                factory.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_SCHEMA, "")
+                // Older Gradle XML APIs lack these constants; the JAXP property names are stable.
+                factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalDTD", "")
+                factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalSchema", "")
                 val builder = factory.newDocumentBuilder()
                 builder.setErrorHandler(org.xml.sax.helpers.DefaultHandler())
                 val bytes = file.inputStream().use { it.readNBytes((1 shl 20) + 1) }

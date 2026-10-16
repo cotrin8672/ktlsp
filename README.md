@@ -288,6 +288,8 @@ navigation through unsaved bound swap/removal/restoration, recording first respo
 identity in `semantic-bounded-receivers.json`.
 Shared generic interoperability tests also cover parameterized extension receivers,
 inline nominal bounds, class literals and real-stdlib expect/actual declaration shapes.
+Standalone workspaces index Kotlin stdlib 2.1.20 by default; Gradle workspaces use their resolved
+classpath. The `java` editor scenario checks `javaClass` diagnostics across unsaved Kotlin edits.
 Java/Kotlin source calls also share a conservative equality/lower/upper constraint
 slice for projected arguments such as Class<? extends T>. Unknown captures, upper-only
 variables, differing lower bounds and Kotlin where/F-bounds remain coverage gaps; see
@@ -407,6 +409,14 @@ Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and 
 for Gradle, matching the project's selected main toolchain. This includes completion inside
 braced Kotlin string templates across unsaved Java return-type changes. The focused
 checks pass; broader coverage is tracked in [the acceptance record](docs/fork-acceptance.md).
+For pinned OkHttp, Moshi, Spring and Gradle, pair each `*-shared-edit.json` manifest
+with `KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_corpus_shared_edit_probes.lua"` through
+the same `corpus` route. These separate cases change a concrete producer member
+from `String` to `AtomicInteger` in memory, check the opposite language's completion
+and exact navigation, apply a two-file rename, and check member retraction after
+restoring the producer. They also record diagnostics for the valid edited consumer;
+Kotlin absence requires an accepted complete compiler result. Compiler-oracle status
+and snapshot hashes are retained separately from the original fifty requests.
 The original CEM and Spring corpus manifests also cover projected factory returns
 and exact overload navigation. Standalone compiler reductions are preserved in
 [the overload controls](dev/corpus/fixtures/spring-overload-controls/README.md).
@@ -519,6 +529,8 @@ The same editor connection checks useful completion, exact definitions, diagnost
 unsaved Kotlin changes. Removal requires a previously useful result. The fixture remaps `:app`
 to `modules/editing`; it requires its generated project, so omit `--root`. Results and build logs
 are recorded in `artifacts/gradle-reload.json` and `artifacts/gradle-phase*-compile.out`.
+The probe waits for the latest requested analysis generation's accepted finish in the trace,
+then checks each completion and definition once. Readiness failures remain separate from semantic results.
 Set `KTLSP_GRADLE_RELOAD_AUTOWATCH=1` to require Neovim's native watched-file notifications;
 the default is an explicit standard-notification control.
 The probe honors `KTLSP_JDK_SRC`. Set it to the Java compile toolchain's `lib/src.zip`

@@ -100,7 +100,7 @@ local function run()
     elseif not enabled then
       local destination = artifacts .. '/disabled-java-classes'
       vim.fn.mkdir(destination, 'p')
-      local compiled = vim.system({ jdk .. '/bin/javac' .. executable_suffix, '-d', destination,
+      local compiled = vim.system({ jdk .. '/bin/javac' .. executable_suffix, '-J-Dfile.encoding=UTF-8', '-d', destination,
         root .. '/app/src/main/java/fixture/JavaUse.java' }, { text = true }):wait(30000)
       check('disabled actual Java compiler rejects generated API uses', compiled.code == 1 and compiled.signal == 0, compiled)
       for _, target in ipairs(generated) do

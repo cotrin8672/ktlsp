@@ -298,6 +298,8 @@ impl Workspace {
             .map(|(key, _)| key.to_string())
             .collect();
         for key in removed {
+            // Artifact retirement does not prove an authored type was deleted.
+            self.index.remove_file_origin(&key);
             self.index.remove_file(&key);
             self.analysis_extensions.remove_source(&self.index, &key);
             self.annotated_type_owners.remove(&key);
@@ -3935,20 +3937,28 @@ mod tests {
             new_return,
         ) = if java_caller {
             (
-                    "mem:///Contract.kt", "mem:///Impl.java", "mem:///Clash.kt", "mem:///Duplicate.kt",
-                    "package generated\ninterface Contract { fun required(): Int }\n",
-                    "package generated\ninterface Clash { fun required(): Long }\n",
-                    "package generated;\npublic class Impl implements Contract {\n    // HERE\n}\nclass Other {\n    // OTHER\n}\nclass Calls { static long use(Impl value) { return value.required(); } }\n",
-                    "int", "long",
-                )
+                "mem:///Contract.kt",
+                "mem:///Impl.java",
+                "mem:///Clash.kt",
+                "mem:///Duplicate.kt",
+                "package generated\ninterface Contract { fun required(): Int }\n",
+                "package generated\ninterface Clash { fun required(): Long }\n",
+                "package generated;\npublic class Impl implements Contract {\n    // HERE\n}\nclass Other {\n    // OTHER\n}\nclass Calls { static long use(Impl value) { return value.required(); } }\n",
+                "int",
+                "long",
+            )
         } else {
             (
-                    "mem:///Contract.java", "mem:///Impl.kt", "mem:///Clash.java", "mem:///Duplicate.java",
-                    "package generated;\npublic interface Contract { int required(); }\n",
-                    "package generated;\npublic interface Clash { long required(); }\n",
-                    "package generated\nclass Impl : Contract {\n    // HERE\n}\nclass Other {\n    // OTHER\n}\nfun use(value: Impl) = value.required()\n",
-                    "Int", "Long",
-                )
+                "mem:///Contract.java",
+                "mem:///Impl.kt",
+                "mem:///Clash.java",
+                "mem:///Duplicate.java",
+                "package generated;\npublic interface Contract { int required(); }\n",
+                "package generated;\npublic interface Clash { long required(); }\n",
+                "package generated\nclass Impl : Contract {\n    // HERE\n}\nclass Other {\n    // OTHER\n}\nfun use(value: Impl) = value.required()\n",
+                "Int",
+                "Long",
+            )
         };
         let mut ws = Workspace::new();
         ws.open(owner_key, owner.into());
@@ -4279,8 +4289,11 @@ mod tests {
                 assert!(entries[0].sym.extension_receiver.is_some());
             }
             let cursor = caller.find("// HERE").unwrap();
-            assert_eq!(required_interface_actions_at(&mut ws, caller_key, cursor).len(), 1,
-                "the native first-slash cursor must produce the action with both stdlib properties indexed");
+            assert_eq!(
+                required_interface_actions_at(&mut ws, caller_key, cursor).len(),
+                1,
+                "the native first-slash cursor must produce the action with both stdlib properties indexed"
+            );
             preview_required_interface_action(&mut ws, caller_key, caller, result);
             let prefix = if java_caller { "java" } else { "kotlin" };
             ws.open(
@@ -5259,11 +5272,21 @@ mod tests {
         let java_use = "package app; class SuperUse { void run(ImportedChild child, KotlinImportedChild kotlin) { child.accept(\"ok\"); kotlin.accept(\"ok\"); } }";
         let kotlin_use = "package app\nfun use(child: ImportedChild, kotlin: KotlinImportedChild) { child.accept(\"ok\"); kotlin.accept(\"ok\") }";
         for (path, text) in [
-            ("support/ImportedBase.java", "package support; public class ImportedBase { public void accept(String value) {} }"),
-            ("app/ImportedBase.java", "package app; public class ImportedBase { public void accept(int value) {} }"),
-            ("app/ImportedChild.java", java_child), ("app/KotlinImportedChild.kt", kotlin_child),
-            ("app/SuperUse.java", java_use), ("app/SuperUse.kt", kotlin_use),
-        ] { std::fs::write(root.join(path), text).unwrap(); }
+            (
+                "support/ImportedBase.java",
+                "package support; public class ImportedBase { public void accept(String value) {} }",
+            ),
+            (
+                "app/ImportedBase.java",
+                "package app; public class ImportedBase { public void accept(int value) {} }",
+            ),
+            ("app/ImportedChild.java", java_child),
+            ("app/KotlinImportedChild.kt", kotlin_child),
+            ("app/SuperUse.java", java_use),
+            ("app/SuperUse.kt", kotlin_use),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
         let mut ws = Workspace::new();
         ws.scan(&root);
         runtime_ready_source_diagnostic_fixture(&mut ws, &root);
@@ -5359,15 +5382,24 @@ mod tests {
         .unwrap();
         let origin = crate::classpath::jdk_origin_id(&home.join("lib/src.zip"));
         for (key, text) in [
-            ("sdk/java/lang/Object.java", "package java.lang; public class Object { public String toString() { return null; } }"),
-            ("sdk/java/lang/String.java", "package java.lang; public final class String {}"),
+            (
+                "sdk/java/lang/Object.java",
+                "package java.lang; public class Object { public String toString() { return null; } }",
+            ),
+            (
+                "sdk/java/lang/String.java",
+                "package java.lang; public final class String {}",
+            ),
         ] {
             let mut parsers = LanguageParsers::new();
             let tree = parsers.parse(SourceLanguage::Java, text);
             assert!(ws.index_dependency_batch(crate::deps::FileSymbols {
-                file: key.into(), symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
-                jvm: None, origin: Some(crate::project_model::FileOrigin {
-                    origin_id: origin.clone(), representation: crate::project_model::SourceRepresentation::Source,
+                file: key.into(),
+                symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
+                jvm: None,
+                origin: Some(crate::project_model::FileOrigin {
+                    origin_id: origin.clone(),
+                    representation: crate::project_model::SourceRepresentation::Source,
                     project_scope: None,
                 }),
             }));
@@ -5757,9 +5789,15 @@ mod tests {
         std::fs::write(&source_jar, b"source revision").unwrap();
         std::fs::write(&pom, b"encoding revision").unwrap();
         let model = |extra: &str| {
-            Arc::new(crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n{extra}END\t:app\n",
-            root.display(), root.join("src").display(), binary.display(), binary.display()))))
+            Arc::new(crate::classpath::ProjectSnapshot::new(
+                crate::classpath::parse_dump(&format!(
+                    "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n{extra}END\t:app\n",
+                    root.display(),
+                    root.join("src").display(),
+                    binary.display(),
+                    binary.display()
+                )),
+            ))
         };
         let accepted = model("");
         let coord = crate::coords::Coordinate::parse("fieldfixture:api:1").unwrap();
@@ -5847,6 +5885,26 @@ mod tests {
         ws.index_dependency_batch(source_batch(&mut parsers, &source, text));
         ws.bump_index_revision();
         useful(&mut ws); // Existing canonical source preference must avoid duplicate ambiguity.
+        let navigation_key = crate::paths::file_key(&root.join("src/Navigate.java"));
+        let navigation_text = "package fieldfixture; class Navigate { int f(FieldOnly value) { return value.count; } }";
+        ws.open(navigation_key.clone(), navigation_text.to_string());
+        let navigation_offset = navigation_text.find("count").unwrap();
+        let source_key = crate::paths::file_key(&source);
+        assert!(ws
+            .goto_definition(&navigation_key, navigation_offset)
+            .iter()
+            .any(|definition| definition.file == source_key));
+        std::fs::write(&pom, b"changed selected encoding metadata").unwrap();
+        ws.set_project_model(model(&format!(
+            "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n",
+            source_jar.display(), pom.display())));
+        assert!(
+            ws.goto_definition(&navigation_key, navigation_offset)
+                .iter()
+                .all(|definition| definition.file != source_key),
+            "an invalidated source declaration must retire"
+        );
+        useful(&mut ws); // Metadata invalidation cannot hide the unchanged selected binary.
         std::fs::write(&binary, b"different selected binary").unwrap();
         ws.set_project_model(model(""));
         assert!(
@@ -5863,9 +5921,15 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("api.jar"), b"first binary").unwrap();
         let model = |version| {
-            Arc::new(crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t{version}\nEND\t:app\n",
-            root.display(), root.join("src").display(), root.join("api.jar").display(), root.join("api.jar").display()))))
+            Arc::new(crate::classpath::ProjectSnapshot::new(
+                crate::classpath::parse_dump(&format!(
+                    "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t{version}\nEND\t:app\n",
+                    root.display(),
+                    root.join("src").display(),
+                    root.join("api.jar").display(),
+                    root.join("api.jar").display()
+                )),
+            ))
         };
         let mut ws = Workspace::new();
         ws.set_project_model(model("1"));

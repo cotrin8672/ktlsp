@@ -193,6 +193,49 @@ local function wait_for(condition, timeout)
     return condition()
   end, 50)
 end
+local function refresh_state(events)
+  local requested, finished
+  for _, event in ipairs(events) do
+    if event.args and probe.path_key(event.args.root or '') == probe.path_key(root) then
+      if event.name == 'workspace.refresh_requested' then requested = event.args.generation end
+      if event.name == 'workspace.accepted_finish' then finished = event.args end
+    end
+  end
+  return requested, finished
+end
+local function read_refresh_state()
+  local events = {}
+  local file = io.open(vim.env.KTLSP_TRACE or artifacts .. '/trace-events.jsonl', 'rb')
+  if file then
+    for line in file:lines() do
+      local ok, event = pcall(vim.json.decode, line)
+      if ok and (event.name == 'workspace.refresh_requested' or event.name == 'workspace.accepted_finish') then
+        events[#events + 1] = event
+      end
+    end
+    file:close()
+  end
+  return refresh_state(events)
+end
+local function refresh_complete(requested, finished, before)
+  return requested ~= nil and requested > (before or 0) and finished ~= nil
+    and finished.generation == requested and finished.failed == 0 and finished.missingSources == 0
+    and finished.classpathComplete == true
+end
+assert(not refresh_complete(2, { generation = 1, failed = 0, missingSources = 0, classpathComplete = true }, 0))
+assert(not refresh_complete(2, { generation = 2, failed = 0, missingSources = 0, classpathComplete = true }, 2))
+assert(not refresh_complete(2, { generation = 2, failed = 1, missingSources = 0, classpathComplete = true }, 1))
+assert(not refresh_complete(2, { generation = 2, failed = 0, missingSources = 0, classpathComplete = false }, 1))
+assert(refresh_complete(2, { generation = 2, failed = 0, missingSources = 0, classpathComplete = true }, 1))
+local function wait_refresh(before, timeout)
+  local requested, finished
+  local ready = wait_for(function()
+    requested, finished = read_refresh_state()
+    return refresh_complete(requested, finished, before)
+  end, timeout)
+  report.phases[#report.phases].refresh = { before = before, requested = requested, accepted_finish = finished, ready = ready }
+  return ready
+end
 -- Read each published model after the existing useful v1/v2 requests, without extra readiness gates.
 local function check_kotlin_metadata(phase, version)
   local capture = { matches = {}, read_errors = {}, model_exports = {}, jdk_selections = {},
@@ -293,12 +336,7 @@ local function check_kotlin_metadata(phase, version)
     { selected = task.java_home, expected_java_compile_home = expected_home })
 end
 local wait_ms = tonumber(vim.env.KTLSP_GRADLE_RELOAD_WAIT_MS) or 60000
-local ready = wait_for(function()
-  for _, message in ipairs(report.messages) do
-    if message.message:match('ktlsp indexed .* library files') then return true end
-  end
-  return false
-end, 120000)
+local ready = wait_refresh(0, 120000)
 check('initial dependency indexing reports completion', ready)
 if automatic_watches then
   check('Neovim advertises automatic watched-file registration', report.watches.capability.dynamicRegistration)
@@ -386,14 +424,12 @@ end
 
 for phase = 1, 3 do
   report.current_phase = phase
+  local before = read_refresh_state()
   fixture.phase(root, phase)
   if not build(phase) then break end
   watch(phase)
+  report.phases[#report.phases].analysis_updated = wait_refresh(before, wait_ms)
   if phase == 1 then
-    report.phases[#report.phases].analysis_updated = wait_for(function()
-      return has(java, 'added.addedApi()', 'addedApi') and has(kotlin, 'added.addedApi()', 'addedApi')
-        and has(java, 'standard.generatedValue()', 'generatedValue') and has(kotlin, 'custom.customValue()', 'customValue')
-    end, wait_ms)
     for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
       for _, item in ipairs({ { 'added.addedApi()', 'addedApi', '/fixture.reload/added/1.0/vendor/Added.java' },
         { 'standard.generatedValue()', 'generatedValue', '/build/generated/sources/fixture/java/main/generated/StandardGenerated.java' },
@@ -406,10 +442,6 @@ for phase = 1, 3 do
       end
     end
   elseif phase == 2 then
-    report.phases[#report.phases].analysis_updated = wait_for(function()
-      return has(java, 'versioned.newApi()', 'newApi') and not has(java, 'versioned.oldApi()', 'oldApi')
-        and has(kotlin, 'versioned.newApi()', 'newApi') and not has(kotlin, 'versioned.oldApi()', 'oldApi')
-    end, wait_ms)
     for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
       local useful = has(buffer, 'versioned.newApi()', 'newApi')
       check('updated ' .. label .. ' v2 new member completion', useful)
@@ -444,11 +476,6 @@ for phase = 1, 3 do
     end
     check_kotlin_metadata(2, '2.0')
   else
-    report.phases[#report.phases].analysis_updated = wait_for(function()
-      return not has(java, 'versioned.newApi()', 'newApi') and not has(java, 'versioned.oldApi()', 'oldApi')
-        and not has(kotlin, 'versioned.newApi()', 'newApi') and not has(kotlin, 'versioned.oldApi()', 'oldApi')
-        and not has(java, 'added.addedApi()', 'addedApi') and not has(kotlin, 'custom.customValue()', 'customValue')
-    end, wait_ms)
     for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
       for _, item in ipairs({ { 'versioned.oldApi()', 'oldApi' }, { 'versioned.newApi()', 'newApi' },
         { 'added.addedApi()', 'addedApi' }, { 'standard.generatedValue()', 'generatedValue' }, { 'custom.customValue()', 'customValue' } }) do
@@ -472,6 +499,10 @@ check('server exits cleanly after the same-connection lifecycle', report.shutdow
 local failures = 0
 for _, item in ipairs(report.checks) do if not item.passed then failures = failures + 1 end end
 report.failed, report.total = failures, #report.checks
+report.readiness_failures = 0
+for _, phase in ipairs(report.phases) do
+  if phase.refresh and not phase.refresh.ready then report.readiness_failures = report.readiness_failures + 1 end
+end
 save()
 print(('Gradle reload: %d/%d checks passed'):format(#report.checks - failures, #report.checks))
-vim.cmd(failures == 0 and 'qa!' or 'cquit 1')
+vim.cmd(failures == 0 and report.readiness_failures == 0 and 'qa!' or 'cquit 1')

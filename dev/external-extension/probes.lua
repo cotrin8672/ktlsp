@@ -1,7 +1,7 @@
 return function(env)
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
   local client, check = env.client, env.check
-  local files = { target = 'fixture/Target.java', alternate = 'fixture/SecondTarget.java', mixin = 'fixture/CaseMixin.java' }
+  local files = { target = 'fixture/Target.java', alternate = 'fixture/SecondTarget.java', mixin = 'fixture/CaseMixin.java', nominaltarget = 'fixture/NominalTarget.java', nominaljava = 'fixture/NominalMixin.java', nominalkotlin = 'fixture/NominalKotlinMixin.kt', blockpos = 'fixture/BlockPos.java', blockstate = 'fixture/BlockState.java' }
   local buffers, paths, original, pending, outbound = {}, {}, {}, {}, {}
   local requests, snapshots = {}, {}
   local notify = client.rpc.notify
@@ -14,7 +14,7 @@ return function(env)
     local path = vim.fs.abspath(env.project .. '/' .. file)
     local buf = vim.fn.bufadd(path)
     vim.fn.bufload(buf)
-    vim.bo[buf].filetype = 'java'
+    vim.bo[buf].filetype = file:match('%.kt$') and 'kotlin' or 'java'
     paths[key], buffers[key], original[key] = path, buf, vim.fn.readfile(path)
     env.sources[path] = env.sources[path] or { buf = buf, disk = original[key], sha256 = vim.fn.sha256(table.concat(original[key], '\n')) }
     vim.lsp.buf_attach_client(buf, client.id)
@@ -145,6 +145,82 @@ return function(env)
   diagnostic('unsaved missing target reports honest incomplete hint', true)
   set('mixin', replaced('mixin', 'twice', 'changed'))
   exact('unsaved shadow rename binds current target', 'mixin', 'public abstract int shadow$changed', 'shadow$changed', 'changed')
+
+  local function nominal_token(key, member)
+    return key == 'nominaljava' and member ~= 'anchor' and 'shadow$' .. member or member
+  end
+  local function nominal_anchor(key, member)
+    if key == 'nominalkotlin' then return member == 'anchor' and 'lateinit var anchor' or 'abstract fun ' .. member end
+    return nominal_token(key, member)
+  end
+  local function nominal_definition(name, key, member, wanted)
+    local token = nominal_token(key, member)
+    local _, range = probe.find(lines('nominaltarget'), member, member)
+    return request(name, key, nominal_anchor(key, member), token, 'textDocument/definition', nil, function(result)
+      if wanted then return probe.exact_definition(result, paths.nominaltarget, { range }) end
+      for _, location in ipairs(probe.locations(result)) do
+        if probe.path_key(vim.uri_to_fname(location.uri or location.targetUri)) == probe.path_key(paths.nominaltarget) then return false end
+      end
+      return true
+    end)
+  end
+  local function nominal_completion(name, key, wanted)
+    local token = nominal_token(key, 'lookup')
+    request(name, key, nominal_anchor(key, 'lookup'), token, 'textDocument/completion', { context = { triggerKind = 1 } }, function(result)
+      local found = false
+      for _, item in ipairs(result and result.items or result or {}) do
+        if item.detail == 'fixture.NominalTarget (Lfixture/BlockPos;)Lfixture/BlockState;' then found = true end
+      end
+      return found == wanted
+    end)
+  end
+  local function nominal_diagnostic(name, key, wanted)
+    local token = nominal_token(key, 'lookup')
+    request(name, key, nominal_anchor(key, 'lookup'), token, 'textDocument/diagnostic', nil, function(result)
+      if type(result) ~= 'table' or result.kind ~= 'full' or type(result.items) ~= 'table' then return false end
+      local found = false
+      for _, item in ipairs(result.items) do
+        if item.message == 'External Shadow: target binding is incomplete' then found = true end
+      end
+      return found == wanted
+    end)
+  end
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do
+    for _, member in ipairs({ 'lookup', 'positions', 'anchor' }) do
+      nominal_definition(key .. ' exact nominal ' .. member, key, member, true)
+    end
+    nominal_completion(key .. ' completion shares canonical nominal descriptor', key, true)
+    local token = nominal_token(key, 'lookup')
+    request(key .. ' nominal return chain remains useful', key, token .. '(pos).solid', 'solid', 'textDocument/completion', { context = { triggerKind = 1 } }, function(result) return probe.completion_has(result, 'solid') end)
+    nominal_diagnostic(key .. ' valid nominal bindings have no extension diagnostic', key, false)
+  end
+  set('nominaltarget', vim.split(table.concat(original.nominaltarget, '\n'):gsub('BlockState lookup', 'BlockPos lookup'):gsub('return new BlockState%(%);', 'return pos;'), '\n', { plain = true }))
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do
+    nominal_definition(key .. ' changed return type retracts binding', key, 'lookup', false)
+    nominal_diagnostic(key .. ' changed descriptor reports incomplete binding', key, true)
+  end
+  set('nominaltarget', original.nominaltarget)
+  set('blockstate', replaced('blockstate', 'class BlockState', 'class MissingState'))
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do
+    nominal_definition(key .. ' missing reference identity retracts binding', key, 'lookup', false)
+    nominal_diagnostic(key .. ' missing reference identity stays unknown', key, true)
+  end
+  set('blockstate', original.blockstate)
+  set('alternate', vim.list_extend(vim.deepcopy(original.alternate), { 'class BlockState {}' }))
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do
+    nominal_definition(key .. ' ambiguous reference identity retracts binding', key, 'lookup', false)
+    nominal_diagnostic(key .. ' ambiguous reference identity stays unknown', key, true)
+  end
+  set('alternate', original.alternate)
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do nominal_definition(key .. ' restored reference identity restores binding', key, 'lookup', true) end
+  configure(false)
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do
+    nominal_definition(key .. ' disabled nominal provider retracts binding', key, 'lookup', false)
+    nominal_completion(key .. ' disabled provider retracts descriptor contribution', key, false)
+    nominal_diagnostic(key .. ' disabled nominal provider retracts diagnostic', key, false)
+  end
+  configure(true)
+  for _, key in ipairs({ 'nominaljava', 'nominalkotlin' }) do nominal_definition(key .. ' reenabled nominal provider restores binding', key, 'lookup', true) end
   for key in pairs(files) do set(key, original[key]); vim.bo[buffers[key]].modified = false end
   deliver('final restore')
   client.rpc.notify = notify

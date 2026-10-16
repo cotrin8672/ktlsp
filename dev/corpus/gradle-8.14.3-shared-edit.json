@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "project_id": "gradle-8.14.3-shared-edit",
+  "revision": "e5ee1df3d88b8ca3a8074787a94f373e3090e1db",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "ProblemReportCreator",
+      "target": "platforms/ide/problems-api/src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java",
+      "target_anchor": "public interface ProblemReportCreator {",
+      "target_token": "ProblemReportCreator",
+      "expected": "Kotlin implements Java ProblemReportCreator from :problems-api; required override signatures are createReportFile(File,List<ProblemSummaryData>) and addProblem(InternalProblem).",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "compiler_status": "focused problems Java+Kotlin compilation passed (root 28m46s)",
+      "target_sha256": "dbb47bcb3ba697c291663e41df6cbbbb9f24ab97faec4edeb6c90547234db361",
+      "completion": false,
+      "module": ":problems",
+      "id": "gradle-kotlin-java-interface",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "anchor": ") : ProblemReportCreator {"
+    }
+  ],
+  "shared_edit": {
+    "producer": "platforms/ide/problems-api/src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java",
+    "consumer": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+    "source_sha256": {
+      "producer": "dbb47bcb3ba697c291663e41df6cbbbb9f24ab97faec4edeb6c90547234db361",
+      "consumer": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+    },
+    "control": "addProblem",
+    "recipes": {
+      "text": {
+        "producer": "  default String ktlspSliceText() { return \"slice\"; }",
+        "consumer": "private fun ktlspConsumerSlice(provider: ProblemReportCreator): String {\n  return provider.ktlspSliceText().substring(0)\n}"
+      },
+      "counter": {
+        "producer": "  default java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() { return new java.util.concurrent.atomic.AtomicInteger(); }",
+        "consumer": "private fun ktlspConsumerSlice(provider: ProblemReportCreator): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}"
+      }
+    },
+    "additional_request_count": 14,
+    "consumer_insertion": "file",
+    "stages": {
+      "text": {
+        "producer": {
+          "sha256": "c044ea4b3dbd6cfbf582c077654c5b2b2ee9909ab205cad06eb3e0e0393b3b36"
+        },
+        "consumer": {
+          "sha256": "6b6c369c67e570a375c1c061be43971066bb2245c6e988db7090d965c39d91ad"
+        }
+      },
+      "counter": {
+        "producer": {
+          "sha256": "010f274a630abed4d82e5a144aeab55d173d9fe934a0a098c23933cfdd1a67e0"
+        },
+        "consumer": {
+          "sha256": "7c9d1aff7f2f379c597ba08e5f399c316cad4f542f8c17eb4f0d33139fdb5832"
+        }
+      },
+      "renamed": {
+        "producer": {
+          "sha256": "626dfdf37c14a23d07455321ed6e2de877f912f6b27cac6892d0ed520410785b"
+        },
+        "consumer": {
+          "sha256": "0e3d5071c4fd148828b918441cefa724c19c16d9ef3300299ab7251aa89dcbfd"
+        }
+      },
+      "retracted": {
+        "producer": {
+          "sha256": "dbb47bcb3ba697c291663e41df6cbbbb9f24ab97faec4edeb6c90547234db361"
+        },
+        "consumer": {
+          "sha256": "7c9d1aff7f2f379c597ba08e5f399c316cad4f542f8c17eb4f0d33139fdb5832"
+        }
+      }
+    },
+    "oracle_status": "UNRUN; source snapshots require actual compiler verification before valid-diagnostic acceptance"
+  }
+}

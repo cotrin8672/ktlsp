@@ -137,6 +137,12 @@ impl Backend {
         let changed = {
             let mut ws = self.ws.lock();
             state.requested = ws.begin_analysis_generation();
+            crate::trace::span(
+                "workspace.refresh_requested",
+                "workspace",
+                Instant::now(),
+                serde_json::json!({"root": root.to_string_lossy(), "generation": state.requested}),
+            );
             self.jdk_source_seeds.lock().clear();
             ws.take_extension_diagnostic_changes()
         };
@@ -935,6 +941,8 @@ fn index_dependency_model(
         coords = deps::coordinates_for_root(root);
         coords.extend(deps::cached_catalog_coordinates(root, &repos));
         coords.extend(deps::coordinates_from_build_files(root, &repos));
+        // Standalone editing uses the documented product default; Gradle owns its classpath.
+        deps::inject_stdlib(&mut coords, true);
     }
     let mut local_jars = VecDeque::new();
     let authoritative = gradle
@@ -1619,11 +1627,22 @@ async fn index_workspace(
     );
     let accepted = {
         let mut guard = ws.lock();
-        guard.finish_analysis_generation(
+        let accepted = guard.finish_analysis_generation(
             generation,
             stats.failed == 0 && stats.missing_sources == 0 && !stats.incomplete_classpath,
             stats.jdk_complete,
-        )
+        );
+        if accepted {
+            crate::trace::span(
+                "workspace.accepted_finish",
+                "workspace",
+                Instant::now(),
+                serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+                    "failed": stats.failed, "missingSources": stats.missing_sources,
+                    "classpathComplete": !stats.incomplete_classpath}),
+            );
+        }
+        accepted
     };
     if !accepted {
         if let Some(p) = ongoing {

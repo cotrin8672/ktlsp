@@ -60,8 +60,8 @@ pub enum Visibility {
     Private,
 }
 
-/// Only these JVM types have a normalized representation in this first contract. An unresolved
-/// class or type parameter must remain Unknown; in particular, it must not be erased to Object.
+/// Normalized scalar types and host-issued nominal identities. An unresolved class or type
+/// parameter must remain Unknown; in particular, it must not be erased to Object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JvmType {
     Boolean,
@@ -73,8 +73,16 @@ pub enum JvmType {
     Float,
     Double,
     String,
+    Reference(JvmReference),
     Array(Box<JvmType>),
     Void,
+}
+
+/// A scoped nominal JVM identity issued by the host; providers cannot construct owner names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JvmReference {
+    owner: TypeId,
+    internal_name: String,
 }
 
 impl JvmType {
@@ -83,6 +91,16 @@ impl JvmType {
             Self::Void => false,
             Self::Array(element) => element.valid_value(),
             _ => true,
+        }
+    }
+
+    fn references(&self, out: &mut Vec<TypeId>) {
+        match self {
+            Self::Reference(reference) if !out.contains(&reference.owner) => {
+                out.push(reference.owner.clone())
+            }
+            Self::Array(element) => element.references(out),
+            _ => {}
         }
     }
 
@@ -97,6 +115,11 @@ impl JvmType {
             Self::Float => out.push('F'),
             Self::Double => out.push('D'),
             Self::String => out.push_str("Ljava/lang/String;"),
+            Self::Reference(reference) => {
+                out.push('L');
+                out.push_str(&reference.internal_name);
+                out.push(';');
+            }
             Self::Array(element) => {
                 out.push('[');
                 element.descriptor(out);
@@ -106,10 +129,18 @@ impl JvmType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct MemberSignature {
     kind: MemberKind,
     descriptor: String,
+    references: Vec<TypeId>,
+}
+
+impl PartialEq for MemberSignature {
+    fn eq(&self, other: &Self) -> bool {
+        // Host handles validate provenance at require(); they do not change JVM signature identity.
+        self.kind == other.kind && self.descriptor == other.descriptor
+    }
 }
 
 impl MemberSignature {
@@ -125,9 +156,14 @@ impl MemberSignature {
         }
         descriptor.push(')');
         returns.descriptor(&mut descriptor);
+        let mut references = Vec::new();
+        for ty in parameters.iter().chain(std::iter::once(returns)) {
+            ty.references(&mut references);
+        }
         Ok(Self {
             kind: MemberKind::Method,
             descriptor,
+            references,
         })
     }
 
@@ -137,9 +173,12 @@ impl MemberSignature {
         }
         let mut descriptor = String::new();
         value.descriptor(&mut descriptor);
+        let mut references = Vec::new();
+        value.references(&mut references);
         Ok(Self {
             kind: MemberKind::Field,
             descriptor,
+            references,
         })
     }
 
@@ -501,6 +540,7 @@ struct SourceFacts {
     coverage: Fact<()>,
     members: BTreeMap<(usize, usize), DeclaredMemberFacts>,
     types: Vec<String>,
+    reference_types: BTreeSet<(usize, usize)>,
     declarations: Vec<source::SourceDeclaration>,
     compiled_revision: u64,
     compiled: Option<(TypeId, Arc<crate::classfile::ClassFileFacts>)>,
@@ -805,6 +845,7 @@ impl ExtensionStore {
                 return Err(ContractError::NotIndexedDeclaration);
             }
         }
+        let reference_types = source::ordinary_reference_types(index, file, &text);
         self.next_generation += 1;
         self.sources.insert(
             file.into(),
@@ -814,6 +855,7 @@ impl ExtensionStore {
                 coverage,
                 members: normalized,
                 types,
+                reference_types,
                 declarations: Vec::new(),
                 compiled_revision: self.next_generation,
                 compiled: None,
@@ -1108,6 +1150,7 @@ impl ReadSession<'_> {
         let signature = MemberSignature {
             kind: MemberKind::Method,
             descriptor: method.descriptor.to_string(),
+            references: Vec::new(),
         };
         let (authored, _) = self.declared_members(&handle.class.owner)?;
         // A known same source declaration is already represented by the ordinary authored path.
@@ -1270,18 +1313,189 @@ impl ReadSession<'_> {
         }
     }
 
+    /// Obtain an opaque JVM reference from one current, unambiguous host-issued source identity.
+    pub fn reference_type(&mut self, owner: &TypeId) -> Result<Fact<JvmType>, ContractError> {
+        self.check_type(owner)?;
+        match self.resolve_type(owner.qualified_name()) {
+            Knowledge::Found(current) if current == *owner => {}
+            Knowledge::Unknown(reasons) => return Ok(Knowledge::Unknown(reasons)),
+            _ => return Ok(unknown(IncompleteReason::IncompleteTarget)),
+        }
+        let source = &self.store.sources[&owner.definition().file];
+        if !source
+            .reference_types
+            .contains(&(owner.definition().start_byte, owner.definition().end_byte))
+        {
+            return Ok(unknown(IncompleteReason::UnsupportedType(
+                owner.qualified_name.clone(),
+            )));
+        }
+        let name = owner.container.replace('.', "$");
+        let internal_name = if owner.package.is_empty() {
+            name
+        } else {
+            format!("{}/{}", owner.package.replace('.', "/"), name)
+        };
+        Ok(Knowledge::Found(JvmType::Reference(JvmReference {
+            owner: owner.clone(),
+            internal_name,
+        })))
+    }
+
+    fn source_jvm_type(
+        &mut self,
+        ty: &crate::types::TypeRef,
+        context: &crate::infer::FileCtx,
+        java: bool,
+        parameters: &[String],
+    ) -> Option<JvmType> {
+        if ty.nullable || ty.qualification.is_none() && parameters.contains(&ty.name) {
+            return None;
+        }
+        if java && ty.name.ends_with("[]") {
+            let mut component = ty.clone();
+            component.name = ty.name.strip_suffix("[]")?.to_string();
+            return self
+                .source_jvm_type(&component, context, java, parameters)
+                .map(|element| JvmType::Array(Box::new(element)));
+        }
+        if !java
+            && ty.name == "Array"
+            && ty.args.len() == 1
+            && (ty.qualification.as_deref() == Some("kotlin")
+                || ty.qualification.is_none()
+                    && ty
+                        .package_candidates
+                        .iter()
+                        .any(|package| package == "kotlin")
+                    && !self.index.lookup_type("Array").iter().any(|entry| {
+                        entry.sym.container.is_none()
+                            && entry.sym.package != "kotlin"
+                            && (ty.package_candidates.contains(&entry.sym.package)
+                                || entry.sym.package == context.package)
+                    }))
+        {
+            let element = self.source_jvm_type(&ty.args[0], context, java, parameters)?;
+            // Kotlin Array<Int> boxes its elements; do not pretend it is an int[].
+            return matches!(
+                element,
+                JvmType::Reference(_) | JvmType::String | JvmType::Array(_)
+            )
+            .then(|| JvmType::Array(Box::new(element)));
+        }
+        if !ty.args.is_empty() {
+            return None;
+        }
+        if let Some(scalar) =
+            source::source_scalar_jvm_type(&self.index, ty, context, java, parameters)
+        {
+            return Some(scalar);
+        }
+        let crate::types::Type::Class {
+            name,
+            package,
+            container,
+            ..
+        } = crate::infer::declared_type(&self.index, ty, context)
+        else {
+            return None;
+        };
+        let qualified = [
+            package.unwrap_or_default(),
+            container.unwrap_or_default(),
+            name,
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+        let Knowledge::Found(owner) = self.resolve_type(&qualified) else {
+            return None;
+        };
+        match self.reference_type(&owner).ok()? {
+            Knowledge::Found(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn source_member_signature(
+        &mut self,
+        entry: &Entry,
+        facts: &DeclaredMemberFacts,
+    ) -> Fact<MemberSignature> {
+        if !matches!(&facts.signature, Knowledge::Unknown(reasons) if !reasons.is_empty()
+            && reasons.iter().all(|reason| matches!(reason, IncompleteReason::UnsupportedType(_))))
+        {
+            return facts.signature.clone();
+        }
+        let source = &self.store.sources[entry.path.as_ref()];
+        // Only the host's accepted source adapter can request this normalization. Other Unknown facts stay Unknown.
+        if !source.declarations.iter().any(|declaration| {
+            declaration.definition == facts.definition && declaration.member.as_ref() == Some(facts)
+        }) || !matches!(facts.dispatch, Knowledge::Found(_))
+            || !matches!(facts.visibility, Knowledge::Found(_))
+            || facts.synthetic != Knowledge::Found(false)
+        {
+            return facts.signature.clone();
+        }
+        let context = crate::infer::FileCtx::new(entry.sym.package.clone(), Vec::new());
+        let parameters = source::member_type_parameters(&self.index, &entry.path, &entry.sym);
+        let signature = if entry.sym.kind == SymbolKind::Property {
+            entry
+                .sym
+                .value_type
+                .as_ref()
+                .and_then(|ty| {
+                    self.source_jvm_type(ty, &context, entry.path.ends_with(".java"), &parameters)
+                })
+                .and_then(|ty| MemberSignature::field(&ty).ok())
+        } else if !entry.sym.has_vararg
+            && entry.sym.arity == Some(entry.sym.params.len().min(u8::MAX as usize) as u8)
+        {
+            let converted: Option<Vec<_>> = entry
+                .sym
+                .params
+                .iter()
+                .map(|ty| {
+                    self.source_jvm_type(ty, &context, entry.path.ends_with(".java"), &parameters)
+                })
+                .collect();
+            let returns = entry.sym.return_type.as_ref().and_then(|ty| {
+                self.source_jvm_type(ty, &context, entry.path.ends_with(".java"), &parameters)
+            });
+            match (converted, returns) {
+                (Some(parameters), Some(returns)) => {
+                    MemberSignature::method(&parameters, &returns).ok()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        signature
+            .map(Knowledge::Found)
+            .unwrap_or_else(|| facts.signature.clone())
+    }
+
     pub fn declared_members(
         &mut self,
         target: &TypeId,
     ) -> Result<(Vec<MemberCandidate>, Fact<()>), ContractError> {
         self.check_type(target)?;
-        let source = &self.store.sources[&target.definition().file];
+        let store = self.store;
+        let source = &store.sources[&target.definition().file];
         self.reads
             .files
             .insert(target.definition().file.clone(), source.generation);
         let mut coverage = source.coverage.clone();
         let mut members = Vec::new();
-        for entry in self.index.members_of(&target.container) {
+        let entries: Vec<_> = self
+            .index
+            .members_of(&target.container)
+            .into_iter()
+            .cloned()
+            .collect();
+        for entry in &entries {
             if entry.path.as_ref() != target.definition().file
                 || entry.sym.package != target.package
                 || entry.sym.container.as_deref() != Some(target.container.as_str())
@@ -1301,7 +1515,7 @@ impl ReadSession<'_> {
                 .get(&(definition.start_byte, definition.end_byte));
             let signature = facts.map_or_else(
                 || unknown(IncompleteReason::MissingFacts),
-                |facts| facts.signature.clone(),
+                |facts| self.source_member_signature(entry, facts),
             );
             let declaration = DeclarationId {
                 host: self.store.host,
@@ -1360,6 +1574,11 @@ impl ReadSession<'_> {
         if matches!(&requirement.signature, Knowledge::Found(signature) if signature.kind != requirement.kind)
         {
             return Err(ContractError::InvalidSignature);
+        }
+        if let Knowledge::Found(signature) = &requirement.signature {
+            for reference in &signature.references {
+                self.check_type(reference)?;
+            }
         }
         let (mut candidates, coverage) = match &requirement.target {
             Knowledge::Found(target) => self.declared_members(target)?,
@@ -1766,5 +1985,83 @@ fn validate_entry(text: &str, entry: &Entry) -> Result<(), ContractError> {
         Err(ContractError::NotIndexedDeclaration)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod nominal_reference_tests {
+    use super::*;
+    use crate::{index::Index, index::Tier, indexer, parser::KotlinParser};
+
+    #[test]
+    fn repeated_self_reference_reads_do_not_parse_and_source_edits_retract_eligibility() {
+        const FILE: &str = "/perf/Self.kt";
+        const PROVIDER: &str = "self-reference";
+        let mut index = Index::new();
+        let mut store = ExtensionStore::default();
+        store.configure_provider(PROVIDER, true, Arc::from("{}"));
+        let scope = indexer::TypeScope::with_default_imports("perf", Vec::new(), &["kotlin"]);
+        let update = |text: &str, index: &mut Index, store: &mut ExtensionStore| {
+            let tree = KotlinParser::new().parse(text);
+            assert!(!tree.root_node().has_error());
+            index.replace_file(
+                FILE,
+                indexer::extract_symbols(&tree, text, "perf"),
+                Tier::Volatile,
+            );
+            let declarations = source::extract(index, FILE, &tree, text, &scope);
+            store
+                .replace_source_declarations(
+                    index,
+                    FILE,
+                    Arc::from(text),
+                    Knowledge::Found(()),
+                    declarations,
+                )
+                .unwrap();
+        };
+        let methods = (0..16)
+            .map(|number| format!("fun same{number}(a: Self, b: Self): Self = a\n"))
+            .collect::<String>();
+        let text = format!("package perf\nclass Self {{\n{methods}}}\n");
+        let start = source::reference_parse_count();
+        update(&text, &mut index, &mut store);
+        let after_upsert = source::reference_parse_count();
+        for _ in 0..4 {
+            let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
+            let Knowledge::Found(owner) = read.resolve_type("perf.Self") else {
+                panic!("Self identity")
+            };
+            let (members, _) = read.declared_members(&owner).unwrap();
+            assert_eq!(members.len(), 16);
+            assert!(members.iter().all(|member| matches!(&member.signature, Knowledge::Found(signature) if signature.descriptor() == "(Lperf/Self;Lperf/Self;)Lperf/Self;")));
+        }
+        assert_eq!(
+            source::reference_parse_count() - after_upsert,
+            0,
+            "four reads of 16 self-referencing methods; upsert parses={}",
+            after_upsert - start
+        );
+        assert_eq!(
+            after_upsert - start,
+            1,
+            "one additional eligibility parse per source update"
+        );
+        update(
+            "package perf\n@JvmInline value class Self(val value: Int)\n",
+            &mut index,
+            &mut store,
+        );
+        let after_edit = source::reference_parse_count();
+        assert_eq!(after_edit - after_upsert, 1);
+        let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
+        let Knowledge::Found(owner) = read.resolve_type("perf.Self") else {
+            panic!("edited identity")
+        };
+        assert!(matches!(
+            read.reference_type(&owner).unwrap(),
+            Knowledge::Unknown(_)
+        ));
+        assert_eq!(source::reference_parse_count(), after_edit);
     }
 }

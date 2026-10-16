@@ -82,7 +82,13 @@ corpus results in the selected compiler recipe run directory.
 
 Host parser unit checks passed. The stock release matched all eight baseline completion and
 exact source-navigation requests, including inherited-ISO `café`, and shut down cleanly.
-The parent-edit and recovery probe is being verified separately.
+The parent-edit probe retracted the old decoded source and restored both completion and exact
+source bytes/ranges after recovery. Its required binary `known` completion was empty while the
+selected encoding was invalid, so that acceptance remains failed. See
+`native-gradle-parent-stock87-2/receipt.json` and `selected-parent-proof.json` in its referenced
+editor artifacts. All five extra requests ran; shutdown was clean, no processes survived, and
+the parent bytes were restored. The next action is to preserve unchanged binary visibility
+when retiring dependency source facts, then rerun this same probe.
 
 The actual within-project collision control in `native-gradle-parent-collision87-2/receipt.json`
 placed the child only in repository B and conflicting parent POMs in repositories A and B.

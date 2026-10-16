@@ -712,17 +712,15 @@ fn local_shadows_bare_type_name() {
 }
 
 // --------------------------------------------------------------------------------------------
-// Documented limitation
+// Local declaration order
 // --------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "documented limitation: a local fun declared below the cursor is not offered (before-use)"]
-fn hoisted_local_fun_not_offered() {
-    // Kotlin hoists local functions, but Stage A inherits scan_block's uniform before-use filter,
-    // so a local `fun` declared textually below the cursor is not offered.
+fn local_functions_respect_declaration_order() {
+    check_none("fun main() {\n    loc/*^*/\n    fun localFunction() {}\n}\n");
     check_contains(
-        "fun main() {\n    hoi/*^*/\n    fun hoisted() {}\n}\n",
-        &["hoisted"],
+        "fun main() {\n    fun localFunction() {}\n    loc/*^*/\n}\n",
+        &["localFunction"],
     );
 }
 

@@ -361,7 +361,7 @@ pub fn candidates<'a>(
     name: &str,
     ctx: &FileCtx,
 ) -> Candidates<'a> {
-    matching_candidates(index, receiver, MemberName::Exact(name), ctx)
+    matching_candidates(index, receiver, MemberName::Exact(name), ctx, true)
 }
 
 pub fn candidates_at<'a>(
@@ -371,7 +371,14 @@ pub fn candidates_at<'a>(
     ctx: &'a FileCtx,
     position: usize,
 ) -> Candidates<'a> {
-    matching_candidates_at(index, receiver, MemberName::Exact(name), ctx, position)
+    matching_candidates_at(
+        index,
+        receiver,
+        MemberName::Exact(name),
+        ctx,
+        position,
+        true,
+    )
 }
 
 pub fn completion_candidates_at<'a>(
@@ -380,8 +387,16 @@ pub fn completion_candidates_at<'a>(
     prefix: &str,
     ctx: &'a FileCtx,
     position: usize,
+    include_extensions: bool,
 ) -> Candidates<'a> {
-    matching_candidates_at(index, receiver, MemberName::Prefix(prefix), ctx, position)
+    matching_candidates_at(
+        index,
+        receiver,
+        MemberName::Prefix(prefix),
+        ctx,
+        position,
+        include_extensions,
+    )
 }
 
 fn matching_candidates_at<'a>(
@@ -390,8 +405,15 @@ fn matching_candidates_at<'a>(
     name: MemberName<'_>,
     ctx: &'a FileCtx,
     position: usize,
+    include_extensions: bool,
 ) -> Candidates<'a> {
-    let mut result = matching_candidates(index, receiver, name, ctx);
+    let mut result = matching_candidates(index, receiver, name, ctx, include_extensions);
+    result
+        .members
+        .retain(|entry| member_accessible_at(index, receiver, entry, ctx, position));
+    if !include_extensions {
+        return result;
+    }
     let mut scopes = BTreeMap::new();
     for local in ctx.local_extensions.iter().flat_map(|locals| locals.iter()) {
         if !local.scope.contains(&position)
@@ -509,8 +531,9 @@ pub(crate) fn matching_candidates<'a>(
     receiver: &Type,
     name: MemberName<'_>,
     ctx: &FileCtx,
+    include_extensions: bool,
 ) -> Candidates<'a> {
-    let mut result = collect_candidates(index, receiver, name, ctx, true);
+    let mut result = collect_candidates(index, receiver, name, ctx, include_extensions);
     remove_overridden_members(index, receiver, &mut result.members, ctx, false);
     result
 }
@@ -599,6 +622,51 @@ fn collect_candidates<'a>(
             &ctx.package,
         ));
     }
+    if let (true, MemberName::Prefix(prefix)) = (include_extensions, name) {
+        let names: BTreeSet<_> = index
+            .entries_with_prefix(prefix, true)
+            .filter(|entry| {
+                entry.sym.ext_receiver.as_deref().is_some_and(|receiver| {
+                    entry
+                        .sym
+                        .type_params
+                        .iter()
+                        .any(|parameter| parameter == receiver)
+                })
+            })
+            .map(|entry| entry.sym.name.as_str())
+            .collect();
+        extensions.extend(
+            names
+                .into_iter()
+                .flat_map(|name| index.lookup_by_name(name))
+                .chain(
+                    ctx.imports
+                        .iter()
+                        .filter(|import| {
+                            import
+                                .alias
+                                .as_deref()
+                                .is_some_and(|alias| alias.starts_with(prefix))
+                        })
+                        .flat_map(|import| index.lookup_by_name(import.simple_name())),
+                )
+                .filter(|entry| {
+                    entry.sym.container.is_none()
+                        && entry.sym.ext_receiver.as_deref().is_some_and(|receiver| {
+                            entry
+                                .sym
+                                .type_params
+                                .iter()
+                                .any(|parameter| parameter == receiver)
+                        })
+                })
+                .filter(|entry| {
+                    resolve::visible_extension_names(entry, &ctx.imports, &ctx.package)
+                        .any(|visible| visible.starts_with(prefix))
+                }),
+        );
+    }
     extensions.retain(|entry| {
         !unavailable_members.iter().any(|(name, kind, _)| {
             *kind == entry.sym.kind
@@ -655,6 +723,73 @@ pub fn receiver_member_accessible(receiver: &Type, entry: &Entry) -> bool {
                 != Some(crate::symbol::MemberImplementation::Constructor)
             && entry.sym.ext_receiver.is_none()
             && entry.sym.extension_receiver.is_none()
+}
+
+/// Shared caller access for normalized source and classfile-backed declarations.
+pub fn member_accessible_at(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    ctx: &FileCtx,
+    position: usize,
+) -> bool {
+    use crate::extensions::{Dispatch, Visibility};
+    let flags = entry.sym.source_member;
+    let visibility = flags.visibility();
+    if visibility == Some(Visibility::Public) || visibility.is_none() {
+        return true;
+    }
+    if visibility == Some(Visibility::Package) {
+        return ctx.package == entry.sym.package;
+    }
+    if visibility == Some(Visibility::Protected)
+        && flags.protected_package_access()
+        && ctx.package == entry.sym.package
+    {
+        return true;
+    }
+    let Some(caller) = ctx.caller_type(index, position) else {
+        return false;
+    };
+    let owner_matches = |ty: &Type| {
+        ty.package() == Some(entry.sym.package.as_str())
+            && infer::receiver_root_key(index, ty).as_deref() == entry.sym.container.as_deref()
+    };
+    if visibility == Some(Visibility::Private) {
+        return owner_matches(&caller);
+    }
+    let subclass = infer::walk_supertypes(index, &caller, 32, |current| {
+        if owner_matches(current) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break();
+    if !subclass {
+        return false;
+    }
+    if flags.dispatch() == Some(Dispatch::Static) {
+        return true;
+    }
+    if ctx.super_access_at(position)
+        && infer::direct_supertypes(index, &caller)
+            .iter()
+            .any(|parent| parent == receiver)
+    {
+        return true;
+    }
+    infer::walk_supertypes(index, receiver, 32, |current| {
+        if current.name() == caller.name()
+            && current.package() == caller.package()
+            && current.container() == caller.container()
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 // shortcut: static/visibility validity needs declaration metadata before invalid overrides can be diagnosed.
