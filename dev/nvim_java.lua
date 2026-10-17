@@ -1832,23 +1832,24 @@ for _, case in ipairs({
   end
 end
 
+local function watch_changes(buffer)
+  local notify, wire, delivery = client.rpc.notify, probe.buffer_full_text(buffer), nil
+  client.rpc.notify = function(method, params)
+    local sent = notify(method, params)
+    if method == "textDocument/didChange" and params.textDocument.uri == vim.uri_from_bufnr(buffer) then
+      local next_wire, err = probe.apply_content_changes(wire, params.contentChanges,
+        client.offset_encoding or "utf-16")
+      if sent and next_wire then wire = next_wire end
+      delivery = { sent = not not sent, version = params.textDocument.version, error = err,
+        text = wire, source_sha256 = probe.buffer_sha256(buffer), wire_source_sha256 = vim.fn.sha256(wire) }
+    end
+    return sent
+  end
+  return function() client.rpc.notify = notify; return delivery end
+end
+
 -- Annotation names must remain completable before their declarations are finished.
 do
-  local function watch_changes(buffer)
-    local notify, wire, delivery = client.rpc.notify, probe.buffer_full_text(buffer), nil
-    client.rpc.notify = function(method, params)
-      local sent = notify(method, params)
-      if method == "textDocument/didChange" and params.textDocument.uri == vim.uri_from_bufnr(buffer) then
-        local next_wire, err = probe.apply_content_changes(wire, params.contentChanges,
-          client.offset_encoding or "utf-16")
-        if sent and next_wire then wire = next_wire end
-        delivery = { sent = not not sent, version = params.textDocument.version, error = err,
-          text = wire, source_sha256 = probe.buffer_sha256(buffer), wire_source_sha256 = vim.fn.sha256(wire) }
-      end
-      return sent
-    end
-    return function() client.rpc.notify = notify; return delivery end
-  end
   local kotlin_buf = vim.fn.bufadd(project .. "/app/KotlinHelper.kt")
   vim.fn.bufload(kotlin_buf)
   vim.bo[kotlin_buf].filetype = "kotlin"
@@ -1994,7 +1995,7 @@ do
     "fun universalName(value: UniversalPlain) = value.javaClass.name" }
   local invalid = { valid[1], valid[2],
     "fun universalName(value: UniversalPlain) = value.missingUniversal" }
-  local report = { phases = {} }
+  local report = { phases = {}, completions = {} }
   for _, phase in ipairs({ { name = "valid", source = valid, missing = false },
       { name = "missing", source = invalid, missing = true },
       { name = "restored", source = valid, missing = false } }) do
@@ -2018,6 +2019,46 @@ do
     report.phases[#report.phases + 1] = { name = phase.name,
       text = probe.buffer_full_text(buffer), observation = observation }
   end
+  for _, case in ipairs({
+    { name = "canonical blank", prefix = "", wanted = "javaClass" },
+    { name = "canonical prefix", prefix = "javaC", wanted = "javaClass" },
+    { name = "alias blank", alias = true, prefix = "", wanted = "runtimeClass" },
+    { name = "alias prefix", alias = true, prefix = "runtimeC", wanted = "runtimeClass" },
+    { name = "alias hides canonical", alias = true, prefix = "javaC" },
+  }) do
+    local lines = { "package app" }
+    if case.alias then lines[#lines + 1] = "import kotlin.jvm.javaClass as runtimeClass" end
+    lines[#lines + 1] = "class UniversalPlain"
+    lines[#lines + 1] = "fun universalMembers(value: UniversalPlain) { value." .. case.prefix .. " }"
+    local finish_delivery = watch_changes(buffer)
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, lines)
+    require("vim.lsp._changetracking").flush(client)
+    local delivery = finish_delivery()
+    local position = { line = #lines - 1,
+      character = assert(lines[#lines]:find("value.", 1, true)) - 1 + #"value." + #case.prefix }
+    local response, row = request_rpc("textDocument/completion", {
+      textDocument = { uri = vim.uri_from_bufnr(buffer) }, position = position }, buffer)
+    local result = response and response.result
+    local found, hidden = false, true
+    for _, item in ipairs(result and result ~= vim.NIL and (result.items or result) or {}) do
+      if item.label == case.wanted then found = true end
+      if case.alias and item.label == "javaClass" then hidden = false end
+    end
+    local matched = row.availability == "responded" and hidden and (not case.wanted or found)
+    check("Kotlin universal JVM property " .. case.name .. " first completion",
+      matched, vim.inspect(result), row)
+    local exact_wire = delivery and delivery.sent and not delivery.error
+      and delivery.version == vim.lsp.util.buf_versions[buffer]
+      and delivery.source_sha256 == probe.buffer_sha256(buffer)
+      and delivery.wire_source_sha256 == delivery.source_sha256
+      and delivery.text == table.concat(lines, "\n") .. "\n"
+    check("Kotlin universal JVM property " .. case.name .. " keeps exact unsaved source",
+      exact_wire and vim.bo[buffer].modified and vim.deep_equal(vim.fn.readfile(path, "b"), original_disk),
+      vim.inspect(delivery))
+    report.completions[#report.completions + 1] = { name = case.name, request = row,
+      delivery = delivery, expected_label = case.wanted, canonical_hidden = hidden,
+      exact_current_wire = not not exact_wire }
+  end
   if vim.env.KTLSP_TRACE then
     vim.fn.writefile({ vim.json.encode(report) },
       vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/kotlin-universal-property.json")
@@ -2030,6 +2071,51 @@ do
   vim.bo[buffer].modified = original_modified
 end
 
+
+-- Enum constants keep their implicit public/static role without guessing an unproved type name.
+do
+  local original = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local original_modified = vim.bo[bufnr].modified
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  local disk, snapshots = vim.fn.readfile(path), {}
+  for _, case in ipairs({
+    { name = "plain enum namespace", header = "class Main", params = "", receiver = "EnumProbeMode", expected = true },
+    { name = "annotated enum namespace", header = "@UnknownProducer class Main", params = "", receiver = "EnumProbeMode", expected = false },
+    { name = "shadowed enum namespace", header = "class Main", params = "Object EnumProbeMode", receiver = "EnumProbeMode", expected = false },
+    { name = "malformed local enum shadow", header = "class Main", params = "", receiver = "EnumProbeMode", before = "Object EnumProbeMode = ; ", expected = false },
+    { name = "annotated explicit enum value", header = "@UnknownProducer class Main", params = "EnumProbeMode value", receiver = "value", expected = true },
+  }) do
+    local lines = { "package app;", "enum EnumProbeMode { ENABLED, DISABLED }",
+      case.header .. " { boolean enumProbe(" .. case.params .. ") { " .. (case.before or "")
+        .. "return " .. case.receiver .. ".ENABLED == " .. case.receiver .. ".DISABLED; } }" }
+    local stop = watch_changes(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+    require("vim.lsp._changetracking").flush(client)
+    local delivery = stop()
+    local position = probe.find(lines, "return ", "ENABLED")
+    local _, target = probe.find(lines, "enum EnumProbeMode", "ENABLED")
+    local response, observation = request_rpc("textDocument/definition", {
+      textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = position,
+    }, bufnr)
+    local result = response and response.result
+    local ok = case.expected and probe.exact_definition(result, path, { target })
+      or not case.expected and #probe.locations(result) == 0
+    check(case.name .. " exact enum navigation", ok, vim.inspect(result), observation)
+    check(case.name .. " uses exact delivered unsaved source", delivery and delivery.sent
+      and delivery.version == vim.lsp.util.buf_versions[bufnr]
+      and delivery.text == probe.buffer_full_text(bufnr)
+      and delivery.source_sha256 == delivery.wire_source_sha256
+      and vim.deep_equal(vim.fn.readfile(path), disk), vim.inspect(delivery))
+    snapshots[#snapshots + 1] = { name = case.name, source = lines, expected = case.expected,
+      expected_range = target, delivery = delivery, observation = observation }
+  end
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/java-enum-namespace.json")
+  end
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, original)
+  require("vim.lsp._changetracking").flush(client)
+  vim.bo[bufnr].modified = original_modified
+end
 
 -- Java parser diagnostics should be published for syntax errors.
 do

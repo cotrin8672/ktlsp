@@ -255,3 +255,38 @@ fn java_type_hierarchy_returns_direct_neighbors() {
         .collect::<Vec<_>>();
     assert_eq!(supertypes, vec!["Base".to_string(), "Named".to_string()]);
 }
+
+#[test]
+fn subtype_candidates_preserve_order_nested_types_and_homonyms() {
+    let mut ws = Workspace::new();
+    let base = "mem:///Base.java";
+    let source = "package app; public interface Base {}";
+    ws.open(base, source.into());
+    ws.open(
+        "mem:///ZLast.java",
+        "package app; class Last implements Base {}".into(),
+    );
+    ws.open(
+        "mem:///AFirst.kt",
+        "package app\nclass Outer { class Nested: Base }\nclass First: Base\n".into(),
+    );
+    ws.open(
+        "mem:///Other.kt",
+        "package other\ninterface Base\nclass Decoy: Base\n".into(),
+    );
+    let parent = ws
+        .hierarchy_item_at(base, source.find("Base").unwrap())
+        .unwrap();
+    let actual: Vec<_> = ws
+        .type_subtypes(&parent)
+        .into_iter()
+        .map(|item| item.name)
+        .collect();
+    assert_eq!(actual, ["Nested", "First", "Last"]);
+    // Both reverse hierarchy entry points retain exactly the same authoritative targets.
+    let implementations = ws.implementation(base, source.find("Base").unwrap());
+    assert_eq!(implementations.len(), actual.len());
+    assert!(implementations
+        .iter()
+        .all(|definition| !definition.file.ends_with("Other.kt")));
+}

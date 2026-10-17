@@ -122,7 +122,7 @@ fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &s
         return false;
     };
     let action = match fact.get("adapter").and_then(Value::as_str) {
-        Some("gradle-7.4.2-stock-actions-v1") => {
+        Some("gradle-7.4.2-stock-actions-v1" | "gradle-7.5-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
         }
         Some("gradle-9.6.1-stock-actions-v1") => {
@@ -147,7 +147,7 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
         return false;
     };
     match fact.get("adapter").and_then(Value::as_str) {
-        Some("gradle-7.4.2-stock-onlyif-v1") => {}
+        Some("gradle-7.4.2-stock-onlyif-v1" | "gradle-7.5-stock-onlyif-v1") => {}
         Some("gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
         _ => return false,
     }
@@ -276,13 +276,7 @@ pub(super) fn import_dependencies(
                 .as_ref()
                 .zip(java.java_home.as_ref())
                 .is_none_or(|(a, b)| !same_path(a, b))
-            || task.options.get("bootstrapClasspath") != Some(&Value::Null)
-            || task.options.get("release") != Some(&Value::Null)
-            || if recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1" {
-                task.options.get("encoding").and_then(Value::as_str) != Some("UTF-8")
-            } else {
-                task.options.get("encoding") != Some(&Value::Null)
-            }
+            || !source_sdk_encoding_supported(task, &recipe)
             || task.output_roots.len() != 1
             || intersecting
                 .iter()
@@ -592,10 +586,25 @@ pub(super) fn selected_tasks_supported(
     let legacy = runtime.compiler_version == "1.8.21" && runtime.gradle_plugin_version == "1.8.21";
     let complete_k2 =
         runtime.compiler_version == "2.4.0" && runtime.gradle_plugin_version == "2.4.0";
-    let adapter = if legacy {
-        "gradle-7.4.2-stock-actions-v1"
+    let gradle75 = legacy
+        && java
+            .options
+            .get("taskActionInventory")
+            .and_then(|fact| fact.get("adapter"))
+            .and_then(Value::as_str)
+            == Some("gradle-7.5-stock-actions-v1");
+    let (adapter, only_if_adapter) = if gradle75 {
+        ("gradle-7.5-stock-actions-v1", "gradle-7.5-stock-onlyif-v1")
+    } else if legacy {
+        (
+            "gradle-7.4.2-stock-actions-v1",
+            "gradle-7.4.2-stock-onlyif-v1",
+        )
     } else {
-        "gradle-9.6.1-stock-actions-v1"
+        (
+            "gradle-9.6.1-stock-actions-v1",
+            "gradle-9.6.1-stock-onlyif-v1",
+        )
     };
     if (!legacy && !complete_k2)
         || [primary, java].iter().any(|task| {
@@ -609,11 +618,7 @@ pub(super) fn selected_tasks_supported(
                     .get("taskOnlyIfInventory")
                     .and_then(|fact| fact.get("adapter"))
                     .and_then(Value::as_str)
-                    != Some(if legacy {
-                        "gradle-7.4.2-stock-onlyif-v1"
-                    } else {
-                        "gradle-9.6.1-stock-onlyif-v1"
-                    })
+                    != Some(only_if_adapter)
         })
         || !matches!(
             primary.task_type.as_str(),
@@ -653,13 +658,13 @@ pub(super) fn selected_tasks_supported(
                     .get("taskActionInventory")
                     .and_then(|fact| fact.get("adapter"))
                     .and_then(Value::as_str)
-                    != Some("gradle-7.4.2-stock-actions-v1")
+                    != Some(adapter)
                 || task
                     .options
                     .get("taskOnlyIfInventory")
                     .and_then(|fact| fact.get("adapter"))
                     .and_then(Value::as_str)
-                    != Some("gradle-7.4.2-stock-onlyif-v1")
+                    != Some(only_if_adapter)
                 || task.language != crate::classpath::CompilerLanguage::Kotlin
                 || !task.annotation_processor_path.is_empty()
         })
@@ -754,7 +759,43 @@ pub(super) fn selected_tasks_supported(
     })
 }
 
-/// The complete captured list is retained. Only its three owned outputs and one Kotlin CP slot move.
+fn explicit_utf8_recipe(recipe: &JavaCompilerRecipe) -> bool {
+    matches!(
+        recipe.adapter.as_str(),
+        "gradle-7.5-current-jdk17-utf8-javac-api-v1"
+            | "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
+    )
+}
+
+fn source_sdk_encoding_supported(task: &CompilerTask, recipe: &JavaCompilerRecipe) -> bool {
+    let release8 = recipe.adapter == "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1";
+    let guide8 = recipe.adapter == "gradle-7.5-current-jdk17-utf8-javac-api-v1";
+    let target17_jdk21 =
+        recipe.adapter == "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1";
+    task.options.get("bootstrapClasspath") == Some(&Value::Null)
+        && task.options.get("release")
+            == Some(&if release8 {
+                serde_json::json!(8)
+            } else {
+                Value::Null
+            })
+        && if explicit_utf8_recipe(recipe) {
+            task.options.get("encoding").and_then(Value::as_str) == Some("UTF-8")
+        } else {
+            task.options.get("encoding") == Some(&Value::Null)
+        }
+        && (!(release8 || guide8)
+            || ["sourceCompatibility", "targetCompatibility"]
+                .iter()
+                .all(|key| task.options.get(*key).and_then(Value::as_str) == Some("1.8")))
+        && (!target17_jdk21
+            || ["sourceCompatibility", "targetCompatibility"]
+                .iter()
+                .all(|key| task.options.get(*key).and_then(Value::as_str) == Some("17")))
+}
+
+/// Retain the complete captured list, including -nowarn, duplicate -proc:none and empty sourcepath.
+/// Only the three proved owned output roles and the exact Kotlin classpath slot may move.
 fn replay_options(
     task: &CompilerTask,
     recipe: &JavaCompilerRecipe,
@@ -762,60 +803,78 @@ fn replay_options(
     private: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let options = &recipe.api_options;
-    let explicit_utf8_jdk21 = recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1";
-    let complete_k2 =
-        explicit_utf8_jdk21 || recipe.adapter == "gradle-9.6.1-current-jdk17-javac-api-v1";
-    let encoding_slots = if explicit_utf8_jdk21 { 2 } else { 0 };
-    let level = if explicit_utf8_jdk21 { "21" } else { "17" };
+    let (levels, decoration, raw_proc): (&[&str], &[&str], bool) = match recipe.adapter.as_str() {
+        "gradle-7.4.2-current-jdk17-javac-api-v1" => {
+            (&["-source", "17", "-target", "17"], &[], true)
+        }
+        "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1" => {
+            (&["--release", "8"], &[], false)
+        }
+        "gradle-7.5-current-jdk17-utf8-javac-api-v1" => (
+            &["-source", "1.8", "-target", "1.8"],
+            &["-nowarn", "-encoding", "UTF-8"],
+            true,
+        ),
+        "gradle-9.6.1-current-jdk17-javac-api-v1"
+        | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1" => {
+            (&["-source", "17", "-target", "17"], &[], false)
+        }
+        "gradle-9.6.1-current-jdk21-utf8-javac-api-v1" => (
+            &["-source", "21", "-target", "21"],
+            &["-encoding", "UTF-8"],
+            false,
+        ),
+        _ => anyhow::bail!("java-api-options-adapter-unhandled"),
+    };
+    let destination = levels.len() + 1;
+    let header = levels.len() + 2 + decoration.len();
+    let classpath = header + 10;
     anyhow::ensure!(
-        options.len()
-            == if explicit_utf8_jdk21 {
-                19
-            } else if complete_k2 {
-                17
-            } else {
-                18
-            },
+        options.len() == header + 11 + usize::from(raw_proc),
         "java-api-options-shape-unhandled"
     );
-    for (index, expected) in [
-        (0, "-source"),
-        (1, level),
-        (2, "-target"),
-        (3, level),
-        (4, "-d"),
-        (6, "-h"),
-        (8, "-g"),
-        (9, "-sourcepath"),
-        (10, ""),
-        (11, "-proc:none"),
-        (12, "-s"),
-        (14, "-XDuseUnsharedTable=true"),
-        (15, "-classpath"),
-    ] {
-        let index = if index >= 6 {
-            index + encoding_slots
-        } else {
-            index
-        };
+    for (index, expected) in levels.iter().enumerate() {
         anyhow::ensure!(
-            options[index] == expected,
+            options[index] == *expected,
             "java-api-options-unhandled-at-{index}"
         );
     }
     anyhow::ensure!(
-        !explicit_utf8_jdk21 || (options[6] == "-encoding" && options[7] == "UTF-8"),
-        "java-api-encoding-options-differ"
+        options[levels.len()] == "-d",
+        "java-api-destination-option-differs"
+    );
+    for (index, expected) in decoration.iter().enumerate() {
+        anyhow::ensure!(
+            options[levels.len() + 2 + index] == *expected,
+            "java-api-encoding-warning-options-differ"
+        );
+    }
+    for (offset, expected) in [
+        (0, "-h"),
+        (2, "-g"),
+        (3, "-sourcepath"),
+        (4, ""),
+        (5, "-proc:none"),
+        (6, "-s"),
+        (8, "-XDuseUnsharedTable=true"),
+        (9, "-classpath"),
+    ] {
+        anyhow::ensure!(
+            options[header + offset] == expected,
+            "java-api-options-unhandled-at-{}",
+            header + offset
+        );
+    }
+    anyhow::ensure!(
+        !raw_proc || options[classpath + 1] == "-proc:none",
+        "java-api-raw-processor-argument-differs"
     );
     anyhow::ensure!(
-        complete_k2 || options[17] == "-proc:none",
-        "java-api-options-unhandled-at-17"
-    );
-    anyhow::ensure!(
-        task.output_roots.len() == 1 && same_path(Path::new(&options[5]), &task.output_roots[0]),
+        task.output_roots.len() == 1
+            && same_path(Path::new(&options[destination]), &task.output_roots[0]),
         "java-output-role-unknown"
     );
-    for position in [7 + encoding_slots, 13 + encoding_slots] {
+    for position in [header + 1, header + 7] {
         anyhow::ensure!(
             task.declared_output_roots
                 .iter()
@@ -824,7 +883,7 @@ fn replay_options(
         );
     }
     anyhow::ensure!(
-        options[16 + encoding_slots] == joined_classpath(&task.classpath)?,
+        options[classpath] == joined_classpath(&task.classpath)?,
         "java-captured-classpath-differs"
     );
     let slots: Vec<_> = task
@@ -845,17 +904,17 @@ fn replay_options(
             "java-other-classpath-overlaps-kotlin-output"
         );
     }
-    let mut classpath = task.classpath.clone();
-    classpath[slots[0]] = private.join("lease");
+    let mut paths = task.classpath.clone();
+    paths[slots[0]] = private.join("lease");
     let mut result = options.clone();
     for (index, directory) in [
-        (5, "java-classes"),
-        (7 + encoding_slots, "java-headers"),
-        (13 + encoding_slots, "java-generated"),
+        (destination, "java-classes"),
+        (header + 1, "java-headers"),
+        (header + 7, "java-generated"),
     ] {
         result[index] = path_text(&private.join(directory))?;
     }
-    result[16 + encoding_slots] = joined_classpath(&classpath)?;
+    result[classpath] = joined_classpath(&paths)?;
     Ok(result)
 }
 
@@ -880,12 +939,21 @@ pub(super) fn configured_recipe(
         .kotlin_compiler
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("kotlin-recipe-unavailable"))?;
-    let explicit_utf8_jdk21 = recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1";
+    let jdk21 = matches!(
+        recipe.adapter.as_str(),
+        "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
+            | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+    );
     anyhow::ensure!(
         ((kotlin.compiler_version == "1.8.21"
             && kotlin.gradle_plugin_version == "1.8.21"
             && !kotlin.run_via_build_tools_api
-            && recipe.adapter == "gradle-7.4.2-current-jdk17-javac-api-v1")
+            && matches!(
+                recipe.adapter.as_str(),
+                "gradle-7.4.2-current-jdk17-javac-api-v1"
+                    | "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+                    | "gradle-7.5-current-jdk17-utf8-javac-api-v1"
+            ))
             || (k2_normal(request)
                 && kotlin.run_via_build_tools_api
                 && matches!(
@@ -894,7 +962,8 @@ pub(super) fn configured_recipe(
                         "gradle-9.6.1-current-jdk17-javac-api-v1",
                         crate::classpath::KotlinCompilerExecutionStrategy::InProcess
                     ) | (
-                        "gradle-9.6.1-current-jdk21-utf8-javac-api-v1",
+                        "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
+                            | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1",
                         crate::classpath::KotlinCompilerExecutionStrategy::Daemon
                     )
                 )))
@@ -914,7 +983,7 @@ pub(super) fn configured_recipe(
             && same_path(&kotlin.gradle_java_home, sdk),
         "java-kotlin-sdk-selection-differs"
     );
-    let version_prefix = if explicit_utf8_jdk21 { "21." } else { "17." };
+    let version_prefix = if jdk21 { "21." } else { "17." };
     anyhow::ensure!(
         recipe.gradle_java_version.starts_with(version_prefix)
             && recipe.java_runtime_version.starts_with(version_prefix)
@@ -923,15 +992,11 @@ pub(super) fn configured_recipe(
     );
     anyhow::ensure!(
         (task.annotation_processing_disabled()
-            || (k2_normal(request) && task.arguments.is_empty()))
+            || ((k2_normal(request)
+                || recipe.adapter == "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1")
+                && task.arguments.is_empty()))
             && task.annotation_processor_path.is_empty()
-            && task.options.get("bootstrapClasspath") == Some(&Value::Null)
-            && task.options.get("release") == Some(&Value::Null)
-            && if explicit_utf8_jdk21 {
-                task.options.get("encoding").and_then(Value::as_str) == Some("UTF-8")
-            } else {
-                task.options.get("encoding") == Some(&Value::Null)
-            },
+            && source_sdk_encoding_supported(task, &recipe),
         "java-custom-compiler-options-unhandled"
     );
     anyhow::ensure!(
@@ -1269,124 +1334,121 @@ impl Tools {
     ) -> anyhow::Result<()> {
         self.capture_inputs(request, environment)?;
         let source_root = self.owner.directory.join("assets");
-        let plugin_classes = self.owner.directory.join("classes/headers");
-        std::fs::create_dir(&plugin_classes)?;
         let recipe = &environment.key.recipe;
-        let mut arguments = vec![
-            "-no-stdlib".into(),
-            "-no-reflect".into(),
-            "-jvm-target".into(),
-            "17".into(),
-            "-jdk-home".into(),
-            path_text(
-                request
-                    .java_task
-                    .as_ref()
-                    .unwrap()
-                    .java_home
-                    .as_ref()
-                    .unwrap(),
-            )?,
-            "-classpath".into(),
-            joined_classpath(&recipe.default_classpath)?,
-            "-d".into(),
-            path_text(&plugin_classes)?,
-            "-version".into(),
-        ];
-        if k2_normal(request) {
-            arguments.push("-Xcontext-parameters".into());
-        }
-        let header_names: Vec<_> = header_assets(request)
-            .into_iter()
-            .map(|(name, _)| name)
-            .filter(|name| name.ends_with(".kt"))
-            .collect();
-        for name in &header_names {
-            arguments.push(path_text(&source_root.join(name))?);
-        }
-        let (exit, text) = kotlin(
-            &arguments,
-            &self.owner.directory.join("build-headers.args"),
-            request,
-            environment,
-        )?;
-        anyhow::ensure!(exit == 0, "java-header-tool-compilation-failed: {text}");
-        let tool_paths: BTreeMap<_, _> = header_names
-            .into_iter()
-            .map(|name| {
-                let path = source_root.join(name);
-                (
-                    kotlin_path_key(&crate::paths::file_key(&path)),
-                    crate::paths::file_key(&path),
-                )
-            })
-            .collect();
-        anyhow::ensure!(
-            matches!(
-                selected_kotlin_output(
-                    &text,
-                    &recipe.compiler_version,
-                    Some(exit),
-                    false,
-                    true,
-                    &tool_paths
-                ),
-                KotlinDiagnosticOutcome::Verified { clean: true, .. }
-            ),
-            "java-header-tool-runtime-unverified"
-        );
-        let plugin = self.owner.directory.join("headers.jar");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&plugin)?;
-        let mut archive = zip::ZipWriter::new(file);
-        let mut classes = BTreeSet::new();
-        for entry in walkdir::WalkDir::new(&plugin_classes).follow_links(false) {
-            let entry = entry?;
-            anyhow::ensure!(
-                !entry.file_type().is_symlink(),
-                "java-helper-output-symlink"
-            );
-            if !entry.file_type().is_file() {
-                continue;
+        let mut outputs = Vec::new();
+        if !k2_normal(request) {
+            let plugin_classes = self.owner.directory.join("classes/headers");
+            std::fs::create_dir(&plugin_classes)?;
+            let mut arguments = vec![
+                "-no-stdlib".into(),
+                "-no-reflect".into(),
+                "-jvm-target".into(),
+                "17".into(),
+                "-jdk-home".into(),
+                path_text(
+                    request
+                        .java_task
+                        .as_ref()
+                        .unwrap()
+                        .java_home
+                        .as_ref()
+                        .unwrap(),
+                )?,
+                "-classpath".into(),
+                joined_classpath(&recipe.default_classpath)?,
+                "-d".into(),
+                path_text(&plugin_classes)?,
+                "-version".into(),
+            ];
+            let header_names: Vec<_> = header_assets(request)
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name.ends_with(".kt"))
+                .collect();
+            for name in &header_names {
+                arguments.push(path_text(&source_root.join(name))?);
             }
-            let relative = entry
-                .path()
-                .strip_prefix(&plugin_classes)?
-                .to_string_lossy()
-                .replace('\\', "/");
+            let (exit, text) = kotlin(
+                &arguments,
+                &self.owner.directory.join("build-headers.args"),
+                request,
+                environment,
+            )?;
+            anyhow::ensure!(exit == 0, "java-header-tool-compilation-failed: {text}");
+            let tool_paths: BTreeMap<_, _> = header_names
+                .into_iter()
+                .map(|name| {
+                    let path = source_root.join(name);
+                    (
+                        kotlin_path_key(&crate::paths::file_key(&path)),
+                        crate::paths::file_key(&path),
+                    )
+                })
+                .collect();
             anyhow::ensure!(
-                relative.starts_with("ktlsp/headers/") || relative.starts_with("META-INF/"),
-                "java-helper-unexpected-class"
+                matches!(
+                    selected_kotlin_output(
+                        &text,
+                        &recipe.compiler_version,
+                        Some(exit),
+                        false,
+                        true,
+                        &tool_paths
+                    ),
+                    KotlinDiagnosticOutcome::Verified { clean: true, .. }
+                ),
+                "java-header-tool-runtime-unverified"
             );
-            archive.start_file(&relative, zip::write::SimpleFileOptions::default())?;
-            archive.write_all(&std::fs::read(entry.path())?)?;
-            classes.insert(relative);
+            let plugin = self.owner.directory.join("headers.jar");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&plugin)?;
+            let mut archive = zip::ZipWriter::new(file);
+            let mut classes = BTreeSet::new();
+            for entry in walkdir::WalkDir::new(&plugin_classes).follow_links(false) {
+                let entry = entry?;
+                anyhow::ensure!(
+                    !entry.file_type().is_symlink(),
+                    "java-helper-output-symlink"
+                );
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let relative = entry
+                    .path()
+                    .strip_prefix(&plugin_classes)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                anyhow::ensure!(
+                    relative.starts_with("ktlsp/headers/") || relative.starts_with("META-INF/"),
+                    "java-helper-unexpected-class"
+                );
+                archive.start_file(&relative, zip::write::SimpleFileOptions::default())?;
+                archive.write_all(&std::fs::read(entry.path())?)?;
+                classes.insert(relative);
+            }
+            anyhow::ensure!(
+                classes.contains("ktlsp/headers/HeaderRegistrar.class")
+                    && classes.contains("ktlsp/headers/HeaderOptions.class"),
+                "java-helper-registrar-absent"
+            );
+            for (name, body) in [
+                (
+                    "META-INF/services/org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar",
+                    "ktlsp.headers.HeaderRegistrar\n",
+                ),
+                (
+                    "META-INF/services/org.jetbrains.kotlin.compiler.plugin.CommandLineProcessor",
+                    "ktlsp.headers.HeaderOptions\n",
+                ),
+            ] {
+                archive.start_file(name, zip::write::SimpleFileOptions::default())?;
+                archive.write_all(body.as_bytes())?;
+            }
+            archive.finish()?.sync_all()?;
+            outputs.push(plugin);
         }
-        anyhow::ensure!(
-            classes.contains("ktlsp/headers/HeaderRegistrar.class")
-                && classes.contains("ktlsp/headers/HeaderOptions.class"),
-            "java-helper-registrar-absent"
-        );
-        for (name, body) in [
-            (
-                if k2_normal(request) {
-                    "META-INF/services/org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar"
-                } else {
-                    "META-INF/services/org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar"
-                },
-                "ktlsp.headers.HeaderRegistrar\n",
-            ),
-            (
-                "META-INF/services/org.jetbrains.kotlin.compiler.plugin.CommandLineProcessor",
-                "ktlsp.headers.HeaderOptions\n",
-            ),
-        ] {
-            archive.start_file(name, zip::write::SimpleFileOptions::default())?;
-            archive.write_all(body.as_bytes())?;
-        }
-        archive.finish()?.sync_all()?;
         let java_classes = self.owner.directory.join("classes/java");
         std::fs::create_dir(&java_classes)?;
         let sdk = request
@@ -1424,7 +1486,6 @@ impl Tools {
             exit == 0 && java_classes.join("JavacDiagnostics.class").is_file(),
             "java-diagnostic-tool-compilation-failed: {text}"
         );
-        let mut outputs = vec![plugin];
         for entry in walkdir::WalkDir::new(&java_classes).follow_links(false) {
             let entry = entry?;
             anyhow::ensure!(
@@ -1513,11 +1574,17 @@ fn check_closed_sources(
             .get(&kotlin_path_key(&crate::paths::file_key(private)))
             .ok_or_else(|| anyhow::anyhow!("java-closed-source-origin-unknown"))?;
         // Match the canonical overlay's exact key policy; a current wire body owns its input.
-        if request
+        if let Some(source) = request
             .overlays
             .iter()
-            .any(|source| source.key == *original)
+            .find(|source| source.key == *original)
         {
+            let body_sha256: [u8; 32] = Sha256::digest(source.text.as_bytes()).into();
+            anyhow::ensure!(
+                expected.get(&header_key(private)) == Some(&sha(source.text.as_bytes()))
+                    && body_sha256 == source.text_sha256,
+                "java-private-wire-source-differs"
+            );
             continue;
         }
         anyhow::ensure!(
@@ -1620,6 +1687,25 @@ fn complete_outputs_match(
         );
     }
     Ok(())
+}
+
+// Full clean K2 output already has canonical compiler authority; Javac reads an exact private copy.
+fn complete_output_lease(
+    canonical: &Path,
+    lease: &Path,
+    before: &BTreeMap<String, (u64, String)>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        complete_output_inventory(canonical)? == *before,
+        "java-k2-canonical-output-changed"
+    );
+    std::fs::create_dir(lease)?;
+    for relative in before.keys() {
+        let target = lease.join(relative);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        write_new(&target, &std::fs::read(canonical.join(relative))?)?;
+    }
+    complete_outputs_match(canonical, lease, before)
 }
 
 fn validate_header_stage(
@@ -1993,12 +2079,13 @@ fn import_diagnostics(
     overlay: &KotlinEditorOverlay,
     packages: &BTreeSet<String>,
     exit: i32,
+    complete_kotlin_output: bool,
 ) -> anyhow::Result<Vec<CompileDiagnostic>> {
     require_bool(value, "compileCompleted", true)?;
-    let explicit_utf8_jdk21 = recipe.adapter == "gradle-9.6.1-current-jdk21-utf8-javac-api-v1";
-    require_bool(value, "gradleConfiguredEncodingNull", !explicit_utf8_jdk21)?;
+    let explicit_utf8 = explicit_utf8_recipe(recipe);
+    require_bool(value, "gradleConfiguredEncodingNull", !explicit_utf8)?;
     anyhow::ensure!(
-        if explicit_utf8_jdk21 {
+        if explicit_utf8 {
             value
                 .get("gradleConfiguredEncoding")
                 .and_then(Value::as_str)
@@ -2106,7 +2193,8 @@ fn import_diagnostics(
                 continue;
             }
             let name = value_string(imported, "name")?;
-            if !disjoint_import(name, packages) {
+            if name.ends_with(".*") || (!complete_kotlin_output && !disjoint_import(name, packages))
+            {
                 continue;
             }
             let Some(start) = imported
@@ -2168,7 +2256,10 @@ pub(super) fn run(
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
     let complete_k2 = k2_normal(request);
-    anyhow::ensure!(!complete_k2 || clean, "java-k2-normal-compilation-required");
+    anyhow::ensure!(
+        !complete_k2 || (clean && canonical.iter().all(|d| d.severity != Severity::Error)),
+        "java-k2-normal-compilation-required"
+    );
     // run_kotlin_editor_compile creates this fresh output and calls us only after owned/EOF
     // selected_kotlin_output; clean=true means exit0 with no reported canonical errors.
     let canonical_outputs = if complete_k2 {
@@ -2204,112 +2295,119 @@ pub(super) fn run(
     // Owner watches are armed by Tools::capture_inputs. Close the earlier canonical copy-to-watch
     // window on every run, including cached tools, before using any closed-source package proof.
     check_closed_sources(request, overlay, &expected)?;
-    let mut source_inventory = String::new();
-    for path in &overlay.sources {
-        let kind = if path.extension().and_then(|e| e.to_str()) == Some("kt") {
-            "kotlin"
-        } else {
-            "java"
-        };
-        source_inventory.push_str(&format!(
-            "{kind}\t{}\t{}\n",
-            expected[&header_key(path)],
-            path_text(path)?
-        ));
-    }
-    let inventory_path = overlay.directory.join("header-sources.tsv");
-    write_new(&inventory_path, source_inventory.as_bytes())?;
-    let raw = overlay.directory.join("raw-headers");
-    std::fs::create_dir(&raw)?;
-    let header_receipt = overlay.directory.join("headers.json");
-    let mut arguments = kotlin_editor_arguments(
-        request,
-        &overlay.directory.join(if complete_k2 {
-            "raw-headers"
-        } else {
-            "unused-header-output"
-        }),
-        &[],
-    )?;
-    let cp_position = arguments
-        .iter()
-        .position(|arg| arg == "-classpath" || arg == "-cp")
-        .ok_or_else(|| anyhow::anyhow!("java-header-effective-classpath-unknown"))?;
-    let cp_file = overlay.directory.join("header-classpath.txt");
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    write_new(
-        &cp_file,
-        (arguments[cp_position + 1]
-            .split(separator)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n")
-            .as_bytes(),
-    )?;
-    arguments.push(format!(
-        "-Xplugin={}",
-        tools.owner.directory.join("headers.jar").display()
-    ));
-    for (key, path) in [
-        ("output", raw),
-        ("receipt", header_receipt.clone()),
-        ("inventory", inventory_path),
-        ("plugins", tools.owner.directory.join("plugins.tsv")),
-        ("classpath", cp_file),
-    ] {
-        arguments.push("-P".into());
-        arguments.push(format!(
-            "plugin:ktlsp.current-api-headers:{key}={}",
-            path_text(&path)?
-        ));
-    }
-    arguments.extend(
-        overlay
-            .sources
-            .iter()
-            .map(|path| path_text(path))
-            .collect::<anyhow::Result<Vec<_>>>()?,
-    );
-    let (exit, text) = kotlin(
-        &arguments,
-        &overlay.directory.join("headers.args"),
-        request,
-        environment,
-    )?;
-    let KotlinDiagnosticOutcome::Verified {
-        diagnostics,
-        clean: header_clean,
-    } = selected_kotlin_output(
-        &text,
-        &environment.key.recipe.compiler_version,
-        Some(exit),
-        false,
-        true,
-        &overlay.paths,
-    )
-    else {
-        anyhow::bail!("java-header-canonical-diagnostics-unverified");
-    };
-    anyhow::ensure!(
-        diagnostics.as_slice() == canonical && header_clean == clean,
-        "java-header-changed-canonical-diagnostics"
-    );
-    if let Some(before) = &canonical_outputs {
-        complete_outputs_match(
+    let (receipt, mut packages) = if let Some(before) = &canonical_outputs {
+        complete_output_lease(
             &overlay.directory.join("classes"),
-            &overlay.directory.join("raw-headers"),
+            &overlay.directory.join("lease"),
             before,
         )?;
-    }
-    let receipt = read_json(&header_receipt)?;
-    let mut packages = validated_lease(
-        request,
-        overlay,
-        &receipt,
-        &expected,
-        canonical,
-        clean && header_clean && exit == 0,
-    )?;
+        (
+            serde_json::json!({
+                "component": "canonical-k2-complete-output",
+                "compilerVersion": environment.key.recipe.compiler_version,
+                "sourceSha256": expected,
+                "outputInventory": before,
+            }),
+            BTreeSet::new(),
+        )
+    } else {
+        let mut source_inventory = String::new();
+        for path in &overlay.sources {
+            let kind = if path.extension().and_then(|e| e.to_str()) == Some("kt") {
+                "kotlin"
+            } else {
+                "java"
+            };
+            source_inventory.push_str(&format!(
+                "{kind}\t{}\t{}\n",
+                expected[&header_key(path)],
+                path_text(path)?
+            ));
+        }
+        let inventory_path = overlay.directory.join("header-sources.tsv");
+        write_new(&inventory_path, source_inventory.as_bytes())?;
+        let raw = overlay.directory.join("raw-headers");
+        std::fs::create_dir(&raw)?;
+        let header_receipt = overlay.directory.join("headers.json");
+        let mut arguments = kotlin_editor_arguments(
+            request,
+            &overlay.directory.join("unused-header-output"),
+            &[],
+        )?;
+        let cp_position = arguments
+            .iter()
+            .position(|arg| arg == "-classpath" || arg == "-cp")
+            .ok_or_else(|| anyhow::anyhow!("java-header-effective-classpath-unknown"))?;
+        let cp_file = overlay.directory.join("header-classpath.txt");
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        write_new(
+            &cp_file,
+            (arguments[cp_position + 1]
+                .split(separator)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n")
+                .as_bytes(),
+        )?;
+        arguments.push(format!(
+            "-Xplugin={}",
+            tools.owner.directory.join("headers.jar").display()
+        ));
+        for (key, path) in [
+            ("output", raw),
+            ("receipt", header_receipt.clone()),
+            ("inventory", inventory_path),
+            ("plugins", tools.owner.directory.join("plugins.tsv")),
+            ("classpath", cp_file),
+        ] {
+            arguments.push("-P".into());
+            arguments.push(format!(
+                "plugin:ktlsp.current-api-headers:{key}={}",
+                path_text(&path)?
+            ));
+        }
+        arguments.extend(
+            overlay
+                .sources
+                .iter()
+                .map(|path| path_text(path))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
+        let (exit, text) = kotlin(
+            &arguments,
+            &overlay.directory.join("headers.args"),
+            request,
+            environment,
+        )?;
+        let KotlinDiagnosticOutcome::Verified {
+            diagnostics,
+            clean: header_clean,
+        } = selected_kotlin_output(
+            &text,
+            &environment.key.recipe.compiler_version,
+            Some(exit),
+            false,
+            true,
+            &overlay.paths,
+        )
+        else {
+            anyhow::bail!("java-header-canonical-diagnostics-unverified");
+        };
+        anyhow::ensure!(
+            diagnostics.as_slice() == canonical && header_clean == clean,
+            "java-header-changed-canonical-diagnostics"
+        );
+        let receipt = read_json(&header_receipt)?;
+        let packages = validated_lease(
+            request,
+            overlay,
+            &receipt,
+            &expected,
+            canonical,
+            clean && header_clean && exit == 0,
+        )?;
+        (receipt, packages)
+    };
     packages.extend(tools.dependency_packages.iter().cloned());
     tools.check_live()?;
     let task = request.java_task.as_ref().unwrap();
@@ -2404,6 +2502,7 @@ pub(super) fn run(
                 "dependent_source_domains": tools.dependency_domains,
                 "producer_closure": false, "whole_api_authority": false,
                 "k2_normal_output_matches_canonical": complete_k2.then_some(true),
+                "canonical_output_reused": complete_k2,
             }),
         );
     }
@@ -2419,7 +2518,15 @@ pub(super) fn run(
         overlay,
         &packages,
         exit,
+        complete_k2,
     )?;
+    if let Some(before) = &canonical_outputs {
+        complete_outputs_match(
+            &overlay.directory.join("classes"),
+            &overlay.directory.join("lease"),
+            before,
+        )?;
+    }
     check_sources(overlay, &expected)?;
     tools.check_live()?;
     request.check_live()?;

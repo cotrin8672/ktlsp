@@ -117,45 +117,52 @@ pub fn implementations(index: &Index, target: &Entry) -> Vec<Def> {
 /// Reverse queries scan candidates globally, then resolve each candidate in its
 /// own source-set scope. The target module need not depend on its consumers.
 fn direct_subtype_entries(index: &Index, target: &HierarchyItem) -> Vec<Entry> {
-    index
-        .all_entries()
-        .into_iter()
-        .filter(|entry| entry.sym.kind.is_type_like())
-        .filter(|entry| {
-            entry
-                .sym
-                .supertype_refs
-                .iter()
-                .any(|supertype| supertype.name.rsplit('.').next() == Some(target.name.as_str()))
-                || entry
+    let candidates = index.entries_with_prefix("", false);
+    let mut entries: Vec<_> =
+        candidates
+            .filter(|entry| entry.sym.kind.is_type_like())
+            .filter(|entry| {
+                entry.sym.supertype_refs.iter().any(|supertype| {
+                    supertype.name.rsplit('.').next() == Some(target.name.as_str())
+                }) || entry
                     .sym
                     .supertypes
                     .iter()
                     .any(|supertype| supertype.rsplit('.').next() == Some(target.name.as_str()))
-        })
-        .filter(|entry| {
-            entry.path.as_ref() != target.file
-                || entry.sym.start_byte != target.start_byte
-                || entry.sym.end_byte != target.end_byte
-        })
-        .filter(|entry| {
-            let scoped = index.scoped_for_file(&entry.path);
-            if !scoped.lookup_type(&entry.sym.name).iter().any(|visible| {
-                visible.path == entry.path
-                    && visible.sym.start_byte == entry.sym.start_byte
-                    && visible.sym.end_byte == entry.sym.end_byte
-            }) {
-                return false;
-            }
-            direct_supertype_entries(&scoped, entry)
-                .iter()
-                .any(|parent| {
-                    parent.path.as_ref() == target.file
-                        && parent.sym.start_byte == target.start_byte
-                        && parent.sym.end_byte == target.end_byte
-                })
-        })
-        .collect()
+            })
+            .filter(|entry| {
+                entry.path.as_ref() != target.file
+                    || entry.sym.start_byte != target.start_byte
+                    || entry.sym.end_byte != target.end_byte
+            })
+            .filter(|entry| {
+                let scoped = index.scoped_for_file(&entry.path);
+                if !scoped.lookup_type(&entry.sym.name).iter().any(|visible| {
+                    visible.path == entry.path
+                        && visible.sym.start_byte == entry.sym.start_byte
+                        && visible.sym.end_byte == entry.sym.end_byte
+                }) {
+                    return false;
+                }
+                direct_supertype_entries(&scoped, entry)
+                    .iter()
+                    .any(|parent| {
+                        parent.path.as_ref() == target.file
+                            && parent.sym.start_byte == target.start_byte
+                            && parent.sym.end_byte == target.end_byte
+                    })
+            })
+            .cloned()
+            .collect();
+    // Preserve the former all_entries file/range order, sorting only actual matches.
+    entries.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.sym.start_byte.cmp(&b.sym.start_byte))
+            .then(a.sym.end_byte.cmp(&b.sym.end_byte))
+            .then(a.sym.name.cmp(&b.sym.name))
+    });
+    entries
 }
 
 fn direct_supertype_entries<'a>(index: &'a dyn InferenceIndex, entry: &Entry) -> Vec<&'a Entry> {

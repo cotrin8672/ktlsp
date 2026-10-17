@@ -862,6 +862,45 @@ pub fn select_call<'a>(
     }
 }
 
+/// Present the same JVM String through the caller's language, preserving its nullability.
+/// Other nominal identities and generic arguments retain their declaration facts.
+pub fn string_result_for_call_mode(
+    index: &dyn InferenceIndex,
+    result: Type,
+    ctx: &FileCtx,
+    mode: crate::members::CallMode,
+) -> Type {
+    let Type::Class {
+        name,
+        package: Some(package),
+        container: None,
+        args,
+        ..
+    } = &result
+    else {
+        return result;
+    };
+    if name != "String" || !args.is_empty() {
+        return result;
+    }
+    let target = match (mode, package.as_str()) {
+        (crate::members::CallMode::Kotlin, "java.lang") => "kotlin",
+        (crate::members::CallMode::Java, "kotlin") => "java.lang",
+        _ => return result,
+    };
+    infer::declared_type(
+        index,
+        &TypeRef {
+            name: "String".into(),
+            qualification: Some(target.into()),
+            package_candidates: std::sync::Arc::new(vec![target.into()]),
+            nullable: result.is_nullable(),
+            ..TypeRef::default()
+        },
+        ctx,
+    )
+}
+
 pub fn projected_return_type(candidate: CallableCandidate<'_>) -> Option<Type> {
     let CallableCandidate::Jvm { facts, .. } = candidate else {
         return None;

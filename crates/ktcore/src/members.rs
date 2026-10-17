@@ -113,7 +113,7 @@ pub enum Applicability {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallMode {
+pub enum CallMode {
     Kotlin,
     Java,
 }
@@ -623,23 +623,10 @@ fn collect_candidates<'a>(
         ));
     }
     if let (true, MemberName::Prefix(prefix)) = (include_extensions, name) {
-        let names: BTreeSet<_> = index
-            .entries_with_prefix(prefix, true)
-            .filter(|entry| {
-                entry.sym.ext_receiver.as_deref().is_some_and(|receiver| {
-                    entry
-                        .sym
-                        .type_params
-                        .iter()
-                        .any(|parameter| parameter == receiver)
-                })
-            })
-            .map(|entry| entry.sym.name.as_str())
-            .collect();
         extensions.extend(
-            names
+            index
+                .generic_receiver_extensions(prefix)
                 .into_iter()
-                .flat_map(|name| index.lookup_by_name(name))
                 .chain(
                     ctx.imports
                         .iter()
@@ -651,16 +638,7 @@ fn collect_candidates<'a>(
                         })
                         .flat_map(|import| index.lookup_by_name(import.simple_name())),
                 )
-                .filter(|entry| {
-                    entry.sym.container.is_none()
-                        && entry.sym.ext_receiver.as_deref().is_some_and(|receiver| {
-                            entry
-                                .sym
-                                .type_params
-                                .iter()
-                                .any(|parameter| parameter == receiver)
-                        })
-                })
+                .filter(|entry| crate::index::is_generic_receiver_extension(entry))
                 .filter(|entry| {
                     resolve::visible_extension_names(entry, &ctx.imports, &ctx.package)
                         .any(|visible| visible.starts_with(prefix))

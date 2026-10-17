@@ -34,6 +34,17 @@ pub struct Entry {
     pub sym: Arc<IndexedSymbol>,
 }
 
+pub(crate) fn is_generic_receiver_extension(entry: &Entry) -> bool {
+    entry.sym.container.is_none()
+        && entry.sym.ext_receiver.as_deref().is_some_and(|receiver| {
+            entry
+                .sym
+                .type_params
+                .iter()
+                .any(|parameter| parameter == receiver)
+        })
+}
+
 /// An identifier *usage* produced by the reverse-reference pass (carries its own name for removal).
 ///
 /// `name` is interned per file at extraction: a project shares most identifier spellings across
@@ -249,6 +260,17 @@ pub trait InferenceIndex {
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_>;
     fn members_of(&self, type_name: &str) -> LookupEntries<'_>;
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_>;
+
+    /// Top-level extensions on a type parameter, filtered before scoped ownership checks.
+    fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+        LookupEntries::Selected(
+            self.entries_with_prefix("", true)
+                .filter(|entry| {
+                    entry.sym.name.starts_with(prefix) && is_generic_receiver_extension(entry)
+                })
+                .collect(),
+        )
+    }
 
     fn contributions_for_file(&self, _file: &str) -> &[crate::extensions::ContributionSet] {
         &[]
@@ -947,6 +969,18 @@ impl InferenceIndex for Index {
         LookupEntries::All(Index::extensions_for(self, receiver_type))
     }
 
+    fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+        LookupEntries::Selected(
+            self.ext_by_receiver
+                .values()
+                .flat_map(|entries| entries.iter())
+                .filter(move |entry| {
+                    entry.sym.name.starts_with(prefix) && is_generic_receiver_extension(entry)
+                })
+                .collect(),
+        )
+    }
+
     fn origin_facts(&self) -> Option<&OriginFacts> {
         Some(&self.origins)
     }
@@ -1019,6 +1053,18 @@ impl InferenceIndex for InferenceIndexSnapshot {
 
     fn origin_facts(&self) -> Option<&OriginFacts> {
         Some(&self.origins)
+    }
+
+    fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+        LookupEntries::Selected(
+            self.ext_by_receiver
+                .values()
+                .flat_map(|entries| entries.iter())
+                .filter(move |entry| {
+                    entry.sym.name.starts_with(prefix) && is_generic_receiver_extension(entry)
+                })
+                .collect(),
+        )
     }
 
     fn entries_with_prefix<'a>(
@@ -1348,6 +1394,10 @@ impl InferenceIndex for ScopedIndex<'_> {
 
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_> {
         self.select(self.index.extensions_for(receiver_type))
+    }
+
+    fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+        self.select(self.index.generic_receiver_extensions(prefix))
     }
 
     fn origin_facts(&self) -> Option<&OriginFacts> {

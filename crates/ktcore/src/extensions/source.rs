@@ -580,6 +580,42 @@ pub(super) fn reference_parse_count() -> usize {
     REFERENCE_PARSES.with(std::cell::Cell::get)
 }
 
+/// Eligibility prepared with a verified source tree off the editor lock. The text and file stay
+/// attached so the host cannot accidentally apply its ranges to a different accepted input.
+#[derive(Clone)]
+pub struct PreparedSourceReferences {
+    pub(super) file: String,
+    pub(super) text: std::sync::Arc<str>,
+    pub(super) ranges: std::collections::BTreeSet<(usize, usize)>,
+}
+
+pub fn prepare_source_references(
+    index: &dyn InferenceIndex,
+    file: &str,
+    text: std::sync::Arc<str>,
+    tree: &Tree,
+) -> PreparedSourceReferences {
+    let ranges = index
+        .entries_for_file(file)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.sym.kind,
+                SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::EnumClass
+                    | SymbolKind::Object
+            ) && ordinary_reference_type(entry, &text, tree)
+        })
+        .map(|entry| (entry.sym.start_byte, entry.sym.end_byte))
+        .collect();
+    PreparedSourceReferences {
+        file: file.into(),
+        text,
+        ranges,
+    }
+}
+
 pub(super) fn ordinary_reference_types(
     index: &dyn InferenceIndex,
     file: &str,
@@ -589,8 +625,13 @@ pub(super) fn ordinary_reference_types(
         .entries_for_file(file)
         .into_iter()
         .filter(|entry| {
-            matches!(entry.sym.kind, SymbolKind::Class | SymbolKind::Interface)
-                && entry.sym.type_params.is_empty()
+            matches!(
+                entry.sym.kind,
+                SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::EnumClass
+                    | SymbolKind::Object
+            ) && entry.sym.type_params.is_empty()
         })
         .collect();
     if entries.is_empty() {
@@ -634,13 +675,20 @@ fn ordinary_reference_type(entry: &crate::index::Entry, text: &str, tree: &Tree)
     let Some(node) = declaration_node(tree, &entry.sym, java) else {
         return false;
     };
-    if !matches!(node.kind(), "class_declaration" | "interface_declaration") {
+    if !matches!(
+        node.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "object_declaration"
+    ) {
         return false;
     }
     if child_of_kind(node, "modifiers").is_some_and(|modifiers| {
         node_text(modifiers, text)
             .split_whitespace()
-            .any(|word| matches!(word, "value" | "inline"))
+            .any(|word| matches!(word, "value" | "inline" | "expect"))
     }) {
         return false;
     }
@@ -663,7 +711,12 @@ fn ordinary_reference_type(entry: &crate::index::Entry, text: &str, tree: &Tree)
     }
     let clean = node
         .children(&mut node.walk())
-        .filter(|child| !matches!(child.kind(), "class_body" | "interface_body"))
+        .filter(|child| {
+            !matches!(
+                child.kind(),
+                "class_body" | "interface_body" | "enum_body" | "enum_class_body"
+            )
+        })
         .all(|child| !child.has_error() && !child.is_missing());
     clean
 }

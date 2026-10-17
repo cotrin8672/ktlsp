@@ -15,7 +15,7 @@ feature-specific completion results, or diagnostic suppression.
 The committed Java annotation declarations are a reduced API subset. They are
 only a convenient unit-test input and implement no bytecode transformation.
 The native integration control must instead use an actual Mixin artifact:
-compile only the three `fixture/*.java` files with
+compile the `fixture/*.java` files with
 `javac -proc:none -classpath "$MIXIN_JAR"`, excluding the reduced declarations.
 For the editor run, replace those two reduced declarations in the disposable
 project with exact `org/spongepowered/asm/mixin/{Mixin,Shadow}.java` entries from
@@ -77,7 +77,23 @@ input guards. Evidence is under the optional local directory
 `C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/external-shadow86-1/`:
 `inputs.json`, `receipt.json`, and `editor/artifacts/external-shadow-proof.json`.
 
-This proves primitive member binding and usable external Rust executable
-composition. Nominal reference signatures such as `BlockPos` remain unsupported
-by the current shared contract. Production Mixin integration, runtime/remapping,
-MixinExtras, Lapis and IDEA parity remain unproved.
+The later nominal group also verifies ordinary class/interface reference identities
+and arrays, including signature equality and source/configuration invalidation.
+An independently built executable on the published499e98e checkpoint passed the
+unchanged2 original +14 primitive +34 nominal requests (50 requests/98 checks).
+Evidence: `C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1/external-nominal89-3/receipt.json`
+and `verified-summary.json`. These results establish the fixture scope, not IDEA
+parity or production framework support.
+
+The new `shape-probes.lua` wrapper runs the existing `probes.lua` first, then a
+separate40-request group for enum, record, named-object and mapped-builtin member
+signatures. Use the same `corpus` command above with
+`KTLSP_CORPUS_EXTRA_PROBES` pointing to `dev/external-extension/shape-probes.lua`.
+Compile the Kotlin fixtures with the selected Kotlin compiler against the same
+Mixin artifact and Java fixture outputs; retain compiler/artifact identities.
+The additional group records `external-shape-proof.json` separately and remains
+under verification. Existing manifests/probe bytes and their denominators stay
+unchanged. Nominal identities do not establish generated enum/record members or
+object-owned callable lowering. Nullable, generic and value-class ABI shapes
+remain unsupported. Production Mixin integration, runtime/remapping, MixinExtras,
+Lapis and IDEA parity remain unproved.

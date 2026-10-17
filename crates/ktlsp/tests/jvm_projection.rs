@@ -509,6 +509,7 @@ fn serialized_dependency_facts_preserve_projection_and_open_source_priority() {
         file: API.into(),
         symbols: facts.symbols,
         jvm: facts.jvm,
+        library_source: None,
         origin: None,
     })
     .unwrap();

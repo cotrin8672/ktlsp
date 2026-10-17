@@ -20,9 +20,15 @@ fn overload_workspace(java_target: bool) -> (Workspace, &'static str) {
     let mut ws = Workspace::new();
     ws.open("/selection/typed/Results.kt", "package typed\nclass NumberResult { fun numberOnly() {} }\nclass TextResult { fun textOnly() {} }\nclass Decoy { fun twice(value: String): TextResult = TextResult() }\n".into());
     let (file, source) = if java_target {
-        ("/selection/typed/Target.java", "package typed; public class Target { public NumberResult twice(int value) { return null; } public TextResult twice(String value) { return null; } public TextResult only(int value) { return null; } }")
+        (
+            "/selection/typed/Target.java",
+            "package typed; public class Target { public NumberResult twice(int value) { return null; } public TextResult twice(String value) { return null; } public TextResult only(int value) { return null; } }",
+        )
     } else {
-        ("/selection/typed/Target.kt", "package typed\nclass Target { fun twice(value: Int): NumberResult = NumberResult()\nfun twice(value: String): TextResult = TextResult()\nfun only(value: Int): TextResult = TextResult() }\n")
+        (
+            "/selection/typed/Target.kt",
+            "package typed\nclass Target { fun twice(value: Int): NumberResult = NumberResult()\nfun twice(value: String): TextResult = TextResult()\nfun only(value: Int): TextResult = TextResult() }\n",
+        )
     };
     ws.open(file, source.into());
     ws.open(OVERLOAD_JAVA, OVERLOAD_USE.into());
@@ -508,8 +514,7 @@ fn rename_override_family_keeps_overloads_and_unrelated_calls_unchanged() {
     let java = "/selection/family/Use.java";
     let kotlin = "/selection/family/Use.kt";
     let decoy = "/selection/family/Decoy.java";
-    let worker_source =
-        "package family; public interface Worker { void assist(); void assist(String value); void assist(int value); }";
+    let worker_source = "package family; public interface Worker { void assist(); void assist(String value); void assist(int value); }";
     let child_source = "package family; public class Child implements Worker { public void assist() {} public void assist(String value) {} public void assist(int value) {} }";
     let decoy_source = "package family; public class Decoy { public void assist() {} }";
     let java_source = "package family; class Use { void run(Child child, Worker worker, Decoy decoy) { child.assist(); worker.assist(); child.assist(\"x\"); worker.assist(\"x\"); decoy.assist(); } }";
@@ -754,10 +759,22 @@ fn rename_bare_java_static_call_preserves_hidden_parent_and_decoy() {
     let java = "/selection/bare/JavaUse.java";
     let kotlin = "/selection/bare/KotlinUse.kt";
     let sources = [
-        (base, "package bare; public class Base { public static int assist() { return 1; } }"),
-        (child, "package bare; public class Child extends Base { public static int assist() { return 2; } public static int run() { return assist(); } }"),
-        (decoy, "package bare; public class Decoy { public static int assist() { return 3; } }"),
-        (java, "package bare; public class JavaUse { public static int run() { return Child.assist(); } }"),
+        (
+            base,
+            "package bare; public class Base { public static int assist() { return 1; } }",
+        ),
+        (
+            child,
+            "package bare; public class Child extends Base { public static int assist() { return 2; } public static int run() { return assist(); } }",
+        ),
+        (
+            decoy,
+            "package bare; public class Decoy { public static int assist() { return 3; } }",
+        ),
+        (
+            java,
+            "package bare; public class JavaUse { public static int run() { return Child.assist(); } }",
+        ),
         (kotlin, "package bare\nfun run(): Int = Child.assist()\n"),
     ];
     for (file, source) in sources {
@@ -825,7 +842,9 @@ fn rename_override_family_does_not_join_static_or_private_methods() {
         } else {
             "Child"
         };
-        let child_source = format!("package family; class Child extends Base {{ {modifier} void assist() {{}} void run() {{ {receiver}.assist(); }} }}");
+        let child_source = format!(
+            "package family; class Child extends Base {{ {modifier} void assist() {{}} void run() {{ {receiver}.assist(); }} }}"
+        );
         ws.open(base, base_source.clone());
         ws.open(child, child_source.clone());
         let definition = target(&ws, child, "assist", SymbolKind::Function);
@@ -2083,6 +2102,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     }]));
     rich.type_params = vec!["Payload".into()];
     rich.type_parameter_facts = ktlsp::symbol::TypeParameterFacts::new(true, false);
+    rich.method_type_bounds = Some(Box::new(vec![("Payload".into(), TypeRef::simple("Known"))]));
     let source = "package api; public class Owner { public native void method(); }";
     let tree = ktlsp::java::JavaParser::new().parse(source);
     rich.source_member = ktlsp::java::extract_symbols(&tree, source)
@@ -2094,12 +2114,20 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     for symbol in [empty, rich] {
         let mut value = serde_json::to_value(&symbol).unwrap();
         value.as_object_mut().unwrap().remove("source_member");
+        value.as_object_mut().unwrap().remove("method_type_bounds");
         let inline: InlineSymbol = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&inline).unwrap(), value);
         let inline_bytes = bincode::serialize(&inline).unwrap();
         let current_bytes = bincode::serialize(&symbol).unwrap();
         assert_eq!(inline_bytes, current_bytes[..inline_bytes.len()]);
-        assert_eq!(current_bytes.len(), inline_bytes.len() + 1);
+        assert_eq!(
+            current_bytes.len(),
+            inline_bytes.len()
+                + 1
+                + bincode::serialize(&symbol.method_type_bounds)
+                    .unwrap()
+                    .len()
+        );
         assert_eq!(
             bincode::deserialize::<IndexedSymbol>(&current_bytes).unwrap(),
             symbol
@@ -2123,6 +2151,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         assert!(!decoded.type_parameter_facts.known_invariant());
         let mut defaulted = symbol.clone();
         defaulted.source_member = Default::default();
+        defaulted.method_type_bounds = None;
         assert_eq!(
             serde_json::from_value::<IndexedSymbol>(value).unwrap(),
             defaulted
@@ -2164,6 +2193,13 @@ fn assert_known_leaf_binary_override(java_caller: bool) {
             include_bytes!("../../ktcore/tests/fixtures/classfile/shadowfixture/GenericMid.class")
                 .as_slice(),
         ),
+        (
+            "NestedBoundMid",
+            include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/shadowfixture/NestedBoundMid.class"
+            )
+            .as_slice(),
+        ),
     ] {
         archive
             .start_file(
@@ -2184,14 +2220,14 @@ public final class KnownLeaf extends GenericMid {
     // Real fixture-owned covariance keeps the return type indexed without inventing SDK facts.
     const TYPED: &str = "/selection/shadow/TypedList.java";
     const TYPED_SOURCE: &str = r#"package shadowfixture;
-public final class TypedList<T> extends java.util.AbstractList<T> {
+public final class TypedList<T> extends shadowfixture.Container.NestedList<T> {
     @Override public T get(int index) { throw new IndexOutOfBoundsException(); }
     @Override public int size() { return 0; }
     public int ownSize() { return size(); }
 }
 "#;
     let mut observed = Vec::new();
-    for ancestor in ["none", "Base", "GenericMid"] {
+    for ancestor in ["none", "Base", "GenericMid", "NestedBoundMid"] {
         for repeated_load in [false, true] {
             let batches = ktlsp::deps::resolve_local_jar_stubs(
                 &jar,
@@ -2207,7 +2243,7 @@ public final class TypedList<T> extends java.util.AbstractList<T> {
             assert!(batches
                 .iter()
                 .flat_map(|batch| &batch.symbols)
-                .any(|owner| owner.name == "GenericMid"
+                .any(|owner| owner.name == "NestedBoundMid"
                     && owner
                         .unavailable_members
                         .as_deref()
@@ -2233,8 +2269,10 @@ public final class TypedList<T> extends java.util.AbstractList<T> {
                         && symbol.kind == SymbolKind::Function
                         && symbol.container.as_deref() == Some("Base")
                 });
-            assert!(base_f_supported && !base_f_unavailable,
-                "actual Base facts: f supported={base_f_supported}, unavailable={base_f_unavailable}");
+            assert!(
+                base_f_supported && !base_f_unavailable,
+                "actual Base facts: f supported={base_f_supported}, unavailable={base_f_unavailable}"
+            );
             let binary_origin = batches[0].origin.as_ref().unwrap().origin_id.clone();
             let mut ws = Workspace::new();
             for batch in batches {
@@ -2247,11 +2285,17 @@ public final class TypedList<T> extends java.util.AbstractList<T> {
                         .replace(" extends GenericMid", "")
                         .replace("@Override ", ""),
                     "Base" => LEAF_SOURCE.replace("extends GenericMid", "extends Base"),
+                    "NestedBoundMid" => {
+                        LEAF_SOURCE.replace("extends GenericMid", "extends NestedBoundMid")
+                    }
                     _ => LEAF_SOURCE.to_string(),
                 },
             );
             let (caller, source) = if java_caller {
-                ("/selection/shadow/Use.java", "package shadowfixture; class Use { void use(KnownLeaf value) { var result = value.f(); value.f().size(); } }")
+                (
+                    "/selection/shadow/Use.java",
+                    "package shadowfixture; class Use { void use(KnownLeaf value) { var result = value.f(); value.f().size(); } }",
+                )
             } else {
                 (
                     "/selection/shadow/Use.kt",
@@ -2318,4 +2362,133 @@ fn binary_known_leaf_override_java() {
 #[test]
 fn binary_known_leaf_override_kotlin() {
     assert_known_leaf_binary_override(false);
+}
+
+#[test]
+fn jvm_string_return_chains_use_caller_identity_without_changing_foreign_strings() {
+    const KOTLIN: &str = "/selection/return-chain/Use.kt";
+    const JAVA: &str = "/selection/return-chain/Use.java";
+    for java_string_available in [false, true] {
+        let mut ws = Workspace::new();
+        ws.open(
+            "/selection/return-chain/KotlinTypes.kt",
+            "package kotlin\nclass Int\nclass String { fun kotlinOnly() {}\nfun get(index: Int): String = this\nfun plus(other: String): String = this }".into(),
+        );
+        ws.open(
+            "/selection/return-chain/KotlinText.kt",
+            "package kotlin.text\nfun String.substring(begin: Int): String = this".into(),
+        );
+        if java_string_available {
+            ws.open("/selection/return-chain/jdk/String.java", "package java.lang; public final class String { public String substring(int begin) { return this; } }".into());
+        }
+        ws.open("/selection/return-chain/AtomicInteger.java", "package java.util.concurrent.atomic; public class AtomicInteger { public int incrementAndGet() { return 0; } }".into());
+        ws.open(
+            "/selection/return-chain/foreign/String.java",
+            "package foreign; public class String { public void foreignOnly() {} }".into(),
+        );
+        ws.open(
+            "/selection/return-chain/JBox.java",
+            "package com.squareup.moshi; public class JBox<T> { public T get() { return null; } }"
+                .into(),
+        );
+        ws.open("/selection/return-chain/JsonReader.java", "package com.squareup.moshi; public abstract class JsonReader { public String ktlspSliceText() { return \"slice\"; } public java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() { return null; } public foreign.String ktlspOther() { return null; } public JBox<String> ktlspGeneric() { return null; } }".into());
+        ws.open("/selection/return-chain/OkHttpClient.kt", "package okhttp3\nimport foreign.String as ForeignText\nclass KBox<T> { fun get(): T = TODO() }\nclass OkHttpClient { fun ktlspSliceText(): String = \"slice\"\nfun ktlspSliceCounter(): java.util.concurrent.atomic.AtomicInteger = TODO()\nfun ktlspOther(): ForeignText = TODO()\nfun ktlspGeneric(): KBox<String> = TODO() }".into());
+        ws.open(KOTLIN, "package reduction\nimport com.squareup.moshi.JsonReader\nfun echo(value: String): String = value\nfun echo(value: foreign.String): java.util.concurrent.atomic.AtomicInteger = TODO()\nfun use(provider: JsonReader, text: String, counter: java.util.concurrent.atomic.AtomicInteger) { text.substring(0); val localText: String = \"slice\"; localText.substring(0); provider.ktlspSliceText().substring(0); counter.incrementAndGet(); provider.ktlspSliceCounter().incrementAndGet(); provider.ktlspOther().foreignOnly(); provider.ktlspGeneric().get().substring(0); val assignedText: String = provider.ktlspSliceText(); echo(text).substring(0); echo(provider.ktlspSliceText()).substring(0); echo(assignedText).substring(0) }".into());
+        for expression in [
+            "text.sub",
+            "localText.sub",
+            "provider.ktlspSliceText().sub",
+            "provider.ktlspGeneric().get().sub",
+            "echo(text).sub",
+            "echo(provider.ktlspSliceText()).sub",
+            "echo(assignedText).sub",
+        ] {
+            assert!(
+                labels(&mut ws, KOTLIN, expression).contains("substring"),
+                "{java_string_available}: {expression}"
+            );
+        }
+        assert_eq!(
+            infer_expression(&ws, KOTLIN, "provider.ktlspSliceText()"),
+            Type::class("String", Some("kotlin".into()))
+        );
+        let generic = infer_expression(&ws, KOTLIN, "provider.ktlspGeneric()");
+        assert_eq!(generic.name(), Some("JBox"));
+        assert_eq!(generic.args().len(), 1);
+        assert_eq!(generic.args()[0].name(), Some("String"));
+        for expression in ["counter.inc", "provider.ktlspSliceCounter().inc"] {
+            assert!(
+                labels(&mut ws, KOTLIN, expression).contains("incrementAndGet"),
+                "{expression}"
+            );
+        }
+        assert!(labels(&mut ws, KOTLIN, "provider.ktlspOther().foreign").contains("foreignOnly"));
+        assert!(!labels(&mut ws, KOTLIN, "provider.ktlspOther().").contains("substring"));
+        assert!(!labels(&mut ws, KOTLIN, "provider.ktlspSliceText().").contains("incrementAndGet"));
+        assert!(!labels(&mut ws, KOTLIN, "provider.ktlspSliceCounter().").contains("substring"));
+        let expected = target(
+            &ws,
+            "/selection/return-chain/KotlinText.kt",
+            "substring",
+            SymbolKind::Function,
+        );
+        assert_eq!(
+            goto(&mut ws, KOTLIN, "provider.ktlspSliceText().substring"),
+            vec![expected]
+        );
+        if java_string_available {
+            ws.open(JAVA, "package reduction; import okhttp3.OkHttpClient; class Use { String echo(String text) { return text; } java.util.concurrent.atomic.AtomicInteger echo(foreign.String text) { return null; } void use(OkHttpClient provider, String text, java.util.concurrent.atomic.AtomicInteger counter) { text.substring(0); provider.ktlspSliceText().substring(0); counter.incrementAndGet(); provider.ktlspSliceCounter().incrementAndGet(); provider.ktlspOther().foreignOnly(); provider.ktlspGeneric().get().substring(0); String assignedText = provider.ktlspSliceText(); echo(text).substring(0); echo(provider.ktlspSliceText()).substring(0); echo(assignedText).substring(0); } }".into());
+            for expression in [
+                "text.sub",
+                "provider.ktlspSliceText().sub",
+                "provider.ktlspGeneric().get().sub",
+                "echo(text).sub",
+                "echo(provider.ktlspSliceText()).sub",
+                "echo(assignedText).sub",
+            ] {
+                assert!(
+                    labels(&mut ws, JAVA, expression).contains("substring"),
+                    "{expression}"
+                );
+            }
+            for expression in ["counter.inc", "provider.ktlspSliceCounter().inc"] {
+                assert!(
+                    labels(&mut ws, JAVA, expression).contains("incrementAndGet"),
+                    "{expression}"
+                );
+            }
+            assert!(labels(&mut ws, JAVA, "provider.ktlspOther().foreign").contains("foreignOnly"));
+            assert!(!labels(&mut ws, JAVA, "provider.ktlspOther().").contains("substring"));
+            assert!(
+                !labels(&mut ws, JAVA, "provider.ktlspSliceText().").contains("incrementAndGet")
+            );
+            assert!(!labels(&mut ws, JAVA, "provider.ktlspSliceCounter().").contains("substring"));
+            let mapped = ktcore::jvm::string_result_for_call_mode(
+                &ws.index,
+                Type::class("String", Some("kotlin".into())).with_nullability(true),
+                &FileCtx::new("reduction".into(), Vec::new()),
+                ktcore::members::CallMode::Java,
+            );
+            assert_eq!(
+                mapped,
+                Type::class("String", Some("java.lang".into())).with_nullability(true)
+            );
+            let expected = target(
+                &ws,
+                "/selection/return-chain/jdk/String.java",
+                "substring",
+                SymbolKind::Function,
+            );
+            assert_eq!(
+                goto(&mut ws, JAVA, "provider.ktlspSliceText().substring"),
+                vec![expected]
+            );
+        } else {
+            // A missing Java API remains a coverage gap, without advertising Kotlin-only methods.
+            ws.open(JAVA, "package reduction; import okhttp3.OkHttpClient; class Use { void missing(OkHttpClient provider) { provider.ktlspSliceText().get(0); provider.ktlspSliceText().plus(null); } }".into());
+            assert!(labels(&mut ws, JAVA, "provider.ktlspS").contains("ktlspSliceText"));
+            let missing = labels(&mut ws, JAVA, "provider.ktlspSliceText().");
+            assert!(!missing.contains("get") && !missing.contains("plus"));
+        }
+    }
 }

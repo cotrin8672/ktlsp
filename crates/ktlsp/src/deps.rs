@@ -50,6 +50,9 @@ pub struct FileSymbols {
     /// Runtime project ownership is reapplied after loading the shared symbol cache.
     #[serde(skip)]
     pub origin: Option<FileOrigin>,
+    /// Exact selected archive authority, reapplied after shared symbol-cache loads.
+    #[serde(skip)]
+    pub library_source: Option<std::sync::Arc<LibrarySource>>,
 }
 
 /// A resolved source location for a dependency coordinate. The `identity` is stable for the actual
@@ -65,6 +68,30 @@ pub struct LibrarySource {
 }
 
 impl LibrarySource {
+    fn jdk_archive(src_zip: &Path, dest: &Path, fingerprint: &str) -> Self {
+        Self {
+            dest: dest.into(),
+            jar: Some(src_zip.into()),
+            fingerprint: Some(fingerprint.into()),
+            origin_id: crate::classpath::jdk_origin_id(src_zip),
+            policy: Ok(SourceTextPolicy::default()),
+        }
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        let (Some(jar), Some(expected), Ok(policy)) = (&self.jar, &self.fingerprint, &self.policy)
+        else {
+            return false;
+        };
+        jar_fingerprint(jar).as_ref() == Some(expected) && policy.validate().is_ok()
+    }
+    fn stamp_batches(&self, mut batches: Vec<FileSymbols>) -> Vec<FileSymbols> {
+        let source = std::sync::Arc::new(self.clone());
+        for batch in &mut batches {
+            batch.library_source = Some(source.clone());
+        }
+        batches
+    }
+
     pub fn identity(&self) -> String {
         let original = if let Some(fingerprint) = &self.fingerprint {
             format!("jar:{fingerprint}")
@@ -690,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v30-java-protected-access";
+const SYMCACHE_VERSION: &[u8] = b"v31-java-generic-signatures-method-bounds";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -960,6 +987,7 @@ fn parse_source_file(
         jvm: facts.jvm,
         file: crate::paths::file_key(path),
         symbols: facts.symbols,
+        library_source: None,
         origin: None,
     })
 }
@@ -1160,7 +1188,7 @@ fn resolve_library_source_unowned(
         return Err(error);
     }
     let Some(jar) = &source.jar else {
-        return parse_dir(&source.dest, kotlin, java);
+        return parse_dir(&source.dest, kotlin, java).map(|batches| source.stamp_batches(batches));
     };
 
     let archive_fingerprint = source
@@ -1184,7 +1212,7 @@ fn resolve_library_source_unowned(
             jar.display()
         );
         policy.validate()?;
-        return Ok(cached);
+        return Ok(source.stamp_batches(cached));
     }
     let symbols = parse_source_jar(jar, &source.dest, policy.java, kotlin, java)?;
     anyhow::ensure!(
@@ -1194,7 +1222,7 @@ fn resolve_library_source_unowned(
     );
     policy.validate()?;
     symcache_store(&fingerprint, &symbols);
-    Ok(symbols)
+    Ok(source.stamp_batches(symbols))
 }
 
 /// Resolve one coordinate to indexed symbols: locate/download its sources jar, ensure it's
@@ -1252,7 +1280,7 @@ pub fn resolve_local_jar_stubs_for_origin(
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
     // Binary stubs without hierarchy and shadow facts must miss.
-    hasher.update(b"|local-jar-java-members-v6|");
+    hasher.update(b"|local-jar-java-members-v7|");
     hasher.update(origin_id.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
@@ -1315,7 +1343,7 @@ pub(crate) fn resolve_module_binary_stubs(
     let origin_id = crate::classpath::maven_origin_id(coord);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|module-jar-java-members-v6|");
+    hasher.update(b"|module-jar-java-members-v7|");
     hasher.update(origin_id.as_bytes());
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
@@ -1985,7 +2013,9 @@ pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPla
             &crate::classpath::jdk_origin_id(src_zip),
             SourceRepresentation::Source,
         );
-        return Some(JdkIndexPlan::Cached(cached));
+        return Some(JdkIndexPlan::Cached(
+            LibrarySource::jdk_archive(src_zip, &dest, &fingerprint).stamp_batches(cached),
+        ));
     }
 
     let bytes = fs::read(src_zip).ok()?;
@@ -2024,7 +2054,7 @@ pub fn parse_jdk_shard(
         &crate::classpath::jdk_origin_id(&plan.src_zip),
         SourceRepresentation::Source,
     );
-    Ok(out)
+    Ok(LibrarySource::jdk_archive(&plan.src_zip, &plan.dest, &plan.fingerprint).stamp_batches(out))
 }
 
 /// Persist the merged shard results. Call only when every shard succeeded, so a partial parse
@@ -2182,7 +2212,7 @@ pub(crate) fn resolve_jdk_imports_from_zip(
         &crate::classpath::jdk_origin_id(src_zip),
         SourceRepresentation::Source,
     );
-    batches
+    LibrarySource::jdk_archive(src_zip, &dest, &fingerprint).stamp_batches(batches)
 }
 
 fn find_extracted_source(dest: &Path, suffix: &str) -> Option<PathBuf> {
@@ -2288,6 +2318,7 @@ fn parse_java_source_file(path: &Path, java: &mut JavaParser) -> Option<FileSymb
         jvm: facts.jvm,
         file: crate::paths::file_key(path),
         symbols: facts.symbols,
+        library_source: None,
         origin: None,
     })
 }
@@ -2319,8 +2350,14 @@ mod tests {
             allow_download: false,
         };
         for state in ["", "SOURCEQUERY\tmain\tfailed\n"] {
-            let model = crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
-                "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n{state}END\t:app\n", root.display(), binary.display(), binary.display())));
+            let model = crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(
+                &format!(
+                    "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n{state}END\t:app\n",
+                    root.display(),
+                    binary.display(),
+                    binary.display()
+                ),
+            ));
             assert_eq!(model.coordinate_binaries(&coord).unwrap().len(), 1);
             let batches = resolve_explicit_import_fqn_from_coordinates(
                 "fieldfixture.FieldOnly",
@@ -2373,7 +2410,9 @@ mod tests {
         );
         write_sources_jar(&binary, &[]);
         let pom = |encoding: &str| {
-            format!("<project><groupId>example</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")
+            format!(
+                "<project><groupId>example</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>"
+            )
         };
         fs::write(&selected_pom, pom("UTF-8")).unwrap();
         let foreign = repos.m2.join("example/encoding/1/encoding-1.pom");
@@ -2381,9 +2420,12 @@ mod tests {
         fs::write(&foreign, pom("ISO-8859-1")).unwrap();
         let snapshot = |parent_record: &str| {
             crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSOURCESET\tmain\nARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\nSOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\n{parent_record}END\t:app\n",
-            root.display(), binary.display(), selected.display(), selected_pom.display()
-        )))
+                "PROJECT\t:app\t{}\nSOURCESET\tmain\nARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\nSOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\texample\tencoding\t1\n{parent_record}END\t:app\n",
+                root.display(),
+                binary.display(),
+                selected.display(),
+                selected_pom.display()
+            )))
         };
         let model = snapshot("");
         let source =
@@ -2510,8 +2552,20 @@ mod tests {
         let selected = root.join("settings-repository/api-1-sources.jar");
         let selected_pom = root.join("settings-repository/api-1.pom");
         let binary = root.join("api-1.jar");
-        write_sources_jar(&wrong, &[("example/api/Policy.java", "package example.api; public class Policy { public int wrongRepository() { return 1; } }")]);
-        write_sources_jar(&selected, &[("example/api/Policy.java", "package example.api; public class Policy { public int chosenRepository() { return 2; } }")]);
+        write_sources_jar(
+            &wrong,
+            &[(
+                "example/api/Policy.java",
+                "package example.api; public class Policy { public int wrongRepository() { return 1; } }",
+            )],
+        );
+        write_sources_jar(
+            &selected,
+            &[(
+                "example/api/Policy.java",
+                "package example.api; public class Policy { public int chosenRepository() { return 2; } }",
+            )],
+        );
         fs::write(&selected_pom, "<project><groupId>example</groupId><artifactId>api</artifactId><version>1</version></project>").unwrap();
         write_sources_jar(&binary, &[]);
         let prefix = format!(
@@ -2526,7 +2580,8 @@ mod tests {
         };
         let records = format!(
             "SOURCEQUERY\tmain\tcomplete\nSOURCEARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\nPOMQUERY\tmain\tcomplete\nPOMARTIFACT\tmain\t{}\tMODULE\texample\tapi\t1\n",
-            selected.display(), selected_pom.display()
+            selected.display(),
+            selected_pom.display()
         );
         let model = snapshot(&records);
         let extract = root.join("extract");
@@ -2570,7 +2625,13 @@ mod tests {
             )
             .is_err());
         }
-        write_sources_jar(&selected, &[("example/api/Policy.java", "package example.api; public class Policy { public long replacementRepository() { return 3; } }")]);
+        write_sources_jar(
+            &selected,
+            &[(
+                "example/api/Policy.java",
+                "package example.api; public class Policy { public long replacementRepository() { return 3; } }",
+            )],
+        );
         assert!(coordinate_source_for_model(&coord, &repos, &extract, Some(&model)).is_err());
         let changed = snapshot(&records);
         let replacement = coordinate_source_for_model(&coord, &repos, &extract, Some(&changed))
@@ -2970,32 +3031,57 @@ mod tests {
     #[test]
     fn jdk_seed_goto_preserves_nearest_member_type_identity() {
         for (case, source, anchor, declaration, prefix) in [
-            ("member_nested",
-             "package seed; class Outer { class Iterable<T> {} void run(Iterable<String> value) {} } class Iterable<T> {}",
-             "Iterable<String>", "class Iterable", "class "),
-            ("nearest_member",
-             "package seed; class Outer { class Iterable<T> {} class Inner { class Iterable<T> { int nearest; } void run(Iterable<String> value) {} } } class Iterable<T> {}",
-             "Iterable<String>", "class Iterable<T> { int nearest; }", "class "),
-            ("outer_interface_member",
-             "package seed; interface Outer { interface Iterable<T> {} class Inner { void run(Iterable<String> value) {} } } class Iterable<T> {}",
-             "Iterable<String>", "interface Iterable", "interface "),
-            ("enum_member",
-             "package seed; enum Outer { VALUE; class Iterable<T> {} void run(Iterable<String> value) {} } class Iterable<T> {}",
-             "Iterable<String>", "class Iterable", "class "),
-            ("nearer_method_parameter",
-             "package seed; class Outer { class Iterable<T> {} <Iterable> void run(Iterable value) {} } class Iterable<T> {}",
-             "Iterable value", "<Iterable>", "<"),
+            (
+                "member_nested",
+                "package seed; class Outer { class Iterable<T> {} void run(Iterable<String> value) {} } class Iterable<T> {}",
+                "Iterable<String>",
+                "class Iterable",
+                "class ",
+            ),
+            (
+                "nearest_member",
+                "package seed; class Outer { class Iterable<T> {} class Inner { class Iterable<T> { int nearest; } void run(Iterable<String> value) {} } } class Iterable<T> {}",
+                "Iterable<String>",
+                "class Iterable<T> { int nearest; }",
+                "class ",
+            ),
+            (
+                "outer_interface_member",
+                "package seed; interface Outer { interface Iterable<T> {} class Inner { void run(Iterable<String> value) {} } } class Iterable<T> {}",
+                "Iterable<String>",
+                "interface Iterable",
+                "interface ",
+            ),
+            (
+                "enum_member",
+                "package seed; enum Outer { VALUE; class Iterable<T> {} void run(Iterable<String> value) {} } class Iterable<T> {}",
+                "Iterable<String>",
+                "class Iterable",
+                "class ",
+            ),
+            (
+                "nearer_method_parameter",
+                "package seed; class Outer { class Iterable<T> {} <Iterable> void run(Iterable value) {} } class Iterable<T> {}",
+                "Iterable value",
+                "<Iterable>",
+                "<",
+            ),
         ] {
             let start = source.find(declaration).unwrap() + prefix.len();
             let expected = crate::symbol::Def {
-                file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len(),
+                file: "seed/Use.java".into(),
+                start_byte: start,
+                end_byte: start + "Iterable".len(),
             };
             assert_jdk_seed_type_reference_goto(case, source, anchor, expected.clone());
             if case != "nearer_method_parameter" {
                 let mut ws = crate::workspace::Workspace::new();
                 ws.open("seed/Use.java", source.to_string());
-                assert_eq!(ws.type_definition("seed/Use.java", source.find(anchor).unwrap()),
-                    vec![expected], "{case}: lexical member type definition");
+                assert_eq!(
+                    ws.type_definition("seed/Use.java", source.find(anchor).unwrap()),
+                    vec![expected],
+                    "{case}: lexical member type definition"
+                );
             }
         }
         // Duplicate current member declarations are ambiguous, never a first-name or JDK fallback.
@@ -3017,29 +3103,104 @@ mod tests {
     #[test]
     fn jdk_seed_goto_resolves_current_source_inherited_type_identity() {
         for (case, source, declaration, prefix, parameter) in [
-            ("inherited_outer", "package seed;\nclass Base { class Iterable {} }\nclass Outer {\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n", "class Iterable", "class ", false),
-            ("inherited_package", "package seed;\nclass Base { class Iterable {} }\nclass Use extends Base {\n    Iterable selected;\n    void run(Iterable value) {}\n}\nclass Iterable {}\n", "class Iterable", "class ", false),
-            ("inherited_import", "package seed;\nimport custom.Iterable;\nclass Base { class Iterable {} }\nclass Use extends Base {\n    Iterable selected;\n    void run(Iterable value) {}\n}\n", "class Iterable", "class ", false),
-            ("inherited_anonymous", "package seed;\nclass Base { class Iterable {} }\nclass Outer {\n    class Iterable {}\n    Object field = new Base() {\n        Iterable selected;\n        void run(Iterable value) {}\n    };\n}\n", "class Iterable", "class ", false),
-            ("own_member_before_inheritance", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { class Iterable { int own; } void run(Iterable value) {} } }", "class Iterable { int own; }", "class ", false),
-            ("own_parameter_before_inheritance", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner<Iterable> extends Base { void run(Iterable value) {} } }", "<Iterable>", "<", true),
-            ("method_parameter_before_inheritance", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { <Iterable> void run(Iterable value) {} } }", "<Iterable>", "<", true),
-            ("inherited_before_outer_parameter", "package seed; class Base { class Iterable {} } class Outer<Iterable> { class Inner extends Base { void run(Iterable value) {} } }", "class Iterable", "class ", false),
-            ("known_super_without_named_type", "package seed; class Base {} class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } }", "class Iterable", "class ", false),
-            ("inherited_with_incomplete_body", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) { value. } } }", "class Iterable", "class ", false),
-            ("qualified_parent_over_member_homonym", "package seed; class Base { class Iterable {} } class Outer { class Base { class Iterable {} } class Inner extends seed.Base { void run(Iterable value) {} } }", "class Iterable", "class ", false),
+            (
+                "inherited_outer",
+                "package seed;\nclass Base { class Iterable {} }\nclass Outer {\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "inherited_package",
+                "package seed;\nclass Base { class Iterable {} }\nclass Use extends Base {\n    Iterable selected;\n    void run(Iterable value) {}\n}\nclass Iterable {}\n",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "inherited_import",
+                "package seed;\nimport custom.Iterable;\nclass Base { class Iterable {} }\nclass Use extends Base {\n    Iterable selected;\n    void run(Iterable value) {}\n}\n",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "inherited_anonymous",
+                "package seed;\nclass Base { class Iterable {} }\nclass Outer {\n    class Iterable {}\n    Object field = new Base() {\n        Iterable selected;\n        void run(Iterable value) {}\n    };\n}\n",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "own_member_before_inheritance",
+                "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { class Iterable { int own; } void run(Iterable value) {} } }",
+                "class Iterable { int own; }",
+                "class ",
+                false,
+            ),
+            (
+                "own_parameter_before_inheritance",
+                "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner<Iterable> extends Base { void run(Iterable value) {} } }",
+                "<Iterable>",
+                "<",
+                true,
+            ),
+            (
+                "method_parameter_before_inheritance",
+                "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { <Iterable> void run(Iterable value) {} } }",
+                "<Iterable>",
+                "<",
+                true,
+            ),
+            (
+                "inherited_before_outer_parameter",
+                "package seed; class Base { class Iterable {} } class Outer<Iterable> { class Inner extends Base { void run(Iterable value) {} } }",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "known_super_without_named_type",
+                "package seed; class Base {} class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } }",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "inherited_with_incomplete_body",
+                "package seed; class Base { class Iterable {} } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) { value. } } }",
+                "class Iterable",
+                "class ",
+                false,
+            ),
+            (
+                "qualified_parent_over_member_homonym",
+                "package seed; class Base { class Iterable {} } class Outer { class Base { class Iterable {} } class Inner extends seed.Base { void run(Iterable value) {} } }",
+                "class Iterable",
+                "class ",
+                false,
+            ),
         ] {
             let start = source.find(declaration).unwrap() + prefix.len();
-            let expected = crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() };
+            let expected = crate::symbol::Def {
+                file: "seed/Use.java".into(),
+                start_byte: start,
+                end_byte: start + "Iterable".len(),
+            };
             assert_jdk_seed_type_reference_goto(case, source, "Iterable value", expected.clone());
             let mut ws = crate::workspace::Workspace::new();
             ws.open("seed/Use.java", source.to_string());
-            let definitions = ws.type_definition("seed/Use.java", source.find("Iterable value").unwrap());
+            let definitions =
+                ws.type_definition("seed/Use.java", source.find("Iterable value").unwrap());
             eprintln!("{case}: current type definitions {definitions:?}");
             if parameter {
                 assert!(definitions.is_empty(), "{case}: {definitions:?}");
             } else {
-                assert_eq!(definitions, vec![expected], "{case}: exact inherited/member type definition");
+                assert_eq!(
+                    definitions,
+                    vec![expected],
+                    "{case}: exact inherited/member type definition"
+                );
             }
         }
         // A known superclass without this name must preserve an ordinary imported type.
@@ -3051,27 +3212,60 @@ mod tests {
             end_byte: start + "Iterable".len(),
         };
         for (case, source) in [
-            ("known_super_import", "package seed; import custom.Iterable; class Base {} class Use extends Base { Iterable value; }"),
-            ("known_super_import_incomplete_body", "package seed; import custom.Iterable; class Base {} class Use extends Base { void run(Iterable value) { value. } }"),
+            (
+                "known_super_import",
+                "package seed; import custom.Iterable; class Base {} class Use extends Base { Iterable value; }",
+            ),
+            (
+                "known_super_import_incomplete_body",
+                "package seed; import custom.Iterable; class Base {} class Use extends Base { void run(Iterable value) { value. } }",
+            ),
         ] {
             assert_jdk_seed_type_reference_goto(case, source, "Iterable value", expected.clone());
             let mut ws = crate::workspace::Workspace::new();
             ws.open("custom/Iterable.java", custom.to_string());
             ws.open("seed/Use.java", source.to_string());
-            assert_eq!(ws.type_definition("seed/Use.java", source.find("Iterable value").unwrap()), vec![expected.clone()]);
+            assert_eq!(
+                ws.type_definition("seed/Use.java", source.find("Iterable value").unwrap()),
+                vec![expected.clone()]
+            );
         }
         // These are Unknown boundaries, not assertions that valid inherited navigation is complete.
         for (case, source) in [
-            ("missing_ancestor", "package seed; class Outer { class Iterable {} class Inner extends Missing { void run(Iterable value) {} } } class Iterable {}"),
-            ("ambiguous_ancestor", "package seed; class Base { class Iterable {} } class Base {} class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } } class Iterable {}"),
-            ("ambiguous_inherited_types", "package seed; interface First { class Iterable {} } interface Second { class Iterable {} } class Outer { class Iterable {} class Inner implements First, Second { void run(Iterable value) {} } }"),
-            ("private_inherited_candidate", "package seed; class Base { private class Iterable {} } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } }"),
-            ("malformed_ancestor_header", "package seed; class Base extends { } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } } class Iterable {}"),
-            ("unindexed_anonymous_local_base", "package seed; class Base { class Iterable {} } class Outer { class Iterable {} void create() { class Base {} Object value = new Base() { void run(Iterable value) {} }; } }"),
-            ("ambiguous_parent_container", "package seed; class Base { class Iterable {} } class Outer { class Base { class Iterable {} } class Inner extends Base { void run(Iterable value) {} } }"),
+            (
+                "missing_ancestor",
+                "package seed; class Outer { class Iterable {} class Inner extends Missing { void run(Iterable value) {} } } class Iterable {}",
+            ),
+            (
+                "ambiguous_ancestor",
+                "package seed; class Base { class Iterable {} } class Base {} class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } } class Iterable {}",
+            ),
+            (
+                "ambiguous_inherited_types",
+                "package seed; interface First { class Iterable {} } interface Second { class Iterable {} } class Outer { class Iterable {} class Inner implements First, Second { void run(Iterable value) {} } }",
+            ),
+            (
+                "private_inherited_candidate",
+                "package seed; class Base { private class Iterable {} } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } }",
+            ),
+            (
+                "malformed_ancestor_header",
+                "package seed; class Base extends { } class Outer { class Iterable {} class Inner extends Base { void run(Iterable value) {} } } class Iterable {}",
+            ),
+            (
+                "unindexed_anonymous_local_base",
+                "package seed; class Base { class Iterable {} } class Outer { class Iterable {} void create() { class Base {} Object value = new Base() { void run(Iterable value) {} }; } }",
+            ),
+            (
+                "ambiguous_parent_container",
+                "package seed; class Base { class Iterable {} } class Outer { class Base { class Iterable {} } class Inner extends Base { void run(Iterable value) {} } }",
+            ),
         ] {
             let mut ws = crate::workspace::Workspace::new();
-            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open(
+                "java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> {}".to_string(),
+            );
             ws.open("seed/Use.java", source.to_string());
             let offset = source.find("Iterable value").unwrap();
             let definitions = ws.goto_definition("seed/Use.java", offset);
@@ -3088,18 +3282,45 @@ mod tests {
         let container = "package custom; public class Container { public static class Base {} }";
         let imported = "package custom; public interface Iterable<T> {}";
         for (case, source, declaration) in [
-            ("import_shadowed_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n", None),
-            ("import_shadowed_anonymous_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Iterable {}\n    Object field = new Base() {\n        Iterable selected;\n        void run(Iterable value) {}\n    };\n}\n", None),
-            ("import_shadowed_parent_qualifier", "package seed; import custom.Container; class Outer { class Container { class Base { class Iterable {} } } class Iterable {} class Inner extends Container.Base { Inner(Container outer) { outer.super(); } void run(Iterable value) {} } }", None),
-            ("unshadowed_import_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n", Some("class Iterable")),
-            ("qualified_import_parent", "package seed; import custom.Base; class Outer { class Base { class Iterable {} } class Iterable { int selected; } class Inner extends custom.Base { void run(Iterable value) {} } }", Some("class Iterable { int selected; }")),
-            ("same_lexical_import_parent", "package seed; import seed.Outer.Base; class Outer { static class Base { class Iterable {} } class Iterable {} class Inner extends Base { void run(Iterable value) {} } }", Some("class Iterable")),
+            (
+                "import_shadowed_parent",
+                "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n",
+                None,
+            ),
+            (
+                "import_shadowed_anonymous_parent",
+                "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Iterable {}\n    Object field = new Base() {\n        Iterable selected;\n        void run(Iterable value) {}\n    };\n}\n",
+                None,
+            ),
+            (
+                "import_shadowed_parent_qualifier",
+                "package seed; import custom.Container; class Outer { class Container { class Base { class Iterable {} } } class Iterable {} class Inner extends Container.Base { Inner(Container outer) { outer.super(); } void run(Iterable value) {} } }",
+                None,
+            ),
+            (
+                "unshadowed_import_parent",
+                "package seed;\nimport custom.Base;\nclass Outer {\n    class Iterable {}\n    class Inner extends Base {\n        Iterable selected;\n        void run(Iterable value) {}\n    }\n}\n",
+                Some("class Iterable"),
+            ),
+            (
+                "qualified_import_parent",
+                "package seed; import custom.Base; class Outer { class Base { class Iterable {} } class Iterable { int selected; } class Inner extends custom.Base { void run(Iterable value) {} } }",
+                Some("class Iterable { int selected; }"),
+            ),
+            (
+                "same_lexical_import_parent",
+                "package seed; import seed.Outer.Base; class Outer { static class Base { class Iterable {} } class Iterable {} class Inner extends Base { void run(Iterable value) {} } }",
+                Some("class Iterable"),
+            ),
         ] {
             let mut ws = crate::workspace::Workspace::new();
             ws.open("custom/Base.java", base.to_string());
             ws.open("custom/Container.java", container.to_string());
             ws.open("custom/Iterable.java", imported.to_string());
-            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open(
+                "java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> {}".to_string(),
+            );
             ws.open("seed/Use.java", source.to_string());
             let offset = source.find("Iterable value").unwrap();
             let definitions = ws.goto_definition("seed/Use.java", offset);
@@ -3107,9 +3328,16 @@ mod tests {
             eprintln!("{case}: goto {definitions:?}; type definitions {type_definitions:?}");
             if let Some(declaration) = declaration {
                 let start = source.find(declaration).unwrap() + "class ".len();
-                let expected = vec![crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() }];
+                let expected = vec![crate::symbol::Def {
+                    file: "seed/Use.java".into(),
+                    start_byte: start,
+                    end_byte: start + "Iterable".len(),
+                }];
                 assert_eq!(definitions, expected, "{case}: exact useful goto");
-                assert_eq!(type_definitions, expected, "{case}: exact useful type definition");
+                assert_eq!(
+                    type_definitions, expected,
+                    "{case}: exact useful type definition"
+                );
             } else {
                 // Valid source needs a lexical-parent resolver; never select the competing outer type.
                 assert!(definitions.is_empty(), "{case}: {definitions:?}");
@@ -3118,15 +3346,33 @@ mod tests {
         }
         let source = "package seed; class Use extends Outer.Middle { Use(Outer outer) { outer.super(); } Iterable selected; void run(Iterable value) {} } class Iterable {}";
         for (case, helpers, source, shadowed) in [
-            ("foreign_import_shadowed_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Middle extends Base {}\n}\n", source, true),
-            ("foreign_unshadowed_import_parent", "package seed;\nimport custom.Base;\nclass Outer {\n    class Middle extends Base {}\n}\n", source, false),
-            ("foreign_import_shadowed_qualifier", "package seed; import custom.Container; class Outer { class Container { class Base { class Iterable {} } } class Middle extends Container.Base { Middle(Container outer) { outer.super(); } } }", "package seed; class Use extends Outer.Middle { Use(Outer outer, Outer.Container container) { outer.super(container); } Iterable selected; void run(Iterable value) {} } class Iterable {}", true),
+            (
+                "foreign_import_shadowed_parent",
+                "package seed;\nimport custom.Base;\nclass Outer {\n    class Base { class Iterable {} }\n    class Middle extends Base {}\n}\n",
+                source,
+                true,
+            ),
+            (
+                "foreign_unshadowed_import_parent",
+                "package seed;\nimport custom.Base;\nclass Outer {\n    class Middle extends Base {}\n}\n",
+                source,
+                false,
+            ),
+            (
+                "foreign_import_shadowed_qualifier",
+                "package seed; import custom.Container; class Outer { class Container { class Base { class Iterable {} } } class Middle extends Container.Base { Middle(Container outer) { outer.super(); } } }",
+                "package seed; class Use extends Outer.Middle { Use(Outer outer, Outer.Container container) { outer.super(container); } Iterable selected; void run(Iterable value) {} } class Iterable {}",
+                true,
+            ),
         ] {
             let mut ws = crate::workspace::Workspace::new();
             ws.open("custom/Base.java", base.to_string());
             ws.open("custom/Container.java", container.to_string());
             ws.open("seed/Helpers.java", helpers.to_string());
-            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open(
+                "java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> {}".to_string(),
+            );
             ws.open("seed/Use.java", source.to_string());
             let offset = source.find("Iterable value").unwrap();
             let definitions = ws.goto_definition("seed/Use.java", offset);
@@ -3137,9 +3383,16 @@ mod tests {
                 assert!(type_definitions.is_empty(), "{case}: {type_definitions:?}");
             } else {
                 let start = source.find("class Iterable").unwrap() + "class ".len();
-                let expected = vec![crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() }];
+                let expected = vec![crate::symbol::Def {
+                    file: "seed/Use.java".into(),
+                    start_byte: start,
+                    end_byte: start + "Iterable".len(),
+                }];
                 assert_eq!(definitions, expected, "{case}: preserve useful fallback");
-                assert_eq!(type_definitions, expected, "{case}: preserve useful fallback");
+                assert_eq!(
+                    type_definitions, expected,
+                    "{case}: preserve useful fallback"
+                );
             }
         }
     }
@@ -3149,15 +3402,45 @@ mod tests {
         let nested_use = "package seed; class Use extends Outer.Middle { Iterable selected; void run(Iterable value) {} } class Iterable {}";
         let top_level_use = "package seed; class Use extends Middle { Iterable selected; void run(Iterable value) {} } class Iterable {}";
         for (case, helpers_key, helpers, source, unavailable) in [
-            ("foreign_kotlin_alias_parent", "seed/Helpers.kt", "package seed\nimport custom.Base as Alias\nclass Outer {\n    open class Alias { class Iterable }\n    open class Middle : Alias()\n}\n", nested_use, true),
-            ("foreign_kotlin_nested_without_parent", "seed/Helpers.kt", "package seed\nclass Outer { open class Middle }\n", nested_use, false),
-            ("foreign_kotlin_top_level_parent", "seed/Helpers.kt", "package seed\nopen class Middle : custom.Base()\n", top_level_use, false),
-            ("foreign_java_nested_parent", "seed/Helpers.java", "package seed; class Outer { static class Middle extends custom.Base {} }", nested_use, false),
+            (
+                "foreign_kotlin_alias_parent",
+                "seed/Helpers.kt",
+                "package seed\nimport custom.Base as Alias\nclass Outer {\n    open class Alias { class Iterable }\n    open class Middle : Alias()\n}\n",
+                nested_use,
+                true,
+            ),
+            (
+                "foreign_kotlin_nested_without_parent",
+                "seed/Helpers.kt",
+                "package seed\nclass Outer { open class Middle }\n",
+                nested_use,
+                false,
+            ),
+            (
+                "foreign_kotlin_top_level_parent",
+                "seed/Helpers.kt",
+                "package seed\nopen class Middle : custom.Base()\n",
+                top_level_use,
+                false,
+            ),
+            (
+                "foreign_java_nested_parent",
+                "seed/Helpers.java",
+                "package seed; class Outer { static class Middle extends custom.Base {} }",
+                nested_use,
+                false,
+            ),
         ] {
             let mut ws = crate::workspace::Workspace::new();
-            ws.open("custom/Base.java", "package custom; public class Base {}".to_string());
+            ws.open(
+                "custom/Base.java",
+                "package custom; public class Base {}".to_string(),
+            );
             ws.open(helpers_key, helpers.to_string());
-            ws.open("java/lang/Iterable.java", "package java.lang; public interface Iterable<T> {}".to_string());
+            ws.open(
+                "java/lang/Iterable.java",
+                "package java.lang; public interface Iterable<T> {}".to_string(),
+            );
             ws.open("seed/Use.java", source.to_string());
             let offset = source.find("Iterable value").unwrap();
             let definitions = ws.goto_definition("seed/Use.java", offset);
@@ -3169,9 +3452,16 @@ mod tests {
                 assert!(type_definitions.is_empty(), "{case}: {type_definitions:?}");
             } else {
                 let start = source.find("class Iterable").unwrap() + "class ".len();
-                let expected = vec![crate::symbol::Def { file: "seed/Use.java".into(), start_byte: start, end_byte: start + "Iterable".len() }];
+                let expected = vec![crate::symbol::Def {
+                    file: "seed/Use.java".into(),
+                    start_byte: start,
+                    end_byte: start + "Iterable".len(),
+                }];
                 assert_eq!(definitions, expected, "{case}: preserve useful goto");
-                assert_eq!(type_definitions, expected, "{case}: preserve useful type definition");
+                assert_eq!(
+                    type_definitions, expected,
+                    "{case}: preserve useful type definition"
+                );
             }
         }
     }
@@ -3663,7 +3953,11 @@ public class ParameterUse<Iterable> {
             fs::write(&source, text).unwrap();
             let cold = parse_source_file(&source, text, &mut kotlin, &mut java).unwrap();
             let pointers = contexts(&cold.symbols);
-            assert!(pointers[1..].iter().all(|other| Arc::ptr_eq(pointers[0], other)));
+            assert!(
+                pointers[1..]
+                    .iter()
+                    .all(|other| Arc::ptr_eq(pointers[0], other))
+            );
 
             let wire = bincode::serialize(&vec![cold]).unwrap();
             let raw: Vec<FileSymbols> = bincode::deserialize(&wire).unwrap();
@@ -3675,23 +3969,38 @@ public class ParameterUse<Iterable> {
             assert_eq!(bincode::serialize(&loaded).unwrap(), wire);
             let pointers = contexts(&loaded[0].symbols);
             assert!(
-                pointers[1..].iter().all(|other| Arc::ptr_eq(pointers[0], other)),
+                pointers[1..]
+                    .iter()
+                    .all(|other| Arc::ptr_eq(pointers[0], other)),
                 "accepted {name} cache must retain cold declaration-context sharing"
             );
-            let imported = loaded[0].symbols.iter().find(|symbol| symbol.name == "third").unwrap();
+            let imported = loaded[0]
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == "third")
+                .unwrap();
             let imported_context = &imported.return_type.as_ref().unwrap().package_candidates;
             assert_eq!(imported_context.as_ref(), &["api"]);
             assert!(!Arc::ptr_eq(pointers[0], imported_context));
             if let Some(jvm) = &loaded[0].jvm {
                 assert_eq!(jvm.callables.len(), 3);
-                assert!(Arc::ptr_eq(pointers[0], &jvm.callables[0].params[0].package_candidates));
+                assert!(Arc::ptr_eq(
+                    pointers[0],
+                    &jvm.callables[0].params[0].package_candidates
+                ));
                 let result = &jvm.callables[0].return_type;
                 assert_eq!(result.name, "Object");
                 assert_eq!(result.qualification.as_deref(), Some("java.lang"));
                 assert!(Arc::ptr_eq(pointers[0], &result.package_candidates));
                 let continuation = jvm.callables[0].params.last().unwrap();
-                assert_eq!(continuation.qualification.as_deref(), Some("kotlin.coroutines"));
-                assert!(Arc::ptr_eq(pointers[0], &continuation.args[0].package_candidates));
+                assert_eq!(
+                    continuation.qualification.as_deref(),
+                    Some("kotlin.coroutines")
+                );
+                assert!(Arc::ptr_eq(
+                    pointers[0],
+                    &continuation.args[0].package_candidates
+                ));
             }
             fs::remove_file(source).unwrap();
             assert!(symcache_load_file(&cache, &tmp).is_none());
@@ -3866,12 +4175,12 @@ public class ParameterUse<Iterable> {
             (
                 false,
                 origin.as_str(),
-                b"|local-jar-java-members-v6|".as_slice(),
+                b"|local-jar-java-members-v7|".as_slice(),
             ),
             (
                 true,
                 module_origin.as_str(),
-                b"|module-jar-java-members-v6|".as_slice(),
+                b"|module-jar-java-members-v7|".as_slice(),
             ),
         ] {
             let mut hasher = Sha256::new();
@@ -3956,15 +4265,41 @@ public class ParameterUse<Iterable> {
                 }
                 workspace.bump_index_revision();
                 for (key, source, needle, expected) in [
-                    ("Fields.java", "import fieldfixture.FieldOnly; class Fields { void f() { FieldOnly.LA; } }", "FieldOnly.LA", "LABEL"),
-                    ("Fields.kt", "import fieldfixture.FieldOnly\nfun f() { FieldOnly.LA }\n", "FieldOnly.LA", "LABEL"),
-                    ("Fields.java", "import fieldfixture.FieldOnly; class Fields { void f(FieldOnly value) { value.co; } }", "value.co", "count"),
-                    ("Fields.kt", "import fieldfixture.FieldOnly\nfun f(value: FieldOnly) { value.co }\n", "value.co", "count"),
+                    (
+                        "Fields.java",
+                        "import fieldfixture.FieldOnly; class Fields { void f() { FieldOnly.LA; } }",
+                        "FieldOnly.LA",
+                        "LABEL",
+                    ),
+                    (
+                        "Fields.kt",
+                        "import fieldfixture.FieldOnly\nfun f() { FieldOnly.LA }\n",
+                        "FieldOnly.LA",
+                        "LABEL",
+                    ),
+                    (
+                        "Fields.java",
+                        "import fieldfixture.FieldOnly; class Fields { void f(FieldOnly value) { value.co; } }",
+                        "value.co",
+                        "count",
+                    ),
+                    (
+                        "Fields.kt",
+                        "import fieldfixture.FieldOnly\nfun f(value: FieldOnly) { value.co }\n",
+                        "value.co",
+                        "count",
+                    ),
                 ] {
                     workspace.open(key, source.to_string());
-                    let query = workspace.completion_query(key, source.find(needle).unwrap() + needle.len()).unwrap();
-                    assert!(query.candidates.iter().any(|item| item.label == expected),
-                        "module={is_module} warm={warm} {key} {needle}: {} {:?}", query.status_label(), query.reason_labels());
+                    let query = workspace
+                        .completion_query(key, source.find(needle).unwrap() + needle.len())
+                        .unwrap();
+                    assert!(
+                        query.candidates.iter().any(|item| item.label == expected),
+                        "module={is_module} warm={warm} {key} {needle}: {} {:?}",
+                        query.status_label(),
+                        query.reason_labels()
+                    );
                     assert_eq!(workspace.doc_text(key).as_deref(), Some(source));
                 }
             }
@@ -4003,6 +4338,13 @@ public class ParameterUse<Iterable> {
                     "GenericMid",
                     include_bytes!(
                         "../../ktcore/tests/fixtures/classfile/shadowfixture/GenericMid.class"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "NestedBoundMid",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/shadowfixture/NestedBoundMid.class"
                     )
                     .as_slice(),
                 ),
@@ -4070,36 +4412,131 @@ public class ParameterUse<Iterable> {
                 }
                 workspace.open("KnownChild.java", "package shadowfixture; public class KnownChild extends GenericMid { public Object f(int value) { return null; } }".to_string());
                 for (file, source, selector, expected_owner) in [
-                    ("Use.kt", "import shadowfixture.Mid\nfun use(value: Mid) = value.f()\n", "value.f", Some("Mid.java")),
-                    ("Use.java", "import shadowfixture.Mid; class Use { Object use(Mid value) { return value.f(); } }", "value.f", Some("Mid.java")),
-                    ("Use.kt", "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.f()\n", "value.f", None),
-                    ("Use.java", "import shadowfixture.GenericMid; class Use { Object use(GenericMid value) { return value.f(); } }", "value.f", None),
-                    ("Use.kt", "import shadowfixture.KnownChild\nfun use(value: KnownChild) = value.f()\n", "value.f", None),
-                    ("Use.java", "import shadowfixture.KnownChild; class Use { Object use(KnownChild value) { return value.f(); } }", "value.f", None),
-                    ("Use.kt", "import shadowfixture.KnownChild\nfun use(value: KnownChild) = value.f(1)\n", "value.f", Some("KnownChild.java")),
-                    ("Use.java", "import shadowfixture.KnownChild; class Use { Object use(KnownChild value) { return value.f(1); } }", "value.f", Some("KnownChild.java")),
-                    ("Use.kt", "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.value\n", "value.value", None),
-                    ("Use.java", "import shadowfixture.GenericMid; class Use { Object use(GenericMid value) { return value.value; } }", "value.value", None),
-                    ("Use.kt", "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.value()\n", "value.value", Some("Base.java")),
-                    ("Use.java", "import shadowfixture.GenericMid; class Use { void use(GenericMid value) { value.value(); } }", "value.value", Some("Base.java")),
-                    ("Use.kt", "import shadowfixture.PublicMid\nfun use(value: PublicMid) = value.value\n", "value.value", Some("PublicMid.java")),
-                    ("Use.java", "import shadowfixture.PublicMid; class Use { Object use(PublicMid value) { return value.value; } }", "value.value", Some("PublicMid.java")),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.Mid\nfun use(value: Mid) = value.f()\n",
+                        "value.f",
+                        Some("Mid.java"),
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.Mid; class Use { Object use(Mid value) { return value.f(); } }",
+                        "value.f",
+                        Some("Mid.java"),
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.f()\n",
+                        "value.f",
+                        Some("GenericMid.java"),
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.GenericMid; class Use { Object use(GenericMid value) { return value.f(); } }",
+                        "value.f",
+                        Some("GenericMid.java"),
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.NestedBoundMid\nfun use(value: NestedBoundMid) = value.f()\n",
+                        "value.f",
+                        None,
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.NestedBoundMid; class Use { Object use(NestedBoundMid value) { return value.f(); } }",
+                        "value.f",
+                        None,
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.KnownChild\nfun use(value: KnownChild) = value.f()\n",
+                        "value.f",
+                        Some("GenericMid.java"),
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.KnownChild; class Use { Object use(KnownChild value) { return value.f(); } }",
+                        "value.f",
+                        Some("GenericMid.java"),
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.KnownChild\nfun use(value: KnownChild) = value.f(1)\n",
+                        "value.f",
+                        Some("KnownChild.java"),
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.KnownChild; class Use { Object use(KnownChild value) { return value.f(1); } }",
+                        "value.f",
+                        Some("KnownChild.java"),
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.value\n",
+                        "value.value",
+                        None,
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.GenericMid; class Use { Object use(GenericMid value) { return value.value; } }",
+                        "value.value",
+                        None,
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.GenericMid\nfun use(value: GenericMid) = value.value()\n",
+                        "value.value",
+                        Some("Base.java"),
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.GenericMid; class Use { void use(GenericMid value) { value.value(); } }",
+                        "value.value",
+                        Some("Base.java"),
+                    ),
+                    (
+                        "Use.kt",
+                        "import shadowfixture.PublicMid\nfun use(value: PublicMid) = value.value\n",
+                        "value.value",
+                        Some("PublicMid.java"),
+                    ),
+                    (
+                        "Use.java",
+                        "import shadowfixture.PublicMid; class Use { Object use(PublicMid value) { return value.value; } }",
+                        "value.value",
+                        Some("PublicMid.java"),
+                    ),
                 ] {
                     workspace.open(file, source.to_string());
                     let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
                     let targets = workspace.goto_definition(file, at);
                     if let Some(owner) = expected_owner {
-                        assert_eq!(targets.len(), 1, "{file} {selector} module={is_module} warm={warm}: {targets:?}");
-                        assert!(targets[0].file.ends_with(owner), "{file} {selector}: {targets:?}");
+                        assert_eq!(
+                            targets.len(),
+                            1,
+                            "{file} {selector} module={is_module} warm={warm}: {targets:?}"
+                        );
+                        assert!(
+                            targets[0].file.ends_with(owner),
+                            "{file} {selector}: {targets:?}"
+                        );
                         if owner == "KnownChild.java" {
                             let query = workspace.completion_query(file, at + 1).unwrap();
                             assert!(query.candidates.iter().any(|item| item.label == "f"));
                         }
                     } else {
-                        assert!(targets.is_empty(), "must not borrow an ancestor: {file} {selector} module={is_module} warm={warm}: {targets:?}");
+                        assert!(
+                            targets.is_empty(),
+                            "must not borrow an ancestor: {file} {selector} module={is_module} warm={warm}: {targets:?}"
+                        );
                         if selector == "value.f" && !source.contains("KnownChild") {
                             let query = workspace.completion_query(file, at + 1).unwrap();
-                            assert!(query.candidates.iter().all(|item| item.label != "f"), "unavailable override: {file} module={is_module} warm={warm}");
+                            assert!(
+                                query.candidates.iter().all(|item| item.label != "f"),
+                                "unavailable override: {file} module={is_module} warm={warm}"
+                            );
                         }
                     }
                 }
@@ -4111,10 +4548,10 @@ public class ParameterUse<Iterable> {
                 assert!(workspace.goto_definition("Leaf.kt", at - 1).is_empty());
                 workspace.open(
                     "Extensions.kt",
-                    "package exts\nfun shadowfixture.GenericMid.f(): String = \"safe\"\n"
+                    "package exts\nfun shadowfixture.NestedBoundMid.f(): String = \"safe\"\n"
                         .to_string(),
                 );
-                let source = "import shadowfixture.GenericMid\nimport exts.f as safeAlias\nfun use(value: GenericMid) { value. }\n";
+                let source = "import shadowfixture.NestedBoundMid\nimport exts.f as safeAlias\nfun use(value: NestedBoundMid) { value. }\n";
                 workspace.open("Alias.kt", source.to_string());
                 let at = source.find("value.").unwrap() + "value.".len();
                 let query = workspace.completion_query("Alias.kt", at).unwrap();
@@ -4205,7 +4642,7 @@ public class ParameterUse<Iterable> {
                 symcache_load(&old_key, &legacy_dir).is_some(),
                 "legacy placeholder cache must exist"
             );
-            let current_key = fingerprint(6);
+            let current_key = fingerprint(7);
             let dest = extract.join("local-jars").join(&current_key);
             let cache = symcache_dir().join(format!("{current_key}.zst"));
             for warm in [false, true] {
@@ -4256,20 +4693,33 @@ public class ParameterUse<Iterable> {
                             && symbol.kind == ktcore::symbol::SymbolKind::Interface),
                     "interface missing: module={is_module} warm={warm}"
                 );
-                assert!(batches.iter().all(|batch| batch
-                    .origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.representation == SourceRepresentation::Stub)));
+                assert!(batches.iter().all(|batch| {
+                    batch
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.representation == SourceRepresentation::Stub)
+                }));
                 let mut workspace = crate::workspace::Workspace::new();
                 for batch in batches {
                     assert!(workspace.index_dependency_batch(batch));
                 }
                 for (file, text) in [
-                    ("Base.java", "package probe; public class Base implements net.createmod.ponder.api.VirtualBlockEntity { public void markVirtual() {} public boolean isVirtual() { return false; } protected float getBreakSpeed() { return 1f; } }"),
+                    (
+                        "Base.java",
+                        "package probe; public class Base implements net.createmod.ponder.api.VirtualBlockEntity { public void markVirtual() {} public boolean isVirtual() { return false; } protected float getBreakSpeed() { return 1f; } }",
+                    ),
                     ("Key.java", "package probe; public class Key<T> {}"),
-                    ("Lookup.java", "package probe; public class Lookup<T> { public T getOrThrow(Key<T> key) { return null; } }"),
-                    ("Use.kt", "package probe\ninterface Marker\nclass MarkerImpl : Marker\nfun <T> Base.holderLookup(key: Key<T>): Lookup<T> = TODO()\nclass Drill : Base(), Marker by MarkerImpl() {\n override fun getBreakSpeed(): Float = super.getBreakSpeed()\n fun work(key: Key<String>) = holderLookup(key).getOrThrow(key)\n}\n"),
-                ] { workspace.open(file, text.to_string()); }
+                    (
+                        "Lookup.java",
+                        "package probe; public class Lookup<T> { public T getOrThrow(Key<T> key) { return null; } }",
+                    ),
+                    (
+                        "Use.kt",
+                        "package probe\ninterface Marker\nclass MarkerImpl : Marker\nfun <T> Base.holderLookup(key: Key<T>): Lookup<T> = TODO()\nclass Drill : Base(), Marker by MarkerImpl() {\n override fun getBreakSpeed(): Float = super.getBreakSpeed()\n fun work(key: Key<String>) = holderLookup(key).getOrThrow(key)\n}\n",
+                    ),
+                ] {
+                    workspace.open(file, text.to_string());
+                }
                 let source = workspace.doc_text("Use.kt").unwrap();
                 for (expression, member, target_file) in [
                     ("super.getBreakSpeed", "getBreakSpeed", "Base.java"),
@@ -4348,9 +4798,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if module {
-                b"|module-jar-java-members-v6|".as_slice()
+                b"|module-jar-java-members-v7|".as_slice()
             } else {
-                b"|local-jar-java-members-v6|".as_slice()
+                b"|local-jar-java-members-v7|".as_slice()
             });
             if module {
                 hash.update(crate::classpath::maven_origin_id(&coord).as_bytes());
@@ -4411,55 +4861,221 @@ public class ParameterUse<Iterable> {
                     assert!(ws.index_dependency_batch(batch));
                 }
                 for (file, source, selector, member, allowed) in [
-                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(){return super.getBreakSpeed();} }", "super.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed() = super.getBreakSpeed() }", "super.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { Position pass(Position p){return super.transform(p);} }", "super.transform", "transform", true),
-                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun pass(p: Position) = super.transform(p) }", "super.transform", "transform", true),
-                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { Position pass(ProtectedApi base, Position p){return super.transform(base.transform(p));} }", "base.transform", "transform", false),
-                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun pass(base: ProtectedApi, p: Position) = super.transform(base.transform(p)) }", "base.transform", "transform", false),
-                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(){return this.getBreakSpeed();} }", "this.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed() = this.getBreakSpeed() }", "this.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(JavaCaller p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed(p: KotlinCaller) = p.getBreakSpeed() }", "p.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.java", "package other; import protectedfixture.*; class Caller { float speed(ProtectedApi p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", false),
-                    ("Caller.kt", "package other\nimport protectedfixture.*\nfun speed(p: ProtectedApi) = p.getBreakSpeed()", "p.getBreakSpeed", "getBreakSpeed", false),
-                    ("Caller.java", "package protectedfixture; class Caller { float speed(ProtectedApi p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.kt", "package protectedfixture\nfun speed(p: ProtectedApi) = p.getBreakSpeed()", "p.getBreakSpeed", "getBreakSpeed", true),
-                    ("Caller.java", "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(ProtectedApi p){return p.getBreakSpeed();} }", "p.getBreakSpeed", "getBreakSpeed", false),
-                    ("Caller.kt", "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed(p: ProtectedApi) = p.getBreakSpeed() }", "p.getBreakSpeed", "getBreakSpeed", false),
-                    ("Caller.java", "package other; import protectedfixture.*; class Caller { int value(ProtectedApi p){return p.known();} }", "p.known", "known", true),
-                    ("Caller.kt", "package other\nimport protectedfixture.*\nfun value(p: ProtectedApi) = p.known()", "p.known", "known", true),
-                    ("Caller.java", "package other; import protectedfixture.*; class Caller { int value(ProtectedApi p){return p.hiddenControl();} }", "p.hiddenControl", "hiddenControl", false),
-                    ("Caller.kt", "package other\nimport protectedfixture.*\nfun value(p: ProtectedApi) = p.hiddenControl()", "p.hiddenControl", "hiddenControl", false),
+                    (
+                        "Caller.java",
+                        "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(){return super.getBreakSpeed();} }",
+                        "super.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed() = super.getBreakSpeed() }",
+                        "super.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.java",
+                        "package access; import protectedfixture.*; class Caller extends ProtectedApi { Position pass(Position p){return super.transform(p);} }",
+                        "super.transform",
+                        "transform",
+                        true,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun pass(p: Position) = super.transform(p) }",
+                        "super.transform",
+                        "transform",
+                        true,
+                    ),
+                    (
+                        "Caller.java",
+                        "package access; import protectedfixture.*; class Caller extends ProtectedApi { Position pass(ProtectedApi base, Position p){return super.transform(base.transform(p));} }",
+                        "base.transform",
+                        "transform",
+                        false,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun pass(base: ProtectedApi, p: Position) = super.transform(base.transform(p)) }",
+                        "base.transform",
+                        "transform",
+                        false,
+                    ),
+                    (
+                        "Caller.java",
+                        "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(){return this.getBreakSpeed();} }",
+                        "this.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed() = this.getBreakSpeed() }",
+                        "this.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.java",
+                        "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(JavaCaller p){return p.getBreakSpeed();} }",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed(p: KotlinCaller) = p.getBreakSpeed() }",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.java",
+                        "package other; import protectedfixture.*; class Caller { float speed(ProtectedApi p){return p.getBreakSpeed();} }",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        false,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package other\nimport protectedfixture.*\nfun speed(p: ProtectedApi) = p.getBreakSpeed()",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        false,
+                    ),
+                    (
+                        "Caller.java",
+                        "package protectedfixture; class Caller { float speed(ProtectedApi p){return p.getBreakSpeed();} }",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package protectedfixture\nfun speed(p: ProtectedApi) = p.getBreakSpeed()",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        true,
+                    ),
+                    (
+                        "Caller.java",
+                        "package access; import protectedfixture.*; class Caller extends ProtectedApi { float speed(ProtectedApi p){return p.getBreakSpeed();} }",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        false,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package access\nimport protectedfixture.*\nclass Caller : ProtectedApi() { fun speed(p: ProtectedApi) = p.getBreakSpeed() }",
+                        "p.getBreakSpeed",
+                        "getBreakSpeed",
+                        false,
+                    ),
+                    (
+                        "Caller.java",
+                        "package other; import protectedfixture.*; class Caller { int value(ProtectedApi p){return p.known();} }",
+                        "p.known",
+                        "known",
+                        true,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package other\nimport protectedfixture.*\nfun value(p: ProtectedApi) = p.known()",
+                        "p.known",
+                        "known",
+                        true,
+                    ),
+                    (
+                        "Caller.java",
+                        "package other; import protectedfixture.*; class Caller { int value(ProtectedApi p){return p.hiddenControl();} }",
+                        "p.hiddenControl",
+                        "hiddenControl",
+                        false,
+                    ),
+                    (
+                        "Caller.kt",
+                        "package other\nimport protectedfixture.*\nfun value(p: ProtectedApi) = p.hiddenControl()",
+                        "p.hiddenControl",
+                        "hiddenControl",
+                        false,
+                    ),
                 ] {
                     for authored in [false, true] {
-                    let source = source.replace("class Caller", if file.ends_with(".java") { "class JavaCaller" } else { "class KotlinCaller" });
-                    let source = if authored {
-                        ws.open("SourceApi.java", include_str!("../../ktcore/tests/fixtures/classfile/sources/protectedfixture/ProtectedApi.java").replace("ProtectedApi", "SourceApi"));
-                        source.replace("ProtectedApi", "SourceApi")
-                    } else { source };
-                    ws.open(file, source.clone());
-                    let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
-                    let targets = ws.goto_definition(file, at);
-                    let query = ws.completion_query(file, at + member.len()).unwrap();
-                    assert_eq!(query.candidates.iter().any(|item| item.label == member), allowed,
-                        "completion {file} {selector} module={module} warm={warm} authored={authored}: {:?}", query.reason_labels());
-                    assert_eq!(!targets.is_empty(), allowed, "navigation {file} {selector} module={module} warm={warm} authored={authored}: {targets:?}");
-                    if !allowed && matches!(member, "getBreakSpeed" | "transform") {
-                        let tree = if file.ends_with(".java") { java.parse(&source) } else { kotlin.parse(&source) };
-                        let mut ctx = ktcore::infer::FileCtx::from_tree_in_file(&tree, &source, file);
-                        if file.ends_with(".java") { ctx.package = crate::java::package_of(&tree, &source); }
-                        let receiver = ktcore::types::Type::class(if authored { "SourceApi" } else { "ProtectedApi" }, Some("protectedfixture".into()));
-                        let status = ktcore::resolve::member_name_status_for_receiver(
-                            &ws.index.scoped_for_file(file), file, &receiver, member,
-                            &ktcore::resolve::CompletenessFacts::default(), &ctx, at,
+                        let source = source.replace(
+                            "class Caller",
+                            if file.ends_with(".java") {
+                                "class JavaCaller"
+                            } else {
+                                "class KotlinCaller"
+                            },
                         );
-                        assert!(!status.is_found(), "denied protected member cannot be Found: {file} {selector} authored={authored}");
-                    }
-                    if allowed {
-                        assert_eq!(targets.len(), 1);
-                        assert!(targets[0].file.ends_with(if authored { "SourceApi.java" } else { "protectedfixture/ProtectedApi.java" }), "{targets:?}");
-                    }
+                        let source = if authored {
+                            ws.open("SourceApi.java", include_str!("../../ktcore/tests/fixtures/classfile/sources/protectedfixture/ProtectedApi.java").replace("ProtectedApi", "SourceApi"));
+                            source.replace("ProtectedApi", "SourceApi")
+                        } else {
+                            source
+                        };
+                        ws.open(file, source.clone());
+                        let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
+                        let targets = ws.goto_definition(file, at);
+                        let query = ws.completion_query(file, at + member.len()).unwrap();
+                        assert_eq!(
+                            query.candidates.iter().any(|item| item.label == member),
+                            allowed,
+                            "completion {file} {selector} module={module} warm={warm} authored={authored}: {:?}",
+                            query.reason_labels()
+                        );
+                        assert_eq!(
+                            !targets.is_empty(),
+                            allowed,
+                            "navigation {file} {selector} module={module} warm={warm} authored={authored}: {targets:?}"
+                        );
+                        if !allowed && matches!(member, "getBreakSpeed" | "transform") {
+                            let tree = if file.ends_with(".java") {
+                                java.parse(&source)
+                            } else {
+                                kotlin.parse(&source)
+                            };
+                            let mut ctx =
+                                ktcore::infer::FileCtx::from_tree_in_file(&tree, &source, file);
+                            if file.ends_with(".java") {
+                                ctx.package = crate::java::package_of(&tree, &source);
+                            }
+                            let receiver = ktcore::types::Type::class(
+                                if authored {
+                                    "SourceApi"
+                                } else {
+                                    "ProtectedApi"
+                                },
+                                Some("protectedfixture".into()),
+                            );
+                            let status = ktcore::resolve::member_name_status_for_receiver(
+                                &ws.index.scoped_for_file(file),
+                                file,
+                                &receiver,
+                                member,
+                                &ktcore::resolve::CompletenessFacts::default(),
+                                &ctx,
+                                at,
+                            );
+                            assert!(
+                                !status.is_found(),
+                                "denied protected member cannot be Found: {file} {selector} authored={authored}"
+                            );
+                        }
+                        if allowed {
+                            assert_eq!(targets.len(), 1);
+                            assert!(
+                                targets[0].file.ends_with(if authored {
+                                    "SourceApi.java"
+                                } else {
+                                    "protectedfixture/ProtectedApi.java"
+                                }),
+                                "{targets:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -4586,14 +5202,38 @@ public class ParameterUse<Iterable> {
             "package access\nopen class Api { protected fun speed(): Int = 1 }".into(),
         );
         for (source, selector, allowed) in [
-            ("package access\nfun use(p: Api) = p.speed()", "p.speed", false),
-            ("package access\nclass Caller : Api() { fun use() = this.speed() }", "this.speed", true),
-            ("package other\nimport access.Api\nclass Caller : Api() { fun use(p: Api) = p.speed() }", "p.speed", false),
+            (
+                "package access\nfun use(p: Api) = p.speed()",
+                "p.speed",
+                false,
+            ),
+            (
+                "package access\nclass Caller : Api() { fun use() = this.speed() }",
+                "this.speed",
+                true,
+            ),
+            (
+                "package other\nimport access.Api\nclass Caller : Api() { fun use(p: Api) = p.speed() }",
+                "p.speed",
+                false,
+            ),
         ] {
             ws.open("Use.kt", source.into());
             let at = source.find(selector).unwrap() + selector.rfind('.').unwrap() + 1;
-            assert_eq!(ws.completion_query("Use.kt", at + 5).unwrap().candidates.iter().any(|item| item.label == "speed"), allowed, "{source}");
-            assert_eq!(!ws.goto_definition("Use.kt", at).is_empty(), allowed, "{source}");
+            assert_eq!(
+                ws.completion_query("Use.kt", at + 5)
+                    .unwrap()
+                    .candidates
+                    .iter()
+                    .any(|item| item.label == "speed"),
+                allowed,
+                "{source}"
+            );
+            assert_eq!(
+                !ws.goto_definition("Use.kt", at).is_empty(),
+                allowed,
+                "{source}"
+            );
         }
     }
 
@@ -4664,9 +5304,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if is_module {
-                b"|module-jar-java-members-v6|".as_slice()
+                b"|module-jar-java-members-v7|".as_slice()
             } else {
-                b"|local-jar-java-members-v6|".as_slice()
+                b"|local-jar-java-members-v7|".as_slice()
             });
             hash.update(owner.as_bytes());
             if is_module {
@@ -4725,34 +5365,72 @@ public class ParameterUse<Iterable> {
                     .any(|parent| parent.name == "KineticBlockEntity"
                         && parent.qualification.as_deref()
                             == Some("com.simibubi.create.content.kinetics.base")));
-                assert!(batches.iter().all(|batch| batch
-                    .origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.origin_id == owner
-                        && origin.representation == SourceRepresentation::Stub)));
+                assert!(batches.iter().all(|batch| {
+                    batch.origin.as_ref().is_some_and(|origin| {
+                        origin.origin_id == owner
+                            && origin.representation == SourceRepresentation::Stub
+                    })
+                }));
                 let mut workspace = crate::workspace::Workspace::new();
                 for batch in batches {
                     assert!(workspace.index_dependency_batch(batch));
                 }
                 workspace.bump_index_revision();
                 for (file, text, selector, member) in [
-                    ("Use.java", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; class Use { void f(BlockBreakingKineticBlockEntity value) { value.getSpe; } }", "value.getSpe", "getSpeed"),
-                    ("Use.kt", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nfun f(value: BlockBreakingKineticBlockEntity) { value.getSpe }\n", "value.getSpe", "getSpeed"),
-                    ("Use.java", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; abstract class Use extends BlockBreakingKineticBlockEntity { float f() { return super.getBreakSpeed(); } }", "super.getBreakSpeed", "getBreakSpeed"),
-                    ("Use.kt", "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nabstract class Use : BlockBreakingKineticBlockEntity() { fun f() = super.getBreakSpeed() }\n", "super.getBreakSpeed", "getBreakSpeed"),
+                    (
+                        "Use.java",
+                        "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; class Use { void f(BlockBreakingKineticBlockEntity value) { value.getSpe; } }",
+                        "value.getSpe",
+                        "getSpeed",
+                    ),
+                    (
+                        "Use.kt",
+                        "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nfun f(value: BlockBreakingKineticBlockEntity) { value.getSpe }\n",
+                        "value.getSpe",
+                        "getSpeed",
+                    ),
+                    (
+                        "Use.java",
+                        "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity; abstract class Use extends BlockBreakingKineticBlockEntity { float f() { return super.getBreakSpeed(); } }",
+                        "super.getBreakSpeed",
+                        "getBreakSpeed",
+                    ),
+                    (
+                        "Use.kt",
+                        "import com.simibubi.create.content.kinetics.base.BlockBreakingKineticBlockEntity\nabstract class Use : BlockBreakingKineticBlockEntity() { fun f() = super.getBreakSpeed() }\n",
+                        "super.getBreakSpeed",
+                        "getBreakSpeed",
+                    ),
                 ] {
                     workspace.open(file, text.to_string());
-                    let query = workspace.completion_query(file, text.find(selector).unwrap()+selector.len()).unwrap();
-                    assert!(query.candidates.iter().any(|item| item.label == member), "{file} {member} module={is_module}: {} {:?}", query.status_label(), query.reason_labels());
+                    let query = workspace
+                        .completion_query(file, text.find(selector).unwrap() + selector.len())
+                        .unwrap();
+                    assert!(
+                        query.candidates.iter().any(|item| item.label == member),
+                        "{file} {member} module={is_module}: {} {:?}",
+                        query.status_label(),
+                        query.reason_labels()
+                    );
                     if file.ends_with(".kt") && member == "getBreakSpeed" {
                         let tree = kotlin.parse(text);
                         let start = text.find(selector).unwrap();
-                        let call = tree.root_node().named_descendant_for_byte_range(start, start + selector.len() + 2).unwrap();
+                        let call = tree
+                            .root_node()
+                            .named_descendant_for_byte_range(start, start + selector.len() + 2)
+                            .unwrap();
                         assert_eq!(call.kind(), "call_expression");
                         let ctx = ktcore::infer::FileCtx::from_tree_in_file(&tree, text, file);
-                        assert_eq!(ktcore::infer::infer(&workspace.index.scoped_for_file(file), call, text, &ctx),
+                        assert_eq!(
+                            ktcore::infer::infer(
+                                &workspace.index.scoped_for_file(file),
+                                call,
+                                text,
+                                &ctx
+                            ),
                             ktcore::types::Type::class("Float", Some("kotlin".into())),
-                            "actual Create protected ()F call must infer Kotlin Float: module={is_module} warm={warm}");
+                            "actual Create protected ()F call must infer Kotlin Float: module={is_module} warm={warm}"
+                        );
                     }
                 }
             }
@@ -4890,26 +5568,119 @@ public class ParameterUse<Iterable> {
             }
             workspace.bump_index_revision();
             for (key, source, needle, expected, absent) in [
-                ("Use.java", "import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder; class Use { void f() { JavaCompilerArgumentsBuilder.EMPTY_SOURCE; } }", "JavaCompilerArgumentsBuilder.EMPTY_SOURCE", "EMPTY_SOURCE_PATH_REF_DIR", "withheld"),
-                ("Use.kt", "import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder\nfun f() { JavaCompilerArgumentsBuilder.EMPTY_SOURCE }\n", "JavaCompilerArgumentsBuilder.EMPTY_SOURCE", "EMPTY_SOURCE_PATH_REF_DIR", "withheld"),
-                ("Use.java", "import pluginfixture.Person; class Use { void f(Person person) { person.ge; } }", "person.ge", "getName", "Person"),
-                ("Use.kt", "import pluginfixture.Person\nfun f(person: Person) { person.ge }\n", "person.ge", "getName", "Person"),
-                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.ro; } }", "factory.ro", "rows", "generic"),
-                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.ro }\n", "factory.ro", "rows", "generic"),
-                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.co; } }", "factory.co", "counts", "hidden"),
-                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.co }\n", "factory.co", "counts", "hidden"),
-                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.an; } }", "factory.an", "annotated", "generic"),
-                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.an }\n", "factory.an", "annotated", "generic"),
-                ("Use.java", "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.withArg; } }", "factory.withArg", "withArgument", "hidden"),
-                ("Use.kt", "import arrayfixture.Factory\nfun f(factory: Factory) { factory.withArg }\n", "factory.withArg", "withArgument", "hidden"),
-                ("Use.java", "import arrayfixture.Factory; class Use { void f() { Factory.st; } }", "Factory.st", "staticRows", "Factory"),
-                ("Use.kt", "import arrayfixture.Factory\nfun f() { Factory.st }\n", "Factory.st", "staticRows", "Factory"),
+                (
+                    "Use.java",
+                    "import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder; class Use { void f() { JavaCompilerArgumentsBuilder.EMPTY_SOURCE; } }",
+                    "JavaCompilerArgumentsBuilder.EMPTY_SOURCE",
+                    "EMPTY_SOURCE_PATH_REF_DIR",
+                    "withheld",
+                ),
+                (
+                    "Use.kt",
+                    "import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder\nfun f() { JavaCompilerArgumentsBuilder.EMPTY_SOURCE }\n",
+                    "JavaCompilerArgumentsBuilder.EMPTY_SOURCE",
+                    "EMPTY_SOURCE_PATH_REF_DIR",
+                    "withheld",
+                ),
+                (
+                    "Use.java",
+                    "import pluginfixture.Person; class Use { void f(Person person) { person.ge; } }",
+                    "person.ge",
+                    "getName",
+                    "Person",
+                ),
+                (
+                    "Use.kt",
+                    "import pluginfixture.Person\nfun f(person: Person) { person.ge }\n",
+                    "person.ge",
+                    "getName",
+                    "Person",
+                ),
+                (
+                    "Use.java",
+                    "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.ro; } }",
+                    "factory.ro",
+                    "rows",
+                    "generic",
+                ),
+                (
+                    "Use.kt",
+                    "import arrayfixture.Factory\nfun f(factory: Factory) { factory.ro }\n",
+                    "factory.ro",
+                    "rows",
+                    "generic",
+                ),
+                (
+                    "Use.java",
+                    "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.co; } }",
+                    "factory.co",
+                    "counts",
+                    "hidden",
+                ),
+                (
+                    "Use.kt",
+                    "import arrayfixture.Factory\nfun f(factory: Factory) { factory.co }\n",
+                    "factory.co",
+                    "counts",
+                    "hidden",
+                ),
+                (
+                    "Use.java",
+                    "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.an; } }",
+                    "factory.an",
+                    "annotated",
+                    "generic",
+                ),
+                (
+                    "Use.kt",
+                    "import arrayfixture.Factory\nfun f(factory: Factory) { factory.an }\n",
+                    "factory.an",
+                    "annotated",
+                    "generic",
+                ),
+                (
+                    "Use.java",
+                    "import arrayfixture.Factory; class Use { void f(Factory factory) { factory.withArg; } }",
+                    "factory.withArg",
+                    "withArgument",
+                    "hidden",
+                ),
+                (
+                    "Use.kt",
+                    "import arrayfixture.Factory\nfun f(factory: Factory) { factory.withArg }\n",
+                    "factory.withArg",
+                    "withArgument",
+                    "hidden",
+                ),
+                (
+                    "Use.java",
+                    "import arrayfixture.Factory; class Use { void f() { Factory.st; } }",
+                    "Factory.st",
+                    "staticRows",
+                    "Factory",
+                ),
+                (
+                    "Use.kt",
+                    "import arrayfixture.Factory\nfun f() { Factory.st }\n",
+                    "Factory.st",
+                    "staticRows",
+                    "Factory",
+                ),
             ] {
                 workspace.open(key, source.to_string());
                 let offset = source.find(needle).unwrap() + needle.len();
                 let query = workspace.completion_query(key, offset).unwrap();
-                let names: Vec<_> = query.candidates.iter().map(|item| item.label.as_str()).collect();
-                assert!(names.contains(&expected), "{key} {needle}: {} {:?} {names:?}", query.status_label(), query.reason_labels());
+                let names: Vec<_> = query
+                    .candidates
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect();
+                assert!(
+                    names.contains(&expected),
+                    "{key} {needle}: {} {:?} {names:?}",
+                    query.status_label(),
+                    query.reason_labels()
+                );
                 assert!(!names.contains(&absent), "{key} {needle}: {names:?}");
                 assert_eq!(workspace.doc_text(key).as_deref(), Some(source));
             }
@@ -5756,7 +6527,9 @@ worktree = "com.example:worktree:9.9"
         write_sources_jar(&archive, &[("api/Useful.java", raw)]);
         let archive_identity = jar_fingerprint(&archive).unwrap();
         let metadata = |encoding| {
-            format!("<project><groupId>fixture</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")
+            format!(
+                "<project><groupId>fixture</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>"
+            )
         };
         fs::write(&pom, metadata("UTF-8")).unwrap();
         let mut kotlin = KotlinParser::new();

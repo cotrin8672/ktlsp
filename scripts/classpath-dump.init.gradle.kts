@@ -41,13 +41,14 @@ object KtlspCompilerConfiguration {
 
     private fun javaGradleProfile(task: Task): JavaGradleProfile = when (task.project.gradle.gradleVersion) {
         "7.4.2" -> JavaGradleProfile("7.4.2", "isConfigurationCache", "IncrementalInputsTaskAction")
+        "7.5" -> JavaGradleProfile("7.5", "isConfigurationCache", "IncrementalInputsTaskAction")
         "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         else -> error("Unsupported Java recipe Gradle adapter")
     }
 
     private fun defaultJavaHome(task: JavaCompile): java.io.File? {
         // shortcut: other Gradle defaults stay unknown; extend after verifying their compiler selector.
-        if (task.project.gradle.gradleVersion != "7.4.2" || task.javaClass.name !in listOf(
+        if (task.project.gradle.gradleVersion !in listOf("7.4.2", "7.5") || task.javaClass.name !in listOf(
                 "org.gradle.api.tasks.compile.JavaCompile",
                 "org.gradle.api.tasks.compile.JavaCompile_Decorated",
             )) return null
@@ -93,6 +94,15 @@ object KtlspCompilerConfiguration {
         val o = task.options
         val explicitUtf8Jdk21 = profile.version == "9.6.1" &&
             task.sourceCompatibility == "21" && task.targetCompatibility == "21" && o.encoding == "UTF-8"
+        val defaultUtf8Target17Jdk21 = profile.version == "9.6.1" &&
+            task.sourceCompatibility == "17" && task.targetCompatibility == "17" &&
+            o.release.orNull == null && o.encoding == null &&
+            java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
+        val release8Utf8Jdk17 = profile.version == "7.4.2" && o.release.orNull == 8 &&
+            task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" &&
+            o.encoding == null && java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
+        val explicitUtf8Jdk17 = profile.version == "7.5" && o.release.orNull == null &&
+            task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" && o.encoding == "UTF-8"
         // allJvmArgs invokes providers even when fork=false; reject before reading it.
         check(o.forkOptions.jvmArgumentProviders.isEmpty()) { "Java JVM argument providers are unhandled" }
         check(!o.isFork && o.forkOptions.executable == null && o.forkOptions.jvmArgs.isNullOrEmpty() &&
@@ -102,7 +112,8 @@ object KtlspCompilerConfiguration {
         check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none")) { "Opaque Java compiler arguments are unhandled" }
         check(o.annotationProcessorPath?.files?.isEmpty() != false) { "Java annotation processing is unhandled" }
         check(o.sourcepath == null && o.bootstrapClasspath == null && o.extensionDirs == null &&
-            o.release.orNull == null && (o.encoding == null || explicitUtf8Jdk21)) { "Unsupported Java source/SDK/encoding policy" }
+            (o.release.orNull == null || release8Utf8Jdk17) &&
+            (o.encoding == null || explicitUtf8Jdk21 || explicitUtf8Jdk17)) { "Unsupported Java source/SDK/encoding policy" }
         check(o.javaModuleVersion.orNull == null && o.javaModuleMainClass.orNull == null &&
             task.source.files.none { it.name == "module-info.java" }) { "Java modules are unhandled" }
         fun invoke(name: String): Any = JavaCompile::class.java.getDeclaredMethod(name).apply {
@@ -112,7 +123,7 @@ object KtlspCompilerConfiguration {
             ?: error("Java stable source inventory is unavailable")
         check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
         val selected = when (profile.version) {
-            "7.4.2" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
+            "7.4.2", "7.5" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
             "9.6.1" -> task.javaCompiler.orNull
             else -> error("Unsupported Java compiler selector")
         } ?: error("Selected Java compiler is unavailable")
@@ -121,7 +132,7 @@ object KtlspCompilerConfiguration {
         }
         val metadata = selected.metadata
         val home = metadata.installationPath.asFile
-        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
+        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21 || defaultUtf8Target17Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
             home.canonicalFile == selectedHome.canonicalFile &&
             home.canonicalFile == java.io.File(System.getProperty("java.home")).canonicalFile) {
             "Java recipe requires the selected current SDK profile"
@@ -146,7 +157,7 @@ object KtlspCompilerConfiguration {
         val compileOptions = read(spec, "getCompileOptions") ?: error("Java compile options are unavailable")
         check((read(spec, "getModulePath") as? Collection<*>)?.isEmpty() == true &&
             (read(spec, "getAnnotationProcessorPath") as? Collection<*>)?.isEmpty() == true &&
-            read(spec, "getRelease") == null && read(compileOptions, "getSourcepath") == null &&
+            read(spec, "getRelease") == o.release.orNull && read(compileOptions, "getSourcepath") == null &&
             read(compileOptions, "getBootClasspath") == null && read(compileOptions, "getExtensionDirs") == null) {
             "Unsupported Java compiler effective inputs"
         }
@@ -171,8 +182,13 @@ object KtlspCompilerConfiguration {
             "Selected Java runtime defaults are empty"
         }
         return linkedMapOf(
-            "adapter" to if (explicitUtf8Jdk21) "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
-                else "gradle-${profile.version}-current-jdk17-javac-api-v1",
+            "adapter" to when {
+                explicitUtf8Jdk21 -> "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
+                defaultUtf8Target17Jdk21 -> "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+                release8Utf8Jdk17 -> "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+                explicitUtf8Jdk17 -> "gradle-7.5-current-jdk17-utf8-javac-api-v1"
+                else -> "gradle-${profile.version}-current-jdk17-javac-api-v1"
+            },
             "compiler_type" to selected.javaClass.name,
             "java_runtime_version" to runtimeVersion,
             "language_version" to metadata.languageVersion.toString(),
@@ -249,7 +265,7 @@ object KtlspCompilerConfiguration {
         val enabledType = defaults[0]!!.javaClass
         fun stockEnabledPredicate(predicate: Any): Boolean {
             if (predicate.javaClass != enabledType) return false
-            if (profile.version == "7.4.2") return true
+            if (profile.version in listOf("7.4.2", "7.5")) return true
             // Gradle 9.6.1 uses the same wrapper for stock and custom onlyIf predicates.
             check(enabledType.name == "org.gradle.api.internal.tasks.execution.SelfDescribingSpec") {
                 "Unsupported stock predicate wrapper"
@@ -268,7 +284,7 @@ object KtlspCompilerConfiguration {
             linkedMapOf<String, Any?>(
                 "class" to predicate.javaClass.name,
                 "stockEnabledPredicate" to stockEnabledPredicate(predicate),
-                "stockKaptPredicate" to (profile.version == "7.4.2" && stockKaptPredicate(predicate)),
+                "stockKaptPredicate" to (profile.version in listOf("7.4.2", "7.5") && stockKaptPredicate(predicate)),
             )
         }
         linkedMapOf("adapter" to "gradle-${profile.version}-stock-onlyif-v1", "predicates" to rows)
@@ -463,7 +479,7 @@ object KtlspCompilerConfiguration {
                 val javaOptions = linkedMapOf<String, Any?>(
                     "javaHomeSelection" to when {
                         configuredCompiler != null -> "javaCompiler"
-                        defaultHome != null -> "gradle-current-jvm-7.4.2"
+                        defaultHome != null -> "gradle-current-jvm-${task.project.gradle.gradleVersion}"
                         else -> null
                     },
                     "sourceCompatibility" to task.sourceCompatibility,

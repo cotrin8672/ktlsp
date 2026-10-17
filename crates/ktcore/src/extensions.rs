@@ -559,6 +559,7 @@ struct ReadSet {
     namespace: Option<u64>,
     files: BTreeMap<String, u64>,
     compiled: BTreeMap<String, u64>,
+    missing_sources: BTreeSet<String>,
 }
 
 pub struct PendingContributions {
@@ -606,6 +607,15 @@ impl Default for ExtensionStore {
 }
 
 impl ExtensionStore {
+    /// Only unresolved source inputs from current, enabled provider evaluations are requested.
+    pub fn requested_source_files(&self) -> BTreeSet<String> {
+        self.sets
+            .values()
+            .filter(|pending| self.is_current(pending))
+            .flat_map(|pending| pending.reads.missing_sources.iter().cloned())
+            .collect()
+    }
+
     pub fn clear_compiled_inputs(&mut self) {
         let mut changed = Vec::new();
         for (file, source) in &mut self.sources {
@@ -743,6 +753,39 @@ impl ExtensionStore {
         coverage: Fact<()>,
         declarations: Vec<source::SourceDeclaration>,
     ) -> Result<(), ContractError> {
+        self.replace_source_declarations_impl(index, file, text, coverage, declarations, None)
+    }
+
+    /// A background host parser may supply the same source eligibility without parsing again
+    /// while applying the accepted source/index batch. Other validation remains identical.
+    pub fn replace_prepared_source_declarations(
+        &mut self,
+        index: &dyn InferenceIndex,
+        prepared: source::PreparedSourceReferences,
+        coverage: Fact<()>,
+        declarations: Vec<source::SourceDeclaration>,
+    ) -> Result<(), ContractError> {
+        let file = prepared.file.clone();
+        let text = prepared.text.clone();
+        self.replace_source_declarations_impl(
+            index,
+            &file,
+            text,
+            coverage,
+            declarations,
+            Some(prepared),
+        )
+    }
+
+    fn replace_source_declarations_impl(
+        &mut self,
+        index: &dyn InferenceIndex,
+        file: &str,
+        text: Arc<str>,
+        coverage: Fact<()>,
+        declarations: Vec<source::SourceDeclaration>,
+        prepared: Option<source::PreparedSourceReferences>,
+    ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let mut seen = BTreeSet::new();
         for declaration in &declarations {
@@ -791,7 +834,7 @@ impl ExtensionStore {
             .iter()
             .filter_map(|declaration| declaration.member.clone())
             .collect();
-        self.replace_source(index, file, text, coverage, members)?;
+        self.replace_source_impl(index, file, text, coverage, members, prepared)?;
         self.sources.get_mut(file).unwrap().declarations = declarations;
         Ok(())
     }
@@ -805,6 +848,18 @@ impl ExtensionStore {
         text: Arc<str>,
         coverage: Fact<()>,
         members: Vec<DeclaredMemberFacts>,
+    ) -> Result<(), ContractError> {
+        self.replace_source_impl(index, file, text, coverage, members, None)
+    }
+
+    fn replace_source_impl(
+        &mut self,
+        index: &dyn InferenceIndex,
+        file: &str,
+        text: Arc<str>,
+        coverage: Fact<()>,
+        members: Vec<DeclaredMemberFacts>,
+        prepared: Option<source::PreparedSourceReferences>,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let mut types: Vec<_> = entries
@@ -845,7 +900,12 @@ impl ExtensionStore {
                 return Err(ContractError::NotIndexedDeclaration);
             }
         }
-        let reference_types = source::ordinary_reference_types(index, file, &text);
+        let reference_types = match prepared {
+            Some(prepared) if prepared.file != file => return Err(ContractError::ForeignFile),
+            Some(prepared) if prepared.text != text => return Err(ContractError::InvalidRange),
+            Some(prepared) => prepared.ranges,
+            None => source::ordinary_reference_types(index, file, &text),
+        };
         self.next_generation += 1;
         self.sources.insert(
             file.into(),
@@ -982,6 +1042,7 @@ impl ExtensionStore {
                 namespace: None,
                 files: BTreeMap::from([(owner.into(), owner_generation)]),
                 compiled: BTreeMap::new(),
+                missing_sources: BTreeSet::new(),
             },
             set: ContributionSet::default(),
         })
@@ -1231,11 +1292,14 @@ impl ReadSession<'_> {
     pub fn resolve_type(&mut self, qualified_name: &str) -> Fact<TypeId> {
         self.reads.namespace = Some(self.store.namespace_generation);
         let name = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
-        let entries: Vec<_> = self
+        let entries = self
             .index
             .lookup_type(name)
             .into_iter()
             .filter(|entry| qualified_type_name(entry) == qualified_name)
+            .collect();
+        let entries: Vec<_> = narrow_archive_jvm_types(&self.index, entries)
+            .into_iter()
             .cloned()
             .collect();
         if !self.index.scope_is_complete() {
@@ -1261,6 +1325,10 @@ impl ReadSession<'_> {
         }
         let declaration = match self.issue_declaration(entry) {
             Ok(declaration) => declaration,
+            Err(ContractError::MissingSource) => {
+                self.reads.missing_sources.insert(entry.path.to_string());
+                return unknown(IncompleteReason::MissingSource);
+            }
             Err(_) => return unknown(IncompleteReason::MissingSource),
         };
         let container = entry.sym.container.as_ref().map_or_else(
@@ -1331,7 +1399,18 @@ impl ReadSession<'_> {
             )));
         }
         let name = owner.container.replace('.', "$");
-        let internal_name = if owner.package.is_empty() {
+        let internal_name = if owner.package == "kotlin" {
+            match owner.container.as_str() {
+                "Any" => "java/lang/Object".into(),
+                "String" => "java/lang/String".into(),
+                // shortcut: other builtin lowering/boxing needs signature context before issuance.
+                _ => {
+                    return Ok(unknown(IncompleteReason::UnsupportedType(
+                        owner.qualified_name.clone(),
+                    )));
+                }
+            }
+        } else if owner.package.is_empty() {
             name
         } else {
             format!("{}/{}", owner.package.replace('.', "/"), name)
@@ -1348,15 +1427,34 @@ impl ReadSession<'_> {
         context: &crate::infer::FileCtx,
         java: bool,
         parameters: &[String],
+        container: Option<&str>,
     ) -> Option<JvmType> {
         if ty.nullable || ty.qualification.is_none() && parameters.contains(&ty.name) {
             return None;
+        }
+        if ty.qualification.is_none() {
+            let mut lexical = container;
+            while let Some(owner) = lexical {
+                if self.index.lookup_type(&ty.name).iter().any(|entry| {
+                    entry.sym.package == context.package
+                        && entry.sym.container.as_deref() == Some(owner)
+                }) {
+                    let mut qualified = ty.clone();
+                    qualified.qualification = Some(if context.package.is_empty() {
+                        owner.into()
+                    } else {
+                        format!("{}.{owner}", context.package)
+                    });
+                    return self.source_jvm_type(&qualified, context, java, parameters, None);
+                }
+                lexical = owner.rsplit_once('.').map(|(outer, _)| outer);
+            }
         }
         if java && ty.name.ends_with("[]") {
             let mut component = ty.clone();
             component.name = ty.name.strip_suffix("[]")?.to_string();
             return self
-                .source_jvm_type(&component, context, java, parameters)
+                .source_jvm_type(&component, context, java, parameters, container)
                 .map(|element| JvmType::Array(Box::new(element)));
         }
         if !java
@@ -1375,7 +1473,8 @@ impl ReadSession<'_> {
                                 || entry.sym.package == context.package)
                     }))
         {
-            let element = self.source_jvm_type(&ty.args[0], context, java, parameters)?;
+            let element =
+                self.source_jvm_type(&ty.args[0], context, java, parameters, container)?;
             // Kotlin Array<Int> boxes its elements; do not pretend it is an int[].
             return matches!(
                 element,
@@ -1446,7 +1545,13 @@ impl ReadSession<'_> {
                 .value_type
                 .as_ref()
                 .and_then(|ty| {
-                    self.source_jvm_type(ty, &context, entry.path.ends_with(".java"), &parameters)
+                    self.source_jvm_type(
+                        ty,
+                        &context,
+                        entry.path.ends_with(".java"),
+                        &parameters,
+                        entry.sym.container.as_deref(),
+                    )
                 })
                 .and_then(|ty| MemberSignature::field(&ty).ok())
         } else if !entry.sym.has_vararg
@@ -1457,11 +1562,23 @@ impl ReadSession<'_> {
                 .params
                 .iter()
                 .map(|ty| {
-                    self.source_jvm_type(ty, &context, entry.path.ends_with(".java"), &parameters)
+                    self.source_jvm_type(
+                        ty,
+                        &context,
+                        entry.path.ends_with(".java"),
+                        &parameters,
+                        entry.sym.container.as_deref(),
+                    )
                 })
                 .collect();
             let returns = entry.sym.return_type.as_ref().and_then(|ty| {
-                self.source_jvm_type(ty, &context, entry.path.ends_with(".java"), &parameters)
+                self.source_jvm_type(
+                    ty,
+                    &context,
+                    entry.path.ends_with(".java"),
+                    &parameters,
+                    entry.sym.container.as_deref(),
+                )
             });
             match (converted, returns) {
                 (Some(parameters), Some(returns)) => {
@@ -1904,6 +2021,47 @@ fn definition(entry: &Entry) -> Def {
     }
 }
 
+// A JVM source archive can carry common expect declarations beside its actual declarations.
+// Only one verified archive view may narrow; unrelated or unauthoritative duplicates stay ambiguous.
+fn narrow_archive_jvm_types<'a>(
+    index: &dyn InferenceIndex,
+    entries: Vec<&'a Entry>,
+) -> Vec<&'a Entry> {
+    if entries.len() < 2 {
+        return entries;
+    }
+    let Some(origins) = index.origin_facts() else {
+        return entries;
+    };
+    let first = entries[0];
+    let Some(origin) = origins.file_origin(&first.path) else {
+        return entries;
+    };
+    if origin.project_scope.is_some()
+        || origin.representation != crate::project_model::SourceRepresentation::Source
+    {
+        return entries;
+    }
+    let archive_root = |path: &str| {
+        let path = path.replace('\\', "/");
+        ["/commonMain/", "/jvmMain/"]
+            .into_iter()
+            .find_map(|view| path.split_once(view).map(|(root, _)| root.to_string()))
+    };
+    let Some(root) = archive_root(&first.path) else {
+        return entries;
+    };
+    if entries.iter().any(|entry| {
+        origins.file_origin(&entry.path) != Some(origin)
+            || archive_root(&entry.path).as_ref() != Some(&root)
+            || entry.sym.kind != first.sym.kind
+            || entry.sym.type_params != first.sym.type_params
+    }) {
+        return entries;
+    }
+    crate::resolve::narrow_source_set_entries(entries)
+}
+
 fn qualified_type_name(entry: &Entry) -> String {
     [
         &entry.sym.package,
@@ -1992,6 +2150,48 @@ fn validate_entry(text: &str, entry: &Entry) -> Result<(), ContractError> {
 mod nominal_reference_tests {
     use super::*;
     use crate::{index::Index, index::Tier, indexer, parser::KotlinParser};
+
+    #[test]
+    fn prepared_reference_eligibility_applies_without_reparsing_and_keeps_generic_unknown() {
+        const FILE: &str = "/background/Types.kt";
+        let text: Arc<str> = Arc::from("package background\nclass Plain\nclass Box<T>\n");
+        let tree = KotlinParser::new().parse(&text);
+        assert!(!tree.root_node().has_error());
+        let mut index = Index::new();
+        index.replace_file(
+            FILE,
+            indexer::extract_symbols(&tree, &text, "background"),
+            Tier::Durable,
+        );
+        let scope = indexer::TypeScope::with_default_imports("background", Vec::new(), &["kotlin"]);
+        let declarations = source::extract(&index, FILE, &tree, &text, &scope);
+        let prepared = source::prepare_source_references(&index, FILE, text, &tree);
+        let mut store = ExtensionStore::default();
+        store.configure_provider("prepared", true, Arc::from("{}"));
+        let before = source::reference_parse_count();
+        store
+            .replace_prepared_source_declarations(
+                &index,
+                prepared,
+                Knowledge::Found(()),
+                declarations,
+            )
+            .unwrap();
+        assert_eq!(
+            source::reference_parse_count(),
+            before,
+            "background tree is reused during acceptance"
+        );
+        let mut read = store.begin(&index, "prepared", FILE).unwrap();
+        let Knowledge::Found(plain) = read.resolve_type("background.Plain") else {
+            panic!("plain type");
+        };
+        assert!(read.reference_type(&plain).unwrap().is_found());
+        let Knowledge::Found(generic) = read.resolve_type("background.Box") else {
+            panic!("generic type identity");
+        };
+        assert!(!read.reference_type(&generic).unwrap().is_found());
+    }
 
     #[test]
     fn repeated_self_reference_reads_do_not_parse_and_source_edits_retract_eligibility() {

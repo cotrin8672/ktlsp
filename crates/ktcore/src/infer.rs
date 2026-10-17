@@ -2934,6 +2934,7 @@ fn selected_member_type(
                 child_infer,
             )
         };
+        let t = crate::jvm::string_result_for_call_mode(index, t, ctx, members::CallMode::Kotlin);
         match &result {
             None => result = Some(t),
             Some(prev) if *prev == t => {}
@@ -2973,7 +2974,11 @@ fn resolve_member_type_with_subst(
     }) {
         return Type::Unknown;
     }
-    if projected {
+    if projected
+        || (entry.sym.extension_receiver.is_none()
+            && !entry.sym.type_params.is_empty()
+            && !entry.sym.type_parameter_facts.known_unbounded())
+    {
         if let Some(bound) = &bound {
             return declared_member_bound_type(index, recv_ty, entry, tr, bound, ctx);
         }
@@ -3137,7 +3142,7 @@ fn projected_application(
 /// A defaulted slot is not a synthesized argument. It must still have modeled declaration types
 /// before removing that slot can turn an uncertain overload into a proven applicable one.
 pub(crate) fn call_parameter_templates_known(index: &dyn InferenceIndex, entry: &Entry) -> bool {
-    if !entry.sym.type_parameter_facts.known_unbounded() {
+    if !callable_bounds_known(entry) {
         return false;
     }
     fn known(
@@ -3217,10 +3222,29 @@ pub(crate) fn projected_member_application(
         &bound.params,
         &arguments.types,
         &entry.sym.type_params,
-        entry.sym.type_parameter_facts.known_unbounded(),
+        callable_bounds_known(entry),
         &ctx,
         &initial,
     );
+    if application.status == solve::ConstraintStatus::Matched {
+        for (parameter, bound) in entry
+            .sym
+            .method_type_bounds
+            .as_deref()
+            .into_iter()
+            .flatten()
+        {
+            let bound = resolve_type_ref(index, bound, &ctx, 0);
+            let satisfies = application
+                .bindings
+                .get(parameter)
+                .is_some_and(|actual| receiver_satisfies_upper_bound(index, actual, &bound));
+            if !satisfies {
+                application.status = solve::ConstraintStatus::Unknown;
+                break;
+            }
+        }
+    }
     if entry.sym.has_vararg
         || arguments.count != Some(arguments.types.len())
         || arguments.trailing_lambda
@@ -3231,6 +3255,12 @@ pub(crate) fn projected_member_application(
         application.status = solve::ConstraintStatus::Unknown;
     }
     Some(application)
+}
+
+fn callable_bounds_known(entry: &Entry) -> bool {
+    entry.sym.type_parameter_facts.known_unbounded()
+        || entry.sym.type_parameter_facts.known_invariant()
+            && entry.sym.method_type_bounds.is_some()
 }
 
 /// A language adapter supplies already synthesized arguments, without using another grammar's AST.
@@ -4844,9 +4874,18 @@ mod tests {
 
         let source = "package app\nfun run(value: A<Item>) { value.missing() }\n";
         for (declarations, expected_queries) in [
-            ("package app\nclass Box<T>\nopen class A<T> : A<Box<T>>()\nclass Item\n", 1),
-            ("package app\nclass Pair<L, R>\nopen class A<T> : A<Pair<T, T>>()\nclass Item\n", 1),
-            ("package app\nclass Pair<L, R>\nopen class A<T> : B<Pair<T, T>>()\nopen class B<T> : A<Pair<T, T>>()\nclass Item\n", 2),
+            (
+                "package app\nclass Box<T>\nopen class A<T> : A<Box<T>>()\nclass Item\n",
+                1,
+            ),
+            (
+                "package app\nclass Pair<L, R>\nopen class A<T> : A<Pair<T, T>>()\nclass Item\n",
+                1,
+            ),
+            (
+                "package app\nclass Pair<L, R>\nopen class A<T> : B<Pair<T, T>>()\nopen class B<T> : A<Pair<T, T>>()\nclass Item\n",
+                2,
+            ),
         ] {
             let mut parser = KotlinParser::new();
             let mut raw_index = Index::new();
@@ -4867,7 +4906,12 @@ mod tests {
                 .descendant_for_byte_range(start, start + expression.len())
                 .unwrap();
             assert_eq!(
-                super::infer(&index, node, source, &super::FileCtx::from_tree(&tree, source)),
+                super::infer(
+                    &index,
+                    node,
+                    source,
+                    &super::FileCtx::from_tree(&tree, source)
+                ),
                 crate::types::Type::Unknown
             );
             assert_eq!(

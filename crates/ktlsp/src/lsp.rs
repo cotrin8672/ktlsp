@@ -220,6 +220,7 @@ impl Backend {
     /// Bump `key`'s version and schedule a debounced diagnostics recompute. Off the request path; the
     /// task discards itself if a newer edit lands during the debounce window.
     fn schedule_diagnostics(&self, key: String) {
+        schedule_extension_sources(&self.ws, &self.client, &self.doc_versions);
         let mut keys = self.ws.lock().take_extension_diagnostic_changes();
         keys.push(key);
         keys.sort();
@@ -2456,6 +2457,7 @@ impl LanguageServer for Backend {
         self.schedule_kotlin_diagnostics();
         let options = Some(params.settings);
         configure_analysis_providers(&mut self.ws.lock(), &options);
+        schedule_extension_sources(&self.ws, &self.client, &self.doc_versions);
         let changed = self.ws.lock().take_extension_diagnostic_changes();
         for key in changed {
             self.schedule_one_diagnostic(key);
@@ -4291,6 +4293,38 @@ async fn publish_diagnostics(
     };
     let (items, _, version) = lsp_diagnostics_with_result(ws, versions, key);
     client.publish_diagnostics(uri, items, version).await;
+    schedule_extension_sources(ws, client, versions);
+}
+
+fn schedule_extension_sources(
+    workspace: &Arc<Mutex<Workspace>>,
+    client: &Client,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
+) {
+    let mut requests = workspace.lock().begin_extension_source_batch();
+    if requests.is_empty() {
+        return;
+    }
+    let workspace = workspace.clone();
+    let client = client.clone();
+    let versions = versions.clone();
+    tokio::spawn(async move {
+        loop {
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::analysis_extensions::prepare_sources(requests)
+            })
+            .await
+            .unwrap_or_default();
+            let changed = workspace.lock().finish_extension_source_batch(prepared);
+            for key in changed {
+                schedule_owned_diagnostic(&workspace, &client, &versions, key);
+            }
+            requests = workspace.lock().begin_extension_source_batch();
+            if requests.is_empty() {
+                break;
+            }
+        }
+    });
 }
 
 fn lsp_diagnostics_with_result(
@@ -6318,9 +6352,9 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         std::fs::write(&wrapper, if cfg!(windows) {
             // An OS lease survives only while this owned child is live. Cancellation can
             // leave a sentinel on disk, so its existence alone cannot prove overlap.
-            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"try { $lease=[IO.File]::Open('%~dp0running',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) } catch { [IO.File]::WriteAllText('%~dp0overlap','overlap'); exit 1 }; try { [IO.File]::AppendAllText('%~dp0invocations','invoked'+[Environment]::NewLine); Start-Sleep -Milliseconds 600; [Console]::Write([IO.File]::ReadAllText('%~dp0dump.txt')) } finally { $lease.Dispose(); [IO.File]::Delete('%~dp0running') }\"\r\nexit /b %errorlevel%\r\n"
+            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"try { $lease=[IO.File]::Open('%~dp0running',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) } catch { [IO.File]::WriteAllText('%~dp0overlap','overlap'); exit 1 }; try { [IO.File]::AppendAllText('%~dp0invocations','invoked'+[Environment]::NewLine); if ([IO.File]::ReadAllLines('%~dp0invocations').Length -eq 2) { while ($true) { Start-Sleep -Milliseconds 20 } }; Start-Sleep -Milliseconds 600; [Console]::Write([IO.File]::ReadAllText('%~dp0dump.txt')) } finally { $lease.Dispose(); [IO.File]::Delete('%~dp0running') }\"\r\nexit /b %errorlevel%\r\n"
         } else {
-            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nif [ -f running ] && kill -0 \"$(cat running)\" 2>/dev/null; then touch overlap; fi\necho $$ > running\necho invoked >> invocations\nsleep 0.6\ncat dump.txt\nrm running\n"
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nif [ -f running ] && kill -0 \"$(cat running)\" 2>/dev/null; then touch overlap; fi\necho $$ > running\necho invoked >> invocations\nif [ \"$(wc -l < invocations)\" -eq 2 ]; then while :; do sleep 0.02; done; fi\nsleep 0.6\ncat dump.txt\nrm running\n"
         }).unwrap();
         let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
         // This scheduler test does not inspect outgoing notifications. Close their
@@ -6359,12 +6393,22 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             1
         );
         backend.did_change_watched_files(event()).await;
-        while !root.join("running").exists() && Instant::now() < deadline {
+        // The lease file appears before logging. Wait for the durable second startup record;
+        // that child then stays active until cancellation, without a 600 ms timing window.
+        let invocations = || {
+            std::fs::read_to_string(root.join("invocations"))
+                .map(|text| text.lines().count())
+                .unwrap_or_default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while invocations() < 2 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(invocations(), 2, "second refresh never completed startup");
         assert!(root.join("running").exists());
         let superseded = backend.ws.lock().analysis_generation();
         backend.did_change_watched_files(event()).await;
+        let deadline = Instant::now() + Duration::from_secs(12);
         while backend.refresh.lock().running && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -7414,6 +7458,7 @@ mod first_java_completion_seed_tests {
             ),
             symbols: crate::java::extract_symbols(&tree, source),
             jvm: None,
+            library_source: None,
             origin: None,
         };
         let mut ws = backend.ws.lock();

@@ -296,9 +296,18 @@ impl OwnedNativeCompile {
     }
 
     pub(crate) fn wait(
+        self,
+        timeout: Duration,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> (std::process::ExitStatus, bool, String, bool, String, bool) {
+        self.wait_with_output_policy(timeout, cancelled, false)
+    }
+
+    fn wait_with_output_policy(
         mut self,
         timeout: Duration,
         cancelled: Option<&std::sync::atomic::AtomicBool>,
+        allow_closed_model_output: bool,
     ) -> (std::process::ExitStatus, bool, String, bool, String, bool) {
         // A successful Gradle wrapper may precede a short single-use daemon shutdown tail.
         const NATURAL_TREE_EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -330,11 +339,26 @@ impl OwnedNativeCompile {
                 "stdout_worker_finished": self.out.as_ref().is_none_or(|h| h.is_finished()),
                 "stderr_worker_finished": self.err.as_ref().is_none_or(|h| h.is_finished()) }),
         );
+        // Model records are authoritative only when root success and both closed streams were
+        // observed before cleanup. Killing a pipe holder must never manufacture complete output.
+        let closed_model_output = allow_closed_model_output
+            && !interrupted
+            && self
+                .tree
+                .root_status()
+                .is_some_and(|status| status.success())
+            && self.out.as_ref().is_some_and(|reader| reader.is_finished())
+            && self.err.as_ref().is_some_and(|reader| reader.is_finished());
         let grace = (!interrupted).then(|| deadline.min(Instant::now() + NATURAL_TREE_EXIT_GRACE));
-        // Wrapper exit alone is insufficient. All assigned processes must be terminal before EOF.
+        // Always verify every assigned process terminal, including a closed-output daemon tail.
         let (status, forced) = self.tree.cleanup(grace);
         let (out, out_complete) = join_capped(&mut self.out);
         let (err, err_complete) = join_capped(&mut self.err);
+        let tail_cleanup_only = forced && closed_model_output && out_complete && err_complete;
+        let interrupted = interrupted
+            || (forced && !tail_cleanup_only)
+            || is_cancelled()
+            || Instant::now() >= deadline;
         crate::trace::span(
             "compiler.native_joined",
             "compiler",
@@ -342,9 +366,10 @@ impl OwnedNativeCompile {
             serde_json::json!({ "root_status": status.code(), "forced": forced,
                 "elapsed_ms": started.elapsed().as_millis(),
                 "stdout_complete": out_complete, "stderr_complete": err_complete,
+                "closed_model_tail_cleanup": tail_cleanup_only,
+                "interrupted": interrupted,
                 "deadline_reached": Instant::now() >= deadline, "cancelled": is_cancelled() }),
         );
-        let interrupted = interrupted || forced || is_cancelled() || Instant::now() >= deadline;
         (status, interrupted, out, out_complete, err, err_complete)
     }
 }
@@ -373,10 +398,39 @@ pub(crate) fn run_with_stdout_file_cancellable(
     timeout: Duration,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<(std::process::ExitStatus, bool, String, bool, String, bool)> {
+    run_stdout_file_with_output_policy(command, stdout, timeout, cancelled, false)
+}
+
+/// Model-only output policy: the caller must strictly parse a complete, nonempty protocol.
+/// Cleanup still owns and verifies the full tree; compiler receipts retain their strict policy.
+pub(crate) fn run_model_with_stdout_file_cancellable(
+    command: &mut Command,
+    stdout: std::fs::File,
+    timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<(std::process::ExitStatus, bool, String, bool, String, bool)> {
+    run_stdout_file_with_output_policy(command, stdout, timeout, cancelled, true)
+}
+
+fn run_stdout_file_with_output_policy(
+    command: &mut Command,
+    stdout: std::fs::File,
+    timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    allow_closed_model_output: bool,
+) -> std::io::Result<(std::process::ExitStatus, bool, String, bool, String, bool)> {
     #[cfg(windows)]
     {
-        Ok(OwnedNativeCompile::spawn_to_file(command, stdout)?.wait(timeout, cancelled))
+        Ok(
+            OwnedNativeCompile::spawn_to_file(command, stdout)?.wait_with_output_policy(
+                timeout,
+                cancelled,
+                allow_closed_model_output,
+            ),
+        )
     }
+    #[cfg(not(windows))]
+    let _ = allow_closed_model_output;
     #[cfg(not(windows))]
     {
         // shortcut: Unix retains wrapper-only ownership, add process-group cleanup after native proof.
@@ -1144,7 +1198,10 @@ mod native_compile_ownership_tests {
     use super::*;
     use std::io::Write;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, SetHandleInformation, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Threading::{
         GetProcessId, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
         PROCESS_SYNCHRONIZE,
@@ -1256,6 +1313,7 @@ mod native_compile_ownership_tests {
                 "leaf.pid",
                 "leaf.pid.tmp",
                 "output-ready",
+                "pipe-inheritance-cleared",
                 "leaf.exit",
                 "fixture-started",
                 "build.gradle.kts",
@@ -1277,6 +1335,29 @@ mod native_compile_ownership_tests {
         assert!(dir.is_dir());
         std::fs::write(dir.join("fixture-started"), b"resumed").unwrap();
         if mode.ends_with("-classpath") {
+            if mode == "closed-tail-classpath" {
+                // NUL selected streams alone do not exclude other inheritable parent handles.
+                // This daemon fixture must retain no writer for either model output pipe.
+                for handle in [
+                    std::io::stdout().as_raw_handle(),
+                    std::io::stderr().as_raw_handle(),
+                ] {
+                    let mut flags = 0;
+                    assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                    assert_ne!(
+                        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) },
+                        0
+                    );
+                    assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                    assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+                }
+                std::fs::write(dir.join("pipe-inheritance-cleared"), b"stdout,stderr").unwrap();
+                let mut leaf = fixture_command(&dir, "leaf");
+                // Model the observed Gradle daemon: it remains owned without either pipe writer.
+                leaf.stdout(Stdio::null()).stderr(Stdio::null());
+                let _leaf = leaf.spawn().unwrap();
+                await_file(&dir, "leaf.pid");
+            }
             let size: usize = match mode.as_str() {
                 "large-classpath" => 11 * 1024 * 1024,
                 "oversized-classpath" => 65 * 1024 * 1024,
@@ -1295,6 +1376,9 @@ mod native_compile_ownership_tests {
                 writeln!(output, "END\t:tail").unwrap();
             }
             output.flush().unwrap();
+            if mode == "closed-tail-classpath" {
+                std::fs::write(dir.join("output-ready"), b"closed model flushed").unwrap();
+            }
             if mode == "failed-classpath" {
                 std::process::exit(7);
             }
@@ -1480,6 +1564,77 @@ mod native_compile_ownership_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_closed_model_output_separates_daemon_cleanup_from_compiler_receipts() {
+        for allow_model in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.0.join("closed-model.stdout");
+            let mut owned = OwnedNativeCompile::spawn_to_file(
+                &mut fixture_command(&fixture.0, "closed-tail-classpath"),
+                std::fs::File::create(&path).unwrap(),
+            )
+            .unwrap();
+            let leaf = fixture.hold_leaf();
+            assert!(owned.tree.contains(leaf.as_raw_handle()).unwrap());
+            while !owned.tree.root_has_exited().unwrap()
+                || !owned.out.as_ref().unwrap().is_finished()
+                || !owned.err.as_ref().unwrap().is_finished()
+            {
+                assert_eq!(
+                    unsafe { WaitForSingleObject(leaf.as_raw_handle(), 0) },
+                    WAIT_TIMEOUT,
+                    "closed-output fixture must reach root exit and both EOFs while its exact owned daemon is still alive: root={:?}, stdout_finished={}, stderr_finished={}",
+                    owned.tree.root_status(),
+                    owned.out.as_ref().unwrap().is_finished(),
+                    owned.err.as_ref().unwrap().is_finished(),
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(owned.tree.root_status().unwrap().code(), Some(0));
+            assert_eq!(
+                std::fs::read(fixture.0.join("pipe-inheritance-cleared")).unwrap(),
+                b"stdout,stderr"
+            );
+            assert_eq!(
+                std::fs::read(fixture.0.join("output-ready")).unwrap(),
+                b"closed model flushed"
+            );
+            assert_eq!(
+                unsafe { WaitForSingleObject(leaf.as_raw_handle(), 0) },
+                WAIT_TIMEOUT,
+                "a naturally exited daemon cannot prove separation of output and owned cleanup"
+            );
+            assert!(owned.tree.contains(leaf.as_raw_handle()).unwrap());
+            let (status, interrupted, failure, complete, _, stderr_complete) =
+                owned.wait_with_output_policy(Duration::from_secs(5), None, allow_model);
+            assert!(status.success() && failure.is_empty() && complete && stderr_complete);
+            assert_eq!(interrupted, !allow_model);
+            assert_eq!(
+                unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
+                WAIT_OBJECT_0
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(crate::classpath::parse_dump(&text).len(), 2);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_model_policy_does_not_accept_output_closed_by_killing_a_pipe_holder() {
+        let fixture = Fixture::new();
+        let owned =
+            OwnedNativeCompile::spawn(&mut fixture_command(&fixture.0, "exit"), MAX_OUTPUT_BYTES)
+                .unwrap();
+        let leaf = fixture.hold_leaf();
+        let (status, interrupted, _, complete, _, stderr_complete) =
+            owned.wait_with_output_policy(Duration::from_secs(5), None, true);
+        assert!(status.success() && interrupted && complete && stderr_complete);
+        assert_eq!(
+            unsafe { WaitForSingleObject(leaf.as_raw_handle(), PROCESS_EXIT_WAIT_MS) },
+            WAIT_OBJECT_0
+        );
     }
 
     #[test]

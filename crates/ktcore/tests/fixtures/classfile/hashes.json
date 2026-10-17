@@ -158,5 +158,90 @@
     "file": "fieldfixture/FieldOnly.class",
     "sha256": "bfaf22b97a5e004a9bbf6f50033ae27ddac0097249f93c02d11c5f36e319025d",
     "bytes": 272
+  },
+  {
+    "file": "sources/genericfixture/Box.java",
+    "sha256": "428e65758aa87726d2366d97073281207f99a5d07ee6d5a693c7938a3649d21c",
+    "bytes": 469
+  },
+  {
+    "file": "sources/genericfixture/Child.java",
+    "sha256": "02da1dc78e2d7558aa2dec535264ed3be49e003d8cf6c8ae4f7650c687f54e55",
+    "bytes": 65
+  },
+  {
+    "file": "sources/genericfixture/Item.java",
+    "sha256": "2a0d8458d545ca43b43eb569d16579cb582dc31f668b76618d53e881387abdcb",
+    "bytes": 91
+  },
+  {
+    "file": "sources/genericfixture/Other.java",
+    "sha256": "7407fc0496a0dc15a72859d2e390c7b476e3293dc3c8100a59d4d6061abfe964",
+    "bytes": 93
+  },
+  {
+    "file": "genericfixture/Box.class",
+    "sha256": "19d7f78007dbe6efb5260c6d1a92c91b872a06ed34f9be1165ef7d35004801ca",
+    "bytes": 1138
+  },
+  {
+    "file": "genericfixture/Child.class",
+    "sha256": "e21a9dfa46e5ea89fbfd48755fb8653fe78d692a88a1dea8fe1a08977e8f230f",
+    "bytes": 267
+  },
+  {
+    "file": "genericfixture/Item.class",
+    "sha256": "63fd8a7623be2c0f4b26c2652bdaa5fdb10ed34c4f5e120afb059519583031f0",
+    "bytes": 278
+  },
+  {
+    "file": "genericfixture/Other.class",
+    "sha256": "5572bbabd79c4ca54664325e5a6cdf3f36c54222b9ec36c49d238359e3f27cf8",
+    "bytes": 281
+  },
+  {
+    "file": "sources/genericfixture/Lexical.java",
+    "sha256": "511292f466c071a64d5fcc9d8cbb90e537efaa368b9c1b9d48a2f81dabb786ea",
+    "bytes": 124
+  },
+  {
+    "file": "sources/shadowfixture/NestedBoundMid.java",
+    "sha256": "f62dcd7ee1184e8c3268a2a1b6d734ff43ad79bb6659bf89f93d27917970fe90",
+    "bytes": 153
+  },
+  {
+    "file": "sources/shadowfixture/Container.java",
+    "sha256": "a03d07d223d46028050a7bad02e09e89dd52de79e95723cc53e0cfd35eb0890a",
+    "bytes": 220
+  },
+  {
+    "file": "genericfixture/Lexical.class",
+    "sha256": "76fcdfc343b2304827a608d5f6c7e2e3b8507996a2e3fe7d9e5bdd4772757b76",
+    "bytes": 386
+  },
+  {
+    "file": "shadowfixture/NestedBoundMid.class",
+    "sha256": "ded9f7e5c31d854da3ed2a9688c8bb4e0be6deccfc2fd6bb3a10456c915bb7b6",
+    "bytes": 593
+  },
+  {
+    "file": "shadowfixture/Container.class",
+    "sha256": "bcb2424f10d36d326bb0663bbc0f9341eec8d3a2c2a678bf7bc7dabdde7d4487",
+    "bytes": 314
+  },
+  {
+    "file": "shadowfixture/Container$NestedList.class",
+    "sha256": "646c503f4fc09255221b905bb6c5185563f66e7a81e89f5ee201413e104324c5",
+    "bytes": 529
+  },
+  {
+    "file": "sources/genericfixture/Holder.java",
+    "sha256": "de8262d2971ed3bf5c22262081405ddecaa6fd24a436efd3b4dd2afc245ae84f",
+    "bytes": 114
+  },
+  {
+    "file": "genericfixture/Holder.class",
+    "sha256": "0a85f336ea4376deb53cf358b503a5046d8234d29cbaeb8ca65b0199b1fbdf5d",
+    "bytes": 332
   }
 ]

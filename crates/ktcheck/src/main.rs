@@ -1820,6 +1820,7 @@ mod tests {
                         file: key.clone(),
                         symbols: scan.symbols,
                         jvm: scan.jvm,
+                        library_source: None,
                         origin: None,
                     }]
                 ));

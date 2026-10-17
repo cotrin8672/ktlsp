@@ -243,6 +243,9 @@ pub struct IndexedSymbol {
     pub type_parameter_facts: TypeParameterFacts,
     #[serde(default)]
     pub source_member: SourceMemberFlags,
+    /// Proven nominal bounds of this callable's own parameters. None keeps unsupported bounds unknown.
+    #[serde(default)]
+    pub method_type_bounds: Option<Box<Vec<(String, TypeRef)>>>,
 }
 
 impl IndexedSymbol {
@@ -282,6 +285,7 @@ impl IndexedSymbol {
             type_params: Vec::new(),
             type_parameter_facts: TypeParameterFacts::default(),
             source_member: SourceMemberFlags::default(),
+            method_type_bounds: None,
         }
     }
 }

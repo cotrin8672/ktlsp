@@ -14,6 +14,69 @@ const OTHER: &str = "package app\nclass Other {\n fun usefulWrong() {}\n}\n";
 const JAVA_BOX: &str = "package app; public class Box<T> { public T get() { return null; } }";
 const KOTLIN_BOX: &str =
     "package app\nclass KotlinBox<T> {\n fun get(): T = error(\"fixture\")\n}\n";
+
+#[test]
+fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
+    let mut ws = workspace(&[
+        (
+            "Item.java",
+            "package app; public class Item { public void useful() {} }",
+        ),
+        (
+            "Other.java",
+            "package app; public class Other { public void usefulWrong() {} }",
+        ),
+        (
+            "Box.java",
+            "package app; public class Box<T extends Item> { public <U extends Item> U same(U value) { return value; } public <T extends Other> T shadow(T value) { return value; } public <U extends T> U related(U value) { return value; } }",
+        ),
+        (
+            "KotlinBox.kt",
+            "package app\nclass KotlinBox<T: Item> { fun <U: Item> same(value: U): U = value\n fun <T: Other> shadow(value: T): T = value\n fun <U: T> related(value: U): U = value }",
+        ),
+    ]);
+    for (file, source) in [
+        (
+            "Use.kt",
+            "package app\nfun use(java: Box<Item>, kotlin: KotlinBox<Item>, item: Item, other: Other) { java.same(item).useful(); kotlin.same(item).useful(); java.shadow(other).usefulWrong(); kotlin.shadow(other).usefulWrong(); java.same(other).usefulWrong(); kotlin.same(other).usefulWrong(); java.related(item).useful(); kotlin.related(item).useful() }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void use(Box<Item> java, KotlinBox<Item> kotlin, Item item, Other other) { java.same(item).useful(); kotlin.same(item).useful(); java.shadow(other).usefulWrong(); kotlin.shadow(other).usefulWrong(); java.same(other).usefulWrong(); kotlin.same(other).usefulWrong(); java.related(item).useful(); kotlin.related(item).useful(); } }",
+        ),
+    ] {
+        ws.open(file, source.into());
+        for receiver in ["java", "kotlin"] {
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.same(item).useful"),
+                "useful",
+                "usefulWrong",
+            );
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.shadow(other).usefulWrong"),
+                "usefulWrong",
+                "useful",
+            );
+            assert!(
+                !labels(
+                    &mut ws,
+                    file,
+                    &format!("{receiver}.same(other).usefulWrong")
+                )
+                .contains("usefulWrong")
+            );
+            assert!(
+                !labels(&mut ws, file, &format!("{receiver}.related(item).useful"))
+                    .contains("useful"),
+                "inter-variable bounds need declaration identity support"
+            );
+        }
+    }
+}
 const IMPORTED_BASE: &str = "package base; public class Base { public void baseOnly() {} public void accept(String value) {} }";
 const WRONG_BASE: &str = "package app; public class Base { public void baseWrong() {} public void accept(int value) {} }";
 const JAVA_CHILD: &str = "package app; import base.Base; public class Child extends Base {}";
@@ -107,10 +170,22 @@ fn bounds_workspace(file: &str, source: &str) -> Workspace {
 #[test]
 fn lexical_class_and_method_bounds_share_completion_navigation_and_inference() {
     for (file, source) in [
-        ("Use.kt", "package app\nclass Use<T>(private val value: T) where T : Move, T : Level {\n fun run() { value.move(); value.getEnchantmentLevel() }\n}\n"),
-        ("Use.kt", "package app\nfun <T : Move> run(value: T) where T : Level { value.move(); value.getEnchantmentLevel() }\n"),
-        ("Use.java", "package app; class Use<T extends Move & Level> { T value; void run() { value.move(); value.getEnchantmentLevel(); } }"),
-        ("Use.java", "package app; class Use { <T extends Move & Level> void run(T value) { value.move(); value.getEnchantmentLevel(); } }"),
+        (
+            "Use.kt",
+            "package app\nclass Use<T>(private val value: T) where T : Move, T : Level {\n fun run() { value.move(); value.getEnchantmentLevel() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun <T : Move> run(value: T) where T : Level { value.move(); value.getEnchantmentLevel() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Move & Level> { T value; void run() { value.move(); value.getEnchantmentLevel(); } }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { <T extends Move & Level> void run(T value) { value.move(); value.getEnchantmentLevel(); } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
         for (name, target) in [("move", "Move.java"), ("getEnchantmentLevel", "Level.kt")] {
@@ -118,7 +193,10 @@ fn lexical_class_and_method_bounds_share_completion_navigation_and_inference() {
             assert_exact_definition(&mut ws, file, &format!("value.{name}()"), target, name);
         }
         if file.ends_with(".kt") {
-            assert_eq!(infer_expression(&ws, file, "value.getEnchantmentLevel()"), Type::class("Int", Some("kotlin".into())));
+            assert_eq!(
+                infer_expression(&ws, file, "value.getEnchantmentLevel()"),
+                Type::class("Int", Some("kotlin".into()))
+            );
         }
     }
 }
@@ -126,14 +204,23 @@ fn lexical_class_and_method_bounds_share_completion_navigation_and_inference() {
 #[test]
 fn generic_bound_arguments_use_the_shared_receiver_substitution() {
     for (file, source) in [
-        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Box<Item>, T : Level {\n fun run() { value.get().useful(); value.getEnchantmentLevel() }\n}\n"),
-        ("Use.java", "package app; class Use<T extends Box<Item> & Level> { T value; void run() { value.get().useful(); value.getEnchantmentLevel(); } }"),
+        (
+            "Use.kt",
+            "package app\nclass Use<T>(val value: T) where T : Box<Item>, T : Level {\n fun run() { value.get().useful(); value.getEnchantmentLevel() }\n}\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Box<Item> & Level> { T value; void run() { value.get().useful(); value.getEnchantmentLevel(); } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
         assert_member(&mut ws, file, "value.get().use", "useful", "usefulWrong");
         assert_exact_definition(&mut ws, file, "value.get().useful()", "Item.kt", "useful");
         if file.ends_with(".kt") {
-            assert_eq!(infer_expression(&ws, file, "value.get()"), Type::class("Item", Some("app".into())));
+            assert_eq!(
+                infer_expression(&ws, file, "value.get()"),
+                Type::class("Item", Some("app".into()))
+            );
         }
     }
 }
@@ -141,15 +228,30 @@ fn generic_bound_arguments_use_the_shared_receiver_substitution() {
 #[test]
 fn lexical_bounds_shadow_class_parameters_imports_and_global_type_names() {
     for (file, source) in [
-        ("Use.kt", "package app\nimport poison.T\nclass Use<T : Wrong>(val outer: T) {\n fun <T : Level> run(inner: T) { outer.wrongOnly(); inner.getEnchantmentLevel() }\n}\n"),
-        ("Use.java", "package app; import poison.T; class Use<T extends Wrong> { T outer; <T extends Level> void run(T inner) { outer.wrongOnly(); inner.getEnchantmentLevel(); } }"),
+        (
+            "Use.kt",
+            "package app\nimport poison.T\nclass Use<T : Wrong>(val outer: T) {\n fun <T : Level> run(inner: T) { outer.wrongOnly(); inner.getEnchantmentLevel() }\n}\n",
+        ),
+        (
+            "Use.java",
+            "package app; import poison.T; class Use<T extends Wrong> { T outer; <T extends Level> void run(T inner) { outer.wrongOnly(); inner.getEnchantmentLevel(); } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
-        ws.open("Poison.java", "package poison; public class T { public void poisoned() {} }".into());
+        ws.open(
+            "Poison.java",
+            "package poison; public class T { public void poisoned() {} }".into(),
+        );
         assert_member(&mut ws, file, "outer.", "wrongOnly", "getEnchantmentLevel");
         assert_member(&mut ws, file, "inner.", "getEnchantmentLevel", "wrongOnly");
         assert!(!labels(&mut ws, file, "inner.").contains("poisoned"));
-        assert_exact_definition(&mut ws, file, "inner.getEnchantmentLevel()", "Level.kt", "getEnchantmentLevel");
+        assert_exact_definition(
+            &mut ws,
+            file,
+            "inner.getEnchantmentLevel()",
+            "Level.kt",
+            "getEnchantmentLevel",
+        );
     }
 }
 
@@ -237,55 +339,163 @@ fn parameter_identity_requires_the_real_file_and_declaration_span() {
 #[test]
 fn unsaved_bound_and_bound_member_edits_replace_both_language_surfaces() {
     for (file, source, before, after) in [
-        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Move, T : Level {\n fun run() { value.getEnchantmentLevel() }\n}\n", "T : Level", "T : Wrong"),
-        ("Use.java", "package app; class Use<T extends Move & Level> { T value; void run() { value.getEnchantmentLevel(); } }", "& Level", "& Wrong"),
+        (
+            "Use.kt",
+            "package app\nclass Use<T>(val value: T) where T : Move, T : Level {\n fun run() { value.getEnchantmentLevel() }\n}\n",
+            "T : Level",
+            "T : Wrong",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Move & Level> { T value; void run() { value.getEnchantmentLevel(); } }",
+            "& Level",
+            "& Wrong",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
         for changed in [source.replace(before, after), source.to_string()] {
             ws.change(file, changed.clone());
             let restored = changed == source;
-            assert_member(&mut ws, file, "value.", if restored { "getEnchantmentLevel" } else { "wrongOnly" }, if restored { "wrongOnly" } else { "getEnchantmentLevel" });
+            assert_member(
+                &mut ws,
+                file,
+                "value.",
+                if restored {
+                    "getEnchantmentLevel"
+                } else {
+                    "wrongOnly"
+                },
+                if restored {
+                    "wrongOnly"
+                } else {
+                    "getEnchantmentLevel"
+                },
+            );
             if restored {
-                assert_exact_definition(&mut ws, file, "value.getEnchantmentLevel()", "Level.kt", "getEnchantmentLevel");
+                assert_exact_definition(
+                    &mut ws,
+                    file,
+                    "value.getEnchantmentLevel()",
+                    "Level.kt",
+                    "getEnchantmentLevel",
+                );
             } else {
-                assert!(ws.goto_definition(file, changed.find("value.getEnchantmentLevel").unwrap() + "value.".len()).is_empty());
+                assert!(
+                    ws.goto_definition(
+                        file,
+                        changed.find("value.getEnchantmentLevel").unwrap() + "value.".len()
+                    )
+                    .is_empty()
+                );
             }
         }
-        ws.change("Level.kt", BOUND_LEVEL.replace("getEnchantmentLevel", "renamedLevel"));
-        assert_member(&mut ws, file, "value.", "renamedLevel", "getEnchantmentLevel");
+        ws.change(
+            "Level.kt",
+            BOUND_LEVEL.replace("getEnchantmentLevel", "renamedLevel"),
+        );
+        assert_member(
+            &mut ws,
+            file,
+            "value.",
+            "renamedLevel",
+            "getEnchantmentLevel",
+        );
         ws.change("Level.kt", BOUND_LEVEL.into());
-        assert_member(&mut ws, file, "value.", "getEnchantmentLevel", "renamedLevel");
+        assert_member(
+            &mut ws,
+            file,
+            "value.",
+            "getEnchantmentLevel",
+            "renamedLevel",
+        );
     }
 }
 
 #[test]
 fn incomplete_bodies_keep_valid_bounds_but_invalid_or_unmodeled_bounds_stay_unknown() {
     for (file, source) in [
-        ("Use.kt", "package app\nclass Use<T : Level>(val value: T) {\n fun run() { value.getEnchantmentLevel(); val broken = }\n}\n"),
-        ("Use.java", "package app; class Use<T extends Level> { T value; void run() { value.getEnchantmentLevel(); Object broken = ; } }"),
+        (
+            "Use.kt",
+            "package app\nclass Use<T : Level>(val value: T) {\n fun run() { value.getEnchantmentLevel(); val broken = }\n}\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Level> { T value; void run() { value.getEnchantmentLevel(); Object broken = ; } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
         assert_member(&mut ws, file, "value.", "getEnchantmentLevel", "poisoned");
-        assert_exact_definition(&mut ws, file, "value.getEnchantmentLevel()", "Level.kt", "getEnchantmentLevel");
+        assert_exact_definition(
+            &mut ws,
+            file,
+            "value.getEnchantmentLevel()",
+            "Level.kt",
+            "getEnchantmentLevel",
+        );
     }
     for (file, source) in [
-        ("Use.kt", "package app\nclass Use<T>(val value: T) {\n fun run() { value.poisoned() }\n}\n"),
-        ("Use.kt", "package app\nclass Use<T : Missing>(val value: T) {\n fun run() { value.getEnchantmentLevel() }\n}\n"),
-        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Move, T : Missing {\n fun run() { value.move() }\n}\n"),
-        ("Use.kt", "package app\nclass Use<T : U, U : T>(val value: T) {\n fun run() { value.poisoned() }\n}\n"),
-        ("Use.kt", "package app\nclass Use<T : Move, T : Level>(val value: T) {\n fun run() { value.move() }\n}\n"),
-        ("Use.kt", "package app\nclass Use<T>(val value: T) where T : Level, Missing : Wrong {\n fun run() { value.getEnchantmentLevel() }\n}\n"),
-        ("Use.kt", "package app\nclass Use<T : Recursive<T>>(val value: T) {\n fun run() { value.getEnchantmentLevel() }\n}\n"),
-        ("Use.java", "package app; class Use<T> { T value; void run() { value.poisoned(); } }"),
-        ("Use.java", "package app; class Use<T extends Missing> { T value; void run() { value.getEnchantmentLevel(); } }"),
-        ("Use.java", "package app; class Use<T extends Move & Missing> { T value; void run() { value.move(); } }"),
-        ("Use.java", "package app; class Use<T extends U, U extends T> { T value; void run() { value.poisoned(); } }"),
-        ("Use.java", "package app; class Use<T extends Move, T extends Level> { T value; void run() { value.move(); } }"),
-        ("Use.java", "package app; class Use<T extends Recursive<T>> { T value; void run() { value.getEnchantmentLevel(); } }"),
+        (
+            "Use.kt",
+            "package app\nclass Use<T>(val value: T) {\n fun run() { value.poisoned() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nclass Use<T : Missing>(val value: T) {\n fun run() { value.getEnchantmentLevel() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nclass Use<T>(val value: T) where T : Move, T : Missing {\n fun run() { value.move() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nclass Use<T : U, U : T>(val value: T) {\n fun run() { value.poisoned() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nclass Use<T : Move, T : Level>(val value: T) {\n fun run() { value.move() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nclass Use<T>(val value: T) where T : Level, Missing : Wrong {\n fun run() { value.getEnchantmentLevel() }\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nclass Use<T : Recursive<T>>(val value: T) {\n fun run() { value.getEnchantmentLevel() }\n}\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T> { T value; void run() { value.poisoned(); } }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Missing> { T value; void run() { value.getEnchantmentLevel(); } }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Move & Missing> { T value; void run() { value.move(); } }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends U, U extends T> { T value; void run() { value.poisoned(); } }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Move, T extends Level> { T value; void run() { value.move(); } }",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Recursive<T>> { T value; void run() { value.getEnchantmentLevel(); } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
-        ws.open("Recursive.java", "package app; public interface Recursive<T> { int getEnchantmentLevel(); }".into());
-        assert!(labels(&mut ws, file, "value.").is_empty(), "{file}: {source}");
+        ws.open(
+            "Recursive.java",
+            "package app; public interface Recursive<T> { int getEnchantmentLevel(); }".into(),
+        );
+        assert!(
+            labels(&mut ws, file, "value.").is_empty(),
+            "{file}: {source}"
+        );
     }
 }
 
@@ -348,31 +558,79 @@ fn local_classes_capture_function_bounds_but_static_nested_scopes_do_not() {
         "getEnchantmentLevel",
     );
     for (file, source) in [
-        ("Use.kt", "package app\nclass Use<T : Level> { class Nested(val value: T) { fun run() { value.getEnchantmentLevel() } } }\n"),
-        ("Use.java", "package app; class Use<T extends Level> { static class Nested { T value; void run() { value.getEnchantmentLevel(); } } }"),
+        (
+            "Use.kt",
+            "package app\nclass Use<T : Level> { class Nested(val value: T) { fun run() { value.getEnchantmentLevel() } } }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use<T extends Level> { static class Nested { T value; void run() { value.getEnchantmentLevel(); } } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
-        assert!(labels(&mut ws, file, "value.").is_empty(), "{file}: inaccessible outer parameter leaked");
+        assert!(
+            labels(&mut ws, file, "value.").is_empty(),
+            "{file}: inaccessible outer parameter leaked"
+        );
     }
 }
 
 #[test]
 fn bounds_expose_only_proven_public_instance_members() {
     for (file, source) in [
-        ("Use.kt", "package app\nfun <T : Access> run(value: T) { value.publicOnly(); value.privateOnly(); value.publicField; value.privateField }\n"),
-        ("Use.java", "package app; class Use { <T extends Access> void run(T value) { value.publicOnly(); value.privateOnly(); int result = value.publicField + value.privateField; } }"),
+        (
+            "Use.kt",
+            "package app\nfun <T : Access> run(value: T) { value.publicOnly(); value.privateOnly(); value.publicField; value.privateField }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { <T extends Access> void run(T value) { value.publicOnly(); value.privateOnly(); int result = value.publicField + value.privateField; } }",
+        ),
     ] {
         let mut ws = bounds_workspace(file, source);
         ws.open("Access.java", "package app; public class Access { public int publicField; private int privateField; public void publicOnly() {} private void privateOnly() {} protected void protectedOnly() {} void packageOnly() {} public static void staticOnly() {} }".into());
         let got = labels(&mut ws, file, "value.");
         assert!(got.contains("publicOnly"), "{file}: {got:?}");
-        for name in ["privateOnly", "protectedOnly", "packageOnly", "staticOnly", "privateField"] {
-            assert!(!got.contains(name), "{file}: member outside the proven bound surface: {name}: {got:?}");
+        for name in [
+            "privateOnly",
+            "protectedOnly",
+            "packageOnly",
+            "staticOnly",
+            "privateField",
+        ] {
+            assert!(
+                !got.contains(name),
+                "{file}: member outside the proven bound surface: {name}: {got:?}"
+            );
         }
-        assert_exact_definition(&mut ws, file, "value.publicOnly()", "Access.java", "publicOnly");
-        assert_exact_definition(&mut ws, file, "value.publicField", "Access.java", "publicField");
-        assert!(ws.goto_definition(file, source.find("value.privateOnly").unwrap() + "value.".len()).is_empty());
-        assert!(ws.goto_definition(file, source.find("value.privateField").unwrap() + "value.".len()).is_empty());
+        assert_exact_definition(
+            &mut ws,
+            file,
+            "value.publicOnly()",
+            "Access.java",
+            "publicOnly",
+        );
+        assert_exact_definition(
+            &mut ws,
+            file,
+            "value.publicField",
+            "Access.java",
+            "publicField",
+        );
+        assert!(
+            ws.goto_definition(
+                file,
+                source.find("value.privateOnly").unwrap() + "value.".len()
+            )
+            .is_empty()
+        );
+        assert!(
+            ws.goto_definition(
+                file,
+                source.find("value.privateField").unwrap() + "value.".len()
+            )
+            .is_empty()
+        );
     }
 }
 
@@ -581,10 +839,21 @@ fn java_calls_members_of_java_and_kotlin_generic_results() {
 #[test]
 fn generic_return_arguments_flow_through_both_languages() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER), ("Box.java", JAVA_BOX),
-        ("Factory.java", "package app; public class Factory { public Box<Item> make() { return null; } }"),
-        ("Use.kt", "package app\nfun run(factory: Factory) { factory.make().get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Factory factory) { factory.make().get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Box.java", JAVA_BOX),
+        (
+            "Factory.java",
+            "package app; public class Factory { public Box<Item> make() { return null; } }",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(factory: Factory) { factory.make().get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Factory factory) { factory.make().get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         assert_member(
@@ -600,10 +869,20 @@ fn generic_return_arguments_flow_through_both_languages() {
 #[test]
 fn kotlin_generic_superclasses_substitute_reordered_arguments() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER),
-        ("Types.kt", "package app\nopen class PairBox<K, V> {\n fun get(): V = error(\"fixture\")\n}\nopen class Middle<X, Y> : PairBox<Y, X>()\nclass Concrete : Middle<Item, Other>()\n"),
-        ("Use.kt", "package app\nfun run(value: Concrete) { value.get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Concrete value) { value.get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        (
+            "Types.kt",
+            "package app\nopen class PairBox<K, V> {\n fun get(): V = error(\"fixture\")\n}\nopen class Middle<X, Y> : PairBox<Y, X>()\nclass Concrete : Middle<Item, Other>()\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(value: Concrete) { value.get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Concrete value) { value.get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         assert_member(&mut ws, file, "value.get().use", "useful", "usefulWrong");
@@ -644,13 +923,31 @@ fn java_generic_superclasses_substitute_reordered_arguments() {
 #[test]
 fn fully_qualified_generic_arguments_keep_their_declaration_package() {
     let mut ws = workspace(&[
-        ("LocalItem.kt", "package app\nclass Item {\n fun usefulWrong() {}\n}\n"),
-        ("ImportedItem.kt", "package model\nclass Item {\n fun useful() {}\n}\n"),
+        (
+            "LocalItem.kt",
+            "package app\nclass Item {\n fun usefulWrong() {}\n}\n",
+        ),
+        (
+            "ImportedItem.kt",
+            "package model\nclass Item {\n fun useful() {}\n}\n",
+        ),
         ("Box.java", JAVA_BOX),
-        ("JavaFactory.java", "package app; public class JavaFactory { public Box<model.Item> make() { return null; } }"),
-        ("KotlinFactory.kt", "package app\nclass KotlinFactory {\n fun make(): Box<model.Item> = error(\"fixture\")\n}\n"),
-        ("Use.kt", "package app\nfun run(java: JavaFactory, kotlin: KotlinFactory) { java.make().get().useful(); kotlin.make().get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(JavaFactory java, KotlinFactory kotlin) { java.make().get().useful(); kotlin.make().get().useful(); } }"),
+        (
+            "JavaFactory.java",
+            "package app; public class JavaFactory { public Box<model.Item> make() { return null; } }",
+        ),
+        (
+            "KotlinFactory.kt",
+            "package app\nclass KotlinFactory {\n fun make(): Box<model.Item> = error(\"fixture\")\n}\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(java: JavaFactory, kotlin: KotlinFactory) { java.make().get().useful(); kotlin.make().get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(JavaFactory java, KotlinFactory kotlin) { java.make().get().useful(); kotlin.make().get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         for prefix in ["java.make().get().use", "kotlin.make().get().use"] {
@@ -662,9 +959,16 @@ fn fully_qualified_generic_arguments_keep_their_declaration_package() {
 #[test]
 fn generic_substitution_preserves_nested_arguments_and_nullability() {
     let ws = workspace(&[
-        ("Item.kt", ITEM), ("Box.java", JAVA_BOX),
-        ("Types.kt", "package app\nopen class Parent<T> {\n fun get(): Box<T?> = error(\"fixture\")\n}\nclass Concrete : Parent<Item>()\n"),
-        ("Use.kt", "package app\nfun run(value: Concrete) { value.get() }\n"),
+        ("Item.kt", ITEM),
+        ("Box.java", JAVA_BOX),
+        (
+            "Types.kt",
+            "package app\nopen class Parent<T> {\n fun get(): Box<T?> = error(\"fixture\")\n}\nclass Concrete : Parent<Item>()\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(value: Concrete) { value.get() }\n",
+        ),
     ]);
     let ty = infer_expression(&ws, "Use.kt", "value.get()");
     assert_eq!(ty.name(), Some("Box"));
@@ -678,11 +982,25 @@ fn generic_substitution_preserves_nested_arguments_and_nullability() {
 #[test]
 fn unsaved_java_return_and_kotlin_supertype_edits_replace_generic_bindings() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER), ("Box.java", JAVA_BOX),
-        ("Factory.java", "package app; public class Factory { public Box<Item> make() { return null; } }"),
-        ("Types.kt", "package app\nopen class Parent<T> {\n fun get(): T = error(\"fixture\")\n}\nclass Concrete : Parent<Item>()\n"),
-        ("Use.kt", "package app\nfun run(factory: Factory, value: Concrete) { factory.make().get().useful(); value.get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Factory factory, Concrete value) { factory.make().get().useful(); value.get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Box.java", JAVA_BOX),
+        (
+            "Factory.java",
+            "package app; public class Factory { public Box<Item> make() { return null; } }",
+        ),
+        (
+            "Types.kt",
+            "package app\nopen class Parent<T> {\n fun get(): T = error(\"fixture\")\n}\nclass Concrete : Parent<Item>()\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(factory: Factory, value: Concrete) { factory.make().get().useful(); value.get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Factory factory, Concrete value) { factory.make().get().useful(); value.get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         for prefix in ["factory.make().get().use", "value.get().use"] {
@@ -704,10 +1022,20 @@ fn unsaved_java_return_and_kotlin_supertype_edits_replace_generic_bindings() {
 #[test]
 fn unknown_type_arguments_and_inheritance_cycles_do_not_guess_members() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Box.java", JAVA_BOX),
-        ("Cycle.kt", "package app\nopen class A : B()\nopen class B : A()\n"),
-        ("Use.kt", "package app\nfun run(box: Box<*>, cycle: A) { box.get().useful(); cycle.get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Box box) { box.get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Box.java", JAVA_BOX),
+        (
+            "Cycle.kt",
+            "package app\nopen class A : B()\nopen class B : A()\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(box: Box<*>, cycle: A) { box.get().useful(); cycle.get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Box box) { box.get().useful(); } }",
+        ),
     ]);
     assert!(labels(&mut ws, "Use.kt", "box.get().use").is_empty());
     assert!(labels(&mut ws, "Use.kt", "cycle.get().use").is_empty());
@@ -718,18 +1046,28 @@ fn unknown_type_arguments_and_inheritance_cycles_do_not_guess_members() {
 fn qualified_nested_types_resolve_without_casing_assumptions() {
     // The compiler oracle covers both languages for Outer.Inner, and Java for outer.inner.
     for (outer, inner, kotlin_supported) in [("Outer", "Inner", true), ("outer", "inner", false)] {
-        let declaration = format!("package model; public class {outer} {{ public static class {inner} {{ public void useful() {{}} }} }}");
+        let declaration = format!(
+            "package model; public class {outer} {{ public static class {inner} {{ public void useful() {{}} }} }}"
+        );
         let unrelated =
             format!("package app; public class {inner} {{ public void usefulWrong() {{}} }}");
-        let factory = format!("package app; public class Factory {{ public Box<model.{outer}.{inner}> make() {{ return null; }} }}");
+        let factory = format!(
+            "package app; public class Factory {{ public Box<model.{outer}.{inner}> make() {{ return null; }} }}"
+        );
         let mut ws = workspace(&[
-        ("Outer.java", &declaration),
-        ("WrongInner.java", &unrelated),
-        ("Box.java", JAVA_BOX),
-        ("Factory.java", &factory),
-        ("Use.kt", "package app\nfun run(factory: Factory) { factory.make().get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Factory factory) { factory.make().get().useful(); } }"),
-    ]);
+            ("Outer.java", &declaration),
+            ("WrongInner.java", &unrelated),
+            ("Box.java", JAVA_BOX),
+            ("Factory.java", &factory),
+            (
+                "Use.kt",
+                "package app\nfun run(factory: Factory) { factory.make().get().useful() }\n",
+            ),
+            (
+                "Use.java",
+                "package app; class Use { void run(Factory factory) { factory.make().get().useful(); } }",
+            ),
+        ]);
         for file in ["Use.kt", "Use.java"] {
             if file == "Use.kt" && !kotlin_supported {
                 continue;
@@ -753,10 +1091,19 @@ fn qualified_nested_types_resolve_without_casing_assumptions() {
 #[test]
 fn inherited_generic_parameter_accepts_the_correct_nested_argument_type() {
     let mut ws = workspace(&[
-        ("Outer.java", "package model; public class Outer { public static class Inner {} }"),
+        (
+            "Outer.java",
+            "package model; public class Outer { public static class Inner {} }",
+        ),
         ("WrongInner.kt", "package app\nclass Inner\n"),
-        ("Holder.kt", "package app\nopen class Holder<T> {\n fun accept(value: T) {}\n}\nclass Concrete : Holder<model.Outer.Inner>()\n"),
-        ("Use.kt", "package app\nfun run(holder: Concrete, value: model.Outer.Inner) { holder.accept(value) }\n"),
+        (
+            "Holder.kt",
+            "package app\nopen class Holder<T> {\n fun accept(value: T) {}\n}\nclass Concrete : Holder<model.Outer.Inner>()\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(holder: Concrete, value: model.Outer.Inner) { holder.accept(value) }\n",
+        ),
     ]);
     ws.assume_index_complete_for_tests();
     let diagnostics = ws.diagnostics("Use.kt");
@@ -769,12 +1116,28 @@ fn inherited_generic_parameter_accepts_the_correct_nested_argument_type() {
 #[test]
 fn imported_generic_superclass_and_return_types_keep_declaration_visibility() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER),
-        ("Base.java", "package library; import app.Item; public class Base<T> { public T get() { return null; } }"),
-        ("WrongBase.java", "package app; public class Base<T> { public Other get() { return null; } }"),
-        ("Concrete.kt", "package app\nclass Concrete : library.Base<Item>()\n"),
-        ("Use.kt", "package app\nfun run(value: Concrete) { value.get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Concrete value) { value.get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        (
+            "Base.java",
+            "package library; import app.Item; public class Base<T> { public T get() { return null; } }",
+        ),
+        (
+            "WrongBase.java",
+            "package app; public class Base<T> { public Other get() { return null; } }",
+        ),
+        (
+            "Concrete.kt",
+            "package app\nclass Concrete : library.Base<Item>()\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(value: Concrete) { value.get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Concrete value) { value.get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         assert_member(&mut ws, file, "value.get().use", "useful", "usefulWrong");
@@ -784,10 +1147,20 @@ fn imported_generic_superclass_and_return_types_keep_declaration_visibility() {
 #[test]
 fn unknown_projections_preserve_later_type_argument_positions() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER),
-        ("Pair.java", "package app; public class Pair<K, V> { public V get() { return null; } }"),
-        ("Use.kt", "package app\nfun run(pair: Pair<*, Item>, unknown: Pair<Item, *>) { pair.get().useful(); unknown.get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Pair<?, Item> pair, Pair<Item, ?> unknown) { pair.get().useful(); unknown.get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        (
+            "Pair.java",
+            "package app; public class Pair<K, V> { public V get() { return null; } }",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(pair: Pair<*, Item>, unknown: Pair<Item, *>) { pair.get().useful(); unknown.get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Pair<?, Item> pair, Pair<Item, ?> unknown) { pair.get().useful(); unknown.get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         assert_member(&mut ws, file, "pair.get().use", "useful", "usefulWrong");
@@ -821,9 +1194,16 @@ fn method_type_parameters_shadow_class_parameters_without_inventing_bindings() {
 #[test]
 fn conflicting_inherited_bindings_remain_unknown() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER),
-        ("Types.kt", "package app\ninterface Root<T> {\n fun get(): T\n}\ninterface Left : Root<Item>\ninterface Right : Root<Other>\nclass Conflict : Left, Right\n"),
-        ("Use.kt", "package app\nfun run(value: Conflict) { value.get().useful() }\n"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        (
+            "Types.kt",
+            "package app\ninterface Root<T> {\n fun get(): T\n}\ninterface Left : Root<Item>\ninterface Right : Root<Other>\nclass Conflict : Left, Right\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(value: Conflict) { value.get().useful() }\n",
+        ),
     ]);
     assert_eq!(
         infer_expression(&ws, "Use.kt", "value.get()"),
@@ -835,10 +1215,20 @@ fn conflicting_inherited_bindings_remain_unknown() {
 #[test]
 fn matching_diamond_bindings_preserve_the_generic_result() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER),
-        ("Types.kt", "package app\ninterface Root<T> {\n fun get(): T\n}\ninterface Left : Root<Item>\ninterface Right : Root<Item>\nabstract class Diamond : Left, Right\n"),
-        ("Use.kt", "package app\nfun run(value: Diamond) { value.get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Diamond value) { value.get().useful(); } }"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        (
+            "Types.kt",
+            "package app\ninterface Root<T> {\n fun get(): T\n}\ninterface Left : Root<Item>\ninterface Right : Root<Item>\nabstract class Diamond : Left, Right\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(value: Diamond) { value.get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Diamond value) { value.get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         assert_member(&mut ws, file, "value.get().use", "useful", "usefulWrong");
@@ -852,10 +1242,17 @@ fn invalid_growing_generic_cycles_stop_in_both_language_clients() {
         "package app; class Pair<L, R> {} class A<T> extends B<Pair<T, T>> { T get() { return null; } } class B<T> extends A<Pair<T, T>> {}",
     ] {
         let mut ws = workspace(&[
-            ("Item.kt", ITEM), ("Other.kt", OTHER),
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
             ("Cycles.java", declarations),
-            ("Use.kt", "package app\nfun run(value: A<Item>) { value.get().useful(); value.missing() }\n"),
-            ("Use.java", "package app; class Use { void run(A<Item> value) { value.get().useful(); value.missing(); } }"),
+            (
+                "Use.kt",
+                "package app\nfun run(value: A<Item>) { value.get().useful(); value.missing() }\n",
+            ),
+            (
+                "Use.java",
+                "package app; class Use { void run(A<Item> value) { value.get().useful(); value.missing(); } }",
+            ),
         ]);
         for file in ["Use.kt", "Use.java"] {
             // The direct member's declared T remains usable while invalid inherited cycles stop.
@@ -870,12 +1267,27 @@ fn invalid_growing_generic_cycles_stop_in_both_language_clients() {
 #[test]
 fn ambiguous_imported_type_arguments_do_not_merge_unrelated_members() {
     let mut ws = workspace(&[
-        ("Left.kt", "package left\nclass Item {\n fun useful() {}\n}\n"),
-        ("Right.kt", "package right\nclass Item {\n fun usefulWrong() {}\n}\n"),
+        (
+            "Left.kt",
+            "package left\nclass Item {\n fun useful() {}\n}\n",
+        ),
+        (
+            "Right.kt",
+            "package right\nclass Item {\n fun usefulWrong() {}\n}\n",
+        ),
         ("Box.java", JAVA_BOX),
-        ("Factory.java", "package app; import left.*; import right.*; public class Factory { public Box<Item> make() { return null; } }"),
-        ("Use.kt", "package app\nfun run(factory: Factory) { factory.make().get().useful() }\n"),
-        ("Use.java", "package app; class Use { void run(Factory factory) { factory.make().get().useful(); } }"),
+        (
+            "Factory.java",
+            "package app; import left.*; import right.*; public class Factory { public Box<Item> make() { return null; } }",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(factory: Factory) { factory.make().get().useful() }\n",
+        ),
+        (
+            "Use.java",
+            "package app; class Use { void run(Factory factory) { factory.make().get().useful(); } }",
+        ),
     ]);
     for file in ["Use.kt", "Use.java"] {
         assert!(labels(&mut ws, file, "factory.make().get().use").is_empty());
@@ -1140,11 +1552,22 @@ fn qualified_nested_superclasses_keep_package_and_container_identity() {
 #[test]
 fn imported_superclass_receiver_lambdas_use_the_declaration_context() {
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER),
-        ("base/Base.kt", "package base\nimport app.Item\nopen class Base {\n fun withItem(block: Item.() -> Unit) { Item().block() }\n}\n"),
-        ("app/Base.kt", "package app\nopen class Base {\n fun withItem(block: Other.() -> Unit) {}\n}\n"),
-        ("app/Child.java", JAVA_CHILD), ("app/KotlinChild.kt", KOTLIN_CHILD),
-        ("app/Use.kt", "package app\nfun run(child: Child, kotlin: KotlinChild) {\n child.withItem { useful() }\n kotlin.withItem { useful() }\n}\n"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        (
+            "base/Base.kt",
+            "package base\nimport app.Item\nopen class Base {\n fun withItem(block: Item.() -> Unit) { Item().block() }\n}\n",
+        ),
+        (
+            "app/Base.kt",
+            "package app\nopen class Base {\n fun withItem(block: Other.() -> Unit) {}\n}\n",
+        ),
+        ("app/Child.java", JAVA_CHILD),
+        ("app/KotlinChild.kt", KOTLIN_CHILD),
+        (
+            "app/Use.kt",
+            "package app\nfun run(child: Child, kotlin: KotlinChild) {\n child.withItem { useful() }\n kotlin.withItem { useful() }\n}\n",
+        ),
     ]);
     ws.assume_index_complete_for_tests();
     for receiver in ["child", "kotlin"] {
@@ -1177,10 +1600,12 @@ fn generic_java_class_property_shares_lookup_inference_navigation_and_completion
     ]);
     ws.assume_index_complete_for_tests();
     {
-        use ktlsp::index::{Entry, Index, InferenceIndex, LookupEntries};
+        use ktlsp::index::{Entry, InferenceIndex, LookupEntries, ScopedIndex};
         struct PrefixIndex<'a> {
-            index: &'a Index,
+            index: &'a dyn InferenceIndex,
             prefixes: std::cell::RefCell<Vec<String>>,
+            generic_prefixes: std::cell::RefCell<Vec<String>>,
+            receiver_queries: std::cell::Cell<usize>,
         }
         impl InferenceIndex for PrefixIndex<'_> {
             fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
@@ -1190,7 +1615,12 @@ fn generic_java_class_property_shares_lookup_inference_navigation_and_completion
                 InferenceIndex::members_of(self.index, name)
             }
             fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
-                InferenceIndex::extensions_for(self.index, name)
+                self.receiver_queries.set(self.receiver_queries.get() + 1);
+                self.index.extensions_for(name)
+            }
+            fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+                self.generic_prefixes.borrow_mut().push(prefix.into());
+                self.index.generic_receiver_extensions(prefix)
             }
             fn entries_with_prefix<'a>(
                 &'a self,
@@ -1198,35 +1628,74 @@ fn generic_java_class_property_shares_lookup_inference_navigation_and_completion
                 top_level_only: bool,
             ) -> Box<dyn Iterator<Item = &'a Entry> + 'a> {
                 self.prefixes.borrow_mut().push(prefix.into());
-                Box::new(self.index.entries_with_prefix(prefix, top_level_only))
+                self.index.entries_with_prefix(prefix, top_level_only)
             }
         }
-        let index = PrefixIndex {
-            index: &ws.index,
-            prefixes: Default::default(),
-        };
+        let snapshot = ws.index.inference_snapshot();
+        let scoped = ws.index.scoped_for_file("Use.kt");
+        let scoped_snapshot = ScopedIndex::new(&snapshot, "Use.kt");
         let context = FileCtx::new("app".into(), Vec::new());
         let receiver = Type::class("Item", Some("app".into()));
-        let java_candidates = ktcore::members::completion_candidates_at(
-            &index, &receiver, "javaC", &context, 0, false,
-        );
-        assert!(java_candidates.extensions.is_empty());
-        assert!(
-            index.prefixes.borrow().is_empty(),
-            "Java queries do not scan Kotlin extensions"
-        );
-        let candidates = ktcore::members::completion_candidates_at(
-            &index, &receiver, "javaC", &context, 0, true,
-        );
-        assert!(candidates
-            .extensions
-            .iter()
-            .any(|entry| entry.sym.name == "javaClass"));
-        assert_eq!(
-            *index.prefixes.borrow(),
-            ["javaC"],
-            "filter names before scoped ownership lookup"
-        );
+        let alias_source = "package app\nimport kotlin.jvm.javaClass as runtimeClass\n";
+        let alias_tree = KotlinParser::new().parse(alias_source);
+        let alias_context = FileCtx::from_tree(&alias_tree, alias_source);
+        for underlying in [
+            &ws.index as &dyn InferenceIndex,
+            &snapshot,
+            &scoped,
+            &scoped_snapshot,
+        ] {
+            let index = PrefixIndex {
+                index: underlying,
+                prefixes: Default::default(),
+                generic_prefixes: Default::default(),
+                receiver_queries: Default::default(),
+            };
+            for prefix in ["", "javaC"] {
+                let java_candidates = ktcore::members::completion_candidates_at(
+                    &index, &receiver, prefix, &context, 0, false,
+                );
+                assert!(java_candidates.extensions.is_empty());
+                assert!(index.generic_prefixes.borrow().is_empty());
+                assert_eq!(
+                    index.receiver_queries.get(),
+                    0,
+                    "Java skips Kotlin extensions"
+                );
+            }
+            for prefix in ["", "javaC"] {
+                let candidates = ktcore::members::completion_candidates_at(
+                    &index, &receiver, prefix, &context, 0, true,
+                );
+                assert!(candidates
+                    .extensions
+                    .iter()
+                    .any(|entry| entry.sym.name == "javaClass"));
+            }
+            assert_eq!(*index.generic_prefixes.borrow(), ["", "javaC"]);
+            for prefix in ["", "runtimeC", "javaC"] {
+                let candidates = ktcore::members::completion_candidates_at(
+                    &index,
+                    &receiver,
+                    prefix,
+                    &alias_context,
+                    0,
+                    true,
+                );
+                assert_eq!(
+                    candidates
+                        .extensions
+                        .iter()
+                        .any(|entry| entry.sym.name == "javaClass"),
+                    prefix != "javaC",
+                    "aliased generic property: {prefix:?}"
+                );
+            }
+            assert!(
+                index.prefixes.borrow().is_empty(),
+                "generic extension queries do not scan all symbols"
+            );
+        }
     }
     assert_eq!(
         infer_expression(&ws, "Use.kt", "item.javaClass"),
@@ -1329,7 +1798,10 @@ fn generic_java_class_property_shares_lookup_inference_navigation_and_completion
     assert!(definitions
         .iter()
         .all(|definition| matches!(definition.file.as_str(), "Left.kt" | "Right.kt")));
-    eprintln!("ambiguous same-return property: two selected candidates, {} navigation targets, unanimous Class<Item>; compiler rejects access", definitions.len());
+    eprintln!(
+        "ambiguous same-return property: two selected candidates, {} navigation targets, unanimous Class<Item>; compiler rejects access",
+        definitions.len()
+    );
     ws.open("Other.kt", "package app\nclass Other\n".into());
     ws.change(
         "Right.kt",
@@ -1478,8 +1950,13 @@ fun <A, B> PairBox<B, A>.choose(): A = error("fixture")
 val <T> PairBox<T, T>.same: T get() = error("fixture")
 "#;
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER), ("Types.kt", declarations),
-        ("Use.kt", "package app\nfun run(pair: PairBox<Other, Item>, child: Child, same: PairBox<Item, Item>, conflict: PairBox<Item, Other>) { pair.chosen.useful(); child.chosen.useful(); pair.choose().useful(); same.same.useful(); conflict.same.useful() }\n"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Types.kt", declarations),
+        (
+            "Use.kt",
+            "package app\nfun run(pair: PairBox<Other, Item>, child: Child, same: PairBox<Item, Item>, conflict: PairBox<Item, Other>) { pair.chosen.useful(); child.chosen.useful(); pair.choose().useful(); same.same.useful(); conflict.same.useful() }\n",
+        ),
     ]);
     for receiver in [
         "pair.chosen.",
@@ -1521,8 +1998,13 @@ abstract class Diamond : Left, Agree
 val <T> Root<T>.chosen: T get() = error("fixture")
 "#;
     let mut ws = workspace(&[
-        ("Item.kt", ITEM), ("Other.kt", OTHER), ("Types.kt", declarations),
-        ("Use.kt", "package app\nfun run(good: Diamond, bad: Conflict) { good.chosen.useful(); bad.chosen.useful() }\n"),
+        ("Item.kt", ITEM),
+        ("Other.kt", OTHER),
+        ("Types.kt", declarations),
+        (
+            "Use.kt",
+            "package app\nfun run(good: Diamond, bad: Conflict) { good.chosen.useful(); bad.chosen.useful() }\n",
+        ),
     ]);
     assert_member(&mut ws, "Use.kt", "good.chosen.", "useful", "usefulWrong");
     assert_exact_definition(&mut ws, "Use.kt", "good.chosen.useful", "Item.kt", "useful");
@@ -1533,7 +2015,9 @@ val <T> Root<T>.chosen: T get() = error("fixture")
 #[test]
 fn generic_extension_properties_do_not_offer_wrong_concrete_receiver_arguments() {
     use ktlsp::resolve::{self, CompletenessFacts, ResolutionStatus};
-    let mut ws = reflection_workspace("package probe\nimport kotlin.reflect.KClass\nfun run(typed: KClass<Invocation>, other: KClass<Other>) { typed.java; other.java }\n");
+    let mut ws = reflection_workspace(
+        "package probe\nimport kotlin.reflect.KClass\nfun run(typed: KClass<Invocation>, other: KClass<Other>) { typed.java; other.java }\n",
+    );
     ws.change("JvmClassMapping.kt", "package kotlin.jvm\nimport kotlin.reflect.KClass\nimport probe.Other\nval KClass<Other>.java: Class<Other> get() = error(\"fixture\")\n".into());
     ws.change(
         "KClass.kt",
@@ -1570,7 +2054,9 @@ fn generic_extension_properties_do_not_offer_wrong_concrete_receiver_arguments()
 
 #[test]
 fn generic_extension_property_edits_replace_bindings_and_respect_type_parameter_shadowing() {
-    let mut ws = reflection_workspace("package probe\nfun run(exact: ExactRequest) { val result = exact.tag(Invocation::class.java)!!; result.service() }\n");
+    let mut ws = reflection_workspace(
+        "package probe\nfun run(exact: ExactRequest) { val result = exact.tag(Invocation::class.java)!!; result.service() }\n",
+    );
     assert_member(&mut ws, "Use.kt", "result.", "service", "serviceWrong");
     ws.open(
         "WrongT.java",
@@ -1604,7 +2090,9 @@ fn generic_extension_property_edits_replace_bindings_and_respect_type_parameter_
 #[test]
 fn kotlin_projected_arguments_preserve_slots_without_inventing_extension_bindings() {
     for projection in ["out Item", "in Item", "*"] {
-        let source = format!("package app\nfun run(value: PairBox<{projection}, Item>) {{ value.second().useful(); value.chosen.useful() }}\n");
+        let source = format!(
+            "package app\nfun run(value: PairBox<{projection}, Item>) {{ value.second().useful(); value.chosen.useful() }}\n"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -1633,8 +2121,14 @@ fn kotlin_projected_arguments_preserve_slots_without_inventing_extension_binding
     }
     let mut ws = workspace(&[
         ("Item.kt", ITEM),
-        ("Types.kt", "package app\nclass Holder<T> { fun body() {} }\nval <T : Item> Holder<T>.bounded: Item get() = error(\"fixture\")\nval <T> Holder<out T>.projected: Item get() = error(\"fixture\")\nval <T> Holder<T>.known: T get() = error(\"fixture\")\n"),
-        ("Use.kt", "package app\nfun run(value: Holder<Item>) { value.known.useful(); value.bounded.useful(); value.projected.useful() }\n"),
+        (
+            "Types.kt",
+            "package app\nclass Holder<T> { fun body() {} }\nval <T : Item> Holder<T>.bounded: Item get() = error(\"fixture\")\nval <T> Holder<out T>.projected: Item get() = error(\"fixture\")\nval <T> Holder<T>.known: T get() = error(\"fixture\")\n",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun run(value: Holder<Item>) { value.known.useful(); value.bounded.useful(); value.projected.useful() }\n",
+        ),
     ]);
     assert_member(&mut ws, "Use.kt", "value.known.", "useful", "missing");
     assert_member(&mut ws, "Use.kt", "value.", "bounded", "projected");
@@ -1729,8 +2223,14 @@ fun run() {{
         );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
-            ("probe/Unit.kt", "package probe\nclass Unit { fun unitWrong() {} }\n"),
-            ("Stdlib.kt", "package kotlin\nclass Throwable\nclass Result<T> { fun value(): T = TODO() }\nfun <R> runCatching(block: () -> R): Result<R> = TODO()\nfun <T> Result<T>.onFailure(action: (Throwable) -> Unit): Result<T> = this\n"),
+            (
+                "probe/Unit.kt",
+                "package probe\nclass Unit { fun unitWrong() {} }\n",
+            ),
+            (
+                "Stdlib.kt",
+                "package kotlin\nclass Throwable\nclass Result<T> { fun value(): T = TODO() }\nfun <R> runCatching(block: () -> R): Result<R> = TODO()\nfun <T> Result<T>.onFailure(action: (Throwable) -> Unit): Result<T> = this\n",
+            ),
             ("Use.kt", &source),
         ]);
         assert_eq!(
@@ -2201,7 +2701,9 @@ fn conflicting_nominal_shapes_never_become_known_receiver_arguments() {
         "package kotlin.reflect\nclass KClass<T>\n",
         "package kotlin.reflect\ninterface KClass<U>\n",
     ] {
-        let mut ws = reflection_workspace("package probe\nimport kotlin.reflect.KClass\nfun run(typed: KClass<Invocation>, exact: ExactRequest) { typed.java; exact.tag(Invocation::class.java)!!.service() }\n");
+        let mut ws = reflection_workspace(
+            "package probe\nimport kotlin.reflect.KClass\nfun run(typed: KClass<Invocation>, exact: ExactRequest) { typed.java; exact.tag(Invocation::class.java)!!.service() }\n",
+        );
         ws.change(
             "KClass.kt",
             "package kotlin.reflect\ninterface KClass<T> { val qualifiedName: String? }\n".into(),
@@ -2234,8 +2736,14 @@ fn conflicting_nominal_shapes_never_become_known_receiver_arguments() {
         let mut ws = workspace(&[
             ("String.kt", "package kotlin\nclass String\n"),
             ("ConflictingString.kt", conflicting),
-            ("Holder.kt", "package app\nclass Holder<T> { fun body() {} }\nval <T> Holder<T>.chosen: T get() = TODO()\n"),
-            ("Use.kt", "package app\nfun run(holder: Holder<kotlin.String>) { holder.chosen; holder.body() }\n"),
+            (
+                "Holder.kt",
+                "package app\nclass Holder<T> { fun body() {} }\nval <T> Holder<T>.chosen: T get() = TODO()\n",
+            ),
+            (
+                "Use.kt",
+                "package app\nfun run(holder: Holder<kotlin.String>) { holder.chosen; holder.body() }\n",
+            ),
         ]);
         assert_member(&mut ws, "Use.kt", "holder.", "body", "chosen");
         assert_eq!(
@@ -2412,8 +2920,10 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
  request.tag(unknown)
  request.both(type,other)
  request.different(type,other)
- request.bounded(type)
- kotlin.bounded(type)
+ request.bounded(type)!!.service()
+ kotlin.bounded(type)!!.service()
+ request.bounded(other)
+ kotlin.bounded(other)
  request.variant(variant)
  request.boundedOwner(bounded)
  variant.body()
@@ -2427,6 +2937,8 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
         "kotlin.both(type,type)!!",
         "request.nested(nested)!!",
         "receiver.from(type)",
+        "request.bounded(type)!!",
+        "kotlin.bounded(type)!!",
     ] {
         assert_member(
             &mut ws,
@@ -2453,8 +2965,8 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
         "request.tag(unknown)",
         "request.both(type,other)",
         "request.different(type,other)",
-        "request.bounded(type)",
-        "kotlin.bounded(type)",
+        "request.bounded(other)",
+        "kotlin.bounded(other)",
         "request.variant(variant)",
         "request.boundedOwner(bounded)",
         "request.invariantNested(pair)",
@@ -3287,14 +3799,14 @@ fun use(left:Class<Invocation>,right:Class<Other>,known:Other) { pick(second=rig
 #[test]
 fn named_calls_do_not_treat_java_parameter_spelling_as_kotlin_source_names() {
     let source = "package probe
-fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,known:Other) { request.tag(type=type);kotlin.upper(type=type);kotlin.star(type=type);kotlin.bounded(type=type);kotlin.tag(type=captured);kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
+fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,wrong:Class<Other>,known:Other) { request.tag(type=type);kotlin.upper(type=type);kotlin.star(type=type);kotlin.bounded(type=type)!!.service();kotlin.bounded(type=wrong);kotlin.tag(type=captured);kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
 ";
     let mut ws = projected_workspace(source);
     for expression in [
         "request.tag(type=type)",
         "kotlin.upper(type=type)",
         "kotlin.star(type=type)",
-        "kotlin.bounded(type=type)",
+        "kotlin.bounded(type=wrong)",
         "kotlin.tag(type=captured)",
     ] {
         assert_eq!(
@@ -3303,6 +3815,20 @@ fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Cla
             "{expression}"
         );
     }
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "kotlin.bounded(type=type)!!.",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "kotlin.bounded(type=type)!!.service()",
+        "Invocation.java",
+        "service",
+    );
     assert_member(
         &mut ws,
         "Use.kt",
@@ -3699,10 +4225,25 @@ fn qualified_free_calls_preserve_value_roots_and_reject_non_dot_package_paths() 
             ws.open("RootValue.kt", extra.into());
         }
         let expression = "probe.freeLeading(required=left)";
-        assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::class("Other", Some("probe".into())));
-        assert_member(&mut ws, "Use.kt", &format!("{expression}."), "body", "service");
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", expression),
+            Type::class("Other", Some("probe".into()))
+        );
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "body",
+            "service",
+        );
         assert_exact_definition(&mut ws, "Use.kt", expression, "Receiver.kt", "freeLeading");
-        assert_exact_definition(&mut ws, "Use.kt", &format!("{expression}.body()"), "Other.java", "body");
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.body()"),
+            "Other.java",
+            "body",
+        );
         assert_member(&mut ws, "Use.kt", "known.", "body", "service");
     }
     let source = "package app\nimport probe.Invocation\nimport probe.Other\nfun use(probe:Missing,left:Class<Invocation>,known:Other) { probe.freeLeading(required=left);known.body() }\n";
@@ -3835,10 +4376,22 @@ fn qualified_free_named_defaults_follow_unsaved_formal_and_default_changes() {
 
 fn java_resource_workspace(source: &str) -> Workspace {
     workspace(&[
-        ("AutoCloseable.java", "package java.lang; public interface AutoCloseable { void close(); }"),
-        ("Body.kt", "package app\nclass Body : AutoCloseable {\n fun string(): String = \"body\"\n override fun close() {}\n}\n"),
-        ("Other.kt", "package app\nclass Other : AutoCloseable {\n fun enqueue() {}\n override fun close() {}\n}\n"),
-        ("body.java", "package app; class body { public static void enqueue() {} }"),
+        (
+            "AutoCloseable.java",
+            "package java.lang; public interface AutoCloseable { void close(); }",
+        ),
+        (
+            "Body.kt",
+            "package app\nclass Body : AutoCloseable {\n fun string(): String = \"body\"\n override fun close() {}\n}\n",
+        ),
+        (
+            "Other.kt",
+            "package app\nclass Other : AutoCloseable {\n fun enqueue() {}\n override fun close() {}\n}\n",
+        ),
+        (
+            "body.java",
+            "package app; class body { public static void enqueue() {} }",
+        ),
         ("Use.java", source),
     ])
 }
@@ -3850,7 +4403,9 @@ fn java_resource_ordinary_local_completion_control() {
         "System.out.println(body.);",
         "System.out.println(body.",
     ] {
-        let source = format!("package app; class Use {{ void run(Body supply) {{\n Body body = supply;\n {line}\n }} }}");
+        let source = format!(
+            "package app; class Use {{ void run(Body supply) {{\n Body body = supply;\n {line}\n }} }}"
+        );
         let mut ws = java_resource_workspace(&source);
         assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
     }
@@ -3863,7 +4418,9 @@ fn java_resource_typed_kotlin_receiver_completion() {
         "System.out.println(body.);",
         "System.out.println(body.",
     ] {
-        let source = format!("package app; class Use {{ void run(Body supply) {{\n try (Body body = supply) {{\n {line}\n }} }} }}");
+        let source = format!(
+            "package app; class Use {{ void run(Body supply) {{\n try (Body body = supply) {{\n {line}\n }} }} }}"
+        );
         let mut ws = java_resource_workspace(&source);
         assert_member(&mut ws, "Use.java", "body.", "string", "enqueue");
     }
@@ -3913,7 +4470,9 @@ fn java_resource_scope_returns_to_the_outer_field_in_catch_finally_and_after() {
 #[test]
 fn java_resource_unknown_declared_type_does_not_fall_back_to_a_same_named_class() {
     for line in ["body.", "System.out.println(body."] {
-        let source = format!("package app; class Use {{ void run(Body supply) {{\n supply.string();\n try (Missing body = supply) {{\n {line}\n }} }} }}");
+        let source = format!(
+            "package app; class Use {{ void run(Body supply) {{\n supply.string();\n try (Missing body = supply) {{\n {line}\n }} }} }}"
+        );
         let mut ws = java_resource_workspace(&source);
         assert_member(&mut ws, "Use.java", "supply.", "string", "enqueue");
         let found = labels(&mut ws, "Use.java", "body.");
@@ -3927,10 +4486,22 @@ fn java_resource_unknown_declared_type_does_not_fall_back_to_a_same_named_class(
 #[test]
 fn java_resource_completion_recovery_keeps_nested_lexical_scopes() {
     for (case, source) in [
-        ("resource shadows field", "package app; class Use { Other body; void run(Body supply) {\n try (Body body = supply) {\n System.out.println(body.\n } } }"),
-        ("finished resource cannot shadow field", "package app; class Use { Body body; void run(Other supply) {\n try (Other body = supply) {}\n System.out.println(body.\n } }"),
-        ("nested local shadows field", "package app; class Use { Other body; void run(Body supply) {\n { Body body = supply;\n System.out.println(body.\n } } }"),
-        ("finished nested local cannot shadow field", "package app; class Use { Body body; void run(Other supply) {\n { Other body = supply; }\n System.out.println(body.\n } }"),
+        (
+            "resource shadows field",
+            "package app; class Use { Other body; void run(Body supply) {\n try (Body body = supply) {\n System.out.println(body.\n } } }",
+        ),
+        (
+            "finished resource cannot shadow field",
+            "package app; class Use { Body body; void run(Other supply) {\n try (Other body = supply) {}\n System.out.println(body.\n } }",
+        ),
+        (
+            "nested local shadows field",
+            "package app; class Use { Other body; void run(Body supply) {\n { Body body = supply;\n System.out.println(body.\n } } }",
+        ),
+        (
+            "finished nested local cannot shadow field",
+            "package app; class Use { Body body; void run(Other supply) {\n { Other body = supply; }\n System.out.println(body.\n } }",
+        ),
     ] {
         let mut ws = java_resource_workspace(source);
         let found = labels(&mut ws, "Use.java", "body.");
@@ -3961,7 +4532,9 @@ fn java_var_local_and_resource_receivers_use_current_initializers() {
                 } else {
                     format!("var body = {initializer}; {line}")
                 };
-                let source = format!("package app; class Use {{ static Body stored; static Body Body; Body make() {{ return null; }} void run(Body supply) {{ {binding} }} }}");
+                let source = format!(
+                    "package app; class Use {{ static Body stored; static Body Body; Body make() {{ return null; }} void run(Body supply) {{ {binding} }} }}"
+                );
                 let mut ws = java_resource_workspace(&source);
                 let found = labels(&mut ws, "Use.java", "body.");
                 assert!(
@@ -4042,7 +4615,9 @@ fn java_var_own_initializer_never_falls_through_to_the_outer_field() {
             } else {
                 format!("var body = {initializer}; body.string();")
             };
-            let source = format!("package app; class Use {{ Body body; Body make(Body value) {{ return value; }} void run() {{ {statements} }} }}");
+            let source = format!(
+                "package app; class Use {{ Body body; Body make(Body value) {{ return value; }} void run() {{ {statements} }} }}"
+            );
             let mut ws = java_resource_workspace(&source);
             let found = labels(&mut ws, "Use.java", "body.");
             assert!(
@@ -4087,7 +4662,9 @@ fn java_var_alias_inference_keeps_typical_chains_and_bounds_longer_chains() {
             statements.push_str(&format!(" var value{current} = value{};", current - 1));
         }
         let prefix = format!("value{}.", count - 1);
-        let source = format!("package app; class Use {{ void run(Body supply) {{ {statements} {prefix}string(); }} }}");
+        let source = format!(
+            "package app; class Use {{ void run(Body supply) {{ {statements} {prefix}string(); }} }}"
+        );
         let mut ws = java_resource_workspace(&source);
         let found = labels(&mut ws, "Use.java", &prefix);
         if count == infer::MAX_DEPTH {
@@ -4115,7 +4692,9 @@ fn java_long_generic_identity_calls_keep_the_useful_receiver_type() {
         for _ in 0..depth {
             expression = format!("identity.id({expression})");
         }
-        let source = format!("package app; class Use {{ void run(Identity identity, Body supply) {{ {expression}.string(); }} }}");
+        let source = format!(
+            "package app; class Use {{ void run(Identity identity, Body supply) {{ {expression}.string(); }} }}"
+        );
         let mut ws = java_resource_workspace(&source);
         ws.open(
             "Identity.java",
@@ -4145,7 +4724,9 @@ fn java_long_generic_identity_calls_keep_the_useful_receiver_type() {
 fn java_ordinary_argument_values_retain_existing_base_members() {
     for expression in ["new Body() {}", "(new Body() {})", "Body"] {
         let prefix = format!("identity.id({expression}).");
-        let source = format!("package app; import static app.Values.Body; class Use {{ void run(Identity identity) {{ {prefix}string(); }} }}");
+        let source = format!(
+            "package app; import static app.Values.Body; class Use {{ void run(Identity identity) {{ {prefix}string(); }} }}"
+        );
         let mut ws = workspace(&[
             (
                 "Body.java",
@@ -4213,7 +4794,9 @@ fn java_enhanced_for_typed_receivers_complete_java_and_kotlin_owners() {
             "System.out.println(item.);",
             "System.out.println(item.",
         ] {
-            let source = format!("package app; class Use {{ void run(Item[] values) {{\n for (Item item : values) {{\n {line}\n }} }} }}");
+            let source = format!(
+                "package app; class Use {{ void run(Item[] values) {{\n for (Item item : values) {{\n {line}\n }} }} }}"
+            );
             let mut ws = workspace(&[
                 (owner, declaration),
                 ("Other.kt", OTHER),
@@ -4332,7 +4915,9 @@ fn java_enhanced_for_unknown_or_unsupported_types_do_not_fall_back() {
         ("Item item[]", "Item[][]"),
         ("Item[] item", "Item[][]"),
     ] {
-        let source = format!("package app; class Use {{ Other item; void run({values_type} values) {{ for ({binding} : values) {{\n item.\n }} }} }}");
+        let source = format!(
+            "package app; class Use {{ Other item; void run({values_type} values) {{ for ({binding} : values) {{\n item.\n }} }} }}"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -4367,7 +4952,9 @@ fn java_enhanced_for_var_array_and_iterable_receivers_have_useful_completion() {
                 "System.out.println(item.);",
                 "System.out.println(item.",
             ] {
-                let source = format!("package app; class Use {{ void run({values}) {{\n for (var item : (values)) {{\n {line}\n }} }} }}");
+                let source = format!(
+                    "package app; class Use {{ void run({values}) {{\n for (var item : (values)) {{\n {line}\n }} }} }}"
+                );
                 let mut ws = workspace(&[
                     (owner, declaration),
                     ("Other.kt", OTHER),
@@ -4389,7 +4976,9 @@ fn java_enhanced_for_var_generic_hierarchy_and_array_elements_keep_substitution(
         } else {
             "item.get()."
         };
-        let source = format!("package app; class Use {{ void run({values}) {{ for (var item : values) {{ {expression}useful(); }} }} }}");
+        let source = format!(
+            "package app; class Use {{ void run({values}) {{ for (var item : values) {{ {expression}useful(); }} }} }}"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -4452,7 +5041,9 @@ fn java_enhanced_for_var_keeps_lexical_values_and_loop_scope() {
 #[test]
 fn java_enhanced_for_var_tracks_unsaved_element_and_hierarchy_edits() {
     for values in ["Item[] values", "java.lang.Iterable<Item> values"] {
-        let source = format!("package app; class Use {{ void run({values}) {{ for (var item : values) {{ item.useful(); }} }} }}");
+        let source = format!(
+            "package app; class Use {{ void run({values}) {{ for (var item : values) {{ item.useful(); }} }} }}"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -4503,7 +5094,9 @@ fn java_enhanced_for_var_unsupported_or_ambiguous_elements_never_invent_a_scalar
         "java.lang.Iterable<Missing> values",
         "NotIterable<Item> values",
     ] {
-        let source = format!("package app; class Use {{ Item item; void run({values}) {{ for (var item : values) {{\n item.\n }} }} }}");
+        let source = format!(
+            "package app; class Use {{ Item item; void run({values}) {{ for (var item : values) {{\n item.\n }} }} }}"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -4522,9 +5115,18 @@ fn java_enhanced_for_var_unsupported_or_ambiguous_elements_never_invent_a_scalar
         "package app; interface Both extends java.lang.Iterable<Other> {} abstract class Values implements java.lang.Iterable<Item>, Both {}",
     ] {
         let source = "package app; class Use { Item item; void run(Values values) { for (var item : values) { item.useful(); } } }";
-        let mut ws = workspace(&[("Item.kt", ITEM), ("Other.kt", OTHER), ("Iterable.java", JAVA_FOREACH_ITERABLE), ("Values.java", declaration), ("Use.java", source)]);
+        let mut ws = workspace(&[
+            ("Item.kt", ITEM),
+            ("Other.kt", OTHER),
+            ("Iterable.java", JAVA_FOREACH_ITERABLE),
+            ("Values.java", declaration),
+            ("Use.java", source),
+        ]);
         let found = labels(&mut ws, "Use.java", "item.");
-        assert!(!found.contains("useful") && !found.contains("usefulWrong"), "{declaration}: {found:?}");
+        assert!(
+            !found.contains("useful") && !found.contains("usefulWrong"),
+            "{declaration}: {found:?}"
+        );
     }
 }
 
@@ -5043,7 +5645,9 @@ fn java_enhanced_for_var_array_aliases_keep_lexical_bindings_and_initializer_met
         "unknown()",
         "null",
     ] {
-        let source = format!("package app; class Use {{ Item[] values; Item[] wrap(Item[] value) {{ return value; }} void run() {{ var values = {initializer}; for (var item : values) {{ item.useful(); }} }} }}");
+        let source = format!(
+            "package app; class Use {{ Item[] values; Item[] wrap(Item[] value) {{ return value; }} void run() {{ var values = {initializer}; for (var item : values) {{ item.useful(); }} }} }}"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -5064,7 +5668,10 @@ fn java_enhanced_for_var_array_aliases_share_the_initializer_depth_limit() {
         for current in 1..count {
             statements.push_str(&format!(" var value{current} = value{};", current - 1));
         }
-        let source = format!("package app; class Use {{ void run(Item[] input) {{ {statements} for (var item : value{}) {{ item.useful(); }} }} }}", count - 1);
+        let source = format!(
+            "package app; class Use {{ void run(Item[] input) {{ {statements} for (var item : value{}) {{ item.useful(); }} }} }}",
+            count - 1
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -5104,7 +5711,9 @@ fn java_enhanced_for_var_array_aliases_preserve_explicit_arrays_iterables_and_su
         ),
         ("Box<Item>[] input", "var alias = input;", "item.get()."),
     ] {
-        let source = format!("package app; class Use {{ void run({parameter}) {{ {statements} for (var item : alias) {{ {receiver}useful(); }} }} }}");
+        let source = format!(
+            "package app; class Use {{ void run({parameter}) {{ {statements} for (var item : alias) {{ {receiver}useful(); }} }} }}"
+        );
         let mut ws = workspace(&[
             ("Item.kt", ITEM),
             ("Other.kt", OTHER),
@@ -5753,10 +6362,22 @@ fun invalid(factory: Factory, unknown: Missing, nominal: Array, index: Other) {
 fn projected_mapped_collection_head_remains_possible_without_mapping_proof() {
     // These are index facts only; compiler control uses the actual JDK/stdlib declarations.
     let ws = workspace(&[
-        ("JavaList.java", "package java.util; public interface List<E> {}"),
-        ("KotlinList.kt", "package kotlin.collections\ninterface List<out E>\n"),
-        ("MappedResult.java", "package mapped; public final class MappedResult {}"),
-        ("MappedConsumer.java", "package mapped; public final class MappedConsumer { public <T> MappedResult consume(java.util.List<? extends T> values) { return null; } public MappedResult consume(MappedResult value) { return value; } }"),
+        (
+            "JavaList.java",
+            "package java.util; public interface List<E> {}",
+        ),
+        (
+            "KotlinList.kt",
+            "package kotlin.collections\ninterface List<out E>\n",
+        ),
+        (
+            "MappedResult.java",
+            "package mapped; public final class MappedResult {}",
+        ),
+        (
+            "MappedConsumer.java",
+            "package mapped; public final class MappedConsumer { public <T> MappedResult consume(java.util.List<? extends T> values) { return null; } public MappedResult consume(MappedResult value) { return value; } }",
+        ),
     ]);
     let actual = Type::Class {
         name: "List".into(),

@@ -416,6 +416,7 @@ pub fn after_dot_query(
         index,
         source: &source,
         replaced_file: Some(file),
+        source_member_proofs: false,
     };
     let ctx = infer::FileCtx::from_tree_in_file(&tree, &synthetic, file);
     member_completion_query_with_ctx(
@@ -890,6 +891,7 @@ pub(crate) struct RecoveredTypeIndex<'a> {
     index: &'a dyn InferenceIndex,
     source: &'a Index,
     replaced_file: Option<&'a str>,
+    source_member_proofs: bool,
 }
 
 impl<'scope> RecoveredTypeIndex<'scope> {
@@ -902,7 +904,13 @@ impl<'scope> RecoveredTypeIndex<'scope> {
             index,
             source,
             replaced_file: Some(file),
+            source_member_proofs: false,
         }
+    }
+
+    pub(crate) fn with_source_member_proofs(mut self, proven_headers: bool) -> Self {
+        self.source_member_proofs = proven_headers;
+        self
     }
 
     fn replace_file_entries<'a>(
@@ -934,7 +942,8 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
     }
 
     fn source_members_complete(&self, owner: &Entry) -> bool {
-        self.replaced_file != Some(owner.path.as_ref()) && self.index.source_members_complete(owner)
+        (self.replaced_file != Some(owner.path.as_ref()) || self.source_member_proofs)
+            && self.index.source_members_complete(owner)
     }
 
     fn may_have_compiled_callables(&self) -> bool {
@@ -986,6 +995,19 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
             self.index.extensions_for(name),
             self.source.extensions_for(name),
         )
+    }
+    fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+        let original = self.index.generic_receiver_extensions(prefix);
+        match self.replaced_file {
+            Some(file) => LookupEntries::Selected(
+                original
+                    .into_iter()
+                    .filter(move |entry| entry.path.as_ref() != file)
+                    .chain(self.source.generic_receiver_extensions(prefix))
+                    .collect(),
+            ),
+            None => original,
+        }
     }
     fn origin_facts(&self) -> Option<&OriginFacts> {
         self.index.origin_facts()
@@ -1096,6 +1118,7 @@ fn member_candidates(
         index,
         source,
         replaced_file: None,
+        source_member_proofs: false,
     });
     let inference_index: &dyn InferenceIndex = match &recovered {
         Some(recovered) => recovered,
@@ -1749,17 +1772,53 @@ mod tests {
     #[test]
     fn annotation_completion_preserves_language_specific_private_nests() {
         for (file, src, needle, available) in [
-            ("Outer.java", "public class Outer { static class Inner { private @interface Hidden {} } @Inner.Hid static class Other {} }", "@Inner.Hid", true),
-            ("Outer.java", "public class Outer { private @interface Hidden {} } @Outer.Hid class Other {}", "@Outer.Hid", false),
-            ("Outer.java", "public class Outer { static class Inner { public @interface Hidden {} } static class Other { static class Inner {} @Inner.Hid void run() {} } }", "@Inner.Hid", false),
-            ("Outer.kt", "class Outer { private annotation class Hidden\n @Hid class Inner }", "@Hid", true),
-            ("Outer.kt", "class Outer { class Inner { private annotation class Hidden }\n @Inner.Hid class Other }", "@Inner.Hid", false),
-            ("Outer.kt", "private annotation class Hidden\n@Hid class Other", "@Hid", true),
+            (
+                "Outer.java",
+                "public class Outer { static class Inner { private @interface Hidden {} } @Inner.Hid static class Other {} }",
+                "@Inner.Hid",
+                true,
+            ),
+            (
+                "Outer.java",
+                "public class Outer { private @interface Hidden {} } @Outer.Hid class Other {}",
+                "@Outer.Hid",
+                false,
+            ),
+            (
+                "Outer.java",
+                "public class Outer { static class Inner { public @interface Hidden {} } static class Other { static class Inner {} @Inner.Hid void run() {} } }",
+                "@Inner.Hid",
+                false,
+            ),
+            (
+                "Outer.kt",
+                "class Outer { private annotation class Hidden\n @Hid class Inner }",
+                "@Hid",
+                true,
+            ),
+            (
+                "Outer.kt",
+                "class Outer { class Inner { private annotation class Hidden }\n @Inner.Hid class Other }",
+                "@Inner.Hid",
+                false,
+            ),
+            (
+                "Outer.kt",
+                "private annotation class Hidden\n@Hid class Other",
+                "@Hid",
+                true,
+            ),
         ] {
             let mut ws = Workspace::new();
             ws.open(file, src.into());
             let result = ws.complete(file, src.find(needle).unwrap() + needle.len(), false);
-            assert_eq!(result.as_ref().is_some_and(|result| result.items.iter().any(|item| item.label == "Hidden")), available, "{file}: {src}: {result:?}");
+            assert_eq!(
+                result
+                    .as_ref()
+                    .is_some_and(|result| result.items.iter().any(|item| item.label == "Hidden")),
+                available,
+                "{file}: {src}: {result:?}"
+            );
         }
     }
 
@@ -2016,6 +2075,7 @@ mod tests {
                 type_params: Vec::new(),
                 type_parameter_facts: Default::default(),
                 source_member: Default::default(),
+                method_type_bounds: None,
             }],
             crate::index::Tier::Durable,
         );
@@ -2593,15 +2653,39 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
 
         let mut ws = Workspace::new();
         let sources = [
-            (COMPILED_BASE, "package oracle; public class Base { public String getName() { return null; } public String getName(int n) { return null; } public String otherName() { return null; } }", "common"),
+            (
+                COMPILED_BASE,
+                "package oracle; public class Base { public String getName() { return null; } public String getName(int n) { return null; } public String otherName() { return null; } }",
+                "common",
+            ),
             (COMPILED_OWNER, owner_source, "a"),
-            ("/compiled/a/Other.java", "package oracle; public class Other { public String getName() { return null; } }", "a"),
-            (COMPILED_USE, "package oracle; class Use { void run(Person p, Base b, Other o) { p.getName(); p.getName(1); p.otherName(); b.getName(); o.getName(); p.getName().length(); } }", "a"),
-            ("/compiled/b/Person.java", "package oracle; public class Person extends Base {}", "b"),
-            (COMPILED_OTHER_SCOPE, "package oracle; class Use { void run(Person p) { p.getName(); } }", "b"),
+            (
+                "/compiled/a/Other.java",
+                "package oracle; public class Other { public String getName() { return null; } }",
+                "a",
+            ),
+            (
+                COMPILED_USE,
+                "package oracle; class Use { void run(Person p, Base b, Other o) { p.getName(); p.getName(1); p.otherName(); b.getName(); o.getName(); p.getName().length(); } }",
+                "a",
+            ),
+            (
+                "/compiled/b/Person.java",
+                "package oracle; public class Person extends Base {}",
+                "b",
+            ),
+            (
+                COMPILED_OTHER_SCOPE,
+                "package oracle; class Use { void run(Person p) { p.getName(); } }",
+                "b",
+            ),
             // Minimal parsed JDK declaration model isolates result-type lookup from indexing.
             // These are existing String declarations, not synthesized members on Person.
-            ("/compiled/jdk/String.java", "package java.lang; public final class String { public int length() { return 0; } }", "jdk"),
+            (
+                "/compiled/jdk/String.java",
+                "package java.lang; public final class String { public int length() { return 0; } }",
+                "jdk",
+            ),
         ];
         for (file, source, _) in sources {
             ws.open(file, source.into());
@@ -2953,14 +3037,26 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
     fn compiled_override_rename_preserves_static_and_private_authored_members() {
         let mut ws = compiled_override_workspace(&["compiled-one"]);
         for (file, source) in [
-            ("/compiled/a/StaticControl.java", "package oracle; class StaticControl { public static String getName() { return null; } void use() { getName(); } }"),
-            ("/compiled/a/PrivateControl.java", "package oracle; class PrivateControl { private String getName() { return null; } void use() { getName(); } }"),
+            (
+                "/compiled/a/StaticControl.java",
+                "package oracle; class StaticControl { public static String getName() { return null; } void use() { getName(); } }",
+            ),
+            (
+                "/compiled/a/PrivateControl.java",
+                "package oracle; class PrivateControl { private String getName() { return null; } void use() { getName(); } }",
+            ),
         ] {
             open_compiled_dispatch_source(&mut ws, file, source);
             let target = compiled_declaration(&ws, file, "getName", 0);
             assert!(ws.prepare_rename(file, target.start_byte).is_some());
             let edits = ws.rename(file, target.start_byte, "support").unwrap();
-            for check in [file, COMPILED_BASE, COMPILED_OWNER, COMPILED_USE, COMPILED_OTHER_SCOPE] {
+            for check in [
+                file,
+                COMPILED_BASE,
+                COMPILED_OWNER,
+                COMPILED_USE,
+                COMPILED_OTHER_SCOPE,
+            ] {
                 let before = ws.doc_text(check).unwrap();
                 let expected = if check == file {
                     before.replace("getName", "support")
@@ -3138,12 +3234,30 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
     fn compiled_dispatch_parsed_parameter_local_own_inherited_and_new_values_keep_getter() {
         let mut ws = compiled_override_workspace(&["compiled-one"]);
         let sources = [
-            ("/compiled/a/ParameterUse.java", "package oracle; class ParameterUse { void run(Person p) { p.getName().length(); } }"),
-            ("/compiled/a/NewUse.java", "package oracle; class NewUse { void run() { new Person().getName().length(); } }"),
-            ("/compiled/a/LocalUse.java", "package oracle; class LocalUse { void run() { Person Person = new Person(); Person.getName().length(); } }"),
-            ("/compiled/a/OwnFieldUse.java", "package oracle; class OwnFieldUse { Person Person; void run() { Person.getName().length(); } }"),
-            ("/compiled/a/Holder.java", "package oracle; public class Holder { public Person Person; }"),
-            ("/compiled/a/InheritedUse.java", "package oracle; class InheritedUse extends Holder { void run() { Person.getName().length(); } }"),
+            (
+                "/compiled/a/ParameterUse.java",
+                "package oracle; class ParameterUse { void run(Person p) { p.getName().length(); } }",
+            ),
+            (
+                "/compiled/a/NewUse.java",
+                "package oracle; class NewUse { void run() { new Person().getName().length(); } }",
+            ),
+            (
+                "/compiled/a/LocalUse.java",
+                "package oracle; class LocalUse { void run() { Person Person = new Person(); Person.getName().length(); } }",
+            ),
+            (
+                "/compiled/a/OwnFieldUse.java",
+                "package oracle; class OwnFieldUse { Person Person; void run() { Person.getName().length(); } }",
+            ),
+            (
+                "/compiled/a/Holder.java",
+                "package oracle; public class Holder { public Person Person; }",
+            ),
+            (
+                "/compiled/a/InheritedUse.java",
+                "package oracle; class InheritedUse extends Holder { void run() { Person.getName().length(); } }",
+            ),
         ];
         for (file, source) in sources {
             open_compiled_dispatch_source(&mut ws, file, source);
@@ -3160,9 +3274,18 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
     fn compiled_dispatch_type_spelling_unknown_import_and_incomplete_parent_do_not_invent_value() {
         let mut ws = compiled_override_workspace(&["compiled-one"]);
         for (file, source) in [
-            ("/compiled/a/TypeUse.java", "package oracle; class TypeUse { void run() { Person.getName().length(); } }"),
-            ("/compiled/a/ImportedUse.java", "package oracle; import static missing.Values.Person; class ImportedUse { void run() { Person.getName().length(); } }"),
-            ("/compiled/a/UncertainUse.java", "package oracle; class UncertainUse extends Missing { void run() { Person.getName().length(); } }"),
+            (
+                "/compiled/a/TypeUse.java",
+                "package oracle; class TypeUse { void run() { Person.getName().length(); } }",
+            ),
+            (
+                "/compiled/a/ImportedUse.java",
+                "package oracle; import static missing.Values.Person; class ImportedUse { void run() { Person.getName().length(); } }",
+            ),
+            (
+                "/compiled/a/UncertainUse.java",
+                "package oracle; class UncertainUse extends Missing { void run() { Person.getName().length(); } }",
+            ),
         ] {
             open_compiled_dispatch_source(&mut ws, file, source);
             assert_compiled_dispatch_unknown(&mut ws, file, source.find("getName").unwrap());
@@ -3216,16 +3339,41 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             "package oracle; public class Holder { public Person person; }",
         );
         for (file, source) in [
-            ("/compiled/a/ParameterCompletion.java", "package oracle; class ParameterCompletion { void run(Person p) { p.ge } }"),
-            ("/compiled/a/LocalCompletion.java", "package oracle; class LocalCompletion { void run() { Person Person = new Person(); Person.ge } }"),
-            ("/compiled/a/OwnCompletion.java", "package oracle; class OwnCompletion { Person person; void run() { person.ge } }"),
-            ("/compiled/a/InheritedCompletion.java", "package oracle; class InheritedCompletion extends Holder { void run() { person.ge } }"),
-            ("/compiled/a/NewCompletion.java", "package oracle; class NewCompletion { void run() { new Person().ge } }"),
+            (
+                "/compiled/a/ParameterCompletion.java",
+                "package oracle; class ParameterCompletion { void run(Person p) { p.ge } }",
+            ),
+            (
+                "/compiled/a/LocalCompletion.java",
+                "package oracle; class LocalCompletion { void run() { Person Person = new Person(); Person.ge } }",
+            ),
+            (
+                "/compiled/a/OwnCompletion.java",
+                "package oracle; class OwnCompletion { Person person; void run() { person.ge } }",
+            ),
+            (
+                "/compiled/a/InheritedCompletion.java",
+                "package oracle; class InheritedCompletion extends Holder { void run() { person.ge } }",
+            ),
+            (
+                "/compiled/a/NewCompletion.java",
+                "package oracle; class NewCompletion { void run() { new Person().ge } }",
+            ),
         ] {
             open_compiled_dispatch_source(&mut ws, file, source);
-            let query = ws.completion_query(file, source.rfind(".ge").unwrap() + 3).unwrap();
+            let query = ws
+                .completion_query(file, source.rfind(".ge").unwrap() + 3)
+                .unwrap();
             assert_eq!(query.status_label(), "ok", "{file}");
-            assert_eq!(query.candidates.iter().filter(|item| item.label == "getName").count(), 1, "{file}");
+            assert_eq!(
+                query
+                    .candidates
+                    .iter()
+                    .filter(|item| item.label == "getName")
+                    .count(),
+                1,
+                "{file}"
+            );
         }
     }
 
@@ -3236,14 +3384,28 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             "package oracle; public class Person { private String name; }",
         );
         for (file, source) in [
-            ("/compiled/a/TypeCompletion.java", "package oracle; class TypeCompletion { void run() { Person.ge } }"),
-            ("/compiled/a/ImportCompletion.java", "package oracle; import static missing.Values.Person; class ImportCompletion { void run() { Person.ge } }"),
-            ("/compiled/a/ParentCompletion.java", "package oracle; class ParentCompletion extends Missing { void run() { Person.ge } }"),
+            (
+                "/compiled/a/TypeCompletion.java",
+                "package oracle; class TypeCompletion { void run() { Person.ge } }",
+            ),
+            (
+                "/compiled/a/ImportCompletion.java",
+                "package oracle; import static missing.Values.Person; class ImportCompletion { void run() { Person.ge } }",
+            ),
+            (
+                "/compiled/a/ParentCompletion.java",
+                "package oracle; class ParentCompletion extends Missing { void run() { Person.ge } }",
+            ),
         ] {
             open_compiled_dispatch_source(&mut ws, file, source);
-            let query = ws.completion_query(file, source.rfind(".ge").unwrap() + 3).unwrap();
+            let query = ws
+                .completion_query(file, source.rfind(".ge").unwrap() + 3)
+                .unwrap();
             assert_eq!(query.status_label(), "unknown", "{file}");
-            assert!(!query.candidates.iter().any(|item| item.label == "getName"), "{file}");
+            assert!(
+                !query.candidates.iter().any(|item| item.label == "getName"),
+                "{file}"
+            );
         }
     }
 

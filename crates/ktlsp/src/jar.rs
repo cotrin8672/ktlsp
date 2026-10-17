@@ -672,7 +672,6 @@ fn java_class_stub_facts(
     if class.access_flags & PUBLIC == 0
         || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | INTERFACE | ABSTRACT) != 0
         || class.access_flags & 0x0410 == 0x0410
-        || class.signature.is_some()
         || class.source_file.as_deref() != Some(format!("{name}.java").as_str())
         || class.attribute_names.iter().any(|attribute| {
             matches!(
@@ -697,14 +696,24 @@ fn java_class_stub_facts(
             || !class.fields.is_empty()
             || class.methods.iter().any(|method| {
                 method.access_flags != PUBLIC | ABSTRACT
-                    || method.signature.is_some()
-                    || !method.attribute_names.is_empty()
+                    || method
+                        .attribute_names
+                        .iter()
+                        .any(|name| name.as_ref() != "Signature")
             }))
     {
         return None;
     }
-    // A non-generic Java class has exact nominal superclass/interface names in its classfile.
-    // Generic signatures remain unsupported; never replace their arguments with raw guesses.
+    let generic = match &class.signature {
+        Some(_) => Some(ktcore::classfile::signature::class_signature(class)?),
+        None => None,
+    };
+    let class_parameters = generic
+        .as_ref()
+        .map_or(&[][..], |signature| signature.type_parameters.as_slice());
+    let type_parameters =
+        java_signature_parameters(class_parameters, class_parameters, !package.is_empty())?;
+    // A Signature must agree with the erased hierarchy before its arguments become facts.
     let hierarchy_type = |internal: &str| -> Option<String> {
         if internal == class.identity.internal_name.as_str() || internal.contains('$') {
             return None;
@@ -713,19 +722,44 @@ fn java_class_stub_facts(
         if !package.is_empty() && ty.qualification.as_deref() == Some("") {
             return None;
         }
-        java_descriptor_type(&ty)
+        java_descriptor_type(&ty, class_parameters, !package.is_empty())
     };
     let superclass = match class.super_name.as_deref() {
         Some("java/lang/Object") | None => None,
-        Some(parent) => Some(hierarchy_type(parent)?),
+        Some(parent) => Some(match &generic {
+            Some(signature) => {
+                if parent == class.identity.internal_name || parent.contains('$') {
+                    return None;
+                }
+                java_descriptor_type(&signature.superclass, class_parameters, !package.is_empty())?
+            }
+            None => hierarchy_type(parent)?,
+        }),
     };
-    let interfaces = class
-        .interfaces
-        .iter()
-        .map(|interface| hierarchy_type(interface))
-        .collect::<Option<Vec<_>>>()?;
+    let interfaces = match &generic {
+        Some(signature) => {
+            if class
+                .interfaces
+                .iter()
+                .any(|internal| internal.as_ref() == class.identity.internal_name)
+            {
+                return None;
+            }
+            signature
+                .interfaces
+                .iter()
+                .map(|ty| java_descriptor_type(ty, class_parameters, !package.is_empty()))
+                .collect::<Option<Vec<_>>>()?
+        }
+        None => class
+            .interfaces
+            .iter()
+            .map(|interface| hierarchy_type(interface))
+            .collect::<Option<Vec<_>>>()?,
+    };
     let mut unique_interfaces = std::collections::BTreeSet::new();
-    if interfaces
+    if class
+        .interfaces
         .iter()
         .any(|interface| !unique_interfaces.insert(interface))
     {
@@ -764,7 +798,6 @@ fn java_class_stub_facts(
             || field.access_flags & 0x0005 == 0x0005
             || field.access_flags & !(PUBLIC | 0x0004 | 0x0008 | 0x0010 | 0x0040 | 0x0080) != 0
             || field.access_flags & 0x0050 == 0x0050
-            || field.signature.is_some()
             || !is_java_identifier(&field.name)
             || field_names.get(field.name.as_ref()) != Some(&1)
             || field
@@ -774,13 +807,23 @@ fn java_class_stub_facts(
         {
             continue;
         }
-        let Some(ty) = ktcore::classfile::field_type(&field.descriptor) else {
+        let scope = if field.access_flags & 0x0008 != 0 {
+            &[][..]
+        } else {
+            class_parameters
+        };
+        let Some(ty) = (match &field.signature {
+            Some(signature) => {
+                ktcore::classfile::signature::field_signature(signature, &field.descriptor, scope)
+            }
+            None => ktcore::classfile::field_type(&field.descriptor),
+        }) else {
             continue;
         };
         if !package.is_empty() && ty.qualification.as_deref() == Some("") {
             continue;
         }
-        let Some(ty) = java_descriptor_type(&ty) else {
+        let Some(ty) = java_descriptor_type(&ty, scope, !package.is_empty()) else {
             continue;
         };
         let static_ = if field.access_flags & 0x0008 != 0 {
@@ -825,7 +868,6 @@ fn java_class_stub_facts(
                 != 0
             || method.access_flags & ABSTRACT != 0
                 && (class.access_flags & ABSTRACT == 0 || method.access_flags & 0x0938 != 0)
-            || method.signature.is_some()
             || !is_java_identifier(&method.name)
             || method
                 .attribute_names
@@ -838,9 +880,41 @@ fn java_class_stub_facts(
         if shapes.get(&key) != Some(&1) {
             continue;
         }
-        let Some((parameters, returns)) = ktcore::classfile::method_types(&method.descriptor)
+        let class_scope = if method.access_flags & 0x0008 != 0 {
+            &[][..]
+        } else {
+            class_parameters
+        };
+        let generic_method = match &method.signature {
+            Some(signature) => match ktcore::classfile::signature::method_signature(
+                signature,
+                &method.descriptor,
+                class_scope,
+            ) {
+                Some(signature) => Some(signature),
+                None => continue,
+            },
+            None => None,
+        };
+        let method_parameters = generic_method
+            .as_ref()
+            .map_or(&[][..], |signature| signature.type_parameters.as_slice());
+        let scope: Vec<_> = method_parameters
+            .iter()
+            .chain(class_scope)
+            .cloned()
+            .collect();
+        let Some(generic_declaration) =
+            java_signature_parameters(method_parameters, &scope, !package.is_empty())
         else {
             continue;
+        };
+        let (parameters, returns) = match generic_method {
+            Some(signature) => (signature.parameters, signature.returns),
+            None => match ktcore::classfile::method_types(&method.descriptor) {
+                Some(types) => types,
+                None => continue,
+            },
         };
         // A named Java package cannot spell an unnamed-package nominal type without rebinding it.
         if !package.is_empty()
@@ -854,13 +928,18 @@ fn java_class_stub_facts(
         let Some(parameters) = parameters
             .iter()
             .enumerate()
-            .map(|(i, ty)| Some(format!("{} p{i}", java_descriptor_type(ty)?)))
+            .map(|(i, ty)| {
+                Some(format!(
+                    "{} p{i}",
+                    java_descriptor_type(ty, &scope, !package.is_empty())?
+                ))
+            })
             .collect::<Option<Vec<_>>>()
         else {
             continue;
         };
         let returns = match returns {
-            Some(ty) => match java_descriptor_type(&ty) {
+            Some(ty) => match java_descriptor_type(&ty, &scope, !package.is_empty()) {
                 Some(ty) => ty,
                 None => continue,
             },
@@ -883,13 +962,13 @@ fn java_class_stub_facts(
         };
         let declaration = if method.access_flags & ABSTRACT != 0 {
             format!(
-                "    {access} abstract {returns} {}({});\n",
+                "    {access} abstract {generic_declaration}{returns} {}({});\n",
                 method.name,
                 parameters.join(", ")
             )
         } else {
             format!(
-                "    {access} {static_}{final_}{returns} {}({}) {{ throw null; }}\n",
+                "    {access} {static_}{final_}{generic_declaration}{returns} {}({}) {{ throw null; }}\n",
                 method.name,
                 parameters.join(", ")
             )
@@ -924,9 +1003,8 @@ fn java_class_stub_facts(
                 })
         {
             let arity = (method.access_flags & 0x0080 == 0)
-                .then(|| ktcore::classfile::method_types(&method.descriptor))
-                .flatten()
-                .and_then(|(parameters, _)| u8::try_from(parameters.len()).ok());
+                .then(|| ktcore::classfile::method_parameter_count(&method.descriptor))
+                .flatten();
             unavailable_methods.insert((method.name.to_string(), arity));
         }
     }
@@ -952,9 +1030,15 @@ fn java_class_stub_facts(
         ""
     };
     if is_interface {
-        source.push_str(&format!("public interface {name}"));
+        source.push_str(&format!(
+            "public interface {name}{}",
+            type_parameters.trim_end()
+        ));
     } else {
-        source.push_str(&format!("public {modifier}class {name}"));
+        source.push_str(&format!(
+            "public {modifier}class {name}{}",
+            type_parameters.trim_end()
+        ));
     }
     if let Some(parent) = superclass {
         source.push_str(&format!(" extends {parent}"));
@@ -978,28 +1062,104 @@ fn java_class_stub_facts(
     Some((source, unavailable))
 }
 
-fn java_descriptor_type(ty: &ktcore::types::TypeRef) -> Option<String> {
+fn java_signature_parameters(
+    parameters: &[ktcore::classfile::signature::SignatureParameter],
+    scope: &[ktcore::classfile::signature::SignatureParameter],
+    named_package: bool,
+) -> Option<String> {
+    if parameters.is_empty() {
+        return Some(String::new());
+    }
+    let declarations = parameters
+        .iter()
+        .map(|parameter| {
+            if !is_java_identifier(&parameter.name) {
+                return None;
+            }
+            let bounds = parameter
+                .bounds
+                .iter()
+                .map(|bound| {
+                    if bound.name.ends_with("[]") {
+                        return None;
+                    }
+                    java_descriptor_type(bound, scope, named_package)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(if bounds.is_empty() {
+                parameter.name.clone()
+            } else {
+                format!("{} extends {}", parameter.name, bounds.join(" & "))
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("<{}> ", declarations.join(", ")))
+}
+
+fn java_descriptor_type(
+    ty: &ktcore::types::TypeRef,
+    scope: &[ktcore::classfile::signature::SignatureParameter],
+    named_package: bool,
+) -> Option<String> {
+    use ktcore::types::Projection;
+    if ty.projection == Projection::Star {
+        return Some("?".to_string());
+    }
+    let mut invariant = ty.clone();
+    invariant.projection = Projection::Invariant;
+    if ty.projection != Projection::Invariant {
+        let bound = java_descriptor_type(&invariant, scope, named_package)?;
+        return Some(format!(
+            "? {} {bound}",
+            if ty.projection == Projection::Out {
+                "extends"
+            } else {
+                "super"
+            }
+        ));
+    }
     let base = ty.name.trim_end_matches("[]");
-    match ty.qualification.as_deref() {
+    let nominal = match ty.qualification.as_deref() {
         None if matches!(
             base,
             "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
         ) =>
         {
-            Some(ty.name.clone())
+            if !ty.args.is_empty() {
+                return None;
+            }
+            Some(base.to_string())
+        }
+        None if is_java_identifier(base)
+            && scope.iter().any(|parameter| parameter.name == base)
+            && ty.args.is_empty() =>
+        {
+            Some(base.to_string())
         }
         Some(package)
             if is_java_identifier(base)
-                && (package.is_empty() || package.split('.').all(is_java_identifier)) =>
+                && ((!named_package && package.is_empty())
+                    || (!package.is_empty() && package.split('.').all(is_java_identifier))) =>
         {
             Some(if package.is_empty() {
-                ty.name.clone()
+                base.to_string()
             } else {
-                format!("{package}.{}", ty.name)
+                format!("{package}.{base}")
             })
         }
         _ => None,
-    }
+    }?;
+    let arguments = if ty.args.is_empty() {
+        String::new()
+    } else {
+        let arguments = ty
+            .args
+            .iter()
+            .map(|argument| java_descriptor_type(argument, scope, named_package))
+            .collect::<Option<Vec<_>>>()?;
+        format!("<{}>", arguments.join(", "))
+    };
+    Some(format!("{nominal}{arguments}{}", &ty.name[base.len()..]))
 }
 
 fn is_java_identifier(name: &str) -> bool {
@@ -1095,6 +1255,415 @@ mod tests {
     }
 
     #[test]
+    fn binary_java_generic_signatures_feed_shared_java_and_kotlin_queries() {
+        let mut workspace = crate::workspace::Workspace::new();
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-binary-generic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        for (name, bytes) in [
+            (
+                "Item",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/genericfixture/Item.class")
+                    .as_slice(),
+            ),
+            (
+                "Other",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/genericfixture/Other.class")
+                    .as_slice(),
+            ),
+            (
+                "Box",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/genericfixture/Box.class")
+                    .as_slice(),
+            ),
+            (
+                "Child",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/genericfixture/Child.class")
+                    .as_slice(),
+            ),
+            (
+                "Holder",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/genericfixture/Holder.class")
+                    .as_slice(),
+            ),
+        ] {
+            let class = ktcore::classfile::decode("javac:genericfixture", bytes).unwrap();
+            let source =
+                java_class_stub(&class).unwrap_or_else(|| panic!("missing binary API for {name}"));
+            assert!(
+                !crate::java::JavaParser::new()
+                    .parse(&source)
+                    .root_node()
+                    .has_error(),
+                "{source}"
+            );
+            workspace.open(
+                crate::paths::file_key(&root.join(format!("{name}.java"))),
+                source,
+            );
+        }
+        // Match the editor's authored buffer and its earlier blank-prefix query exactly:
+        // an unfinished statement later in the body must not erase a proven parameter.
+        let native_source = include_str!(
+            "../../../dev/corpus/fixtures/binary-java-jar/binarygenerics/JavaGenerics.java"
+        );
+        let partial = native_source.replace("Holder.ITEM.get().ping();", "Holder.ITEM.get().");
+        let control_key = crate::paths::file_key(&root.join("JavaGenerics.java"));
+        workspace.open(&control_key, native_source.to_string());
+        workspace.scan(&root);
+        let baseline_at = native_source.find("child.get().ping").unwrap() + "child.get().".len();
+        assert!(
+            workspace
+                .completion_query(&control_key, baseline_at)
+                .is_some_and(|query| {
+                    query
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.label == "ping")
+                }),
+            "the unchanged native Java buffer must resolve the same indexed binary API"
+        );
+        let mut missing_controls = Vec::new();
+        for (context, text) in [
+            ("later unfinished statement", partial.clone()),
+            (
+                "later malformed local and unfinished statement",
+                partial.replace(
+                    "        Holder.ITEM.get().",
+                    "        Object Holder = ;\n        Holder.ITEM.get().",
+                ),
+            ),
+        ] {
+            workspace.change(&control_key, text.clone());
+            workspace.scan(&root);
+            let at = text.find("child.get().ping").unwrap() + "child.get().".len();
+            let useful = workspace
+                .completion_query(&control_key, at)
+                .is_some_and(|query| {
+                    query
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.label == "ping")
+                });
+            if !useful {
+                missing_controls.push(context);
+            }
+        }
+        for (context, text, receiver) in [
+            (
+                "unresolved foreign parameter",
+                partial.replace("Child child", "foreign.Missing child"),
+                "child.get().",
+            ),
+            (
+                "unrelated nominal parameter",
+                partial.replace("Child child", "Other child"),
+                "child.get().",
+            ),
+            (
+                "inapplicable invocation",
+                partial.replace("child.get().ping", "child.get(item).ping"),
+                "child.get(item).",
+            ),
+        ] {
+            workspace.change(&control_key, text.clone());
+            workspace.scan(&root);
+            let at = text.find(receiver).unwrap() + receiver.len();
+            if let Some(query) = workspace.completion_query(&control_key, at) {
+                assert!(
+                    query
+                        .candidates
+                        .iter()
+                        .all(|candidate| candidate.label != "ping"),
+                    "prefix recovery must preserve {context}: {:?}",
+                    query.candidates
+                );
+            }
+        }
+        workspace.close(&control_key);
+        assert!(
+            missing_controls.is_empty(),
+            "earlier native instance controls lost their parameter identity: {missing_controls:?}"
+        );
+        for (file, source) in [
+            (
+                "Use.java",
+                "package genericfixture; class Use { void test(Child child, Item item, Other other) { child.get().ping(); child.value.ping(); child.array()[0].ping(); child.same(item).ping(); child.shadow(other).pong(); Holder.ITEM.get().ping(); var inferred = Holder.ITEM.get(); inferred.ping(); } }",
+            ),
+            (
+                "Use.kt",
+                "package genericfixture\nfun test(child: Child, item: Item, other: Other) { child.get().ping(); child.value.ping(); child.array()[0].ping(); child.same(item).ping(); child.shadow(other).pong(); Holder.ITEM.get().ping() }",
+            ),
+        ] {
+            let key = crate::paths::file_key(&root.join(file));
+            workspace.open(&key, source.to_string());
+            workspace.scan(&root);
+            let static_item = source.find("Holder.ITEM").unwrap() + "Holder.".len();
+            let holder_key = crate::paths::file_key(&root.join("Holder.java"));
+            let holder_source = workspace.doc_text(&holder_key).unwrap();
+            let declaration = holder_source.find("ITEM").unwrap();
+            assert_eq!(
+                workspace.goto_definition(&key, static_item),
+                vec![crate::symbol::Def {
+                    file: holder_key,
+                    start_byte: declaration,
+                    end_byte: declaration + "ITEM".len(),
+                }],
+                "{file} exact static ITEM navigation"
+            );
+            for (expression, member, target) in [
+                ("child.get().ping", "ping", "Item.java"),
+                ("child.value.ping", "ping", "Item.java"),
+                ("child.array()[0].ping", "ping", "Item.java"),
+                ("child.same(item).ping", "ping", "Item.java"),
+                ("child.shadow(other).pong", "pong", "Other.java"),
+                ("Holder.ITEM.get().ping", "ping", "Item.java"),
+            ] {
+                let at = source.find(expression).unwrap() + expression.len();
+                let query = workspace
+                    .completion_query(&key, at)
+                    .unwrap_or_else(|| panic!("no completion: {file} {expression}"));
+                assert!(
+                    query
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.label == member),
+                    "{file} {expression}: {:?}",
+                    query.candidates
+                );
+                let targets = workspace.goto_definition(&key, at - member.len());
+                assert_eq!(targets.len(), 1, "{file} {expression}: {targets:?}");
+                assert_eq!(
+                    targets[0].file,
+                    crate::paths::file_key(&root.join(target)),
+                    "{file} {expression}"
+                );
+            }
+            if file == "Use.java" {
+                let hints = workspace.inlay_hints(&key, 0, source.len());
+                assert!(
+                    hints.iter().any(|hint| hint.label == ": Item"),
+                    "static generic inference: {hints:?}"
+                );
+                let call = "Holder.ITEM.get().ping(";
+                let at = source.find(call).unwrap() + call.len();
+                let help = workspace
+                    .signature_help(&key, at)
+                    .expect("static field chain signature");
+                assert!(
+                    help.signatures
+                        .iter()
+                        .any(|signature| signature.label.contains("ping")
+                            && signature.label.contains("String")),
+                    "{help:?}"
+                );
+                let item_key = crate::paths::file_key(&root.join("Item.java"));
+                let item_source = workspace.doc_text(&item_key).unwrap();
+                let references =
+                    workspace.references(&item_key, item_source.find("ping").unwrap(), false);
+                assert!(
+                    references.iter().any(|reference| reference.file == key
+                        && reference.start_byte == at - "ping(".len()),
+                    "static chain references: {references:?}"
+                );
+                for invalid in [
+                    source.replace("Holder.ITEM.get()", "Holder.instance.get()"),
+                    source.replace("Other other)", "Other other, Object Holder)"),
+                    source.replace("class Use", "@UnknownProducer class Use"),
+                    source.replace(
+                        "Holder.ITEM.get().ping();",
+                        "Object Holder = ; Holder.ITEM.get().ping();",
+                    ),
+                    source.replace(
+                        "Holder.ITEM.get().ping();",
+                        "Object Holder\nHolder.ITEM.get().ping();",
+                    ),
+                ] {
+                    workspace.change(&key, invalid.clone());
+                    workspace.scan(&root);
+                    let expression = if invalid.contains("Holder.instance") {
+                        "Holder.instance.get().ping"
+                    } else {
+                        "Holder.ITEM.get().ping"
+                    };
+                    let at = invalid.find(expression).unwrap() + expression.len();
+                    if let Some(query) = workspace.completion_query(&key, at) {
+                        assert!(
+                            query
+                                .candidates
+                                .iter()
+                                .all(|candidate| candidate.label != "ping"),
+                            "unsafe static receiver: {invalid}"
+                        );
+                    }
+                    assert!(
+                        workspace
+                            .goto_definition(&key, at - "ping".len())
+                            .is_empty(),
+                        "unsafe static receiver: {invalid}"
+                    );
+                }
+            }
+            let unfinished = if file == "Use.java" {
+                "package genericfixture; class Use { void test() { Holder.ITEM.get(). } }"
+            } else {
+                "package genericfixture\nfun unfinished() { Holder.ITEM.get(). }"
+            };
+            workspace.change(&key, unfinished.into());
+            workspace.scan(&root);
+            let at = unfinished.find("Holder.ITEM.get().").unwrap() + "Holder.ITEM.get().".len();
+            let query = workspace
+                .completion_query(&key, at)
+                .expect("unfinished static generic chain");
+            assert!(
+                query
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.label == "ping"),
+                "{file} actual unfinished source: {:?}",
+                query.candidates
+            );
+            let item = unfinished.find("Holder.ITEM").unwrap() + "Holder.".len();
+            let holder_key = crate::paths::file_key(&root.join("Holder.java"));
+            let holder_source = workspace.doc_text(&holder_key).unwrap();
+            let declaration = holder_source.find("ITEM").unwrap();
+            assert_eq!(
+                workspace.goto_definition(&key, item),
+                vec![crate::symbol::Def {
+                    file: holder_key,
+                    start_byte: declaration,
+                    end_byte: declaration + "ITEM".len(),
+                }],
+                "{file} exact unfinished static ITEM navigation"
+            );
+            if file == "Use.java" {
+                for invalid in [
+                    unfinished.replace("class Use", "@UnknownProducer class Use"),
+                    unfinished.replace("test()", "test(Object Holder)"),
+                    unfinished.replace("test()", "test("),
+                    unfinished.replace("Holder.ITEM", "Object Holder = ; Holder.ITEM"),
+                    unfinished.replace("Holder.ITEM", "Object Holder\nHolder.ITEM"),
+                    unfinished.trim_end_matches('}').to_string(),
+                ] {
+                    workspace.change(&key, invalid.clone());
+                    workspace.scan(&root);
+                    let at =
+                        invalid.find("Holder.ITEM.get().").unwrap() + "Holder.ITEM.get().".len();
+                    if let Some(query) = workspace.completion_query(&key, at) {
+                        assert!(
+                            query
+                                .candidates
+                                .iter()
+                                .all(|candidate| candidate.label != "ping"),
+                            "unsafe unfinished static receiver: {invalid}"
+                        );
+                    }
+                    let item = invalid.find("Holder.ITEM").unwrap() + "Holder.".len();
+                    assert!(
+                        workspace.goto_definition(&key, item).is_empty(),
+                        "unsafe unfinished static navigation: {invalid}"
+                    );
+                }
+                let unrelated = "package genericfixture; class Use { void test() { Holder.ITEM.get().; Object Holder = null; Holder.ITEM.get(). } }";
+                workspace.change(&key, unrelated.into());
+                workspace.scan(&root);
+                let shadowed_item = unrelated.rfind("Holder.ITEM").unwrap() + "Holder.".len();
+                assert!(workspace.goto_definition(&key, shadowed_item).is_empty(), "an unrelated unfinished receiver cannot erase the later local shadow");
+                let typed = "package genericfixture; @UnknownProducer class Use { void test(Child child) { child.value. } }";
+                workspace.change(&key, typed.into());
+                workspace.scan(&root);
+                let at = typed.find("child.value.").unwrap() + "child.value.".len();
+                let query = workspace.completion_query(&key, at).expect("annotated caller's explicit value receiver");
+                assert!(query.candidates.iter().any(|candidate| candidate.label == "ping"), "annotated typed receiver must remain useful: {:?}", query.candidates);
+                let value = typed.find("child.value").unwrap() + "child.".len();
+                let box_key = crate::paths::file_key(&root.join("Box.java"));
+                let box_source = workspace.doc_text(&box_key).unwrap();
+                let declaration = box_source.find("value").unwrap();
+                assert_eq!(workspace.goto_definition(&key, value), vec![crate::symbol::Def {
+                    file: box_key, start_byte: declaration, end_byte: declaration + "value".len(),
+                }], "annotated caller's typed field navigation");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn java_field_chain_withholds_inaccessible_hidden_and_kotlin_lowered_properties() {
+        let mut workspace = crate::workspace::Workspace::new();
+        workspace.open(
+            "Item.java",
+            "package fieldguard; public class Item { public void ping() {} }".into(),
+        );
+        workspace.open(
+            "Parent.java",
+            "package fieldguard; public class Parent { public Item field; }".into(),
+        );
+        workspace.open(
+            "Child.java",
+            "package fieldguard; public class Child extends Parent { private Item field; }".into(),
+        );
+        workspace.open(
+            "Hidden.java",
+            "package fieldguard; public class Hidden { private Item field; }".into(),
+        );
+        workspace.open(
+            "Holder.kt",
+            "package fieldguard\nclass Holder(val field: Item)".into(),
+        );
+        let source = "package fieldguard; class Use { void use(Child child, Hidden hidden, Holder holder) { child.field.ping(); hidden.field.ping(); holder.field.ping(); } }";
+        workspace.open("Use.java", source.into());
+        for expression in ["child.field.ping", "hidden.field.ping", "holder.field.ping"] {
+            let at = source.find(expression).unwrap() + expression.len();
+            if let Some(query) = workspace.completion_query("Use.java", at) {
+                assert!(
+                    query
+                        .candidates
+                        .iter()
+                        .all(|candidate| candidate.label != "ping"),
+                    "{expression}"
+                );
+            }
+            assert!(
+                workspace
+                    .goto_definition("Use.java", at - "ping".len())
+                    .is_empty(),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_namespace_proof_keeps_body_edits_separate_from_declaration_errors() {
+        let mut parser = crate::java::JavaParser::new();
+        for (source, expected) in [
+            // This grammar loses the class header; only validated completion recovery can prove it.
+            ("class Use { void test() { Holder.ITEM.get(). } }", false),
+            ("class Use { void test() { int n = ; } }", true),
+            ("class Use { void test( { Holder.ITEM.get(). } }", false),
+            ("class Use { Item ; void test() {} }", false),
+            ("class Use { Item value = Holder.ITEM.get().; }", false),
+            ("class Use { void test() { Holder.ITEM.get(). }", false),
+        ] {
+            let tree = parser.parse(source);
+            assert!(
+                tree.root_node().has_error(),
+                "fixture must contain an actual edit error: {source}"
+            );
+            assert_eq!(
+                crate::java::declaration_headers_complete(&tree, source),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn binary_java_hierarchy_preserves_abstract_shadows_and_withholds_unknown_overrides() {
         // Injected metadata isolates shadowing; the Ponder fixture supplies a valid method shape.
         let mut class = ktcore::classfile::decode(
@@ -1152,6 +1721,13 @@ mod tests {
         class.methods[0].access_flags = 0x0001;
         class.methods[0].descriptor = "()Ljava/util/List;".into();
         class.methods[0].signature = Some("()Ljava/util/List<Ljava/lang/String;>;".into());
+        let source = java_class_stub(&class).unwrap();
+        assert!(
+            source.contains("java.util.List<java.lang.String> f()"),
+            "{source}"
+        );
+        // A present but contradictory Signature cannot fall back to the raw descriptor.
+        class.methods[0].signature = Some("()Ljava/util/Set<Ljava/lang/String;>;".into());
         let (source, unavailable) = java_class_stub_facts(&class).unwrap();
         assert!(source.contains("extends binaryhierarchy.Base") && !source.contains(" f("));
         assert!(unavailable.iter().any(|(name, kind, arity)| name == "f"
@@ -1559,9 +2135,13 @@ mod tests {
                     .unwrap();
                 assert_eq!(with_argument.params[0].name, "int");
                 assert_eq!(with_argument.min_arity, Some(1));
-                assert!(!methods
+                let generic = methods
                     .iter()
-                    .any(|method| matches!(method.name.as_str(), "generic" | "Factory")));
+                    .find(|method| method.name == "generic")
+                    .unwrap();
+                assert_eq!(generic.type_params, vec!["T"]);
+                assert_eq!(generic.return_type.as_ref().unwrap().name, "T[]");
+                assert!(!methods.iter().any(|method| method.name == "Factory"));
                 let hidden = methods
                     .iter()
                     .find(|method| method.name == "hidden")

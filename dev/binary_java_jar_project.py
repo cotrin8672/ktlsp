@@ -36,9 +36,11 @@ else:
 project = destination / "projects/library"
 fixture = repo / "dev/corpus/fixtures/binary-java-jar/binaryuse"
 fields_fixture = fixture.parent / "binaryfields"
+generics_fixture = fixture.parent / "binarygenerics"
 classes = repo / "crates/ktcore/tests/fixtures/classfile"
 names = ("arrayfixture/Factory.class", "arrayfixture/Item.class", "pluginfixture/Person.class",
-         "gradle8142/JavaCompilerArgumentsBuilder.class", "fieldfixture/FieldOnly.class")
+         "gradle8142/JavaCompilerArgumentsBuilder.class", "fieldfixture/FieldOnly.class",
+         *(f"genericfixture/{name}.class" for name in ("Item", "Other", "Box", "Child", "Holder")))
 pins = {entry["file"]: entry for entry in json.loads((classes / "hashes.json").read_text(encoding="utf-8"))}
 binary = {}
 for name in names:
@@ -52,13 +54,18 @@ sources = {
     "src/main/kotlin/binaryuse/KotlinUse.kt": (fixture / "KotlinUse.kt").read_bytes(),
     "src/main/java/binaryfields/JavaFields.java": (fields_fixture / "JavaFields.java").read_bytes(),
     "src/main/kotlin/binaryfields/KotlinFields.kt": (fields_fixture / "KotlinFields.kt").read_bytes(),
+    "src/main/java/binarygenerics/JavaGenerics.java": (generics_fixture / "JavaGenerics.java").read_bytes(),
+    "src/main/kotlin/binarygenerics/KotlinGenerics.kt": (generics_fixture / "KotlinGenerics.kt").read_bytes(),
+    "oracle/Holder.stub.txt": (generics_fixture / "Holder.stub.txt").read_bytes(),
 }
 manifest_path = repo / "dev/corpus/binary-java-jar.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 fields_manifest_path = repo / "dev/corpus/binary-java-fields.json"
 fields_manifest = json.loads(fields_manifest_path.read_text(encoding="utf-8"))
-assert len(manifest["probes"]) == 12 and len(fields_manifest["probes"]) == 2
-for selected in (manifest, fields_manifest):
+generics_manifest_path = repo / "dev/corpus/binary-java-generics.json"
+generics_manifest = json.loads(generics_manifest_path.read_text(encoding="utf-8"))
+assert len(manifest["probes"]) == 12 and len(fields_manifest["probes"]) == 2 and len(generics_manifest["probes"]) == 18
+for selected in (manifest, fields_manifest, generics_manifest):
     for case in selected["probes"]:
         text = "\n".join(sources[case["source"]].decode("utf-8").splitlines())
         assert hashlib.sha256(text.encode("utf-8")).hexdigest() == case["source_sha256"]
@@ -107,7 +114,8 @@ receipt = {
     "module_pom": identity(jar.with_suffix(".pom")) if sys.argv[2] == "module" else None,
     "class_inputs": [identity(classes / name) for name in names],
     "harness": identity(harness_path), "manifest": identity(manifest_path),
-    "fields_manifest": identity(fields_manifest_path), "bash_argv": bash_argv,
+    "fields_manifest": identity(fields_manifest_path), "generics_manifest": identity(generics_manifest_path),
+    "generics_probes": identity(generics_fixture / "probes.lua"), "bash_argv": bash_argv,
     "library_function_sha256": hashlib.sha256(function.encode("utf-8")).hexdigest(),
     "project_files": [identity(path) for path in sorted(project.rglob("*")) if path.is_file()],
     "native_Gradle_Nvim_JVM_started": False,

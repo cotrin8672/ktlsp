@@ -1,0 +1,7 @@
+// Binary declaration stub; initializers and method bodies are unavailable.
+package genericfixture;
+
+public class Holder {
+    public static genericfixture.Box<genericfixture.Item> ITEM;
+    public genericfixture.Box<genericfixture.Item> instance;
+}

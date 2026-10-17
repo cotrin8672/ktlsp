@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "project_id": "cem-ordinary-restored-canonical",
+  "build_tool": "gradle",
+  "scope": "Separate one-request ordinary Kotlin restored-valid canonical diagnostic control. Open one caller without completion/goto; the existing canonical helper waits for a current accepted store before one final pull.",
+  "probes": [
+    {
+      "token": "getBreakSpeed",
+      "target_file": "../source-oracles/com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.java",
+      "target_anchor": "protected float getBreakSpeed()",
+      "target_token": "getBreakSpeed",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "target_uri_suffix": "com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.java",
+      "target_sha256": "9079393254407c0be252419437db145de78cab19b53548f80be4b12d56ceabb3",
+      "compiler_status": "CEM source snapshot classes --offline passed JDK21/Kotlin2.4",
+      "expected": "Kotlin super.getBreakSpeed resolves inherited protected Java method through DrillBlockEntity, with useful completion.",
+      "module": ":",
+      "id": "cem-ordinary-restored-canonical-open-only",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "anchor": "return super.getBreakSpeed()",
+      "completion": false,
+      "definition": false,
+      "source_raw_sha256": "1212632ddb9f16a70cdd5d86c4e20a0aa5efa90a2149e8230dae8bffbda44113"
+    }
+  ]
+}

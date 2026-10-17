@@ -373,6 +373,15 @@ fn push_ext(
 /// Classify an already parsed declaration once; body errors do not erase a valid header.
 pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMemberFlags {
     use crate::extensions::{Dispatch, Visibility};
+    if java && node.kind() == "enum_constant" {
+        return SourceMemberFlags::new(
+            MemberImplementation::Concrete,
+            Dispatch::Static,
+            Visibility::Public,
+            false,
+            false,
+        );
+    }
     if node.kind() == "constructor_declaration" {
         return SourceMemberFlags::new(
             MemberImplementation::Constructor,
@@ -665,6 +674,19 @@ fn function_symbol(
     let type_params = type_params_of(decl, src);
     let declaration_scope = scope.without_shadowed_imports(&type_params);
     let scope = declaration_scope.as_ref().unwrap_or(scope);
+    let type_parameter_facts = type_parameter_facts_of(decl);
+    let method_type_bounds = if !type_params.is_empty()
+        && !type_parameter_facts.known_unbounded()
+        && type_parameter_facts.known_invariant()
+    {
+        method_type_bounds(
+            &type_parameters_in_scope(decl, src, package, &scope.imports),
+            decl.start_byte(),
+            decl.end_byte(),
+        )
+    } else {
+        None
+    };
     IndexedSymbol {
         source_member: source_member_flags(decl, src, false),
         ext_receiver: ext_receiver
@@ -682,7 +704,8 @@ fn function_symbol(
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
         kotlin_parameters: kotlin_parameters_of(decl, src, &shape.parameters),
-        type_parameter_facts: type_parameter_facts_of(decl),
+        type_parameter_facts,
+        method_type_bounds,
         type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -1072,6 +1095,49 @@ pub fn type_parameters_in_scope(
     out
 }
 
+/// Keep only proven nominal callable bounds; variable relationships require declaration identities.
+pub fn method_type_bounds(
+    parameters: &[TypeParameterBounds],
+    start: usize,
+    end: usize,
+) -> Option<Box<Vec<(String, TypeRef)>>> {
+    fn mentions_parameter(ty: &TypeRef, parameters: &[TypeParameterBounds]) -> bool {
+        ty.qualification.is_none()
+            && parameters
+                .iter()
+                .any(|parameter| parameter.name == ty.name.trim_end_matches("[]"))
+            || ty
+                .args
+                .iter()
+                .any(|argument| mentions_parameter(argument, parameters))
+    }
+    let own: Vec<_> = parameters
+        .iter()
+        .filter(|parameter| parameter.scope_start == start && parameter.scope_end == end)
+        .collect();
+    if own.is_empty() || own.iter().any(|parameter| !parameter.complete) {
+        return None;
+    }
+    let mut bounds = Vec::new();
+    for parameter in own {
+        for bound in &parameter.upper_bounds {
+            // A class parameter referenced here must never rebind to a same-spelled method parameter.
+            if mentions_parameter(bound, parameters) {
+                return None;
+            }
+            if bound.name == "Object"
+                && bound.qualification.as_deref() == Some("java.lang")
+                && bound.args.is_empty()
+                && !bound.nullable
+            {
+                continue;
+            }
+            bounds.push((parameter.name.clone(), bound.clone()));
+        }
+    }
+    Some(Box::new(bounds))
+}
+
 /// The declared types of a `function_declaration`'s value parameters, in order (one [`TypeRef`] per
 /// `parameter`; an unannotated parameter — rare for named functions — gets `TypeRef::default()` to
 /// preserve positional alignment). Empty when there is no `function_value_parameters` child.
@@ -1367,7 +1433,7 @@ fn return_type_of(decl: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
         if after_params {
             match child.kind() {
                 "user_type" | "nullable_type" | "function_type" | "parenthesized_type" => {
-                    return type_ref_from(child, src, Some(scope))
+                    return type_ref_from(child, src, Some(scope));
                 }
                 "function_body" => {
                     // A block-bodied Kotlin function without an annotation always returns kotlin.Unit,
@@ -1538,6 +1604,7 @@ fn push_synthetic_member(
         type_params,
         type_parameter_facts: Default::default(),
         source_member: SourceMemberFlags::default(),
+        method_type_bounds: None,
     });
 }
 

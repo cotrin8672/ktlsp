@@ -289,7 +289,8 @@ identity in `semantic-bounded-receivers.json`.
 Shared generic interoperability tests also cover parameterized extension receivers,
 inline nominal bounds, class literals and real-stdlib expect/actual declaration shapes.
 Standalone workspaces index Kotlin stdlib 2.1.20 by default; Gradle workspaces use their resolved
-classpath. The `java` editor scenario checks `javaClass` diagnostics across unsaved Kotlin edits.
+classpath. The `java` editor scenario checks `javaClass` diagnostics across unsaved Kotlin edits,
+and first-response completion with empty prefixes, typed prefixes, and import aliases.
 Java/Kotlin source calls also share a conservative equality/lower/upper constraint
 slice for projected arguments such as Class<? extends T>. Unknown captures, upper-only
 variables, differing lower bounds and Kotlin where/F-bounds remain coverage gaps; see
@@ -382,6 +383,8 @@ and unknown receivers without saving source. Changes and restoration require out
 each query uses one response after Neovim's flush. Negative unknown cases also require a useful
 known receiver in the same edited state. [dev/corpus](dev/corpus/README.md) includes these controls.
 See [the corpus record](docs/fork-corpus.md) for pinned projects, candidate probes and remaining coverage.
+The [ordinary CEM controls](dev/corpus/fixtures/cem-ordinary-production/README.md)
+use this route for completion, exact navigation, hover, signature help and a restored Kotlin diagnostic.
 The `gradle-8.14.3.json` and `gradle-8.14.3-incomplete.json` manifests cover Java/Kotlin
 navigation and unfinished editing after importing the real Gradle project. Discovery
 streams large model output through a temporary file and rejects incomplete project
@@ -451,8 +454,11 @@ checks; provider behavior requires an actual run and is not established by regis
 The [external provider fixture](dev/external-extension/README.md) uses this route
 with a separate Rust executable and actual Mixin annotation sources. It covers
 primitive Shadow binding, configuration and unsaved-edit invalidation, and an
-applied rename that preserves the authored prefix. Nominal reference signatures
-and production Mixin integration remain outside that fixture's verified coverage.
+applied rename that preserves the authored prefix. Its verified nominal group covers
+ordinary class/interface references and arrays through the same shared semantics.
+The additional enum/record/object and mapped-builtin probe uses the same `corpus`
+scenario with `KTLSP_CORPUS_EXTRA_PROBES=dev/external-extension/shape-probes.lua`;
+that group remains under verification. Production Mixin integration is separate.
 
 `dev/jvm_projection_project.lua` generates a disposable four-buffer Kotlin/JVM fixture for
 this route. Its `dev/corpus/jvm-projections.json` manifest checks the Java exported suspend

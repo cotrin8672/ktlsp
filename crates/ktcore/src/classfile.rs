@@ -1,7 +1,8 @@
 //! Source-less JVM declaration metadata. Reading a class never loads or executes it.
 //!
 //! These are positive binary facts, not a verified callable surface: bytecode and annotation
-//! payloads are opaque, and generic signatures remain unparsed. A consumer must establish output
+//! payloads are opaque. Generic declaration signatures can be projected with [`signature`].
+//! A consumer must establish output
 //! freshness, selected origin, language callability, and any real source mapping separately. In
 //! particular, a public JVM constructor need not be callable from Kotlin source.
 
@@ -14,6 +15,8 @@ use noak::reader::{cpool, Attribute, Class, DecodeMany};
 use sha2::{Digest, Sha256};
 
 use crate::jvm::{ClassIdentity, InputIdentity};
+
+pub mod signature;
 
 /// An oversized input is unsupported, never evidence that a declaration is absent.
 pub const MAX_CLASS_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -208,6 +211,21 @@ pub fn method_types(
             None => None,
         },
     ))
+}
+
+/// Count descriptor parameters without claiming that their binary names are source types.
+pub fn method_parameter_count(descriptor: &str) -> Option<u8> {
+    let encoded = noak::MString::from(descriptor);
+    let method = MethodDescriptor::parse(&encoded).ok()?;
+    let mut count = 0u8;
+    for parameter in method.parameters() {
+        validate_type_name(&parameter).ok()?;
+        count = count.checked_add(1)?;
+    }
+    if let Some(returns) = method.return_type() {
+        validate_type_name(&returns).ok()?;
+    }
+    Some(count)
 }
 
 /// Prove only a narrow, requires-only module descriptor has no ordinary declarations.

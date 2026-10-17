@@ -1,0 +1,296 @@
+{
+  "build_tool": "gradle",
+  "project_id": "binary-java-generics",
+  "probes": [
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-get",
+      "anchor": "child.get().ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-field",
+      "anchor": "child.value.ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-array",
+      "anchor": "child.array()[0].ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-bounded",
+      "anchor": "child.same(item).ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-shadow",
+      "anchor": "child.shadow(other).pong",
+      "token": "pong",
+      "completion_token": "pong",
+      "completion_excludes": [
+        "ping"
+      ]
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-static",
+      "anchor": "Holder.ITEM.get().ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": true,
+      "completion_prefix": "",
+      "id": "binary-generics-java-exact-ITEM",
+      "anchor": "Holder.ITEM",
+      "token": "ITEM",
+      "completion_token": "ITEM",
+      "target_file": "oracle/Holder.stub.txt",
+      "target_sha256": "0ca645561996336265d1691888e18075f0d60c5f0c6bcdeec1baab0f95d6f690",
+      "target_anchor": " ITEM;",
+      "target_token": "ITEM",
+      "target_uri_suffix": "genericfixture/Holder.java"
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-wrong-bound",
+      "buffer_edits": [
+        {
+          "anchor": "child.same(item).ping()",
+          "replacement": "child.same(other).pong()"
+        }
+      ],
+      "anchor": "child.same(other).pong",
+      "token": "pong",
+      "completion_token": false,
+      "completion_excludes": [
+        "ping",
+        "pong"
+      ],
+      "known_control": {
+        "anchor": "child.get().ping",
+        "token": "ping",
+        "completion_prefix": "",
+        "completion_token": "ping"
+      }
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-java-value-shadow",
+      "buffer_edits": [
+        {
+          "anchor": "public void use(",
+          "replacement": "public void use(Object Holder, "
+        }
+      ],
+      "anchor": "Holder.ITEM.get().ping",
+      "token": "ping",
+      "completion_token": false,
+      "completion_excludes": [
+        "ping",
+        "pong"
+      ],
+      "known_control": {
+        "anchor": "child.get().ping",
+        "token": "ping",
+        "completion_prefix": "",
+        "completion_token": "ping"
+      }
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-get",
+      "anchor": "child.get().ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-field",
+      "anchor": "child.value.ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-array",
+      "anchor": "child.array()[0].ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-bounded",
+      "anchor": "child.same(item).ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-shadow",
+      "anchor": "child.shadow(other).pong",
+      "token": "pong",
+      "completion_token": "pong",
+      "completion_excludes": [
+        "ping"
+      ]
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-static",
+      "anchor": "Holder.ITEM.get().ping",
+      "token": "ping",
+      "completion_token": "ping",
+      "completion_excludes": [
+        "pong"
+      ]
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": true,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-exact-ITEM",
+      "anchor": "Holder.ITEM",
+      "token": "ITEM",
+      "completion_token": "ITEM",
+      "target_file": "oracle/Holder.stub.txt",
+      "target_sha256": "0ca645561996336265d1691888e18075f0d60c5f0c6bcdeec1baab0f95d6f690",
+      "target_anchor": " ITEM;",
+      "target_token": "ITEM",
+      "target_uri_suffix": "genericfixture/Holder.java"
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-wrong-bound",
+      "buffer_edits": [
+        {
+          "anchor": "child.same(item).ping()",
+          "replacement": "child.same(other).pong()"
+        }
+      ],
+      "anchor": "child.same(other).pong",
+      "token": "pong",
+      "completion_token": false,
+      "completion_excludes": [
+        "ping",
+        "pong"
+      ],
+      "known_control": {
+        "anchor": "child.get().ping",
+        "token": "ping",
+        "completion_prefix": "",
+        "completion_token": "ping"
+      }
+    },
+    {
+      "source": "src/main/kotlin/binarygenerics/KotlinGenerics.kt",
+      "source_sha256": "a05316ed538c3bfcb8bdc7d03455a52d453f7224418a86f5182a33b0e81939f7",
+      "definition": false,
+      "completion_prefix": "",
+      "id": "binary-generics-kotlin-value-shadow",
+      "buffer_edits": [
+        {
+          "anchor": "fun useGenerics(",
+          "replacement": "fun useGenerics(Holder: Any, "
+        }
+      ],
+      "anchor": "Holder.ITEM.get().ping",
+      "token": "ping",
+      "completion_token": false,
+      "completion_excludes": [
+        "ping",
+        "pong"
+      ],
+      "known_control": {
+        "anchor": "child.get().ping",
+        "token": "ping",
+        "completion_prefix": "",
+        "completion_token": "ping"
+      }
+    }
+  ]
+}

@@ -101,6 +101,165 @@ fn set_recipe(request: &mut KotlinDiagnosticRequest, recipe: JavaCompilerRecipe)
     );
 }
 
+// Shapes are the actual pinned Moshi7.4.2 and OkHttp7.5 JavaCompilerArgumentsBuilder captures.
+fn selected_captured_legacy_profile(request: &mut KotlinDiagnosticRequest, release8: bool) {
+    let mut recipe = request
+        .java_task
+        .as_ref()
+        .unwrap()
+        .java_compiler_recipe()
+        .unwrap();
+    let task = request.java_task.as_mut().unwrap();
+    task.options
+        .insert("sourceCompatibility".into(), json!("1.8"));
+    task.options
+        .insert("targetCompatibility".into(), json!("1.8"));
+    if release8 {
+        recipe.adapter = "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1".into();
+        recipe.api_options = [
+            vec!["--release".into(), "8".into()],
+            recipe.api_options[4..17].to_vec(),
+        ]
+        .concat();
+        task.arguments.clear();
+        task.options.insert("release".into(), json!(8));
+    } else {
+        recipe.adapter = "gradle-7.5-current-jdk17-utf8-javac-api-v1".into();
+        recipe.api_options[1] = "1.8".into();
+        recipe.api_options[3] = "1.8".into();
+        recipe
+            .api_options
+            .splice(6..6, ["-nowarn", "-encoding", "UTF-8"].map(String::from));
+        task.options.insert("encoding".into(), json!("UTF-8"));
+        for selected in [&mut request.task, task] {
+            selected.options.get_mut("taskActionInventory").unwrap()["adapter"] =
+                json!("gradle-7.5-stock-actions-v1");
+            selected.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] =
+                json!("gradle-7.5-stock-onlyif-v1");
+        }
+    }
+    set_recipe(request, recipe);
+}
+
+#[test]
+fn captured_release8_and_gradle75_options_preserve_flags_and_proved_replay_roles() {
+    for release8 in [true, false] {
+        let (_owner, mut request) = fixture();
+        selected_captured_legacy_profile(&mut request, release8);
+        let recipe = configured_recipe(&request).unwrap();
+        let task = request.java_task.as_ref().unwrap();
+        assert!(selected_tasks_supported(
+            &request.task,
+            task,
+            &[request.task.clone(), task.clone()]
+        ));
+        assert_eq!(recipe.api_options.len(), if release8 { 15 } else { 21 });
+        let roles = if release8 {
+            [3, 5, 11, 14]
+        } else {
+            [5, 10, 16, 19]
+        };
+        let private = request.project_dir.join("private-captured-profile");
+        let replayed =
+            replay_options(task, &recipe, &request.task.output_roots[0], &private).unwrap();
+        for (index, original) in recipe.api_options.iter().enumerate() {
+            if !roles.contains(&index) {
+                assert_eq!(&replayed[index], original);
+            }
+        }
+        assert_eq!(
+            replayed[roles[0]],
+            path_text(&private.join("java-classes")).unwrap()
+        );
+        assert_eq!(
+            replayed[roles[1]],
+            path_text(&private.join("java-headers")).unwrap()
+        );
+        assert_eq!(
+            replayed[roles[2]],
+            path_text(&private.join("java-generated")).unwrap()
+        );
+        assert_eq!(
+            replayed[roles[3]],
+            joined_classpath(&[task.classpath[0].clone(), private.join("lease")]).unwrap()
+        );
+        if !release8 {
+            assert_eq!(&replayed[6..9], &["-nowarn", "-encoding", "UTF-8"]);
+        }
+    }
+}
+
+#[test]
+fn captured_legacy_profiles_reject_unproved_sdk_release_encoding_flags_and_processors() {
+    for release8 in [true, false] {
+        for kind in ["sdk", "release", "encoding", "flags", "processor"] {
+            let (_owner, mut request) = fixture();
+            selected_captured_legacy_profile(&mut request, release8);
+            match kind {
+                "sdk" => {
+                    request.java_task.as_mut().unwrap().java_home =
+                        Some(request.project_dir.join("other-sdk"))
+                }
+                "release" => {
+                    request
+                        .java_task
+                        .as_mut()
+                        .unwrap()
+                        .options
+                        .insert("release".into(), json!(11));
+                }
+                "encoding" => {
+                    request
+                        .java_task
+                        .as_mut()
+                        .unwrap()
+                        .options
+                        .insert("encoding".into(), json!("UTF-16"));
+                }
+                "processor" => request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .annotation_processor_path
+                    .push(request.project_dir.join("processor.jar")),
+                _ => {
+                    let mut recipe = request
+                        .java_task
+                        .as_ref()
+                        .unwrap()
+                        .java_compiler_recipe()
+                        .unwrap();
+                    recipe.api_options.remove(if release8 { 0 } else { 6 });
+                    set_recipe(&mut request, recipe);
+                }
+            }
+            assert!(configured_recipe(&request).is_err(), "{release8}/{kind}");
+        }
+    }
+    let (_owner, mut request) = fixture();
+    selected_captured_legacy_profile(&mut request, false);
+    let java = request.java_task.as_ref().unwrap();
+    let mut auxiliary = inactive_kapt_tasks(&request);
+    for task in &mut auxiliary {
+        task.options.get_mut("taskActionInventory").unwrap()["adapter"] =
+            json!("gradle-7.5-stock-actions-v1");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] =
+            json!("gradle-7.5-stock-onlyif-v1");
+    }
+    let mut tasks = vec![request.task.clone(), java.clone()];
+    tasks.extend(auxiliary.clone());
+    assert!(selected_tasks_supported(&request.task, java, &tasks));
+    auxiliary[0]
+        .options
+        .insert("processors".into(), json!(["active.Processor"]));
+    let mut active = vec![request.task.clone(), java.clone()];
+    active.extend(auxiliary);
+    assert!(!selected_tasks_supported(&request.task, java, &active));
+    tasks[1].options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] =
+        json!("custom.Action");
+    assert!(!selected_tasks_supported(&request.task, &tasks[1], &tasks));
+}
+
 #[test]
 fn actual_option_order_and_output_roles_survive_partial_header_replay() {
     let (_owner, request) = fixture();
@@ -286,8 +445,8 @@ fn java_receipt(path: &Path, text: &str, recipe: &JavaCompilerRecipe) -> Value {
         json!({"path": path, "uri": uri, "bytes": text.len(), "sha256": sha(text.as_bytes())});
     json!({"compileCompleted": true, "failure": null, "success": false, "options": recipe.api_options,
         "gradleFileEncoding": recipe.gradle_file_encoding,
-        "gradleConfiguredEncodingNull": recipe.language_version != "21",
-        "gradleConfiguredEncoding": if recipe.language_version == "21" { json!("UTF-8") } else { Value::Null },
+        "gradleConfiguredEncodingNull": !explicit_utf8_recipe(recipe),
+        "gradleConfiguredEncoding": if explicit_utf8_recipe(recipe) { json!("UTF-8") } else { Value::Null },
         "gradleEffectiveDefaultCharset": recipe.effective_charset,
         "gradleEffectiveDefaultLocale": recipe.locale, "explicitFileManagerCharset": recipe.effective_charset,
         "explicitDiagnosticLocale": recipe.locale, "runtime": {"javaVersion": recipe.gradle_java_version,
@@ -319,6 +478,7 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &overlay,
         &packages,
         1,
+        false,
     )
     .unwrap();
     assert_eq!(receipt["diagnostics"].as_array().unwrap().len(), 6);
@@ -340,7 +500,8 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
             &expected,
             &overlay,
             &packages,
-            1
+            1,
+            false,
         )
         .unwrap()
         .len(),
@@ -355,7 +516,8 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &expected,
         &overlay,
         &packages,
-        1
+        1,
+        false,
     )
     .is_err());
     wrong = receipt.clone();
@@ -368,7 +530,8 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
             &expected,
             &overlay,
             &packages,
-            1
+            1,
+            false,
         )
         .unwrap()
         .len(),
@@ -382,7 +545,8 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &expected,
         &overlay,
         &overlapping,
-        1
+        1,
+        false,
     )
     .unwrap()
     .is_empty());
@@ -394,7 +558,8 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &expected,
         &overlay,
         &packages,
-        1
+        1,
+        false,
     )
     .is_err());
 }
@@ -427,6 +592,7 @@ fn java_positions_use_utf16_offsets_instead_of_javac_visual_tab_columns() {
         &overlay,
         &BTreeSet::from(["fixture".into()]),
         1,
+        false,
     )
     .unwrap();
     assert_eq!(errors[0].col, 19);
@@ -1415,6 +1581,19 @@ fn closed_source_edits_before_owner_watch_cannot_authorize_import_absence_but_wi
             check_closed_sources(&request, &overlay, &expected).is_ok(),
             "wire input need not have a disk file"
         );
+        let private = overlay
+            .sources
+            .iter()
+            .find(|path| path.extension().unwrap() == extension)
+            .unwrap();
+        std::fs::write(private, original_text.replace("fixture", "tampered")).unwrap();
+        let tampered = current_sources(&overlay).unwrap();
+        assert!(
+            check_closed_sources(&request, &overlay, &tampered).is_err(),
+            "private wire bytes must match the exact current request body"
+        );
+        std::fs::write(private, original_text).unwrap();
+        assert!(check_closed_sources(&request, &overlay, &expected).is_ok());
         request.overlays.retain(|source| source.key != key);
         assert!(
             check_closed_sources(&request, &overlay, &expected).is_err(),
@@ -1760,6 +1939,161 @@ fn selected_k2_jdk21(request: &mut KotlinDiagnosticRequest) {
         .insert("targetCompatibility".into(), json!("21"));
 }
 
+// Actual unchanged generic fixture getter: SDK21, target17, default UTF8, seventeen API options.
+fn selected_captured_k2_jdk21_target17(request: &mut KotlinDiagnosticRequest) {
+    selected_k2_jdk21(request);
+    let mut recipe = request
+        .java_task
+        .as_ref()
+        .unwrap()
+        .java_compiler_recipe()
+        .unwrap();
+    recipe.adapter = "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1".into();
+    recipe.api_options[1] = "17".into();
+    recipe.api_options[3] = "17".into();
+    recipe.api_options.drain(6..8);
+    set_recipe(request, recipe);
+    let task = request.java_task.as_mut().unwrap();
+    task.options.insert("encoding".into(), Value::Null);
+    task.options
+        .insert("sourceCompatibility".into(), json!("17"));
+    task.options
+        .insert("targetCompatibility".into(), json!("17"));
+}
+
+#[test]
+fn captured_gradle961_jdk21_target17_default_utf8_preserves_order_and_output_roles() {
+    let (_owner, mut request) = fixture();
+    selected_captured_k2_jdk21_target17(&mut request);
+    let task = request.java_task.as_ref().unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    assert_eq!(recipe.language_version, "21");
+    assert_eq!(recipe.api_options.len(), 17);
+    assert!(!recipe
+        .api_options
+        .iter()
+        .any(|arg| arg == "-encoding" || arg == "--release"));
+    assert!(task.arguments.is_empty());
+    assert!(selected_tasks_supported(
+        &request.task,
+        task,
+        &[request.task.clone(), task.clone()]
+    ));
+    let private = request.project_dir.join("private-captured-target17");
+    let replayed = replay_options(task, &recipe, &request.task.output_roots[0], &private).unwrap();
+    for (index, original) in recipe.api_options.iter().enumerate() {
+        if ![5, 7, 13, 16].contains(&index) {
+            assert_eq!(&replayed[index], original);
+        }
+    }
+    assert_eq!(&replayed[..5], &["-source", "17", "-target", "17", "-d"]);
+    assert_eq!(
+        &replayed[8..13],
+        &["-g", "-sourcepath", "", "-proc:none", "-s"]
+    );
+    assert_eq!(replayed[14], "-XDuseUnsharedTable=true");
+    assert_eq!(replayed[15], "-classpath");
+    for (index, directory) in [
+        (5, "java-classes"),
+        (7, "java-headers"),
+        (13, "java-generated"),
+    ] {
+        assert_eq!(
+            replayed[index],
+            path_text(&private.join(directory)).unwrap()
+        );
+    }
+    assert_eq!(
+        replayed[16],
+        joined_classpath(&[task.classpath[0].clone(), private.join("lease")]).unwrap()
+    );
+}
+
+#[test]
+fn captured_gradle961_jdk21_target17_default_utf8_rejects_unproved_policies() {
+    for kind in [
+        "encoding",
+        "source",
+        "target",
+        "release",
+        "runtime",
+        "charset",
+        "api-order",
+        "api-target",
+        "processor",
+        "strategy",
+    ] {
+        let (_owner, mut request) = fixture();
+        selected_captured_k2_jdk21_target17(&mut request);
+        match kind {
+            "encoding" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("encoding".into(), json!("UTF-8"));
+            }
+            "source" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("sourceCompatibility".into(), json!("21"));
+            }
+            "target" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("targetCompatibility".into(), json!("21"));
+            }
+            "release" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .insert("release".into(), json!(17));
+            }
+            "processor" => request
+                .java_task
+                .as_mut()
+                .unwrap()
+                .annotation_processor_path
+                .push(request.project_dir.join("processor.jar")),
+            "strategy" => {
+                request
+                    .task
+                    .kotlin_compiler
+                    .as_mut()
+                    .unwrap()
+                    .execution_strategy =
+                    crate::classpath::KotlinCompilerExecutionStrategy::InProcess
+            }
+            _ => {
+                let mut recipe = request
+                    .java_task
+                    .as_ref()
+                    .unwrap()
+                    .java_compiler_recipe()
+                    .unwrap();
+                match kind {
+                    "runtime" => recipe.java_runtime_version = "17.0.7".into(),
+                    "charset" => recipe.effective_charset = "windows-31j".into(),
+                    "api-order" => recipe.api_options[0] = "-target".into(),
+                    "api-target" => recipe.api_options[3] = "21".into(),
+                    _ => unreachable!(),
+                }
+                set_recipe(&mut request, recipe);
+            }
+        }
+        assert!(configured_recipe(&request).is_err(), "{kind}");
+    }
+}
+
 #[test]
 fn k2_jdk21_daemon_recipe_preserves_ordered_explicit_utf8_and_output_roles() {
     let (_owner, mut request) = fixture();
@@ -1930,10 +2264,16 @@ fn k2_jdk17_retains_in_process_and_null_encoding_policy() {
 
 #[test]
 fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() {
-    for sdk21 in [false, true] {
+    for profile in 0..5 {
+        let sdk21 = matches!(profile, 1 | 4);
+        let explicit_utf8 = matches!(profile, 1 | 3);
         let (owner, mut request) = fixture();
-        if sdk21 {
+        if profile == 4 {
+            selected_captured_k2_jdk21_target17(&mut request);
+        } else if sdk21 {
             selected_k2_jdk21(&mut request);
+        } else if profile >= 2 {
+            selected_captured_legacy_profile(&mut request, profile == 2);
         }
         let overlay =
             KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
@@ -1954,7 +2294,8 @@ fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() 
                 &expected,
                 &overlay,
                 &packages,
-                1
+                1,
+                false,
             )
             .unwrap()
             .len(),
@@ -1967,9 +2308,9 @@ fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() 
         ] {
             let mut wrong = receipt.clone();
             wrong[field] = match field {
-                "gradleConfiguredEncodingNull" => json!(sdk21),
+                "gradleConfiguredEncodingNull" => json!(explicit_utf8),
                 "gradleConfiguredEncoding" => {
-                    if sdk21 {
+                    if explicit_utf8 {
                         Value::Null
                     } else {
                         json!("UTF-8")
@@ -1985,11 +2326,186 @@ fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() 
                     &expected,
                     &overlay,
                     &packages,
-                    1
+                    1,
+                    false,
                 )
                 .is_err(),
                 "sdk21={sdk21} {field}"
             );
         }
     }
+}
+
+#[test]
+fn canonical_k2_lease_requires_exact_current_outputs_before_and_after_javac() {
+    let (owner, _) = fixture();
+    let canonical = owner.directory.join("canonical-fast");
+    std::fs::create_dir_all(canonical.join("fixture")).unwrap();
+    std::fs::create_dir_all(canonical.join("META-INF")).unwrap();
+    std::fs::write(
+        canonical.join("fixture/Helper.class"),
+        b"synthetic class bytes",
+    )
+    .unwrap();
+    std::fs::write(
+        canonical.join("META-INF/main.kotlin_module"),
+        b"module bytes",
+    )
+    .unwrap();
+    let before = complete_output_inventory(&canonical).unwrap();
+    let lease = owner.directory.join("canonical-lease");
+    complete_output_lease(&canonical, &lease, &before).unwrap();
+    complete_outputs_match(&canonical, &lease, &before).unwrap();
+    for relative in before.keys() {
+        assert_eq!(
+            std::fs::read(canonical.join(relative)).unwrap(),
+            std::fs::read(lease.join(relative)).unwrap()
+        );
+    }
+    // Neither replacing both trees nor changing only Javac's read copy preserves this lease.
+    std::fs::write(lease.join("fixture/Helper.class"), b"changed").unwrap();
+    assert!(complete_outputs_match(&canonical, &lease, &before).is_err());
+    std::fs::write(canonical.join("fixture/Helper.class"), b"changed").unwrap();
+    assert!(complete_outputs_match(&canonical, &lease, &before).is_err());
+    assert!(
+        complete_output_lease(&canonical, &owner.directory.join("stale-lease"), &before).is_err()
+    );
+    assert!(!owner.directory.join("stale-lease").exists());
+    std::fs::remove_file(canonical.join("fixture/Helper.class")).unwrap();
+    assert!(
+        complete_output_lease(&canonical, &owner.directory.join("missing-lease"), &before).is_err()
+    );
+    assert!(!owner.directory.join("missing-lease").exists());
+    std::fs::write(
+        canonical.join("fixture/Helper.class"),
+        b"synthetic class bytes",
+    )
+    .unwrap();
+    std::fs::write(canonical.join("fixture/Extra.class"), b"extra").unwrap();
+    assert!(
+        complete_output_lease(&canonical, &owner.directory.join("extra-lease"), &before).is_err()
+    );
+    assert!(!owner.directory.join("extra-lease").exists());
+    std::fs::remove_dir_all(&canonical).unwrap();
+    assert!(
+        complete_output_lease(&canonical, &owner.directory.join("removed-lease"), &before).is_err()
+    );
+}
+
+#[test]
+fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_projection() {
+    let (owner, mut request) = fixture();
+    selected_k2_jdk21(&mut request);
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let path = overlay
+        .sources
+        .iter()
+        .find(|p| p.extension().unwrap() == "java")
+        .unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let receipt = java_receipt(path, JAVA, &recipe);
+    let expected = vec![(path.clone(), sha(JAVA.as_bytes()))];
+    let packages = BTreeSet::from(["generated".into()]);
+    assert!(import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1,
+        false
+    )
+    .unwrap()
+    .is_empty());
+    let actual = import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1,
+        true,
+    )
+    .unwrap();
+    assert_eq!(actual.len(), 3);
+    // Full output does not relax byte, runtime, AST range, static-import or error-code checks.
+    let mut wrong = receipt.clone();
+    wrong["imports"][0]["static"] = json!(true);
+    assert_eq!(
+        import_diagnostics(
+            &wrong,
+            &recipe.api_options,
+            &recipe,
+            &expected,
+            &overlay,
+            &packages,
+            1,
+            true
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    wrong = receipt.clone();
+    wrong["diagnostics"][0]["position"] = json!(JAVA.find("generated.KspKotlin").unwrap());
+    assert_eq!(
+        import_diagnostics(
+            &wrong,
+            &recipe.api_options,
+            &recipe,
+            &expected,
+            &overlay,
+            &packages,
+            1,
+            true
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    wrong = receipt.clone();
+    wrong["diagnostics"][0]["code"] = json!("compiler.err.cant.resolve.location");
+    assert_eq!(
+        import_diagnostics(
+            &wrong,
+            &recipe.api_options,
+            &recipe,
+            &expected,
+            &overlay,
+            &packages,
+            1,
+            true
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    wrong = receipt.clone();
+    wrong["runtime"]["javaVersion"] = json!("17");
+    assert!(import_diagnostics(
+        &wrong,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1,
+        true
+    )
+    .is_err());
+    std::fs::write(path, format!("{JAVA}// changed")).unwrap();
+    assert!(import_diagnostics(
+        &receipt,
+        &recipe.api_options,
+        &recipe,
+        &expected,
+        &overlay,
+        &packages,
+        1,
+        true
+    )
+    .is_err());
 }

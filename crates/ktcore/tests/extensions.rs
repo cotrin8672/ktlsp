@@ -2131,3 +2131,458 @@ fn nominal_value_generic_and_ambiguous_reference_owners_stay_unknown() {
         matches!(read.reference_type(&owner).unwrap(), Knowledge::Unknown(reasons) if reasons.contains(&IncompleteReason::AmbiguousType))
     );
 }
+
+#[test]
+fn nominal_enum_record_and_named_object_owners_have_canonical_descriptors() {
+    let (mut index, mut store) = fixture();
+    let java = "package oracle; class JavaKinds { enum Axis { X, Y } record Point(int value) {} }";
+    let symbols = [
+        ("JavaKinds", SymbolKind::Class, None),
+        ("Axis", SymbolKind::EnumClass, Some("JavaKinds")),
+        ("Point", SymbolKind::Class, Some("JavaKinds")),
+    ]
+    .into_iter()
+    .map(|(name, kind, container)| {
+        let at = java.find(name).unwrap();
+        IndexedSymbol::new(
+            name,
+            kind,
+            "oracle",
+            container.map(str::to_string),
+            at,
+            at + name.len(),
+        )
+    })
+    .collect();
+    index.replace_file("/oracle/JavaKinds.java", symbols, Tier::Volatile);
+    let kotlin =
+        "package oracle\nclass KotlinKinds {\n enum class Axis { X, Y }\n object Marker\n}\n";
+    index_source(&mut index, "/oracle/KotlinKinds.kt", kotlin, "oracle");
+    for (file, text) in [
+        ("/oracle/JavaKinds.java", java),
+        ("/oracle/KotlinKinds.kt", kotlin),
+    ] {
+        store
+            .replace_source(
+                &index,
+                file,
+                Arc::from(text),
+                Knowledge::Found(()),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for name in [
+        "JavaKinds.Axis",
+        "JavaKinds.Point",
+        "KotlinKinds.Axis",
+        "KotlinKinds.Marker",
+    ] {
+        let qualified = format!("oracle.{name}");
+        let Knowledge::Found(owner) = read.resolve_type(&qualified) else {
+            panic!("{qualified}")
+        };
+        let Knowledge::Found(reference) = read.reference_type(&owner).unwrap() else {
+            panic!("reference {qualified}")
+        };
+        let internal = format!("oracle/{}", name.replace('.', "$"));
+        assert_eq!(
+            method(&[JvmType::Array(Box::new(reference.clone()))], &reference).descriptor(),
+            format!("([L{internal};)L{internal};")
+        );
+    }
+}
+
+fn install_nominal_kotlin(
+    index: &mut Index,
+    store: &mut ExtensionStore,
+    file: &str,
+    text: &str,
+    package: &str,
+) {
+    let tree = KotlinParser::new().parse(text);
+    assert!(!tree.root_node().has_error(), "{text}");
+    index.replace_file(file, extract_symbols(&tree, text, package), Tier::Volatile);
+    let scope = ktcore::indexer::TypeScope::with_default_imports(
+        package,
+        Vec::new(),
+        &["kotlin", "java.lang"],
+    );
+    let declarations = ktcore::extensions::source::extract(index, file, &tree, text, &scope);
+    store
+        .replace_source_declarations(
+            index,
+            file,
+            Arc::from(text),
+            Knowledge::Found(()),
+            declarations,
+        )
+        .unwrap();
+}
+
+#[test]
+fn nominal_enum_and_object_source_signatures_are_useful() {
+    let (mut index, mut store) = fixture();
+    install_nominal_kotlin(&mut index, &mut store, "/oracle/KotlinKinds.kt", "package oracle\nclass KotlinKinds {\n enum class Axis { X, Y }\n object Marker\n fun axis(value: oracle.KotlinKinds.Axis): oracle.KotlinKinds.Axis = value\n fun marker(value: oracle.KotlinKinds.Marker): oracle.KotlinKinds.Marker = value\n}\n", "oracle");
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("oracle.KotlinKinds") else {
+        panic!("owner")
+    };
+    let (members, _) = read.declared_members(&owner).unwrap();
+    for (name, descriptor) in [
+        (
+            "axis",
+            "(Loracle/KotlinKinds$Axis;)Loracle/KotlinKinds$Axis;",
+        ),
+        (
+            "marker",
+            "(Loracle/KotlinKinds$Marker;)Loracle/KotlinKinds$Marker;",
+        ),
+    ] {
+        let member = members.iter().find(|member| member.name == name).unwrap();
+        assert!(
+            matches!(&member.signature, Knowledge::Found(signature) if signature.descriptor() == descriptor),
+            "{name}: {:?}",
+            member.signature
+        );
+    }
+}
+
+#[test]
+fn nominal_kotlin_any_and_string_references_use_platform_names() {
+    let (mut index, mut store) = fixture();
+    install_nominal_kotlin(
+        &mut index,
+        &mut store,
+        "/kotlin/Builtins.kt",
+        "package kotlin\nclass Any\nclass String\n",
+        "kotlin",
+    );
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for (name, descriptor) in [
+        ("Any", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+        ("String", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ] {
+        let Knowledge::Found(owner) = read.resolve_type(&format!("kotlin.{name}")) else {
+            panic!("{name}")
+        };
+        let Knowledge::Found(reference) = read.reference_type(&owner).unwrap() else {
+            panic!("reference {name}")
+        };
+        assert_eq!(
+            method(&[reference.clone()], &reference).descriptor(),
+            descriptor
+        );
+    }
+}
+
+#[test]
+fn nominal_kotlin_any_source_signatures_and_arrays_are_useful() {
+    let (mut index, mut store) = fixture();
+    install_nominal_kotlin(
+        &mut index,
+        &mut store,
+        "/kotlin/Builtins.kt",
+        "package kotlin\nclass Any\nclass String\nclass Int\n",
+        "kotlin",
+    );
+    install_nominal_kotlin(&mut index, &mut store, "/oracle/Mapped.kt", "package oracle\nclass Mapped {\n fun any(value: Any): Any = value\n fun text(value: String): String = value\n fun refs(value: Array<Any>): Array<Any> = value\n fun boxed(value: Array<Int>): Array<Int> = value\n fun nullable(value: Any?): Any? = value\n}\n", "oracle");
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("oracle.Mapped") else {
+        panic!("Mapped")
+    };
+    let (members, _) = read.declared_members(&owner).unwrap();
+    for (name, descriptor) in [
+        ("any", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+        ("text", "(Ljava/lang/String;)Ljava/lang/String;"),
+        ("refs", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+    ] {
+        let member = members.iter().find(|member| member.name == name).unwrap();
+        assert!(
+            matches!(&member.signature, Knowledge::Found(signature) if signature.descriptor() == descriptor),
+            "{name}: {:?}",
+            member.signature
+        );
+    }
+    for name in ["boxed", "nullable"] {
+        assert!(
+            matches!(
+                &members
+                    .iter()
+                    .find(|member| member.name == name)
+                    .unwrap()
+                    .signature,
+                Knowledge::Unknown(_)
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn nominal_kotlin_builtin_boxing_without_a_signature_context_stays_unknown() {
+    let (mut index, mut store) = fixture();
+    install_nominal_kotlin(
+        &mut index,
+        &mut store,
+        "/kotlin/Builtins.kt",
+        "package kotlin\nclass Int\nclass Boolean\nclass Unit\n",
+        "kotlin",
+    );
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for name in ["Int", "Boolean", "Unit"] {
+        let Knowledge::Found(owner) = read.resolve_type(&format!("kotlin.{name}")) else {
+            panic!("{name}")
+        };
+        assert!(
+            matches!(read.reference_type(&owner).unwrap(), Knowledge::Unknown(_)),
+            "{name} cannot be issued using its source name"
+        );
+    }
+}
+
+#[test]
+fn nominal_new_declaration_kinds_keep_local_generic_and_malformed_headers_unknown() {
+    let (mut index, mut store) = fixture();
+    for (file, text, name, kind, container) in [
+        (
+            "/oracle/Local.java",
+            "package oracle; class Local { void f() { enum Axis { X } } }",
+            "Axis",
+            SymbolKind::EnumClass,
+            Some("Local"),
+        ),
+        (
+            "/oracle/GenericRecord.java",
+            "package oracle; record Point<T>(T value) {}",
+            "Point",
+            SymbolKind::Class,
+            None,
+        ),
+        (
+            "/oracle/Broken.java",
+            "package oracle; enum Broken implements {}",
+            "Broken",
+            SymbolKind::EnumClass,
+            None,
+        ),
+    ] {
+        let at = text.find(name).unwrap();
+        let mut symbol = IndexedSymbol::new(
+            name,
+            kind,
+            "oracle",
+            container.map(str::to_string),
+            at,
+            at + name.len(),
+        );
+        if name == "Point" {
+            symbol.type_params.push("T".into());
+        }
+        index.replace_file(file, vec![symbol], Tier::Volatile);
+        store
+            .replace_source(
+                &index,
+                file,
+                Arc::from(text),
+                Knowledge::Found(()),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    install_nominal_kotlin(
+        &mut index,
+        &mut store,
+        "/oracle/Expected.kt",
+        "package oracle\nexpect enum class Expected { X }\n",
+        "oracle",
+    );
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for name in [
+        "oracle.Local.Axis",
+        "oracle.Point",
+        "oracle.Broken",
+        "oracle.Expected",
+    ] {
+        let Knowledge::Found(owner) = read.resolve_type(name) else {
+            panic!("{name}")
+        };
+        assert!(
+            matches!(read.reference_type(&owner).unwrap(), Knowledge::Unknown(_)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn nominal_nested_owner_scope_selects_its_own_enum_and_keeps_generic_array_shadow_unknown() {
+    let (mut index, mut store) = fixture();
+    install_nominal_kotlin(&mut index, &mut store, "/oracle/ScopedKinds.kt", "package oracle\nclass First {\n enum class Axis { X }\n class Array<T>\n fun axis(value: Axis): Axis = value\n fun rows(value: Array<Axis>): Array<Axis> = value\n}\nclass Second {\n enum class Axis { Y }\n fun axis(value: Axis): Axis = value\n}\n", "oracle");
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    for name in ["First", "Second"] {
+        let Knowledge::Found(owner) = read.resolve_type(&format!("oracle.{name}")) else {
+            panic!("{name}")
+        };
+        let (members, _) = read.declared_members(&owner).unwrap();
+        let signature = &members
+            .iter()
+            .find(|member| member.name == "axis")
+            .unwrap()
+            .signature;
+        let expected = format!("(Loracle/{name}$Axis;)Loracle/{name}$Axis;");
+        assert!(
+            matches!(signature, Knowledge::Found(signature) if signature.descriptor() == expected),
+            "{name}: {signature:?}"
+        );
+        if name == "First" {
+            assert!(
+                matches!(
+                    &members
+                        .iter()
+                        .find(|member| member.name == "rows")
+                        .unwrap()
+                        .signature,
+                    Knowledge::Unknown(_)
+                ),
+                "an authored generic Array must not become a JVM array"
+            );
+        }
+    }
+}
+
+#[test]
+fn nominal_archive_jvm_actual_any_is_useful_and_common_expect_is_not_selected() {
+    let (mut index, mut store) = fixture();
+    let common = "/cache/stdlib/2.1.20/commonMain/kotlin/Any.kt";
+    let actual = "/cache/stdlib/2.1.20/jvmMain/kotlin/Any.kt";
+    for (file, text) in [
+        (common, "package kotlin\npublic expect open class Any()\n"),
+        (actual, "package kotlin\npublic actual open class Any {}\n"),
+    ] {
+        install_nominal_kotlin(&mut index, &mut store, file, text, "kotlin");
+        index.set_file_origin(
+            file,
+            ktcore::project_model::FileOrigin {
+                origin_id: "maven:stdlib:2.1.20".into(),
+                representation: ktcore::project_model::SourceRepresentation::Source,
+                project_scope: None,
+            },
+        );
+    }
+    install_nominal_kotlin(
+        &mut index,
+        &mut store,
+        "/oracle/Mapped.kt",
+        "package oracle\nclass Mapped { fun any(value: Any): Any = value }\n",
+        "oracle",
+    );
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(owner) = read.resolve_type("kotlin.Any") else {
+        panic!("actual Any");
+    };
+    assert_eq!(owner.definition().file, actual);
+    assert!(read.reference_type(&owner).unwrap().is_found());
+    let Knowledge::Found(mapped) = read.resolve_type("oracle.Mapped") else {
+        panic!("Mapped");
+    };
+    let member = read
+        .declared_members(&mapped)
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|member| member.name == "any")
+        .unwrap();
+    assert!(matches!(member.signature, Knowledge::Found(signature)
+        if signature.descriptor() == "(Ljava/lang/Object;)Ljava/lang/Object;"));
+}
+
+#[test]
+fn nominal_archive_source_view_narrowing_preserves_genuine_ambiguity() {
+    for (other, different_origin, authority) in [
+        ("/cache/one/jvmMain/oracle/Value.kt", true, true),
+        ("/cache/two/jvmMain/oracle/Value.kt", false, true),
+        ("/cache/one/jvmMain/oracle/Value.kt", false, false),
+        ("/cache/one/jsMain/oracle/Value.kt", false, true),
+    ] {
+        let (mut index, mut store) = fixture();
+        let common = "/cache/one/commonMain/oracle/Value.kt";
+        for (file, text) in [
+            (common, "package oracle\nexpect class Value\n"),
+            (other, "package oracle\nactual class Value {}\n"),
+        ] {
+            install_nominal_kotlin(&mut index, &mut store, file, text, "oracle");
+            if authority {
+                index.set_file_origin(
+                    file,
+                    ktcore::project_model::FileOrigin {
+                        origin_id: if file == other && different_origin {
+                            "maven:other:1"
+                        } else {
+                            "maven:one:1"
+                        }
+                        .into(),
+                        representation: ktcore::project_model::SourceRepresentation::Source,
+                        project_scope: None,
+                    },
+                );
+            }
+        }
+        let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+        assert!(
+            matches!(read.resolve_type("oracle.Value"), Knowledge::Unknown(_)),
+            "{other}"
+        );
+    }
+}
+
+#[test]
+fn nominal_archive_narrowing_leaves_single_declarations_unchanged() {
+    for text in [
+        "package oracle\nclass Single {}\n",
+        "package oracle\nexpect class Single()\n",
+    ] {
+        let (mut index, mut store) = fixture();
+        let file = "/cache/only/commonMain/oracle/Single.kt";
+        install_nominal_kotlin(&mut index, &mut store, file, text, "oracle");
+        let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+        let Knowledge::Found(owner) = read.resolve_type("oracle.Single") else {
+            panic!("single declaration");
+        };
+        assert_eq!(owner.definition().file, file);
+    }
+}
+
+#[test]
+fn nominal_archive_multiple_jvm_actual_declarations_stay_ambiguous() {
+    let (mut index, mut store) = fixture();
+    for (file, text) in [
+        (
+            "/cache/one/commonMain/oracle/Value.kt",
+            "package oracle\nexpect class Value\n",
+        ),
+        (
+            "/cache/one/jvmMain/oracle/Value.kt",
+            "package oracle\nactual class Value {}\n",
+        ),
+        (
+            "/cache/one/jvmMain/oracle/Other.kt",
+            "package oracle\nactual class Value {}\n",
+        ),
+    ] {
+        install_nominal_kotlin(&mut index, &mut store, file, text, "oracle");
+        index.set_file_origin(
+            file,
+            ktcore::project_model::FileOrigin {
+                origin_id: "maven:one:1".into(),
+                representation: ktcore::project_model::SourceRepresentation::Source,
+                project_scope: None,
+            },
+        );
+    }
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    assert!(matches!(
+        read.resolve_type("oracle.Value"),
+        Knowledge::Unknown(_)
+    ));
+}

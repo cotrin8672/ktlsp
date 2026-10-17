@@ -519,6 +519,7 @@ fn late_open_dependency_ownership(file: &str, source: &str) {
                 jvm: None,
                 file: ktlsp::paths::file_key(&root.join("cache/Seed.java")),
                 symbols: Vec::new(),
+                library_source: None,
                 origin: Some(origin.clone()),
             }));
             ws.bump_index_revision();
@@ -549,6 +550,7 @@ fn late_open_dependency_ownership(file: &str, source: &str) {
             jvm: None,
             file: target_key.clone(),
             symbols: symbols.clone(),
+            library_source: None,
             origin: Some(origin.clone()),
         };
         let owner_scope = ws

@@ -389,6 +389,9 @@ impl InferenceIndex for BinaryDiagnostics<'_> {
     fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
         self.index.extensions_for(name)
     }
+    fn generic_receiver_extensions(&self, prefix: &str) -> LookupEntries<'_> {
+        self.index.generic_receiver_extensions(prefix)
+    }
     fn origin_facts(&self) -> Option<&OriginFacts> {
         self.index.origin_facts()
     }

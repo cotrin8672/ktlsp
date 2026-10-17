@@ -152,9 +152,15 @@ impl CompilerTask {
             (recipe.adapter.as_str(), recipe.language_version.as_str()),
             (
                 "gradle-7.4.2-current-jdk17-javac-api-v1"
+                    | "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+                    | "gradle-7.5-current-jdk17-utf8-javac-api-v1"
                     | "gradle-9.6.1-current-jdk17-javac-api-v1",
                 "17"
             ) | ("gradle-9.6.1-current-jdk21-utf8-javac-api-v1", "21")
+                | (
+                    "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1",
+                    "21"
+                )
         ) && recipe.compiler_type
             == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler"
             && (recipe.language_version != "21" || recipe.effective_charset == "UTF-8")
@@ -1483,14 +1489,26 @@ fn read_cache_entry(path: &Path) -> Option<CacheEntry> {
     serde_json::from_reader(BufReader::new(file)).ok()
 }
 
-fn cache_path(root: &Path) -> PathBuf {
-    // One cache file per root, named by a hash of the canonical root path.
+fn model_cache_hash(root: &Path, module: Option<&str>, script: &str) -> u64 {
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut hash: u64 = 1469598103934665603; // FNV-1a
-    for b in key.to_string_lossy().bytes() {
+                                             // Compiler recipe enrichment changes with the embedded adapter, even when build files do not.
+    for b in key
+        .to_string_lossy()
+        .bytes()
+        .chain([0])
+        .chain(module.unwrap_or("").bytes())
+        .chain([0])
+        .chain(script.bytes())
+    {
         hash ^= b as u64;
         hash = hash.wrapping_mul(1099511628211);
     }
+    hash
+}
+
+fn cache_path(root: &Path) -> PathBuf {
+    let hash = model_cache_hash(root, None, INIT_SCRIPT);
     crate::deps::cache_home()
         .join("classpath")
         .join(format!("{hash:016x}.json"))
@@ -1753,12 +1771,7 @@ fn write_cache_entry(path: &Path, entry: &impl Serialize) {
 }
 
 fn module_cache_path(root: &Path, module: &str) -> PathBuf {
-    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut hash: u64 = 1469598103934665603;
-    for b in key.to_string_lossy().bytes().chain(module.bytes()) {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
+    let hash = model_cache_hash(root, Some(module), INIT_SCRIPT);
     crate::deps::cache_home()
         .join("classpath")
         .join(format!("mod-{hash:016x}.json"))
@@ -1912,7 +1925,7 @@ fn run_dump_cancellable(
         .open(&stdout_path)?;
     let _stdout_guard = TempFile(&stdout_path);
     let (status, interrupted, stdout_failure, stdout_complete, stderr, stderr_complete) =
-        crate::compile::run_with_stdout_file_cancellable(
+        crate::compile::run_model_with_stdout_file_cancellable(
             &mut command,
             stdout.try_clone()?,
             std::time::Duration::from_secs(60 * 60),
@@ -3322,6 +3335,33 @@ END\t:lib\n";
     }
 
     #[test]
+    #[ignore = "local real Gradle protocol replay; requires KTLSP_CLOSED_GRADLE_PROTOCOL artifact"]
+    fn retained_gradle_8142_closed_output_passes_the_normal_strict_parser() {
+        let path = std::env::var_os("KTLSP_CLOSED_GRADLE_PROTOCOL")
+            .expect("actual retained protocol path");
+        let file = std::fs::File::open(path).unwrap();
+        let modules = parse_dump_reader(BufReader::new(file), true).unwrap();
+        assert_eq!(modules.len(), 194);
+        let problems = modules
+            .iter()
+            .find(|module| module.module == ":problems")
+            .unwrap();
+        let main = problems
+            .source_sets
+            .iter()
+            .find(|source_set| source_set.name == "main")
+            .unwrap();
+        assert!(main
+            .compiler_tasks
+            .iter()
+            .any(|task| task.task == ":problems:compileJava" && task.complete));
+        assert!(main
+            .compiler_tasks
+            .iter()
+            .any(|task| task.task == ":problems:compileKotlin" && task.complete));
+    }
+
+    #[test]
     fn parse_empty_is_empty() {
         assert!(parse_dump("no records here\njust gradle output\n").is_empty());
     }
@@ -3497,6 +3537,77 @@ dependencies {
             vec![module.join("libs/datatester-java-sdk-2.0.24.jar")]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn embedded_adapter_content_invalidates_root_and_module_cache_keys() {
+        let root = Path::new("/cache-key-fixture");
+        for module in [None, Some(":app")] {
+            assert_eq!(
+                model_cache_hash(root, module, "same adapter"),
+                model_cache_hash(root, module, "same adapter")
+            );
+            assert_ne!(
+                model_cache_hash(root, module, "old adapter"),
+                model_cache_hash(root, module, "new adapter")
+            );
+        }
+        assert_ne!(
+            model_cache_hash(root, None, INIT_SCRIPT),
+            model_cache_hash(root, Some(":app"), INIT_SCRIPT)
+        );
+    }
+
+    #[test]
+    fn old_adapter_cache_requires_a_normal_dump_then_reuses_the_new_result() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-adapter-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let make_module = |name: &str| ModuleClasspath {
+            module: name.into(),
+            project_dir: root.clone(),
+            build: ":".into(),
+            source_sets: Vec::new(),
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        let old_hash = model_cache_hash(&root, None, "previous embedded compiler adapter");
+        let old_path = cache_path(&root).with_file_name(format!("{old_hash:016x}.json"));
+        assert_ne!(old_path, cache_path(&root));
+        write_cache_entry(
+            &old_path,
+            &CacheEntry {
+                model_version: MODEL_VERSION,
+                mtimes: BTreeMap::new(),
+                modules: vec![make_module(":old-unsupported-recipe")],
+            },
+        );
+        let called = std::cell::Cell::new(false);
+        let fresh = load_snapshot_with(&root, false, || {
+            called.set(true);
+            Ok(vec![make_module(":fresh-adapter")])
+        })
+        .unwrap();
+        assert!(
+            called.get(),
+            "different adapter must perform a normal dump instead of reusing old compiler metadata"
+        );
+        assert_eq!(fresh.modules[0].module, ":fresh-adapter");
+        store_snapshot(&root, &fresh);
+        let warm = load_snapshot_with(&root, false, || {
+            anyhow::bail!("unchanged adapter should reuse its normal dump")
+        })
+        .unwrap();
+        assert_eq!(warm.modules[0].module, ":fresh-adapter");
+        std::fs::remove_file(old_path).unwrap();
+        std::fs::remove_file(cache_path(&root)).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

@@ -82,7 +82,12 @@ fn actual_serializer_owner_generic_signature_and_bridge_are_preserved() {
         callable.signature.as_deref(),
         Some("()Lkotlinx/serialization/KSerializer<Lpluginfixture/Model;>;")
     );
-    assert_eq!(serializer.signature.as_deref(), Some("Ljava/lang/Object;Lkotlinx/serialization/internal/GeneratedSerializer<Lpluginfixture/Model;>;"));
+    assert_eq!(
+        serializer.signature.as_deref(),
+        Some(
+            "Ljava/lang/Object;Lkotlinx/serialization/internal/GeneratedSerializer<Lpluginfixture/Model;>;"
+        )
+    );
     assert_eq!(
         serializer.interfaces[0].as_ref(),
         "kotlinx/serialization/internal/GeneratedSerializer"
@@ -624,6 +629,27 @@ fn erased_method_descriptor_types_keep_java_array_rank_and_qualified_component_i
         "()[Lpkg/Outer$Inner;",
     ] {
         assert!(method_types(unsupported).is_none(), "{unsupported}");
+    }
+}
+
+#[test]
+fn method_parameter_count_keeps_nested_binary_identity_opaque() {
+    use ktcore::classfile::{method_parameter_count, method_types};
+    let class = ktcore::classfile::decode(
+        "fixture:nested-return",
+        include_bytes!("fixtures/classfile/shadowfixture/NestedBoundMid.class"),
+    )
+    .unwrap();
+    let method = class
+        .methods
+        .iter()
+        .find(|method| method.name.as_ref() == "f" && method.access_flags & 0x1040 == 0)
+        .unwrap();
+    assert!(method_types(&method.descriptor).is_none());
+    assert_eq!(method_parameter_count(&method.descriptor), Some(0));
+    assert_eq!(method_parameter_count("(J[[Lpkg/Outer$Inner;D)V"), Some(3));
+    for malformed in ["()", "()[V", "()Igarbage", "(Lpkg//Nested;)V", "(V)V"] {
+        assert_eq!(method_parameter_count(malformed), None, "{malformed}");
     }
 }
 

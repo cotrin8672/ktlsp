@@ -9,6 +9,9 @@ use ktcore::index::{Index, InferenceIndex};
 use ktcore::knowledge::Knowledge;
 use tree_sitter::Tree;
 
+mod source_hydration;
+pub(crate) use source_hydration::{prepare_sources, PreparedSource, SourceRequest};
+
 pub use ktcore::extensions::AnalysisProvider;
 
 #[derive(Default)]
@@ -23,6 +26,16 @@ pub(crate) struct AnalysisExtensions {
     suspended: bool,
     pending_index: bool,
     published_revision: u64,
+    source_epoch: u64,
+    library_sources: BTreeMap<
+        String,
+        (
+            ktcore::project_model::FileOrigin,
+            Arc<crate::deps::LibrarySource>,
+        ),
+    >,
+    attempted_sources: BTreeMap<String, source_hydration::SourceStamp>,
+    hydrated_sources: BTreeMap<String, source_hydration::SourceStamp>,
 }
 
 impl AnalysisExtensions {
@@ -100,6 +113,7 @@ impl AnalysisExtensions {
         let namespace = self.store.namespace_revision();
         let keys: Vec<_> = sources.iter().map(|(key, _, _)| key.clone()).collect();
         for (key, text, tree) in sources {
+            self.hydrated_sources.remove(&key);
             self.changed.insert(key.clone());
             // A host source replacement cannot transfer a prior build's binary authority.
             let compiled = self
@@ -112,6 +126,7 @@ impl AnalysisExtensions {
                     text,
                     tree,
                     compiled,
+                    prepared_references: None,
                 },
             );
         }
@@ -140,6 +155,9 @@ impl AnalysisExtensions {
             self.clear_compiled();
         }
         self.inputs.remove(key);
+        self.hydrated_sources.remove(key);
+        self.attempted_sources.remove(key);
+        self.library_sources.remove(key);
         let namespace = self.store.namespace_revision();
         self.store.remove_source(key);
         self.changed.insert(key.into());
@@ -155,6 +173,7 @@ impl AnalysisExtensions {
         }
         self.mark_published();
         self.suspended = true;
+        self.invalidate_hydrated_sources();
         self.clear_compiled();
         self.store.invalidate_model();
     }
@@ -164,6 +183,7 @@ impl AnalysisExtensions {
             return;
         }
         self.mark_published();
+        self.invalidate_hydrated_sources();
         self.clear_compiled();
         self.store.invalidate_model();
         self.normalize_all(index);
@@ -233,13 +253,20 @@ impl AnalysisExtensions {
             return Ok(());
         };
         let facts = crate::language::extension_source_facts(index, key, &input.tree, &input.text);
-        if let Err(error) = self.store.replace_source_declarations(
-            index,
-            key,
-            input.text.clone(),
-            Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]),
-            facts,
-        ) {
+        let coverage = Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]);
+        let replaced = match input.prepared_references.clone() {
+            Some(prepared) => self
+                .store
+                .replace_prepared_source_declarations(index, prepared, coverage, facts),
+            None => self.store.replace_source_declarations(
+                index,
+                key,
+                input.text.clone(),
+                coverage,
+                facts,
+            ),
+        };
+        if let Err(error) = replaced {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
             self.store.remove_source(key);
             tracing::warn!(file = key, ?error, "invalid normalized extension source");
@@ -349,6 +376,7 @@ struct SourceInput {
     text: Arc<str>,
     tree: Tree,
     compiled: Option<Arc<ktcore::classfile::ClassFileFacts>>,
+    prepared_references: Option<ktcore::extensions::source::PreparedSourceReferences>,
 }
 
 impl AnalysisExtensions {
@@ -439,6 +467,7 @@ impl AnalysisExtensions {
                     text: owner.text,
                     tree: owner.tree,
                     compiled: Some(owner.class),
+                    prepared_references: None,
                 },
             );
         }

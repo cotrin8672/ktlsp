@@ -186,6 +186,86 @@ mod tests {
     }
 
     #[test]
+    fn shape_and_mapped_builtin_signatures_bind_through_source_adapters() {
+        let mut workspace =
+            ktlsp::workspace::Workspace::with_analysis_providers(vec![Arc::new(ShadowProvider)]);
+        for (file, source) in [
+            (
+                "Mixin.java",
+                include_str!("../project/org/spongepowered/asm/mixin/Mixin.java"),
+            ),
+            (
+                "Shadow.java",
+                include_str!("../project/org/spongepowered/asm/mixin/Shadow.java"),
+            ),
+            (
+                "ShapeTarget.java",
+                include_str!("../project/fixture/ShapeTarget.java"),
+            ),
+            (
+                "ShapeMixin.java",
+                include_str!("../project/fixture/ShapeMixin.java"),
+            ),
+            (
+                "ShapeKotlinMixin.kt",
+                include_str!("../project/fixture/ShapeKotlinMixin.kt"),
+            ),
+            (
+                "KotlinShapeTarget.kt",
+                include_str!("../project/fixture/KotlinShapeTarget.kt"),
+            ),
+            (
+                "KotlinShapeMixin.kt",
+                include_str!("../project/fixture/KotlinShapeMixin.kt"),
+            ),
+            ("Object.java", "package java.lang; public class Object {}"),
+            ("Any.kt", "package kotlin\nopen class Any\n"),
+        ] {
+            workspace.open(file, source.into());
+        }
+        for (file, target, names, prefix) in [
+            (
+                "ShapeMixin.java",
+                "ShapeTarget.java",
+                &["axis", "point"][..],
+                "shadow$",
+            ),
+            (
+                "ShapeKotlinMixin.kt",
+                "ShapeTarget.java",
+                &["axis", "point", "any", "text"][..],
+                "",
+            ),
+            (
+                "KotlinShapeMixin.kt",
+                "KotlinShapeTarget.kt",
+                &["axis", "marker"][..],
+                "",
+            ),
+        ] {
+            let source = workspace.doc_text(file).unwrap().to_string();
+            let target_source = workspace.doc_text(target).unwrap().to_string();
+            for name in names {
+                let offset = source.find(&format!("{prefix}{name}(")).unwrap() + prefix.len();
+                let targets = workspace.goto_definition(file, offset);
+                assert_eq!(targets.len(), 1, "{file} {name}: {targets:?}");
+                assert_eq!(targets[0].file, target, "{file} {name}: {targets:?}");
+                assert_eq!(
+                    targets[0].start_byte,
+                    target_source.find(&format!(" {name}(")).unwrap() + 1
+                );
+            }
+            assert!(
+                !workspace
+                    .diagnostics(file)
+                    .iter()
+                    .any(|item| item.message.starts_with("External Shadow:")),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
     fn nominal_shadow_bindings_follow_types_edits_and_configuration() {
         let mut workspace =
             ktlsp::workspace::Workspace::with_analysis_providers(vec![Arc::new(ShadowProvider)]);

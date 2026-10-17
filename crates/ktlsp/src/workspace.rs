@@ -90,6 +90,7 @@ pub struct Workspace {
     live_dependency_origins: BTreeSet<String>,
     project_refresh_pending: bool,
     analysis_extensions: crate::analysis_extensions::AnalysisExtensions,
+    extension_sources_running: bool,
     annotated_type_owners: HashMap<String, BTreeSet<Def>>,
     observed_compile: Option<ObservedCompileTicket>,
     kotlin_diagnostic_tickets: BTreeMap<ProjectScope, KotlinDiagnosticTicket>,
@@ -131,6 +132,7 @@ impl Workspace {
             live_dependency_origins: BTreeSet::new(),
             project_refresh_pending: false,
             analysis_extensions: crate::analysis_extensions::AnalysisExtensions::new(providers),
+            extension_sources_running: false,
             annotated_type_owners: HashMap::new(),
             observed_compile: None,
             kotlin_diagnostic_tickets: BTreeMap::new(),
@@ -482,7 +484,7 @@ impl Workspace {
         }
         if let Some(model) = &self.project_model {
             if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
-                if let Some(origin) = batch.origin {
+                if let Some(origin) = batch.origin.clone() {
                     if origin.origin_id.starts_with("jdk:")
                         && self.global_origins.insert(origin.origin_id.clone())
                     {
@@ -497,11 +499,27 @@ impl Workspace {
                 }
             }
         }
+        // Archive hydration also needs exact ownership in projects without an imported model.
+        if self.project_model.is_none()
+            && self.index.file_origin(&batch.file).is_none()
+            && batch.library_source.is_some()
+        {
+            if let Some(origin) = &batch.origin {
+                metadata_changed |= self.index.set_file_origin(&batch.file, origin.clone());
+            }
+        }
         if metadata_changed {
             self.invalidate_observed_compile();
             self.analysis_extensions.mark_index_changed();
         }
-        if self.index_dependency_file(&batch.file, batch.symbols) {
+        let indexed = self.index_dependency_file(&batch.file, batch.symbols);
+        self.analysis_extensions.select_library_source(
+            &self.index,
+            &batch.file,
+            batch.origin.clone(),
+            batch.library_source,
+        );
+        if indexed {
             self.index
                 .replace_jvm_source(&batch.file, batch.jvm, Tier::Durable);
             true
@@ -576,6 +594,36 @@ impl Workspace {
             self.bump_index_revision();
         }
         registered
+    }
+
+    pub(crate) fn begin_extension_source_batch(
+        &mut self,
+    ) -> Vec<crate::analysis_extensions::SourceRequest> {
+        if self.extension_sources_running {
+            return Vec::new();
+        }
+        let requests = self.analysis_extensions.take_source_requests(&self.index);
+        self.extension_sources_running = !requests.is_empty();
+        requests
+    }
+
+    pub(crate) fn finish_extension_source_batch(
+        &mut self,
+        prepared: Vec<crate::analysis_extensions::PreparedSource>,
+    ) -> Vec<String> {
+        if self
+            .analysis_extensions
+            .accept_sources(&self.index, prepared)
+        {
+            self.bump_index_revision();
+        }
+        self.extension_sources_running = false;
+        let mut changed = self.take_extension_diagnostic_changes();
+        // Closed archive facts do not need editor diagnostics or a second closed-document parse.
+        changed.retain(|key| {
+            self.open_docs.contains_key(key) || self.project_file_meta.contains_key(key)
+        });
+        changed
     }
 
     pub fn take_extension_diagnostic_changes(&mut self) -> Vec<String> {
@@ -829,19 +877,12 @@ impl Workspace {
     }
 
     /// `textDocument/definition`: resolve the identifier at `offset` (a byte offset into the
-    /// current text of `key`). Open buffers use their cached tree (no parse on the hot path);
-    /// a non-open file is read from disk and parsed once.
+    /// current text of `key`). Open buffers reuse their cached tree; unfinished receivers may
+    /// need query-local recovery. Closed source authority can require fresh parsing.
     pub fn goto_definition(&mut self, key: &str, offset: usize) -> Vec<Def> {
         self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
-            let defs = language::goto_definition(
-                &self.index.scoped_for_file(key),
-                SourceLanguage::for_key(key),
-                key,
-                &doc.text,
-                &doc.tree,
-                offset,
-            );
+            let defs = self.goto_definition_for_tree(key, &doc.text, &doc.tree, offset);
             materialize_definition_files(&defs);
             return defs;
         }
@@ -856,14 +897,7 @@ impl Workspace {
                 return defs;
             }
         }
-        let defs = language::goto_definition(
-            &self.index.scoped_for_file(key),
-            language,
-            key,
-            &text,
-            &tree,
-            offset,
-        );
+        let defs = self.goto_definition_for_tree(key, &text, &tree, offset);
         materialize_definition_files(&defs);
         defs
     }
@@ -875,14 +909,24 @@ impl Workspace {
         tree: &Tree,
         offset: usize,
     ) -> Vec<Def> {
-        language::goto_definition(
-            &self.index.scoped_for_file(key),
-            SourceLanguage::for_key(key),
-            key,
-            text,
-            tree,
-            offset,
-        )
+        let recovery = is_java_path(key)
+            .then(|| java::definition_source(key, text, tree, offset))
+            .flatten();
+        self.with_java_member_proofs_in_source(key, recovery.as_ref(), |index| {
+            if let Some(recovery) = &recovery {
+                if let Some(recovered) = recovery.recovered_index(index, key) {
+                    return language::goto_definition(
+                        &recovered,
+                        SourceLanguage::Java,
+                        key,
+                        &recovery.text,
+                        &recovery.tree,
+                        offset,
+                    );
+                }
+            }
+            language::goto_definition(index, SourceLanguage::for_key(key), key, text, tree, offset)
+        })
     }
 
     fn closed_member_goto_definition(
@@ -994,24 +1038,28 @@ impl Workspace {
     ) -> Option<semantic_query::ResolvedSymbolQuery> {
         self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
-            return semantic_query::resolved_symbol_query(
-                &self.index.scoped_for_file(key),
-                key,
-                &doc.tree,
-                &doc.text,
-                offset,
-                &self.effective_completeness(),
-            );
+            return self.with_java_member_proofs(key, |index| {
+                semantic_query::resolved_symbol_query(
+                    index,
+                    key,
+                    &doc.tree,
+                    &doc.text,
+                    offset,
+                    &self.effective_completeness(),
+                )
+            });
         }
         let (text, tree) = self.parsed_closed_doc(key)?;
-        semantic_query::resolved_symbol_query(
-            &self.index.scoped_for_file(key),
-            key,
-            &tree,
-            &text,
-            offset,
-            &self.effective_completeness(),
-        )
+        self.with_java_member_proofs(key, |index| {
+            semantic_query::resolved_symbol_query(
+                index,
+                key,
+                &tree,
+                &text,
+                offset,
+                &self.effective_completeness(),
+            )
+        })
     }
 
     pub fn after_dot_query(
@@ -1044,24 +1092,32 @@ impl Workspace {
         self.refresh_compiled_freshness();
         if is_java_path(key) {
             if let Some(doc) = self.open_docs.get(key) {
-                return java::completion_query(
-                    &self.index.scoped_for_file(key),
-                    key,
-                    &doc.text,
-                    &doc.tree,
-                    offset,
-                    MAX_COMPLETIONS,
-                );
+                let recovery = java::completion_source(key, &doc.text, &doc.tree, offset);
+                return self.with_java_member_proofs_in_source(key, recovery.as_ref(), |index| {
+                    java::completion_query_with_source(
+                        index,
+                        key,
+                        &doc.text,
+                        &doc.tree,
+                        offset,
+                        MAX_COMPLETIONS,
+                        recovery.as_ref(),
+                    )
+                });
             }
             let (text, tree) = self.parsed_closed_doc(key)?;
-            return java::completion_query(
-                &self.index.scoped_for_file(key),
-                key,
-                &text,
-                &tree,
-                offset,
-                MAX_COMPLETIONS,
-            );
+            let recovery = java::completion_source(key, &text, &tree, offset);
+            return self.with_java_member_proofs_in_source(key, recovery.as_ref(), |index| {
+                java::completion_query_with_source(
+                    index,
+                    key,
+                    &text,
+                    &tree,
+                    offset,
+                    MAX_COMPLETIONS,
+                    recovery.as_ref(),
+                )
+            });
         }
         if !self.open_docs.contains_key(key) {
             if let Some(query) = self.closed_completion_query(key, offset) {
@@ -1374,29 +1430,33 @@ impl Workspace {
     ) -> Vec<crate::hints::InlayHint> {
         self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
-            return language::inlay_hints(
-                SourceLanguage::for_key(key),
-                &self.index.scoped_for_file(key),
-                key,
-                &doc.tree,
-                &doc.text,
-                start_byte,
-                end_byte,
-            );
+            return self.with_java_member_proofs(key, |index| {
+                language::inlay_hints(
+                    SourceLanguage::for_key(key),
+                    index,
+                    key,
+                    &doc.tree,
+                    &doc.text,
+                    start_byte,
+                    end_byte,
+                )
+            });
         }
         let (text, tree) = match self.parsed_closed_doc(key) {
             Some(parsed) => parsed,
             None => return Vec::new(),
         };
-        language::inlay_hints(
-            SourceLanguage::for_key(key),
-            &self.index.scoped_for_file(key),
-            key,
-            &tree,
-            &text,
-            start_byte,
-            end_byte,
-        )
+        self.with_java_member_proofs(key, |index| {
+            language::inlay_hints(
+                SourceLanguage::for_key(key),
+                index,
+                key,
+                &tree,
+                &text,
+                start_byte,
+                end_byte,
+            )
+        })
     }
 
     /// `textDocument/prepareRename`: exact range + current spelling for project/local symbols.
@@ -1488,7 +1548,23 @@ impl Workspace {
         if self.index.lookup_refs(&name).len() > RENAME_REF_CAP {
             return None;
         }
-        let family = self.rename_member_family(&target)?;
+        let family_start = std::time::Instant::now();
+        let family = self.rename_member_family(&target);
+        if crate::trace::enabled() {
+            crate::trace::span(
+                "workspace.rename.member_family",
+                "workspace",
+                family_start,
+                serde_json::json!({
+                    "file": key,
+                    "targetFile": target.file,
+                    "symbol": name,
+                    "found": family.is_some(),
+                    "members": family.as_ref().map_or(0, Vec::len),
+                }),
+            );
+        }
+        let family = family?;
         if family.len() > 1 {
             let candidates = self.index.lookup_refs(&name).to_vec();
             for candidate in candidates {
@@ -2196,27 +2272,31 @@ impl Workspace {
     pub fn type_definition(&mut self, key: &str, offset: usize) -> Vec<Def> {
         self.refresh_compiled_freshness();
         if let Some(doc) = self.open_docs.get(key) {
-            return language::type_definition(
-                SourceLanguage::for_key(key),
-                &self.index.scoped_for_file(key),
-                key,
-                &doc.tree,
-                &doc.text,
-                offset,
-            );
+            return self.with_java_member_proofs(key, |index| {
+                language::type_definition(
+                    SourceLanguage::for_key(key),
+                    index,
+                    key,
+                    &doc.tree,
+                    &doc.text,
+                    offset,
+                )
+            });
         }
         let (text, tree) = match self.parsed_closed_doc(key) {
             Some(parsed) => parsed,
             None => return Vec::new(),
         };
-        language::type_definition(
-            SourceLanguage::for_key(key),
-            &self.index.scoped_for_file(key),
-            key,
-            &tree,
-            &text,
-            offset,
-        )
+        self.with_java_member_proofs(key, |index| {
+            language::type_definition(
+                SourceLanguage::for_key(key),
+                index,
+                key,
+                &tree,
+                &text,
+                offset,
+            )
+        })
     }
 
     pub fn hierarchy_item_at(&mut self, key: &str, offset: usize) -> Option<HierarchyItem> {
@@ -2256,27 +2336,31 @@ impl Workspace {
 
     pub fn outgoing_calls(&mut self, item: &HierarchyItem) -> Vec<OutgoingCall> {
         if let Some(doc) = self.open_docs.get(&item.file) {
-            return language::outgoing_calls(
-                SourceLanguage::for_key(&item.file),
-                &self.index.scoped_for_file(&item.file),
-                &item.file,
-                &doc.tree,
-                &doc.text,
-                item,
-            );
+            return self.with_java_member_proofs(&item.file, |index| {
+                language::outgoing_calls(
+                    SourceLanguage::for_key(&item.file),
+                    index,
+                    &item.file,
+                    &doc.tree,
+                    &doc.text,
+                    item,
+                )
+            });
         }
         let (text, tree) = match self.parsed_closed_doc(&item.file) {
             Some(parsed) => parsed,
             None => return Vec::new(),
         };
-        language::outgoing_calls(
-            SourceLanguage::for_key(&item.file),
-            &self.index.scoped_for_file(&item.file),
-            &item.file,
-            &tree,
-            &text,
-            item,
-        )
+        self.with_java_member_proofs(&item.file, |index| {
+            language::outgoing_calls(
+                SourceLanguage::for_key(&item.file),
+                index,
+                &item.file,
+                &tree,
+                &text,
+                item,
+            )
+        })
     }
 
     pub fn signature_help(
@@ -2299,14 +2383,9 @@ impl Workspace {
             mut entries,
             unqualified,
             projected_signatures,
-        } = language::signature_entries(
-            &self.index.scoped_for_file(key),
-            language,
-            key,
-            doc_text,
-            tree,
-            offset,
-        )?;
+        } = self.with_java_member_proofs(key, |index| {
+            language::signature_entries(index, language, key, doc_text, tree, offset)
+        })?;
         if entries.is_empty() && unqualified {
             entries = self
                 .index
@@ -2356,6 +2435,32 @@ impl Workspace {
         text: &str,
         tree: &Tree,
     ) -> Vec<crate::diagnostics::Diagnostic> {
+        self.with_java_member_proofs(key, |index| {
+            language::diagnostics(
+                index,
+                SourceLanguage::for_key(key),
+                key,
+                text,
+                tree,
+                &self.effective_completeness(),
+            )
+        })
+    }
+
+    fn with_java_member_proofs<T>(
+        &self,
+        key: &str,
+        query: impl FnOnce(&dyn crate::index::InferenceIndex) -> T,
+    ) -> T {
+        self.with_java_member_proofs_in_source(key, None, query)
+    }
+
+    fn with_java_member_proofs_in_source<T>(
+        &self,
+        key: &str,
+        recovery: Option<&java::CompletionSource>,
+        query: impl FnOnce(&dyn crate::index::InferenceIndex) -> T,
+    ) -> T {
         let scoped = self.index.scoped_for_file(key);
         let model = self
             .project_model
@@ -2365,9 +2470,13 @@ impl Workspace {
             .and_then(|model| model.plain_java_task(key))
             .filter(|_| is_java_path(key));
         let services = OnceCell::new();
-        let source_only = model.is_none() && self.source_only_caller(key);
+        let source_only_policy = OnceCell::new();
+        let source_only = || {
+            *source_only_policy
+                .get_or_init(|| model.is_none() && self.source_only_caller_in_source(key, recovery))
+        };
         let inventory = |owner: &crate::index::Entry| {
-            if source_only {
+            if source_only() {
                 let origin = self.index.file_origin(&owner.path)?;
                 if owner.tier == Tier::Durable
                     && !self.open_docs.contains_key(owner.path.as_ref())
@@ -2407,15 +2516,22 @@ impl Workspace {
             if let Some(complete) = source_proofs.borrow().get(&identity) {
                 return *complete;
             }
-            let complete = if source_only {
-                self.standalone_source_members_complete(owner)
+            let complete = if source_only() {
+                self.standalone_source_members_complete_in_source(
+                    owner,
+                    (owner.path.as_ref() == key).then_some(recovery).flatten(),
+                )
             } else {
                 match (model, caller) {
                     (Some(model), Some(task)) => {
-                        self.plain_java_source_members_complete(model, task, key, owner)
-                            && *services.get_or_init(|| {
-                                self.class_inventory.borrow_mut().plain_caller(task)
-                            })
+                        self.plain_java_source_members_complete_in_source(
+                            model,
+                            task,
+                            key,
+                            owner,
+                            (owner.path.as_ref() == key).then_some(recovery).flatten(),
+                        ) && *services
+                            .get_or_init(|| self.class_inventory.borrow_mut().plain_caller(task))
                     }
                     _ => false,
                 }
@@ -2428,14 +2544,7 @@ impl Workspace {
             inventory: &inventory,
             source_members: &source_members,
         };
-        language::diagnostics(
-            &index,
-            SourceLanguage::for_key(key),
-            key,
-            text,
-            tree,
-            &self.effective_completeness(),
-        )
+        query(&index)
     }
 
     fn effective_completeness(&self) -> resolve::CompletenessFacts {
@@ -2450,14 +2559,23 @@ impl Workspace {
         facts
     }
 
-    fn source_only_caller(&self, key: &str) -> bool {
+    fn source_only_caller_in_source(
+        &self,
+        key: &str,
+        recovery: Option<&java::CompletionSource>,
+    ) -> bool {
         if self.project_model.is_some()
             || self.project_refresh_pending
             || !self.project_scan_initialized
-            || !self
-                .project_file_meta
-                .get(key)
-                .is_some_and(|meta| meta.clean && meta.scope.is_none())
+            || !self.project_file_meta.get(key).is_some_and(|meta| {
+                (meta.clean
+                    || recovery.is_some_and(|view| view.headers_complete)
+                    || is_java_path(key)
+                        && self.open_docs.get(key).is_some_and(|doc| {
+                            java::declaration_headers_complete(&doc.tree, &doc.text)
+                        }))
+                    && meta.scope.is_none()
+            })
         {
             return false;
         }
@@ -2478,12 +2596,17 @@ impl Workspace {
             })
     }
 
-    fn standalone_source_members_complete(&self, owner: &crate::index::Entry) -> bool {
+    fn standalone_source_members_complete_in_source(
+        &self,
+        owner: &crate::index::Entry,
+        recovery: Option<&java::CompletionSource>,
+    ) -> bool {
+        let recovery = recovery.filter(|view| view.proves_owner(owner));
         if owner.tier != Tier::Volatile
             || owner.sym.container.is_some()
             || !matches!(owner.sym.kind, SymbolKind::Class | SymbolKind::Interface)
             || !owner.sym.type_params.is_empty()
-            || !self.source_only_caller(&owner.path)
+            || !self.source_only_caller_in_source(&owner.path, recovery)
             || self.analysis_extensions.needs_source(&owner.path)
             || !self
                 .annotated_type_owners
@@ -2493,7 +2616,9 @@ impl Workspace {
             return false;
         }
         let closed;
-        let (text, tree) = if let Some(doc) = self.open_docs.get(owner.path.as_ref()) {
+        let (text, tree) = if let Some(view) = recovery {
+            (view.text.as_str(), &view.tree)
+        } else if let Some(doc) = self.open_docs.get(owner.path.as_ref()) {
             (doc.text.as_str(), &doc.tree)
         } else {
             let Some(mut batch) =
@@ -2525,7 +2650,9 @@ impl Workspace {
             closed = batch.source;
             (closed.0.as_ref(), &closed.1)
         };
-        if tree.root_node().has_error() {
+        if tree.root_node().has_error()
+            && !(is_java_path(&owner.path) && java::declaration_headers_complete(tree, text))
+        {
             return false;
         }
         let Some(name) = self.identifier_at_key(&owner.path, tree, owner.sym.start_byte) else {
@@ -2592,8 +2719,8 @@ impl Workspace {
     }
 
     /// A current Java owner under the caller's selected javac task. This does not close project
-    /// producers or Kotlin output. A closed owner is re-read only for this negative diagnostic,
-    /// with a stable indexed stamp and exact current declaration facts; no source cache is added.
+    /// producers or Kotlin output. Closed owners are freshly parsed against the indexed stamp
+    /// and declaration facts; query-local recovery can prove preserved current caller headers.
     fn plain_java_source_members_complete(
         &self,
         model: &crate::classpath::ProjectSnapshot,
@@ -2601,6 +2728,18 @@ impl Workspace {
         caller: &str,
         owner: &crate::index::Entry,
     ) -> bool {
+        self.plain_java_source_members_complete_in_source(model, task, caller, owner, None)
+    }
+
+    fn plain_java_source_members_complete_in_source(
+        &self,
+        model: &crate::classpath::ProjectSnapshot,
+        task: &crate::classpath::CompilerTask,
+        caller: &str,
+        owner: &crate::index::Entry,
+        recovery: Option<&java::CompletionSource>,
+    ) -> bool {
+        let recovery = recovery.filter(|view| view.proves_owner(owner));
         if self.project_refresh_pending
             || owner.tier != Tier::Volatile
             || !is_java_path(&owner.path)
@@ -2631,7 +2770,12 @@ impl Workspace {
         let Some(meta) = self.project_file_meta.get(owner.path.as_ref()) else {
             return false;
         };
-        if !meta.clean
+        if !(meta.clean
+            || recovery.is_some()
+            || self
+                .open_docs
+                .get(owner.path.as_ref())
+                .is_some_and(|doc| java::declaration_headers_complete(&doc.tree, &doc.text)))
             || meta.package != owner.sym.package
             || meta.scope.is_none()
             || meta.scope != self.project_scope_for_file(caller)
@@ -2643,7 +2787,9 @@ impl Workspace {
             return false;
         }
         let closed;
-        let (text, tree) = if let Some(doc) = self.open_docs.get(owner.path.as_ref()) {
+        let (text, tree) = if let Some(view) = recovery {
+            (view.text.as_str(), &view.tree)
+        } else if let Some(doc) = self.open_docs.get(owner.path.as_ref()) {
             (doc.text.as_str(), &doc.tree)
         } else {
             let Some(stamp) = self.source_stamps.get(owner.path.as_ref()) else {
@@ -2682,8 +2828,18 @@ impl Workspace {
             (closed.0.as_ref(), &closed.1)
         };
         let root = tree.root_node();
-        if root.has_error() {
+        if !java::declaration_headers_complete(tree, text) {
             return false;
+        }
+        if recovery.is_some() {
+            let mut pending = vec![root];
+            while let Some(node) = pending.pop() {
+                if matches!(node.kind(), "annotation" | "marker_annotation") {
+                    return false;
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.children(&mut cursor));
+            }
         }
         let is_type = |node: &tree_sitter::Node<'_>| {
             matches!(
@@ -5214,6 +5370,7 @@ mod tests {
                 file: crate::paths::file_key(&path),
                 symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
                 jvm: None,
+                library_source: None,
                 origin: Some(crate::project_model::FileOrigin {
                     origin_id: crate::classpath::jdk_origin_id(
                         &root.join(format!("jdk{feature}/lib/src.zip")),
@@ -5397,6 +5554,7 @@ mod tests {
                 file: key.into(),
                 symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
                 jvm: None,
+                library_source: None,
                 origin: Some(crate::project_model::FileOrigin {
                     origin_id: origin.clone(),
                     representation: crate::project_model::SourceRepresentation::Source,
@@ -5825,6 +5983,7 @@ mod tests {
                 jvm: None,
                 file: key,
                 symbols: language::file_facts(SourceLanguage::Java, &tree, text).symbols,
+                library_source: None,
                 origin: Some(FileOrigin {
                     origin_id: origin.clone(),
                     representation: SourceRepresentation::Source,
@@ -5941,6 +6100,7 @@ mod tests {
                 jvm: None,
                 file: key.to_string(),
                 symbols: language::file_facts(SourceLanguage::for_key(key), &tree, text).symbols,
+                library_source: None,
                 origin: Some(FileOrigin {
                     origin_id: "maven:vendor:api:1".to_string(),
                     representation: SourceRepresentation::Source,

@@ -1735,13 +1735,7 @@ pub fn generic_receiver_extensions<'a>(
                 .filter(|real_name| *real_name != name),
         )
         .flat_map(|lookup_name| index.lookup_by_name(lookup_name))
-        .filter(|e| e.sym.container.is_none())
-        .filter(|e| {
-            e.sym
-                .ext_receiver
-                .as_deref()
-                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
-        })
+        .filter(|e| crate::index::is_generic_receiver_extension(e))
         .filter(|e| visible_extension_names(e, imports, current_pkg).any(|visible| visible == name))
         .collect()
 }
@@ -2066,7 +2060,7 @@ fn entries_to_defs(entries: Vec<&Entry>) -> Vec<Def> {
         .collect()
 }
 
-fn narrow_source_set_entries(entries: Vec<&Entry>) -> Vec<&Entry> {
+pub(crate) fn narrow_source_set_entries(entries: Vec<&Entry>) -> Vec<&Entry> {
     if entries.len() <= 1 {
         return entries;
     }

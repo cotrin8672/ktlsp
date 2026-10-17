@@ -355,6 +355,16 @@ fn walk_declaration_container<'tree>(
                     sym.params = parameter_types(child, src, scope);
                     sym.type_params = type_parameter_names(child, src);
                     sym.type_parameter_facts = java_type_parameter_facts(child);
+                    if !sym.type_params.is_empty()
+                        && !sym.type_parameter_facts.known_unbounded()
+                        && sym.type_parameter_facts.known_invariant()
+                    {
+                        sym.method_type_bounds = ktcore::indexer::method_type_bounds(
+                            &java_type_parameters_in_scope(child, src, scope),
+                            child.start_byte(),
+                            child.end_byte(),
+                        );
+                    }
                     sym.arity = Some(sym.params.len().min(u8::MAX as usize) as u8);
                     sym.min_arity = sym.arity;
                     sym.has_vararg = has_vararg_parameter(child);
@@ -392,7 +402,10 @@ fn walk_declaration_container<'tree>(
             }
             "enum_constant" => {
                 if let Some(name) = name_field(child) {
-                    push(out, name, src, SymbolKind::EnumEntry, package, container);
+                    let mut symbol =
+                        indexed_symbol(name, src, SymbolKind::EnumEntry, package, container);
+                    symbol.source_member = crate::indexer::source_member_flags(child, src, true);
+                    out.push(symbol);
                 }
             }
             // Recurse only through declaration-bearing wrappers. Avoid walking arbitrary
@@ -434,6 +447,52 @@ fn has_vararg_parameter(node: Node<'_>) -> bool {
         .named_children(&mut cursor)
         .any(|child| child.kind() == "spread_parameter");
     has_vararg
+}
+
+/// Method-body edits cannot add owner fields when every declaration header and outer brace survives.
+pub(crate) fn declaration_headers_complete(tree: &Tree, src: &str) -> bool {
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            return false;
+        }
+        let body = if matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            if ktcore::indexer::source_member_flags(node, src, true)
+                .implementation()
+                .is_none()
+            {
+                return false;
+            }
+            let body = node.child_by_field_name("body");
+            if let Some(body) = body {
+                let Some(first) = body.child(0) else {
+                    return false;
+                };
+                let Some(last) = body.child(body.child_count().saturating_sub(1)) else {
+                    return false;
+                };
+                if first.kind() != "{"
+                    || last.kind() != "}"
+                    || first.is_missing()
+                    || last.is_missing()
+                {
+                    return false;
+                }
+            }
+            body
+        } else {
+            None
+        };
+        let mut cursor = node.walk();
+        pending.extend(
+            node.children(&mut cursor)
+                .filter(|child| Some(*child) != body),
+        );
+    }
+    true
 }
 
 fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<TypeRef> {
@@ -604,13 +663,21 @@ fn type_parameter_names(node: Node<'_>, src: &str) -> Vec<String> {
 
 fn type_parameters_in_scope(node: Node<'_>, src: &str, tree: &Tree) -> Vec<TypeParameterBounds> {
     let file_scope = type_scope(tree, src);
+    java_type_parameters_in_scope(node, src, &file_scope)
+}
+
+fn java_type_parameters_in_scope(
+    node: Node<'_>,
+    src: &str,
+    file_scope: &TypeScope,
+) -> Vec<TypeParameterBounds> {
     let mut out = Vec::new();
     let mut current = Some(node);
     let mut accessible = true;
     while let Some(decl) = current {
         if let Some(parameters) = decl.child_by_field_name("type_parameters") {
-            let scoped = java_declaration_scope(decl, src, &file_scope);
-            let scope = scoped.as_ref().unwrap_or(&file_scope);
+            let scoped = java_declaration_scope(decl, src, file_scope);
+            let scope = scoped.as_ref().unwrap_or(file_scope);
             let mut cursor = decl.walk();
             let valid_header = accessible
                 && !parameters.has_error()
@@ -3257,23 +3324,44 @@ fn receiver_member_defs(
         }
         return parent.child_by_field_name("object").map(|_| Vec::new());
     }
-    let object = match kind {
+    match kind {
         "field_access" if parent.child_by_field_name("field") == Some(usage) => {
             parent.child_by_field_name("object")
         }
         _ => None,
     }?;
     let name = node_text(usage, src);
-    let Some(recv) = receiver_type(index, file, src, tree, object, initializer_depth) else {
+    let Some((recv, receiver_kind)) =
+        java_member_receiver(index, file, src, tree, parent, initializer_depth)
+    else {
         return Some(Vec::new());
     };
-    let members = java_member_entries(index, &recv, name, SymbolKind::Property);
+    if receiver_kind == ktcore::jvm::ReceiverKind::Unknown {
+        return Some(Vec::new());
+    }
     let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
     ctx.package = package_of(tree, src);
+    ctx.imports = inference_imports(tree, src);
+    let candidates = ktcore::members::candidates(index, &recv, name, &ctx);
+    let members = candidates
+        .select(index, &recv, &ktcore::members::MemberUse::Value, &ctx)
+        .entries;
     let mut defs = members
         .iter()
         .filter(|entry| {
-            ktcore::members::member_accessible_at(index, &recv, entry, &ctx, usage.start_byte())
+            java_member_kind_matches(entry.sym.kind, SymbolKind::Property)
+                && is_java_file(&entry.path)
+                && entry.sym.source_member.dispatch().is_some()
+                && (receiver_kind != ktcore::jvm::ReceiverKind::Type
+                    || entry.sym.source_member.dispatch()
+                        == Some(ktcore::extensions::Dispatch::Static))
+                && ktcore::members::member_accessible_at(
+                    index,
+                    &recv,
+                    entry,
+                    &ctx,
+                    usage.start_byte(),
+                )
         })
         .map(|entry| Def {
             file: entry.path.to_string(),
@@ -3511,19 +3599,52 @@ fn receiver_type(
             }
         }
         "field_access" => {
-            let receiver = receiver_type(
-                index,
-                file,
-                src,
-                tree,
-                object.child_by_field_name("object")?,
-                initializer_depth + 1,
-            )?;
-            ktcore::members::java_array_member_type(
+            let (receiver, kind) =
+                java_member_receiver(index, file, src, tree, object, initializer_depth + 1)?;
+            let name = node_text(object.child_by_field_name("field")?, src);
+            if let Some(ty) = ktcore::members::java_array_member_type(
                 &receiver,
-                node_text(object.child_by_field_name("field")?, src),
+                name,
                 &ktcore::members::MemberUse::Value,
-            )
+            ) {
+                return Some(ty);
+            }
+            if kind == ktcore::jvm::ReceiverKind::Unknown {
+                return None;
+            }
+            let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
+            ctx.package = package_of(tree, src);
+            ctx.imports = inference_imports(tree, src);
+            let candidates = ktcore::members::candidates(index, &receiver, name, &ctx);
+            let selected =
+                candidates.select(index, &receiver, &ktcore::members::MemberUse::Value, &ctx);
+            let [field] = selected.entries.as_slice() else {
+                return None;
+            };
+            // Kotlin properties need verified JVM field lowering before Java field syntax is valid.
+            if field.sym.kind != SymbolKind::Property
+                || !is_java_file(&field.path)
+                || field.sym.source_member.dispatch().is_none()
+                || kind == ktcore::jvm::ReceiverKind::Type
+                    && field.sym.source_member.dispatch()
+                        != Some(ktcore::extensions::Dispatch::Static)
+                || !ktcore::members::member_accessible_at(
+                    index,
+                    &receiver,
+                    field,
+                    &ctx,
+                    object.start_byte(),
+                )
+            {
+                return None;
+            }
+            Some(infer::declared_member_type(
+                index,
+                &receiver,
+                field,
+                field.sym.value_type.as_ref()?,
+                &ctx,
+            ))
         }
         "method_invocation" => {
             java_method_invocation_return_type(index, file, src, tree, object, initializer_depth)
@@ -3660,12 +3781,14 @@ fn java_member_receiver(
                     }
                 }
             }
-            // No compiler/value-namespace closure is available here. Even a known class name
-            // could denote an unresolved imported or generated field; do not prove Type.
+            if let Some(receiver) = java_unshadowed_type_receiver(index, file, src, tree, object) {
+                return Some((receiver, ReceiverKind::Type));
+            }
+            // Without selected source closure an imported/generated field may shadow the type.
             receiver_type_from_type_identifier(index, file, src, tree, object)
                 .map(|receiver| (receiver, ReceiverKind::Unknown))
         }
-        "object_creation_expression" | "method_invocation" => {
+        "object_creation_expression" | "method_invocation" | "field_access" => {
             receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
@@ -3674,6 +3797,136 @@ fn java_member_receiver(
         _ => receiver_type(index, file, src, tree, object, initializer_depth)
             .map(|receiver| (receiver, ReceiverKind::Unknown)),
     }
+}
+
+fn java_unshadowed_type_receiver(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    object: Node<'_>,
+) -> Option<Type> {
+    let name = node_text(object, src);
+    let mut enclosing = object.parent();
+    while let Some(node) = enclosing {
+        enclosing = node.parent();
+        if !matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            continue;
+        }
+        let mut pending = vec![node.child_by_field_name("body")?];
+        while let Some(before) = pending.pop() {
+            if before.start_byte() >= object.start_byte() {
+                continue;
+            }
+            // A malformed earlier local declaration can hide a value with this type's name.
+            if before.is_error() || before.is_missing() {
+                return None;
+            }
+            let mut cursor = before.walk();
+            pending.extend(before.children(&mut cursor));
+        }
+        break;
+    }
+    if !index.scope_is_complete() || static_imports_of(tree, src).may_resolve(name) {
+        return None;
+    }
+    let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
+    ctx.package = package_of(tree, src);
+    ctx.imports = inference_imports(tree, src);
+    let receiver = infer::declared_type_in_scope(
+        index,
+        &type_scope(tree, src).type_ref(name, false, Vec::new()),
+        &ctx,
+        &type_parameters_in_scope(object, src, tree),
+    );
+    if !matches!(
+        &receiver,
+        Type::Class {
+            package: Some(_),
+            ..
+        }
+    ) || index
+        .lookup_type(receiver.name()?)
+        .iter()
+        .filter(|owner| {
+            Some(owner.sym.package.as_str()) == receiver.package()
+                && owner.sym.container.as_deref() == receiver.container()
+        })
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let mut found_owner = false;
+    let mut ancestor = object.parent();
+    while let Some(node) = ancestor {
+        ancestor = node.parent();
+        if !matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
+            continue;
+        }
+        let declared = name_field(node)?;
+        let owners: Vec<_> = index
+            .lookup_type(node_text(declared, src))
+            .into_iter()
+            .filter(|owner| {
+                owner.path.as_ref() == file
+                    && owner.sym.start_byte == declared.start_byte()
+                    && owner.sym.end_byte == declared.end_byte()
+            })
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        found_owner = true;
+        let owner_type = Type::Class {
+            name: owner.sym.name.clone(),
+            package: Some(owner.sym.package.clone()),
+            container: owner.sym.container.clone(),
+            nullable: false,
+            args: Vec::new(),
+        };
+        let mut complete = true;
+        let _ = infer::walk_supertypes(index, &owner_type, JAVA_SUPERTYPE_WALK_CAP, |current| {
+            let Some(root) = infer::receiver_root_key(index, current) else {
+                complete = false;
+                return ControlFlow::Break(());
+            };
+            let declarations: Vec<_> = index
+                .lookup_type(current.name().unwrap_or_default())
+                .into_iter()
+                .filter(|entry| {
+                    Some(entry.sym.package.as_str()) == current.package()
+                        && entry.sym.container.as_deref() == current.container()
+                })
+                .collect();
+            if declarations.len() != 1
+                || !index.source_members_complete(declarations[0])
+                || index.members_of(&root).iter().any(|entry| {
+                    entry.sym.name == name
+                        && entry.sym.kind.is_value_like()
+                        && Some(entry.sym.package.as_str()) == current.package()
+                        && entry.sym.container.as_deref() == Some(root.as_str())
+                })
+            {
+                complete = false;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        if !complete {
+            return None;
+        }
+    }
+    found_owner.then_some(receiver)
 }
 
 fn implicit_receiver_kind(node: Node<'_>, src: &str) -> ktcore::jvm::ReceiverKind {
@@ -4054,6 +4307,12 @@ fn java_method_invocation_return_type(
         let declared = entry.sym.return_type.as_ref()?;
         let ty =
             infer::declared_member_call_type(index, &receiver, &entry, declared, &arguments, &ctx);
+        let ty = ktcore::jvm::string_result_for_call_mode(
+            index,
+            ty,
+            &ctx,
+            ktcore::members::CallMode::Java,
+        );
         if !matches!(ty, Type::Array { .. })
             && ty
                 .name()
@@ -4585,6 +4844,27 @@ pub fn completion_query(
     offset: usize,
     max_candidates: usize,
 ) -> Option<CompletionQuery> {
+    let recovery = completion_source(file, src, tree, offset);
+    completion_query_with_source(
+        index,
+        file,
+        src,
+        tree,
+        offset,
+        max_candidates,
+        recovery.as_ref(),
+    )
+}
+
+pub(crate) fn completion_query_with_source(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+    max_candidates: usize,
+    recovery: Option<&CompletionSource>,
+) -> Option<CompletionQuery> {
     let context = completion_context(tree, src, offset);
     if context != complete::CompletionContext::None {
         let package = package_of(tree, src);
@@ -4613,91 +4893,22 @@ pub fn completion_query(
         }
     }
     if context == complete::CompletionContext::AfterDot {
-        let (prefix, mut synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
-        let selector_end = syn_offset
-            + synthetic[syn_offset..]
-                .chars()
-                .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
-                .map(char::len_utf8)
-                .sum::<usize>();
-        // Preserve an authored call, including a selector suffix to the right of the cursor.
-        let force_call = !synthetic[selector_end..].trim_start().starts_with('(');
-        if force_call {
-            synthetic.insert_str(selector_end, "()");
-        }
-        let mut synthetic_tree = JavaParser::new().parse(&synthetic);
-        let call_end = if force_call {
-            Some(selector_end + 2)
-        } else {
-            completion_receiver_at(&synthetic_tree, syn_offset)
-                .and_then(|receiver| receiver.parent())
-                .and_then(|call| call.child_by_field_name("arguments"))
-                .filter(|arguments| !arguments.has_error())
-                .map(|arguments| arguments.end_byte())
-        };
-        let mut restored = None;
-        let mut truncated = false;
-        if let Some(call_end) =
-            call_end.filter(|_| completion_needs_scope(&synthetic_tree, syn_offset))
-        {
-            if let Some(delimiters) = completion_delimiter_stack(&synthetic_tree, call_end) {
-                if let Some(closers) = completion_call_closers(&synthetic, call_end, &delimiters) {
-                    restored = Some((call_end, closers.len()));
-                    synthetic.insert_str(call_end, &closers);
-                    synthetic_tree = JavaParser::new().parse(&synthetic);
-                } else if let Some((prefix_source, prefix_tree)) = completion_prefix_source(
-                    &synthetic_tree,
-                    &synthetic,
-                    syn_offset,
-                    call_end,
-                    &delimiters,
-                ) {
-                    synthetic = prefix_source;
-                    synthetic_tree = prefix_tree;
-                    truncated = true;
-                }
-            }
-        }
-        let mut source = crate::index::Index::new();
-        let recovered = if tree.root_node().has_error() && !truncated {
-            let mut symbols = extract_symbols(&synthetic_tree, &synthetic);
-            let (call_end, restored_closers) = restored.unwrap_or((selector_end, 0));
-            // Keep semantic identities at authored offsets; discard names touching synthetic text.
-            symbols.retain_mut(|symbol| {
-                for (at, len) in [
-                    (call_end, restored_closers),
-                    (selector_end, usize::from(force_call) * 2),
-                    (offset, complete::DOT_PLACEHOLDER.len()),
-                ] {
-                    if len == 0 {
-                        continue;
-                    }
-                    if symbol.start_byte >= at + len {
-                        symbol.start_byte -= len;
-                        symbol.end_byte -= len;
-                    } else if symbol.end_byte > at {
-                        return false;
-                    }
-                }
-                true
-            });
-            source.replace_file(file, symbols, crate::index::Tier::Volatile);
-            Some(semantic_query::RecoveredTypeIndex::replacing_file(
-                index, &source, file,
-            ))
-        } else {
-            None
-        };
+        let recovery = recovery?;
+        let synthetic = &recovery.text;
+        let synthetic_tree = &recovery.tree;
+        let syn_offset = recovery.offset;
+        let prefix = recovery.prefix.clone();
+        let recovered = recovery.recovered_index(index, file);
         let index: &dyn InferenceIndex = recovered.as_ref().map_or(index, |recovered| recovered);
-        let receiver = completion_receiver_at(&synthetic_tree, syn_offset);
+        let receiver = completion_receiver_at(synthetic_tree, syn_offset);
         let (ty, receiver_kind) = if index.may_have_compiled_callables() {
             receiver
                 .and_then(|receiver| {
                     java_member_receiver(
                         index,
                         file,
-                        &synthetic,
-                        &synthetic_tree,
+                        synthetic,
+                        synthetic_tree,
                         receiver.parent()?,
                         0,
                     )
@@ -4707,20 +4918,20 @@ pub fn completion_query(
             (
                 receiver
                     .and_then(|receiver| {
-                        receiver_type(index, file, &synthetic, &synthetic_tree, receiver, 0)
+                        receiver_type(index, file, synthetic, synthetic_tree, receiver, 0)
                     })
                     .unwrap_or(Type::Unknown),
                 ktcore::jvm::ReceiverKind::Unknown,
             )
         };
-        let mut ctx = FileCtx::from_tree_in_file(&synthetic_tree, &synthetic, file);
-        ctx.package = package_of(&synthetic_tree, &synthetic);
-        ctx.imports = inference_imports(&synthetic_tree, &synthetic);
+        let mut ctx = FileCtx::from_tree_in_file(synthetic_tree, synthetic, file);
+        ctx.package = package_of(synthetic_tree, synthetic);
+        ctx.imports = inference_imports(synthetic_tree, synthetic);
         return semantic_query::member_completion_query_for_type_with_ctx(
             index,
             language::SourceLanguage::Java,
-            &synthetic_tree,
-            &synthetic,
+            synthetic_tree,
+            synthetic,
             ty,
             receiver_kind,
             prefix,
@@ -4750,6 +4961,211 @@ pub fn completion_query(
         candidates,
         layout: imports::import_layout_with_style(ImportStyle::Java, tree, src),
         status,
+    })
+}
+
+pub(crate) struct CompletionSource {
+    pub(crate) text: String,
+    pub(crate) tree: Tree,
+    pub(crate) headers_complete: bool,
+    prefix: String,
+    offset: usize,
+    symbols: Option<crate::index::Index>,
+    authored_edit_start: usize,
+}
+
+impl CompletionSource {
+    pub(crate) fn recovered_index<'a>(
+        &'a self,
+        index: &'a dyn InferenceIndex,
+        file: &'a str,
+    ) -> Option<semantic_query::RecoveredTypeIndex<'a>> {
+        self.symbols.as_ref().map(|source| {
+            semantic_query::RecoveredTypeIndex::replacing_file(index, source, file)
+                .with_source_member_proofs(self.headers_complete)
+        })
+    }
+
+    pub(crate) fn proves_owner(&self, owner: &crate::index::Entry) -> bool {
+        self.headers_complete
+            && owner.sym.end_byte <= self.authored_edit_start
+            && self.symbols.as_ref().is_some_and(|symbols| {
+                symbols
+                    .lookup_by_name(&owner.sym.name)
+                    .iter()
+                    .any(|entry| entry.sym == owner.sym)
+            })
+    }
+}
+
+/// Recover only an authored identifier contained in the receiver of an actual unfinished dot.
+pub(crate) fn definition_source(
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Option<CompletionSource> {
+    if !tree.root_node().has_error() {
+        return None;
+    }
+    let identifier = identifier_at(tree, offset)?;
+    let mut pending = vec![tree.root_node()];
+    let mut selected = None;
+    while let Some(node) = pending.pop() {
+        if node.end_byte() <= identifier.end_byte() {
+            continue;
+        }
+        if node.kind() == "."
+            && src[node.end_byte()..]
+                .trim_start()
+                .chars()
+                .next()
+                .is_none_or(|next| matches!(next, '}' | ')' | ']' | ';'))
+        {
+            let Some(recovery) = completion_source(file, src, tree, node.end_byte()) else {
+                continue;
+            };
+            if !recovery.headers_complete {
+                continue;
+            }
+            let Some(receiver) = completion_receiver_at(&recovery.tree, recovery.offset) else {
+                continue;
+            };
+            let Some(recovered_identifier) = identifier_at(&recovery.tree, offset) else {
+                continue;
+            };
+            if receiver.has_error()
+                || identifier.start_byte() < receiver.start_byte()
+                || identifier.end_byte() > receiver.end_byte()
+                || identifier.byte_range() != recovered_identifier.byte_range()
+                || node_text(identifier, src) != node_text(recovered_identifier, &recovery.text)
+            {
+                continue;
+            }
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some(recovery);
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    selected
+}
+
+/// A query-local view; only insertions inside surviving method bodies may certify owner headers.
+pub(crate) fn completion_source(
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    offset: usize,
+) -> Option<CompletionSource> {
+    if completion_context(tree, src, offset) != complete::CompletionContext::AfterDot {
+        return None;
+    }
+    let (prefix, mut synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
+    let selector_end = syn_offset
+        + synthetic[syn_offset..]
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+            .map(char::len_utf8)
+            .sum::<usize>();
+    // Preserve an authored call, including a selector suffix to the right of the cursor.
+    let force_call = !synthetic[selector_end..].trim_start().starts_with('(');
+    if force_call {
+        synthetic.insert_str(selector_end, "()");
+    }
+    let mut synthetic_tree = JavaParser::new().parse(&synthetic);
+    let call_end = if force_call {
+        Some(selector_end + 2)
+    } else {
+        completion_receiver_at(&synthetic_tree, syn_offset)
+            .and_then(|receiver| receiver.parent())
+            .and_then(|call| call.child_by_field_name("arguments"))
+            .filter(|arguments| !arguments.has_error())
+            .map(|arguments| arguments.end_byte())
+    };
+    let mut restored = None;
+    let mut truncated = false;
+    if let Some(call_end) = call_end.filter(|_| completion_needs_scope(&synthetic_tree, syn_offset))
+    {
+        if let Some(delimiters) = completion_delimiter_stack(&synthetic_tree, call_end) {
+            if let Some(closers) = completion_call_closers(&synthetic, call_end, &delimiters) {
+                restored = Some((call_end, closers.len()));
+                synthetic.insert_str(call_end, &closers);
+                synthetic_tree = JavaParser::new().parse(&synthetic);
+            } else if let Some((prefix_source, prefix_tree)) = completion_prefix_source(
+                &synthetic_tree,
+                &synthetic,
+                syn_offset,
+                call_end,
+                &delimiters,
+            ) {
+                synthetic = prefix_source;
+                synthetic_tree = prefix_tree;
+                truncated = true;
+            }
+        }
+    }
+    let (call_end, restored_closers) = restored.unwrap_or((selector_end, 0));
+    let edits = [
+        (call_end, restored_closers),
+        (selector_end, usize::from(force_call) * 2),
+        (offset, complete::DOT_PLACEHOLDER.len()),
+    ];
+    let headers_complete = !truncated
+        && declaration_headers_complete(&synthetic_tree, &synthetic)
+        && edits.iter().filter(|(_, len)| *len > 0).all(|(at, len)| {
+            let mut node = synthetic_tree
+                .root_node()
+                .descendant_for_byte_range(*at, at + len);
+            while let Some(current) = node {
+                if current.kind() == "block"
+                    && current.parent().is_some_and(|parent| {
+                        matches!(
+                            parent.kind(),
+                            "method_declaration" | "constructor_declaration"
+                        )
+                    })
+                {
+                    return current.start_byte() < *at && at + len < current.end_byte();
+                }
+                node = current.parent();
+            }
+            false
+        });
+    let symbols = if tree.root_node().has_error() && !truncated {
+        let mut symbols = extract_symbols(&synthetic_tree, &synthetic);
+        // Keep semantic identities at authored offsets; discard names touching synthetic text.
+        symbols.retain_mut(|symbol| {
+            for (at, len) in edits {
+                if len == 0 {
+                    continue;
+                }
+                if symbol.start_byte >= at + len {
+                    symbol.start_byte -= len;
+                    symbol.end_byte -= len;
+                } else if symbol.end_byte > at {
+                    return false;
+                }
+            }
+            true
+        });
+        let mut source = crate::index::Index::new();
+        source.replace_file(file, symbols, crate::index::Tier::Volatile);
+        Some(source)
+    } else {
+        None
+    };
+    Some(CompletionSource {
+        text: synthetic,
+        tree: synthetic_tree,
+        headers_complete,
+        prefix,
+        offset: syn_offset,
+        symbols,
+        authored_edit_start: offset,
     })
 }
 
@@ -4805,8 +5221,8 @@ fn completion_call_closers(
 }
 
 /// A later incomplete statement can erase an earlier receiver's block. Recover only a prefix
-/// that proves the same identifier is a preserved local, parameter or resource; fields and types
-/// may depend on declarations in the discarded suffix, so their full view must remain available.
+/// that proves the receiver is rooted in a preserved local, parameter or resource; fields and
+/// types may depend on the discarded suffix, so they cannot serve as that lexical root.
 fn completion_prefix_source(
     tree: &Tree,
     src: &str,
@@ -4815,7 +5231,7 @@ fn completion_prefix_source(
     delimiters: &[(u8, bool)],
 ) -> Option<(String, Tree)> {
     let original = completion_receiver_at(tree, selector_offset)?;
-    if original.kind() != "identifier" {
+    if original.has_error() {
         return None;
     }
     if delimiters.iter().any(|(_, semicolon)| *semicolon) {
@@ -4841,14 +5257,24 @@ fn completion_prefix_source(
     }
     let prefix_tree = JavaParser::new().parse(&prefix);
     let recovered = completion_receiver_at(&prefix_tree, selector_offset)?;
-    if recovered.kind() != "identifier"
+    if recovered.has_error()
+        || recovered.kind() != original.kind()
         || recovered.start_byte() != original.start_byte()
         || recovered.end_byte() != original.end_byte()
         || node_text(recovered, &prefix) != node_text(original, src)
     {
         return None;
     }
-    local_declaration_node(&prefix, recovered)?;
+    let mut binding = recovered;
+    while binding.kind() != "identifier" {
+        binding = match binding.kind() {
+            "method_invocation" | "field_access" => binding.child_by_field_name("object")?,
+            "array_access" => binding.child_by_field_name("array")?,
+            "parenthesized_expression" => binding.named_child(0)?,
+            _ => return None,
+        };
+    }
+    local_declaration_node(&prefix, binding)?;
     Some((prefix, prefix_tree))
 }
 
@@ -5654,32 +6080,73 @@ public class App {
     }
 }
 "#;
-        let enum_tree = JavaParser::new().parse(enum_src);
-        let app_tree = JavaParser::new().parse(app_src);
-        let mut index = Index::new();
-        index.replace_file(
-            "/other/Visibility.java",
-            extract_symbols(&enum_tree, enum_src),
-            crate::index::Tier::Volatile,
-        );
-        index.replace_file(
-            "/demo/App.java",
-            extract_symbols(&app_tree, app_src),
-            crate::index::Tier::Volatile,
-        );
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-enum-goto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::create_dir_all(root.join("demo")).unwrap();
+        let enum_path = root.join("other/Visibility.java");
+        let app_path = root.join("demo/App.java");
+        std::fs::write(&enum_path, enum_src).unwrap();
+        std::fs::write(&app_path, app_src).unwrap();
+        let enum_key = crate::paths::file_key(&enum_path);
+        let app_key = crate::paths::file_key(&app_path);
+        let mut workspace = crate::workspace::Workspace::new();
+        workspace.open(&enum_key, enum_src.into());
+        workspace.open(&app_key, app_src.into());
+        workspace.scan(&root);
 
         let public_offset = app_src.find("PUBLIC").unwrap();
-        let defs = goto_definition(&index, "/demo/App.java", app_src, &app_tree, public_offset);
+        let defs = workspace.goto_definition(&app_key, public_offset);
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].file, "/other/Visibility.java");
+        assert_eq!(defs[0].file, enum_key);
         let public_decl = enum_src.find("PUBLIC").unwrap();
         assert_eq!(defs[0].start_byte, public_decl);
 
         let private_offset = app_src.find("PRIVATE").unwrap();
-        let defs = goto_definition(&index, "/demo/App.java", app_src, &app_tree, private_offset);
+        let defs = workspace.goto_definition(&app_key, private_offset);
         assert_eq!(defs.len(), 1);
         let private_decl = enum_src.find("PRIVATE").unwrap();
         assert_eq!(defs[0].start_byte, private_decl);
+        for invalid in [
+            app_src.replace("public class App", "@UnknownProducer public class App"),
+            app_src.replace("boolean ok()", "boolean ok(Object Visibility)"),
+            app_src.replace(
+                "return Visibility.PUBLIC",
+                "Object Visibility = ; return Visibility.PUBLIC",
+            ),
+        ] {
+            workspace.change(&app_key, invalid.clone());
+            workspace.scan(&root);
+            assert!(
+                workspace
+                    .goto_definition(&app_key, invalid.find("PUBLIC").unwrap())
+                    .is_empty(),
+                "unproved enum namespace: {invalid}"
+            );
+        }
+        let typed = app_src
+            .replace("public class App", "@UnknownProducer public class App")
+            .replace("boolean ok()", "boolean ok(Visibility value)")
+            .replace("Visibility.PUBLIC", "value.PUBLIC")
+            .replace("Visibility.PRIVATE", "value.PRIVATE");
+        workspace.change(&app_key, typed.clone());
+        workspace.scan(&root);
+        assert_eq!(
+            workspace.goto_definition(&app_key, typed.find("PUBLIC").unwrap()),
+            vec![Def {
+                file: enum_key,
+                start_byte: public_decl,
+                end_byte: public_decl + "PUBLIC".len(),
+            }],
+            "an annotated caller retains its explicit enum value receiver"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

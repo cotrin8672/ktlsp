@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "project_id": "cem-ordinary-production",
+  "revision": "09073e3d71c9f62a48009f3c3698bb6e159a0636 plus exact existing user-source snapshot; hashes pinned",
+  "build_tool": "gradle",
+  "scope": "Separate ordinary non-Mixin production group: three CEM callers, six completion/exact-definition requests and six first-response hover/signature requests from the existing corpus extra hook. No original10 or auxiliary8 repeats, Mixin semantics, projectwide parity or speed acceptance.",
+  "compiler_baseline": "These unchanged selected production sources were included in actual clean canonical Kotlin2.4.0 CEM compilation. The twelve first editor responses matched on immutable integrated90-3; see docs/fork-current.md for evidence and limits. No IDEA result claimed.",
+  "probes": [
+    {
+      "id": "cem-ordinary-overloaded-factory",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/util/EnchantedItemFactory.kt",
+      "anchor": "val stack = getPickaxeItemStack(enchantments)",
+      "token": "getPickaxeItemStack",
+      "target_file": "src/main/kotlin/io/github/cotrin8672/cem/util/EnchantedItemFactory.kt",
+      "target_anchor": "fun getPickaxeItemStack(enchantmentSet: ItemEnchantments): ItemStack",
+      "expected": "Select the one-argument ItemEnchantments overload, not the nullable CompoundTag/MovementContext overload; useful completion and exact authored Kotlin declaration.",
+      "hover_contains": [
+        "getPickaxeItemStack",
+        "ItemEnchantments",
+        "ItemStack"
+      ],
+      "signature_parameters": 1,
+      "signature_contains": [
+        "getPickaxeItemStack",
+        "ItemEnchantments",
+        "ItemStack"
+      ],
+      "signature_excludes": [
+        "CompoundTag",
+        "MovementContext"
+      ],
+      "source_sha256": "b4cd8338fab846052a753a05acf755e789310ca98f5776a04247dfe0256e2201",
+      "target_sha256": "b4cd8338fab846052a753a05acf755e789310ca98f5776a04247dfe0256e2201",
+      "target_token": "getPickaxeItemStack",
+      "module": ":",
+      "compiler_status": "Included in clean selected canonical Kotlin2.4.0 CEM compilation; completion, exact declaration, hover and selected signature matched once. No IDEA result claimed.",
+      "source_raw_sha256": "2afc8e9aafd72258ade2aea1bc3ecd24d73f80d7fabcdfa6e10999aed3593314"
+    },
+    {
+      "id": "cem-ordinary-smartcast-member",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/roller/EnchantableRollerBlock.kt",
+      "anchor": "blockEntity.setEnchantment(enchantments)",
+      "token": "setEnchantment",
+      "target_file": "src/main/kotlin/io/github/cotrin8672/cem/content/block/EnchantableBlockEntity.kt",
+      "target_anchor": "fun setEnchantment(enchantments: ItemEnchantments)",
+      "expected": "After blockEntity is EnchantableBlockEntity, complete and navigate the ordinary Kotlin interface member instead of losing the smart cast to Minecraft BlockEntity.",
+      "hover_contains": [
+        "setEnchantment",
+        "ItemEnchantments"
+      ],
+      "signature_parameters": 1,
+      "signature_contains": [
+        "setEnchantment",
+        "ItemEnchantments"
+      ],
+      "source_sha256": "acbfaad0b95120851f152bc6c2f5fcd2d49abbabd205bc134f29ec2e53ff3e47",
+      "target_sha256": "5dbe4f1a019496492d3c52552808c721c18458cbfbfda61118d6d89a184e523e",
+      "target_token": "setEnchantment",
+      "module": ":",
+      "compiler_status": "Included in clean selected canonical Kotlin2.4.0 CEM compilation; completion, exact declaration, hover and selected signature matched once. No IDEA result claimed.",
+      "source_raw_sha256": "71961edbd6965565fde00327197a4a2eb9252f8f327234026b8afe64c77945c4"
+    },
+    {
+      "id": "cem-ordinary-delegated-interface",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/millstone/EnchantableMillstoneBlockEntity.kt",
+      "anchor": "readEnchantments(compound, registries)",
+      "token": "readEnchantments",
+      "target_file": "src/main/kotlin/io/github/cotrin8672/cem/content/block/EnchantableBlockEntity.kt",
+      "target_anchor": "fun readEnchantments(tag: CompoundTag, provider: HolderLookup.Provider)",
+      "expected": "Resolve the ordinary implicit receiver interface default member from the class implementing EnchantableBlockEntity by delegation; complete and navigate its exact Kotlin declaration.",
+      "hover_contains": [
+        "readEnchantments",
+        "CompoundTag",
+        "Provider"
+      ],
+      "signature_parameters": 2,
+      "signature_contains": [
+        "readEnchantments",
+        "CompoundTag",
+        "Provider"
+      ],
+      "source_sha256": "60be8dc55695f214c2899cb783e221caf0a1d88f1b7f4a989409923017ee8ae1",
+      "target_sha256": "5dbe4f1a019496492d3c52552808c721c18458cbfbfda61118d6d89a184e523e",
+      "target_token": "readEnchantments",
+      "module": ":",
+      "compiler_status": "Included in clean selected canonical Kotlin2.4.0 CEM compilation; completion, exact declaration, hover and selected signature matched once. No IDEA result claimed.",
+      "source_raw_sha256": "aa0afc736678350f6a65f1e9450502be24d89cc63a2a4c39b984cc1f95172d58"
+    }
+  ]
+}
