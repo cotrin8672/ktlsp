@@ -34,10 +34,47 @@ The20,806,656-byte immutable binary is native-integrated110-1/bin/ktlsp.exe,
 SHA2567ac393360fa6784a9bd8a9d2f5e65ca31714cd87f3b02a7244c51e8d451b9d5e.
 It uses the temporary explicit System allocator baseline; allocator trial
 manifest/lock/main edits are separate and have no demonstrated speed benefit.
-Original114 and Gradle's original three first responses are being rechecked
-against this release. The automatic-watch reload repeat has58 passing checks,
-including the canonical barrier previously blocked by the wrong setup; its
-remaining checks are not yet certified.
+Original114 on110 finishes107 passing checks/seven failures. The worker runtime
+entry is now captured correctly. The first private generation executes all nine
+tasks successfully, then rejects an input without a current owner. Its precise
+path was lost when temporary audit files were cleaned up; existing errors now
+include task/path for the next targeted reproduction, without changing the
+ownership predicate. A later task-not-found error overlaps disabled phase2 and
+does not establish the cause of the first rejection. Original114 remains RED.
+
+Gradle's original three first responses all match on110 after a successful
+offline194-module import. Root verifies eight artifact references. This actual
+run closes naturally with zero owned residuals; it takes613.25s under concurrent
+load, including229.328s for the Gradle dump and288.821s for dependency indexing.
+Index destruction itself takes43.528s with about31 CPU seconds for125,576
+library files/2,067,696 symbols. These are baseline observations, not speed
+acceptance. Evidence: recovery89/allocator110-import1/terminal-summary.json
+SHA256e7bbe7245b70b1504fcc393e07b895f2a4742d42a73d4d49b865b6eb3510e35d.
+
+The frozen109 automatic-watch reload repeat passes all90 checks/61 first
+requests, zero retries/readiness failures and nine real registrations. Root
+checks15 artifact references and compares the check-name multisets against107:
+all original86 remain, with exactly four native Java checks added. Current-wire
+positive error1 and fixed push/pull0 both pass; clean shutdown/owned0 hold.
+Evidence: recovery89/gradle-reload109-auto1/summary.json SHA256
+c4256937d174d3af9e8dfde3536fbe7799d58f22ab913903069f351c575bcb66.
+
+CEM's original18 cases also pass on110:10 canonical first responses plus eight
+Java assertions. The ResourceKey getter has exactly the correct HolderGetter
+source target, rather than its TagKey overload. Both sessions exit cleanly;
+the224-file CEM footprint, source guards and build-output inventories remain
+unchanged. Root checks15 artifact references. Missing-source coverage remains
+three with one failed input; no whole-project parity is inferred. The measured
+launcher-to-first-tested-useful responses are142.553s/107.551s under concurrent
+load, not earliest availability or display latency. Evidence:
+recovery89/cem110-original18-1/original18-acceptance-v2.json SHA256
+042cd0ae2123f23d753c8b7de04a23e0e53d148af63358eb3b215bd282b8b0d2.
+
+The next speed slice caches the embedded init script under a stable content
+identity, avoiding a new Gradle Kotlin DSL class name for every query. Its
+concurrent publication/content-version/corruption guard passes, as do64 related
+classpath tests. Release111 and a targeted processor-owner reproduction are in
+progress. Compilation reuse and performance benefit remain unmeasured.
 
 ### Previous109: integrated processors and diagnostic reconciliation
 
