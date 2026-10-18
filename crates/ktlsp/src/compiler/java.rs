@@ -1,6 +1,6 @@
-//! Positive Java import errors on the existing selected Kotlin diagnostic worker.
-//! shortcut: only verified Kotlin 1.8.21/Gradle 7.4.2/JDK 17 plain tasks and explicit imports;
-//! expand after independent compiler, namespace and editor controls for the new case pass.
+//! Positive Java errors on the existing selected Kotlin diagnostic worker.
+//! shortcut: pinned plain tasks and explicit imports; complete K2 also admits zero-argument
+//! non-generic java.base receiver methods. Expand after same-Javac and editor controls pass.
 use super::*;
 use crate::classpath::{CompilerTask, JavaCompilerRecipe};
 use serde_json::Value;
@@ -2070,6 +2070,22 @@ fn validated_lease(
     Ok(packages.into_values().collect())
 }
 
+/// Javac positions count UTF-16 code units across the whole source, not UTF-8 bytes.
+/// Require an exact boundary: a surrogate midpoint or an offset past EOF has no source token.
+fn utf16_byte_offset(text: &str, offset: usize) -> Option<usize> {
+    let mut units = 0usize;
+    for (byte, ch) in text.char_indices() {
+        if units == offset {
+            return Some(byte);
+        }
+        units += ch.len_utf16();
+        if units > offset {
+            return None;
+        }
+    }
+    (units == offset).then_some(text.len())
+}
+
 /// A nested class import can have any preceding name prefix as its actual JVM package.
 fn disjoint_import(name: &str, packages: &BTreeSet<String>) -> bool {
     let mut prefix = String::new();
@@ -2198,10 +2214,6 @@ fn import_diagnostics(
             continue;
         };
         let text = std::fs::read_to_string(path)?;
-        anyhow::ensure!(
-            text.is_ascii(),
-            "java-nonascii-position-adapter-unavailable"
-        );
         let Some(position) = diagnostic
             .get("position")
             .and_then(Value::as_u64)
@@ -2237,22 +2249,164 @@ fn import_diagnostics(
             let Some(dot) = name.rfind('.') else {
                 continue;
             };
-            // Pinned Javac's missing-package diagnostic points at the select's dot, not its name.
-            // Bind that raw range to the original task AST, then publish the class-name token.
+            let (Some(start_byte), Some(end_byte), Some(selector)) = (
+                utf16_byte_offset(&text, start),
+                utf16_byte_offset(&text, end),
+                position
+                    .checked_add(1)
+                    .and_then(|offset| utf16_byte_offset(&text, offset)),
+            ) else {
+                continue;
+            };
+            // Bind Javac's UTF-16 AST/diagnostic ranges before publishing the class-name token.
             if start >= end
-                || end > text.len()
-                || &text[start..end] != name
+                || text.get(start_byte..end_byte) != Some(name)
                 || diagnostic.get("start").and_then(Value::as_u64) != Some(start as u64)
                 || diagnostic.get("end").and_then(Value::as_u64) != Some(end as u64)
-                || position != start + dot
+                || start.checked_add(name[..dot].encode_utf16().count()) != Some(position)
             {
                 continue;
             }
-            let selector = position + 1;
             let original = overlay
                 .paths
                 .get(&kotlin_path_key(&crate::paths::file_key(path)))
                 .ok_or_else(|| anyhow::anyhow!("java-diagnostic-source-unmapped"))?;
+            if !seen.insert((original.clone(), selector)) {
+                continue;
+            }
+            let (line, col) = crate::text::LineIndex::new(&text).position(&text, selector);
+            result.push(CompileDiagnostic {
+                path: original.clone(),
+                line: line + 1,
+                col: col + 1,
+                severity: Severity::Error,
+                message: value_string(diagnostic, "message")?.to_owned(),
+            });
+        }
+    }
+    result.extend(platform_method_diagnostics(
+        value,
+        expected_sources,
+        overlay,
+        complete_kotlin_output,
+    )?);
+    Ok(result)
+}
+
+// Called only after import_diagnostics validates this SAME task's full source/option/runtime stream.
+// K2 contributes complete current outputs; java.base receivers use the existing watched selected SDK.
+fn platform_method_diagnostics(
+    value: &Value,
+    expected_sources: &[(PathBuf, String)],
+    overlay: &KotlinEditorOverlay,
+    complete_kotlin_output: bool,
+) -> anyhow::Result<Vec<CompileDiagnostic>> {
+    if !complete_kotlin_output {
+        return Ok(Vec::new());
+    }
+    let Some(calls) = value.get("platformCalls").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut by_uri = BTreeMap::new();
+    for (row, (path, digest)) in array(value, "sourcesBefore")?.iter().zip(expected_sources) {
+        anyhow::ensure!(
+            same_path(Path::new(value_string(row, "path")?), path)
+                && value_string(row, "sha256")? == digest
+                && sha(&std::fs::read(path)?) == *digest,
+            "java-platform-source-differs"
+        );
+        by_uri.insert(value_string(row, "uri")?, path);
+    }
+    let pos = |row: &Value, key: &str| {
+        row.get(key)
+            .and_then(Value::as_u64)
+            .and_then(|p| usize::try_from(p).ok())
+    };
+    let mut result = Vec::new();
+    let mut seen = BTreeSet::new();
+    for diagnostic in array(value, "diagnostics")? {
+        if diagnostic["kind"] != "ERROR"
+            || diagnostic["code"] != "compiler.err.cant.resolve.location.args"
+        {
+            continue;
+        }
+        let Some(uri) = diagnostic["sourceUri"].as_str() else {
+            continue;
+        };
+        let Some(path) = by_uri.get(uri) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(path)?;
+        for call in calls {
+            if call["sourceUri"] != uri
+                || call["diagnosticOrdinal"].as_u64().is_none()
+                || call["diagnosticOrdinal"] != diagnostic["ordinal"]
+                || !matches!(
+                    call["receiverKind"].as_str(),
+                    Some("variable" | "construction")
+                )
+            {
+                continue;
+            }
+            let (Some(receiver), Some(binary), Some(method)) = (
+                call["receiverText"].as_str(),
+                call["receiverBinaryName"].as_str(),
+                call["method"].as_str(),
+            ) else {
+                continue;
+            };
+            let identifier = |s: &str| {
+                !s.is_empty()
+                    && s.bytes().enumerate().all(|(i, c)| {
+                        c.is_ascii_alphabetic()
+                            || c == b'_'
+                            || c == b'$'
+                            || (i > 0 && c.is_ascii_digit())
+                    })
+            };
+            if !binary.split('.').all(identifier)
+                || method.is_empty()
+                || call["originUri"] != format!("jrt:/java.base/{}.class", binary.replace('.', "/"))
+            {
+                continue;
+            }
+            let (Some(start), Some(receiver_end), Some(end), Some(call_end)) = (
+                pos(call, "selectStart"),
+                pos(call, "receiverEnd"),
+                pos(call, "selectEnd"),
+                pos(call, "callEnd"),
+            ) else {
+                continue;
+            };
+            if pos(call, "callStart") != Some(start)
+                || pos(call, "receiverStart") != Some(start)
+                || pos(diagnostic, "start") != Some(start)
+                || pos(diagnostic, "end") != Some(end)
+                || pos(diagnostic, "position") != Some(receiver_end)
+                || receiver_end != start.saturating_add(receiver.encode_utf16().count())
+                || end != receiver_end.saturating_add(1 + method.encode_utf16().count())
+                || call_end != end.saturating_add(2)
+            {
+                continue;
+            }
+            let (Some(byte_start), Some(byte_call_end), Some(selector)) = (
+                utf16_byte_offset(&text, start),
+                utf16_byte_offset(&text, call_end),
+                utf16_byte_offset(&text, receiver_end + 1),
+            ) else {
+                continue;
+            };
+            if text.get(byte_start..byte_call_end)
+                != Some(format!("{receiver}.{method}()").as_str())
+            {
+                continue;
+            }
+            let Some(original) = overlay
+                .paths
+                .get(&kotlin_path_key(&crate::paths::file_key(path)))
+            else {
+                continue;
+            };
             if !seen.insert((original.clone(), selector)) {
                 continue;
             }
@@ -2459,10 +2613,6 @@ pub(super) fn run(
                     .is_some_and(|key| same_path(Path::new(key), original))
             })
             .ok_or_else(|| anyhow::anyhow!("java-selected-source-not-in-overlay"))?;
-        anyhow::ensure!(
-            std::fs::read_to_string(private)?.is_ascii(),
-            "java-nonascii-position-adapter-unavailable"
-        );
         java_sources.push((private.clone(), expected[&header_key(private)].clone()));
     }
     let spec = overlay.directory.join("java.properties");
@@ -2558,7 +2708,7 @@ pub(super) fn run(
     tools.check_live()?;
     request.check_live()?;
     environment.check_live()?;
-    tracing::debug!(identity = %tools.input_sha256, errors = result.len(), "selected Java explicit import positive diagnostics");
+    tracing::debug!(identity = %tools.input_sha256, errors = result.len(), "selected Java positive diagnostics");
     Ok(result)
 }
 

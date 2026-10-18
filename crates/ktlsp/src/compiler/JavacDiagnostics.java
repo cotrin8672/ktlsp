@@ -1,5 +1,17 @@
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ImportTree;
+import com.sun.source.tree.IdentifierTree;
+import com.sun.source.tree.MemberSelectTree;
+import com.sun.source.tree.MethodInvocationTree;
+import com.sun.source.tree.NewClassTree;
+import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeKind;
+import javax.tools.StandardLocation;
 import com.sun.source.util.JavacTask;
 import com.sun.source.util.TaskEvent;
 import com.sun.source.util.TaskListener;
@@ -139,13 +151,16 @@ public final class JavacDiagnostics {
 
     // Observe the original task: a second parse would not bind these compiler diagnostics.
     private static void observeImports(JavaCompiler.CompilationTask task, List<Object> imports,
-            List<Object> parsedUnits) {
+            List<Object> parsedUnits, List<Object> platformCalls, StandardJavaFileManager manager,
+            List<Map<String, Object>> diagnostics) {
         if (!(task instanceof JavacTask javac))
             throw new IllegalStateException("Selected SDK does not expose public JavacTask");
         Trees trees = Trees.instance(javac);
         javac.addTaskListener(new TaskListener() {
             @Override public void started(TaskEvent event) {}
             @Override public void finished(TaskEvent event) {
+                if (event.getKind() == TaskEvent.Kind.ANALYZE)
+                    observePlatformCalls(javac, trees, manager, event, platformCalls, diagnostics);
                 if (event.getKind() != TaskEvent.Kind.PARSE) return;
                 CompilationUnitTree unit = Objects.requireNonNull(event.getCompilationUnit());
                 String uri = unit.getSourceFile().toUri().toString();
@@ -165,6 +180,88 @@ public final class JavacDiagnostics {
                 }
             }
         });
+    }
+
+
+    // Same-task attribution; only the selected SDK's complete java.base API is eligible.
+    private static void observePlatformCalls(JavacTask javac, Trees trees,
+            StandardJavaFileManager manager, TaskEvent event, List<Object> calls,
+            List<Map<String, Object>> diagnostics) {
+        CompilationUnitTree unit = Objects.requireNonNull(event.getCompilationUnit());
+        String uri = unit.getSourceFile().toUri().toString();
+        if (diagnostics.stream().noneMatch(d -> "ERROR".equals(d.get("kind"))
+                && "compiler.err.cant.resolve.location.args".equals(d.get("code"))
+                && uri.equals(d.get("sourceUri")))) return;
+        TreePath owner = trees.getPath(event.getTypeElement());
+        if (owner == null) return;
+        new TreePathScanner<Void, Void>() {
+            @Override public Void visitMethodInvocation(MethodInvocationTree call, Void unused) {
+                if (call.getMethodSelect() instanceof MemberSelectTree select
+                        && call.getArguments().isEmpty() && call.getTypeArguments().isEmpty()) {
+                    var expression = select.getExpression();
+                    long selectStart = trees.getSourcePositions().getStartPosition(unit, select);
+                    long selectEnd = trees.getSourcePositions().getEndPosition(unit, select);
+                    long receiverEnd = trees.getSourcePositions().getEndPosition(unit, expression);
+                    Map<String, Object> diagnostic = diagnostics.stream().filter(d ->
+                        "ERROR".equals(d.get("kind"))
+                        && "compiler.err.cant.resolve.location.args".equals(d.get("code"))
+                        && uri.equals(d.get("sourceUri")) && Long.valueOf(selectStart).equals(d.get("start"))
+                        && Long.valueOf(selectEnd).equals(d.get("end"))
+                        && Long.valueOf(receiverEnd).equals(d.get("position"))).findFirst().orElse(null);
+                    if (diagnostic == null) return super.visitMethodInvocation(call, unused);
+                    TreePath receiverPath = new TreePath(new TreePath(getCurrentPath(), select), expression);
+                    var element = trees.getElement(receiverPath);
+                    boolean variable = expression instanceof IdentifierTree && element != null
+                        && (element.getKind() == ElementKind.LOCAL_VARIABLE
+                            || element.getKind() == ElementKind.PARAMETER);
+                    boolean construction = expression instanceof NewClassTree created
+                        && created.getClassBody() == null && created.getTypeArguments().isEmpty()
+                        && element instanceof ExecutableElement
+                        && element.getKind() == ElementKind.CONSTRUCTOR;
+                    var mirror = trees.getTypeMirror(receiverPath);
+                    if ((variable || construction) && mirror != null && mirror.getKind() == TypeKind.DECLARED
+                            && mirror instanceof DeclaredType declared && declared.getTypeArguments().isEmpty()
+                            && declared.asElement() instanceof TypeElement type && type.getTypeParameters().isEmpty()
+                            && javac.getElements().getModuleOf(type).getQualifiedName().contentEquals("java.base")
+                            && trees.getPath(type) == null
+                            && type.equals(javac.getElements().getTypeElement(javac.getElements().getModuleOf(type),
+                                type.getQualifiedName()))) {
+                        try {
+                            String binary = javac.getElements().getBinaryName(type).toString();
+                            var location = manager.getLocationForModule(StandardLocation.SYSTEM_MODULES, "java.base");
+                            JavaFileObject origin = manager.getJavaFileForInput(location, binary, JavaFileObject.Kind.CLASS);
+                            String expected = "jrt:/java.base/" + binary.replace('.', '/') + ".class";
+                            if (origin != null && "java.base".equals(manager.inferModuleName(location))
+                                    && origin.toUri().toString().equals(expected)) {
+                                long start = trees.getSourcePositions().getStartPosition(unit, expression);
+                                long end = trees.getSourcePositions().getEndPosition(unit, expression);
+                                String source = unit.getSourceFile().getCharContent(true).toString();
+                                if (start >= 0 && end > start && end <= source.length()) {
+                                    Map<String, Object> row = new LinkedHashMap<>();
+                                    row.put("sourceUri", uri);
+                                    row.put("diagnosticOrdinal", diagnostic.get("ordinal"));
+                                    row.put("receiverText", source.substring((int) start, (int) end));
+                                    row.put("receiverKind", variable ? "variable" : "construction");
+                                    row.put("receiverBinaryName", binary);
+                                    row.put("originUri", expected);
+                                    row.put("method", select.getIdentifier().toString());
+                                    row.put("receiverStart", start);
+                                    row.put("receiverEnd", end);
+                                    row.put("selectStart", trees.getSourcePositions().getStartPosition(unit, select));
+                                    row.put("selectEnd", trees.getSourcePositions().getEndPosition(unit, select));
+                                    row.put("callStart", trees.getSourcePositions().getStartPosition(unit, call));
+                                    row.put("callEnd", trees.getSourcePositions().getEndPosition(unit, call));
+                                    calls.add(row);
+                                }
+                            }
+                        } catch (Exception unavailable) {
+                            // Unavailable origin is not absence authority.
+                        }
+                    }
+                }
+                return super.visitMethodInvocation(call, unused);
+            }
+        }.scan(owner, null);
     }
 
     public static void main(String[] args) throws Exception {
@@ -191,6 +288,7 @@ public final class JavacDiagnostics {
         StringWriter compilerOutput = new StringWriter();
         List<Object> imports = new ArrayList<>();
         List<Object> parsedUnits = new ArrayList<>();
+        List<Object> platformCalls = new ArrayList<>();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("component", "ktlsp selected-SDK public Javac API");
         out.put("stage", require(p, "stage"));
@@ -229,7 +327,7 @@ public final class JavacDiagnostics {
                 JavaCompiler.CompilationTask task = compiler.getTask(compilerOutput, manager,
                     d -> diagnostics.add(diagnostic(d, locale, diagnostics.size())), options, null, units);
                 task.setLocale(locale);
-                observeImports(task, imports, parsedUnits);
+                observeImports(task, imports, parsedUnits, platformCalls, manager, diagnostics);
                 success = Boolean.TRUE.equals(task.call());
                 completed = true;
             }
@@ -255,6 +353,7 @@ public final class JavacDiagnostics {
         out.put("diagnostics", diagnostics);
         out.put("imports", imports);
         out.put("parsedUnits", parsedUnits);
+        out.put("platformCalls", platformCalls);
         out.put("countsByKind", kinds);
         out.put("compilerOutput", compilerOutput.toString());
         out.put("wholeApiAuthority", false);

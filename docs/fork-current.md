@@ -6,7 +6,48 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest107: current source and native validation
+## Latest108: current source and native validation
+
+Javac absolute UTF-16 positions now map to exact UTF-8 boundaries before source
+slicing; Japanese and non-BMP comments no longer disable Java import diagnostics.
+The focused reproduction compiles and fails on the previous ASCII veto, then
+both new tests and two existing related tests pass. The same adapter is used by
+the new bounded Java body-diagnostic slice: same-task attributed non-generic
+java.base receivers, zero-argument calls, complete current K2 output and exact
+diagnostic/AST/source binding. It supports Unicode method names. The Java
+observer skips scanning when no relevant error exists, and avoids origin/source
+work for calls that do not match an actual error. K1, generated receiver APIs
+and general Java body diagnostics remain outside this slice.
+
+The body reproduction compiles before the fix and yields zero instead of two
+positives. The initial green attempt exposes a synthetic fixture incorrectly
+using UTF-8 length for a Unicode method's raw Javac range; correcting that
+fixture to UTF-16 retains both expected positives. The three focused checks and
+all46 existing Java-boundary checks pass. Workspace108 passes1,687/zero failed/
+seven ignored; release succeeds. Root independently verifies344 unchanged
+inputs, both raw captures,40 result blocks and the immutable binary. All owned
+Jobs close with zero live or terminated residuals. Evidence:
+native-integrated108-1/receipt.json SHA256
+3ac354319dfb4ce71d1c395ab8a8dfe9018fe82b02af3a378401c28752baa872.
+The20,223,488-byte release is native-integrated108-1/bin/ktlsp.exe, SHA256
+1a99c7e073ec9fff117304773f04958386a6c63ea9e2823aac8f8949ab99de37.
+Real-Neovim body error/fix and exact non-ASCII range verification are pending;
+the Rust results do not establish that the native observer emits these facts.
+Additional existing Workspace trace markers distinguish final-owner release,
+Index destruction and subsequent field destruction. Their runtime measurement
+is pending; Index and Salsa share facts, so the middle marker is not proof that
+all symbol payloads have been freed.
+
+The restored fixed IDEA reference independently passes the original OkHttp
+incomplete-code cases: five cases, six first responses,13 semantic checks, one
+attempt each. Root verifies57 current guards and four artifact references.
+Import reports success. Graceful shutdown still exceeds15s; the owned Job
+terminates one remaining process and closes with zero live processes. This is
+semantic reference evidence, not lifecycle or speed acceptance. Evidence:
+recovery89/corpus90/native-five-okhttp-idea-restored-reference-1/receipt.json
+SHA256da2611fcde20049ff78f0e35e997f512564478de1cd23a2ed1ed23e5dee3b122.
+
+### Previous107 source and native validation
 
 New unsaved Java/Kotlin sources now reuse the stock task's future-source policy
 for auxiliary Java compilation. Exact declared inputs remain mandatory; only
@@ -46,6 +87,11 @@ event, which the positive-only contract does not generate. This observation
 deadline is retained; it is not a publisher failure or Java clean authority.
 Evidence: recovery89/java-native-import107-control1/owned-1/summary.json SHA256
 ca5eaf9a6b5ebcd8dc85ae4256c74de3d487e24457ae2e41cffb330fb78d906a.
+The subsequent wire-v2 record distinguishes cleanup-removed private input paths
+from durable source evidence. Root verifies17 artifact references and13 current
+guards; the recorded wire bytes match native before/after hashes. Evidence:
+recovery89/java-native-import107-control1/owned-1/summary-wire-v2.json SHA256
+1d9e85489731acf0be58ca83d1e45a1bec165f0f614838c1f2533599c1905c2e.
 
 One diagnostic Gradle ordinary-session repeat keeps all three first responses
 and exits naturally in18.172s with zero termination calls. The optional corpus

@@ -74,7 +74,9 @@ fn is_java_path(key: &str) -> bool {
 }
 
 pub struct Workspace {
+    _drop_start_marker: WorkspaceDropMarker,
     pub index: Index,
+    _index_drop_marker: WorkspaceDropMarker,
     /// Open buffers, keyed by canonical identity. Take precedence over disk.
     open_docs: HashMap<String, DocState>,
     parsers: LanguageParsers,
@@ -104,13 +106,13 @@ pub struct Workspace {
     _drop_marker: WorkspaceDropMarker,
 }
 
-struct WorkspaceDropMarker;
+struct WorkspaceDropMarker(&'static str);
 
 impl Drop for WorkspaceDropMarker {
     fn drop(&mut self) {
         if crate::trace::enabled() {
             crate::trace::span(
-                "workspace.fields.dropped",
+                self.0,
                 "workspace",
                 std::time::Instant::now(),
                 serde_json::json!({}),
@@ -134,7 +136,9 @@ impl Workspace {
         providers: Vec<Arc<dyn crate::analysis_extensions::AnalysisProvider>>,
     ) -> Self {
         Workspace {
+            _drop_start_marker: WorkspaceDropMarker("workspace.drop.start"),
             index: Index::new(),
+            _index_drop_marker: WorkspaceDropMarker("workspace.index.dropped"),
             open_docs: HashMap::new(),
             parsers: LanguageParsers::new(),
             salsa: SalsaState::new(),
@@ -159,7 +163,7 @@ impl Workspace {
             kotlin_diagnostic_store_epoch: 0,
             kotlin_diagnostic_changes: BTreeSet::new(),
             class_inventory: RefCell::default(),
-            _drop_marker: WorkspaceDropMarker,
+            _drop_marker: WorkspaceDropMarker("workspace.fields.dropped"),
         }
     }
 

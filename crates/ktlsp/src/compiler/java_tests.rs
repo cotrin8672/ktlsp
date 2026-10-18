@@ -426,19 +426,23 @@ fn java_receipt(path: &Path, text: &str, recipe: &JavaCompilerRecipe) -> Value {
         "generated.KspJava",
         "generated.KaptJava",
     ] {
-        let start = text.find(name).unwrap();
+        let byte_start = text.find(name).unwrap();
+        let start = text[..byte_start].encode_utf16().count();
+        let end = start + name.encode_utf16().count();
         // Exact selected JDK17 receipt: JCFieldAccess position is the dot before the class name.
-        let position = start + name.find('.').unwrap();
-        imports.push(json!({"sourceUri": uri, "static": false, "name": name, "start": start - 7, "end": start + name.len() + 1,
-            "qualifiedStart": start, "qualifiedEnd": start + name.len()}));
-        diagnostics.push(json!({"kind": "ERROR", "code": "compiler.err.doesnt.exist", "sourceUri": uri,
-            "position": position, "start": start, "end": start + name.len(), "line": -1, "column": 999,
-            "message": "パッケージgeneratedは存在しません"}));
+        let position = start + name[..name.find('.').unwrap()].encode_utf16().count();
+        imports.push(json!({"sourceUri": uri, "static": false, "name": name, "start": start - 7, "end": end + 1,
+            "qualifiedStart": start, "qualifiedEnd": end}));
+        diagnostics.push(
+            json!({"kind": "ERROR", "code": "compiler.err.doesnt.exist", "sourceUri": uri,
+            "position": position, "start": start, "end": end, "line": -1, "column": 999,
+            "message": "パッケージgeneratedは存在しません"}),
+        );
     }
     for name in ["KspKotlin a", "KspJava b", "KaptJava c"] {
         diagnostics.push(
             json!({"kind": "ERROR", "code": "compiler.err.cant.resolve.location", "sourceUri": uri,
-            "position": text.find(name).unwrap(), "message": "シンボルを見つけられません"}),
+            "position": text[..text.find(name).unwrap()].encode_utf16().count(), "message": "シンボルを見つけられません"}),
         );
     }
     let source =
@@ -562,6 +566,101 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         false,
     )
     .is_err());
+}
+
+#[test]
+fn javac_absolute_utf16_offsets_require_exact_utf8_boundaries() {
+    let text = "a😀日\r\n\t終";
+    for (byte, _) in text.char_indices() {
+        assert_eq!(
+            utf16_byte_offset(text, text[..byte].encode_utf16().count()),
+            Some(byte)
+        );
+    }
+    assert_eq!(
+        utf16_byte_offset(text, 2),
+        None,
+        "middle of the surrogate pair"
+    );
+    assert_eq!(
+        utf16_byte_offset(text, text.encode_utf16().count()),
+        Some(text.len())
+    );
+    assert_eq!(
+        utf16_byte_offset(text, text.encode_utf16().count() + 1),
+        None
+    );
+    assert_eq!(utf16_byte_offset(text, usize::MAX), None);
+    assert_eq!(utf16_byte_offset("", 0), Some(0));
+}
+
+#[test]
+fn java_import_positions_bind_unicode_current_text_and_utf16_ast_ranges() {
+    let (owner, mut request) = fixture();
+    let text = format!(
+        "// 前置😀\r\n{}",
+        JAVA.replace("\nimport", "\n\t/* 日本語😀 */ import")
+    );
+    let source = request
+        .overlays
+        .iter_mut()
+        .find(|source| source.key.ends_with(".java"))
+        .unwrap();
+    *source = KotlinSourceOverlay::new(source.key.clone(), text.clone(), 2);
+    let overlay =
+        KotlinEditorOverlay::create_in(&request, &owner.directory.join("overlays")).unwrap();
+    let path = overlay
+        .sources
+        .iter()
+        .find(|path| path.extension().unwrap() == "java")
+        .unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let receipt = java_receipt(path, &text, &recipe);
+    let expected = vec![(path.clone(), sha(text.as_bytes()))];
+    let packages = BTreeSet::from(["fixture".into()]);
+    let check = |receipt: &Value| {
+        import_diagnostics(
+            receipt,
+            &recipe.api_options,
+            &recipe,
+            &expected,
+            &overlay,
+            &packages,
+            1,
+            false,
+        )
+    };
+    let errors = check(&receipt).unwrap();
+    assert_eq!(errors.len(), 3);
+    for (i, error) in errors.iter().enumerate() {
+        assert_eq!(error.line, i as u32 + 3);
+        assert_eq!(
+            error.col, 31,
+            "UTF-16 column, including tab and astral comment"
+        );
+        assert_eq!(
+            error.path,
+            crate::paths::file_key(&request.project_dir.join("src/Main.java"))
+        );
+    }
+    let midpoint = text[..text.find('😀').unwrap()].encode_utf16().count() + 1;
+    for field in ["qualifiedStart", "qualifiedEnd"] {
+        let mut wrong = receipt.clone();
+        wrong["imports"][0][field] = json!(midpoint);
+        assert_eq!(
+            check(&wrong).unwrap().len(),
+            2,
+            "reject {field} inside surrogate pair"
+        );
+    }
+    let mut wrong = receipt.clone();
+    wrong["diagnostics"][0]["position"] = json!(usize::MAX);
+    assert_eq!(check(&wrong).unwrap().len(), 2);
+    std::fs::write(path, text.replace("日本語", "別入力")).unwrap();
+    assert!(
+        check(&receipt).is_err(),
+        "current source bytes must still match the owned receipt"
+    );
 }
 
 #[test]
@@ -2715,4 +2814,169 @@ fn new_editor_sources_keep_unknown_filtered_generated_and_excluded_policy_unavai
         let pending = ws.begin_kotlin_diagnostics(&helper).unwrap();
         assert!(configured_recipe(&pending).is_err(), "{kind}");
     }
+}
+
+#[test]
+fn same_javac_platform_body_errors_require_current_receiver_attribution() {
+    for prefix in ["", "// \u{65e5}\u{672c}\u{8a9e} \u{1f600}\n\t"] {
+        let (owner, mut request) = fixture();
+        selected_k2_jdk21(&mut request);
+        let variable_method = "missing\u{30e1}\u{30bd}\u{30c3}\u{30c9}";
+        let body = format!(
+            r#"class Body {{ void call(String receiver) {{ receiver.{variable_method}(); new String("x").missingConstructedMethod(); }} }}"#
+        );
+        let text = format!("{prefix}{JAVA}{body}");
+        for source in &mut request.overlays {
+            if source.key.ends_with(".java") {
+                *source = KotlinSourceOverlay::new(source.key.clone(), text.clone(), 1);
+            }
+        }
+        let overlay =
+            KotlinEditorOverlay::create_in(&request, &owner.directory.join("platform-overlay"))
+                .unwrap();
+        let path = overlay
+            .sources
+            .iter()
+            .find(|p| p.extension().unwrap() == "java")
+            .unwrap();
+        let recipe = configured_recipe(&request).unwrap();
+        let mut receipt = java_receipt(path, &text, &recipe);
+        let uri = receipt["sourcesBefore"][0]["uri"].clone();
+        receipt["imports"] = json!([]);
+        receipt["diagnostics"] = json!([]);
+        receipt["platformCalls"] = json!([]);
+        for (receiver, method, kind) in [
+            ("receiver", variable_method, "variable"),
+            (
+                r#"new String("x")"#,
+                "missingConstructedMethod",
+                "construction",
+            ),
+        ] {
+            let expression = format!("{receiver}.{method}()");
+            let byte_start = text.find(&expression).unwrap();
+            let start = text[..byte_start].encode_utf16().count();
+            let receiver_end = start + receiver.encode_utf16().count();
+            let end = receiver_end + 1 + method.encode_utf16().count();
+            let ordinal = receipt["diagnostics"].as_array().unwrap().len();
+            receipt["platformCalls"].as_array_mut().unwrap().push(json!({
+            "sourceUri": uri, "diagnosticOrdinal": ordinal, "receiverText": receiver, "receiverKind": kind,
+            "receiverBinaryName": "java.lang.String", "originUri": "jrt:/java.base/java/lang/String.class",
+            "method": method, "receiverStart": start, "receiverEnd": receiver_end,
+            "selectStart": start, "selectEnd": end, "callStart": start, "callEnd": end + 2,
+        }));
+            receipt["diagnostics"].as_array_mut().unwrap().push(json!({
+            "ordinal": ordinal, "kind": "ERROR", "code": "compiler.err.cant.resolve.location.args", "sourceUri": uri,
+            "start": start, "end": end, "position": receiver_end,
+            "message": format!("Missing method {method}"),
+        }));
+        }
+        let expected = vec![(path.clone(), sha(text.as_bytes()))];
+        let decode = |receipt: &Value, complete| {
+            import_diagnostics(
+                receipt,
+                &recipe.api_options,
+                &recipe,
+                &expected,
+                &overlay,
+                &BTreeSet::new(),
+                1,
+                complete,
+            )
+        };
+        let actual = decode(&receipt, true).unwrap();
+        assert_eq!(actual.len(), 2);
+        assert!(actual.iter().all(|error| error.path
+            == crate::paths::file_key(&request.project_dir.join("src/Main.java"))));
+        for (error, method) in actual
+            .iter()
+            .zip([variable_method, "missingConstructedMethod"])
+        {
+            let start =
+                crate::text::LineIndex::new(&text).offset(&text, error.line - 1, error.col - 1);
+            assert_eq!(&text[start..start + method.len()], method);
+        }
+        assert!(
+            decode(&receipt, false).unwrap().is_empty(),
+            "K1 partial headers cannot gain body authority"
+        );
+        for (field, value) in [
+            ("diagnosticOrdinal", json!(999)),
+            ("receiverKind", json!("static")),
+            ("originUri", json!("file:/unwatched/String.class")),
+            (
+                "originUri",
+                json!("jrt:/other.module/java/lang/String.class"),
+            ),
+            ("receiverBinaryName", json!("other.String")),
+            ("receiverText", json!("other")),
+            ("method", json!("otherMethod")),
+            ("sourceUri", json!("other-source")),
+            ("callEnd", json!(0)),
+            ("receiverStart", json!(0)),
+        ] {
+            let mut wrong = receipt.clone();
+            for row in wrong["platformCalls"].as_array_mut().unwrap() {
+                row[field] = value.clone();
+            }
+            assert!(decode(&wrong, true).unwrap().is_empty(), "{field}={value}");
+        }
+        for field in ["start", "end", "position"] {
+            let mut wrong = receipt.clone();
+            for row in wrong["diagnostics"].as_array_mut().unwrap() {
+                row[field] = json!(0);
+            }
+            assert!(decode(&wrong, true).unwrap().is_empty(), "{field}");
+        }
+        let mut wrong = receipt.clone();
+        wrong["platformCalls"] = json!([]);
+        assert!(
+            decode(&wrong, true).unwrap().is_empty(),
+            "raw diagnostic code alone is insufficient"
+        );
+        wrong = receipt.clone();
+        for row in wrong["diagnostics"].as_array_mut().unwrap() {
+            row["code"] = json!("compiler.err.cant.resolve.location");
+        }
+        assert!(decode(&wrong, true).unwrap().is_empty());
+        std::fs::write(path, format!("{text}//changed")).unwrap();
+        assert!(
+            decode(&receipt, true).is_err(),
+            "current private bytes are required"
+        );
+    }
+}
+
+#[test]
+fn k2_platform_origin_rejects_release_and_patched_system_modules() {
+    for flags in [
+        vec!["--release", "17"],
+        vec!["--patch-module", "java.base=unwatched"],
+        vec!["--system", "unwatched-sdk"],
+        vec!["--upgrade-module-path", "unwatched"],
+    ] {
+        let (_owner, mut request) = fixture();
+        selected_k2_jdk21(&mut request);
+        assert!(configured_recipe(&request).is_ok());
+        let mut recipe = request
+            .java_task
+            .as_ref()
+            .unwrap()
+            .java_compiler_recipe()
+            .unwrap();
+        recipe
+            .api_options
+            .extend(flags.iter().map(|flag| (*flag).into()));
+        set_recipe(&mut request, recipe);
+        assert!(configured_recipe(&request).is_err(), "{flags:?}");
+    }
+    let (_owner, mut request) = fixture();
+    selected_k2_jdk21(&mut request);
+    request
+        .java_task
+        .as_mut()
+        .unwrap()
+        .options
+        .insert("release".into(), json!(17));
+    assert!(configured_recipe(&request).is_err());
 }
