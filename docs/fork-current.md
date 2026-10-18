@@ -6,7 +6,49 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest110: selected KAPT runtime and warning-free Gradle import
+## Latest112 investigation: processor input ownership and speed candidates
+
+The targeted two-phase processor reproduction now preserves private events
+before snapshot cleanup. Its26 events identify the previously rejected input
+as the selected processor Jar task's default25-byte MANIFEST.MF. The112 candidate
+admits that exact payload/path only when the same selected Jar task succeeds
+and its modeled output matches the current inventory. The real invocation
+passes this input check and next rejects differing compiler options. Root reads
+the actual editor output:47 passes, three failed obsolete Java API diagnostics
+and four unmeasured Kotlin diagnostic checks. The original114 remains RED;
+this54-check diagnostic subset does not replace it. Evidence:
+recovery89/corpus90/native-processor-owner112-phase1-1/receipt.json SHA256
+09e22dfef51fbc80c29209e01b0ed8d98a0dafea739c044029c825ff4162a4f6.
+
+The111 allocator trial completes warmups plus ABBA with two measured runs per
+variant. Root verifies12 receipt/trace references; all six runs match the same
+three first responses and close naturally without owned residuals. Medians
+System/mimalloc: process CPU92.76/76.59s, index destruction18.65/4.21s,
+post-index first-tested-useful47.05/55.11s, completion handler6.78/7.84ms.
+Concurrent CPU activity and n=2 prevent a startup non-regression conclusion.
+The allocator is not adopted; a quiet comparison and the existing unsaved-edit
+scenario are next. Evidence: recovery89/allocator-abba111-1/summary.json.
+These requests follow WAIT_INDEX and do not measure earliest useful completion
+or visible editor latency. Cold/warm index-count differences are explained by
+cumulative preview/source counters, not demonstrated missing semantic facts;
+full binary-only fact parity remains unverified.
+
+The content-addressed Gradle init-script candidate has focused/classpath tests
+and release111. CEM warmups plus ACCA complete with all eight original assertions
+passing in each of six runs; Root verifies25 receipt/raw references. After
+warmup, the candidate reuses the same four compiled Gradle script classes with
+unchanged bytes/hashes/mtimes across both measured runs; the baseline creates
+distinct timestamp-named classes for model and source queries. Measured
+post-index first-tested-useful medians are119.10s/107.95s, but the candidate's
+samples lie within the baseline range and background load differs. This proves
+compilation reuse, not a causal speed win or a reliable tail latency estimate.
+Evidence: recovery89/cem-init111-perf1/performance-summary.json SHA256
+7e14d4d823280198caaa68d71ffb34a077c104237136b521fbde814115595ddc.
+Earliest useful completion and persistent-cache reopen remain unmeasured.
+Neither a full correctness rerun nor speed acceptance has been established
+for the combined current edits.
+
+## Previous110: selected KAPT runtime and warning-free Gradle import
 
 KAPT's null java_home is no longer confused with an unselected worker JVM.
 The Gradle exporter captures the stock worker executable, build JVM and worker
