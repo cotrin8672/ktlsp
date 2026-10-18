@@ -32,6 +32,82 @@ class KtlspSourceSet(
     val resolutionRoot: Provider<ResolvedComponentResult>,
 )
 
+// Owned only by this export invocation; no Gradle/KGP classloader enters this inventory.
+abstract class KtlspCompilerRuntimes : org.gradle.api.services.BuildService<org.gradle.api.services.BuildServiceParameters.None>, AutoCloseable {
+    private val shared = linkedMapOf<List<String>, URLClassLoader>()
+    private val owned = mutableListOf<URLClassLoader>()
+    private val fingerprints = linkedMapOf<java.io.File, ByteArray>()
+    private var closed = false
+
+    private fun sha256(file: java.io.File): ByteArray {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(65536)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest()
+    }
+
+    @Synchronized
+    fun inspector(compilerClasspath: List<java.io.File>, toolsJar: java.io.File?): URLClassLoader {
+        check(!closed) { "Kotlin compiler runtime inspection has finished" }
+        // The parent is always null; preserve every URL and its order, including a tools JAR.
+        val runtime = compilerClasspath + listOfNotNull(toolsJar)
+        // Directory/missing runtimes retain fresh task-local inspection, with no shared stale state.
+        if (!runtime.all { it.isFile }) return open(compilerClasspath, toolsJar).also { owned.add(it) }
+        val key = runtime.map { it.toURI().toURL().toExternalForm() }
+        return shared.getOrPut(key) {
+            runtime.forEach { file -> fingerprints.getOrPut(file) { sha256(file) } }
+            open(compilerClasspath, toolsJar).also { owned.add(it) }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        var failure: Exception? = null
+        try {
+            fingerprints.forEach { (file, expected) ->
+                check(java.security.MessageDigest.isEqual(expected, sha256(file))) {
+                    "Selected Kotlin compiler runtime changed during export: $file"
+                }
+            }
+        } catch (problem: Exception) {
+            failure = problem
+        } finally {
+            owned.forEach { loader ->
+                try { loader.close() } catch (problem: Exception) {
+                    val previous = failure
+                    if (previous == null) failure = problem else previous.addSuppressed(problem)
+                }
+            }
+            owned.clear()
+            shared.clear()
+            fingerprints.clear()
+        }
+        failure?.let { throw it }
+    }
+
+    companion object {
+        fun open(compilerClasspath: List<java.io.File>, toolsJar: java.io.File?): URLClassLoader =
+            object : URLClassLoader((compilerClasspath + listOfNotNull(toolsJar)).map { it.toURI().toURL() }.toTypedArray(), null) {
+                override fun getResourceAsStream(name: String): java.io.InputStream? {
+                    val resource = getResource(name) ?: return null
+                    return try {
+                        resource.openConnection().apply { useCaches = false }.getInputStream()
+                    } catch (_: java.io.IOException) {
+                        null
+                    }
+                }
+            }
+    }
+}
+
 object KtlspCompilerConfiguration {
     private data class JavaGradleProfile(
         val version: String,
@@ -375,7 +451,7 @@ object KtlspCompilerConfiguration {
             "registered_inputs" to registered.map { it.absolutePath }.sorted())
     }.getOrNull()
 
-    private fun kotlinCompilerRecipe(task: Task, toolchain: Any, toolchainJavaHome: java.io.File): Map<String, Any?> {
+    private fun kotlinCompilerRecipe(task: Task, toolchain: Any, toolchainJavaHome: java.io.File, runtimes: KtlspCompilerRuntimes): Map<String, Any?> {
         // This is KGP's actual ordered compiler runtime input, separate from target libraries.
         val compilerClasspath = (read(task, "getDefaultCompilerClasspath\$kotlin_gradle_plugin_common") as? FileCollection)
             ?.toList() ?: error("Kotlin compiler runtime classpath is unavailable")
@@ -416,25 +492,15 @@ object KtlspCompilerConfiguration {
         check(daemonArguments.all { it is String }) { "Unsupported Kotlin compiler daemon JVM argument value" }
         val compilerVersion = try {
             // No parent loader: the KGP plugin version must not stand in for the selected compiler.
-            object : URLClassLoader((compilerClasspath + listOfNotNull(toolsJar)).map { it.toURI().toURL() }.toTypedArray(), null) {
-                override fun getResourceAsStream(name: String): java.io.InputStream? {
-                    val resource = getResource(name) ?: return null
-                    return try {
-                        resource.openConnection().apply { useCaches = false }.getInputStream()
-                    } catch (_: java.io.IOException) {
-                        null
-                    }
-                }
-            }.use { loader ->
-                val versionClass = Class.forName("org.jetbrains.kotlin.config.KotlinCompilerVersion", true, loader)
-                val version = versionClass.getMethod("getVersion").invoke(null) as? String
-                    ?: error("Selected Kotlin compiler version is unavailable")
-                check(version.isNotBlank() && version != "@snapshot@" && version != "<unknown>") {
-                    "Selected Kotlin compiler version is unavailable: $version"
-                }
-                Class.forName("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", false, loader)
-                version
+            val loader = runtimes.inspector(compilerClasspath, toolsJar)
+            val versionClass = Class.forName("org.jetbrains.kotlin.config.KotlinCompilerVersion", true, loader)
+            val version = versionClass.getMethod("getVersion").invoke(null) as? String
+                ?: error("Selected Kotlin compiler version is unavailable")
+            check(version.isNotBlank() && version != "@snapshot@" && version != "<unknown>") {
+                "Selected Kotlin compiler version is unavailable: $version"
             }
+            Class.forName("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", false, loader)
+            version
         } catch (failure: LinkageError) {
             throw IllegalStateException("Selected Kotlin compiler runtime cannot be loaded", failure)
         }
@@ -456,7 +522,7 @@ object KtlspCompilerConfiguration {
     private fun sdkSourceFacts(task: Task, language: String): Pair<Map<String, Any?>?, Map<String, Any?>?> {
         var claims: Map<String, Any?>? = null
         val policy = runCatching {
-        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "9.6.1"))
+        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.6.1"))
         val sets = task.project.extensions.findByType(SourceSetContainer::class.java) ?: return@runCatching null
         val sourceSet = sets.filter {
             if (language == "java") it.compileJavaTaskName == task.name
@@ -486,7 +552,9 @@ object KtlspCompilerConfiguration {
         val visitorType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor", false, loader)
         val treeType = Class.forName("org.gradle.api.internal.file.FileCollectionInternal", false, loader)
         val visitType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType", false, loader)
-        val spec = visitType.enumConstants.single { (it as Enum<*>).name == "Spec" }
+        // Verified Gradle 8/9 visitors removed Spec and default to Visit.
+        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.6.1")) "Visit" else "Spec"
+        val spec = visitType.enumConstants.single { (it as Enum<*>).name == visitName }
         val future = linkedSetOf<java.io.File>()
         val producerRoots = linkedSetOf<java.io.File>()
         var rootsComplete = true
@@ -546,7 +614,7 @@ object KtlspCompilerConfiguration {
         return claims to policy
     }
 
-    fun dump(task: Task, language: String): String {
+    fun dump(task: Task, language: String, runtimes: Provider<KtlspCompilerRuntimes>): String {
         // Keep producer coverage even when later SDK/recipe capture fails.
         val sdkSources = sdkSourceFacts(task, language)
         val record = linkedMapOf<String, Any?>(
@@ -650,7 +718,7 @@ object KtlspCompilerConfiguration {
                 check(explicitHome == null || explicitHome.isAbsolute) { "Kotlin compiler JDK argument must be absolute" }
                 record["java_home"] = if ("-no-jdk" in strings) null else (explicitHome ?: javaHome).absolutePath
                 // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
-                val recipe = kotlinCompilerRecipe(task, toolchain, javaHome)
+                val recipe = kotlinCompilerRecipe(task, toolchain, javaHome, runtimes.get())
                 record["kotlin_compiler"] = recipe
                 record["options"] = linkedMapOf(
                     "sdkProducerClaims" to sdkSources.first,
@@ -938,6 +1006,8 @@ class KtlspDumpClasspathAction(
 // and source membership. Watching the configuration collection also handles plugins that create
 // `compileClasspath` from a later `afterEvaluate` callback. Modules without that configuration skip
 // task registration entirely.
+val compilerRuntimes = gradle.sharedServices.registerIfAbsent("ktlspCompilerRuntimes", KtlspCompilerRuntimes::class.java) {}
+
 allprojects {
     val projectPath = project.path
     val projectDirPath = project.projectDir.absolutePath
@@ -980,8 +1050,8 @@ allprojects {
                         sourceSet.getTaskName("ksp", "Kotlin"),
                     ).mapNotNull { taskName -> tasks.findByName(taskName) }).distinctBy { it.path }
                     val compilers = listOfNotNull(
-                        compileJava?.let { KtlspCompilerConfiguration.dump(it, "java") },
-                    ) + kotlinTasks.map { KtlspCompilerConfiguration.dump(it, "kotlin") }
+                        compileJava?.let { KtlspCompilerConfiguration.dump(it, "java", compilerRuntimes) },
+                    ) + kotlinTasks.map { KtlspCompilerConfiguration.dump(it, "kotlin", compilerRuntimes) }
                     compileJava?.options?.generatedSourceOutputDirectory?.orNull?.asFile?.let(roots::add)
                     // KAPT can feed generated Java directly to JavaCompile, outside allJava.
                     compileJava?.source?.visit {
@@ -1037,6 +1107,7 @@ allprojects {
 
         listOf("ktlspDumpClasspath", "ktlspDumpSources").forEach { taskName ->
           tasks.register(taskName) {
+            usesService(compilerRuntimes)
             // Gradle 7 serializes enclosing Kotlin DSL closures, including their Project receiver.
             doLast(KtlspDumpClasspathAction(
                 projectPath, projectDirPath, currentBuildRoot, includedBuildRoots,
@@ -1117,8 +1188,8 @@ object KtlspSelectedTaskObserver {
         it.name == "getSerializedCompilerArguments" && it.parameterCount == 0
     }
 
-    fun configuration(task: Task): Map<*, *> = groovy.json.JsonSlurper().parseText(
-        KtlspCompilerConfiguration.dump(task, if (task is JavaCompile) "java" else "kotlin")
+    fun configuration(task: Task, runtimes: Provider<KtlspCompilerRuntimes>): Map<*, *> = groovy.json.JsonSlurper().parseText(
+        KtlspCompilerConfiguration.dump(task, if (task is JavaCompile) "java" else "kotlin", runtimes)
     ) as Map<*, *>
 
     fun pluginFiles(configurations: List<Map<*, *>>): List<Map<String, Any?>> {
@@ -1131,7 +1202,8 @@ object KtlspSelectedTaskObserver {
     }
 
     fun javaInputs(task: JavaCompile, sourceSet: org.gradle.api.tasks.SourceSet,
-                   compilerTasks: List<Task>, buildFiles: List<java.io.File>): Map<String, Any?> {
+                   compilerTasks: List<Task>, buildFiles: List<java.io.File>,
+                   runtimes: Provider<KtlspCompilerRuntimes>): Map<String, Any?> {
         val kotlinExtension = sourceSet.extensions.findByName("kotlin")
         val kotlinDirectories = when (kotlinExtension) {
             is SourceDirectorySet -> kotlinExtension
@@ -1143,7 +1215,7 @@ object KtlspSelectedTaskObserver {
         }
         val sources = (sourceSet.allJava.files + (kotlinDirectories?.files ?: emptySet()) + task.source.files)
             .sortedBy { path(it) }
-        val configurations = compilerTasks.map { configuration(it) }
+        val configurations = compilerTasks.map { configuration(it, runtimes) }
         val homes = configurations.mapNotNull { it["java_home"] as? String }.toMutableSet()
         homes.add(System.getProperty("java.home"))
         val runtimeFiles = homes.sorted().flatMap { home ->
@@ -1151,7 +1223,7 @@ object KtlspSelectedTaskObserver {
                 .map { file(java.io.File(home, it)) }
         }
         return linkedMapOf(
-            "configuration" to configuration(task),
+            "configuration" to configuration(task, runtimes),
             "compiler_configurations" to configurations,
             "compiler_runtime_files" to runtimeFiles,
             "module_sources" to sources.map { file(it) },
@@ -1188,6 +1260,11 @@ val ktlspObserverRoot = System.getProperty("ktlsp.observer.root")
 val ktlspObserverTask = System.getProperty("ktlsp.observer.task")
 val ktlspObserverNonce = System.getProperty("ktlsp.observer.nonce")
 if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserverTask != null && ktlspObserverNonce != null) {
+    allprojects {
+        tasks.configureEach {
+            if (KtlspSelectedTaskObserver.compiler(this)) usesService(compilerRuntimes)
+        }
+    }
     gradle.taskGraph.whenReady(object : Action<org.gradle.api.execution.TaskExecutionGraph> {
         override fun execute(graph: org.gradle.api.execution.TaskExecutionGraph) {
             if (gradle.rootProject.rootDir.canonicalFile != java.io.File(ktlspObserverRoot).canonicalFile) return
@@ -1221,14 +1298,14 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                 "gradle_home" to gradle.gradleHomeDir?.let { observer.path(it) },
                 "gradle_user_home" to observer.path(gradle.gradleUserHomeDir),
                 "init_scripts" to gradle.startParameter.initScripts.map { observer.file(it) },
-                "compiler_configurations" to compilerTasks.map { observer.configuration(it) },
+                "compiler_configurations" to compilerTasks.map { observer.configuration(it, compilerRuntimes) },
             ))
             var selectedStarted = false
             selected.doFirst(object : Action<Task> {
                 override fun execute(task: Task) {
                     selectedStarted = true
                     observer.event("selected-action-start", linkedMapOf("task" to selected.path,
-                        "inputs" to observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles),
+                        "inputs" to observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles, compilerRuntimes),
                         "outputs_before" to observer.inventory(selected.outputs.files.files.toList())))
                 }
             })
@@ -1244,7 +1321,7 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                 override fun beforeExecute(task: Task) {
                     val record = linkedMapOf<String, Any?>("task" to task.path, "type" to task.javaClass.name)
                     if (task in compilerTasks) {
-                        record["configuration"] = observer.configuration(task)
+                        record["configuration"] = observer.configuration(task, compilerRuntimes)
                         record["declared_inputs"] = observer.inventory(task.inputs.files.files.sortedBy { observer.path(it) })
                     }
                     observer.event("task-start", record)
@@ -1252,7 +1329,7 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                 override fun afterExecute(task: Task, state: org.gradle.api.tasks.TaskState) {
                     val record = linkedMapOf<String, Any?>("task" to task.path, "state" to observer.state(state))
                     if (task in compilerTasks) record["outputs"] = observer.inventory(task.outputs.files.files.toList())
-                    if (task == selected && selectedStarted) record["inputs_after"] = observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles)
+                    if (task == selected && selectedStarted) record["inputs_after"] = observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles, compilerRuntimes)
                     observer.event("task-end", record)
                 }
             })

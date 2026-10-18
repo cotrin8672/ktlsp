@@ -346,28 +346,27 @@ import java.io.IOException
 import java.net.URLClassLoader
 import java.util.jar.JarEntry
 import java.util.jar.JarOutputStream
+import org.gradle.api.provider.Provider
 
-class CompilerResourceProbe(private val jar: File) : Action<Task>, java.io.Serializable {
-    private fun inspector(compilerClasspath: List<File>, toolsJar: File?): URLClassLoader =
 KOTLIN
-  # Execute the production factory itself; extraction drift must stop the probe before Gradle runs.
+  # Use the production service and factory; extraction drift must stop before Gradle runs.
   awk '
-    /val compilerVersion = try \{/ { recipes++; recipe = 1; next }
-    recipe && /^            (object : )?URLClassLoader\(/ { starts++; copying = 1 }
-    copying {
-      if (index($0, ".use { loader ->") != 0) {
-        sub(/\.use \{ loader ->.*/, ""); print; copying = 0; recipe = 0; ends++
-      } else print
-    }
+    /^abstract class KtlspCompilerRuntimes / { starts++; copying = 1 }
+    copying && /^object KtlspCompilerConfiguration / { copying = 0; ends++ }
+    copying { print }
     END {
-      if (recipes != 1 || starts != 1 || ends != 1) {
-        print "Compiler resource probe: expected one production compiler loader factory; extraction drifted" > "/dev/stderr"
+      if (starts != 1 || ends != 1) {
+        print "Compiler resource probe: expected one production runtime owner; extraction drifted" > "/dev/stderr"
         exit 1
       }
     }
   ' "$repo/scripts/classpath-dump.init.gradle.kts" >> "$project/build.gradle.kts" || return $?
   cat >> "$project/build.gradle.kts" <<'KOTLIN'
 
+class CompilerResourceProbe(
+    private val jar: File,
+    private val runtimes: Provider<KtlspCompilerRuntimes>,
+) : Action<Task>, java.io.Serializable {
     override fun execute(task: Task) {
         val expected = ByteArray(17783) { (it % 251).toByte() }
         check(jar.parentFile.mkdirs() || jar.parentFile.isDirectory)
@@ -380,7 +379,7 @@ KOTLIN
         for (production in listOf(false, true)) {
             URLClassLoader(urls, null).use { victim ->
                 checkNotNull(victim.getResourceAsStream("victim")).use { pending ->
-                    val inspector = if (production) inspector(listOf(jar), null) else URLClassLoader(urls, null)
+                    val inspector = if (production) KtlspCompilerRuntimes.open(listOf(jar), null) else URLClassLoader(urls, null)
                     check(inspector.parent == null && inspector.getURLs().contentEquals(urls))
                     inspector.use { loader ->
                         checkNotNull(loader.getResourceAsStream("inspector")).use { check(it.read() == 42) }
@@ -399,11 +398,64 @@ KOTLIN
             }
         }
         task.logger.quiet("PASS  compiler inspector closes without invalidating another loader's pending resource")
+        val owner = runtimes.get()
+        val owned = owner.inspector(listOf(jar), null)
+        check(owned.parent == null && owner.inspector(listOf(jar), null) === owned)
+        val second = File(jar.parentFile, "compiler-resource-second.jar")
+        jar.copyTo(second, overwrite = true)
+        val ordered = owner.inspector(listOf(jar, second), null)
+        check(ordered !== owned && owner.inspector(listOf(jar), second) === ordered)
+        check(owner.inspector(listOf(second, jar), null) !== ordered)
+        check(ordered.getURLs().contentEquals(arrayOf(jar.toURI().toURL(), second.toURI().toURL())))
+        URLClassLoader(urls, null).use { borrowed ->
+            checkNotNull(borrowed.getResourceAsStream("victim")).use { pending ->
+                checkNotNull(owned.getResourceAsStream("inspector")).use { check(it.read() == 42) }
+                owner.close()
+                check(pending.readBytes().contentEquals(expected))
+                check(borrowed.findResource("victim") != null)
+            }
+        }
+        check(owned.findResource("inspector") == null && ordered.findResource("inspector") == null)
+        check(runCatching { owner.inspector(listOf(jar), null) }.isFailure)
+        owner.close()
+        task.logger.quiet("PASS  compiler runtime owner reuses exact ordered URLs and closes only its own loaders")
     }
 }
 
+class CompilerRuntimeMutationProbe(
+    private val jar: File,
+    private val directory: String,
+    private val runtimes: Provider<KtlspCompilerRuntimes>,
+) : Action<Task>, java.io.Serializable {
+    override fun execute(task: Task) {
+        check(jar.parentFile.mkdirs() || jar.parentFile.isDirectory)
+        JarOutputStream(jar.outputStream()).use { output ->
+            output.putNextEntry(JarEntry("runtime")); output.write(42); output.closeEntry()
+        }
+        val loader = runtimes.get().inspector(listOf(jar), null)
+        checkNotNull(loader.getResourceAsStream("runtime")).use { check(it.read() == 42) }
+        // Complete, valid model bytes precede the late runtime mutation/close failure.
+        task.logger.quiet("PROJECT\t:mutation\t$directory\nBUILD\t:\nSOURCESET\tmain\nEND\t:mutation")
+        val previous = jar.lastModified()
+        val bytes = jar.readBytes()
+        // Preserve size and mtime: only a content digest, rather than a stat key, detects this.
+        bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte()
+        jar.writeBytes(bytes)
+        check(jar.setLastModified(previous))
+        task.logger.quiet("KTLSP_RUNTIME_MUTATED_AFTER_COMPLETE_MODEL")
+    }
+}
+
+val compilerMutationRuntimes = gradle.sharedServices.registerIfAbsent("ktlspCompilerMutationRuntimes", KtlspCompilerRuntimes::class.java) {}
+tasks.register("ktlspCompilerRuntimeMutationProbe") {
+    usesService(compilerMutationRuntimes)
+    doLast(CompilerRuntimeMutationProbe(layout.buildDirectory.file("compiler-runtime-mutated.jar").get().asFile, projectDir.absolutePath, compilerMutationRuntimes))
+}
+
+val compilerProbeRuntimes = gradle.sharedServices.registerIfAbsent("ktlspCompilerProbeRuntimes", KtlspCompilerRuntimes::class.java) {}
 tasks.register("ktlspCompilerResourceProbe") {
-    doLast(CompilerResourceProbe(layout.buildDirectory.file("compiler-resource-probe.jar").get().asFile))
+    usesService(compilerProbeRuntimes)
+    doLast(CompilerResourceProbe(layout.buildDirectory.file("compiler-resource-probe.jar").get().asFile, compilerProbeRuntimes))
 }
 KOTLIN
   printf '%s\n' "$project"
@@ -428,6 +480,7 @@ run_classpath_config_cache_probe() {
   grep -q $'^PROJECT\t:app\t' "$cold_out" || return 1
   grep -q $'^UNRESOLVED\tcom.example:ktlsp-harness-missing:0.0.0\t' "$cold_out" || return 1
   grep -q '^PASS  compiler inspector closes without invalidating' "$cold_out" || return 1
+  grep -q '^PASS  compiler runtime owner reuses exact ordered URLs' "$cold_out" || return 1
 
   (
     cd "$project"

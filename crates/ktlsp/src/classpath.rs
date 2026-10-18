@@ -1108,6 +1108,15 @@ fn sdk_feature_version(release: &str) -> Option<u16> {
     (feature >= 8).then_some(feature)
 }
 
+// Kotlin's selected compiler accepts the legacy spelling only for Java 8.
+fn kotlin_jdk_release_feature(value: &str) -> Option<u16> {
+    if value == "1.8" {
+        Some(8)
+    } else {
+        value.parse().ok()
+    }
+}
+
 fn source_set_jdk_source(
     source: &SourceSetClasspath,
     features: &mut BTreeMap<String, Option<u16>>,
@@ -1237,7 +1246,7 @@ fn source_set_jdk_home(
                         }
                     }
                     if let Some(release) = argument.strip_prefix("-Xjdk-release=") {
-                        if release.parse::<u16>().ok() != Some(feature) {
+                        if kotlin_jdk_release_feature(release) != Some(feature) {
                             return None;
                         }
                     } else if argument.starts_with("-Xjdk-release") {
@@ -1482,17 +1491,39 @@ fn source_set_sdk_api(
             release
         }
         CompilerLanguage::Kotlin => {
+            let mut target = None;
+            let mut arguments = task.arguments.iter();
+            while let Some(argument) = arguments.next() {
+                let value = if argument == "-jvm-target" {
+                    Some(arguments.next()?.as_str())
+                } else {
+                    argument.strip_prefix("-jvm-target=")
+                };
+                if let Some(value) = value {
+                    if target.is_some() {
+                        return None;
+                    }
+                    target = Some(kotlin_jdk_release_feature(value)?);
+                }
+            }
             let mut release = None;
             for argument in &mut normalized.arguments {
                 if let Some(value) = argument.strip_prefix("-Xjdk-release=") {
                     if release.is_some() {
                         return None;
                     }
-                    release = Some(value.parse::<u16>().ok()?);
+                    release = Some(kotlin_jdk_release_feature(value)?);
                     *argument = format!("-Xjdk-release={feature}");
                 } else if argument.starts_with("-Xjdk-release") {
                     return None;
                 }
+            }
+            // Validate the authored flags before normalizing the release for SDK-home checks.
+            if release
+                .zip(target)
+                .is_some_and(|(release, target)| release != target)
+            {
+                return None;
             }
             release
         }
@@ -3705,6 +3736,89 @@ pub(crate) mod tests {
             opaque.sdk_api_for_file(&new_java_path).is_none(),
             "opaque task filters must not admit new Java files"
         );
+        // Actual Gradle 8.14.2 / KGP 2.0.21 metadata uses release=1.8 and target=1.8.
+        // The selected compiler independently emits identical AtomicKt bytes for release 8/1.8.
+        let atomic_text = "fun atomic(i: java.util.concurrent.atomic.AtomicInteger, s: java.lang.String): Int { s.strip(); s.incrementAndGet(); return i.incrementAndGet() }";
+        for release in ["8", "1.8"] {
+            let mut legacy = module.clone();
+            legacy.source_sets[0].compiler_tasks[1].arguments = vec![
+                "-jvm-target".into(),
+                "1.8".into(),
+                format!("-Xjdk-release={release}"),
+            ];
+            let legacy_model = Arc::new(ProjectSnapshot::new(vec![legacy.clone()]));
+            let selection = legacy_model
+                .sdk_api_for_file(&kotlin_path)
+                .unwrap_or_else(|| {
+                    panic!("valid Kotlin release {release} needs its API inventory")
+                });
+            assert_eq!(selection.release, Some(8));
+            assert!(selection
+                .entries
+                .get("java/util/concurrent/atomic/AtomicInteger")
+                .is_some_and(Option::is_some));
+            let projected = crate::sdk_api::index(selection, &root.join("extract")).unwrap();
+            ws.set_project_model(legacy_model);
+            for batch in projected.batches {
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.open(&kotlin_key, atomic_text.into());
+            let offset = atomic_text.find("i.inc").unwrap() + "i.inc".len();
+            assert!(
+                ws.complete(&kotlin_key, offset, true)
+                    .is_some_and(|result| result
+                        .items
+                        .iter()
+                        .any(|item| item.label == "incrementAndGet")),
+                "release {release}: actual AtomicInteger API must remain useful"
+            );
+            let definition =
+                ws.goto_definition(&kotlin_key, atomic_text.rfind("incrementAndGet").unwrap());
+            assert_eq!(definition.len(), 1, "release {release}: {definition:?}");
+            assert!(definition[0].file.replace('\\', "/").contains("/jdk-api/"));
+            for prefix in ["s.str", "s.inc"] {
+                let offset = atomic_text.find(prefix).unwrap() + prefix.len();
+                assert!(
+                    !ws.complete(&kotlin_key, offset, true)
+                        .is_some_and(|result| result.items.iter().any(|item| item.label
+                            == if prefix == "s.str" {
+                                "strip"
+                            } else {
+                                "incrementAndGet"
+                            })),
+                    "release {release}: {prefix}"
+                );
+            }
+            legacy.source_sets[0].compiler_tasks[1]
+                .options
+                .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+            assert!(
+                ProjectSnapshot::new(vec![legacy])
+                    .sdk_api_for_file(&kotlin_path)
+                    .is_none(),
+                "release normalization must not invent the actual96 missing source policy"
+            );
+        }
+        for arguments in [
+            vec!["-Xjdk-release=bogus"],
+            vec!["-Xjdk-release=1.9"],
+            vec!["-Xjdk-release=999"],
+            vec!["-Xjdk-release=8", "-Xjdk-release=8"],
+            vec!["-Xjdk-release=8", "-Xjdk-release=17"],
+            vec!["-jvm-target", "17", "-Xjdk-release=8"],
+        ] {
+            let mut unsupported = module.clone();
+            unsupported.source_sets[0].compiler_tasks[1].arguments = arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect();
+            assert!(
+                ProjectSnapshot::new(vec![unsupported])
+                    .sdk_api_for_file(&kotlin_path)
+                    .is_none(),
+                "unsupported/ambiguous Kotlin API policy: {arguments:?}"
+            );
+        }
         let mut unsupported = module;
         unsupported.source_sets[0].compiler_tasks[0]
             .options
@@ -3713,6 +3827,64 @@ pub(crate) mod tests {
             .sdk_api_for_file(&java_path)
             .is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "actual captured SourceSet/SDK oracle; requires KTLSP_SDK_CAPTURED_SOURCE_SET"]
+    fn captured_gradle_kotlin_legacy_release_selects_atomic_signature() {
+        use sha2::Digest;
+        use std::io::Read;
+        let captured = PathBuf::from(std::env::var_os("KTLSP_SDK_CAPTURED_SOURCE_SET").unwrap());
+        let source: SourceSetClasspath =
+            serde_json::from_slice(&std::fs::read(captured).unwrap()).unwrap();
+        let task = sdk_producing_task(&source, &CompilerLanguage::Kotlin).unwrap();
+        assert!(task
+            .arguments
+            .iter()
+            .any(|argument| argument == "-Xjdk-release=1.8"));
+        assert_eq!(task.source_files.len(), 12);
+        assert!(task.options.get("sdkSourcePolicy").unwrap().is_null());
+        assert!(
+            sdk_source_policy(task, &source, "kt").is_none(),
+            "the actual96 null policy is a separate caller-admission gap"
+        );
+        let selection = source_set_sdk_api(
+            &source,
+            CompilerLanguage::Kotlin,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+        .expect("compiler-valid actual release1.8 needs the selected API8 inventory");
+        assert_eq!(selection.release, Some(8));
+        let name = selection
+            .entries
+            .get("java/util/concurrent/atomic/AtomicInteger")
+            .and_then(Option::as_ref)
+            .expect("AtomicInteger belongs to Java8");
+        let bytes = std::fs::read(&selection.archive).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+            selection.archive_sha256
+        );
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut entry = archive.by_name(name).unwrap();
+        assert!(entry.size() <= ktcore::classfile::MAX_CLASS_FILE_BYTES as u64);
+        let mut signature = Vec::new();
+        entry.read_to_end(&mut signature).unwrap();
+        let facts = ktcore::classfile::decode(&selection.origin(), &signature).unwrap();
+        assert_eq!(
+            facts.identity.internal_name.as_str(),
+            "java/util/concurrent/atomic/AtomicInteger"
+        );
+        assert!(facts
+            .methods
+            .iter()
+            .any(|method| method.name.as_ref() == "incrementAndGet"
+                && method.descriptor.as_ref() == "()I"
+                && method.access_flags & 1 == 1));
+        let (declaration, _) =
+            crate::jar::selected_sdk_class_stub_facts(&selection, &facts).unwrap();
+        assert!(declaration.contains("incrementAndGet("));
     }
 
     #[test]
@@ -5756,5 +5928,37 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
             &snapshot(&root.canonicalize().unwrap()).unwrap()
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "local real Gradle runtime mutation admission; requires KTLSP_COMPILER_RUNTIME_PROBE_ROOT"]
+    fn normal_dump_rejects_changed_runtime_after_complete_model_output() {
+        let root = PathBuf::from(
+            std::env::var_os("KTLSP_COMPILER_RUNTIME_PROBE_ROOT")
+                .expect("prepared disposable classpath-config-cache harness project"),
+        );
+        // A complete protocol by itself is valid. The actual stock Gradle service's close
+        // must fail, and the normal importer must not accept those already-printed rows.
+        let complete = format!(
+            "PROJECT\t:mutation\t{}\nBUILD\t:\nSOURCESET\tmain\nEND\t:mutation\n",
+            root.display()
+        );
+        assert_eq!(
+            parse_dump_reader(std::io::Cursor::new(complete), true)
+                .unwrap()
+                .len(),
+            1
+        );
+        let failure = run_dump(&root, "ktlspCompilerRuntimeMutationProbe", true)
+            .expect_err("changed runtime must not become an accepted model");
+        let message = format!("{failure:#}");
+        assert!(
+            message.contains("gradle classpath dump failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Selected Kotlin compiler runtime changed during export"),
+            "{message}"
+        );
     }
 }
