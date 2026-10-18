@@ -8239,6 +8239,8 @@ impl Workspace {
             .iter()
             .map(|path| (crate::paths::file_key(path), path.clone()))
             .collect();
+        let source_views = model.compiler_source_views();
+        let mut java_editor_sources = BTreeSet::new();
         let mut overlays = Vec::new();
         let mut dependency_overlays = Vec::new();
         for (open_key, doc) in &self.open_docs {
@@ -8260,8 +8262,19 @@ impl Workspace {
                 .map_or(self.index_revision, |source| source.revision);
             if own {
                 if open_key.ends_with(".kt") || open_key.ends_with(".java") {
-                    // Explicit editing policy: owned new buffers join the selected task overlay.
-                    // This is not proof that custom Gradle Spec/Closure filters would include them.
+                    // Preserve the canonical editor policy; Java needs stock task membership too.
+                    if !sources.contains_key(open_key) {
+                        let mut views = source_views
+                            .iter()
+                            .filter(|view| view.matches_file(open_key));
+                        if views
+                            .next()
+                            .is_some_and(|view| view.visibility.scope == scope)
+                            && views.next().is_none()
+                        {
+                            java_editor_sources.insert(open_key.clone());
+                        }
+                    }
                     sources.insert(open_key.clone(), std::path::PathBuf::from(open_key));
                     overlays.push(crate::compile::KotlinSourceOverlay::new(
                         open_key.clone(),
@@ -8290,18 +8303,20 @@ impl Workspace {
                 .chain(dependency_overlays.iter().map(|source| &source.key))
                 .all(|file| self.index.contributions_for_file(file).is_empty())
         {
-            model.plain_java_task(key).and_then(|java| {
-                java.java_compiler_recipe()?;
-                crate::compile::java_import_dependencies(
-                    task,
-                    java,
-                    source,
-                    &model,
-                    &visibilities,
-                    &visible_origins,
-                )
-                .map(|dependencies| (java.clone(), dependencies))
-            })
+            model
+                .plain_java_task_for_editor(key, &java_editor_sources)
+                .and_then(|java| {
+                    java.java_compiler_recipe()?;
+                    crate::compile::java_import_dependencies(
+                        task,
+                        java,
+                        source,
+                        &model,
+                        &visibilities,
+                        &visible_origins,
+                    )
+                    .map(|dependencies| (java.clone(), dependencies))
+                })
         } else {
             None
         };
@@ -8336,6 +8351,7 @@ impl Workspace {
             task: task.clone(),
             java_task,
             java_dependencies,
+            java_editor_sources,
             positive_diagnostics_only: source.compiler_tasks.iter().any(|candidate| {
                 candidate.language == CompilerLanguage::Kotlin && candidate.task != task.task
             }),

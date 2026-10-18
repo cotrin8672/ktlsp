@@ -3611,6 +3611,8 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub java_task: Option<crate::classpath::CompilerTask>,
     /// Existing source-set facts for participating plain Java dependencies; no binary API authority.
     pub java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
+    /// New owned wire sources admitted by the current stock task source policy.
+    pub java_editor_sources: std::collections::BTreeSet<String>,
     /// Auxiliary Kotlin tasks may produce semantics this independent invocation cannot certify.
     pub positive_diagnostics_only: bool,
     pub source_roots: Vec<PathBuf>,
@@ -3749,6 +3751,7 @@ struct KotlinEnvironmentKey {
     java_task: Option<crate::classpath::CompilerTask>,
     java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     java_helper_sha256: Option<String>,
+    java_editor_sources: std::collections::BTreeSet<String>,
 }
 
 impl KotlinEnvironmentKey {
@@ -3801,6 +3804,11 @@ impl KotlinEnvironmentKey {
                 Vec::new()
             },
             java_helper_sha256: java_available.then(java_diagnostics::assets_sha256),
+            java_editor_sources: if java_available {
+                request.java_editor_sources.clone()
+            } else {
+                Default::default()
+            },
         })
     }
 
@@ -4540,6 +4548,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         task,
         java_task: None,
         java_dependencies: Vec::new(),
+        java_editor_sources: Default::default(),
         positive_diagnostics_only: false,
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),

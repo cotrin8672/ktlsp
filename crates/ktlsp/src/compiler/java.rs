@@ -1013,8 +1013,25 @@ pub(super) fn configured_recipe(
         .map(|p| header_key(p))
         .collect();
     let selected: BTreeSet<_> = request.sources.iter().map(|p| header_key(p)).collect();
+    let editor: BTreeSet<_> = request
+        .java_editor_sources
+        .iter()
+        .map(|key| header_key(Path::new(key)))
+        .collect();
+    let wire: BTreeSet<_> = request
+        .overlays
+        .iter()
+        .map(|source| header_key(Path::new(&source.key)))
+        .collect();
     anyhow::ensure!(
-        declared == selected
+        declared.is_subset(&selected)
+            && selected
+                .difference(&declared)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == editor
+            && editor.is_subset(&wire)
+            && editor.len() == request.java_editor_sources.len()
             && declared.len() == request.task.source_files.len()
             && selected.len() == request.sources.len(),
         "java-aux-new-or-duplicate-source-unhandled"
@@ -1027,8 +1044,11 @@ pub(super) fn configured_recipe(
         .collect();
     let selected_java: BTreeSet<_> = task.source_files.iter().map(|p| header_key(p)).collect();
     anyhow::ensure!(
-        !selected_java.is_empty()
-            && selected_java == declared_java
+        !declared_java.is_empty()
+            && selected_java.is_subset(&declared_java)
+            && declared_java
+                .difference(&selected_java)
+                .all(|key| editor.contains(key))
             && selected_java.len() == task.source_files.len(),
         "java-selected-source-membership-differs"
     );
@@ -1037,7 +1057,7 @@ pub(super) fn configured_recipe(
             .overlays
             .iter()
             .any(|source| source.key.ends_with(".java")
-                && selected_java.contains(&header_key(Path::new(&source.key)))),
+                && declared_java.contains(&header_key(Path::new(&source.key)))),
         "java-no-open-selected-source"
     );
     replay_options(
@@ -2424,7 +2444,11 @@ pub(super) fn run(
         std::fs::create_dir(overlay.directory.join(name))?;
     }
     let mut java_sources = Vec::new();
-    for original in &task.source_files {
+    for original in request
+        .sources
+        .iter()
+        .filter(|path| path.extension().and_then(|suffix| suffix.to_str()) == Some("java"))
+    {
         let private = overlay
             .sources
             .iter()

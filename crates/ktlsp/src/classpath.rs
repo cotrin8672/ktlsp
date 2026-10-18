@@ -7,7 +7,7 @@
 //!
 //! Pure parsing (`parse_dump`) is unit-tested; `resolve` does the gradle process IO.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -281,6 +281,7 @@ pub struct ProjectSnapshot {
     visibilities: Vec<ScopeVisibility>,
     sdk_selections: BTreeMap<ProjectScope, BTreeMap<String, SdkApiSelection>>,
     sdk_caller_views: Vec<ktcore::index::CallerScopeVisibility>,
+    compiler_source_views: Vec<ktcore::index::CallerScopeVisibility>,
 }
 
 impl ProjectSnapshot {
@@ -346,6 +347,7 @@ impl ProjectSnapshot {
             visibilities: Vec::new(),
             sdk_selections: BTreeMap::new(),
             sdk_caller_views: Vec::new(),
+            compiler_source_views: Vec::new(),
         };
         for entry in model
             .modules
@@ -443,7 +445,12 @@ impl ProjectSnapshot {
                     .insert(path_key(input), file_origin_id(input));
             }
         }
-        model.sdk_caller_views = model.build_caller_scope_visibilities();
+        model.sdk_caller_views = model.build_caller_scope_visibilities(true);
+        model.compiler_source_views = model.build_caller_scope_visibilities(false);
+        for view in &mut model.compiler_source_views {
+            // New inputs require future-root policy, not another task's exact selected file.
+            view.source_files.clear();
+        }
         model.local_source_keys = model
             .local_jars()
             .iter()
@@ -473,7 +480,15 @@ impl ProjectSnapshot {
     /// Configured Java inputs only: this does not prove compiler service absence, binary
     /// freshness, or generated API closure. Kotlin compiler plugins are a separate surface.
     pub(crate) fn plain_java_task(&self, key: &str) -> Option<&CompilerTask> {
-        let (_, source) = self.owner_for_key(key)?;
+        self.plain_java_task_for_editor(key, &BTreeSet::new())
+    }
+
+    pub(crate) fn plain_java_task_for_editor(
+        &self,
+        key: &str,
+        editor_sources: &BTreeSet<String>,
+    ) -> Option<&CompilerTask> {
+        let (module, source) = self.owner_for_key(key)?;
         let source = source?;
         if source.compiler_metadata_incomplete
             || source.classpath_incomplete
@@ -486,6 +501,17 @@ impl ProjectSnapshot {
             .iter()
             .filter(|task| task.language == CompilerLanguage::Java);
         let task = java.next()?;
+        let scope = project_scope(module, source);
+        let has_new_java = editor_sources.iter().any(|file| {
+            let mut views = self
+                .compiler_source_views
+                .iter()
+                .filter(|view| view.suffix == "java" && view.matches_file(file));
+            views
+                .next()
+                .is_some_and(|view| view.visibility.scope == scope)
+                && views.next().is_none()
+        });
         let fork_java_home_matches = match task.options.get("forkJavaHome") {
             Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::String(home)) => task
@@ -502,7 +528,7 @@ impl ProjectSnapshot {
                 "org.gradle.api.tasks.compile.JavaCompile"
                     | "org.gradle.api.tasks.compile.JavaCompile_Decorated"
             )
-            || task.source_files.is_empty()
+            || (task.source_files.is_empty() && !has_new_java)
             || (!task.arguments.is_empty() && !task.annotation_processing_disabled())
             || !task.annotation_processor_path.is_empty()
             || task.java_home.is_none()
@@ -634,7 +660,15 @@ impl ProjectSnapshot {
             .collect()
     }
 
-    fn build_caller_scope_visibilities(&self) -> Vec<ktcore::index::CallerScopeVisibility> {
+    /// Reuse stock pattern and producer-overlap checks without requiring SDK source indexing.
+    pub(crate) fn compiler_source_views(&self) -> &[ktcore::index::CallerScopeVisibility] {
+        &self.compiler_source_views
+    }
+
+    fn build_caller_scope_visibilities(
+        &self,
+        require_sdk: bool,
+    ) -> Vec<ktcore::index::CallerScopeVisibility> {
         let mut result = Vec::new();
         // Producer claims only veto a view. SDK or pattern-policy failure cannot erase them.
         let mut claimed = Vec::new();
@@ -678,18 +712,20 @@ impl ProjectSnapshot {
                 let Some(task) = sdk_producing_task(source, &language) else {
                     continue;
                 };
-                let Some(selection) = self
+                let selection = self
                     .sdk_selections
                     .get(&visibility.scope)
-                    .and_then(|views| views.get(suffix))
-                else {
+                    .and_then(|views| views.get(suffix));
+                if require_sdk && selection.is_none() {
                     continue;
-                };
+                }
                 let Some(policy) = sdk_source_policy(task, source, suffix) else {
                     continue;
                 };
                 let mut caller = visibility.clone();
-                caller.ordered_origins.push(selection.origin());
+                if let Some(selection) = selection {
+                    caller.ordered_origins.push(selection.origin());
+                }
                 result.push(ktcore::index::CallerScopeVisibility {
                     visibility: caller,
                     suffix: suffix.into(),

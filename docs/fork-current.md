@@ -6,7 +6,37 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest106: current source and native validation
+## Latest107: current source and native validation
+
+New unsaved Java/Kotlin sources now reuse the stock task's future-source policy
+for auxiliary Java compilation. Exact declared inputs remain mandatory; only
+current owned editor inputs with an unambiguous matching policy may extend them.
+Unknown filters, generated/excluded roots and ambiguous ownership remain
+unavailable. The environment identity includes the admitted editor inputs.
+The focused reproduction compiles before the fix (one pass/one failure), then
+both cases pass. Workspace107 passes1,683/zero failed/seven ignored; release
+succeeds. Root independently verified the40 test-result blocks, artifact hashes
+and344 inputs before/after the build. The only later changed guarded input is
+the harness shell's shutdown-observation help line; compiled Rust is unchanged.
+Evidence: native-integrated107-1/receipt.json SHA256
+669ce7195ff60881a516a7e8a38d2216951a6a00a1b04b1414f7ec9026f67fa6.
+The20,224,000-byte immutable release is native-integrated107-1/bin/ktlsp.exe,
+SHA2568e9513e1c453c5732095ea1862939d47228f83d63bcf7b2ee19d488cf6901101.
+
+Reload107 retains all86 checks and58 first requests without retry, through four
+accepted generations and clean shutdown. Root verified230 current runtime guards
+and four artifact references. Evidence: recovery89/gradle-reload107-1/receipt.json
+SHA256f1bfc3ef0c43a7c42f238c39fd4ba7e8e8fff6c30b028c3412df3418a25dddf9.
+Its deliberately incomplete Kotlin buffer prevents normal K2 compilation, so
+Java compiler diagnostic certification remains unproved by this reload case.
+A separate valid-Kotlin/new-Java control reaches normal K2 output and Javac:
+one missing-method error becomes zero after the unsaved fix. Three useful
+completion/navigation controls pass on their first responses. However, the
+existing Java diagnostic selector admits explicit-import errors only; the body
+error is not published as a canonical compiler diagnostic. The canonical
+observation deadline therefore leaves the native-to-editor certificate
+unproved. This is a diagnostic coverage gap, not evidence of a store bug.
+The explicit-import control and safe body-diagnostic extension are in progress.
 
 The full101 workspace run compiled and returned1,672 passed/three failed/seven
 ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
@@ -112,10 +142,19 @@ recovery89/corpus90/native-five-gradle-editor104-2/startup-watch-classification.
 Focused receipt: recovery89/watch-refresh105-focus2/receipt.json SHA256
 b71b952c1c9c936fc5644b22fa0063a976c53c0b94ad086ada0328945725f23e.
 The same105 binary also passes the unchanged Moshi9, OkHttp10 and Retrofit12
-qualified first responses:40/40 across these four projects including Gradle.
+qualified first responses. Spring's ten cases also pass:50/50 across all five
+projects, with one received response per request and no unmeasured/unqualified
+case. Root independently checked those50 attempts and the aggregate SHA.
 Root verified each direct receipt's artifact references/current guards/closure.
-Moshi and OkHttp exit cleanly; both Retrofit sessions retain the15s graceful
-shutdown failure. Spring's ten cases are still running. Receipts under
+Moshi and OkHttp exit cleanly; both Retrofit and both Spring sessions retain
+the15s graceful shutdown failure. With Gradle ordinary, that is five lifecycle
+failures in ten sessions; all owned Jobs close with zero residual processes.
+The semantic gate passes while whole-run acceptance remains false. Evidence:
+recovery89/corpus90/original50-current105-summary.json SHA256
+0f3dbba96ba74b2edb3eb144afd98b0766f09a0c4a94dfb7f8eb3cd66f7b1f49.
+Spring direct receipt SHA256
+cbb90cff0597c7971c83cca3f6490c08915ad2b87ac2f7a2e5a8ed16c7bc6911.
+Receipts under
 recovery89/corpus90/native-five-{moshi,okhttp,retrofit}-editor105-1/receipt.json
 have SHA256 respectively:
 4a2d3d8939f21d4e03f2577dae7d9117bdfc6f9c994decf73e90ff25c0d86fcc,
@@ -134,8 +173,17 @@ native-integrated106-1/bin/ktlsp.exe,20,190,720 bytes, SHA256
 160f57005434bc89da027f63095a10de8e8ba132d9c05cbf284ec5449f847210.
 Receipt: native-integrated106-1/receipt.json SHA256
 ab7e3666b18634b0b2868e238758e8854be89719167416b52b291e7bce32d6d2.
-Real-project revalidation of106 remains pending. Wrapper-JAR notifications are
-separate from this fix; their same-byte baseline handling is not yet changed.
+Moshi106 repeats the same nine qualified first responses with clean shutdowns
+and stable guards. Both sessions use generation1 and cached models; no actual
+property/JAR notifications occur, so this run does not exercise suppression.
+Evidence: recovery89/corpus90/native-five-moshi-editor106-1/semantic-receipt.json
+SHA25625f218bfe8cb1a45d60cb14c48c7ed48da5857198d4a4550f9f2202f38ffd404.
+Wrapper-JAR notifications are separate from106. The107 source change
+hashes only canonical wrappers with adjacent launcher/build configuration,
+retains changed/unknown events and excludes resource/library decoys. Its focused
+scheduler case and combined workspace/release107 checks pass. Reload107 passes
+as described above; no runtime claim is made that the wrapper deduplication
+branch was exercised by that probe.
 
 The unchanged dependency/generated-source reload probe on105 records82/86
 checks, four failed assertions and two readiness deadlines. All four offline
@@ -149,8 +197,18 @@ recovery89/gradle-reload105-1/receipt.json SHA256
 49a1f446d4963b85ab16c0760814f5dc794e8f3f73e0923023d2a689e151f42e.
 Java diagnostics use the fast path: the compiler rejects the new unsaved source
 membership, so empty Java diagnostics are not compiler-certified. The106 repeat
-retains all expectations and raises only the existing readiness wait, to test
-post-readiness semantics; this cannot qualify speed. It is currently running.
+retains all86 expectations and raises only the existing readiness wait. It
+passes86/86 checks and58 received requests without retry; all feature requests
+follow their accepted generation. Exact v2 source goto and subsequent member
+removal work in both languages. Root independently verifies230 current guards
+and five artifact references. It exits cleanly with zero owned residuals.
+Receipt: recovery89/gradle-reload106-1/receipt.json SHA256
+d716faa596287d93dab670359c54e62615803956e4442d4434b3a77d0f2d4532.
+Summary SHA2562aa316ffbd23fd524889081e29b7bdfca3830dbf2fc005cde19a08f94da2586a.
+Per-phase refresh-to-accept N1 values are70.073/51.217/47.865/71.812s. These are
+correctness observations under an extended wait, not speed acceptance. Java
+compiler certification remains unavailable for the new unsaved buffers in this
+probe;107's stock-policy correction passes focused RED/GREEN and workspace checks.
 
 Readiness investigation confirms corpus timing waits for all libraries, while
 product completion has no equivalent global barrier. The Gradle105 canonical

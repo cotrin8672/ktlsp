@@ -2541,3 +2541,178 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
     )
     .is_err());
 }
+
+fn editor_membership_fixture() -> (KotlinEditorOverlay, KotlinDiagnosticRequest) {
+    let (owner, mut request) = fixture();
+    let roots = request.source_roots.clone();
+    for task in [&mut request.task, request.java_task.as_mut().unwrap()] {
+        task.options.insert(
+            "sdkSourcePolicy".into(),
+            json!({
+                "adapter": "gradle-source-tree-stock-patterns-v1",
+                "task": task.task, "language": task.language,
+                "authored_roots": roots, "future_roots": roots, "generated_roots": [],
+                "default_excludes": crate::classpath::tests::sdk_source_default_excludes(),
+            }),
+        );
+        task.options.insert(
+            "sdkProducerClaims".into(),
+            json!({
+                "adapter": "gradle-producing-source-trees-v1",
+                "task": task.task, "language": task.language, "roots": roots, "complete": true,
+            }),
+        );
+    }
+    (owner, request)
+}
+
+#[test]
+fn new_editor_java_and_kotlin_sources_use_stock_membership_and_distinct_cache() {
+    for first_java in [false, true] {
+        let (_owner, mut request) = editor_membership_fixture();
+        if first_java {
+            request
+                .sources
+                .retain(|path| path.extension().and_then(|s| s.to_str()) != Some("java"));
+            request.task.source_files = request.sources.clone();
+            request
+                .task
+                .declared_input_files
+                .retain(|path| path.extension().and_then(|s| s.to_str()) != Some("java"));
+            request
+                .overlays
+                .retain(|source| !source.key.ends_with(".java"));
+            let task = request.java_task.as_mut().unwrap();
+            task.source_files.clear();
+            task.declared_input_files
+                .retain(|path| path.extension().and_then(|s| s.to_str()) != Some("java"));
+        }
+        let mut ws = workspace(&request, Vec::new());
+        let java = crate::paths::file_key(&request.source_roots[0].join("Editor.java"));
+        let kotlin = crate::paths::file_key(&request.source_roots[0].join("Editor.kt"));
+        let java_text =
+            "package fixture; class Editor { void call(Helper h) { h.editorUnsaved(); } }";
+        let kotlin_text = "package fixture\nfun edit(helper: Helper) { helper.editorUnsaved() }";
+        ws.open(&java, java_text.into());
+        ws.open(&kotlin, kotlin_text.into());
+        let first = ws.begin_kotlin_diagnostics(&kotlin).unwrap();
+        assert!(
+            configured_recipe(&first).is_ok(),
+            "stock future policy admits both new wire inputs; first Java={first_java}"
+        );
+        assert!(!first
+            .task
+            .source_files
+            .iter()
+            .any(|path| same_path(path, Path::new(&java))));
+        assert!(!first
+            .java_task
+            .as_ref()
+            .unwrap()
+            .source_files
+            .iter()
+            .any(|path| same_path(path, Path::new(&java))));
+        let overlay = KotlinEditorOverlay::create(&first).unwrap();
+        for (key, text) in [(&java, java_text), (&kotlin, kotlin_text)] {
+            let private = overlay
+                .sources
+                .iter()
+                .find(|path| {
+                    overlay
+                        .paths
+                        .get(&kotlin_path_key(&crate::paths::file_key(path)))
+                        == Some(key)
+                })
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(private).unwrap(), text);
+        }
+        let first_key = KotlinEnvironmentKey::new(&first).unwrap();
+        ws.close(&kotlin);
+        let helper = crate::paths::file_key(&request.project_dir.join("src/Helper.kt"));
+        let next = ws.begin_kotlin_diagnostics(&helper).unwrap();
+        assert!(configured_recipe(&next).is_ok());
+        assert!(
+            first_key != KotlinEnvironmentKey::new(&next).unwrap(),
+            "new source membership cannot reuse an old Java tools/domain cache"
+        );
+    }
+}
+
+#[test]
+fn new_editor_sources_keep_unknown_filtered_generated_and_excluded_policy_unavailable() {
+    for kind in [
+        "unknown",
+        "empty-java-no-policy",
+        "filtered",
+        "default-excludes",
+        "generated",
+        "excluded",
+        "unmodeled-root",
+    ] {
+        let (_owner, mut request) = editor_membership_fixture();
+        let relative = if kind == "excluded" {
+            ".git/Editor.java"
+        } else {
+            "Editor.java"
+        };
+        let java = crate::paths::file_key(&request.source_roots[0].join(relative));
+        match kind {
+            "empty-java-no-policy" => {
+                let task = request.java_task.as_mut().unwrap();
+                task.source_files.clear();
+                task.options.remove("sdkSourcePolicy");
+            }
+            "unknown" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .remove("sdkSourcePolicy");
+            }
+            "filtered" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .get_mut("sdkSourcePolicy")
+                    .unwrap()["future_roots"] = json!([]);
+            }
+            "default-excludes" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .get_mut("sdkSourcePolicy")
+                    .unwrap()["default_excludes"] = Value::Null;
+            }
+            "generated" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .get_mut("sdkSourcePolicy")
+                    .unwrap()["generated_roots"] =
+                    json!([request.source_roots[0].join("Editor.java")]);
+            }
+            "unmodeled-root" => {
+                request
+                    .java_task
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .get_mut("sdkSourcePolicy")
+                    .unwrap()["authored_roots"] = json!([request.project_dir.join("foreign")]);
+            }
+            _ => {}
+        }
+        let mut ws = workspace(&request, Vec::new());
+        ws.open(&java, "package fixture; class Editor {}".into());
+        let helper = crate::paths::file_key(&request.project_dir.join("src/Helper.kt"));
+        let pending = ws.begin_kotlin_diagnostics(&helper).unwrap();
+        assert!(configured_recipe(&pending).is_err(), "{kind}");
+    }
+}

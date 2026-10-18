@@ -2121,6 +2121,26 @@ async fn register_project_watches(
     }
 }
 
+fn is_gradle_wrapper(file: &Path) -> bool {
+    if !file.ends_with("gradle/wrapper/gradle-wrapper.jar") {
+        return false;
+    }
+    let Some(root) = file.ancestors().nth(3) else {
+        return false;
+    };
+    ["gradlew", "gradlew.bat"]
+        .iter()
+        .any(|name| root.join(name).is_file())
+        && [
+            "settings.gradle",
+            "settings.gradle.kts",
+            "build.gradle",
+            "build.gradle.kts",
+        ]
+        .iter()
+        .any(|name| root.join(name).is_file())
+}
+
 fn is_project_configuration(file: &Path) -> bool {
     let name = file
         .file_name()
@@ -2130,6 +2150,7 @@ fn is_project_configuration(file: &Path) -> bool {
         || name.ends_with(".gradle.kts")
         || name.ends_with(".toml")
         || matches!(name, "gradle.properties" | "gradle-wrapper.properties")
+        || is_gradle_wrapper(file)
 }
 
 fn configuration_content(path: &Path) -> Option<[u8; 32]> {
@@ -2146,6 +2167,7 @@ fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
             "*.toml",
             "*gradle.properties",
             "*gradle-wrapper.properties",
+            "*gradle-wrapper.jar",
         ],
     )
     .unwrap_or_else(|| {
@@ -7380,8 +7402,20 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             root.join("gradle/wrapper/gradle-wrapper.properties"),
             nested.join("gradle.properties"),
             nested.join("gradle/wrapper/gradle-wrapper.properties"),
+            root.join("gradle/wrapper/gradle-wrapper.jar"),
+            nested.join("gradle/wrapper/gradle-wrapper.jar"),
         ];
         for file in &configuration_files {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "baseline=true\n").unwrap();
+        }
+        std::fs::write(nested.join("gradlew"), "wrapper launcher").unwrap();
+        std::fs::write(nested.join("build.gradle.kts"), "plugins { java }").unwrap();
+        let excluded_jars = [
+            root.join("src/main/resources/gradle/wrapper/gradle-wrapper.jar"),
+            root.join("libs/dependency.jar"),
+        ];
+        for file in &excluded_jars {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, "baseline=true\n").unwrap();
         }
@@ -7399,6 +7433,14 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             .success());
         let root_contents = configuration_contents(&root);
         let nested_contents = configuration_contents(&nested);
+        for file in &excluded_jars {
+            let key = crate::paths::file_key(file);
+            assert!(
+                !root_contents.contains_key(&key),
+                "non-wrapper JAR was baselined: {key}"
+            );
+            assert_eq!(project_change(&root, None, &key), Some(true));
+        }
         for file in &configuration_files {
             let key = crate::paths::file_key(file);
             assert!(
@@ -7468,6 +7510,19 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         for _ in 0..5 {
             backend.did_change_watched_files(event()).await;
         }
+        for file in [
+            root.join("gradle/wrapper/gradle-wrapper.jar"),
+            nested.join("gradle/wrapper/gradle-wrapper.jar"),
+        ] {
+            backend
+                .did_save(DidSaveTextDocumentParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Uri::from_file_path(file).unwrap(),
+                    },
+                    text: None,
+                })
+                .await;
+        }
         assert_eq!(backend.refresh.lock().requested, initial);
         assert!(!initial_cancelled.load(std::sync::atomic::Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(12);
@@ -7527,18 +7582,30 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             "latest model was never published"
         );
         drop(ws);
-        let key = crate::paths::file_key(&root.join("build.gradle.kts"));
         let mut watches = backend.watches.lock();
-        assert!(!watches.unchanged_configuration(&key, FileChangeType::CREATED));
-        std::fs::remove_file(&key).unwrap();
-        assert!(!watches.unchanged_configuration(&key, FileChangeType::DELETED));
-        assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
-        std::fs::create_dir(&key).unwrap();
-        assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
-        std::fs::remove_dir(&key).unwrap();
-        std::fs::write(&key, "plugins { java }").unwrap();
-        assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
-        assert!(watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        for file in &excluded_jars {
+            let key = crate::paths::file_key(file);
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        }
+        for file in [
+            root.join("build.gradle.kts"),
+            root.join("gradle/wrapper/gradle-wrapper.jar"),
+        ] {
+            let key = crate::paths::file_key(&file);
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CREATED));
+            std::fs::remove_file(&key).unwrap();
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::DELETED));
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+            std::fs::create_dir(&key).unwrap();
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+            std::fs::remove_dir(&key).unwrap();
+            std::fs::write(&key, "plugins { java }").unwrap();
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+            assert!(watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+            watches.configuration_contents.remove(&key);
+            assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        }
         let unknown = crate::paths::file_key(&root.join("new.gradle.kts"));
         std::fs::write(&unknown, "plugins { java }").unwrap();
         assert!(!watches.unchanged_configuration(&unknown, FileChangeType::CHANGED));
