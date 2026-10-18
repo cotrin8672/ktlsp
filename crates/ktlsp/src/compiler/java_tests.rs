@@ -3050,14 +3050,18 @@ fn processor_method_capture_paired_current_api_receiver_and_ranges() {
             .arg(&helper),
         0,
     );
-    for (current, absent) in [("versionOne", "versionTwo"), ("versionTwo", "versionOne")] {
+    for (api_name, receiver, current, absent) in [
+        ("Api", "api", "versionOne", "versionTwo"),
+        ("Api", "api", "versionTwo", "versionOne"),
+        ("生成API", "対象", "現在", "削除済"),
+    ] {
         let phase = root.join(current);
         std::fs::create_dir(&phase).unwrap();
-        let api = phase.join("Api.java");
+        let api = phase.join(format!("{api_name}.java"));
         std::fs::write(
             &api,
             format!(
-                "package generated; public class Api {{ public int {current}() {{ return 1; }} }}"
+                "package generated; public class {api_name} {{ public int {current}() {{ return 1; }} }}"
             ),
         )
         .unwrap();
@@ -3065,13 +3069,13 @@ fn processor_method_capture_paired_current_api_receiver_and_ranges() {
         std::fs::create_dir(&classes).unwrap();
         owned(
             Command::new(sdk.join("bin/javac.exe"))
-                .args(["-proc:none", "-d"])
+                .args(["-proc:none", "-encoding", "UTF-8", "-d"])
                 .arg(&classes)
                 .arg(&api),
             0,
         );
         let consumer = phase.join("Consumer.java");
-        let text = format!("class Consumer {{ void use(generated.Api api) {{ api.{absent}(); api.{current}(); }} }}\n");
+        let text = format!("// 前置😀\nclass Consumer {{ void use(generated.{api_name} {receiver}) {{ {receiver}.{absent}(); {receiver}.{current}(); }} }}\n");
         std::fs::write(&consumer, &text).unwrap();
         let options = vec![
             "-proc:none".to_owned(),
@@ -3126,26 +3130,43 @@ fn processor_method_capture_paired_current_api_receiver_and_ranges() {
         let calls = array(&value, "methodCalls").expect("same-task attribution is required");
         assert_eq!(calls.len(), 2);
         for call in calls {
-            assert_eq!(call["receiverType"], "generated.Api");
-            assert_eq!(call["receiver"], "api");
+            assert_eq!(call["receiverType"], format!("generated.{api_name}"));
+            assert_eq!(call["receiver"], receiver);
             assert_eq!(call["simpleOwnedApi"], true);
             assert_eq!(call["originKind"], "class");
             assert!(same_path(
                 Path::new(value_string(call, "originPath").unwrap()),
-                &classes.join("generated/Api.class")
+                &classes.join(format!("generated/{api_name}.class"))
             ));
             assert_eq!(
                 value_string(call, "originSha256").unwrap(),
-                sha(&std::fs::read(classes.join("generated/Api.class")).unwrap())
+                sha(&std::fs::read(classes.join(format!("generated/{api_name}.class"))).unwrap())
             );
             assert_eq!(call["publicInstanceZeroArgumentMethods"], json!([current]));
         }
         let missing = calls.iter().find(|c| c["method"] == absent).unwrap();
         let start = missing["selectStart"].as_u64().unwrap() as usize;
         let end = missing["selectEnd"].as_u64().unwrap() as usize;
-        assert_eq!(&text[start..end], format!("api.{absent}"));
+        assert_eq!(
+            &text[utf16_byte_offset(&text, start).unwrap()..utf16_byte_offset(&text, end).unwrap()],
+            format!("{receiver}.{absent}")
+        );
         assert_eq!(errors[0]["start"], missing["selectStart"]);
         assert_eq!(errors[0]["position"], missing["receiverEnd"]);
+        let bytes = std::fs::read(classes.join(format!("generated/{api_name}.class"))).unwrap();
+        let class = ktcore::classfile::decode("current-method-capture", &bytes).unwrap();
+        assert_eq!(
+            class.identity.internal_name.as_ref(),
+            format!("generated/{api_name}")
+        );
+        assert!(class
+            .methods
+            .iter()
+            .any(|method| method.name.as_ref() == current));
+        assert!(!class
+            .methods
+            .iter()
+            .any(|method| method.name.as_ref() == absent));
     }
 }
 

@@ -177,11 +177,11 @@ fn position(row: &Value, key: &str) -> Option<usize> {
 }
 
 fn identifier(value: &str) -> bool {
-    let mut chars = value.bytes();
+    let mut chars = value.chars();
     chars
         .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'$'))
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$'))
+        .is_some_and(|c| c.is_alphabetic() || matches!(c, '_' | '$'))
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
 }
 
 /// The caller first runs import_diagnostics to validate the entire SAME-task source/runtime,
@@ -349,7 +349,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixture() -> (
+    fn fixture(
+        owner_name: &str,
+        receiver: &str,
+        current: &str,
+        removed: &str,
+    ) -> (
         KotlinEditorOverlay,
         KotlinDiagnosticRequest,
         KotlinEditorOverlay,
@@ -365,13 +370,13 @@ mod tests {
         .unwrap();
         let root = owner.directory.join("project");
         let java = root.join("src/Main.java");
-        let generated = root.join("src/generated/Api.java");
+        let generated = root.join(format!("src/generated/{owner_name}.java"));
         std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
-        let text = "// 前置😀\r\nimport generated.Api; class Main { void use(Api api) { /* 同行😀 */ api.removed(); api.current(); } }";
-        std::fs::write(&java, text).unwrap();
+        let text = format!("// 前置😀\r\nimport generated.{owner_name}; class Main {{ void use({owner_name} {receiver}) {{ /* 同行😀 */ {receiver}.{removed}(); {receiver}.{current}(); }} }}");
+        std::fs::write(&java, &text).unwrap();
         std::fs::write(
             &generated,
-            "package generated; public class Api { public int current() { return 2; } }",
+            format!("package generated; public class {owner_name} {{ public int {current}() {{ return 2; }} }}"),
         )
         .unwrap();
         let mut request = kotlin_test_request(&root);
@@ -394,11 +399,12 @@ mod tests {
         let api = overlay
             .sources
             .iter()
-            .find(|p| p.file_name().unwrap() == "Api.java")
+            .find(|p| p.file_name().unwrap() == format!("{owner_name}.java").as_str())
             .unwrap();
-        let byte_start = text.find("api.removed()").unwrap();
+        let byte_start = text.find(&format!("{receiver}.{removed}()")).unwrap();
         let start = text[..byte_start].encode_utf16().count();
-        let end = start + "api.removed".len();
+        let receiver_end = start + receiver.encode_utf16().count();
+        let end = receiver_end + 1 + removed.encode_utf16().count();
         let before: Vec<_> = expected
             .iter()
             .map(|(p, digest)| {
@@ -408,17 +414,18 @@ mod tests {
             .collect();
         let value = json!({"sourcesBefore":before,
             "diagnostics":[{"kind":"ERROR", "code":"compiler.err.cant.resolve.location.args", "sourceUri":"file:///current/Main.java",
-                "start":start,"end":end,"position":start+3,"message":"cannot find symbol: method removed()"}],
-            "methodCalls":[{"sourceUri":"file:///current/Main.java", "simpleOwnedApi":true,"receiver":"api","method":"removed",
-                "receiverType":"generated.Api", "originKind":"source", "originPath":crate::paths::file_key(api),
-                "originSha256":sha(&std::fs::read(api).unwrap()), "publicInstanceZeroArgumentMethods":["current"],
-                "selectStart":start,"selectEnd":end,"receiverStart":start,"receiverEnd":start+3,"callStart":start,"callEnd":end+2}]});
+                "start":start,"end":end,"position":receiver_end,"message":format!("cannot find symbol: method {removed}()") }],
+            "methodCalls":[{"sourceUri":"file:///current/Main.java", "simpleOwnedApi":true,"receiver":receiver,"method":removed,
+                "receiverType":format!("generated.{owner_name}"), "originKind":"source", "originPath":crate::paths::file_key(api),
+                "originSha256":sha(&std::fs::read(api).unwrap()), "publicInstanceZeroArgumentMethods":[current],
+                "selectStart":start,"selectEnd":end,"receiverStart":start,"receiverEnd":receiver_end,"callStart":start,"callEnd":end+2}]});
         (owner, request, overlay, produced, value, expected)
     }
 
     #[test]
     fn processor_method_positive_requires_current_owned_receiver_api_and_exact_method_range() {
-        let (_owner, request, overlay, produced, value, expected) = fixture();
+        let (_owner, request, overlay, produced, value, expected) =
+            fixture("Api", "api", "current", "removed");
         let api =
             MethodApi::prepare(&produced, &request, &overlay, &json!({"outputs":[]})).unwrap();
         let diagnostics = admitted(&value, &request, &overlay, &expected, &api).unwrap();
@@ -435,8 +442,39 @@ mod tests {
     }
 
     #[test]
+    fn processor_method_positive_accepts_current_japanese_identifiers() {
+        for names in [
+            ("Api", "対象", "current", "removed"),
+            ("Api", "api", "current", "削除済"),
+            ("生成API", "api", "現在", "removed"),
+        ] {
+            let (_owner, request, overlay, produced, value, expected) =
+                fixture(names.0, names.1, names.2, names.3);
+            let api =
+                MethodApi::prepare(&produced, &request, &overlay, &json!({"outputs":[]})).unwrap();
+            let diagnostics = admitted(&value, &request, &overlay, &expected, &api).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{names:?}");
+            assert_eq!(diagnostics[0].line, 2);
+            let text = std::fs::read_to_string(&request.sources[0]).unwrap();
+            let selector =
+                text.find(&format!("{}.{}()", names.1, names.3)).unwrap() + names.1.len() + 1;
+            assert_eq!(
+                diagnostics[0].col,
+                crate::text::LineIndex::new(&text)
+                    .position(&text, selector)
+                    .1
+                    + 1
+            );
+        }
+        for invalid in ["", "1対象", "対象.現在", "対象()", "対象 名前"] {
+            assert!(!identifier(invalid), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn processor_method_wrong_receiver_origin_current_method_and_range_are_unavailable() {
-        let (_owner, request, overlay, produced, value, expected) = fixture();
+        let (_owner, request, overlay, produced, value, expected) =
+            fixture("Api", "api", "current", "removed");
         let api =
             MethodApi::prepare(&produced, &request, &overlay, &json!({"outputs":[]})).unwrap();
         for kind in [
@@ -484,7 +522,8 @@ mod tests {
 
     #[test]
     fn processor_method_other_current_generation_cannot_reuse_old_api() {
-        let (_owner, mut request, overlay, produced, value, expected) = fixture();
+        let (_owner, mut request, overlay, produced, value, expected) =
+            fixture("Api", "api", "current", "removed");
         let api =
             MethodApi::prepare(&produced, &request, &overlay, &json!({"outputs":[]})).unwrap();
         request.generation += 1;

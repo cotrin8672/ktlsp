@@ -8,6 +8,20 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Latest112 investigation: processor input ownership and speed candidates
 
+The generated-method diagnostic adapter no longer rejects Japanese receiver
+and method identifiers merely for being non-ASCII. The focused reproduction
+compiles and fails before the three-line change (zero admitted diagnostics
+instead of one), then all five related checks pass. These include the existing
+real-Javac observer with Japanese owner/current/missing method names, decoded
+classfile facts, two observed calls and the exact UTF-16 error range. Root
+verifies both raw output references. This extends the existing identifier
+subset, not all Java Unicode identifier rules or generated-API completion.
+Evidence: recovery89/processor-identifiers113/summary.json SHA256
+00bd967b77222eba22dc5438798a4e9831d61fc7f6240f62e25debb4b1183780.
+Each Cargo Job closes with no live residuals after cleaning one owned MSVC
+vctip.exe helper; this is not a forced production-LSP shutdown. The combined
+workspace/release and editor validation remain pending.
+
 The targeted two-phase processor reproduction now preserves private events
 before snapshot cleanup. Its26 events identify the previously rejected input
 as the selected processor Jar task's default25-byte MANIFEST.MF. The112 candidate
@@ -26,12 +40,26 @@ three first responses and close naturally without owned residuals. Medians
 System/mimalloc: process CPU92.76/76.59s, index destruction18.65/4.21s,
 post-index first-tested-useful47.05/55.11s, completion handler6.78/7.84ms.
 Concurrent CPU activity and n=2 prevent a startup non-regression conclusion.
-The allocator is not adopted; a quiet comparison and the existing unsaved-edit
-scenario are next. Evidence: recovery89/allocator-abba111-1/summary.json.
+The initial ABBA does not justify adoption by itself; the follow-up comparison
+and unsaved-edit checks are recorded below. Evidence:
+recovery89/allocator-abba111-1/summary.json.
 These requests follow WAIT_INDEX and do not measure earliest useful completion
 or visible editor latency. Cold/warm index-count differences are explained by
 cumulative preview/source counters, not demonstrated missing semantic facts;
 full binary-only fact parity remains unverified.
+
+The follow-up pair excludes other agent benchmark/build jobs while retaining
+normal background processes. System/mimalloc post-index first-tested-useful
+is46.893/42.082s, process CPU86.94/72.58s and completion handler6.143/6.479ms.
+All three original first responses match; models are byte-identical and both
+servers close naturally. Root verifies four receipt/trace references. The
+existing Java scenario separately passes367 assertions for each allocator,
+including unsaved cross-language edits. This supports retaining the candidate,
+not a one-pair population speed estimate. The trial feature/System branches
+are removed in favor of a Windows-only default allocator; its final combined
+build is pending. Evidence: recovery89/allocator-quiet111-1/summary.json SHA256
+9364870a7d4c5626633b7d73c3500e7a8ab0255a98e4ee3e5940969d30d5852a,
+and recovery89/allocator-quiet111-java-summary.json.
 
 The content-addressed Gradle init-script candidate has focused/classpath tests
 and release111. CEM warmups plus ACCA complete with all eight original assertions
