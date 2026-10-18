@@ -12,9 +12,21 @@ const DOMAIN_SOURCE: &str = include_str!("DomainProof.kt");
 const K2_HEADER_SOURCE: &str = include_str!("K2CompleteHeaders.kt");
 const JAVA_SOURCE: &str = include_str!("JavacDiagnostics.java");
 
+#[path = "method_diagnostics.rs"]
+mod method_diagnostics;
+#[path = "processor.rs"]
+pub(super) mod processor;
+
 pub(super) fn assets_sha256() -> String {
     let mut hash = Sha256::new();
-    for source in [HEADER_SOURCE, DOMAIN_SOURCE, K2_HEADER_SOURCE, JAVA_SOURCE] {
+    for source in [
+        HEADER_SOURCE,
+        DOMAIN_SOURCE,
+        K2_HEADER_SOURCE,
+        JAVA_SOURCE,
+        processor::OBSERVER,
+        include_str!("../../../../scripts/classpath-dump.init.gradle.kts"),
+    ] {
         hash.update((source.len() as u64).to_be_bytes());
         hash.update(source.as_bytes());
     }
@@ -2392,7 +2404,9 @@ fn platform_method_diagnostics(
             let (Some(byte_start), Some(byte_call_end), Some(selector)) = (
                 utf16_byte_offset(&text, start),
                 utf16_byte_offset(&text, call_end),
-                utf16_byte_offset(&text, receiver_end + 1),
+                receiver_end
+                    .checked_add(1)
+                    .and_then(|offset| utf16_byte_offset(&text, offset)),
             ) else {
                 continue;
             };
@@ -2429,6 +2443,7 @@ pub(super) fn run(
     overlay: &KotlinEditorOverlay,
     canonical: &[CompileDiagnostic],
     clean: bool,
+    generated: Option<&processor::GeneratedSources>,
 ) -> anyhow::Result<Vec<CompileDiagnostic>> {
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
@@ -2664,6 +2679,9 @@ pub(super) fn run(
         .arg("JavacDiagnostics")
         .arg(&spec)
         .arg(&output);
+    let method_api = generated
+        .map(|g| method_diagnostics::MethodApi::prepare(g, request, overlay, &receipt))
+        .transpose()?;
     let (exit, _) = native(&mut command, request, environment)?;
     anyhow::ensure!(matches!(exit, 0 | 1), "java-helper-failed");
     let value = read_json(&output)?;
@@ -2687,7 +2705,7 @@ pub(super) fn run(
         value_string(&value, "inputSpecSha256")? == sha(&std::fs::read(&spec)?),
         "java-helper-spec-identity-differs"
     );
-    let result = import_diagnostics(
+    let mut result = import_diagnostics(
         &value,
         &options,
         &recipe,
@@ -2697,6 +2715,15 @@ pub(super) fn run(
         exit,
         complete_k2,
     )?;
+    if let Some(api) = &method_api {
+        result.extend(method_diagnostics::admitted(
+            &value,
+            request,
+            overlay,
+            &java_sources,
+            api,
+        )?);
+    }
     if let Some(before) = &canonical_outputs {
         complete_outputs_match(
             &overlay.directory.join("classes"),

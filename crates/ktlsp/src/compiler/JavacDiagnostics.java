@@ -37,6 +37,8 @@ import javax.tools.JavaFileObject;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
 
+import javax.lang.model.element.Modifier;
+
 public final class JavacDiagnostics {
     private static String require(Properties p, String key) {
         return Objects.requireNonNull(p.getProperty(key), "Missing property " + key);
@@ -151,7 +153,7 @@ public final class JavacDiagnostics {
 
     // Observe the original task: a second parse would not bind these compiler diagnostics.
     private static void observeImports(JavaCompiler.CompilationTask task, List<Object> imports,
-            List<Object> parsedUnits, List<Object> platformCalls, StandardJavaFileManager manager,
+            List<Object> parsedUnits, List<Object> platformCalls, List<Object> methodCalls, StandardJavaFileManager manager,
             List<Map<String, Object>> diagnostics) {
         if (!(task instanceof JavacTask javac))
             throw new IllegalStateException("Selected SDK does not expose public JavacTask");
@@ -159,8 +161,10 @@ public final class JavacDiagnostics {
         javac.addTaskListener(new TaskListener() {
             @Override public void started(TaskEvent event) {}
             @Override public void finished(TaskEvent event) {
-                if (event.getKind() == TaskEvent.Kind.ANALYZE)
+                if (event.getKind() == TaskEvent.Kind.ANALYZE) {
                     observePlatformCalls(javac, trees, manager, event, platformCalls, diagnostics);
+                    observeMethodCalls(javac, trees, manager, event, methodCalls);
+                }
                 if (event.getKind() != TaskEvent.Kind.PARSE) return;
                 CompilationUnitTree unit = Objects.requireNonNull(event.getCompilationUnit());
                 String uri = unit.getSourceFile().toUri().toString();
@@ -264,6 +268,79 @@ public final class JavacDiagnostics {
         }.scan(owner, null);
     }
 
+    // Descriptive facts from the SAME attribution task, never an authority supplied by Java text.
+    // Only the host's current owned API lease may admit a corresponding diagnostic.
+    private static void observeMethodCalls(JavacTask javac, Trees trees,
+            StandardJavaFileManager manager, TaskEvent event, List<Object> calls) {
+        CompilationUnitTree unit = Objects.requireNonNull(event.getCompilationUnit());
+        TreePath owner = trees.getPath(event.getTypeElement());
+        if (owner == null) return;
+        new TreePathScanner<Void, Void>() {
+            @Override public Void visitMethodInvocation(MethodInvocationTree call, Void unused) {
+                if (call.getMethodSelect() instanceof MemberSelectTree select
+                        && select.getExpression() instanceof IdentifierTree receiver
+                        && call.getArguments().isEmpty() && call.getTypeArguments().isEmpty()) {
+                    TreePath selectPath = new TreePath(getCurrentPath(), select);
+                    TreePath receiverPath = new TreePath(selectPath, receiver);
+                    var variable = trees.getElement(receiverPath);
+                    var mirror = trees.getTypeMirror(receiverPath);
+                    if (variable != null && (variable.getKind() == ElementKind.PARAMETER
+                            || variable.getKind() == ElementKind.LOCAL_VARIABLE)
+                            && mirror != null && mirror.getKind() == TypeKind.DECLARED
+                            && mirror instanceof DeclaredType declared
+                            && declared.getTypeArguments().isEmpty()
+                            && declared.asElement() instanceof TypeElement type) {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("sourceUri", unit.getSourceFile().toUri().toString());
+                        row.put("receiver", receiver.getName().toString());
+                        row.put("receiverType", type.getQualifiedName().toString());
+                        row.put("method", select.getIdentifier().toString());
+                        row.put("callStart", trees.getSourcePositions().getStartPosition(unit, call));
+                        row.put("callEnd", trees.getSourcePositions().getEndPosition(unit, call));
+                        row.put("selectStart", trees.getSourcePositions().getStartPosition(unit, select));
+                        row.put("selectEnd", trees.getSourcePositions().getEndPosition(unit, select));
+                        row.put("receiverStart", trees.getSourcePositions().getStartPosition(unit, receiver));
+                        row.put("receiverEnd", trees.getSourcePositions().getEndPosition(unit, receiver));
+                        row.put("simpleOwnedApi", type.getInterfaces().isEmpty()
+                            && type.getTypeParameters().isEmpty()
+                            && type.getSuperclass().getKind() == TypeKind.DECLARED
+                            && ((DeclaredType) type.getSuperclass()).asElement() instanceof TypeElement base
+                            && base.getQualifiedName().contentEquals("java.lang.Object"));
+                        List<String> zeroArgumentMethods = new ArrayList<>();
+                        for (var member : type.getEnclosedElements()) {
+                            if (member instanceof ExecutableElement method
+                                    && member.getKind() == ElementKind.METHOD
+                                    && method.getParameters().isEmpty()
+                                    && method.getTypeParameters().isEmpty()
+                                    && method.getModifiers().contains(Modifier.PUBLIC)
+                                    && !method.getModifiers().contains(Modifier.STATIC)) {
+                                zeroArgumentMethods.add(method.getSimpleName().toString());
+                            }
+                        }
+                        row.put("publicInstanceZeroArgumentMethods", zeroArgumentMethods);
+                        try {
+                            TreePath declaration = trees.getPath(type);
+                            JavaFileObject origin = declaration != null
+                                ? declaration.getCompilationUnit().getSourceFile()
+                                : manager.getJavaFileForInput(StandardLocation.CLASS_PATH,
+                                    type.getQualifiedName().toString(), JavaFileObject.Kind.CLASS);
+                            if (origin != null && origin.toUri().getScheme().equals("file")) {
+                                Path path = Path.of(origin.toUri()).toAbsolutePath().normalize();
+                                row.put("originKind", declaration == null ? "class" : "source");
+                                row.put("originPath", path.toString());
+                                row.put("originSha256", sha(path));
+                            }
+                        } catch (Exception unavailable) {
+                            row.put("originProblem", unavailable.getClass().getName());
+                        }
+                        calls.add(row);
+                    }
+                }
+                return super.visitMethodInvocation(call, unused);
+            }
+        }.scan(owner, null);
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length != 2) throw new IllegalArgumentException("spec.properties receipt.json");
         Path spec = Path.of(args[0]).toAbsolutePath().normalize();
@@ -289,6 +366,7 @@ public final class JavacDiagnostics {
         List<Object> imports = new ArrayList<>();
         List<Object> parsedUnits = new ArrayList<>();
         List<Object> platformCalls = new ArrayList<>();
+        List<Object> methodCalls = new ArrayList<>();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("component", "ktlsp selected-SDK public Javac API");
         out.put("stage", require(p, "stage"));
@@ -327,7 +405,7 @@ public final class JavacDiagnostics {
                 JavaCompiler.CompilationTask task = compiler.getTask(compilerOutput, manager,
                     d -> diagnostics.add(diagnostic(d, locale, diagnostics.size())), options, null, units);
                 task.setLocale(locale);
-                observeImports(task, imports, parsedUnits, platformCalls, manager, diagnostics);
+                observeImports(task, imports, parsedUnits, platformCalls, methodCalls, manager, diagnostics);
                 success = Boolean.TRUE.equals(task.call());
                 completed = true;
             }
@@ -354,6 +432,7 @@ public final class JavacDiagnostics {
         out.put("imports", imports);
         out.put("parsedUnits", parsedUnits);
         out.put("platformCalls", platformCalls);
+        out.put("methodCalls", methodCalls);
         out.put("countsByKind", kinds);
         out.put("compilerOutput", compilerOutput.toString());
         out.put("wholeApiAuthority", false);

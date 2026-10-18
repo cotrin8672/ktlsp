@@ -285,7 +285,7 @@ object KtlspCompilerConfiguration {
         val incremental = Class.forName("org.gradle.api.internal.project.taskfactory.${profile.incrementalAction}", false, loader)
         val methodField = standard.getDeclaredField("method").apply { isAccessible = true }
         val rows = task.actions.map { action ->
-            val method = if (action.javaClass == incremental)
+            val method = if (action.javaClass == incremental || action.javaClass == standard)
                 methodField.get(action) as? java.lang.reflect.Method else null
             linkedMapOf<String, Any?>(
                 "class" to action.javaClass.name,
@@ -296,6 +296,67 @@ object KtlspCompilerConfiguration {
         }
         linkedMapOf("adapter" to "gradle-${profile.version}-stock-actions-v1", "actions" to rows)
     }.getOrNull()
+
+    // The serialized getter precedes KSP's callCompilerAsync apclasspath injection.
+    // Capture the configured read role only; it never certifies producer execution.
+    private fun kspProcessorInputs(task: Task, recipe: Map<String, Any?>): Map<String, Any?> {
+        check(task.project.gradle.gradleVersion == "7.4.2" &&
+            recipe["compiler_version"] == "1.8.21" && recipe["gradle_plugin_version"] == "1.8.21") {
+            "Unsupported KSP producer input profile"
+        }
+        val loader = task.javaClass.classLoader
+        val type = Class.forName("com.google.devtools.ksp.gradle.KspTaskJvm", false, loader)
+        check(type.isInstance(task)) { "Unsupported KSP task type" }
+        val taskClassSha = classEntrySha(type)
+        val expectedTransformerSha = when (taskClassSha) {
+            "17f978d4c95c090f1441aa1bd9ef95778743193c2777953525d006b92a84552f" ->
+                "37746fc33ef72b4972f51e72dc579f697e1d084fd4f4e4f3b3bf6b3392236dab"
+            // Gradle7.4.2 adds lambda deserialization; original methods/fields remain identical.
+            "2f242870186225d3a6bff2ae134213ac6363423a3114efcb109c26c3e13c5c29" ->
+                "daf4803ac34409a1b641f49447ba0fd96acb5b5e2d3cdfd3d2851ea79995983d"
+            else -> error("Unsupported KSP task implementation")
+        }
+        val providers = read(task, "getCommandLineArgumentProviders") as? List<*>
+            ?: error("KSP argument provider inventory unavailable")
+        check(providers.isEmpty()) { "KSP argument providers require execution-boundary capture" }
+        val transformers = read(task, "getIncrementalChangesTransformers") as? List<*>
+            ?: error("KSP incremental transformer inventory unavailable")
+        check(transformers.size == 1) { "Custom or ambiguous KSP incremental transformers" }
+        val transformer = checkNotNull(transformers.single())
+        val transformerType = Class.forName(
+            "com.google.devtools.ksp.gradle.KspSubpluginKt\$createIncrementalChangesTransformer\$1", false, loader)
+        check(transformer.javaClass == transformerType &&
+            transformerType.protectionDomain.codeSource?.location == type.protectionDomain.codeSource?.location &&
+            classEntrySha(transformerType) == expectedTransformerSha) {
+            "Unsupported KSP incremental transformer implementation"
+        }
+        fun captured(name: String): Any? = transformerType.getDeclaredField(name)
+            .apply { isAccessible = true }.get(transformer)
+        val processorProvider = captured("\$processorCP") as? Provider<*>
+            ?: error("KSP processor classpath provider unavailable")
+        val processors = (processorProvider.orNull as? FileCollection)?.files?.toList()
+            ?: error("KSP processor classpath unavailable")
+        val declared = task.inputs.files.files
+        check(processors.all { it.isAbsolute && it in declared }) {
+            "KSP processor classpath is not a declared input"
+        }
+        val incremental = captured("\$isKspIncremental") as? Boolean
+            ?: error("KSP incremental mode unavailable")
+        val intermodule = captured("\$isIntermoduleIncremental") as? Boolean
+            ?: error("KSP intermodule mode unavailable")
+        val cache = captured("\$cacheDir") as? java.io.File ?: error("KSP cache path unavailable")
+        check(cache.isAbsolute) { "KSP cache path must be absolute" }
+        return linkedMapOf(
+            "adapter" to "gradle-7.4.2-ksp-1.8.21-1.0.11-configured-inputs-v1",
+            "basis" to "stock-callCompilerAsync-transformer-fields",
+            "taskClassSha256" to taskClassSha, "transformerClassSha256" to expectedTransformerSha,
+            "processorClasspath" to processors.map { it.absolutePath },
+            "commandLineArgumentProviderCount" to providers.size,
+            "incremental" to incremental, "intermoduleIncremental" to intermodule,
+            "cacheDirectory" to cache.absolutePath,
+            "producerCompletion" to false, "apiAuthority" to false,
+        )
+    }
 
     // shortcut: pinned stock Gradle predicates; only Gradle 7.4.2/KGP 1.8.21 KAPT is verified.
     // Read identity/bytecode, never evaluate a task predicate or a compiler/AP argument provider.
@@ -720,13 +781,25 @@ object KtlspCompilerConfiguration {
                 // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
                 val recipe = kotlinCompilerRecipe(task, toolchain, javaHome, runtimes.get())
                 record["kotlin_compiler"] = recipe
-                record["options"] = linkedMapOf(
+                val options = linkedMapOf<String, Any?>(
                     "sdkProducerClaims" to sdkSources.first,
                     "sdkSourcePolicy" to sdkSources.second,
                     "kotlinClasspathSnapshotInputs" to kotlinClasspathSnapshotInputs(task, recipe),
                     "taskActionInventory" to producerActions(task),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
                 )
+                record["options"] = options
+                if (task.javaClass.name == "com.google.devtools.ksp.gradle.KspTaskJvm_Decorated") {
+                    options["kspProcessorInputs"] = null
+                    options["kspProcessorInputsProblem"] = null
+                    try {
+                        options["kspProcessorInputs"] = kspProcessorInputs(task, recipe)
+                    } catch (failure: Exception) {
+                        options["kspProcessorInputsProblem"] = (failure.cause ?: failure).toString()
+                    } catch (failure: LinkageError) {
+                        options["kspProcessorInputsProblem"] = "KSP input adapter cannot be loaded: $failure"
+                    }
+                }
             } else {
                 val processors = read(task, "getKaptClasspath") as? FileCollection
                     ?: error("Annotation processor classpath is unavailable")
@@ -742,7 +815,25 @@ object KtlspCompilerConfiguration {
                 // Presence is observed without executing user provider code. Empty flattened
                 // arguments never prove absence of a provider (including nested empty providers).
                 val providerArguments = if (optionProviders.isEmpty()) emptyList<String>() else null
+                // KGP 1.8.21 uses the build JVM for NONE, or this executable for PROCESS.
+                // Capture both selectors; the host admits only its verified stock/JDK profile.
+                val workerToolchain = read(task, "getDefaultKotlinJavaToolchain\$kotlin_gradle_plugin_common")
+                    ?: error("KAPT worker toolchain is unavailable")
+                val workerJava = read(workerToolchain, "getJavaExecutable\$kotlin_gradle_plugin_common") as? org.gradle.api.file.RegularFile
+                    ?: error("KAPT worker executable is unavailable")
+                val buildJvm = read(workerToolchain, "getBuildJvm\$kotlin_gradle_plugin_common")
+                    ?: error("KAPT build JVM is unavailable")
+                val buildHome = read(buildJvm, "getJavaHome") as? java.io.File
+                    ?: error("KAPT build JVM home is unavailable")
+                val workerArgs = read(task, "getKaptProcessJvmArgs") as? List<*>
+                    ?: error("KAPT worker JVM arguments are unavailable")
+                check(workerJava.asFile.isAbsolute && buildHome.isAbsolute && workerArgs.all { it is String })
                 record["options"] = linkedMapOf(
+                    "kaptWorkerJvm" to linkedMapOf(
+                        "adapter" to "kgp-1.8.21-kapt-worker-jvm-v1",
+                        "javaExecutable" to workerJava.asFile.absolutePath,
+                        "buildJavaHome" to buildHome.absolutePath,
+                        "jvmArgs" to workerArgs.toList()),
                     "pluginOptions" to pluginOptions,
                     "javacOptions" to read(task, "getJavacOptions"),
                     "processors" to read(task, "getAnnotationProcessorFqNames"),

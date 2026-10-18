@@ -3561,6 +3561,8 @@ mod observed_path_cache_tests {
 #[path = "compiler/java.rs"]
 mod java_diagnostics;
 
+pub(crate) use java_diagnostics::processor::Plan as ProcessorPlan;
+
 pub(crate) fn java_import_dependencies(
     primary: &crate::classpath::CompilerTask,
     java: &crate::classpath::CompilerTask,
@@ -3603,6 +3605,7 @@ impl KotlinSourceOverlay {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct KotlinDiagnosticRequest {
     pub project_dir: PathBuf,
     pub scope: crate::project_model::ProjectScope,
@@ -3613,6 +3616,8 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     /// New owned wire sources admitted by the current stock task source policy.
     pub java_editor_sources: std::collections::BTreeSet<String>,
+    /// Configured invocation facts only. Completion/API authority requires owned current execution.
+    pub processor_plan: Option<ProcessorPlan>,
     /// Auxiliary Kotlin tasks may produce semantics this independent invocation cannot certify.
     pub positive_diagnostics_only: bool,
     pub source_roots: Vec<PathBuf>,
@@ -3752,6 +3757,7 @@ struct KotlinEnvironmentKey {
     java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     java_helper_sha256: Option<String>,
     java_editor_sources: std::collections::BTreeSet<String>,
+    processor_plan: Option<ProcessorPlan>,
 }
 
 impl KotlinEnvironmentKey {
@@ -3809,6 +3815,7 @@ impl KotlinEnvironmentKey {
             } else {
                 Default::default()
             },
+            processor_plan: request.processor_plan.clone(),
         })
     }
 
@@ -3847,6 +3854,7 @@ pub(crate) struct KotlinDiagnosticEnvironment {
     watch: std::sync::Arc<crate::compiled_watch::NativeInputWatch>,
     // Failed helper builds retain their watched assets and cannot erase canonical Kotlin results.
     java_tools: std::sync::Mutex<Option<(java_diagnostics::Tools, Result<(), String>)>>,
+    processor_artifacts: std::sync::Mutex<Option<java_diagnostics::processor::CachedArtifacts>>,
 }
 
 impl KotlinDiagnosticEnvironment {
@@ -3880,6 +3888,9 @@ impl KotlinDiagnosticEnvironment {
             .cloned()
             .collect();
         inputs.extend(kotlin_plugin_paths(&key.arguments)?);
+        if let Some(plan) = &key.processor_plan {
+            inputs.extend(plan.watch_inputs());
+        }
         let host = &key.recipe.gradle_java_home;
         anyhow::ensure!(host.is_absolute(), "compiler-host-jdk-relative");
         anyhow::ensure!(
@@ -3946,6 +3957,7 @@ impl KotlinDiagnosticEnvironment {
             environment_sha256,
             watch,
             java_tools: std::sync::Mutex::new(None),
+            processor_artifacts: std::sync::Mutex::new(None),
         });
         environment.check_live()?;
         request.check_live()?;
@@ -4389,6 +4401,20 @@ pub(crate) fn run_kotlin_editor_compile(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
 ) -> KotlinDiagnosticOutcome {
+    if let Some(plan) = &request.processor_plan {
+        return match java_diagnostics::processor::run(request, environment, plan) {
+            Ok(outcome) => outcome,
+            Err(error) => KotlinDiagnosticOutcome::Unverified(error.to_string()),
+        };
+    }
+    run_selected_kotlin_editor_compile(request, environment, None)
+}
+
+fn run_selected_kotlin_editor_compile(
+    request: &KotlinDiagnosticRequest,
+    environment: &KotlinDiagnosticEnvironment,
+    generated: Option<&java_diagnostics::processor::GeneratedSources>,
+) -> KotlinDiagnosticOutcome {
     let run = || -> anyhow::Result<KotlinDiagnosticOutcome> {
         request.check_live()?;
         environment.check_live()?;
@@ -4460,6 +4486,7 @@ pub(crate) fn run_kotlin_editor_compile(
                         &overlay,
                         diagnostics,
                         *clean,
+                        generated,
                     ) {
                         Ok(java) => java,
                         Err(error) => {
@@ -4549,6 +4576,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         java_task: None,
         java_dependencies: Vec::new(),
         java_editor_sources: Default::default(),
+        processor_plan: None,
         positive_diagnostics_only: false,
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),

@@ -7,7 +7,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 const JAVA: &str = "package fixture;\nimport generated.KspKotlin;\nimport generated.KspJava;\nimport generated.KaptJava;\nclass Main { void use(KspKotlin a, KspJava b, KaptJava c) { new Helper().editorUnsaved(); } }\n";
 const KOTLIN: &str = "package fixture\nclass Helper { fun editorUnsaved(): Int = 1 }\n";
 
-fn request(root: &Path) -> KotlinDiagnosticRequest {
+pub(super) fn request(root: &Path) -> KotlinDiagnosticRequest {
     let mut request = kotlin_test_request(root);
     let recipe = request.task.kotlin_compiler.as_mut().unwrap();
     recipe.compiler_version = "1.8.21".into();
@@ -2939,6 +2939,26 @@ fn same_javac_platform_body_errors_require_current_receiver_attribution() {
             row["code"] = json!("compiler.err.cant.resolve.location");
         }
         assert!(decode(&wrong, true).unwrap().is_empty());
+        // Coherent malformed raw ranges must not overflow before boundary validation.
+        let mut malformed = receipt.clone();
+        for i in 0..malformed["platformCalls"].as_array().unwrap().len() {
+            let start = usize::MAX
+                - malformed["platformCalls"][i]["receiverText"]
+                    .as_str()
+                    .unwrap()
+                    .encode_utf16()
+                    .count();
+            for field in ["callStart", "receiverStart", "selectStart"] {
+                malformed["platformCalls"][i][field] = json!(start);
+            }
+            for field in ["receiverEnd", "selectEnd", "callEnd"] {
+                malformed["platformCalls"][i][field] = json!(usize::MAX);
+            }
+            malformed["diagnostics"][i]["start"] = json!(start);
+            malformed["diagnostics"][i]["end"] = json!(usize::MAX);
+            malformed["diagnostics"][i]["position"] = json!(usize::MAX);
+        }
+        assert!(decode(&malformed, true).unwrap().is_empty());
         std::fs::write(path, format!("{text}//changed")).unwrap();
         assert!(
             decode(&receipt, true).is_err(),
@@ -2979,4 +2999,446 @@ fn k2_platform_origin_rejects_release_and_patched_system_modules() {
         .options
         .insert("release".into(), json!(17));
     assert!(configured_recipe(&request).is_err());
+}
+
+// Native, baseline-compilable regression: the current helper compiles/runs but has no
+// methodCalls attribution facts. Explicitly run with the captured SDK17, never auto-skip.
+#[test]
+#[ignore = "requires KTLSP_PROCESSOR_TEST_JAVA_HOME: captured SDK17 native observer control"]
+fn processor_method_capture_paired_current_api_receiver_and_ranges() {
+    assert!(
+        cfg!(windows),
+        "native ownership qualification is Windows-only"
+    );
+    let sdk =
+        PathBuf::from(std::env::var_os("KTLSP_PROCESSOR_TEST_JAVA_HOME").expect("SDK17 required"));
+    let (owner, request) = fixture();
+    let root = owner.directory.join("method-capture");
+    std::fs::create_dir(&root).unwrap();
+    let tools = root.join("tools");
+    std::fs::create_dir(&tools).unwrap();
+    let helper = root.join("JavacDiagnostics.java");
+    std::fs::write(&helper, JAVA_SOURCE).unwrap();
+    let owned = |command: &mut Command, expected: i32| {
+        #[cfg(windows)]
+        {
+            for name in [
+                "JAVA_TOOL_OPTIONS",
+                "_JAVA_OPTIONS",
+                "JDK_JAVA_OPTIONS",
+                "JAVA_OPTS",
+            ] {
+                command.env_remove(name);
+            }
+            let (status, interrupted, out, out_complete, err, err_complete) =
+                OwnedNativeCompile::spawn(command, MAX_OUTPUT_BYTES)
+                    .unwrap()
+                    .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
+            assert!(!interrupted && out_complete && err_complete, "{out}\n{err}");
+            assert_eq!(status.code(), Some(expected), "{out}\n{err}");
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (command, expected);
+            unreachable!();
+        }
+    };
+    owned(
+        Command::new(sdk.join("bin/javac.exe"))
+            .args(["-encoding", "UTF-8", "-d"])
+            .arg(&tools)
+            .arg(&helper),
+        0,
+    );
+    for (current, absent) in [("versionOne", "versionTwo"), ("versionTwo", "versionOne")] {
+        let phase = root.join(current);
+        std::fs::create_dir(&phase).unwrap();
+        let api = phase.join("Api.java");
+        std::fs::write(
+            &api,
+            format!(
+                "package generated; public class Api {{ public int {current}() {{ return 1; }} }}"
+            ),
+        )
+        .unwrap();
+        let classes = phase.join("lease");
+        std::fs::create_dir(&classes).unwrap();
+        owned(
+            Command::new(sdk.join("bin/javac.exe"))
+                .args(["-proc:none", "-d"])
+                .arg(&classes)
+                .arg(&api),
+            0,
+        );
+        let consumer = phase.join("Consumer.java");
+        let text = format!("class Consumer {{ void use(generated.Api api) {{ api.{absent}(); api.{current}(); }} }}\n");
+        std::fs::write(&consumer, &text).unwrap();
+        let options = vec![
+            "-proc:none".to_owned(),
+            "-sourcepath".into(),
+            "".into(),
+            "-classpath".into(),
+            path_text(&classes).unwrap(),
+            "-d".into(),
+            path_text(&phase.join("out")).unwrap(),
+        ];
+        let mut spec = BTreeMap::from([
+            ("stage".into(), "processor-method-capture-regression".into()),
+            ("expected.javaHome".into(), path_text(&sdk).unwrap()),
+            ("expected.javaVersion".into(), "17.0.7".into()),
+            (
+                "expected.javaRuntimeVersion".into(),
+                "17.0.7+8-LTS-224".into(),
+            ),
+            ("gradle.configuredEncodingNull".into(), "true".into()),
+            ("effective.charset".into(), "UTF-8".into()),
+            ("effective.locale".into(), "ja-JP".into()),
+            ("gradle.fileEncoding".into(), "UTF-8".into()),
+            ("option.count".into(), options.len().to_string()),
+            ("source.count".into(), "1".into()),
+            ("source.0.path".into(), path_text(&consumer).unwrap()),
+            ("source.0.sha256".into(), sha(text.as_bytes())),
+        ]);
+        for (i, option) in options.iter().enumerate() {
+            spec.insert(format!("option.{i}"), option.clone());
+        }
+        let properties_file = phase.join("java.properties");
+        std::fs::write(&properties_file, properties(&spec)).unwrap();
+        let output = phase.join("java.json");
+        owned(
+            Command::new(sdk.join("bin/java.exe"))
+                .arg("-cp")
+                .arg(&tools)
+                .arg("JavacDiagnostics")
+                .arg(&properties_file)
+                .arg(&output),
+            1,
+        );
+        let value = read_json(&output).unwrap();
+        require_bool(&value, "compileCompleted", true).unwrap();
+        let errors: Vec<_> = array(&value, "diagnostics")
+            .unwrap()
+            .iter()
+            .filter(|d| d["kind"] == "ERROR")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["code"], "compiler.err.cant.resolve.location.args");
+        let calls = array(&value, "methodCalls").expect("same-task attribution is required");
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(call["receiverType"], "generated.Api");
+            assert_eq!(call["receiver"], "api");
+            assert_eq!(call["simpleOwnedApi"], true);
+            assert_eq!(call["originKind"], "class");
+            assert!(same_path(
+                Path::new(value_string(call, "originPath").unwrap()),
+                &classes.join("generated/Api.class")
+            ));
+            assert_eq!(
+                value_string(call, "originSha256").unwrap(),
+                sha(&std::fs::read(classes.join("generated/Api.class")).unwrap())
+            );
+            assert_eq!(call["publicInstanceZeroArgumentMethods"], json!([current]));
+        }
+        let missing = calls.iter().find(|c| c["method"] == absent).unwrap();
+        let start = missing["selectStart"].as_u64().unwrap() as usize;
+        let end = missing["selectEnd"].as_u64().unwrap() as usize;
+        assert_eq!(&text[start..end], format!("api.{absent}"));
+        assert_eq!(errors[0]["start"], missing["selectStart"]);
+        assert_eq!(errors[0]["position"], missing["receiverEnd"]);
+    }
+}
+
+// Configuration admits only a background execution plan, never saved generated API authority.
+fn processor_workspace_control(
+    unsupported_provider: bool,
+) -> (KotlinEditorOverlay, Workspace, String, String) {
+    processor_workspace_control_with_support(unsupported_provider, false)
+}
+
+fn processor_workspace_control_with_support(
+    unsupported_provider: bool,
+    include_support: bool,
+) -> (KotlinEditorOverlay, Workspace, String, String) {
+    let (owner, request) = fixture();
+    let root = owner.directory.clone();
+    let build = format!("legacy:{}", crate::paths::file_key(&root));
+    let processor_dir = root.join("processor");
+    let processor_source =
+        crate::paths::file_key(&processor_dir.join("src/main/java/Processor.java"));
+    let artifact = processor_dir.join("build/libs/processor.jar");
+    let mut auxiliary = inactive_kapt_tasks(&request);
+    // Actual KaptWithoutKotlincTask has no compiler java_home; its worker owns JVM selection.
+    auxiliary[0].java_home = None;
+    auxiliary[0].options.insert(
+        "kaptWorkerJvm".into(),
+        json!({
+            "adapter": "kgp-1.8.21-kapt-worker-jvm-v1",
+            "javaExecutable": request.task.java_home.as_ref().unwrap().join("bin").join(
+                if cfg!(windows) { "java.exe" } else { "java" }),
+            "buildJavaHome": request.task.kotlin_compiler.as_ref().unwrap().gradle_java_home,
+            "jvmArgs": [],
+        }),
+    );
+    auxiliary[0].annotation_processor_path = vec![artifact.clone()];
+    auxiliary[0]
+        .options
+        .insert("processors".into(), json!(["processor.CurrentProcessor"]));
+    let mut ksp = request.task.clone();
+    ksp.task = ":kspKotlin".into();
+    ksp.task_type = "com.google.devtools.ksp.gradle.KspTaskJvm_Decorated".into();
+    ksp.options
+        .insert("kspProcessorInputsProblem".into(), Value::Null);
+    ksp.options.insert("kspProcessorInputs".into(), json!({
+        "adapter":"gradle-7.4.2-ksp-1.8.21-1.0.11-configured-inputs-v1",
+        "basis":"stock-callCompilerAsync-transformer-fields",
+        "commandLineArgumentProviderCount": if unsupported_provider {1} else {0},
+        "producerCompletion":false, "apiAuthority":false,
+        "taskClassSha256":"17f978d4c95c090f1441aa1bd9ef95778743193c2777953525d006b92a84552f",
+        "transformerClassSha256":"37746fc33ef72b4972f51e72dc579f697e1d084fd4f4e4f3b3bf6b3392236dab",
+        "processorClasspath":[artifact]
+    }));
+    let mut tasks = vec![
+        request.task.clone(),
+        request.java_task.clone().unwrap(),
+        ksp,
+    ];
+    tasks.extend(auxiliary);
+    let mut producer = request.java_task.clone().unwrap();
+    producer.task = ":processor:compileJava".into();
+    producer.source_files = vec![PathBuf::from(&processor_source)];
+    // The processor is independent of the consumer. A consumer-output CP in this synthetic
+    // fixture would model a circular bootstrap rather than the intended plain processor.
+    producer.classpath.clear();
+    producer.declared_input_files = producer.source_files.clone();
+    producer.output_roots = vec![processor_dir.join("build/classes/java/main")];
+    producer.declared_output_roots = producer.output_roots.clone();
+    let support_artifact = root.join("support/build/libs/support.jar");
+    if include_support {
+        // compileOnly(project(":support")): it is a processor compiler input, absent from both
+        // the KSP runtime processor path above and the consumer's semantic compile classpath.
+        producer.classpath.push(support_artifact.clone());
+        producer.declared_input_files.push(support_artifact.clone());
+        assert!(!request
+            .task
+            .classpath
+            .iter()
+            .any(|p| same_path(p, &support_artifact)));
+        assert!(!request
+            .java_task
+            .as_ref()
+            .unwrap()
+            .classpath
+            .iter()
+            .any(|p| same_path(p, &support_artifact)));
+        assert!(tasks[2].options["kspProcessorInputs"]["processorClasspath"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| !same_path(Path::new(p.as_str().unwrap()), &support_artifact)));
+    }
+
+    let mut modules = vec![
+        ModuleClasspath {
+            module: ":".into(),
+            project_dir: request.project_dir.clone(),
+            build: build.clone(),
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(),
+                source_roots: request.source_roots.clone(),
+                kotlin_compile_task: Some(request.task.task.clone()),
+                compiler_tasks: tasks,
+                ..Default::default()
+            }],
+        },
+        ModuleClasspath {
+            module: ":processor".into(),
+            project_dir: processor_dir.clone(),
+            build,
+            entries: Vec::new(),
+            unresolved: Vec::new(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(),
+                source_roots: vec![processor_dir.join("src/main/java")],
+                provided_artifacts: vec![artifact],
+                compiler_tasks: vec![producer],
+                ..Default::default()
+            }],
+        },
+    ];
+
+    if include_support {
+        for name in ["support", "unrelated"] {
+            let dir = root.join(name);
+            let source = dir.join("src/main/java/Constants.java");
+            let classes = dir.join("build/classes/java/main");
+            let artifact = if name == "support" {
+                support_artifact.clone()
+            } else {
+                dir.join("build/libs/unrelated.jar")
+            };
+            let mut task = request.java_task.clone().unwrap();
+            task.task = format!(":{name}:compileJava");
+            task.source_files = vec![source.clone()];
+            task.declared_input_files = vec![source];
+            task.classpath.clear();
+            task.output_roots = vec![classes.clone()];
+            task.declared_output_roots = vec![classes.clone()];
+            modules.push(ModuleClasspath {
+                module: format!(":{name}"),
+                project_dir: dir.clone(),
+                build: modules[0].build.clone(),
+                entries: Vec::new(),
+                unresolved: Vec::new(),
+                source_sets: vec![SourceSetClasspath {
+                    name: "main".into(),
+                    source_roots: vec![dir.join("src/main/java")],
+                    output_roots: vec![classes.clone()],
+                    provided_artifacts: vec![artifact, classes],
+                    compiler_tasks: vec![task],
+                    ..Default::default()
+                }],
+            });
+        }
+    }
+    let mut ws = Workspace::new();
+    ws.set_project_model(Arc::new(ProjectSnapshot::new(modules)));
+    for source in &request.overlays {
+        ws.open(source.key.clone(), source.text.clone());
+    }
+    ws.open(
+        processor_source.clone(),
+        "package processor; class Processor { int current = 2; }".into(),
+    );
+
+    if include_support {
+        for name in ["support", "unrelated"] {
+            ws.open(
+                crate::paths::file_key(&root.join(name).join("src/main/java/Constants.java")),
+                format!("package {name}; class Constants {{ static final int CURRENT = 2; }}"),
+            );
+        }
+    }
+    let target = crate::paths::file_key(&request.project_dir.join("src/Main.java"));
+    (owner, ws, target, processor_source)
+}
+
+#[test]
+fn processor_current_plan_captures_unsaved_nonsemantic_processor_and_cancels_on_edit() {
+    let (_owner, mut ws, target, processor) = processor_workspace_control(false);
+    let request = ws.begin_kotlin_diagnostics(&target).unwrap();
+    assert!(
+        request.java_task.is_some(),
+        "configured active producers require owned execution, not permanent Java unavailability"
+    );
+    assert!(
+        request
+            .dependency_overlays
+            .iter()
+            .any(|s| s.key == processor && s.text.contains("current = 2")),
+        "processor buffers are execution inputs even outside semantic compile visibility"
+    );
+    ws.change(
+        &processor,
+        "package processor; class Processor { int current = 3; }".into(),
+    );
+    assert!(request.invalid.load(std::sync::atomic::Ordering::Acquire));
+    let baseline = ws.project_snapshot().unwrap();
+    for mutation in [
+        "missing",
+        "different-executable",
+        "different-build-jvm",
+        "worker-args",
+    ] {
+        let mut modules = baseline.modules.clone();
+        let kapt = modules[0].source_sets[0]
+            .compiler_tasks
+            .iter_mut()
+            .find(|t| {
+                t.task_type
+                    == "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask_Decorated"
+            })
+            .unwrap();
+        match mutation {
+            "missing" => {
+                kapt.options.remove("kaptWorkerJvm");
+            }
+            "different-executable" => {
+                kapt.options.get_mut("kaptWorkerJvm").unwrap()["javaExecutable"] =
+                    json!(_owner.directory.join("other-jdk/bin/java"))
+            }
+            "different-build-jvm" => {
+                kapt.options.get_mut("kaptWorkerJvm").unwrap()["buildJavaHome"] =
+                    json!(_owner.directory.join("other-jdk"))
+            }
+            "worker-args" => {
+                kapt.options.get_mut("kaptWorkerJvm").unwrap()["jvmArgs"] =
+                    json!(["-Djava.system.class.loader=custom.Loader"])
+            }
+            _ => unreachable!(),
+        }
+        ws.set_project_model(Arc::new(ProjectSnapshot::new(modules)));
+        assert!(
+            ws.begin_kotlin_diagnostics(&target)
+                .unwrap()
+                .java_task
+                .is_none(),
+            "unproved KAPT worker must remain unavailable: {mutation}"
+        );
+    }
+}
+
+#[test]
+fn processor_unknown_provider_keeps_java_unavailable() {
+    let (_owner, mut ws, target, _processor) = processor_workspace_control(true);
+    let request = ws.begin_kotlin_diagnostics(&target).unwrap();
+    assert!(request.java_task.is_none());
+    assert!(request.task.kotlin_compiler.is_some());
+}
+
+#[test]
+fn processor_compile_only_bootstrap_support_captures_unsaved_source_and_invalidates() {
+    let (owner, mut ws, target, _) = processor_workspace_control_with_support(false, true);
+    let support =
+        crate::paths::file_key(&owner.directory.join("support/src/main/java/Constants.java"));
+    let unrelated = crate::paths::file_key(
+        &owner
+            .directory
+            .join("unrelated/src/main/java/Constants.java"),
+    );
+    let request = ws.begin_kotlin_diagnostics(&target).unwrap();
+    assert!(request.java_task.is_some());
+    assert!(request.dependency_overlays.iter().any(|s| s.key == support && s.text.contains("CURRENT = 2")),
+        "compileOnly bootstrap sources require current overlays even when absent from runtime/consumer CP");
+    assert!(!request
+        .dependency_overlays
+        .iter()
+        .any(|s| s.key == unrelated));
+    ws.change(
+        &support,
+        "package support; class Constants { static final int CURRENT = 3; }".into(),
+    );
+    assert!(request.invalid.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn processor_unrelated_project_does_not_join_bootstrap_overlay_or_cancel_request() {
+    let (owner, mut ws, target, _) = processor_workspace_control_with_support(false, true);
+    let unrelated = crate::paths::file_key(
+        &owner
+            .directory
+            .join("unrelated/src/main/java/Constants.java"),
+    );
+    let request = ws.begin_kotlin_diagnostics(&target).unwrap();
+    assert!(!request
+        .dependency_overlays
+        .iter()
+        .any(|s| s.key == unrelated));
+    ws.change(
+        &unrelated,
+        "package unrelated; class Constants { static final int CURRENT = 3; }".into(),
+    );
+    assert!(!request.invalid.load(std::sync::atomic::Ordering::Acquire));
 }

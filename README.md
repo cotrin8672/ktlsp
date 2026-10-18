@@ -551,8 +551,11 @@ to `modules/editing`; it requires its generated project, so omit `--root`. Resul
 are recorded in `artifacts/gradle-reload.json` and `artifacts/gradle-phase*-compile.out`.
 The probe waits for the latest requested analysis generation's accepted finish in the trace,
 then checks each completion and definition once. Readiness failures remain separate from semantic results.
-Set `KTLSP_GRADLE_RELOAD_AUTOWATCH=1` to require Neovim's native watched-file notifications;
-the default is an explicit standard-notification control.
+After the reload checks, valid unsaved Kotlin and a new Java buffer exercise one canonical Javac
+body error with an exact Japanese/emoji UTF-16 range, then a current-version push and one standard
+diagnostic pull after fixing it. Empty Java diagnostics do not certify whole-API authority.
+Neovim's native watched-file registration is enabled by default and required for canonical
+diagnostics. Explicit `KTLSP_GRADLE_RELOAD_AUTOWATCH=0` fails before fixture creation.
 The probe honors `KTLSP_JDK_SRC`. Set it to the Java compile toolchain's `lib/src.zip`
 to check Java's obsolete dependency-member diagnostics against selected classfiles and
 their actual JDK ancestors; the default tiny JDK fixture covers ordinary reload behavior.

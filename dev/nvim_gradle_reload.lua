@@ -5,7 +5,7 @@ local fixture = dofile(dev .. '/gradle_reload_project.lua')
 local probe = dofile(dev .. '/nvim_lsp_probe.lua')
 local root, binary, artifacts = assert(arg[1]), assert(arg[2]), assert(arg[3])
 root, artifacts = vim.fs.normalize(root), vim.fs.normalize(artifacts)
-local automatic_watches = vim.env.KTLSP_GRADLE_RELOAD_AUTOWATCH == '1'
+local automatic_watches = (vim.env.KTLSP_GRADLE_RELOAD_AUTOWATCH or '1') == '1'
 local report = { checks = {}, phases = {}, messages = {}, requests = {}, engine = binary,
   watches = { mode = automatic_watches and 'automatic Neovim' or 'explicit notification control',
     registrations = {}, notifications = {} },
@@ -26,6 +26,15 @@ local function check(name, passed, detail, observation)
   report.checks[#report.checks + 1] = item
   print((item.measured == false and 'UNMEASURED  ' or (item.passed and 'PASS  ' or 'FAIL  ')) .. name)
   save()
+end
+
+if not automatic_watches then
+  local reason = 'canonical diagnostics require real client watch registration; set KTLSP_GRADLE_RELOAD_AUTOWATCH=1'
+  report.precondition = { passed = false, reason = reason }
+  save()
+  print('PRECONDITION: ' .. reason)
+  vim.cmd('cquit 1')
+  return
 end
 
 -- Redirect the build in the native shell so a reused Gradle daemon cannot retain the editor's
@@ -493,6 +502,73 @@ for phase = 1, 3 do
   clean_current_diagnostics(phase)
   save()
 end
+
+-- Retire deliberately invalid editors before checking Java against complete Kotlin output.
+report.current_phase = 'native-java'
+for _, buffer in ipairs({ java, kotlin }) do
+  vim.lsp.buf_detach_client(buffer, id)
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+for _, buffer in ipairs({ main, use, helper }) do
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.fn.readfile(vim.api.nvim_buf_get_name(buffer)))
+end
+local helper_disk = table.concat(text(helper), '\n')
+local valid_helper, replacements = helper_disk:gsub('fun assist%(%)%: Int = 1',
+  'fun assist(): Int = 1\n    fun assistValidUnsaved(): Int = 42', 1)
+assert(replacements == 1)
+vim.api.nvim_buf_set_lines(helper, 0, -1, false, vim.split(valid_helper, '\n', { plain = true }))
+local good = [[// 日本語😀 UTF-16 prefix
+package app;
+public class NativeJavacCertificate {
+    public int probe(KotlinHelper helper) {
+        int known = new String("x").length();
+        int peer = helper.assistValidUnsaved();
+        /* 日本語😀 */ return known + peer;
+    }
+}]]
+local bad = good:gsub('return known %+ peer;', 'return known + peer + new String("x").missingJavacCertificateMethod();', 1)
+local _, expected = probe.find(vim.split(bad, '\n', { plain = true }),
+  'new String("x").missingJavacCertificateMethod()', 'missingJavacCertificateMethod')
+assert(vim.deep_equal(expected, { start = { line = 6, character = 58 }, ['end'] = { line = 6, character = 87 } }))
+local native_path = module .. '/src/main/java/app/NativeJavacCertificate.java'
+assert(vim.fn.filereadable(native_path) == 0)
+local native = open('src/main/java/app/NativeJavacCertificate.java', 'java', good)
+assert(vim.lsp.buf_attach_client(native, id))
+check('new Java sees valid unsaved Kotlin member', has(native, 'helper.assistValidUnsaved()', 'assistValidUnsaved'))
+local notify_before, publish_before = client.rpc.notify, client.handlers['textDocument/publishDiagnostics']
+local positive, observed = probe.canonical_kotlin_diagnostics(client, native, {
+  observation_timeout_ms = wait_ms, request_timeout_ms = 4000, compiler_version = '2.4.0', require_complete = false,
+  edit_label = 'one new unsaved Java body error with valid Kotlin sources',
+  mutate = function() vim.api.nvim_buf_set_lines(native, 0, -1, false, vim.split(bad, '\n', { plain = true })) end,
+  flush = flush,
+})
+report.requests[#report.requests + 1] = { phase = 'native-positive', method = observed.method,
+  uri = observed.uri, result = positive, error = observed.error, response = observed.response }
+report.native_java = { expected_range = expected, positive = { result = positive, observation = observed },
+  whole_api_authority = false }
+local errors = vim.tbl_filter(function(item) return item.severity == 1 end, positive and positive.items or {})
+check('new Java one canonical Javac body error has exact Unicode token range', observed.canonical_certified
+  and observed.accepted.count == 1 and #errors == 1 and errors[1].code ~= 'unresolved_reference'
+  and errors[1].message:find('missingJavacCertificateMethod', 1, true) ~= nil
+  and vim.deep_equal(errors[1].range, expected), positive, observed)
+local _, finish = probe.observe_diagnostics(client, native)
+vim.api.nvim_buf_set_lines(native, 0, -1, false, vim.split(good, '\n', { plain = true }))
+flush()
+local _, delivery = finish(wait_ms)
+local delivered = delivery.error == nil and delivery.generation_certified and delivery.wire_matches_snapshot
+local fixed
+if delivered then fixed = request(native, 'textDocument/diagnostic') end
+local function no_errors(items)
+  return type(items) == 'table' and vim.iter(items):all(function(item) return item.severity ~= 1 end)
+end
+report.native_java.fixed = { delivery = delivery, result = fixed, canonical_certified = false, whole_api_authority = false }
+check('fixed Java current-wire push and first standard pull remove the old error', delivered
+  and no_errors(delivery.response.result.diagnostics)
+  and fixed and fixed.kind == 'full' and no_errors(fixed.items), report.native_java.fixed)
+check('native Java case restores observers and leaves both sources unwritten',
+  client.rpc.notify == notify_before and client.handlers['textDocument/publishDiagnostics'] == publish_before
+    and vim.fn.filereadable(native_path) == 0
+    and table.concat(vim.fn.readfile(module .. '/src/main/kotlin/app/KotlinHelper.kt'), '\n') == helper_disk)
 
 report.shutdown = probe.shutdown(client, shutdown_state, 10000)
 check('server exits cleanly after the same-connection lifecycle', report.shutdown.clean, report.shutdown)

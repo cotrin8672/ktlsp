@@ -29,6 +29,7 @@ pub(crate) struct WatchPlan {
     exact: BTreeSet<String>,
     trees: BTreeSet<String>,
     ancestors: BTreeSet<String>,
+    memberships: BTreeSet<String>,
     delegated_sources: BTreeSet<String>,
     delegated_outputs: BTreeSet<String>,
 }
@@ -86,6 +87,29 @@ impl WatchPlan {
         let mut plan = Self::default();
         for input in inputs {
             plan.add_input(input, input.is_dir())?;
+        }
+        Ok(plan)
+    }
+
+    /// A bounded copied inventory: exact file reads plus direct-child membership changes.
+    pub(crate) fn read_source_inventory(
+        files: &[PathBuf],
+        directories: &[PathBuf],
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            files.len() + directories.len() <= MAX_INPUT_PATHS,
+            "compiler-native-input-cap"
+        );
+        let mut plan = Self::read_inputs(files)?;
+        for directory in directories {
+            let metadata = std::fs::symlink_metadata(directory)?;
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "compiler-watch-inventory-directory-unknown"
+            );
+            plan.memberships.insert(key(directory));
+            plan.add_directory(directory)?;
+            plan.guard_parents(directory)?;
         }
         Ok(plan)
     }
@@ -191,13 +215,14 @@ impl WatchPlan {
         self.exact.extend(next.exact);
         self.trees.extend(next.trees);
         self.ancestors.extend(next.ancestors);
+        self.memberships.extend(next.memberships);
         self.delegated_sources.extend(next.delegated_sources);
         self.delegated_outputs.extend(next.delegated_outputs);
         for directory in next.directories {
             self.add_directory(&directory)?;
         }
         anyhow::ensure!(
-            self.exact.len() + self.trees.len() <= MAX_INPUT_PATHS,
+            self.exact.len() + self.trees.len() + self.memberships.len() <= MAX_INPUT_PATHS,
             "compiler-native-input-cap"
         );
         Ok(())
@@ -229,6 +254,7 @@ impl WatchPlan {
                 | EventKind::Modify(notify::event::ModifyKind::Name(_))
         );
         event.paths.iter().any(|path| {
+            let parent = path.parent().map(key);
             let key = key(path);
             // Explicit non-source input files always win, even inside an output container.
             if self.exact.contains(&key) {
@@ -257,6 +283,10 @@ impl WatchPlan {
             }
             self.trees.iter().any(|root| path_under(&key, root))
                 || (ancestor_change && self.ancestors.contains(&key))
+                || (ancestor_change
+                    && parent
+                        .as_ref()
+                        .is_some_and(|parent| self.memberships.contains(parent)))
         })
     }
 }

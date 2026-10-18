@@ -6,7 +6,106 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest108: current source and native validation
+## Latest110: selected KAPT runtime and warning-free Gradle import
+
+KAPT's null java_home is no longer confused with an unselected worker JVM.
+The Gradle exporter captures the stock worker executable, build JVM and worker
+arguments; the processor plan binds them to the selected runtime and retains
+the existing KSP/stubs/toolchain checks. Missing or different runtime facts and
+extra worker arguments remain unavailable. The existing focused fixture now
+uses the real KAPT model shape: it fails before the fix and passes afterward.
+All18 processor-focused checks pass, with one native observer ignored.
+Unsupported plan reasons are also available through the existing debug log.
+
+A real Gradle8.14.2 import independently exposes an unchecked-map cast in the
+new KSP exporter: this project treats Kotlin DSL warnings as errors. The
+exporter now constructs a typed map directly, preserving its serialized fields.
+The failed allocator warmup has zero measured samples and is retained under
+recovery89/allocator-abba1; it supplies no evidence of a performance benefit.
+
+After both fixes, final workspace passes1,706/zero failed/eight ignored across
+40 result blocks; release succeeds. Root checks all348 current inputs and
+three referenced artifacts. All final Jobs close without live/terminated
+residuals. Earlier evidence retains one descendant-cleanup wall-time failure
+(6.031s under load); the unchanged single test and subsequent broad runs pass.
+Evidence: native-integrated110-1/receipt.json SHA256
+011c5867352d9f529cc685cca66c77c6fa64a81ecf70755a8c135f371775b8ec.
+The20,806,656-byte immutable binary is native-integrated110-1/bin/ktlsp.exe,
+SHA2567ac393360fa6784a9bd8a9d2f5e65ca31714cd87f3b02a7244c51e8d451b9d5e.
+It uses the temporary explicit System allocator baseline; allocator trial
+manifest/lock/main edits are separate and have no demonstrated speed benefit.
+Original114 and Gradle's original three first responses are being rechecked
+against this release. The automatic-watch reload repeat has58 passing checks,
+including the canonical barrier previously blocked by the wrong setup; its
+remaining checks are not yet certified.
+
+### Previous109: integrated processors and diagnostic reconciliation
+
+The shared diagnostic merge removes only a fast unresolved-reference error at
+the exact range of a current accepted compiler error; other codes, severities
+and ranges remain visible. The focused preservation guard passes. Processor
+execution now retains current Java overlays in the private selected-source
+request and watches bounded original producer inputs before copying them.
+The current release includes KSP/KAPT execution and generated-API provenance
+checks; general compiler-plugin compatibility remains unproved.
+
+Final workspace passes1,706/zero failed/eight ignored across40 result blocks;
+release succeeds. Root verifies all348 current inputs, identical before/after
+snapshots, six referenced artifacts and zero live/terminated owned residuals.
+Evidence: native-integrated109-1/receipt.json SHA256
+4306ed1713d9a4156262e4b7a617b84670dd31fd5531905e77bc90e9ff4b61d6.
+The20,833,280-byte immutable release is native-integrated109-1/bin/ktlsp.exe,
+SHA2563b7844e8a9a7dea24794442e644db71a7f7aa726e0d08594c06ddf08f4ca7b4e.
+The same seven first requests that reproduced duplicate diagnostics on108 now
+pass all17 native checks without retry: the Unicode missing-method range has
+one compiler error instead of two errors, and the unsaved fix clears both
+current-version push and the first standard pull. Root verifies seven artifact
+references, including durable source bytes; shutdown is natural, guards remain
+stable, and no owned process remains. Empty results still do not claim general
+Java API authority. Evidence:
+recovery89/java-native-body109-1/owned-1/summary.json SHA256
+3b7086cca66202aba08707e481335f7ca88a532e7b97e71a11760603da4caaae.
+Actual original114 processor run finishes111 passing checks and three failures,
+all obsolete generated Java API diagnostics in phase1. All60 original requests
+and four phases finish, with zero owned residuals. Root verifies the binary/raw
+references and retains the failures. Evidence:
+recovery89/corpus90/native-processor114-editor109-1/receipt.json SHA256
+eaaa4cf878f0c6f6cfec99faf678bde05dea0d918976fa141f1ece756c0dac42.
+The actual model exports KAPT java_home as null; the processor plan incorrectly
+requires equality with the primary JDK17. The next fix captures the stock KAPT
+worker's selected JVM rather than treating null as proof. Processor
+method certificates currently admit ASCII identifiers only; Japanese/non-BMP
+comments have exact ranges, but Japanese generated identifiers remain a gap.
+
+The first portable109 reload run reaches39 passing checks, then cannot start
+canonical compilation: its unset AUTOWATCH selects explicit notification mode,
+which never supplies a dynamic project-watch ACK. In contrast, original107
+used automatic Neovim watches and nine registrations. This is a run-setup
+regression, not evidence of a production generation race. Retain the original
+run and repeat with genuine automatic registration; do not extend the timeout
+or bypass the freshness guard. Static clients still lack this canonical path:
+a safe fallback must watch model configuration and closed-source membership
+before reading overlays, and retain those watches through publication.
+
+The broad real-Neovim Java scenario on frozen109 passes367 checks with zero
+failures/unmeasured and157 requests. It verifies unsaved Kotlin member changes
+in Java completion (including removal of the old member), Java/Kotlin array
+completion and exact goto, and actual application of override/static renames
+followed by Kotlin goto. Root independently checks21 artifacts and10 current
+runtime guards, plus representative assertion outcomes. Natural shutdown has
+a null shutdown response, exit/code0/signal0 and no forced termination or owned
+residuals. Evidence: recovery89/editor109-java1/receipt.json SHA256
+b388fbb518b59a7559c1fc4921552ebc728429310ed65728a8a80f9a266171fb.
+
+A separate frozen108 features run reports78 passing checks and two failures:
+missing-type diagnostics and definitely-absent explanation in a fixture without
+compiler-model completeness. These failures remain visible; do not weaken the
+semantic proof requirements to turn them green. Evidence:
+recovery89/editor109-features1/receipt.json. This Kotlin-oriented probe checks
+returned rename edits without applying them, and explicitly force-stops the
+client; it does not establish rename application or natural shutdown.
+
+### Previous108: source and native validation
 
 Javac absolute UTF-16 positions now map to exact UTF-8 boundaries before source
 slicing; Japanese and non-BMP comments no longer disable Java import diagnostics.
@@ -31,12 +130,36 @@ native-integrated108-1/receipt.json SHA256
 3ac354319dfb4ce71d1c395ab8a8dfe9018fe82b02af3a378401c28752baa872.
 The20,223,488-byte release is native-integrated108-1/bin/ktlsp.exe, SHA256
 1a99c7e073ec9fff117304773f04958386a6c63ea9e2823aac8f8949ab99de37.
-Real-Neovim body error/fix and exact non-ASCII range verification are pending;
-the Rust results do not establish that the native observer emits these facts.
+Real-Neovim108 completes all seven first requests without retry:16 checks pass
+and one fails. The exact non-ASCII method range(6:58-87), native positive to
+accepted store/pull and fixed current-version empty push/standard pull all work.
+The failed expectation requires one error; the editor receives both the correct
+Javac error and a fast unresolved-reference error at the same range. Keep that
+expectation: shared diagnostic reconciliation is being corrected. The server
+shuts down cleanly with zero owned residuals. Only a mutable build-summary JSON
+guard changed; executable, hook, runtime and fixture inputs remain unchanged.
+That metadata failure remains recorded separately from the semantic duplicate.
+Evidence: recovery89/java-native-body108-candidate1/owned-1/summary.json SHA256
+ac68f57cf39af57fe6f85426b07094335ca31a183b56e6cdb783dc5d4c7ae1a7.
 Additional existing Workspace trace markers distinguish final-owner release,
-Index destruction and subsequent field destruction. Their runtime measurement
-is pending; Index and Salsa share facts, so the middle marker is not proof that
-all symbol payloads have been freed.
+Index destruction and subsequent field destruction. One108 repeat reaches
+Workspace destruction0.520ms after serve closure, spends11.506s destroying
+Index, then146ms on subsequent fields. Index accounts for98.7% of the measured
+Workspace destruction interval, with about11.22-11.52 CPU seconds. All three
+original first responses match and exit is natural, without forced termination.
+This identifies active Index teardown; concurrent conditions preclude a speed
+comparison, and shared Salsa facts may still be released after the middle marker.
+Evidence: recovery89/shutdown108-natural1/cpu-rss-summary.json.
+
+The AP109 implementation is now in the current checkout. Its overlay regression
+fails on missing open-Java membership, then passes after preserving current
+overlays in the private stock-selected request. The processor suite passes19
+checks with one ignored; the selected-SDK17 native observer control also passes.
+A pre-reconciliation workspace run passes1,705/zero failed/eight ignored with
+348 stable inputs. Release was deliberately not launched so the diagnostic
+merge fix can be included. Final integrated Rust/release and original114 real
+editor checks remain pending; neither generated API correctness nor general
+compiler-plugin parity is established by these Rust results.
 
 The restored fixed IDEA reference independently passes the original OkHttp
 incomplete-code cases: five cases, six first responses,13 semantic checks, one
@@ -46,6 +169,13 @@ terminates one remaining process and closes with zero live processes. This is
 semantic reference evidence, not lifecycle or speed acceptance. Evidence:
 recovery89/corpus90/native-five-okhttp-idea-restored-reference-1/receipt.json
 SHA256da2611fcde20049ff78f0e35e997f512564478de1cd23a2ed1ed23e5dee3b122.
+The same restored reference passes Spring's original six first responses and
+13 semantic checks, including the previously unconfirmed dangling-dot case.
+Root independently verifies57 guards and four references. Each run's actual
+Gradle daemon log records JDK17. Spring retains the same shutdown wait failure
+and exact owned cleanup of one process, with zero remaining live processes.
+Evidence: recovery89/corpus90/native-five-sp-idea-ref-1/receipt.json SHA256
+6a081b03e1f798b16499a1c7db7dca42aa01a5476927dc7c70411ce1fc80c7e3.
 
 ### Previous107 source and native validation
 
@@ -293,6 +423,14 @@ read-set contradiction (processor-ap106-rebase1/review-blockers.json).
 The requested test-efficiency audit found build work dominates the inspected
 five runs (about344.5s build versus22.4s tests). The inner loop now selects the
 changed semantic layer, then runs one workspace gate and one release build.
+The109 follow-up finds71.33s of test-profile build work versus0.03s executing
+four focused invocations. Two additional attempts to qualify a caller fixture
+cost25.703s without reproducing the native failure. Stop that fixture loop and
+use the retained actual failure before adding one focused regression. Batch
+pending shared-source merges before the workspace gate; keep one final broad
+gate and current-release editor check. The two109 workspace runs have different
+source inputs, and the release hold launches no native process; neither is
+counted as an identical-input duplicate. See recovery89/test-efficiency109.txt.
 Existing owned runner APIs/configs are reused without new controller clones.
 CPU parallelism is16 after the user's resource authorization; cache/profile
 flags remain unchanged and there is no claim of a controlled speedup. Storage

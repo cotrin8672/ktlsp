@@ -2590,17 +2590,41 @@ impl Workspace {
             .filter(|(owner, _)| *owner == key)
             .flat_map(|(_, set)| set.diagnostics().iter().cloned())
             .collect::<Vec<_>>();
-        extra.extend(self.current_kotlin_diagnostics(key));
-        if let Some(doc) = self.open_docs.get(key) {
-            extra.extend(self.diagnostics_for_tree(key, &doc.text, &doc.tree));
-            return extra;
-        }
-        let (text, tree) = match self.parsed_closed_doc(key) {
-            Some(parsed) => parsed,
-            None => return Vec::new(),
+        let canonical = self.current_kotlin_diagnostics(key);
+        let fast = if let Some(doc) = self.open_docs.get(key) {
+            self.diagnostics_for_tree(key, &doc.text, &doc.tree)
+        } else {
+            let (text, tree) = match self.parsed_closed_doc(key) {
+                Some(parsed) => parsed,
+                None => return Vec::new(),
+            };
+            self.diagnostics_for_tree(key, &text, &tree)
         };
-        extra.extend(self.diagnostics_for_tree(key, &text, &tree));
+        let fast = Self::reconcile_fast_diagnostics(&canonical, fast);
+        extra.extend(canonical);
+        extra.extend(fast);
         extra
+    }
+
+    fn reconcile_fast_diagnostics(
+        canonical: &[crate::diagnostics::Diagnostic],
+        mut fast: Vec<crate::diagnostics::Diagnostic>,
+    ) -> Vec<crate::diagnostics::Diagnostic> {
+        use crate::diagnostics::{DiagnosticCode, Severity};
+        if canonical.is_empty() || fast.is_empty() {
+            return fast;
+        }
+        let current_errors: HashSet<_> = canonical
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| (diagnostic.start_byte, diagnostic.end_byte))
+            .collect();
+        fast.retain(|diagnostic| {
+            diagnostic.code != Some(DiagnosticCode::UnresolvedReference)
+                || diagnostic.severity != Severity::Error
+                || !current_errors.contains(&(diagnostic.start_byte, diagnostic.end_byte))
+        });
+        fast
     }
 
     fn diagnostics_for_tree(
@@ -4225,6 +4249,49 @@ mod tests {
             },
         );
         root
+    }
+
+    #[test]
+    fn canonical_fast_merge_preserves_other_fast_meanings_ranges_and_severities() {
+        use crate::diagnostics::{Diagnostic, DiagnosticCode, Severity};
+        let canonical = Diagnostic {
+            start_byte: 10,
+            end_byte: 20,
+            severity: Severity::Error,
+            code: None,
+            message: "compiler positive".into(),
+        };
+        let unresolved = Diagnostic {
+            code: Some(DiagnosticCode::UnresolvedReference),
+            message: "fast unresolved".into(),
+            ..canonical.clone()
+        };
+        let fast = vec![
+            Diagnostic {
+                start_byte: 11,
+                ..unresolved.clone()
+            },
+            Diagnostic {
+                severity: Severity::Warning,
+                ..unresolved.clone()
+            },
+            Diagnostic {
+                code: Some(DiagnosticCode::CallShapeMismatch),
+                ..unresolved.clone()
+            },
+        ];
+        assert_eq!(
+            Workspace::reconcile_fast_diagnostics(&[canonical.clone()], fast.clone()),
+            fast
+        );
+        let warning = Diagnostic {
+            severity: Severity::Warning,
+            ..canonical
+        };
+        assert_eq!(
+            Workspace::reconcile_fast_diagnostics(&[warning], vec![unresolved.clone()]),
+            vec![unresolved]
+        );
     }
 
     fn required_interface_actions_at(ws: &mut Workspace, key: &str, cursor: usize) -> Vec<Action> {
@@ -8101,6 +8168,13 @@ impl Workspace {
         {
             return true;
         }
+        if request
+            .processor_plan
+            .as_ref()
+            .is_some_and(|plan| plan.affects_processor_source(Path::new(key)))
+        {
+            return true;
+        }
         // Keep selected external sources and files without a current model origin protected.
         request
             .sources
@@ -8245,6 +8319,18 @@ impl Workspace {
             .collect();
         let source_views = model.compiler_source_views();
         let mut java_editor_sources = BTreeSet::new();
+        let mut processor_plan = if self.analysis_extensions.is_empty() {
+            model.plain_java_task(key).and_then(|java| {
+                crate::compile::ProcessorPlan::capture(module, source, task, java, &model)
+                    .inspect_err(|error| {
+                        tracing::debug!(task = %task.task, %error,
+                            "selected processor execution plan unavailable");
+                    })
+                    .ok()
+            })
+        } else {
+            None
+        };
         let mut overlays = Vec::new();
         let mut dependency_overlays = Vec::new();
         for (open_key, doc) in &self.open_docs {
@@ -8257,7 +8343,10 @@ impl Workspace {
             let dependency = origin
                 .as_ref()
                 .is_some_and(|origin| visible_origins.contains(&origin.origin_id));
-            if !own && !dependency {
+            let processor = processor_plan
+                .as_ref()
+                .is_some_and(|plan| plan.affects_processor_source(Path::new(open_key)));
+            if !own && !dependency && !processor {
                 continue;
             }
             let revision = self
@@ -8301,12 +8390,12 @@ impl Workspace {
         dependency_overlays.sort_by(|a, b| a.key.cmp(&b.key));
         // Plain javac cannot reject virtual targets contributed by LSPExtension providers.
         // Until Java compiler positives reconcile with those facts, keep this surface unavailable.
-        let java_inputs = if self.analysis_extensions.is_empty()
+        let compiler_sources_supported = self.analysis_extensions.is_empty()
             && sources
                 .keys()
                 .chain(dependency_overlays.iter().map(|source| &source.key))
-                .all(|file| self.index.contributions_for_file(file).is_empty())
-        {
+                .all(|file| self.index.contributions_for_file(file).is_empty());
+        let java_inputs = if compiler_sources_supported {
             model
                 .plain_java_task_for_editor(key, &java_editor_sources)
                 .and_then(|java| {
@@ -8320,10 +8409,14 @@ impl Workspace {
                         &visible_origins,
                     )
                     .map(|dependencies| (java.clone(), dependencies))
+                    .or_else(|| processor_plan.as_ref().map(|_| (java.clone(), Vec::new())))
                 })
         } else {
             None
         };
+        if java_inputs.is_none() {
+            processor_plan = None;
+        }
         let (java_task, java_dependencies) = match java_inputs {
             Some((task, dependencies)) => (Some(task), dependencies),
             None => (None, Vec::new()),
@@ -8356,6 +8449,7 @@ impl Workspace {
             java_task,
             java_dependencies,
             java_editor_sources,
+            processor_plan,
             positive_diagnostics_only: source.compiler_tasks.iter().any(|candidate| {
                 candidate.language == CompilerLanguage::Kotlin && candidate.task != task.task
             }),
@@ -8397,6 +8491,10 @@ impl Workspace {
                     .is_some_and(|origin| origin.project_scope.as_ref() == Some(&request.scope)))
                 && (key.ends_with(".kt") || key.ends_with(".java"));
             if !own
+                && !request
+                    .processor_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.affects_processor_source(Path::new(key)))
                 && origin
                     .as_ref()
                     .is_none_or(|origin| !request.visible_origins.contains(&origin.origin_id))
