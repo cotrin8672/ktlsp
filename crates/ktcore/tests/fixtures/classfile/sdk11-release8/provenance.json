@@ -1,0 +1,59 @@
+{
+  "source_archive": {
+    "path": "C:\\Users\\gummy\\.jdks\\corretto-11.0.22\\lib\\ct.sym",
+    "bytes": 4496477,
+    "sha256": "5f3bdb360bee9a229490dc94ab08b17405bd37c2219733c2fba753c6c35a019b"
+  },
+  "sdk_release_file": {
+    "path": "C:\\Users\\gummy\\.jdks\\corretto-11.0.22\\release",
+    "bytes": 1312,
+    "sha256": "21c31f3a94920c85d06d442a0f5dde717b3e3d7c18c988649c7a3d398404b055"
+  },
+  "sdk_release_text": "IMPLEMENTOR=\"Amazon.com Inc.\"\nIMPLEMENTOR_VERSION=\"Corretto-11.0.22.7.1\"\nJAVA_RUNTIME_VERSION=\"11.0.22+7-LTS\"\nJAVA_VERSION=\"11.0.22\"\nJAVA_VERSION_DATE=\"2024-01-16\"\nLIBC=\"default\"\nMODULES=\"java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.vm.ci jdk.management jdk.unsupported jdk.internal.vm.compiler jdk.aot jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.crypto.mscapi jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.internal.le jdk.internal.opt jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.ldap jdk.naming.rmi jdk.net jdk.pack jdk.rmic jdk.scripting.nashorn jdk.scripting.nashorn.shell jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported.desktop jdk.xml.dom jdk.zipfs\"\nOS_ARCH=\"x86_64\"\nOS_NAME=\"Windows\"\nSOURCE=\"\"\n",
+  "selected_api_release": 8,
+  "fixture_entries": [
+    {
+      "entry": "876/java/lang/Object.sig",
+      "crc32": "e9db5b03",
+      "path": "C:\\Users\\gummy\\.codex\\ktlsp-runs\\01a12550-7d56-71f2-8c34-8ab8c5fe5dda\\recovery89\\sdk11-layout95-draft\\fixtures\\crates\\ktcore\\tests\\fixtures\\classfile\\sdk11-release8\\Object.sig",
+      "bytes": 657,
+      "sha256": "0a413006a7c45ae1b9f9803c3b06e548da75b3dc55c25ebe1a3fb5f860d3b754"
+    },
+    {
+      "entry": "8/java/lang/String.sig",
+      "crc32": "cebeb3b5",
+      "path": "C:\\Users\\gummy\\.codex\\ktlsp-runs\\01a12550-7d56-71f2-8c34-8ab8c5fe5dda\\recovery89\\sdk11-layout95-draft\\fixtures\\crates\\ktcore\\tests\\fixtures\\classfile\\sdk11-release8\\String.sig",
+      "bytes": 3530,
+      "sha256": "dc12ecdd961984373730c4c4fac35418351ee694095d75a9bc96765ad78f3c53"
+    },
+    {
+      "entry": "8769A/java/io/Serializable.sig",
+      "crc32": "c0c346e1",
+      "path": "C:\\Users\\gummy\\.codex\\ktlsp-runs\\01a12550-7d56-71f2-8c34-8ab8c5fe5dda\\recovery89\\sdk11-layout95-draft\\fixtures\\crates\\ktcore\\tests\\fixtures\\classfile\\sdk11-release8\\Serializable.sig",
+      "bytes": 159,
+      "sha256": "a066df7c29992c718e6c10170d09691324dcc0e58de606ab19f6327ca6785ea2"
+    },
+    {
+      "entry": "8769A/java/lang/Comparable.sig",
+      "crc32": "606236d5",
+      "path": "C:\\Users\\gummy\\.codex\\ktlsp-runs\\01a12550-7d56-71f2-8c34-8ab8c5fe5dda\\recovery89\\sdk11-layout95-draft\\fixtures\\crates\\ktcore\\tests\\fixtures\\classfile\\sdk11-release8\\Comparable.sig",
+      "bytes": 283,
+      "sha256": "282b6475084ff1e15f95755c39fdbaec137a0dbe8a34fe4bcc3e85705e3cc893"
+    },
+    {
+      "entry": "8/java/lang/CharSequence.sig",
+      "crc32": "a7fd0bee",
+      "path": "C:\\Users\\gummy\\.codex\\ktlsp-runs\\01a12550-7d56-71f2-8c34-8ab8c5fe5dda\\recovery89\\sdk11-layout95-draft\\fixtures\\crates\\ktcore\\tests\\fixtures\\classfile\\sdk11-release8\\CharSequence.sig",
+      "bytes": 472,
+      "sha256": "a88d4f9c8b3758ab2cfd4eff275da9064e8c8f59184f46b28249b54211e6b2f3"
+    }
+  ],
+  "capture": "exact unmodified signature bytes from this actual SDK11 archive; no SDK17 relabeling",
+  "portable_test_archive": "tests package these original entries into a small ZIP; not a complete SDK archive",
+  "root_sdk_api_source": {
+    "path": "C:\\Users\\gummy\\ghq\\github.com\\cotrin8672\\ktlsp\\crates\\ktlsp\\src\\sdk_api.rs",
+    "bytes": 17211,
+    "sha256": "a09f3cece8c2adcb0c00389bc3f1157b9d71e7cd1843d029a82ba565acc0956f"
+  },
+  "parent_fixture_reason": "Exact direct String interfaces close the same nominal ancestry as the existing SDK17 subset; no saved or fabricated API facts."
+}

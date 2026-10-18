@@ -1,2 +1,3 @@
-# Preserve published metadata bytes, including upstream trailing spaces, in regression fixtures.
+# Preserve published artifact bytes, including upstream trailing spaces, in regression fixtures.
 crates/ktlsp/tests/fixtures/source-encoding/*.pom -text whitespace=-blank-at-eol
+crates/ktlsp/tests/fixtures/extension_sources/Shadow.java -text whitespace=-blank-at-eol

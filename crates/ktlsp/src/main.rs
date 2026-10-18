@@ -106,6 +106,14 @@ async fn main() -> anyhow::Result<()> {
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
         .serve(service)
         .await;
+    if ktlsp::trace::enabled() {
+        ktlsp::trace::span(
+            "server.serve.closed",
+            "server",
+            std::time::Instant::now(),
+            serde_json::json!({}),
+        );
+    }
     if let Some(profiler) = profiler {
         profiler.finish()?;
     }

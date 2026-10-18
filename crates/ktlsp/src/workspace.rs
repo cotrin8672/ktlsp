@@ -99,6 +99,23 @@ pub struct Workspace {
     kotlin_diagnostic_store_epoch: u64,
     kotlin_diagnostic_changes: BTreeSet<String>,
     class_inventory: RefCell<crate::binary_diagnostics::ClassInventoryCache>,
+    // Keep this last: its destructor observes completion of all preceding field destruction.
+    _drop_marker: WorkspaceDropMarker,
+}
+
+struct WorkspaceDropMarker;
+
+impl Drop for WorkspaceDropMarker {
+    fn drop(&mut self) {
+        if crate::trace::enabled() {
+            crate::trace::span(
+                "workspace.fields.dropped",
+                "workspace",
+                std::time::Instant::now(),
+                serde_json::json!({}),
+            );
+        }
+    }
 }
 
 impl Default for Workspace {
@@ -141,6 +158,7 @@ impl Workspace {
             kotlin_diagnostic_store_epoch: 0,
             kotlin_diagnostic_changes: BTreeSet::new(),
             class_inventory: RefCell::default(),
+            _drop_marker: WorkspaceDropMarker,
         }
     }
 
@@ -234,6 +252,11 @@ impl Workspace {
         self.index.replace_scope_visibilities(
             model.scope_visibilities(&self.global_origins.iter().cloned().collect::<Vec<_>>()),
         );
+        self.index.replace_caller_scope_visibilities(
+            model.caller_scope_visibilities(
+                &self.global_origins.iter().cloned().collect::<Vec<_>>(),
+            ),
+        );
         for key in self.project_file_meta.keys().chain(self.open_docs.keys()) {
             if let Some(origin) = model.file_origin(Path::new(key)) {
                 self.index.set_file_origin(key, origin);
@@ -258,7 +281,7 @@ impl Workspace {
             .unwrap_or_default();
         let revisions = model.artifact_revisions();
         self.global_origins.retain(|origin| {
-            !origin.starts_with("jdk:")
+            !crate::classpath::is_sdk_origin(origin)
                 || active.contains(origin)
                     && (self.project_model.is_none()
                         || previous_revisions.get(origin) == revisions.get(origin))
@@ -476,7 +499,7 @@ impl Workspace {
             if let Some(origin) = batch
                 .origin
                 .as_ref()
-                .filter(|origin| origin.origin_id.starts_with("jdk:"))
+                .filter(|origin| crate::classpath::is_sdk_origin(&origin.origin_id))
             {
                 self.global_origins.insert(origin.origin_id.clone());
                 metadata_changed |= self.index.set_file_origin(&batch.file, origin.clone());
@@ -485,7 +508,7 @@ impl Workspace {
         if let Some(model) = &self.project_model {
             if model.modules.iter().any(|m| !m.source_sets.is_empty()) {
                 if let Some(origin) = batch.origin.clone() {
-                    if origin.origin_id.starts_with("jdk:")
+                    if crate::classpath::is_sdk_origin(&origin.origin_id)
                         && self.global_origins.insert(origin.origin_id.clone())
                     {
                         metadata_changed |=
@@ -493,6 +516,11 @@ impl Workspace {
                                 .replace_scope_visibilities(model.scope_visibilities(
                                     &self.global_origins.iter().cloned().collect::<Vec<_>>(),
                                 ));
+                        metadata_changed |= self.index.replace_caller_scope_visibilities(
+                            model.caller_scope_visibilities(
+                                &self.global_origins.iter().cloned().collect::<Vec<_>>(),
+                            ),
+                        );
                     }
                     // Late ownership metadata also belongs to authoritative open source buffers.
                     metadata_changed |= self.index.set_file_origin(&batch.file, origin);
@@ -594,6 +622,17 @@ impl Workspace {
             self.bump_index_revision();
         }
         registered
+    }
+
+    pub(crate) fn extension_source_input_identity(&self, owner: &str) -> Option<Arc<str>> {
+        self.analysis_extensions.source_input_identity(owner)
+    }
+
+    pub(crate) fn extension_source_wait(
+        &mut self,
+        owner: &str,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.analysis_extensions.source_wait(&self.index, owner)
     }
 
     pub(crate) fn begin_extension_source_batch(
@@ -3761,7 +3800,9 @@ pub(crate) fn prepare_model_sources(
 }
 
 fn is_dependency_origin(origin: &str) -> bool {
-    origin.starts_with("maven:") || origin.starts_with("file:") || origin.starts_with("jdk:")
+    origin.starts_with("maven:")
+        || origin.starts_with("file:")
+        || crate::classpath::is_sdk_origin(origin)
 }
 
 fn project_index_threads() -> usize {
@@ -4000,6 +4041,7 @@ mod tests {
                 signature: None,
                 source_file: None,
                 attribute_names: Vec::new(),
+                inner_classes: Vec::new(),
                 fields: Vec::new(),
                 methods: Vec::new(),
             },
@@ -5337,7 +5379,17 @@ mod tests {
                 "task": ":compileJava", "language": "java", "task_type": "org.gradle.api.tasks.compile.JavaCompile",
                 "java_home": root.join(format!("jdk{feature}")), "arguments": [], "annotation_processor_path": [],
                 "source_files": [&key], "classpath": [], "output_roots": [], "complete": true, "problem": null,
-                "options": {"release": null, "bootstrapClasspath": null, "fork": false, "forkJavaHome": null, "forkExecutable": null, "forkJvmArgs": []}
+                "options": {
+                    "release": null, "bootstrapClasspath": null, "fork": false, "forkJavaHome": null, "forkExecutable": null, "forkJvmArgs": [],
+                    "sdkSourcePolicy": {
+                        "adapter":"gradle-source-tree-stock-patterns-v1", "task":":compileJava", "language":"java",
+                        "authored_roots":[project.join("src")], "future_roots":[project.join("src")], "generated_roots":[],
+                    },
+                    "sdkProducerClaims": {
+                        "adapter":"gradle-producing-source-trees-v1", "task":":compileJava", "language":"java",
+                        "roots":[project.join("src")], "complete":true,
+                    },
+                }
             })).unwrap();
             Arc::new(crate::classpath::ProjectSnapshot::new(vec![
                 crate::classpath::ModuleClasspath {
@@ -5582,6 +5634,7 @@ mod tests {
                 signature: None,
                 source_file: None,
                 attribute_names: Vec::new(),
+                inner_classes: Vec::new(),
                 fields: Vec::new(),
                 methods: Vec::new(),
             },

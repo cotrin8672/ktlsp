@@ -389,6 +389,11 @@ The `gradle-8.14.3.json` and `gradle-8.14.3-incomplete.json` manifests cover Jav
 navigation and unfinished editing after importing the real Gradle project. Discovery
 streams large model output through a temporary file and rejects incomplete project
 blocks; it also supports this project's Kotlin DSL warnings-as-errors policy.
+These manifests include selected-SDK completion in saved and unfinished Java/Kotlin
+buffers. SDK visibility follows the producing compiler task's toolchain and release;
+portable Rust regressions also cover legacy SDK11 `ct.sym` layout and new unsaved
+files under captured Gradle source-tree exclusions. Current project results and
+remaining gaps are recorded in [the fork state](docs/fork-current.md).
 For pinned Moshi, set `KTLSP_UI_CASES` to the absolute path of
 `dev/corpus/moshi-1.15.2-ui.json` and `KTLSP_UI_SAMPLES=31` with the same corpus route.
 For pinned Retrofit, use `dev/corpus/retrofit-2.11.0-ui.json` with that sample count.
@@ -456,6 +461,10 @@ with a separate Rust executable and actual Mixin annotation sources. It covers
 primitive Shadow binding, configuration and unsaved-edit invalidation, and an
 applied rename that preserves the authored prefix. Its verified nominal group covers
 ordinary class/interface references and arrays through the same shared semantics.
+The same corpus route exercises cold annotation-source binding. Completion,
+navigation and diagnostics wait for the selected source's semantic publication;
+focused Rust tests cover the other semantic consumers, applied two-file rename,
+cancellation and close/reopen with a reused document version.
 The additional enum/record/object and mapped-builtin probe uses the same `corpus`
 scenario with `KTLSP_CORPUS_EXTRA_PROBES=dev/external-extension/shape-probes.lua`;
 that group remains under verification. Production Mixin integration is separate.

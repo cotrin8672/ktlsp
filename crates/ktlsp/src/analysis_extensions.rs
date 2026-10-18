@@ -36,6 +36,7 @@ pub(crate) struct AnalysisExtensions {
     >,
     attempted_sources: BTreeMap<String, source_hydration::SourceStamp>,
     hydrated_sources: BTreeMap<String, source_hydration::SourceStamp>,
+    source_producers: BTreeMap<String, source_hydration::SourceProducer>,
 }
 
 impl AnalysisExtensions {
@@ -114,6 +115,7 @@ impl AnalysisExtensions {
         let keys: Vec<_> = sources.iter().map(|(key, _, _)| key.clone()).collect();
         for (key, text, tree) in sources {
             self.hydrated_sources.remove(&key);
+            self.forget_source_producer(&key);
             self.changed.insert(key.clone());
             // A host source replacement cannot transfer a prior build's binary authority.
             let compiled = self
@@ -158,6 +160,7 @@ impl AnalysisExtensions {
         self.hydrated_sources.remove(key);
         self.attempted_sources.remove(key);
         self.library_sources.remove(key);
+        self.forget_source_producer(key);
         let namespace = self.store.namespace_revision();
         self.store.remove_source(key);
         self.changed.insert(key.into());
@@ -211,6 +214,11 @@ impl AnalysisExtensions {
         self.suspended = false;
         self.normalize_all(index);
         self.evaluate(index);
+    }
+
+    /// Retain the existing input allocation across a cancellable request, without copying text.
+    pub(crate) fn source_input_identity(&self, key: &str) -> Option<Arc<str>> {
+        self.inputs.get(key).map(|input| input.text.clone())
     }
 
     pub fn revision(&self) -> u64 {

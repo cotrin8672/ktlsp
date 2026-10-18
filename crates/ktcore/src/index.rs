@@ -119,10 +119,114 @@ pub struct InferenceIndexSnapshot {
 pub struct OriginFacts {
     files: Arc<FxHashMap<String, FileOrigin>>,
     visibilities: Arc<BTreeMap<ProjectScope, ScopeVisibility>>,
+    caller_visibilities: Arc<BTreeMap<ProjectScope, Vec<CallerScopeVisibility>>>,
     // Only types actually removed from authoritative source are stale. A
     // source-less binary class may instead be generated and is not excluded.
     removed_source_types: Arc<BTreeSet<(String, String, String)>>,
     configured: bool,
+}
+
+/// A compiler-validated caller view. Roots admit newly opened ordinary files; exact input
+/// claims also retain current files selected by narrower task patterns. Generated roots never match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerScopeVisibility {
+    pub visibility: ScopeVisibility,
+    pub suffix: String,
+    pub source_files: BTreeSet<String>,
+    pub authored_roots: Vec<String>,
+    pub generated_roots: Vec<String>,
+    pub excluded_segments: Vec<String>,
+}
+
+impl CallerScopeVisibility {
+    pub fn matches_file(&self, file: &str) -> bool {
+        let under = |root: &str| {
+            file.strip_prefix(root.trim_end_matches('/'))
+                .is_some_and(|tail| tail.starts_with('/'))
+        };
+        std::path::Path::new(file)
+            .extension()
+            .and_then(|suffix| suffix.to_str())
+            == Some(self.suffix.as_str())
+            && !file.split('/').any(|part| matches!(part, "." | ".."))
+            && !self
+                .generated_roots
+                .iter()
+                .any(|root| root == file || under(root))
+            && (self.source_files.contains(file)
+                || self.authored_roots.iter().any(|root| {
+                    let Some(tail) = file
+                        .strip_prefix(root.trim_end_matches('/'))
+                        .and_then(|tail| tail.strip_prefix('/'))
+                    else {
+                        return false;
+                    };
+                    tail.split('/').all(|part| {
+                        !part.is_empty()
+                            && !self
+                                .excluded_segments
+                                .iter()
+                                .any(|pattern| source_segment_matches(pattern, part))
+                    })
+                }))
+    }
+}
+
+/// Normalize the bounded stock Ant forms used to exclude a path component or its subtree.
+/// Other glob shapes require more task policy proof and cannot grant future-file visibility.
+pub fn ant_default_exclude_segments(patterns: &[String]) -> Option<Vec<String>> {
+    if patterns.len() > 128 {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for pattern in patterns {
+        if pattern.len() > 256 {
+            return None;
+        }
+        let body = pattern.strip_prefix("**/")?;
+        let body = if let Some(component) = body.strip_suffix("/**") {
+            if !patterns
+                .iter()
+                .any(|pattern| pattern == &format!("**/{component}"))
+            {
+                return None;
+            }
+            component
+        } else {
+            body
+        };
+        if body.is_empty()
+            || body
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\' | '?'))
+        {
+            return None;
+        }
+        segments.push(body.to_string());
+    }
+    segments.sort();
+    segments.dedup();
+    Some(segments)
+}
+
+fn source_segment_matches(pattern: &str, segment: &str) -> bool {
+    let Some((prefix, tail)) = pattern.split_once('*') else {
+        return pattern == segment;
+    };
+    let Some(mut rest) = segment.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut parts = tail.split('*').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return rest.ends_with(part);
+        }
+        let Some(offset) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[offset + part.len()..];
+    }
+    false
 }
 
 /// A query borrows the original lookup bucket; a scoped query selects references
@@ -575,6 +679,7 @@ impl Index {
             return false;
         }
         self.origins.visibilities = Arc::new(next);
+        self.origins.caller_visibilities = Arc::default();
         self.origins.configured = true;
         true
     }
@@ -583,23 +688,47 @@ impl Index {
         self.origins.visibilities.get(scope)
     }
 
+    pub fn replace_caller_scope_visibilities(
+        &mut self,
+        visibilities: Vec<CallerScopeVisibility>,
+    ) -> bool {
+        let mut next: BTreeMap<ProjectScope, Vec<CallerScopeVisibility>> = BTreeMap::new();
+        for visibility in visibilities {
+            next.entry(visibility.visibility.scope.clone())
+                .or_default()
+                .push(visibility);
+        }
+        if *self.origins.caller_visibilities == next {
+            return false;
+        }
+        self.origins.caller_visibilities = Arc::new(next);
+        true
+    }
+
     /// Forget stale-source history after an ownership batch removes an origin.
     /// Called once per model update, rather than scanning all files per removal.
     pub fn prune_origin_history(&mut self) -> bool {
         if self.origins.removed_source_types.is_empty() {
             return false;
         }
-        let active: HashSet<&str> =
-            self.origins
-                .files
-                .values()
-                .map(|origin| origin.origin_id.as_str())
-                .chain(
-                    self.origins.visibilities.values().flat_map(|visibility| {
-                        visibility.ordered_origins.iter().map(String::as_str)
-                    }),
-                )
-                .collect();
+        let active: HashSet<&str> = self
+            .origins
+            .files
+            .values()
+            .map(|origin| origin.origin_id.as_str())
+            .chain(
+                self.origins
+                    .visibilities
+                    .values()
+                    .chain(
+                        self.origins
+                            .caller_visibilities
+                            .values()
+                            .flat_map(|views| views.iter().map(|view| &view.visibility)),
+                    )
+                    .flat_map(|visibility| visibility.ordered_origins.iter().map(String::as_str)),
+            )
+            .collect();
         if self
             .origins
             .removed_source_types
@@ -1121,8 +1250,14 @@ impl<'a> ScopedIndex<'a> {
             Some(facts) => match facts.files.get(file) {
                 Some(origin) => match &origin.project_scope {
                     Some(scope) => facts
-                        .visibilities
+                        .caller_visibilities
                         .get(scope)
+                        .and_then(|callers| {
+                            let mut matches = callers.iter().filter(|view| view.matches_file(file));
+                            let selected = matches.next()?;
+                            matches.next().is_none().then_some(&selected.visibility)
+                        })
+                        .or_else(|| facts.visibilities.get(scope))
                         .map(QueryScope::Project)
                         .unwrap_or(QueryScope::Unknown(Some(&origin.origin_id))),
                     None => QueryScope::Library {
@@ -1130,6 +1265,12 @@ impl<'a> ScopedIndex<'a> {
                         contexts: facts
                             .visibilities
                             .values()
+                            .chain(
+                                facts
+                                    .caller_visibilities
+                                    .values()
+                                    .flat_map(|views| views.iter().map(|view| &view.visibility)),
+                            )
                             .filter(|context| context.ordered_origins.contains(&origin.origin_id))
                             .collect(),
                     },
@@ -1532,6 +1673,144 @@ mod tests {
             visibility("b", &["b", "library-v1"]),
         ]);
         index
+    }
+
+    #[test]
+    fn caller_sdk_future_paths_follow_stock_task_exclusions() {
+        for suffix in ["java", "kt"] {
+            let view = CallerScopeVisibility {
+                visibility: visibility("app", &["app", "jdk:selected"]),
+                suffix: suffix.into(),
+                source_files: BTreeSet::new(),
+                authored_roots: vec!["/app/src".into()],
+                generated_roots: vec!["/app/src/generated".into()],
+                excluded_segments: vec![
+                    "#*#".into(),
+                    "%*%".into(),
+                    "*~".into(),
+                    ".#*".into(),
+                    ".DS_Store".into(),
+                    "._*".into(),
+                    ".bzr".into(),
+                    ".bzrignore".into(),
+                    ".cvsignore".into(),
+                    ".git".into(),
+                    ".gitattributes".into(),
+                    ".gitignore".into(),
+                    ".gitmodules".into(),
+                    ".hg".into(),
+                    ".hgignore".into(),
+                    ".hgsub".into(),
+                    ".hgsubstate".into(),
+                    ".hgtags".into(),
+                    ".svn".into(),
+                    "CVS".into(),
+                    "SCCS".into(),
+                    "vssver.scc".into(),
+                ],
+            };
+            for directory in [
+                "ordinary",
+                "nested.with.dots",
+                "nested-with-hyphen",
+                "nested space",
+                "日本語",
+                "_darcs",
+            ] {
+                assert!(
+                    view.matches_file(&format!("/app/src/{directory}/Use.{suffix}")),
+                    "{directory}.{suffix}"
+                );
+            }
+            for directory in [
+                "CVS",
+                "SCCS",
+                ".git",
+                ".svn",
+                "backup~",
+                "#backup#",
+                "%backup%",
+                ".#backup",
+                "._backup",
+                ".cvsignore",
+                ".gitignore",
+                ".DS_Store",
+                "vssver.scc",
+                "generated",
+            ] {
+                assert!(
+                    !view.matches_file(&format!("/app/src/{directory}/Use.{suffix}")),
+                    "{directory}.{suffix}"
+                );
+            }
+            for name in if suffix == "java" {
+                vec!["package-info.java", "A.B.java", "File-with-hyphen.java"]
+            } else {
+                vec!["Platform.jvm.kt", "Caf\u{e9}.日本語.kt", "Cafe\u{301}.kt"]
+            } {
+                assert!(view.matches_file(&format!("/app/src/{name}")), "{name}");
+            }
+            assert!(!view.matches_file(&format!("/app/src/../Use.{suffix}")));
+        }
+    }
+
+    #[test]
+    fn caller_sdk_kotlin_future_filenames_are_not_identifiers() {
+        let view = CallerScopeVisibility {
+            visibility: visibility("app", &["app", "jdk:selected"]),
+            suffix: "kt".into(),
+            source_files: ["/app/src/Captured.jvm.kt".into()].into(),
+            authored_roots: vec!["/app/src".into()],
+            generated_roots: vec!["/app/src/generated".into()],
+            excluded_segments: vec![
+                "#*#".into(),
+                "%*%".into(),
+                "*~".into(),
+                ".#*".into(),
+                ".DS_Store".into(),
+                "._*".into(),
+                ".bzr".into(),
+                ".bzrignore".into(),
+                ".cvsignore".into(),
+                ".git".into(),
+                ".gitattributes".into(),
+                ".gitignore".into(),
+                ".gitmodules".into(),
+                ".hg".into(),
+                ".hgignore".into(),
+                ".hgsub".into(),
+                ".hgsubstate".into(),
+                ".hgtags".into(),
+                ".svn".into(),
+                "CVS".into(),
+                "SCCS".into(),
+                "vssver.scc".into(),
+            ],
+        };
+        for name in [
+            "Captured.jvm.kt",
+            "Platform.jvm.kt",
+            "Caf\u{e9}.日本語.kt",
+            "Cafe\u{301}.kt",
+            "kotlin-source.kt",
+        ] {
+            assert!(view.matches_file(&format!("/app/src/{name}")), "{name}");
+        }
+        for name in [
+            "Platform.jvm.kts",
+            ".#Platform.kt",
+            "._Platform.kt",
+            "../Platform.kt",
+            "generated/Platform.jvm.kt",
+        ] {
+            assert!(!view.matches_file(&format!("/app/src/{name}")), "{name}");
+        }
+        let java = CallerScopeVisibility {
+            suffix: "java".into(),
+            ..view
+        };
+        assert!(java.matches_file("/app/src/Platform.java"));
+        assert!(java.matches_file("/app/src/Platform.jvm.java"));
     }
 
     #[test]

@@ -122,6 +122,53 @@ impl Backend {
         }
     }
 
+    async fn await_extension_sources(&self, key: &str) -> Result<()> {
+        let (generation, version, input) = {
+            let ws = self.ws.lock();
+            (
+                ws.analysis_generation(),
+                self.doc_versions
+                    .lock()
+                    .get(key)
+                    .and_then(|r| r.document_version),
+                ws.extension_source_input_identity(key),
+            )
+        };
+        loop {
+            let pending = {
+                let mut ws = self.ws.lock();
+                let current_input = ws.extension_source_input_identity(key);
+                let same_input = match (&input, &current_input) {
+                    (Some(before), Some(current)) => Arc::ptr_eq(before, current),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same_input
+                    || !ws.is_current_generation(generation)
+                    || self
+                        .doc_versions
+                        .lock()
+                        .get(key)
+                        .and_then(|r| r.document_version)
+                        != version
+                {
+                    return Err(tower_lsp_server::jsonrpc::Error {
+                        code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801),
+                        message: "document or project changed during source preparation".into(),
+                        data: None,
+                    });
+                }
+                ws.extension_source_wait(key)
+            };
+            let Some(mut ready) = pending else {
+                return Ok(());
+            };
+            schedule_extension_sources(&self.ws, &self.client, &self.doc_versions);
+            // Only exact selected producers advance this dependency frontier; no semantic polling.
+            let _ = ready.changed().await;
+        }
+    }
+
     fn schedule_project_refresh(&self, force: bool, initial_delay: Duration) {
         let Some(root) = self.root.lock().clone() else {
             return;
@@ -552,6 +599,43 @@ fn spawn_jdk_shard_workers(
         spawned += ok as usize;
     }
     spawned
+}
+
+fn spawn_sdk_api_worker(
+    selection: classpath::SdkApiSelection,
+    extract_root: PathBuf,
+    tx: std::sync::mpsc::Sender<DependencyResult>,
+) -> bool {
+    std::thread::Builder::new()
+        .name("ktlsp-sdk-api".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let origin = selection.origin();
+            let indexed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::sdk_api::index(&selection, &extract_root)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("SDK API index worker panicked")));
+            let (batches, failed, incomplete) = match indexed {
+                Ok(indexed) => (indexed.batches, false, !indexed.complete),
+                Err(error) => {
+                    tracing::warn!(%error, "selected SDK API indexing failed");
+                    (Vec::new(), true, true)
+                }
+            };
+            let _ = tx.send(DependencyResult {
+                coord: None,
+                label: "selected SDK API signatures".into(),
+                batches,
+                discovered: Vec::new(),
+                failed,
+                skipped: false,
+                missing_source: incomplete,
+                jdk: true,
+                local_jar: false,
+                local_origin: Some(origin),
+            });
+        })
+        .is_ok()
 }
 
 /// Cached-JDK fast path: no parsing, so a single result carries the whole symcache load.
@@ -1030,15 +1114,28 @@ fn index_dependency_model(
     }
     let mut jdk_states: BTreeMap<String, JdkShardState> = BTreeMap::new();
     let mut jdk_pending = VecDeque::new();
-    let jdk_origins = jdk_sources
+    let mut jdk_origins = jdk_sources
         .iter()
         .map(|source| classpath::jdk_origin_id(source))
         .collect::<Vec<_>>();
+    let api_selections = model
+        .as_ref()
+        .map(|model| model.selected_release_apis())
+        .unwrap_or_default();
+    jdk_origins.extend(
+        api_selections
+            .iter()
+            .map(classpath::SdkApiSelection::origin),
+    );
     stats.jdk_reused = !jdk_origins.is_empty()
         && jdk_origins
             .iter()
             .all(|origin| ws.lock().dependency_origin_complete(origin));
     let jdk_shards = (max_workers / jdk_sources.len().max(1)).max(1);
+    let mut sdk_api_pending: VecDeque<_> = api_selections
+        .into_iter()
+        .filter(|selection| !ws.lock().dependency_origin_complete(&selection.origin()))
+        .collect();
     for (source, origin) in jdk_sources.into_iter().zip(&jdk_origins) {
         crate::trace::span(
             "deps.jdk_selection",
@@ -1064,13 +1161,27 @@ fn index_dependency_model(
         }
     }
 
-    while active > 0 || !jdk_pending.is_empty() || !local_jars.is_empty() || !queue.is_empty() {
+    while active > 0
+        || !jdk_pending.is_empty()
+        || !sdk_api_pending.is_empty()
+        || !local_jars.is_empty()
+        || !queue.is_empty()
+    {
         if !ws.lock().is_current_generation(generation) {
             queue.clear();
             local_jars.clear();
             jdk_pending.clear();
+            sdk_api_pending.clear();
         }
         while active < max_workers {
+            if let Some(selection) = sdk_api_pending.pop_front() {
+                if spawn_sdk_api_worker(selection, extract_root.clone(), tx.clone()) {
+                    active += 1;
+                } else {
+                    stats.failed += 1;
+                }
+                continue;
+            }
             let jdk_slots = jdk_pending.front().map(|(_, plan)| match plan {
                 deps::JdkIndexPlan::Cached(_) => 1,
                 deps::JdkIndexPlan::Parse(_) => jdk_shards,
@@ -2568,6 +2679,7 @@ impl LanguageServer for Backend {
                 .into(),
             );
         };
+        self.await_extension_sources(&key).await?;
         let start = Instant::now();
         let (items, result_id, _) = lsp_diagnostics_with_result(&self.ws, &self.doc_versions, &key);
         crate::trace::span(
@@ -2604,6 +2716,7 @@ impl LanguageServer for Backend {
             let Some(uri) = key_to_uri(&key) else {
                 continue;
             };
+            self.await_extension_sources(&key).await?;
             let (diagnostics, result_id, version) =
                 lsp_diagnostics_with_result(&self.ws, &self.doc_versions, &key);
             items.push(WorkspaceDocumentDiagnosticReport::Full(
@@ -2631,6 +2744,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
 
         // All work is synchronous; the lock is never held across an `.await`.
         let (mut locations, symbol, text, offset) = {
@@ -2753,6 +2867,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let locations = {
             let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
@@ -2778,6 +2893,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let locations = {
             let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
@@ -2802,6 +2918,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
 
         let (locations, symbol) = {
             let mut ws = self.ws.lock();
@@ -2840,6 +2957,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let help = {
             let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
@@ -2858,6 +2976,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let requested = params.context.only;
 
         let (actions, symbol, line, character) = {
@@ -2927,6 +3046,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let edit = {
             let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
@@ -2950,6 +3070,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let prepared = {
             let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
@@ -2985,6 +3106,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
         let items = {
             let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
@@ -3007,6 +3129,7 @@ impl LanguageServer for Backend {
         let Some(item) = from_call_hierarchy_item(&params.item) else {
             return Ok(None);
         };
+        self.await_extension_sources(&item.file).await?;
         let calls = {
             let mut ws = self.ws.lock();
             ws.incoming_calls(&item)
@@ -3024,6 +3147,7 @@ impl LanguageServer for Backend {
         let Some(item) = from_call_hierarchy_item(&params.item) else {
             return Ok(None);
         };
+        self.await_extension_sources(&item.file).await?;
         let calls = {
             let mut ws = self.ws.lock();
             ws.outgoing_calls(&item)
@@ -3118,6 +3242,7 @@ impl LanguageServer for Backend {
                 let Some(key) = uri_to_key(&uri) else {
                     return Ok(Some(serde_json::json!({ "status": "invalid-uri" })));
                 };
+                self.await_extension_sources(&key).await?;
                 let result = {
                     let mut ws = self.ws.lock();
                     let text = match ws.doc_text(&key) {
@@ -3171,6 +3296,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
 
         let (mut hover, symbol, mut semantic, text, offset) = {
             let mut ws = self.ws.lock();
@@ -3292,6 +3418,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
 
         let (highlights, symbol) = {
             let mut ws = self.ws.lock();
@@ -3522,6 +3649,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
 
         let hints = {
             let mut ws = self.ws.lock();
@@ -3562,6 +3690,7 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
+        self.await_extension_sources(&key).await?;
 
         let snippets = *self.snippets_supported.lock();
         let query = |ws: &mut Workspace| {
@@ -4512,6 +4641,547 @@ mod tests {
         );
         let model = classpath::ProjectSnapshot::new(Vec::new());
         assert_eq!(selected_jdk_source_for_file(Some(&model), file, true), None);
+    }
+
+    const SDK_CALLER_JAVA: &str = "class Use { int value(java.util.concurrent.atomic.AtomicInteger i, String s) { i.incrementAndGet(); s.strip(); return 0; } }";
+    const SDK_CALLER_KOTLIN: &str = "fun value(i: java.util.concurrent.atomic.AtomicInteger, s: java.lang.String): String { i.incrementAndGet(); return s.strip() }";
+
+    // Uses the existing dependency-index entry point so this test compiles before SDK API support.
+    fn caller_sdk_index_fixture() -> (PathBuf, classpath::ModuleClasspath, Arc<Mutex<Workspace>>) {
+        use std::io::Write;
+        let (root, mut modules) = classpath::tests::sdk_selection_fixture();
+        let mut module = modules.remove(0);
+        let source = &mut module.source_sets[0];
+        let source_root = source.source_roots[0].clone();
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("Use.java"), SDK_CALLER_JAVA).unwrap();
+        std::fs::write(source_root.join("Use.kt"), SDK_CALLER_KOTLIN).unwrap();
+        let java = &mut source.compiler_tasks[0];
+        let home = java.java_home.clone().unwrap();
+        java.source_files = vec![source_root.join("Use.java")];
+        java.classpath.clear();
+        java.arguments = vec!["-proc:none".into()];
+        java.options.insert("release".into(), serde_json::json!(8));
+        java.options.get_mut("javaCompilerRecipe").unwrap()["api_options"] =
+            serde_json::json!(["--release", "8", "-proc:none"]);
+        let mut kotlin = java.clone();
+        kotlin.language = classpath::CompilerLanguage::Kotlin;
+        kotlin.task = ":compileKotlin".into();
+        kotlin.task_type = "org.jetbrains.kotlin.gradle.tasks.KotlinCompile".into();
+        kotlin.source_files = vec![source_root.join("Use.kt"), source_root.join("Use.java")];
+        kotlin.arguments.clear();
+        source.kotlin_compile_task = Some(kotlin.task.clone());
+        source.compiler_tasks = vec![source.compiler_tasks[0].clone(), kotlin];
+        for task in &mut source.compiler_tasks {
+            task.options.insert(
+                "sdkSourcePolicy".into(),
+                serde_json::json!({
+                    "adapter":"gradle-source-tree-stock-patterns-v1", "task":task.task,
+                    "language":task.language, "authored_roots":[source_root],
+                    "future_roots":[source_root], "generated_roots":[source_root.join("generated")],
+                    "default_excludes": classpath::tests::sdk_source_default_excludes(),
+                }),
+            );
+            task.options.insert(
+                "sdkProducerClaims".into(),
+                serde_json::json!({
+                    "adapter":"gradle-producing-source-trees-v1", "task":task.task,
+                    "language":task.language, "roots":[source_root], "complete":true,
+                }),
+            );
+        }
+        let fixtures: &[(&str, &[u8])] = &[
+            (
+                "java/lang/Object",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Object.sig"),
+            ),
+            (
+                "java/lang/Number",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Number.sig"),
+            ),
+            (
+                "java/lang/String",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/String.sig"),
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicInteger",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/AtomicInteger.sig"
+                ),
+            ),
+            (
+                "java/io/Serializable",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/Serializable.sig"
+                ),
+            ),
+            (
+                "java/lang/Comparable",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/Comparable.sig"
+                ),
+            ),
+            (
+                "java/lang/CharSequence",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/CharSequence.sig"
+                ),
+            ),
+        ];
+        let mut signatures =
+            zip::ZipWriter::new(std::fs::File::create(home.join("lib/ct.sym")).unwrap());
+        for (owner, bytes) in fixtures {
+            signatures
+                .start_file(
+                    format!("8/java.base/{owner}.sig"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            signatures.write_all(bytes).unwrap();
+        }
+        signatures.finish().unwrap();
+        let mut sources =
+            zip::ZipWriter::new(std::fs::File::create(home.join("lib/src.zip")).unwrap());
+        for (owner, text) in [
+            ("java/lang/String", "package java.lang; public final class String { public String strip(){return this;} public String trim(){return this;} }"),
+            ("java/util/concurrent/atomic/AtomicInteger", "package java.util.concurrent.atomic; public class AtomicInteger { public final int incrementAndGet(){return 0;} }"),
+        ] {
+            sources.start_file(format!("java.base/{owner}.java"), zip::write::SimpleFileOptions::default()).unwrap();
+            sources.write_all(text.as_bytes()).unwrap();
+        }
+        sources.finish().unwrap();
+        let model = Arc::new(classpath::ProjectSnapshot::new(vec![module.clone()]));
+        let ws = Arc::new(Mutex::new(Workspace::new()));
+        ws.lock().set_project_model(model.clone());
+        let generation = ws.lock().analysis_generation();
+        let stats = index_dependency_model(&ws, &root, Some(model), true, generation, None, true);
+        assert_eq!(stats.failed, 0);
+        let mut guard = ws.lock();
+        for (name, text) in [
+            ("Use.java", SDK_CALLER_JAVA),
+            ("Use.kt", SDK_CALLER_KOTLIN),
+            ("New.java", SDK_CALLER_JAVA),
+            ("New.kt", SDK_CALLER_KOTLIN),
+        ] {
+            if name.starts_with("New") {
+                assert!(!source_root.join(name).exists());
+            }
+            guard.open(
+                &crate::paths::file_key(&source_root.join(name)),
+                text.into(),
+            );
+        }
+        guard.assume_index_complete_for_tests();
+        drop(guard);
+        (root, module, ws)
+    }
+
+    fn assert_sdk_caller_member(
+        ws: &mut Workspace,
+        file: &Path,
+        prefix: &str,
+        member: &str,
+        expected: bool,
+    ) {
+        let key = crate::paths::file_key(file);
+        let text = ws.doc_text(&key).unwrap();
+        let offset = text.find(prefix).unwrap() + prefix.len();
+        let found = ws
+            .complete(&key, offset, true)
+            .is_some_and(|result| result.items.iter().any(|item| item.label == member));
+        assert_eq!(found, expected, "{file:?}: {member}");
+        if expected {
+            let start = text.find(&format!("{member}(")).unwrap();
+            let definitions = ws.goto_definition(&key, start);
+            assert_eq!(definitions.len(), 1, "{file:?}: exact {member} navigation");
+        }
+    }
+
+    #[test]
+    fn caller_sdk_release8_and_kotlin17_feed_current_and_unsaved_queries() {
+        let (root, module, ws) = caller_sdk_index_fixture();
+        let source_root = module.source_sets[0].source_roots[0].clone();
+        let mut ws = ws.lock();
+        for name in ["Use.java", "Use.kt", "New.java", "New.kt"] {
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(name),
+                "i.inc",
+                "incrementAndGet",
+                true,
+            );
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(name),
+                "s.str",
+                "strip",
+                name.ends_with(".kt"),
+            );
+        }
+        for (name, text, prefix, member) in [
+            (
+                "generated/Kapt.java",
+                SDK_CALLER_JAVA,
+                "i.inc",
+                "incrementAndGet",
+            ),
+            ("generated/Ksp.kt", SDK_CALLER_KOTLIN, "s.str", "strip"),
+            ("Script.kts", SDK_CALLER_KOTLIN, "s.str", "strip"),
+            (
+                "Foreign.java",
+                "class Foreign { void use(foreign.Missing i) { i.incrementAndGet(); } }",
+                "i.inc",
+                "incrementAndGet",
+            ),
+        ] {
+            let path = source_root.join(name);
+            ws.open(&crate::paths::file_key(&path), text.into());
+            assert_sdk_caller_member(&mut ws, &path, prefix, member, false);
+        }
+        drop(ws);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_sdk_kotlin_dotted_filenames_keep_current_and_unsaved_queries() {
+        let (root, module, ws) = caller_sdk_index_fixture();
+        let source_root = module.source_sets[0].source_roots[0].clone();
+        let names = ["Platform.jvm.kt", "Caf\u{e9}.日本語.kt", "Cafe\u{301}.kt"];
+        let mut captured = module.clone();
+        for name in names {
+            let path = source_root.join(name);
+            std::fs::write(&path, SDK_CALLER_KOTLIN).unwrap();
+            captured.source_sets[0].compiler_tasks[1]
+                .source_files
+                .push(path);
+        }
+        let mut ws = ws.lock();
+        ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![captured])));
+        for name in names {
+            let path = source_root.join(name);
+            ws.open(&crate::paths::file_key(&path), SDK_CALLER_KOTLIN.into());
+            assert_sdk_caller_member(&mut ws, &path, "i.inc", "incrementAndGet", true);
+            assert_sdk_caller_member(&mut ws, &path, "s.str", "strip", true);
+            std::fs::remove_file(path).unwrap();
+        }
+        // The same buffers now have no on-disk file or exact compiler-input claim.
+        ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![
+            module.clone()
+        ])));
+        for name in names {
+            let path = source_root.join(name);
+            assert!(!path.exists());
+            assert_sdk_caller_member(&mut ws, &path, "i.inc", "incrementAndGet", true);
+            assert_sdk_caller_member(&mut ws, &path, "s.str", "strip", true);
+        }
+        for name in ["Platform.jvm.kts", ".#Platform.kt", "._Platform.kt"] {
+            let path = source_root.join(name);
+            ws.open(&crate::paths::file_key(&path), SDK_CALLER_KOTLIN.into());
+            assert_sdk_caller_member(&mut ws, &path, "i.inc", "incrementAndGet", false);
+        }
+        let mut competing = module.clone();
+        competing.module.push_str("-competing-kotlin-producer");
+        competing.source_sets[0]
+            .compiler_tasks
+            .retain(|task| task.language == classpath::CompilerLanguage::Kotlin);
+        competing.source_sets[0].compiler_tasks[0]
+            .options
+            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+        ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![
+            module, competing,
+        ])));
+        for name in names {
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(name),
+                "i.inc",
+                "incrementAndGet",
+                false,
+            );
+        }
+        drop(ws);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_sdk_stock_task_paths_feed_unsaved_java_and_kotlin_queries() {
+        let (root, module, ws) = caller_sdk_index_fixture();
+        let source_root = module.source_sets[0].source_roots[0].clone();
+        let mut ws = ws.lock();
+        for (name, text) in [
+            ("nested.with.dots/Use.java", SDK_CALLER_JAVA),
+            ("nested-with-hyphen/Use.java", SDK_CALLER_JAVA),
+            ("nested space/A.B.java", SDK_CALLER_JAVA),
+            ("nested.with.dots/Platform.jvm.kt", SDK_CALLER_KOTLIN),
+            ("nested-with-hyphen/Use.kt", SDK_CALLER_KOTLIN),
+            ("nested space/Cafe\u{301}.kt", SDK_CALLER_KOTLIN),
+            ("_darcs/Use.java", SDK_CALLER_JAVA),
+            ("_darcs/Use.kt", SDK_CALLER_KOTLIN),
+        ] {
+            let path = source_root.join(name);
+            assert!(!path.exists(), "new buffer is not an exact compiler input");
+            ws.open(&crate::paths::file_key(&path), text.into());
+            assert_sdk_caller_member(&mut ws, &path, "i.inc", "incrementAndGet", true);
+            assert_sdk_caller_member(&mut ws, &path, "s.str", "strip", name.ends_with(".kt"));
+        }
+        for name in [
+            "CVS/Use.java",
+            ".git/Use.kt",
+            "backup~/Use.java",
+            ".gitignore/Use.kt",
+            "generated/nested.with.dots/Use.kt",
+            "nested.with.dots/Use.kts",
+        ] {
+            let path = source_root.join(name);
+            ws.open(
+                &crate::paths::file_key(&path),
+                if name.ends_with(".java") {
+                    SDK_CALLER_JAVA.into()
+                } else {
+                    SDK_CALLER_KOTLIN.into()
+                },
+            );
+            assert_sdk_caller_member(&mut ws, &path, "i.inc", "incrementAndGet", false);
+        }
+        let mut competing = module.clone();
+        competing.module.push_str("-competing-producer");
+        for task in &mut competing.source_sets[0].compiler_tasks {
+            task.options
+                .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+        }
+        ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![
+            module, competing,
+        ])));
+        for name in [
+            "nested.with.dots/Use.java",
+            "nested.with.dots/Platform.jvm.kt",
+        ] {
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(name),
+                "i.inc",
+                "incrementAndGet",
+                false,
+            );
+        }
+        drop(ws);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_sdk_missing_producer_claims_veto_current_and_unsaved_queries() {
+        let (root, module, ws) = caller_sdk_index_fixture();
+        let source_root = module.source_sets[0].source_roots[0].clone();
+        let mut ws = ws.lock();
+        for name in ["Use.java", "Use.kt", "New.java", "New.kt"] {
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(name),
+                "i.inc",
+                "incrementAndGet",
+                true,
+            );
+        }
+        for (language, suffix) in [
+            (classpath::CompilerLanguage::Java, "java"),
+            (classpath::CompilerLanguage::Kotlin, "kt"),
+        ] {
+            for failure in [
+                "unsupported-sdk",
+                "null-policy",
+                "missing-claims",
+                "incomplete-producer",
+            ] {
+                let mut second = module.clone();
+                second.module.push_str("-competing-producer");
+                second.source_sets[0]
+                    .compiler_tasks
+                    .retain(|task| task.language == language);
+                let task = &mut second.source_sets[0].compiler_tasks[0];
+                match failure {
+                    "unsupported-sdk" if language == classpath::CompilerLanguage::Java => {
+                        task.options
+                            .insert("release".into(), serde_json::json!(999));
+                    }
+                    "unsupported-sdk" => task.arguments.push("-Xjdk-release=999".into()),
+                    "null-policy" => {
+                        task.options
+                            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+                    }
+                    "missing-claims" => {
+                        task.options
+                            .insert("sdkProducerClaims".into(), serde_json::Value::Null);
+                    }
+                    "incomplete-producer" => task.complete = false,
+                    _ => unreachable!(),
+                }
+                ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![
+                    module.clone(),
+                    second,
+                ])));
+                for name in [format!("Use.{suffix}"), format!("New.{suffix}")] {
+                    assert_sdk_caller_member(
+                        &mut ws,
+                        &source_root.join(name),
+                        "i.inc",
+                        "incrementAndGet",
+                        false,
+                    );
+                }
+                let other = if suffix == "java" { "kt" } else { "java" };
+                assert_sdk_caller_member(
+                    &mut ws,
+                    &source_root.join(format!("New.{other}")),
+                    "i.inc",
+                    "incrementAndGet",
+                    true,
+                );
+            }
+        }
+        let mut auxiliary = module.clone();
+        auxiliary.module.push_str("-kapt-nonproducer");
+        let mut task = auxiliary.source_sets[0].compiler_tasks[1].clone();
+        task.task = ":kaptGenerateStubsKotlin".into();
+        task.task_type = "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask".into();
+        task.options
+            .insert("sdkProducerClaims".into(), serde_json::Value::Null);
+        task.options
+            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+        auxiliary.source_sets[0].compiler_tasks = vec![task];
+        auxiliary.source_sets[0].kotlin_compile_task = None;
+        ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![
+            module.clone(),
+            auxiliary,
+        ])));
+        for name in ["New.java", "New.kt"] {
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(name),
+                "i.inc",
+                "incrementAndGet",
+                true,
+            );
+        }
+        for unrelated in [false, true] {
+            for proof in ["known-empty", "missing", "opaque", "incomplete-compiler"] {
+                let mut unknown = module.source_sets[0].clone();
+                unknown.name = "unproved-inputs".into();
+                unknown.source_roots = vec![root.join("other-declared-root")];
+                unknown
+                    .compiler_tasks
+                    .retain(|task| task.language == classpath::CompilerLanguage::Java);
+                unknown.kotlin_compile_task = None;
+                let task = &mut unknown.compiler_tasks[0];
+                task.task = ":compileUnknownJava".into();
+                task.source_files.clear();
+                task.options
+                    .insert("sdkProducerClaims".into(), serde_json::Value::Null);
+                task.options
+                    .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+                if proof == "known-empty" || proof == "opaque" {
+                    task.options.insert(
+                        "sdkProducerClaims".into(),
+                        serde_json::json!({
+                            "adapter":"gradle-producing-source-trees-v1", "task":task.task,
+                            "language":task.language, "roots":[], "complete":proof == "known-empty",
+                        }),
+                    );
+                }
+                if proof == "incomplete-compiler" {
+                    task.complete = false;
+                }
+                let model = if unrelated {
+                    let mut other = module.clone();
+                    other.module.push_str("-unrelated");
+                    other.source_sets = vec![unknown];
+                    classpath::ProjectSnapshot::new(vec![module.clone(), other])
+                } else {
+                    let mut local = module.clone();
+                    local.source_sets.push(unknown);
+                    classpath::ProjectSnapshot::new(vec![local])
+                };
+                ws.set_project_model(Arc::new(model));
+                assert_sdk_caller_member(
+                    &mut ws,
+                    &source_root.join("Use.java"),
+                    "i.inc",
+                    "incrementAndGet",
+                    unrelated || proof == "known-empty",
+                );
+                assert_sdk_caller_member(
+                    &mut ws,
+                    &source_root.join("New.java"),
+                    "i.inc",
+                    "incrementAndGet",
+                    unrelated || proof == "known-empty",
+                );
+                assert_sdk_caller_member(
+                    &mut ws,
+                    &source_root.join("New.kt"),
+                    "i.inc",
+                    "incrementAndGet",
+                    true,
+                );
+            }
+        }
+        drop(ws);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_sdk_same_source_set_rejects_multiple_actual_producers() {
+        for (language, suffix) in [
+            (classpath::CompilerLanguage::Java, "java"),
+            (classpath::CompilerLanguage::Kotlin, "kt"),
+        ] {
+            let (root, mut module, workspace) = caller_sdk_index_fixture();
+            let source_root = module.source_sets[0].source_roots[0].clone();
+            let mut ws = workspace.lock();
+            for name in [format!("Use.{suffix}"), format!("New.{suffix}")] {
+                assert_sdk_caller_member(
+                    &mut ws,
+                    &source_root.join(name),
+                    "i.inc",
+                    "incrementAndGet",
+                    true,
+                );
+            }
+            let mut unsupported = module.source_sets[0]
+                .compiler_tasks
+                .iter()
+                .find(|task| task.language == language)
+                .unwrap()
+                .clone();
+            if language == classpath::CompilerLanguage::Java {
+                unsupported.task.push_str("Other");
+                unsupported
+                    .options
+                    .insert("release".into(), serde_json::json!(999));
+            } else {
+                unsupported.arguments.push("-Xjdk-release=999".into());
+            }
+            module.source_sets[0].compiler_tasks.push(unsupported);
+            ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(vec![module])));
+            for name in [format!("Use.{suffix}"), format!("New.{suffix}")] {
+                assert_sdk_caller_member(
+                    &mut ws,
+                    &source_root.join(name),
+                    "i.inc",
+                    "incrementAndGet",
+                    false,
+                );
+            }
+            let other = if suffix == "java" { "kt" } else { "java" };
+            assert_sdk_caller_member(
+                &mut ws,
+                &source_root.join(format!("New.{other}")),
+                "i.inc",
+                "incrementAndGet",
+                true,
+            );
+            drop(ws);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -7066,9 +7736,26 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
+        let start = crate::trace::enabled().then(Instant::now);
+        if let Some(start) = start {
+            crate::trace::span(
+                "server.backend.drop.start",
+                "server",
+                start,
+                serde_json::json!({}),
+            );
+        }
         self.close_project_refresh();
         self.close_compiler_jobs();
         self.jdk_source_seeds.lock().clear();
+        if let Some(start) = start {
+            crate::trace::span(
+                "server.backend.drop",
+                "server",
+                start,
+                serde_json::json!({}),
+            );
+        }
     }
 }
 
@@ -7733,5 +8420,1149 @@ mod first_java_completion_seed_tests {
             );
             assert!(backend.jdk_source_seeds.lock().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod first_extension_source_tests {
+    use super::*;
+    use ktcore::{extensions::*, knowledge::Knowledge};
+    use std::io::Write;
+
+    static NEXT_FIXTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    const OWNER: &str = "package fixture; import org.spongepowered.asm.mixin.Shadow; public abstract class Consumer { @Shadow public abstract int bound(); }";
+    const PLAIN: &str =
+        "package fixture; class Plain { void ordinary() {} void run(Plain item) { item.ordinary(); } }";
+    const PROVIDER: &str = "test.selected-shadow";
+    const BACKLOG_TYPES: &[&str] = &[
+        "arrayfixture.Factory",
+        "arrayfixture.Item",
+        "fieldfixture.FieldOnly",
+        "genericfixture.Box",
+        "genericfixture.Child",
+        "genericfixture.Holder",
+        "genericfixture.Item",
+        "genericfixture.Other",
+    ];
+    macro_rules! backlog {
+        ($($path:literal),+ $(,)?) => { &[$((
+            $path,
+            include_bytes!(concat!("../../ktcore/tests/fixtures/classfile/", $path, ".class")).as_slice(),
+            include_bytes!(concat!("../../ktcore/tests/fixtures/classfile/sources/", $path, ".java")).as_slice(),
+        )),+] };
+    }
+    const BACKLOG: &[(&str, &[u8], &[u8])] = backlog![
+        "arrayfixture/Factory",
+        "arrayfixture/Item",
+        "fieldfixture/FieldOnly",
+        "genericfixture/Box",
+        "genericfixture/Child",
+        "genericfixture/Holder",
+        "genericfixture/Item",
+        "genericfixture/Other",
+    ];
+    const SECOND_BACKLOG_TYPES: &[&str] = &[
+        "protectedfixture.Position",
+        "protectedfixture.ProtectedApi",
+        "shadowfixture.Base",
+        "shadowfixture.GenericMid",
+        "shadowfixture.Marker",
+        "shadowfixture.Mid",
+        "shadowfixture.NestedBoundMid",
+        "shadowfixture.PublicMid",
+    ];
+    const SECOND_BACKLOG: &[(&str, &[u8], &[u8])] = backlog![
+        "protectedfixture/Position",
+        "protectedfixture/ProtectedApi",
+        "shadowfixture/Base",
+        "shadowfixture/GenericMid",
+        "shadowfixture/Marker",
+        "shadowfixture/Mid",
+        "shadowfixture/NestedBoundMid",
+        "shadowfixture/PublicMid",
+    ];
+    struct Provider;
+    impl AnalysisProvider for Provider {
+        fn id(&self) -> &str {
+            PROVIDER
+        }
+        fn analyze(&self, read: &mut ReadSession<'_>) -> std::result::Result<(), ContractError> {
+            if read.source().contains("class Other") {
+                for ty in BACKLOG_TYPES {
+                    let _ = read.resolve_type(ty);
+                }
+            }
+            if read.source().contains("sixteen background inputs") {
+                for ty in SECOND_BACKLOG_TYPES {
+                    let _ = read.resolve_type(ty);
+                }
+            }
+            let direct = read
+                .source()
+                .split_once("// wait-for: ")
+                .map(|(_, ty)| ty.trim().to_string());
+            if let Some(ty) = direct {
+                let _ = read.resolve_type(&ty);
+            }
+            for declaration in read.declarations().to_vec() {
+                let shadow = declaration.annotations.iter().any(|annotation| {
+                    matches!(read.resolve_type_ref(&annotation.ty), Knowledge::Found(ty)
+                        if ty.qualified_name() == "org.spongepowered.asm.mixin.Shadow")
+                });
+                if !shadow {
+                    continue;
+                }
+                let Knowledge::Found(owner) = read.resolve_type("fixture.Consumer") else {
+                    continue;
+                };
+                let Knowledge::Found(target) = read.resolve_type("fixture.Target") else {
+                    continue;
+                };
+                let Some(member) = read
+                    .declared_members(&owner)?
+                    .0
+                    .into_iter()
+                    .find(|member| member.id.definition() == &declaration.definition)
+                else {
+                    continue;
+                };
+                let range = declaration.definition.start_byte..declaration.definition.end_byte;
+                let authored = read.declaration(range.clone())?;
+                let authored_name = read.source()[range.clone()].to_string();
+                let id = read.require(MemberRequirement {
+                    target: Knowledge::Found(target),
+                    authored: Some(authored),
+                    names: MemberNames::Exact(vec![authored_name]),
+                    kind: MemberKind::Method,
+                    signature: member.signature,
+                    dispatch: member.dispatch,
+                    name_link: NameLink::Direct,
+                })?;
+                let found = read.resolution(id)?.binding.is_found();
+                read.bind_site(id, range.clone(), range.clone(), RenameSubject::Target)?;
+                if found {
+                    read.diagnostic(ktcore::diagnostics::Diagnostic {
+                        start_byte: range.start,
+                        end_byte: range.end,
+                        severity: ktcore::diagnostics::Severity::Hint,
+                        code: None,
+                        message: "selected-shadow-ready".into(),
+                    })?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        jar: PathBuf,
+        key: String,
+        target: String,
+    }
+    impl Fixture {
+        fn new(backend: &Backend) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ktlsp-first-extension-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT_FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let src = root.join("src/main/java/fixture");
+            std::fs::create_dir_all(&src).unwrap();
+            for (name, text) in [
+                ("Consumer.java", OWNER),
+                (
+                    "Target.java",
+                    "package fixture; public class Target { public int bound() { return 1; } }",
+                ),
+                ("Plain.java", PLAIN),
+                ("Other.java", "package fixture; class Other {}"),
+            ] {
+                std::fs::write(src.join(name), text).unwrap();
+            }
+            let jar = root.join("selected.jar");
+            let mut binaries: Vec<_> = BACKLOG
+                .iter()
+                .map(|(path, bytes, _)| (format!("{path}.class"), *bytes))
+                .collect();
+            binaries.push((
+                "org/spongepowered/asm/mixin/Shadow.class".into(),
+                include_bytes!("../tests/fixtures/extension_sources/Shadow.class"),
+            ));
+            Self::zip(
+                &jar,
+                &binaries
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), *bytes))
+                    .collect::<Vec<_>>(),
+            );
+            let mut sources: Vec<_> = BACKLOG
+                .iter()
+                .map(|(path, _, bytes)| (format!("{path}.java"), *bytes))
+                .collect();
+            sources.push((
+                "org/spongepowered/asm/mixin/Shadow.java".into(),
+                include_bytes!("../tests/fixtures/extension_sources/Shadow.java"),
+            ));
+            Self::zip(
+                &root.join("selected-sources.jar"),
+                &sources
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), *bytes))
+                    .collect::<Vec<_>>(),
+            );
+            let key = crate::paths::file_key(&src.join("Consumer.java"));
+            let target = crate::paths::file_key(&src.join("Target.java"));
+            {
+                let mut ws = backend.ws.lock();
+                let generation = ws.begin_analysis_generation();
+                ws.open(key.clone(), OWNER.into());
+                let dump = format!(
+                    "PROJECT\t:\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nEND\t:\n",
+                    root.display(),
+                    root.join("src/main/java").display(),
+                    jar.display()
+                );
+                ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(
+                    crate::classpath::parse_dump(&dump),
+                )));
+                assert_eq!(ws.scan_model_sources(), 3);
+                assert!(ws.finish_analysis_generation(generation, true, true));
+            }
+            backend
+                .doc_versions
+                .lock()
+                .entry(key.clone())
+                .or_default()
+                .document_version = Some(1);
+            Self {
+                root,
+                jar,
+                key,
+                target,
+            }
+        }
+        fn zip(path: &Path, entries: &[(&str, &[u8])]) {
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            for (name, bytes) in entries {
+                archive
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        fn index(&self, backend: &Backend, name: &str) {
+            let batches = crate::deps::resolve_local_jar_stubs(
+                &self.jar,
+                &self.root.join("extract"),
+                &mut crate::parser::KotlinParser::new(),
+                &mut crate::java::JavaParser::new(),
+            )
+            .unwrap();
+            let mut ws = backend.ws.lock();
+            for batch in batches
+                .into_iter()
+                .filter(|batch| batch.file.ends_with(name))
+            {
+                assert!(batch.library_source.is_some());
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.bump_index_revision();
+        }
+        fn pending(&self, backend: &Backend) -> Vec<crate::analysis_extensions::SourceRequest> {
+            let requests = backend.ws.lock().begin_extension_source_batch();
+            assert_eq!(requests.len(), 1, "one exact selected annotation producer");
+            requests
+        }
+        async fn prepare(
+            requests: Vec<crate::analysis_extensions::SourceRequest>,
+        ) -> Vec<crate::analysis_extensions::PreparedSource> {
+            let expected = requests.len();
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::analysis_extensions::prepare_sources(requests)
+            })
+            .await
+            .unwrap();
+            assert_eq!(prepared.len(), expected);
+            prepared
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum Feature {
+        Completion,
+        Definition,
+        Diagnostic,
+    }
+    impl Feature {
+        async fn request(self, backend: &Backend, key: &str) -> Result<serde_json::Value> {
+            let offset = OWNER.find("bound").unwrap()
+                + if matches!(self, Self::Completion) {
+                    5
+                } else {
+                    0
+                };
+            let (line, character) = LineIndex::new(OWNER).position(OWNER, offset);
+            let document = TextDocumentIdentifier {
+                uri: key_to_uri(key).unwrap(),
+            };
+            let position = TextDocumentPositionParams {
+                text_document: document.clone(),
+                position: Position { line, character },
+            };
+            Ok(match self {
+                Self::Completion => serde_json::to_value(
+                    backend
+                        .completion(CompletionParams {
+                            text_document_position: position,
+                            context: None,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::Definition => serde_json::to_value(
+                    backend
+                        .goto_definition(GotoDefinitionParams {
+                            text_document_position_params: position,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::Diagnostic => serde_json::to_value(
+                    backend
+                        .diagnostic(DocumentDiagnosticParams {
+                            text_document: document,
+                            identifier: None,
+                            previous_result_id: None,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+            })
+        }
+        fn useful(self, value: &serde_json::Value, target: &str) -> bool {
+            match self {
+                Self::Completion => value
+                    .get("items")
+                    .and_then(|items| items.as_array())
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["detail"] == "fixture.Target ()I")
+                    }),
+                Self::Definition => {
+                    value
+                        .get("uri")
+                        .and_then(|uri| uri.as_str())
+                        .is_some_and(|uri| {
+                            uri.parse::<Uri>()
+                                .ok()
+                                .as_ref()
+                                .and_then(uri_to_key)
+                                .as_deref()
+                                == Some(target)
+                        })
+                }
+                Self::Diagnostic => value
+                    .get("items")
+                    .and_then(|items| items.as_array())
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["message"] == "selected-shadow-ready")
+                    }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn first_extension_features_wait_for_selected_shadow_publication() {
+        for feature in [
+            Feature::Completion,
+            Feature::Definition,
+            Feature::Diagnostic,
+        ] {
+            let (service, socket) = tower_lsp_server::LspService::new(|client| {
+                Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+            });
+            drop(socket);
+            let backend = service.inner();
+            let fixture = Fixture::new(backend);
+            fixture.index(backend, "Shadow.java");
+            let requests = fixture.pending(backend);
+            let shadow = backend
+                .ws
+                .lock()
+                .index
+                .lookup_type("Shadow")
+                .into_iter()
+                .find(|entry| entry.sym.package == "org.spongepowered.asm.mixin")
+                .unwrap()
+                .path
+                .to_string();
+            assert!(!Path::new(&shadow).exists());
+            let mut response = Box::pin(feature.request(backend, &fixture.key));
+            tokio::select! { biased; result = &mut response => panic!("first response escaped before selected source preparation: {result:?}"), _ = tokio::task::yield_now() => {} }
+            let prepared = Fixture::prepare(requests).await;
+            // Physical extraction alone does not certify accepted current facts or publication.
+            assert!(Path::new(&shadow).is_file());
+            tokio::select! { biased; result = &mut response => panic!("physical source write was mistaken for publication: {result:?}"), _ = tokio::task::yield_now() => {} }
+            backend.ws.lock().finish_extension_source_batch(prepared);
+            let result = response.await.unwrap();
+            assert!(
+                feature.useful(&result, &fixture.target),
+                "first response: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ninth_queued_extension_source_is_file_specific_and_advances_after_first_batch() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        fixture.index(backend, "");
+        let unrelated = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(
+            unrelated.len(),
+            8,
+            "the selected Shadow is queued beyond SOURCE_BATCH"
+        );
+        let plain = crate::paths::file_key(&fixture.root.join("src/main/java/fixture/Plain.java"));
+        backend.ws.lock().open(plain.clone(), PLAIN.into());
+        let offset = PLAIN.find("item.").unwrap() + 5;
+        let (line, character) = LineIndex::new(PLAIN).position(PLAIN, offset);
+        let mut ordinary = Box::pin(backend.completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: key_to_uri(&plain).unwrap(),
+                },
+                position: Position { line, character },
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }));
+        let result = tokio::select! { biased; result=&mut ordinary => result.unwrap(), _=tokio::task::yield_now() => panic!("unrelated ordinary completion waited for archive work") };
+        let result = serde_json::to_value(result).unwrap();
+        assert!(result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "ordinary"));
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("queued selected producer escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        let prepared = Fixture::prepare(unrelated).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let shadow = backend
+            .ws
+            .lock()
+            .index
+            .lookup_type("Shadow")
+            .into_iter()
+            .find(|entry| entry.sym.package == "org.spongepowered.asm.mixin")
+            .unwrap()
+            .path
+            .to_string();
+        assert!(
+            !Path::new(&shadow).exists(),
+            "the first eight actual files must exclude the selected ninth source"
+        );
+        tokio::select! { biased; result=&mut response => panic!("unrelated producer released selected waiter: {result:?}"), _=tokio::task::yield_now() => {} }
+        // Resume the existing worker at its next-batch boundary, without retrying the feature RPC.
+        schedule_extension_sources(&backend.ws, &backend.client, &backend.doc_versions);
+        let result = response.await.unwrap();
+        assert!(Path::new(&shadow).is_file());
+        assert!(
+            Feature::Definition.useful(&result, &fixture.target),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ninth_queued_extension_source_closes_on_shutdown_before_its_batch_starts() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        fixture.index(backend, "");
+        let first = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(first.len(), 8);
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("never-started selected source escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        backend.shutdown().await.unwrap();
+        assert!(
+            response.await.is_err(),
+            "shutdown must close queued as well as running producers"
+        );
+        drop(first);
+        backend.ws.lock().finish_extension_source_batch(Vec::new());
+    }
+
+    #[tokio::test]
+    async fn failed_extension_source_is_unknown_and_not_retried_per_request() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        fixture.index(backend, "Shadow.java");
+        let requests = fixture.pending(backend);
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("pending failed producer escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        drop(requests);
+        backend.ws.lock().finish_extension_source_batch(Vec::new());
+        let result = response.await.unwrap();
+        assert!(!Feature::Definition.useful(&result, &fixture.target));
+        let mut next = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        let result = tokio::select! { biased; result=&mut next => result.unwrap(), _=tokio::task::yield_now() => panic!("a failed exact source was awaited again") };
+        assert!(!Feature::Definition.useful(&result, &fixture.target));
+        assert!(backend.ws.lock().begin_extension_source_batch().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extension_source_wait_discards_stale_documents_and_shutdown_without_waiting_for_io() {
+        for shutdown in [false, true] {
+            let (service, socket) = tower_lsp_server::LspService::new(|client| {
+                Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+            });
+            drop(socket);
+            let backend = service.inner();
+            let fixture = Fixture::new(backend);
+            fixture.index(backend, "Shadow.java");
+            let requests = fixture.pending(backend);
+            let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+            tokio::select! { biased; result=&mut response => panic!("pending source escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+            if shutdown {
+                backend.shutdown().await.unwrap();
+            } else {
+                backend
+                    .ws
+                    .lock()
+                    .change(&fixture.key, OWNER.replace("bound", "changed"));
+                backend
+                    .doc_versions
+                    .lock()
+                    .get_mut(&fixture.key)
+                    .unwrap()
+                    .document_version = Some(2);
+                // The selected producer completes; the earlier document must never receive its result.
+                let prepared = Fixture::prepare(requests).await;
+                backend.ws.lock().finish_extension_source_batch(prepared);
+                assert!(response.await.is_err());
+                continue;
+            }
+            assert!(response.await.is_err());
+            drop(requests);
+            backend.ws.lock().finish_extension_source_batch(Vec::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_extension_request_leaves_the_shared_source_producer_usable() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        fixture.index(backend, "Shadow.java");
+        let requests = fixture.pending(backend);
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("pending source escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        drop(response);
+        let prepared = Fixture::prepare(requests).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        assert!(Feature::Definition.useful(
+            &Feature::Definition
+                .request(backend, &fixture.key)
+                .await
+                .unwrap(),
+            &fixture.target
+        ));
+    }
+    impl Fixture {
+        fn with_two_background_batches(backend: &Backend) -> Self {
+            let fixture = Self::new(backend);
+            let binary = fixture.root.join("background.jar");
+            let binaries: Vec<_> = SECOND_BACKLOG
+                .iter()
+                .map(|(path, bytes, _)| (format!("{path}.class"), *bytes))
+                .collect();
+            Self::zip(
+                &binary,
+                &binaries
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), *bytes))
+                    .collect::<Vec<_>>(),
+            );
+            let sources: Vec<_> = SECOND_BACKLOG
+                .iter()
+                .map(|(path, _, bytes)| (format!("{path}.java"), *bytes))
+                .collect();
+            Self::zip(
+                &fixture.root.join("background-sources.jar"),
+                &sources
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), *bytes))
+                    .collect::<Vec<_>>(),
+            );
+            std::fs::write(
+                fixture.root.join("src/main/java/fixture/Other.java"),
+                "package fixture; class Other { /* sixteen background inputs */ }",
+            )
+            .unwrap();
+            {
+                let mut ws = backend.ws.lock();
+                let dump = format!("PROJECT\t:\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nSCP\tmain\t{}\nEND\t:\n",
+                    fixture.root.display(), fixture.root.join("src/main/java").display(), fixture.jar.display(), binary.display());
+                ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(
+                    crate::classpath::parse_dump(&dump),
+                )));
+                ws.scan_model_sources();
+                let generation = ws.analysis_generation();
+                assert!(ws.finish_analysis_generation(generation, true, true));
+            }
+            // Distinct real artifacts may use different extraction roots; all background keys precede Shadow.
+            for (jar, extract) in [(&binary, "extract/a"), (&fixture.jar, "extract/z")] {
+                let batches = crate::deps::resolve_local_jar_stubs(
+                    jar,
+                    &fixture.root.join(extract),
+                    &mut crate::parser::KotlinParser::new(),
+                    &mut crate::java::JavaParser::new(),
+                )
+                .unwrap();
+                let mut ws = backend.ws.lock();
+                for batch in batches {
+                    assert!(batch.library_source.is_some());
+                    assert!(ws.index_dependency_batch(batch));
+                }
+                ws.bump_index_revision();
+            }
+            let shadow = Self::source_path(backend, "org.spongepowered.asm.mixin.Shadow");
+            for ty in BACKLOG_TYPES.iter().chain(SECOND_BACKLOG_TYPES) {
+                assert!(
+                    Self::source_path(backend, ty) < shadow,
+                    "fixture must prove global-order starvation"
+                );
+            }
+            fixture
+        }
+        fn source_path(backend: &Backend, ty: &str) -> String {
+            let (package, name) = ty.rsplit_once('.').unwrap();
+            backend
+                .ws
+                .lock()
+                .index
+                .lookup_type(name)
+                .into_iter()
+                .find(|entry| entry.sym.package == package)
+                .unwrap()
+                .path
+                .to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn active_extension_request_prioritizes_its_source_in_the_next_batch() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::with_two_background_batches(backend);
+        let first = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(first.len(), 8);
+        let shadow = Fixture::source_path(backend, "org.spongepowered.asm.mixin.Shadow");
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("pending feature escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        let prepared = Fixture::prepare(first).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        assert!(!Path::new(&shadow).exists());
+        let second = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(second.len(), 8);
+        let prepared = Fixture::prepare(second).await;
+        assert!(
+            Path::new(&shadow).is_file(),
+            "the active source was postponed behind a second unrelated batch"
+        );
+        tokio::select! { biased; result=&mut response => panic!("physical write preceded acceptance: {result:?}"), _=tokio::task::yield_now() => {} }
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let result = response.await.unwrap();
+        assert!(
+            Feature::Definition.useful(&result, &fixture.target),
+            "first response: {result}"
+        );
+        let remaining = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "foreground priority must leave the other background work scheduled"
+        );
+        let prepared = Fixture::prepare(remaining).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        assert!(backend.ws.lock().begin_extension_source_batch().is_empty());
+        for ty in BACKLOG_TYPES.iter().chain(SECOND_BACKLOG_TYPES) {
+            assert!(Path::new(&Fixture::source_path(backend, ty)).is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_extension_waiter_does_not_retain_queue_priority() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::with_two_background_batches(backend);
+        let first = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(first.len(), 8);
+        let shadow = Fixture::source_path(backend, "org.spongepowered.asm.mixin.Shadow");
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("pending feature escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        drop(response);
+        let prepared = Fixture::prepare(first).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let second = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(second.len(), 8);
+        let prepared = Fixture::prepare(second).await;
+        assert!(
+            !Path::new(&shadow).exists(),
+            "a canceled request retained its foreground position"
+        );
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let last = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(last.len(), 1);
+        let prepared = Fixture::prepare(last).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        assert!(Path::new(&shadow).is_file());
+    }
+
+    #[tokio::test]
+    async fn active_extension_waiters_reserve_background_progress_in_each_batch() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::with_two_background_batches(backend);
+        let first = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(first.len(), 8);
+        let mut waiters = Vec::new();
+        for (ordinal, ty) in BACKLOG_TYPES.iter().take(7).enumerate() {
+            let key = crate::paths::file_key(
+                &fixture
+                    .root
+                    .join(format!("src/main/java/fixture/Waiter{ordinal}.java")),
+            );
+            let mut ws = backend.ws.lock();
+            ws.open(
+                &key,
+                format!("package fixture; class Waiter{ordinal} {{}} // wait-for: {ty}"),
+            );
+            waiters.push(
+                ws.extension_source_wait(&key)
+                    .expect("one exact source per active waiter"),
+            );
+        }
+        waiters.push(
+            backend
+                .ws
+                .lock()
+                .extension_source_wait(&fixture.key)
+                .unwrap(),
+        );
+        assert_eq!(waiters.len(), 8);
+        let background = Fixture::source_path(backend, BACKLOG_TYPES[7]);
+        let prepared = Fixture::prepare(first).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let second = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(second.len(), 8);
+        let prepared = Fixture::prepare(second).await;
+        assert!(
+            Path::new(&background).is_file(),
+            "eight active sources starved the remaining background input"
+        );
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let last = backend.ws.lock().begin_extension_source_batch();
+        assert_eq!(last.len(), 1);
+        let prepared = Fixture::prepare(last).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        assert!(waiters.iter().all(|ready| *ready.borrow()));
+        assert!(backend.ws.lock().begin_extension_source_batch().is_empty());
+    }
+    #[derive(Clone, Copy)]
+    enum ConsumerFeature {
+        References,
+        PrepareRename,
+        Rename,
+        Hover,
+        CallHierarchy,
+        Highlights,
+        WorkspaceDiagnostics,
+    }
+    impl ConsumerFeature {
+        async fn request(self, backend: &Backend, key: &str) -> Result<serde_json::Value> {
+            let (line, character) =
+                LineIndex::new(OWNER).position(OWNER, OWNER.find("bound").unwrap());
+            let position = TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: key_to_uri(key).unwrap(),
+                },
+                position: Position { line, character },
+            };
+            Ok(match self {
+                Self::References => serde_json::to_value(
+                    backend
+                        .references(ReferenceParams {
+                            text_document_position: position,
+                            context: ReferenceContext {
+                                include_declaration: true,
+                            },
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::PrepareRename => {
+                    serde_json::to_value(backend.prepare_rename(position).await?).unwrap()
+                }
+                Self::Rename => serde_json::to_value(
+                    backend
+                        .rename(RenameParams {
+                            text_document_position: position,
+                            new_name: "renamed".into(),
+                            work_done_progress_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::Hover => serde_json::to_value(
+                    backend
+                        .hover(HoverParams {
+                            text_document_position_params: position,
+                            work_done_progress_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::CallHierarchy => serde_json::to_value(
+                    backend
+                        .prepare_call_hierarchy(CallHierarchyPrepareParams {
+                            text_document_position_params: position,
+                            work_done_progress_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::Highlights => serde_json::to_value(
+                    backend
+                        .document_highlight(DocumentHighlightParams {
+                            text_document_position_params: position,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+                Self::WorkspaceDiagnostics => serde_json::to_value(
+                    backend
+                        .workspace_diagnostic(WorkspaceDiagnosticParams {
+                            identifier: None,
+                            previous_result_ids: Vec::new(),
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await?,
+                )
+                .unwrap(),
+            })
+        }
+    }
+    impl Fixture {
+        async fn first_consumer_response(
+            &self,
+            backend: &Backend,
+            feature: ConsumerFeature,
+        ) -> serde_json::Value {
+            self.index(backend, "Shadow.java");
+            let requests = self.pending(backend);
+            let mut response = Box::pin(feature.request(backend, &self.key));
+            tokio::select! { biased; result=&mut response => panic!("extension consumer escaped before its selected source: {result:?}"), _=tokio::task::yield_now() => {} }
+            let prepared = Self::prepare(requests).await;
+            tokio::select! { biased; result=&mut response => panic!("extension consumer used a physical write before publication: {result:?}"), _=tokio::task::yield_now() => {} }
+            backend.ws.lock().finish_extension_source_batch(prepared);
+            response.await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn first_extension_references_wait_for_selected_source_binding() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        let value = fixture
+            .first_consumer_response(backend, ConsumerFeature::References)
+            .await;
+        let locations: Vec<Location> = serde_json::from_value(value).unwrap();
+        assert_eq!(locations.len(), 2);
+        let keys: std::collections::BTreeSet<_> = locations
+            .iter()
+            .map(|location| uri_to_key(&location.uri).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [fixture.key.clone(), fixture.target.clone()]
+                .into_iter()
+                .collect()
+        );
+        for location in locations {
+            let key = uri_to_key(&location.uri).unwrap();
+            let text = backend.ws.lock().doc_text(&key).unwrap();
+            let index = LineIndex::new(&text);
+            let start = index.offset(
+                &text,
+                location.range.start.line,
+                location.range.start.character,
+            );
+            let end = index.offset(&text, location.range.end.line, location.range.end.character);
+            assert_eq!(&text[start..end], "bound");
+        }
+    }
+
+    #[tokio::test]
+    async fn first_extension_prepare_rename_waits_for_selected_source_binding() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        let value = fixture
+            .first_consumer_response(backend, ConsumerFeature::PrepareRename)
+            .await;
+        assert_eq!(value["placeholder"], "bound");
+        let range: Range = serde_json::from_value(value["range"].clone()).unwrap();
+        let index = LineIndex::new(OWNER);
+        assert_eq!(
+            &OWNER[index.offset(OWNER, range.start.line, range.start.character)
+                ..index.offset(OWNER, range.end.line, range.end.character)],
+            "bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_extension_rename_waits_and_applies_consumer_and_target_edits() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        let value = fixture
+            .first_consumer_response(backend, ConsumerFeature::Rename)
+            .await;
+        let edit: WorkspaceEdit = serde_json::from_value(value).unwrap();
+        let changes = edit.changes.unwrap();
+        assert_eq!(
+            changes.len(),
+            2,
+            "rename must change the linked consumer and target"
+        );
+        let mut updated = HashMap::new();
+        for (uri, edits) in changes {
+            let key = uri_to_key(&uri).unwrap();
+            assert!(key == fixture.key || key == fixture.target);
+            assert_eq!(edits.len(), 1);
+            let original = backend.ws.lock().doc_text(&key).unwrap();
+            let index = LineIndex::new(&original);
+            let edits: Vec<_> = edits
+                .into_iter()
+                .map(|edit| {
+                    crate::edit::TextEdit::new(
+                        &key,
+                        index.offset(&original, edit.range.start.line, edit.range.start.character),
+                        index.offset(&original, edit.range.end.line, edit.range.end.character),
+                        edit.new_text,
+                    )
+                })
+                .collect();
+            let text = crate::edit::apply_to_text(&key, &original, &edits).unwrap();
+            assert_eq!(text, original.replace("bound", "renamed"));
+            assert!(!crate::java::JavaParser::new()
+                .parse(&text)
+                .root_node()
+                .has_error());
+            updated.insert(key, text);
+        }
+        let target = updated.remove(&fixture.target).unwrap();
+        std::fs::write(&fixture.target, &target).unwrap();
+        backend.ws.lock().reindex(&fixture.target, &target);
+        let consumer = updated.remove(&fixture.key).unwrap();
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: key_to_uri(&fixture.key).unwrap(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: consumer.clone(),
+                }],
+            })
+            .await;
+        assert_eq!(backend.ws.lock().doc_text(&fixture.key).unwrap(), consumer);
+        assert_eq!(std::fs::read_to_string(&fixture.target).unwrap(), target);
+        let result = Feature::Definition
+            .request(backend, &fixture.key)
+            .await
+            .unwrap();
+        assert!(
+            Feature::Definition.useful(&result, &fixture.target),
+            "renamed binding must still navigate to the edited target: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_extension_passive_consumers_wait_for_selected_binding() {
+        for feature in [
+            ConsumerFeature::Hover,
+            ConsumerFeature::CallHierarchy,
+            ConsumerFeature::Highlights,
+        ] {
+            let (service, socket) = tower_lsp_server::LspService::new(|client| {
+                Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+            });
+            drop(socket);
+            let backend = service.inner();
+            let fixture = Fixture::new(backend);
+            let value = fixture.first_consumer_response(backend, feature).await;
+            match feature {
+                ConsumerFeature::Hover => assert!(
+                    value["contents"]["value"]
+                        .as_str()
+                        .unwrap()
+                        .contains("fixture.Target"),
+                    "{value}"
+                ),
+                ConsumerFeature::CallHierarchy => {
+                    let items: Vec<CallHierarchyItem> = serde_json::from_value(value).unwrap();
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(
+                        uri_to_key(&items[0].uri).as_deref(),
+                        Some(fixture.target.as_str())
+                    );
+                }
+                ConsumerFeature::Highlights => {
+                    let items: Vec<DocumentHighlight> = serde_json::from_value(value).unwrap();
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(
+                        items[0].range.start.character as usize,
+                        OWNER.find("bound").unwrap()
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn first_extension_workspace_diagnostics_wait_for_selected_binding() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        let value = fixture
+            .first_consumer_response(backend, ConsumerFeature::WorkspaceDiagnostics)
+            .await;
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["uri"], key_to_uri(&fixture.key).unwrap().as_str());
+        assert!(items[0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["message"] == "selected-shadow-ready"));
+    }
+
+    #[tokio::test]
+    async fn extension_source_wait_rejects_close_reopen_with_reused_version() {
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)])
+        });
+        drop(socket);
+        let backend = service.inner();
+        let fixture = Fixture::new(backend);
+        fixture.index(backend, "Shadow.java");
+        let requests = fixture.pending(backend);
+        let generation = backend.ws.lock().analysis_generation();
+        // Definition already uses the wait helper in the baseline, isolating its lifetime guard.
+        let mut response = Box::pin(Feature::Definition.request(backend, &fixture.key));
+        tokio::select! { biased; result=&mut response => panic!("selected source escaped: {result:?}"), _=tokio::task::yield_now() => {} }
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: key_to_uri(&fixture.key).unwrap(),
+                },
+            })
+            .await;
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: key_to_uri(&fixture.key).unwrap(),
+                    language_id: "java".into(),
+                    version: 1,
+                    text: OWNER.replace("bound", "other"),
+                },
+            })
+            .await;
+        assert_eq!(backend.ws.lock().analysis_generation(), generation);
+        assert_eq!(
+            backend
+                .doc_versions
+                .lock()
+                .get(&fixture.key)
+                .unwrap()
+                .document_version,
+            Some(1)
+        );
+        let prepared = Fixture::prepare(requests).await;
+        backend.ws.lock().finish_extension_source_batch(prepared);
+        let error = response.await.expect_err(
+            "the old document lifetime must not receive the reopened document's result",
+        );
+        assert_eq!(
+            error.code,
+            tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801)
+        );
     }
 }

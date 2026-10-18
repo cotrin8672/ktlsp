@@ -27,6 +27,19 @@ struct CachedClass {
 }
 
 impl ClassInventoryCache {
+    fn selected_sdk_class(
+        &mut self,
+        selection: &classpath::SdkApiSelection,
+        owner: &str,
+    ) -> Option<Arc<ClassFileFacts>> {
+        if classpath::file_origin_id(&selection.archive) != selection.archive_revision {
+            return None;
+        }
+        let entry = selection.entries.get(owner)?.as_deref()?;
+        self.read(&selection.archive, entry, &selection.origin())
+            .ok()?
+            .filter(|facts| facts.identity.internal_name == owner)
+    }
     /// The SDK already selected and source-indexed for a source-only workspace.
     pub(crate) fn object_for_source_origin(&mut self, origin: &str) -> Option<Arc<ClassFileFacts>> {
         let source = Path::new(origin.strip_prefix("jdk:")?);
@@ -60,8 +73,7 @@ impl ClassInventoryCache {
         use classpath::CompilerLanguage;
         let task = if crate::language::SourceLanguage::for_key(caller).is_java() {
             let task = model.plain_java_task(caller)?;
-            if task.options.get("release") != Some(&serde_json::Value::Null)
-                || task.options.get("bootstrapClasspath") != Some(&serde_json::Value::Null)
+            if task.options.get("bootstrapClasspath") != Some(&serde_json::Value::Null)
                 || !self.plain_caller(task)
             {
                 return None;
@@ -126,6 +138,17 @@ impl ClassInventoryCache {
             .source_files
             .iter()
             .any(|path| crate::paths::file_key(path) == caller)
+        {
+            return None;
+        }
+        if let Some(selection) = model
+            .sdk_api_for_file(Path::new(caller))
+            .filter(|selection| selection.release.is_some())
+        {
+            return self.selected_sdk_class(selection, "java/lang/Object");
+        }
+        if task.language == CompilerLanguage::Java
+            && task.options.get("release") != Some(&serde_json::Value::Null)
         {
             return None;
         }
@@ -213,6 +236,13 @@ impl ClassInventoryCache {
             internal.push('$');
         }
         internal.push_str(&owner.sym.name);
+        if origin.starts_with("jdk-api:") {
+            let selection = model.sdk_api_for_file(Path::new(caller))?;
+            if selection.origin() != origin || selection.release.is_none() {
+                return None;
+            }
+            return self.selected_sdk_class(selection, &internal);
+        }
         if origin.starts_with("jdk:") {
             if task.options.get("release") != Some(&serde_json::Value::Null) {
                 // shortcut: --release selects ct.sym APIs; do not substitute the running JDK's jmods.

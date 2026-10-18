@@ -27,6 +27,7 @@ pub mod paths;
 pub mod refactor;
 pub mod rename;
 pub mod salsa_support;
+mod sdk_api;
 pub mod semantic_query;
 pub mod sidecar;
 mod source_encoding;

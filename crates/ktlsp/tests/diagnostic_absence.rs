@@ -747,6 +747,7 @@ fn binary_inventory() -> BinaryInventoryIndex {
                 signature: None,
                 source_file: Some(Arc::from(file)),
                 attribute_names: Vec::new(),
+                inner_classes: Vec::new(),
                 fields: Vec::new(),
                 methods: methods
                     .into_iter()

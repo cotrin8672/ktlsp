@@ -238,6 +238,37 @@ struct OutputOwners {
 }
 
 /// A shared immutable Gradle model. Ownership queries do no filesystem or Gradle work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SdkApiSelection {
+    pub home: PathBuf,
+    /// Navigation sources do not establish the API surface of a lower --release.
+    pub source_zip: Option<PathBuf>,
+    pub release: Option<u16>,
+    pub archive: PathBuf,
+    pub archive_sha256: String,
+    pub archive_revision: String,
+    pub entries: Arc<BTreeMap<String, Option<String>>>,
+}
+
+impl SdkApiSelection {
+    pub(crate) fn identity(&self) -> String {
+        format!(
+            "jdk-api:{}#release={}#{}",
+            path_key(&self.home),
+            self.release
+                .map_or_else(|| "full".into(), |release| release.to_string()),
+            self.archive_sha256
+        )
+    }
+
+    pub(crate) fn origin(&self) -> String {
+        match self.release {
+            Some(_) => self.identity(),
+            None => jdk_origin_id(self.source_zip.as_ref().expect("full SDK source selection")),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProjectSnapshot {
     pub modules: Vec<ModuleClasspath>,
@@ -248,6 +279,8 @@ pub struct ProjectSnapshot {
     selected_kotlin_source_keys: std::collections::BTreeSet<String>,
     mtimes: BTreeMap<String, u128>,
     visibilities: Vec<ScopeVisibility>,
+    sdk_selections: BTreeMap<ProjectScope, BTreeMap<String, SdkApiSelection>>,
+    sdk_caller_views: Vec<ktcore::index::CallerScopeVisibility>,
 }
 
 impl ProjectSnapshot {
@@ -311,6 +344,8 @@ impl ProjectSnapshot {
             selected_kotlin_source_keys,
             mtimes: BTreeMap::new(),
             visibilities: Vec::new(),
+            sdk_selections: BTreeMap::new(),
+            sdk_caller_views: Vec::new(),
         };
         for entry in model
             .modules
@@ -361,6 +396,7 @@ impl ProjectSnapshot {
             })
             .collect();
         let mut sdk_features = BTreeMap::new();
+        let mut sdk_digests = BTreeMap::new();
         for (visibility, source) in model
             .visibilities
             .iter_mut()
@@ -368,6 +404,29 @@ impl ProjectSnapshot {
         {
             if let Some(source_zip) = source_set_jdk_source(source, &mut sdk_features) {
                 visibility.ordered_origins.push(jdk_origin_id(&source_zip));
+            }
+            let selections = model
+                .sdk_selections
+                .entry(visibility.scope.clone())
+                .or_default();
+            for (language, suffixes) in [
+                (CompilerLanguage::Java, &["java"][..]),
+                (CompilerLanguage::Kotlin, &["kt"][..]),
+            ] {
+                if let Some(selection) =
+                    source_set_sdk_api(source, language, &mut sdk_features, &mut sdk_digests)
+                {
+                    for suffix in suffixes {
+                        selections.insert((*suffix).into(), selection.clone());
+                    }
+                }
+            }
+        }
+        for selection in model.sdk_selections.values().flat_map(BTreeMap::values) {
+            for input in [&selection.archive, &selection.home.join("release")] {
+                model
+                    .file_origins
+                    .insert(path_key(input), file_origin_id(input));
             }
         }
         for source_zip in model.selected_jdk_sources() {
@@ -384,6 +443,7 @@ impl ProjectSnapshot {
                     .insert(path_key(input), file_origin_id(input));
             }
         }
+        model.sdk_caller_views = model.build_caller_scope_visibilities();
         model.local_source_keys = model
             .local_jars()
             .iter()
@@ -491,9 +551,12 @@ impl ProjectSnapshot {
     pub fn scope_visibilities(&self, global_origins: &[String]) -> Vec<ScopeVisibility> {
         let mut visibilities = self.visibilities.clone();
         for visibility in &mut visibilities {
+            visibility
+                .ordered_origins
+                .retain(|origin| !is_sdk_origin(origin));
             for origin in global_origins {
                 // Model-owned SDKs are scoped above; a host SDK must never leak into another target.
-                if origin.starts_with("jdk:") {
+                if is_sdk_origin(origin) {
                     continue;
                 }
                 if !visibility.ordered_origins.contains(origin) {
@@ -505,28 +568,201 @@ impl ProjectSnapshot {
     }
 
     pub(crate) fn selected_jdk_sources(&self) -> Vec<PathBuf> {
-        self.visibilities
-            .iter()
-            .flat_map(|visibility| &visibility.ordered_origins)
-            .filter_map(|origin| origin.strip_prefix("jdk:").map(PathBuf::from))
+        self.sdk_selections
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter(|selection| selection.release.is_none())
+            .filter_map(|selection| selection.source_zip.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
     }
 
     pub(crate) fn selected_jdk_source_for_file(&self, file: &Path) -> Option<PathBuf> {
+        let selection = self.sdk_api_for_file(file)?;
+        // API8 declarations come from selected signatures. SDK17 sources cannot seed API8 facts.
+        selection
+            .release
+            .is_none()
+            .then(|| selection.source_zip.clone())
+            .flatten()
+    }
+
+    pub(crate) fn sdk_api_for_file(&self, file: &Path) -> Option<&SdkApiSelection> {
         let (module, source) = self.owner_for(file)?;
         let scope = project_scope(module, source?);
-        let visibility = self
-            .visibilities
+        let key = crate::paths::file_key(file);
+        let mut views = self
+            .sdk_caller_views
             .iter()
-            .find(|visibility| visibility.scope == scope)?;
-        let mut origins = visibility
-            .ordered_origins
+            .filter(|view| view.visibility.scope == scope && view.matches_file(&key));
+        let selected = views.next()?;
+        if views.next().is_some() {
+            return None;
+        }
+        self.sdk_selections.get(&scope)?.get(&selected.suffix)
+    }
+
+    pub(crate) fn selected_release_apis(&self) -> Vec<SdkApiSelection> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.sdk_selections
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter(|selection| selection.release.is_some() && seen.insert(selection.identity()))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn caller_scope_visibilities(
+        &self,
+        global_origins: &[String],
+    ) -> Vec<ktcore::index::CallerScopeVisibility> {
+        self.sdk_caller_views
             .iter()
-            .filter_map(|origin| origin.strip_prefix("jdk:"));
-        let selected = PathBuf::from(origins.next()?);
-        origins.next().is_none().then_some(selected)
+            .cloned()
+            .map(|mut view| {
+                for origin in global_origins
+                    .iter()
+                    .filter(|origin| !is_sdk_origin(origin))
+                {
+                    if !view.visibility.ordered_origins.contains(origin) {
+                        view.visibility.ordered_origins.push(origin.clone());
+                    }
+                }
+                view
+            })
+            .collect()
+    }
+
+    fn build_caller_scope_visibilities(&self) -> Vec<ktcore::index::CallerScopeVisibility> {
+        let mut result = Vec::new();
+        // Producer claims only veto a view. SDK or pattern-policy failure cannot erase them.
+        let mut claimed = Vec::new();
+        for (visibility, source) in self
+            .scope_visibilities(&[])
+            .into_iter()
+            .zip(self.modules.iter().flat_map(|module| &module.source_sets))
+        {
+            for (language, suffix) in [
+                (CompilerLanguage::Java, "java"),
+                (CompilerLanguage::Kotlin, "kt"),
+            ] {
+                for task in source.compiler_tasks.iter().filter(|task| {
+                    task.language == language
+                        && (language == CompilerLanguage::Java
+                            || source.kotlin_compile_task.as_deref() == Some(task.task.as_str()))
+                }) {
+                    let files = task
+                        .source_files
+                        .iter()
+                        .filter(|file| {
+                            file.extension().and_then(|value| value.to_str()) == Some(suffix)
+                        })
+                        .map(|file| crate::paths::file_key(file))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let roots = sdk_producer_roots(task).or_else(|| {
+                        sdk_source_policy(task, source, suffix)
+                            .map(|policy| (policy.future_roots, false))
+                    });
+                    let inputs_proved = task.complete
+                        && task.problem.is_none()
+                        && roots.as_ref().is_some_and(|(_, complete)| *complete);
+                    claimed.push((
+                        visibility.scope.clone(),
+                        suffix,
+                        files,
+                        roots,
+                        inputs_proved,
+                    ));
+                }
+                let Some(task) = sdk_producing_task(source, &language) else {
+                    continue;
+                };
+                let Some(selection) = self
+                    .sdk_selections
+                    .get(&visibility.scope)
+                    .and_then(|views| views.get(suffix))
+                else {
+                    continue;
+                };
+                let Some(policy) = sdk_source_policy(task, source, suffix) else {
+                    continue;
+                };
+                let mut caller = visibility.clone();
+                caller.ordered_origins.push(selection.origin());
+                result.push(ktcore::index::CallerScopeVisibility {
+                    visibility: caller,
+                    suffix: suffix.into(),
+                    source_files: task
+                        .source_files
+                        .iter()
+                        .filter(|file| {
+                            file.extension().and_then(|value| value.to_str()) == Some(suffix)
+                                && policy
+                                    .authored_roots
+                                    .iter()
+                                    .any(|root| path_under_key(&path_key(file), root))
+                        })
+                        .map(|file| crate::paths::file_key(file))
+                        .collect(),
+                    authored_roots: policy.future_roots,
+                    generated_roots: policy.generated_roots,
+                    excluded_segments: policy.excluded_segments,
+                });
+            }
+        }
+        // Equal or nested producing roots in different scopes cannot borrow the first owner.
+        for view in &mut result {
+            for (scope, suffix, files, roots, inputs_complete) in &claimed {
+                if *suffix != view.suffix || *scope == view.visibility.scope {
+                    continue;
+                }
+                let (roots, roots_complete) = roots
+                    .as_ref()
+                    .map(|(roots, complete)| (roots.as_slice(), *complete))
+                    .unwrap_or((&[][..], false));
+                if !roots_complete && scope.module == view.visibility.scope.module {
+                    // Current exact inputs cannot prove absence of a future local producer.
+                    // Do not turn an unresolved source-set capture into a global SDK stall.
+                    view.authored_roots.clear();
+                    if !inputs_complete {
+                        view.source_files.clear();
+                    }
+                }
+                for file in &view.source_files {
+                    if files.contains(file) || roots.iter().any(|root| path_under_key(file, root)) {
+                        view.generated_roots.push(file.clone());
+                    }
+                }
+                for file in files {
+                    if view
+                        .authored_roots
+                        .iter()
+                        .any(|root| path_under_key(file, root))
+                    {
+                        view.generated_roots.push(file.clone());
+                    }
+                }
+                let mut unresolved_roots = Vec::new();
+                for own_root in &view.authored_roots {
+                    if !roots_complete && files.iter().any(|file| path_under_key(file, own_root)) {
+                        unresolved_roots.push(own_root.clone());
+                    }
+                    for other_root in roots {
+                        if own_root == other_root || path_under_key(own_root, other_root) {
+                            view.generated_roots.push(own_root.clone());
+                        } else if path_under_key(other_root, own_root) {
+                            view.generated_roots.push(other_root.clone());
+                        }
+                    }
+                }
+                view.authored_roots
+                    .retain(|root| !unresolved_roots.contains(root));
+            }
+            view.generated_roots.sort();
+            view.generated_roots.dedup();
+        }
+        result
     }
 
     fn origins_for_entry(&self, entry: &Path, component: Option<&ComponentId>) -> Vec<String> {
@@ -736,6 +972,17 @@ impl ProjectSnapshot {
         self.visibilities
             .iter()
             .flat_map(|visibility| visibility.ordered_origins.iter().cloned())
+            .chain(
+                self.sdk_selections
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .map(SdkApiSelection::origin),
+            )
+            .chain(
+                self.selected_jdk_sources()
+                    .iter()
+                    .map(|source| jdk_origin_id(source)),
+            )
             .collect()
     }
 
@@ -786,6 +1033,15 @@ impl ProjectSnapshot {
                         .into_iter()
                         .filter_map(|input| self.file_origins.get(&path_key(input)).cloned()),
                 );
+        }
+        for selection in self.sdk_selections.values().flat_map(BTreeMap::values) {
+            let inputs = revisions.entry(selection.origin()).or_default();
+            inputs.insert(selection.identity());
+            for input in [&selection.archive, &selection.home.join("release")] {
+                if let Some(revision) = self.file_origins.get(&path_key(input)) {
+                    inputs.insert(revision.clone());
+                }
+            }
         }
         revisions
     }
@@ -853,6 +1109,13 @@ fn sdk_feature_version(release: &str) -> Option<u16> {
 }
 
 fn source_set_jdk_source(
+    source: &SourceSetClasspath,
+    features: &mut BTreeMap<String, Option<u16>>,
+) -> Option<PathBuf> {
+    crate::deps::src_zip_for_home(source_set_jdk_home(source, features)?)
+}
+
+fn source_set_jdk_home(
     source: &SourceSetClasspath,
     features: &mut BTreeMap<String, Option<u16>>,
 ) -> Option<PathBuf> {
@@ -994,7 +1257,308 @@ fn source_set_jdk_source(
     if source.kotlin_compile_task.is_some() && selected_kotlin != 1 {
         return None;
     }
-    crate::deps::src_zip_for_home(home?)
+    home
+}
+
+fn sdk_producing_task<'a>(
+    source: &'a SourceSetClasspath,
+    language: &CompilerLanguage,
+) -> Option<&'a CompilerTask> {
+    let selected = if *language == CompilerLanguage::Kotlin {
+        Some(source.kotlin_compile_task.as_deref()?)
+    } else {
+        None
+    };
+    let mut tasks = source.compiler_tasks.iter().filter(|task| {
+        &task.language == language && selected.is_none_or(|selected| task.task == selected)
+    });
+    let task = tasks.next()?;
+    (tasks.next().is_none() && task.complete && task.problem.is_none()).then_some(task)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SdkProducerClaims {
+    adapter: String,
+    language: CompilerLanguage,
+    task: String,
+    roots: Vec<String>,
+    complete: bool,
+}
+
+fn sdk_producer_roots(task: &CompilerTask) -> Option<(Vec<String>, bool)> {
+    let claims: SdkProducerClaims =
+        serde_json::from_value(task.options.get("sdkProducerClaims")?.clone()).ok()?;
+    if claims.adapter != "gradle-producing-source-trees-v1"
+        || claims.language != task.language
+        || claims.task != task.task
+        || claims.roots.len() > 1024
+        || claims.roots.iter().any(|root| {
+            !Path::new(root).is_absolute() || root.split(['/', '\\']).any(|part| part == "..")
+        })
+    {
+        return None;
+    }
+    let mut roots = claims
+        .roots
+        .iter()
+        .map(|root| path_key(Path::new(root)))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    let suffix = if task.language == CompilerLanguage::Java {
+        "java"
+    } else {
+        "kt"
+    };
+    if claims.complete
+        && task
+            .source_files
+            .iter()
+            .filter(|file| file.extension().and_then(|value| value.to_str()) == Some(suffix))
+            .any(|file| {
+                let file = crate::paths::file_key(file);
+                !roots
+                    .iter()
+                    .any(|root| root == &file || path_under_key(&file, root))
+            })
+    {
+        return None;
+    }
+    Some((roots, claims.complete))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SdkSourcePolicy {
+    adapter: String,
+    language: CompilerLanguage,
+    task: String,
+    authored_roots: Vec<String>,
+    future_roots: Vec<String>,
+    #[serde(default)]
+    default_excludes: Option<Vec<String>>,
+    #[serde(skip)]
+    excluded_segments: Vec<String>,
+    generated_roots: Vec<String>,
+}
+
+fn path_under_key(file: &str, root: &str) -> bool {
+    file.strip_prefix(root.trim_end_matches('/'))
+        .is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn sdk_source_policy(
+    task: &CompilerTask,
+    source: &SourceSetClasspath,
+    suffix: &str,
+) -> Option<SdkSourcePolicy> {
+    let mut policy: SdkSourcePolicy =
+        serde_json::from_value(task.options.get("sdkSourcePolicy")?.clone()).ok()?;
+    if policy.adapter != "gradle-source-tree-stock-patterns-v1"
+        || policy.language != task.language
+        || policy.task != task.task
+        || policy.authored_roots.len() > 256
+        || policy.future_roots.len() > 256
+        || policy.generated_roots.len() > 1024
+        || suffix
+            != match task.language {
+                CompilerLanguage::Java => "java",
+                CompilerLanguage::Kotlin => "kt",
+            }
+    {
+        return None;
+    }
+    for roots in [
+        &mut policy.authored_roots,
+        &mut policy.future_roots,
+        &mut policy.generated_roots,
+    ] {
+        if roots.iter().any(|root| {
+            !Path::new(root).is_absolute() || root.split(['/', '\\']).any(|part| part == "..")
+        }) {
+            return None;
+        }
+        *roots = roots.iter().map(|root| path_key(Path::new(root))).collect();
+        roots.sort();
+        roots.dedup();
+    }
+    if policy.authored_roots.iter().any(|root| {
+        !source
+            .source_roots
+            .iter()
+            .any(|declared| path_key(declared) == *root)
+    }) || policy
+        .future_roots
+        .iter()
+        .any(|root| !policy.authored_roots.contains(root))
+    {
+        return None;
+    }
+    match policy
+        .default_excludes
+        .as_deref()
+        .and_then(ktcore::index::ant_default_exclude_segments)
+    {
+        Some(excludes) => policy.excluded_segments = excludes,
+        None => policy.future_roots.clear(),
+    }
+    policy
+        .generated_roots
+        .extend(source.output_roots.iter().map(|root| path_key(root)));
+    policy.generated_roots.extend(
+        source
+            .compiler_tasks
+            .iter()
+            .flat_map(|task| task.declared_output_roots.iter().chain(&task.output_roots))
+            .map(|root| path_key(root)),
+    );
+    policy.generated_roots.sort();
+    policy.generated_roots.dedup();
+    Some(policy)
+}
+
+fn source_set_sdk_api(
+    source: &SourceSetClasspath,
+    language: CompilerLanguage,
+    features: &mut BTreeMap<String, Option<u16>>,
+    digests: &mut BTreeMap<String, Option<SdkApiSelection>>,
+) -> Option<SdkApiSelection> {
+    use sha2::{Digest, Sha256};
+    if source.compiler_metadata_incomplete {
+        return None;
+    }
+    let selected_kotlin = if language == CompilerLanguage::Kotlin {
+        Some(source.kotlin_compile_task.as_deref()?)
+    } else {
+        None
+    };
+    let mut tasks = source.compiler_tasks.iter().filter(|task| {
+        task.language == language && selected_kotlin.is_none_or(|selected| task.task == selected)
+    });
+    let task = tasks.next()?;
+    if tasks.next().is_some() || !task.complete || task.problem.is_some() {
+        return None;
+    }
+    let home = task.java_home.as_ref()?;
+    if !home.is_absolute() {
+        return None;
+    }
+    let feature = *features.entry(path_key(home)).or_insert_with(|| {
+        let bytes = std::fs::read(home.join("release")).ok()?;
+        (bytes.len() <= 64 * 1024).then_some(())?;
+        sdk_feature_version(std::str::from_utf8(&bytes).ok()?)
+    });
+    let feature = feature?;
+    let mut normalized = task.clone();
+    let release = match language {
+        CompilerLanguage::Java => {
+            let release = match task.options.get("release")? {
+                serde_json::Value::Null => None,
+                serde_json::Value::Number(value) => Some(u16::try_from(value.as_u64()?).ok()?),
+                _ => return None,
+            };
+            let target = release.unwrap_or(feature);
+            if !sdk_java_arguments_match(&task.arguments, target) {
+                return None;
+            }
+            normalize_java_release(&mut normalized.arguments, feature)?;
+            if let Some(recipe) = normalized
+                .options
+                .get_mut("javaCompilerRecipe")
+                .filter(|recipe| !recipe.is_null())
+            {
+                let mut arguments: Vec<String> =
+                    serde_json::from_value(recipe.get("api_options")?.clone()).ok()?;
+                if !sdk_java_arguments_match(&arguments, target) {
+                    return None;
+                }
+                normalize_java_release(&mut arguments, feature)?;
+                recipe["api_options"] = serde_json::to_value(arguments).ok()?;
+            }
+            normalized
+                .options
+                .insert("release".into(), serde_json::json!(feature));
+            release
+        }
+        CompilerLanguage::Kotlin => {
+            let mut release = None;
+            for argument in &mut normalized.arguments {
+                if let Some(value) = argument.strip_prefix("-Xjdk-release=") {
+                    if release.is_some() {
+                        return None;
+                    }
+                    release = Some(value.parse::<u16>().ok()?);
+                    *argument = format!("-Xjdk-release={feature}");
+                } else if argument.starts_with("-Xjdk-release") {
+                    return None;
+                }
+            }
+            release
+        }
+    };
+    if release.is_some_and(|release| release < 8 || release > feature) {
+        return None;
+    }
+    // Reuse the existing task/SDK validation, varying only the independently checked API release.
+    let checked = SourceSetClasspath {
+        compiler_tasks: vec![normalized],
+        kotlin_compile_task: selected_kotlin.map(str::to_owned),
+        ..Default::default()
+    };
+    if source_set_jdk_home(&checked, features).as_ref() != Some(home) {
+        return None;
+    }
+    let source_zip = crate::deps::src_zip_for_home(home.clone());
+    let release = release.filter(|release| *release != feature);
+    let archive = match release {
+        Some(_) => home.join("lib/ct.sym"),
+        None => source_zip.clone()?,
+    };
+    digests
+        .entry(format!(
+            "{}#{}",
+            path_key(&archive),
+            release.map_or_else(|| "full".into(), |release| release.to_string())
+        ))
+        .or_insert_with(|| {
+            let before = std::fs::metadata(&archive).ok()?;
+            if before.len() > 256 * 1024 * 1024 {
+                return None;
+            }
+            let bytes = std::fs::read(&archive).ok()?;
+            let after = std::fs::metadata(&archive).ok()?;
+            (before.len() == bytes.len() as u64
+                && after.len() == before.len()
+                && after.modified().ok()? == before.modified().ok()?)
+            .then_some(())?;
+            let entries = match release {
+                Some(release) => crate::sdk_api::release_entries(&bytes, release).ok()?,
+                None => BTreeMap::new(),
+            };
+            Some(SdkApiSelection {
+                home: home.clone(),
+                source_zip,
+                release,
+                archive: archive.clone(),
+                archive_sha256: format!("{:x}", Sha256::digest(bytes)),
+                archive_revision: file_origin_id(&archive),
+                entries: Arc::new(entries),
+            })
+        })
+        .clone()
+}
+
+fn normalize_java_release(arguments: &mut [String], feature: u16) -> Option<()> {
+    let mut arguments = arguments.iter_mut();
+    while let Some(argument) = arguments.next() {
+        if argument == "--release" {
+            *arguments.next()? = feature.to_string();
+        } else if argument.starts_with("--release=") {
+            *argument = format!("--release={feature}");
+        }
+    }
+    Some(())
 }
 
 fn sdk_java_arguments_match(arguments: &[String], feature: u16) -> bool {
@@ -1086,6 +1650,10 @@ fn file_revision(path: &Path) -> String {
 
 pub fn jdk_origin_id(path: &Path) -> String {
     format!("jdk:{}", path_key(path))
+}
+
+pub(crate) fn is_sdk_origin(origin: &str) -> bool {
+    origin.starts_with("jdk:") || origin.starts_with("jdk-api:")
 }
 
 fn find_ancestor<T>(mut key: &str, mut lookup: impl FnMut(&str) -> Option<T>) -> Option<T> {
@@ -2234,7 +2802,7 @@ fn coordinate_from_gradle_cache_path(path: &Path) -> Option<Coordinate> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     fn selected_kotlin_recipe() -> serde_json::Value {
         serde_json::json!({
             "default_classpath": ["/compiler/z-runtime.jar", "/compiler/a-runtime.jar"],
@@ -2295,7 +2863,93 @@ mod tests {
         }
     }
 
-    fn sdk_selection_fixture() -> (PathBuf, Vec<ModuleClasspath>) {
+    #[test]
+    fn caller_sdk_future_paths_require_captured_default_exclusions() {
+        let (root, original) = sdk_selection_fixture();
+        let source_root = original[0].source_sets[0].source_roots[0].clone();
+        assert!(ProjectSnapshot::new(original.clone())
+            .sdk_api_for_file(&source_root.join("New.java"))
+            .is_some());
+        for failure in [
+            "missing",
+            "null",
+            "unsupported",
+            "unpaired-subtree",
+            "oversized",
+        ] {
+            let mut modules = original.clone();
+            for task in &mut modules[0].source_sets[0].compiler_tasks {
+                let policy = task.options.get_mut("sdkSourcePolicy").unwrap();
+                match failure {
+                    "missing" => {
+                        policy.as_object_mut().unwrap().remove("default_excludes");
+                    }
+                    "null" => policy["default_excludes"] = serde_json::Value::Null,
+                    "unsupported" => {
+                        policy["default_excludes"] = serde_json::json!(["**/unknown/*/tree"])
+                    }
+                    "unpaired-subtree" => {
+                        policy["default_excludes"] = serde_json::json!(["**/Excluded.java/**"])
+                    }
+                    "oversized" => {
+                        policy["default_excludes"] = serde_json::json!(vec!["**/excluded"; 129])
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let model = ProjectSnapshot::new(modules);
+            for suffix in ["java", "kt"] {
+                assert!(
+                    model
+                        .sdk_api_for_file(&source_root.join(format!("Use.{suffix}")))
+                        .is_some(),
+                    "{failure}: exact compiler input"
+                );
+                assert!(
+                    model
+                        .sdk_api_for_file(&source_root.join(format!("New.{suffix}")))
+                        .is_none(),
+                    "{failure}: future input remains unknown"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    pub(crate) fn sdk_source_default_excludes() -> serde_json::Value {
+        serde_json::json!([
+            "**/%*%",
+            "**/.git/**",
+            "**/SCCS",
+            "**/.bzr",
+            "**/.hg/**",
+            "**/.bzrignore",
+            "**/.git",
+            "**/SCCS/**",
+            "**/.hg",
+            "**/.#*",
+            "**/vssver.scc",
+            "**/.bzr/**",
+            "**/._*",
+            "**/#*#",
+            "**/*~",
+            "**/CVS",
+            "**/.hgtags",
+            "**/.svn/**",
+            "**/.hgignore",
+            "**/.svn",
+            "**/.gitignore",
+            "**/.gitmodules",
+            "**/.hgsubstate",
+            "**/.gitattributes",
+            "**/CVS/**",
+            "**/.hgsub",
+            "**/.DS_Store",
+            "**/.cvsignore"
+        ])
+    }
+
+    pub(crate) fn sdk_selection_fixture() -> (PathBuf, Vec<ModuleClasspath>) {
         let root = std::env::temp_dir().join(format!(
             "ktlsp-sdk-selection-{}-{}",
             std::process::id(),
@@ -2324,6 +2978,30 @@ mod tests {
             java["options"]["bootstrapClasspath"] = serde_json::Value::Null;
             java["options"]["javaCompilerRecipe"] = selected_java_recipe();
             java["options"]["javaCompilerRecipe"]["language_version"] = feature.to_string().into();
+            let authored_root = root.join(format!("module{feature}/src"));
+            java["source_files"] = serde_json::json!([authored_root.join("Use.java")]);
+            java["options"]["sdkSourcePolicy"] = serde_json::json!({
+                "adapter": "gradle-source-tree-stock-patterns-v1", "task": java["task"], "language": "java",
+                "authored_roots": [authored_root], "future_roots": [authored_root], "generated_roots": [],
+                "default_excludes": sdk_source_default_excludes(),
+            });
+            java["options"]["sdkProducerClaims"] = serde_json::json!({
+                "adapter": "gradle-producing-source-trees-v1", "task": java["task"],
+                "language": "java", "roots": [authored_root], "complete": true,
+            });
+            let mut kotlin = java.clone();
+            kotlin["task"] = serde_json::json!(format!(":sdk{feature}:compileKotlin"));
+            kotlin["language"] = serde_json::json!("kotlin");
+            kotlin["task_type"] =
+                serde_json::json!("org.jetbrains.kotlin.gradle.tasks.KotlinCompile");
+            kotlin["source_files"] =
+                serde_json::json!([authored_root.join("Use.kt"), authored_root.join("Use.java")]);
+            kotlin["arguments"] = serde_json::json!([]);
+            kotlin["options"]["sdkSourcePolicy"]["task"] = kotlin["task"].clone();
+            kotlin["options"]["sdkSourcePolicy"]["language"] = serde_json::json!("kotlin");
+            kotlin["options"]["sdkProducerClaims"]["task"] = kotlin["task"].clone();
+            kotlin["options"]["sdkProducerClaims"]["language"] = serde_json::json!("kotlin");
+            let kotlin_task = kotlin["task"].as_str().unwrap().to_owned();
             modules.push(ModuleClasspath {
                 module: format!(":sdk{feature}"),
                 project_dir: root.join(format!("module{feature}")),
@@ -2333,12 +3011,213 @@ mod tests {
                 source_sets: vec![SourceSetClasspath {
                     name: "main".into(),
                     source_roots: vec![root.join(format!("module{feature}/src"))],
-                    compiler_tasks: vec![serde_json::from_value(java).unwrap()],
+                    compiler_tasks: vec![
+                        serde_json::from_value(java).unwrap(),
+                        serde_json::from_value(kotlin).unwrap(),
+                    ],
+                    kotlin_compile_task: Some(kotlin_task),
                     ..Default::default()
                 }],
             });
         }
         (root, modules)
+    }
+
+    #[test]
+    fn caller_sdk_overlap_keeps_ineligible_producer_claims() {
+        let (root, modules) = sdk_selection_fixture();
+        let first = modules[0].clone();
+        let source_root = first.source_sets[0].source_roots[0].clone();
+        for (language, suffix) in [
+            (CompilerLanguage::Java, "java"),
+            (CompilerLanguage::Kotlin, "kt"),
+        ] {
+            let existing = source_root.join(format!("Use.{suffix}"));
+            let future = source_root.join(format!("New.{suffix}"));
+            let other_suffix = if suffix == "java" { "kt" } else { "java" };
+            for failure in [
+                "unsupported-sdk",
+                "null-policy",
+                "incomplete-roots",
+                "incomplete-compiler",
+                "ambiguous-producers",
+            ] {
+                let mut second = first.clone();
+                second.module.push_str("-other-producer");
+                second.source_sets[0]
+                    .compiler_tasks
+                    .retain(|task| task.language == language);
+                let task = &mut second.source_sets[0].compiler_tasks[0];
+                match failure {
+                    "unsupported-sdk" if language == CompilerLanguage::Java => {
+                        task.options
+                            .insert("release".into(), serde_json::json!(999));
+                    }
+                    "unsupported-sdk" => task.arguments.push("-Xjdk-release=999".into()),
+                    "null-policy" => {
+                        task.options
+                            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+                    }
+                    "incomplete-roots" => {
+                        task.options
+                            .insert("sdkProducerClaims".into(), serde_json::Value::Null);
+                    }
+                    "incomplete-compiler" => task.complete = false,
+                    "ambiguous-producers" => {}
+                    _ => unreachable!(),
+                }
+                if failure == "ambiguous-producers" {
+                    let duplicate = task.clone();
+                    second.source_sets[0].compiler_tasks.push(duplicate);
+                }
+                let model = ProjectSnapshot::new(vec![first.clone(), second]);
+                assert!(
+                    model.sdk_api_for_file(&existing).is_none(),
+                    "{suffix}/{failure}: current exact overlap"
+                );
+                assert!(
+                    model.sdk_api_for_file(&future).is_none(),
+                    "{suffix}/{failure}: future overlap"
+                );
+                assert!(
+                    model
+                        .sdk_api_for_file(&source_root.join(format!("New.{other_suffix}")))
+                        .is_some(),
+                    "{suffix}/{failure}: another language is not this producer"
+                );
+            }
+        }
+        for (language, suffix) in [
+            (CompilerLanguage::Java, "java"),
+            (CompilerLanguage::Kotlin, "kt"),
+        ] {
+            let mut same_source_set = first.clone();
+            let mut unsupported = same_source_set.source_sets[0]
+                .compiler_tasks
+                .iter()
+                .find(|task| task.language == language)
+                .unwrap()
+                .clone();
+            if language == CompilerLanguage::Java {
+                unsupported.task.push_str("Other");
+                unsupported
+                    .options
+                    .insert("release".into(), serde_json::json!(999));
+            } else {
+                // This is a duplicate of the publicly selected producing task, not a KAPT consumer.
+                unsupported.arguments.push("-Xjdk-release=999".into());
+            }
+            same_source_set.source_sets[0]
+                .compiler_tasks
+                .push(unsupported);
+            let model = ProjectSnapshot::new(vec![same_source_set]);
+            for name in [format!("Use.{suffix}"), format!("New.{suffix}")] {
+                assert!(
+                    model.sdk_api_for_file(&source_root.join(name)).is_none(),
+                    "same SourceSet must reject multiple actual producers"
+                );
+            }
+            let other = if suffix == "java" { "kt" } else { "java" };
+            assert!(model
+                .sdk_api_for_file(&source_root.join(format!("New.{other}")))
+                .is_some());
+        }
+        let with_auxiliary = first.clone();
+        let mut auxiliary = with_auxiliary.source_sets[0].compiler_tasks[1].clone();
+        auxiliary.task = ":kaptGenerateStubsKotlin".into();
+        auxiliary.task_type = "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask".into();
+        auxiliary
+            .options
+            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+        auxiliary
+            .options
+            .insert("sdkProducerClaims".into(), serde_json::Value::Null);
+        let mut other = first.clone();
+        other.module.push_str("-nonproducer");
+        other.source_sets[0].compiler_tasks = vec![auxiliary];
+        other.source_sets[0].kotlin_compile_task = None;
+        let model = ProjectSnapshot::new(vec![with_auxiliary, other]);
+        for suffix in ["java", "kt"] {
+            assert!(
+                model
+                    .sdk_api_for_file(&source_root.join(format!("New.{suffix}")))
+                    .is_some(),
+                "unselected KAPT task and Kotlin-read Java headers cannot veto {suffix}"
+            );
+        }
+        let mut headers = first.clone();
+        headers.module.push_str("-kotlin-header-consumer");
+        headers.source_sets[0]
+            .compiler_tasks
+            .retain(|task| task.language == CompilerLanguage::Kotlin);
+        let task = &mut headers.source_sets[0].compiler_tasks[0];
+        task.source_files = vec![source_root.join("Use.java")];
+        task.options
+            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+        let headers = ProjectSnapshot::new(vec![first, headers]);
+        for file in ["Use.java", "New.java"] {
+            assert!(
+                headers.sdk_api_for_file(&source_root.join(file)).is_some(),
+                "a Kotlin Java-header input cannot claim Java production"
+            );
+        }
+        for unrelated in [false, true] {
+            for proof in ["known-empty", "missing", "opaque", "incomplete-compiler"] {
+                let first = modules[0].clone();
+                let mut unknown = first.source_sets[0].clone();
+                unknown.name = "unproved-inputs".into();
+                unknown.source_roots = vec![root.join("other-declared-root")];
+                unknown
+                    .compiler_tasks
+                    .retain(|task| task.language == CompilerLanguage::Java);
+                unknown.kotlin_compile_task = None;
+                let task = &mut unknown.compiler_tasks[0];
+                task.task = ":compileUnknownJava".into();
+                task.source_files.clear();
+                task.options
+                    .insert("sdkProducerClaims".into(), serde_json::Value::Null);
+                task.options
+                    .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+                if proof == "known-empty" || proof == "opaque" {
+                    task.options.insert(
+                        "sdkProducerClaims".into(),
+                        serde_json::json!({
+                            "adapter":"gradle-producing-source-trees-v1", "task":task.task,
+                            "language":task.language, "roots":[], "complete":proof == "known-empty",
+                        }),
+                    );
+                }
+                if proof == "incomplete-compiler" {
+                    task.complete = false;
+                }
+                let model = if unrelated {
+                    let mut other = first.clone();
+                    other.module.push_str("-unrelated");
+                    other.source_sets = vec![unknown];
+                    ProjectSnapshot::new(vec![first, other])
+                } else {
+                    let mut local = first;
+                    local.source_sets.push(unknown);
+                    ProjectSnapshot::new(vec![local])
+                };
+                assert_eq!(
+                    model
+                        .sdk_api_for_file(&source_root.join("Use.java"))
+                        .is_some(),
+                    unrelated || proof == "known-empty",
+                    "absent source_files is not an independently complete empty inventory: {proof}"
+                );
+                assert_eq!(model.sdk_api_for_file(&source_root.join("New.java")).is_some(), unrelated || proof == "known-empty",
+                "empty current inputs do not prove disjoint future ownership within the same modeled module");
+                assert!(
+                    model
+                        .sdk_api_for_file(&source_root.join("New.kt"))
+                        .is_some(),
+                    "Java producer uncertainty does not veto Kotlin"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2351,6 +3230,8 @@ mod tests {
         std::fs::write(home.join("release"), "JAVA_VERSION=\"1.8.0_352\"\n").unwrap();
         std::fs::write(home.join("jre/lib/rt.jar"), "selected legacy runtime").unwrap();
         let mut module = modules[0].clone();
+        module.source_sets[0].compiler_tasks.truncate(1);
+        module.source_sets[0].kotlin_compile_task = None;
         let task = &mut module.source_sets[0].compiler_tasks[0];
         task.java_home = Some(home.clone());
         task.options.get_mut("javaCompilerRecipe").unwrap()["language_version"] = "8".into();
@@ -2396,7 +3277,31 @@ mod tests {
                 .iter()
                 .filter(|origin| origin.starts_with("jdk:"))
                 .collect::<Vec<_>>();
-            assert_eq!(sdks, [&jdk_origin_id(&source)]);
+            assert!(
+                sdks.is_empty(),
+                "raw source-set scope cannot choose a caller API"
+            );
+            let callers =
+                model.caller_scope_visibilities(&["jdk:/unrelated/host/lib/src.zip".into()]);
+            let own_scope = project_scope(module, &module.source_sets[0]);
+            let selected: Vec<_> = callers
+                .iter()
+                .filter(|view| view.visibility.scope == own_scope)
+                .collect();
+            assert_eq!(
+                selected.len(),
+                2,
+                "validated Java and Kotlin producing tasks"
+            );
+            for view in selected {
+                let sdks: Vec<_> = view
+                    .visibility
+                    .ordered_origins
+                    .iter()
+                    .filter(|origin| is_sdk_origin(origin))
+                    .collect();
+                assert_eq!(sdks, [&jdk_origin_id(&source)]);
+            }
             for name in ["Unsaved.java", "Unsaved.kt"] {
                 assert_eq!(
                     model.selected_jdk_source_for_file(
@@ -2422,6 +3327,9 @@ mod tests {
     fn selected_sdk_sources_refuse_cross_feature_ambiguous_or_unverified_inputs() {
         let (root, modules) = sdk_selection_fixture();
         let mut source = modules[1].source_sets[0].clone();
+        // This case adds its own selected Kotlin producer below.
+        source.compiler_tasks.truncate(1);
+        source.kotlin_compile_task = None;
         for field in ["release", "javaCompilerRecipe"] {
             let mut changed = source.clone();
             if field == "release" {
@@ -2504,6 +3412,306 @@ mod tests {
         source.kotlin_compile_task = None;
         source.compiler_metadata_incomplete = true;
         assert!(source_set_jdk_source(&source, &mut BTreeMap::new()).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_sdk_api_separates_release8_java_from_target8_kotlin() {
+        use crate::workspace::Workspace;
+        use std::io::Write;
+        let (root, modules) = sdk_selection_fixture();
+        let mut module = modules[0].clone();
+        let source_root = module.source_sets[0].source_roots[0].clone();
+        let java_path = source_root.join("Api8.java");
+        let kotlin_path = source_root.join("Api17.kt");
+        let java_key = crate::paths::file_key(&java_path);
+        let kotlin_key = crate::paths::file_key(&kotlin_path);
+        let source = &mut module.source_sets[0];
+        source.compiler_tasks.truncate(1);
+        let java = &mut source.compiler_tasks[0];
+        let home = java.java_home.clone().unwrap();
+        java.source_files = vec![java_path.clone()];
+        java.classpath.clear();
+        java.arguments = vec!["-proc:none".into()];
+        java.options.insert("release".into(), serde_json::json!(8));
+        java.options.get_mut("javaCompilerRecipe").unwrap()["api_options"] =
+            serde_json::json!(["--release", "8", "-proc:none"]);
+        let mut kotlin = java.clone();
+        kotlin.language = CompilerLanguage::Kotlin;
+        kotlin.task = ":compileKotlin".into();
+        kotlin.task_type = "org.jetbrains.kotlin.gradle.tasks.KotlinCompile".into();
+        // Kotlin reads Java headers too; that does not make it the Java producing task.
+        kotlin.source_files = vec![kotlin_path.clone(), java_path.clone()];
+        kotlin.arguments.clear();
+        kotlin
+            .options
+            .insert("jvmTarget".into(), serde_json::json!("1.8"));
+        source.kotlin_compile_task = Some(kotlin.task.clone());
+        source.compiler_tasks.push(kotlin);
+        for task in &mut source.compiler_tasks {
+            task.options.insert("sdkSourcePolicy".into(), serde_json::json!({
+                "adapter": "gradle-source-tree-stock-patterns-v1", "task": task.task,
+                "language": task.language, "authored_roots": [source_root],
+                "future_roots": [source_root], "generated_roots": [source_root.join("generated")],
+                "default_excludes": sdk_source_default_excludes(),
+            }));
+            task.options.insert(
+                "sdkProducerClaims".into(),
+                serde_json::json!({
+                    "adapter": "gradle-producing-source-trees-v1", "task": task.task,
+                    "language": task.language, "roots": [source_root], "complete": true,
+                }),
+            );
+        }
+        let fixtures: &[(&str, &[u8])] = &[
+            (
+                "java/lang/Object",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Object.sig"),
+            ),
+            (
+                "java/lang/Number",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Number.sig"),
+            ),
+            (
+                "java/lang/String",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/String.sig"),
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicInteger",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/AtomicInteger.sig"
+                ),
+            ),
+            (
+                "java/io/Serializable",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/Serializable.sig"
+                ),
+            ),
+            (
+                "java/lang/Comparable",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/Comparable.sig"
+                ),
+            ),
+            (
+                "java/lang/CharSequence",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/CharSequence.sig"
+                ),
+            ),
+        ];
+        let mut signatures =
+            zip::ZipWriter::new(std::fs::File::create(home.join("lib/ct.sym")).unwrap());
+        for (owner, bytes) in fixtures {
+            signatures
+                .start_file(
+                    format!("8/java.base/{owner}.sig"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            signatures.write_all(bytes).unwrap();
+        }
+        signatures.finish().unwrap();
+        let mut sources =
+            zip::ZipWriter::new(std::fs::File::create(home.join("lib/src.zip")).unwrap());
+        let string_source = "package java.lang; public final class String { public String trim(){return this;} public String strip(){return this;} public int length(){return 0;} }";
+        sources
+            .start_file(
+                "java.base/java/lang/String.java",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        sources.write_all(string_source.as_bytes()).unwrap();
+        sources.finish().unwrap();
+        let model = Arc::new(ProjectSnapshot::new(vec![module.clone()]));
+        let java_api = model.sdk_api_for_file(&java_path).unwrap();
+        let kotlin_api = model.sdk_api_for_file(&kotlin_path).unwrap();
+        assert_eq!(java_api.release, Some(8));
+        let new_java_path = source_root.join("NewApi8.java");
+        let new_kotlin_path = source_root.join("NewApi17.kt");
+        assert_eq!(
+            model.sdk_api_for_file(&new_java_path).unwrap().release,
+            Some(8)
+        );
+        assert_eq!(
+            model.sdk_api_for_file(&new_kotlin_path).unwrap().release,
+            None
+        );
+        for unavailable in [
+            source_root.join("generated/Kapt.java"),
+            source_root.join("generated/Ksp.kt"),
+            source_root.join("Script.kts"),
+        ] {
+            assert!(
+                model.sdk_api_for_file(&unavailable).is_none(),
+                "{unavailable:?}"
+            );
+        }
+        assert!(
+            model.selected_jdk_source_for_file(&java_path).is_none(),
+            "SDK17 source cannot seed Java API8"
+        );
+        assert_eq!(
+            model.selected_jdk_source_for_file(&kotlin_path),
+            kotlin_api.source_zip
+        );
+        assert_eq!(
+            kotlin_api.release, None,
+            "jvmTarget alone does not restrict SDK APIs"
+        );
+        assert_eq!(java_api.source_zip, kotlin_api.source_zip);
+        assert_ne!(java_api.origin(), kotlin_api.origin());
+        assert!(model.artifact_revisions()[&java_api.origin()].contains(&java_api.identity()));
+        let mut ws = Workspace::new();
+        ws.set_project_model(model.clone());
+        let indexed = crate::sdk_api::index(java_api, &root.join("extract")).unwrap();
+        assert!(
+            indexed.complete,
+            "selected portable ct.sym subset must have useful declaration coverage"
+        );
+        assert!(!indexed.batches.is_empty());
+        for batch in indexed.batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        let full_sources = crate::deps::resolve_jdk_sources(
+            &home.join("lib/src.zip"),
+            &root.join("extract"),
+            &mut crate::parser::KotlinParser::new(),
+            &mut crate::java::JavaParser::new(),
+        );
+        for batch in full_sources {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        let java_text = "class Api8 { int value(java.util.concurrent.atomic.AtomicInteger i, String s) { i.incrementAndGet(); s.trim(); s.strip(); return 0; } }";
+        let kotlin_text = "fun value(i: java.util.concurrent.atomic.AtomicInteger, s: java.lang.String): String = s.strip()";
+        ws.open(&java_key, java_text.into());
+        ws.open(&kotlin_key, kotlin_text.into());
+        let new_java_key = crate::paths::file_key(&new_java_path);
+        let new_kotlin_key = crate::paths::file_key(&new_kotlin_path);
+        // Neither new unsaved file occurs in model.source_files; root policy must suffice.
+        ws.open(&new_java_key, java_text.into());
+        ws.open(&new_kotlin_key, kotlin_text.into());
+        ws.assume_index_complete_for_tests();
+        for (file, text, prefix, expected, stub) in [
+            (&java_key, java_text, "i.inc", "incrementAndGet", true),
+            (&java_key, java_text, "s.tr", "trim", true),
+            (&kotlin_key, kotlin_text, "s.str", "strip", false),
+            (&new_java_key, java_text, "i.inc", "incrementAndGet", true),
+            (&new_java_key, java_text, "s.tr", "trim", true),
+            (&new_kotlin_key, kotlin_text, "s.str", "strip", false),
+        ] {
+            let offset = text.find(prefix).unwrap() + prefix.len();
+            let completion = ws
+                .complete(file, offset, true)
+                .expect("useful SDK completion");
+            assert!(
+                completion.items.iter().any(|item| item.label == expected),
+                "{file}: {completion:?}"
+            );
+            let start = text.find(&format!("{expected}(")).unwrap();
+            let definitions = ws.goto_definition(file, start);
+            assert_eq!(definitions.len(), 1, "{file}: {definitions:?}");
+            assert_eq!(
+                definitions[0].file.replace('\\', "/").contains("/jdk-api/"),
+                stub,
+                "{definitions:?}"
+            );
+            // SDK API declarations are eagerly written; only archive-backed sources are lazy.
+            if !stub {
+                assert!(crate::deps::materialize_source_file(Path::new(
+                    &definitions[0].file
+                )));
+            }
+            assert!(std::fs::read_to_string(&definitions[0].file).unwrap()
+                [definitions[0].start_byte..definitions[0].end_byte]
+                .starts_with(expected));
+        }
+        let strip_offset = java_text.find("s.strip").unwrap() + "s.str".len();
+        assert!(!ws
+            .complete(&java_key, strip_offset, true)
+            .is_some_and(|result| result.items.iter().any(|item| item.label == "strip")));
+        assert!(
+            ws.diagnostics(&java_key)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("strip")),
+            "Java release8 must reject strip"
+        );
+        assert!(
+            ws.diagnostics(&kotlin_key).is_empty(),
+            "SDK17 Kotlin strip is valid"
+        );
+        let mut restricted = module.clone();
+        restricted.source_sets[0].compiler_tasks[1]
+            .arguments
+            .push("-Xjdk-release=8".into());
+        ws.set_project_model(Arc::new(ProjectSnapshot::new(vec![restricted])));
+        let offset = kotlin_text.find("s.str").unwrap() + "s.str".len();
+        assert!(!ws
+            .complete(&kotlin_key, offset, true)
+            .is_some_and(|result| result.items.iter().any(|item| item.label == "strip")));
+        ws.set_project_model(model);
+        assert!(
+            !ws.complete(&kotlin_key, offset, true)
+                .is_some_and(|result| result.items.iter().any(|item| item.label == "strip")),
+            "restoring model metadata cannot resurrect retired SDK source facts"
+        );
+        let generation = ws.analysis_generation();
+        let restored = crate::deps::resolve_jdk_sources(
+            &home.join("lib/src.zip"),
+            &root.join("extract"),
+            &mut crate::parser::KotlinParser::new(),
+            &mut crate::java::JavaParser::new(),
+        );
+        assert!(
+            !restored.is_empty(),
+            "selected SDK source inventory must be republished"
+        );
+        for batch in restored {
+            assert_eq!(
+                batch.origin.as_ref().unwrap().origin_id,
+                jdk_origin_id(&home.join("lib/src.zip"))
+            );
+            assert!(ws.index_dependency_batch_for_generation(generation, batch));
+        }
+        assert!(ws
+            .complete(&kotlin_key, offset, true)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.label == "strip"));
+        let mut ambiguous = module.clone();
+        let second_java = ambiguous.source_sets[0].compiler_tasks[0].clone();
+        ambiguous.source_sets[0].compiler_tasks.push(second_java);
+        assert!(ProjectSnapshot::new(vec![ambiguous])
+            .sdk_api_for_file(&java_path)
+            .is_none());
+        let mut overlapping = module.clone();
+        overlapping.module.push_str("-other-owner");
+        let overlapping = ProjectSnapshot::new(vec![module.clone(), overlapping]);
+        assert!(overlapping.sdk_api_for_file(&java_path).is_none());
+        assert!(overlapping.sdk_api_for_file(&new_java_path).is_none());
+        let mut opaque = module.clone();
+        opaque.source_sets[0].compiler_tasks[0]
+            .options
+            .get_mut("sdkSourcePolicy")
+            .unwrap()["future_roots"] = serde_json::json!([]);
+        let opaque = ProjectSnapshot::new(vec![opaque]);
+        assert!(
+            opaque.sdk_api_for_file(&java_path).is_some(),
+            "exact existing claim survives opaque future policy"
+        );
+        assert!(
+            opaque.sdk_api_for_file(&new_java_path).is_none(),
+            "opaque task filters must not admit new Java files"
+        );
+        let mut unsupported = module;
+        unsupported.source_sets[0].compiler_tasks[0]
+            .options
+            .insert("release".into(), serde_json::json!(999));
+        assert!(ProjectSnapshot::new(vec![unsupported])
+            .sdk_api_for_file(&java_path)
+            .is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3194,8 +4402,14 @@ mod tests {
         }
         let modules = parse_dump(&format!(
             "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nARTIFACT\tmain\t{}\tMODULE\tvendor\tmissing\t1\nSOURCEQUERY\tmain\tfailed\nSOURCEARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nPOMQUERY\tmain\tfailed\nPOMARTIFACT\tmain\t{}\tMODULE\tvendor\tapi\t1\nPOMARTIFACT\tmain\t{}\tMODULE\tvendor\tparent\t1\nEND\t:app\n",
-            root.display(), binary.display(), binary.display(), root.join("missing.jar").display(),
-            sources.display(), pom.display(), parent.display()));
+            root.display(),
+            binary.display(),
+            binary.display(),
+            root.join("missing.jar").display(),
+            sources.display(),
+            pom.display(),
+            parent.display()
+        ));
         let selected = ProjectSnapshot::new(modules.clone());
         let api = Coordinate::parse("vendor:api:1").unwrap();
         let missing = Coordinate::parse("vendor:missing:1").unwrap();
@@ -4397,10 +5611,12 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
                 "maven:vendor:api:1",
             ]
         );
-        assert!(visibilities.iter().all(|scope| !scope
-            .ordered_origins
-            .iter()
-            .any(|origin| origin == "jdk:chosen")));
+        assert!(visibilities.iter().all(|scope| {
+            !scope
+                .ordered_origins
+                .iter()
+                .any(|origin| origin == "jdk:chosen")
+        }));
         assert_eq!(
             model
                 .coordinates_for_file(Path::new("/repo/modules/editing/src/test/java/Use.java"))

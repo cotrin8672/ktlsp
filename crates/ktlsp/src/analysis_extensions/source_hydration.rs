@@ -468,6 +468,118 @@ mod tests {
         assert!(bound(&mut ws));
         assert_eq!(drain(&mut ws), 0);
     }
+    #[test]
+    fn selected_source_producers_wake_and_replace_at_unchanged_epoch() {
+        let fixture = Fixture::new();
+        let mut index = Index::new();
+        let batch = crate::deps::resolve_local_jar_stubs(
+            &fixture.binary,
+            &fixture.extract,
+            &mut KotlinParser::new(),
+            &mut JavaParser::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|batch| batch.file.ends_with("Factory.java"))
+        .unwrap();
+        index.replace_file(&batch.file, batch.symbols.clone(), Tier::Durable);
+        index.set_file_origin(&batch.file, batch.origin.clone().unwrap());
+        let mut host = AnalysisExtensions::new(vec![Arc::new(Probe)]);
+        host.select_library_source(
+            &index,
+            &batch.file,
+            batch.origin.clone(),
+            batch.library_source.clone(),
+        );
+        let epoch = host.source_epoch;
+        let stamp = host.source_stamp(&index, &batch.file).unwrap();
+        let old = host
+            .source_producer(&batch.file, stamp.clone())
+            .ready
+            .subscribe();
+        host.attempted_sources
+            .insert(batch.file.clone(), stamp.clone());
+        // Re-publishing identical authority must preserve the active producer and its attempt.
+        host.select_library_source(
+            &index,
+            &batch.file,
+            batch.origin.clone(),
+            batch.library_source.clone(),
+        );
+        assert!(!*old.borrow());
+        assert_eq!(host.attempted_sources.get(&batch.file), Some(&stamp));
+        // The selected representation can disappear without advancing the model generation.
+        host.select_library_source(&index, &batch.file, None, None);
+        assert!(*old.borrow());
+        assert_eq!(host.source_epoch, epoch);
+        assert!(!host.attempted_sources.contains_key(&batch.file));
+        host.select_library_source(
+            &index,
+            &batch.file,
+            batch.origin.clone(),
+            batch.library_source.clone(),
+        );
+        let fresh = host.source_producer(&batch.file, stamp).ready.subscribe();
+        assert!(!old.same_channel(&fresh));
+        assert!(!*fresh.borrow());
+        // A changed indexed symbol generation is also an exact authority change, not a global wait.
+        let mut changed = batch.symbols.clone();
+        changed[0].start_byte += 1;
+        index.replace_file(&batch.file, changed, Tier::Durable);
+        host.select_library_source(&index, &batch.file, batch.origin, batch.library_source);
+        assert!(*fresh.borrow());
+        assert_eq!(host.source_epoch, epoch);
+    }
+
+    #[test]
+    fn forgotten_source_producers_wake_queued_and_running_waiters_at_unchanged_epoch() {
+        for running in [false, true] {
+            let fixture = Fixture::new();
+            let mut index = Index::new();
+            let batch = crate::deps::resolve_local_jar_stubs(
+                &fixture.binary,
+                &fixture.extract,
+                &mut KotlinParser::new(),
+                &mut JavaParser::new(),
+            )
+            .unwrap()
+            .into_iter()
+            .find(|batch| batch.file.ends_with("Factory.java"))
+            .unwrap();
+            index.replace_file(&batch.file, batch.symbols, Tier::Durable);
+            index.set_file_origin(&batch.file, batch.origin.clone().unwrap());
+            let mut host = AnalysisExtensions::new(vec![Arc::new(Probe)]);
+            host.select_library_source(&index, &batch.file, batch.origin, batch.library_source);
+            let epoch = host.source_epoch;
+            let stamp = host.source_stamp(&index, &batch.file).unwrap();
+            let ready = host
+                .source_producer(&batch.file, stamp.clone())
+                .ready
+                .subscribe();
+            if running {
+                host.attempted_sources.insert(batch.file.clone(), stamp);
+            }
+            host.forget_hydrated_source(&batch.file);
+            assert!(*ready.borrow());
+            assert!(!host.source_producers.contains_key(&batch.file));
+            assert!(!host.attempted_sources.contains_key(&batch.file));
+            assert_eq!(host.source_epoch, epoch);
+        }
+    }
+}
+
+pub(super) struct SourceProducer {
+    stamp: SourceStamp,
+    epoch: u64,
+    ready: tokio::sync::watch::Sender<bool>,
+}
+
+// A failed/panicking load must release its exact waiters too; success stays owned until acceptance.
+struct SourceSignal(tokio::sync::watch::Sender<bool>);
+impl Drop for SourceSignal {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
 }
 
 pub(crate) struct SourceRequest {
@@ -475,6 +587,7 @@ pub(crate) struct SourceRequest {
     stamp: SourceStamp,
     epoch: u64,
     source: Arc<LibrarySource>,
+    _signal: SourceSignal,
 }
 
 pub(crate) struct PreparedSource {
@@ -561,9 +674,73 @@ impl AnalysisExtensions {
         } else {
             self.library_sources.remove(file);
         }
-        if self.hydrated_sources.get(file) != self.source_stamp(index, file).as_ref() {
+        let stamp = self.source_stamp(index, file);
+        if self.source_producers.get(file).is_some_and(|producer| {
+            Some(&producer.stamp) != stamp.as_ref() || producer.epoch != self.source_epoch
+        }) {
+            self.forget_source_producer(file);
+        }
+        if self
+            .hydrated_sources
+            .get(file)
+            .is_some_and(|hydrated| Some(hydrated) != stamp.as_ref())
+        {
             self.forget_hydrated_source(file);
         }
+    }
+
+    fn source_producer(&mut self, file: &str, stamp: SourceStamp) -> &mut SourceProducer {
+        let replace = self
+            .source_producers
+            .get(file)
+            .is_none_or(|producer| producer.stamp != stamp || producer.epoch != self.source_epoch);
+        if replace {
+            if let Some(old) = self.source_producers.remove(file) {
+                old.ready.send_replace(true);
+            }
+            let (ready, _) = tokio::sync::watch::channel(false);
+            self.source_producers.insert(
+                file.into(),
+                SourceProducer {
+                    stamp,
+                    epoch: self.source_epoch,
+                    ready,
+                },
+            );
+        }
+        self.source_producers.get_mut(file).unwrap()
+    }
+
+    pub(crate) fn source_wait(
+        &mut self,
+        index: &Index,
+        owner: &str,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        if self.suspended {
+            return None;
+        }
+        for file in self.store.requested_source_files_for(owner) {
+            let Some(stamp) = self.source_stamp(index, &file) else {
+                continue;
+            };
+            if self.attempted_sources.get(&file) == Some(&stamp) {
+                // A completed failed input stays Unknown instead of retrying on every request.
+                if !self.source_producers.get(&file).is_some_and(|producer| {
+                    producer.stamp == stamp
+                        && producer.epoch == self.source_epoch
+                        && !*producer.ready.borrow()
+                }) {
+                    continue;
+                }
+            }
+            let producer = self.source_producer(&file, stamp);
+            let ready = producer.ready.subscribe();
+            let pending = !*ready.borrow();
+            if pending {
+                return Some(ready);
+            }
+        }
+        None
     }
 
     pub(crate) fn take_source_requests(&mut self, index: &Index) -> Vec<SourceRequest> {
@@ -571,7 +748,38 @@ impl AnalysisExtensions {
             return Vec::new();
         }
         let mut requests = Vec::new();
-        for file in self.store.requested_source_files() {
+        let wanted = self.store.requested_source_files();
+        let obsolete: Vec<_> = self
+            .source_producers
+            .keys()
+            .filter(|file| !wanted.contains(*file))
+            .cloned()
+            .collect();
+        for file in obsolete {
+            if let Some(producer) = self.source_producers.remove(&file) {
+                producer.ready.send_replace(true);
+            }
+        }
+        let priority: std::collections::BTreeSet<_> = self
+            .source_producers
+            .iter()
+            .filter(|(_, producer)| {
+                producer.ready.receiver_count() > 0 && !*producer.ready.borrow()
+            })
+            .map(|(file, _)| file.clone())
+            .collect();
+        let mut foreground = wanted.iter().filter(|file| priority.contains(*file));
+        let mut background = wanted.iter().filter(|file| !priority.contains(*file));
+        while requests.len() < SOURCE_BATCH {
+            // Serve active requests first while reserving one slot for background progress.
+            let next = if requests.len() + 1 == SOURCE_BATCH {
+                background.next().or_else(|| foreground.next())
+            } else {
+                foreground.next().or_else(|| background.next())
+            };
+            let Some(file) = next.cloned() else {
+                break;
+            };
             let Some(stamp) = self.source_stamp(index, &file) else {
                 continue;
             };
@@ -579,15 +787,15 @@ impl AnalysisExtensions {
                 continue;
             }
             self.attempted_sources.insert(file.clone(), stamp.clone());
+            let producer = self.source_producer(&file, stamp.clone());
+            let signal = SourceSignal(producer.ready.clone());
             requests.push(SourceRequest {
                 source: self.library_sources[&file].1.clone(),
                 file,
                 stamp,
                 epoch: self.source_epoch,
+                _signal: signal,
             });
-            if requests.len() == SOURCE_BATCH {
-                break;
-            }
         }
         requests
     }
@@ -633,7 +841,19 @@ impl AnalysisExtensions {
         true
     }
 
+    pub(super) fn forget_source_producer(&mut self, file: &str) {
+        if let Some(producer) = self.source_producers.remove(file) {
+            if !*producer.ready.borrow()
+                && self.attempted_sources.get(file) == Some(&producer.stamp)
+            {
+                self.attempted_sources.remove(file);
+            }
+            producer.ready.send_replace(true);
+        }
+    }
+
     fn forget_hydrated_source(&mut self, file: &str) {
+        self.forget_source_producer(file);
         if self.hydrated_sources.remove(file).is_some() {
             self.inputs.remove(file);
             self.store.remove_source(file);
@@ -642,6 +862,14 @@ impl AnalysisExtensions {
 
     pub(super) fn invalidate_hydrated_sources(&mut self) {
         self.source_epoch = self.source_epoch.wrapping_add(1);
+        for (file, producer) in std::mem::take(&mut self.source_producers) {
+            if !*producer.ready.borrow()
+                && self.attempted_sources.get(&file) == Some(&producer.stamp)
+            {
+                self.attempted_sources.remove(&file);
+            }
+            producer.ready.send_replace(true);
+        }
         for (file, _) in std::mem::take(&mut self.hydrated_sources) {
             self.attempted_sources.remove(&file);
             self.inputs.remove(&file);

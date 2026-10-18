@@ -6,7 +6,178 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Current93 verification in progress
+## Current96 broad checks pass; release and project validation pending
+
+Current source fixes caller-specific SDK views, SDK11 legacy signatures, nested
+Map.Entry generic result chains, Gradle future-file selection and the exporter
+deprecation that blocked real Gradle imports. Shared extension-source readiness
+now covers semantic consumers and rejects stale close/reopen requests.
+The same29 focused cases pass, including all12 reproduced failures. The full
+workspace passes1,650/zero failed/five ignored across40 groups (495.797s including
+build); Root independently verified raw bytes/hash, group totals, exit0 and
+owned closure. Evidence: native-integrated96-1/workspace-receipt.json SHA256
+b7b985b400a76b10468aa7b3e44861803604547a9a3b904d427a577204ffb2e1.
+Release build is active. Current native CEM and original Gradle nine-request
+acceptance remain unproved until the new immutable copy runs; the older95
+failures below are retained. AP current-generation support and Moshi dirty
+mixed-producer support remain outside-checkout work. No all-six-project,
+compiler-plugin, IDEA-parity or speed acceptance is claimed.
+
+## Previous95 broad and core editor checks pass; Gradle import blocked
+
+The focused95 snapshot passes18 tests with zero failures (2.19s test execution):
+caller-specific SDKs, unsaved dotted/Unicode Kotlin filenames, nested SDK
+completion/navigation, first extension responses, cancellation, invalidation and
+foreground/background queue progress. The filename and Map.Entry cases first
+fail useful-completion assertions; queue ordering first fails while its two
+controls pass. Evidence: recovery89/focus95-green.raw,
+recovery89/sdk95-filename-red.raw, recovery89/sdk95-nested-entry-red.raw and
+recovery89/extension95-priority-red.raw.
+The final revision retains17 of those tests and strengthens the nested SDK case
+to require String completion after Map.Entry<String,String>.getKey(), for both
+qualified and imported Entry. A proposed global parameterized-owner rejection
+was removed to preserve existing source-nested completion; full outer-argument
+fidelity remains a coverage gap. Its full workspace run returns1,634 passed,
+three failed and five ignored; all17 retained focused cases, including the
+strengthened String chain, pass. The three failures reproduce in isolated
+processes. Their fixtures incorrectly demand lazy materialization of an eager
+stub, edit the wrong Kotlin producer after the shared fixture gained a second
+task, or omit the new explicit caller ownership metadata. Corrections retain
+the expected completion items, exact navigation spans and file contents.
+Evidence: native-integrated95-1/receipt.json SHA256
+2c3b74434c7a47f6916e0c51bf4120f5ab9fea12947f61964488a5a548839e9e;
+recovery89/cem90/sdk95-isolated-three1/receipt.json SHA256
+202d59f40fd7be5ea0684d31114b1049d00de25f68fb8e9be0a24af630142ffa.
+The next focused run passes two cases and reaches a later unready-state
+assertion in the third: metadata restoration alone cannot resurrect retired
+SDK facts. That test now requires absence before actual SDK batch publication
+and the original useful result afterward. The remaining focused case now passes,
+and the full95-3 workspace suite passes1,637/zero failed/five ignored across40
+groups (290.75s including build). Root verified the raw artifact and independently
+summed every group; regular output file closed and owned jobs ended without
+forced cleanup. Evidence: native-integrated95-3/workspace-receipt.json SHA256
+555d4a97a90ac7b0c209f058efb2ea10e9db9c1f1ccefa5d150f8711b00750d2.
+The main release build also exits0 (491.016s), with no live owned jobs or forced
+cleanup. Root verified all327 current input guards and12 artifact references in
+native-integrated95-3/main-ready.json (SHA256
+7483887117ba55c716bdafdd85e545ce184e43278943083498e180fb921f0e4f).
+The immutable19987456-byte binary has SHA256
+1c3a21e48adfb2fa5349d35cd29d2b2c867cafd777b2ce134e8830f166236a61.
+The same copy passes the real Neovim basic9, semantic137 and Java373 checks
+(519 total, zero failures). The initial console-line count missed six coalesced
+Java checks; the structured result records373 and157 first-attempt responses.
+Its bound semantic-acceptance.json SHA256 is
+a5fece777634a6e3830ff20d33e6f26c171d80a98b48f9f0b12b890f9dc31cc7.
+All three owned runs close without residuals; Root
+verified44 artifact references in recovery89/editor95-core1/receipt.json, SHA256
+1d05621ff77cd8c4ed9eaf22befe3301c6536ce9783d818365e5f2061d982d9b.
+The fresh Gradle import fails both normal offline/online attempts before model
+capture: new exporter line510 uses deprecated String.toLowerCase(Locale.ROOT),
+which Gradle8.14.2 treats as a script compilation error. The nine SDK requests
+remain unrun. The outside-checkout one-line correction passes a minimal
+same-Gradle warnings-as-errors causal pair (deprecated exit1, fixed exit0),
+with clean owned closure. This proves script compatibility, not a full export;
+recovery89/sdk-native95-import-failure/causal-pair96-1/receipt.json SHA256
+2abb0a34a636dfb93f38df0a237bac170a179f74d374c82c9724d21a979ce9e9.
+External-consumer tests pass4/zero failed and its release build exits0. Root
+verified all327 final current input guards and17 artifact references before
+the96 source changes. Final receipt native-integrated95-3/receipt.json SHA256
+d16c912bf08014ee7abd5053ae9321f2a5e9fab1812bbc3c03c1c758409451c4.
+Its20045312-byte external binary has SHA256
+6548bbaf985f4f8a4c4713784a3813abe2dfc92cd0c11cd0c82a297ad82f820a.
+Both shared libraries recompile in the independent consumer build despite lock
+alignment; third-party dependencies are Fresh. This is no build-speed result.
+No current all-six-project acceptance or performance claim follows.
+The original18 CEM editor cases finish against the immutable95 copy:
+five raw matched/nine mismatched/four unmeasured, with both scenarios naturally
+closed and private properties unchanged. All nine valid canonical positives are
+missing; its only canonical match is the unknown-receiver negative control.
+No successful current model load is observed, so these are not CEM acceptance.
+Evidence: recovery89/cem95-original18-95-1/original18-acceptance.json SHA256
+4dda96d9ad11f88959a3d4ecf554cf67f39ed3826543395e96faab9f5d9b8059.
+Their normal Gradle9.6.1 offline/online imports also fail at the same exporter
+line510, without a project warnings-as-errors setting. Thus the correction is
+required for CEM as well, not merely strict Gradle8 builds. Both failed imports
+remain recorded; no model or editor success is inferred from fallback indexing.
+
+The96 tests-only baseline compiles and returns17 passed/12 failed across two
+library groups: three SDK11 failures, three task-path-policy failures and six
+extension consumer/reopen failures. Root verified334 current input guards and
+the raw result before applying production changes. Evidence:
+focus96-red1/receipt.json SHA256
+490ab9d642dc1910344d696a28917e6262d96fbe83763a9d44a61ce80e8d6555.
+The reviewed production patches are now applied and formatting passes. The
+same29-case focus passes all29/zero failures across two groups (2+27), retaining
+the17 positive controls and turning all12 reproduced failures green. Root
+verified its raw hash, exact group totals, exit0 and owned closure. Evidence:
+native-integrated96-1/focus96-receipt.json SHA256
+c47c8eb83d74adba005ea1e8f74b64e897b56fbc2f40d1efa54c0eb6c5c24fe3.
+The full suite now passes as recorded above; release/native validation remains pending.
+They correct SDK11 legacy ct.sym paths (one actual194-model producer uses
+SDK11/release8), capture stock Ant exclusions for future-file ownership, and
+share the first-source wait plus close/reopen input identity across semantic
+consumers. The one-line exporter lowercase correction is included. SDK11 layout,
+captured Ant defaults and consumer-wait draft manifests are respectively under
+recovery89/sdk11-layout95-draft/status.json,
+recovery89/sdk-ant95-draft/promotion-qualification.json and
+recovery89/extension96-consumer-{tests,production}.patch. Their Rust execution is
+pending for the new production revision. The Ant draft's normal exporter capture is verified separately from
+the extracted matcher: six task records include the captured exclusions, while
+custom-pattern future roots stay unavailable; capture receipt SHA256
+b11311b570d210fdb9b98fcf08497d41b34bfae73af5bfe968b8add5f1df66ae.
+
+Earlier94 observations retained below:
+
+Caller-specific SDK views and per-file extension-source producer waits are now
+applied to the checkout. The three SDK LSP tests pass after the fix (zero failures,
+0.39s test execution); formatting also passes. The integrated runner stopped after
+Cargo exited0 because one owned residual required termination. Its identity was
+not captured, so lifecycle acceptance remains failed and is not attributed to
+the SDK change. No broad suite, release build, or extension check ran in that
+pipeline. Evidence: native-integrated94-1/receipt.json SHA256
+418e699fe43206479c29b5827e11e0d86917c89cf8c0283886d3bbb808dabfcc.
+The runner writes a regular raw file; its EOF flag is derived from owned-process
+cleanup, not an independently observed pipe EOF.
+Direct execution of the six compiled extension tests then closes all owned jobs
+without residuals: three pass and three fail their useful-result checks. The
+three failures use an invalid test-provider contract (Direct name linkage with
+an Authored rename subject); the core rejects that combination. The fixture now
+uses Target, as the real external provider already does. Expected completion,
+navigation and diagnostic results are unchanged; a new green run remains needed.
+Evidence: recovery89/cem90/focus94-extension-direct1/receipt.json SHA256
+473f5d7739a4ec33f7a88a97f7af1f6b2493973438f4e3c09c8b39a0aabc9699.
+A separate three-test queue probe reproduces an active source waiting behind
+another unrelated batch (one failure, cancellation and background-progress
+controls pass). The worker now prioritizes active waiters while reserving one
+background slot per batch. This production change still awaits its green run.
+Raw baseline: recovery89/extension95-priority-red.raw.
+The baseline
+SDK tests run3/3 and fail their first useful AtomicInteger control. All six
+extension readiness cases also reproduce premature first responses: four have
+independent initial results, and two sharing a Windows timestamp-based fixture
+directory are qualified only by their separate fresh-process executions. Both
+original colliding results are retained. Fixture IDs now add an atomic counter,
+without changing expected semantics. Exact upstream Shadow bytes are preserved
+with a narrow .gitattributes rule and verified against the fixture provenance.
+Evidence: recovery89/cem90/focus94-red1/receipt.json SHA256
+86e710039831f112a657209a033ae8f48b58785133ac1db588bf738e827626c4;
+recovery89/cem90/focus94-isolated-red1/receipt.json SHA256
+3900970fae450c34f053912731866ea32dd3c02765e1c83bac4ae2f8e7763e15.
+New shutdown landmarks preserve field destruction order and public Workspace
+field moves; they diagnose the retained large-project cleanup failure, not fix it.
+The independent consumer lock now pins the same compatible shared dependencies
+as the host, with zero shared version/source/feature drift in actual metadata;
+host dependencies and profiles are unchanged. Root verified eight corrected
+artifact refs before copying the55,108-byte lock (SHA256
+8cdf04b6363f87aa4aecd8c62920928eea894e9845e523cc9fa86e487ac1c4c5).
+The first metadata receipt incorrectly referenced a mutable pre-resolution seed
+and remains rejected; the correction binds separate immutable seed/resolved files
+without rerunning the experiment. Evidence:
+recovery89/cem90/external-lock94-evaluation/receipt-corrected.json SHA256
+e644dea69a0c5ae455bfb30e65a271a3808210cd97b69d53decdb016926b8e4e.
+Actual build reuse and the remaining94 production checks are still pending.
+
+## Verified93 checkpoint and actual project results
 
 The narrow SDK21/target17 InProcess compiler profile now passes the40-test
 compiler group after its new captured-profile regression first failed. Other
@@ -17,7 +188,19 @@ Source enrichment now compares unique modules by build/project identity while
 preserving every other model fact and all inner ordering. The four source-snapshot
 tests and the retained actual194-module pair pass after reproducing the failure
 before the fix. Duplicate identities and binary/compiler/build-file drift remain
-rejected. A fresh normal Gradle import with this binary is still unrun.
+rejected. Actual normal Gradle194 import on immutable93 now accepts source
+enrichment despite156 reordered positions:194 modules/1,176 source sets retain
+49,390 source artifacts and72,307 POMs, with identical non-source facts. The
+accepted current-generation dependency index publishes102,260 files/1,825,236
+symbols. Root verified nine bound artifact refs and the post-guard trace; this
+proves the ordering fix through the real import path, not all-project semantics.
+Ten dependency-source failures and27 missing sources remain in that index.
+Shutdown still requires forced cleanup after the existing15-second bound; the
+owner retains exit1/AssertionError rather than converting it into lifecycle
+acceptance. No nine-RPC replay was performed while its SDK gap is unchanged.
+Evidence: recovery89/corpus90/native-five-gradle-model93-1/normal-import-acceptance.json
+SHA2564bb660108b8a91355662308aa79c1437fd8de6c53061c33284e821ae77ba3d36;
+original receipt SHA256f1bb2c38f71a5421a2f75dca32f7f31ba0210d2d5a831b0e96722eff70ea61f7.
 
 The Gradle exporter reuses its securely configured XML factory while reading
 fresh bounded POM bytes and creating a new builder per document. Extracted actual
@@ -50,23 +233,64 @@ bound artifact refs. Receipt: recovery89/cem90/editor-smoke93-1/receipt.json,
 SHA25607bda16e8cfde90f79f40e503a4cd32bf51c3b31e35fce18e3aadd8bc596bc05.
 That existing Java trace emits all five new span types (plan1, parse-shard8,
 symcache-store1, publication1, jar-resolution1); no extra measurement run was
-required. External-extension tests also pass4/4; its release build is still
-running with the single Cargo owner and CARGO_BUILD_JOBS=1.
+required. External-extension tests also pass4/4 and its release build completes.
+Root verified all311 current input hashes, eight final build refs and11 external
+copy refs before applying the next test-only94 slice. Final93 receipt:
+native-integrated93-1/receipt.json SHA256
+9345416cafaf3b5824bb89aabe726cc2a696d790e1033c79c0d21e8ea8e226e5.
+The external19,747,840-byte copy has SHA256
+3231b5a0d23839f21d85136ce0c7e5565b4da4be9de7d586e22d2c8772aff7eb.
+Its unchanged native50+shape40 corpus now passes90/90 single-attempt outcomes,
+including all three formerly failing Kotlin Any cases; shutdown is natural0.
+Receipt: external-shapes93-native1/receipt.json SHA256
+bcf14926ad667d7fbc87897f1f405bb7306d5433c0551195b04015bb69d83b4e.
+The old independent consumer lock resolves56 dependency/version pairs differently
+from the host. An outside-only host-seeded metadata control now resolves with zero
+shared version/source or feature drift, preserving independent consumer builds;
+actual artifact reuse remains unverified. The original lock bytes are retained
+in the93 copy receipt. No production dependency or profile has changed.
 Focused evidence: recovery89/cem90/focus93-summary.json,
 SHA256e6ead20f7b26748be641fa5826b868b750d78c7cac53224ef8921e8590a0a439.
 
 The processor114 failures are now bound to an absent current Java diagnostic
 store: the active KAPT/KSP bridge was not admitted, rather than a compiler run
 certifying the obsolete calls. An independent compiler control produces all
-three expected missing-method errors. Current processor-input/output ownership
-is still missing; saved generated files alone must not qualify dirty inputs.
+three expected missing-method errors. A new isolated prototype now owns actual
+KSP-to-stubs-to-active-KAPT generation for both v1/v2 on the same exact dirty
+wire inputs. Existing K1 API headers accept both generations; structured javac
+returns exactly three expected errors per generation while paired current APIs
+remain useful. No saved output substitutes for generation. Root verified20
+bound artifact refs: recovery89/corpus90/processor-current-input-output-proof93.json
+SHA256f59c9aa5d073c23c660f386514fa6e02106f397e2dae120e116b13c3213f93f4.
+A further real phase-separated generation closes KSP, stubs and active KAPT
+successfully, with the latter two reading sealed current predecessor outputs
+without rebuilding processor tasks. Five native read watches remain valid;
+a separate change-and-restore control invalidates despite identical final bytes.
+Root verified nine bound refs: recovery89/corpus90/processor-rust94-draft/
+separated-phases2/receipt.json SHA256
+997c89799bf5e81fee9761e0dee7301edbe9d6af6309bcdcc77803a9b874823f.
+The first broad-build-directory watch failure is retained. This prototype does
+not prove reuse across edits. The production Rust adapter and method-diagnostic
+admission remain outside-checkout work; original114 remains111/3. Saved generated
+files alone must not qualify dirty inputs.
 
-The genuine external-library run passed20 new source-navigation/descriptor/
+The external95 genuine cold-source check now passes all3 first responses:
+completion requires fixture.Target(I)I and the exact `twice` replacement edit,
+goto reaches the actual target, and the full diagnostic response is clean.
+The unchanged mixed Sponge project indexes15,604 library files from3 dependencies
+with zero failures/missing sources. Exit0 is graceful with no termination calls
+or owned residuals; all413 runtime guards remain stable. Root verified the raw
+result SHA and exact single-attempt outcomes. Evidence:
+external-library95-cold1/receipt.json SHA256
+163a2ca284680f3e7655e5bf7ec6da66a1a2409831dd9314f7466bb7ec3ec0a9.
+Earlier20 real-library checks are reused, not added to this run's denominator.
+
+Historical control: the genuine external-library run using the external91 binary passed20 new source-navigation/descriptor/
 diagnostic checks but retained a baseline binding failure. Closed trace comparison
 shows that failing completion finished before the selected Shadow.java source
 was materialized; the first responses succeed in a separate warm diagnostic run.
 The scoped unit regression passes and does not reproduce this readiness race.
-No production fix or stable acceptance is claimed. Exact hydration publication
+That historical run did not prove a stable fix. Exact hydration publication
 timing is not traced. Evidence: recovery89/extension93-closed-readiness-comparison.json.
 
 ## Verified91 baseline

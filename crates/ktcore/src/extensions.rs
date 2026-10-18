@@ -616,6 +616,16 @@ impl ExtensionStore {
             .collect()
     }
 
+    /// Dependencies of this source's current enabled providers, without waiting for other files.
+    pub fn requested_source_files_for(&self, owner: &str) -> BTreeSet<String> {
+        self.providers
+            .keys()
+            .filter_map(|provider| self.sets.get(&(provider.clone(), owner.into())))
+            .filter(|pending| self.is_current(pending))
+            .flat_map(|pending| pending.reads.missing_sources.iter().cloned())
+            .collect()
+    }
+
     pub fn clear_compiled_inputs(&mut self) {
         let mut changed = Vec::new();
         for (file, source) in &mut self.sources {

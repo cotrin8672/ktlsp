@@ -2761,6 +2761,7 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             signature: None,
             source_file: Some(Arc::from("Person.java")),
             attribute_names: Vec::new(),
+            inner_classes: Vec::new(),
             fields: Vec::new(),
             methods: vec![MemberFacts {
                 name: Arc::from("getName"),

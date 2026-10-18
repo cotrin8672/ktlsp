@@ -11,7 +11,7 @@ use anyhow::Context;
 
 /// Cap on source files extracted from a single jar — a defensive bound against a pathological or
 /// malicious archive with an absurd number of entries.
-const MAX_SOURCE_FILES: usize = 50_000;
+pub(crate) const MAX_SOURCE_FILES: usize = 50_000;
 
 /// Cap on the per-entry capacity hint taken from the archive's declared uncompressed size, so a
 /// forged header cannot trigger an absurd upfront allocation.
@@ -660,6 +660,70 @@ fn java_class_stub_facts(
     String,
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
 )> {
+    java_declaration_stub(class, false)
+}
+
+/// Only a pinned compiler SDK archive establishes that absent SourceFile and API annotations
+/// describe Java declarations rather than an unknown source-language lowering.
+pub(crate) fn selected_sdk_class_stub_facts(
+    selection: &crate::classpath::SdkApiSelection,
+    class: &ktcore::classfile::ClassFileFacts,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
+    (selection.release.is_some()
+        && class.identity.origin_id == selection.origin()
+        && selection
+            .entries
+            .get(class.identity.internal_name.as_str())
+            .is_some_and(Option::is_some))
+    .then(|| java_declaration_stub(class, true))
+    .flatten()
+}
+
+fn java_declaration_stub(
+    class: &ktcore::classfile::ClassFileFacts,
+    selected_sdk: bool,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
+    java_declaration_stub_named(class, selected_sdk, None)
+}
+
+/// Only an already-proven nested identity may supply a source simple name.
+pub(crate) fn selected_sdk_nested_stub_facts(
+    selection: &crate::classpath::SdkApiSelection,
+    class: &ktcore::classfile::ClassFileFacts,
+    name: &str,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
+    selected_sdk_class_stub_facts(selection, class)?;
+    let row = class
+        .inner_classes
+        .iter()
+        .find(|row| row.inner.as_ref() == class.identity.internal_name)?;
+    if row.name.as_deref() != Some(name)
+        || row.access_flags != 0x0609
+        || class.access_flags != 0x0601
+        || !is_java_identifier(name)
+    {
+        return None;
+    }
+    java_declaration_stub_named(class, true, Some(name))
+}
+
+fn java_declaration_stub_named(
+    class: &ktcore::classfile::ClassFileFacts,
+    selected_sdk: bool,
+    source_name: Option<&str>,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
     const PUBLIC: u16 = 0x0001;
     const INTERFACE: u16 = 0x0200;
     const ABSTRACT: u16 = 0x0400;
@@ -672,18 +736,21 @@ fn java_class_stub_facts(
     if class.access_flags & PUBLIC == 0
         || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | INTERFACE | ABSTRACT) != 0
         || class.access_flags & 0x0410 == 0x0410
-        || class.source_file.as_deref() != Some(format!("{name}.java").as_str())
+        || (class.source_file.is_some() || !selected_sdk)
+            && class.source_file.as_deref() != Some(format!("{name}.java").as_str())
         || class.attribute_names.iter().any(|attribute| {
-            matches!(
-                attribute.as_ref(),
-                "RuntimeVisibleAnnotations"
-                    | "RuntimeInvisibleAnnotations"
-                    | "RuntimeVisibleTypeAnnotations"
-                    | "RuntimeInvisibleTypeAnnotations"
-                    | "Synthetic"
-                    | "Record"
-                    | "EnclosingMethod"
-            )
+            (!selected_sdk
+                && matches!(
+                    attribute.as_ref(),
+                    "RuntimeVisibleAnnotations"
+                        | "RuntimeInvisibleAnnotations"
+                        | "RuntimeVisibleTypeAnnotations"
+                        | "RuntimeInvisibleTypeAnnotations"
+                ))
+                || matches!(
+                    attribute.as_ref(),
+                    "Synthetic" | "Record" | "EnclosingMethod"
+                )
         })
     {
         return None;
@@ -693,14 +760,15 @@ fn java_class_stub_facts(
     if is_interface
         && (class.access_flags != PUBLIC | INTERFACE | ABSTRACT
             || class.super_name.as_deref() != Some("java/lang/Object")
-            || !class.fields.is_empty()
-            || class.methods.iter().any(|method| {
-                method.access_flags != PUBLIC | ABSTRACT
-                    || method
-                        .attribute_names
-                        .iter()
-                        .any(|name| name.as_ref() != "Signature")
-            }))
+            || !selected_sdk
+                && (!class.fields.is_empty()
+                    || class.methods.iter().any(|method| {
+                        method.access_flags != PUBLIC | ABSTRACT
+                            || method
+                                .attribute_names
+                                .iter()
+                                .any(|name| name.as_ref() != "Signature")
+                    })))
     {
         return None;
     }
@@ -864,7 +932,14 @@ fn java_class_stub_facts(
         if method.access_flags & (PUBLIC | 0x0004) == 0
             || method.access_flags & 0x0005 == 0x0005
             || method.access_flags
-                & !(PUBLIC | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0800 | ABSTRACT)
+                & !(PUBLIC
+                    | 0x0004
+                    | 0x0008
+                    | 0x0010
+                    | 0x0020
+                    | 0x0800
+                    | ABSTRACT
+                    | if selected_sdk { 0x0100 } else { 0 })
                 != 0
             || method.access_flags & ABSTRACT != 0
                 && (class.access_flags & ABSTRACT == 0 || method.access_flags & 0x0938 != 0)
@@ -960,6 +1035,12 @@ fn java_class_stub_facts(
         } else {
             "protected"
         };
+        let default_ =
+            if selected_sdk && is_interface && method.access_flags & (0x0008 | ABSTRACT) == 0 {
+                "default "
+            } else {
+                ""
+            };
         let declaration = if method.access_flags & ABSTRACT != 0 {
             format!(
                 "    {access} abstract {generic_declaration}{returns} {}({});\n",
@@ -968,14 +1049,14 @@ fn java_class_stub_facts(
             )
         } else {
             format!(
-                "    {access} {static_}{final_}{generic_declaration}{returns} {}({}) {{ throw null; }}\n",
+                "    {access} {default_}{static_}{final_}{generic_declaration}{returns} {}({}) {{ throw null; }}\n",
                 method.name,
                 parameters.join(", ")
             )
         };
         methods.insert(key, declaration);
     }
-    if is_interface && methods.len() != class.methods.len() {
+    if is_interface && !selected_sdk && methods.len() != class.methods.len() {
         return None;
     }
     let mut unavailable_fields = std::collections::BTreeSet::new();
@@ -1017,6 +1098,7 @@ fn java_class_stub_facts(
                 .map(|name| (name, ktcore::symbol::SymbolKind::Property, None)),
         )
         .collect();
+    let name = source_name.unwrap_or(name);
     let mut source =
         "// Binary declaration stub; initializers and method bodies are unavailable.\n".to_string();
     if !package.is_empty() {
@@ -1162,7 +1244,7 @@ fn java_descriptor_type(
     Some(format!("{nominal}{arguments}{}", &ty.name[base.len()..]))
 }
 
-fn is_java_identifier(name: &str) -> bool {
+pub(crate) fn is_java_identifier(name: &str) -> bool {
     if matches!(
         name,
         "_" | "abstract"

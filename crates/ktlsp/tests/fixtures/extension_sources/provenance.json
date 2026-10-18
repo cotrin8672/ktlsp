@@ -1,0 +1,21 @@
+{
+  "coordinate": "net.fabricmc:sponge-mixin:0.15.2+mixin.0.8.7",
+  "license": "MIT",
+  "upstream": "https://github.com/FabricMC/Mixin",
+  "entries": {
+    "Shadow.class": {
+      "entry": "org/spongepowered/asm/mixin/Shadow.class",
+      "sha256": "2f9a34fef42c1aefa360b819c39af89c7090146a027610474c8b96449f17752b",
+      "bytes": 572
+    },
+    "Shadow.java": {
+      "entry": "org/spongepowered/asm/mixin/Shadow.java",
+      "sha256": "e136a503ac061e9793d95313ec8ce0e09ddeb22d15b95e530185ef9678142ac8",
+      "bytes": 6257
+    }
+  },
+  "archives": {
+    "sponge-mixin-0.15.2+mixin.0.8.7.jar": "1d45cfe3ae4a2eab38dc74276803748cf799088986260d6d912e50ddb35d15c5",
+    "sponge-mixin-0.15.2+mixin.0.8.7-sources.jar": "4b62970960c14df552d1855a1d21366dd8676b3bde129ddbd064a80d70e7f21f"
+  }
+}

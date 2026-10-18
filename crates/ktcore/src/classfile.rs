@@ -33,8 +33,18 @@ pub struct ClassFileFacts {
     /// A debug filename hint, not an editable source location or identity.
     pub source_file: Option<Arc<str>>,
     pub attribute_names: Vec<Arc<str>>,
+    pub inner_classes: Vec<InnerClassFacts>,
     pub fields: Vec<MemberFacts>,
     pub methods: Vec<MemberFacts>,
+}
+
+/// Exact JVMS InnerClasses identity; absent outer/name denotes local or anonymous ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InnerClassFacts {
+    pub inner: Arc<str>,
+    pub outer: Option<Arc<str>>,
+    pub name: Option<Arc<str>>,
+    pub access_flags: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +159,7 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
         signature: attributes.signature,
         source_file: attributes.source_file,
         attribute_names: attributes.names,
+        inner_classes: attributes.inner_classes.unwrap_or_default(),
         fields,
         methods,
     })
@@ -461,6 +472,7 @@ impl<'input> Strings<'_, 'input> {
 
 #[derive(Default)]
 struct Attributes {
+    inner_classes: Option<Vec<InnerClassFacts>>,
     names: Vec<Arc<str>>,
     signature: Option<Arc<str>>,
     source_file: Option<Arc<str>>,
@@ -480,6 +492,48 @@ fn attributes<'input>(
             "Signature" => {
                 ensure!(result.signature.is_none(), "duplicate Signature attribute");
                 result.signature = Some(strings.attribute_string(attribute.content())?);
+            }
+            "InnerClasses" if class => {
+                ensure!(
+                    result.inner_classes.is_none(),
+                    "duplicate InnerClasses attribute"
+                );
+                let mut bytes = attribute.content();
+                let count = usize::from(take_u16(&mut bytes)?);
+                ensure!(bytes.len() == count * 8, "invalid InnerClasses length");
+                let mut rows = Vec::with_capacity(count);
+                let mut seen = HashSet::new();
+                for _ in 0..count {
+                    let inner = strings.class_name(cpool::Index::new(take_u16(&mut bytes)?)?)?;
+                    let outer = take_u16(&mut bytes)?;
+                    let outer = if outer == 0 {
+                        None
+                    } else {
+                        Some(strings.class_name(cpool::Index::new(outer)?)?)
+                    };
+                    let name = take_u16(&mut bytes)?;
+                    let name = if name == 0 {
+                        None
+                    } else {
+                        Some(strings.get(cpool::Index::new(name)?)?)
+                    };
+                    if let Some(name) = &name {
+                        strings.charge(name.len())?;
+                        ensure!(unqualified_name(name), "invalid inner simple name");
+                    }
+                    let access_flags = take_u16(&mut bytes)?;
+                    ensure!(
+                        seen.insert(inner.clone()),
+                        "duplicate InnerClasses identity"
+                    );
+                    rows.push(InnerClassFacts {
+                        inner,
+                        outer,
+                        name,
+                        access_flags,
+                    });
+                }
+                result.inner_classes = Some(rows);
             }
             "SourceFile" if class => {
                 ensure!(

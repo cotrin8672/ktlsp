@@ -451,13 +451,111 @@ object KtlspCompilerConfiguration {
         )
     }
 
+    // Directory structure, rather than today's file set, proves eligibility of a new buffer.
+    // Unsupported filters retain exact current source ownership but admit no future root.
+    private fun sdkSourceFacts(task: Task, language: String): Pair<Map<String, Any?>?, Map<String, Any?>?> {
+        var claims: Map<String, Any?>? = null
+        val policy = runCatching {
+        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "9.6.1"))
+        val sets = task.project.extensions.findByType(SourceSetContainer::class.java) ?: return@runCatching null
+        val sourceSet = sets.filter {
+            if (language == "java") it.compileJavaTaskName == task.name
+            else primaryKotlinCompileTask(task.project, it)?.path == task.path
+        }.singleOrNull() ?: return@runCatching null
+        val kotlinExtension = sourceSet.extensions.findByName("kotlin")
+        val kotlin = when (kotlinExtension) {
+            is SourceDirectorySet -> kotlinExtension
+            null -> null
+            else -> kotlinExtension.javaClass.methods.firstOrNull {
+                it.name == "getKotlin" && it.parameterCount == 0 && SourceDirectorySet::class.java.isAssignableFrom(it.returnType)
+            }?.invoke(kotlinExtension) as? SourceDirectorySet
+        }
+        val authored = (sourceSet.java.srcDirs + (kotlin?.srcDirs ?: emptySet())).map { it.absoluteFile.normalize() }.toSet()
+        val generated = linkedSetOf<java.io.File>()
+        generated.addAll(sourceSet.output.generatedSourcesDirs.files)
+        val compileJava = task.project.tasks.findByName(sourceSet.compileJavaTaskName) as? JavaCompile
+        compileJava?.options?.generatedSourceOutputDirectory?.orNull?.asFile?.let(generated::add)
+        val producers = listOf(sourceSet.getTaskName("kapt", "Kotlin"),
+            sourceSet.getTaskName("kaptGenerateStubs", "Kotlin"), sourceSet.getTaskName("ksp", "Kotlin"))
+            .mapNotNull(task.project.tasks::findByName)
+        producers.flatMapTo(generated) { it.outputs.files.files }
+        val sources = if (task is JavaCompile) task.source else read(task, "getSources") as? FileCollection
+            ?: return@runCatching null
+        sources.buildDependencies.getDependencies(task).filter { it != task }.flatMapTo(generated) { it.outputs.files.files }
+        val loader = Task::class.java.classLoader
+        val visitorType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor", false, loader)
+        val treeType = Class.forName("org.gradle.api.internal.file.FileCollectionInternal", false, loader)
+        val visitType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType", false, loader)
+        val spec = visitType.enumConstants.single { (it as Enum<*>).name == "Spec" }
+        val future = linkedSetOf<java.io.File>()
+        val producerRoots = linkedSetOf<java.io.File>()
+        var rootsComplete = true
+        val suffix = if (language == "java") "java" else "kt"
+        // A modified Ant default exclusion set can hide arbitrary future paths.
+        val defaultExcludes = runCatching {
+            val ant = Class.forName("org.apache.tools.ant.DirectoryScanner", false, loader)
+            val initial = ant.getDeclaredField("DEFAULTEXCLUDES").apply { isAccessible = true }.get(null) as Array<*>
+            val current = ant.getMethod("getDefaultExcludes").invoke(null) as Array<*>
+            check(initial.toSet() == current.toSet())
+            current.map { it as String }.sorted()
+        }.getOrNull()
+        fun stockPatterns(patterns: Any): Boolean {
+            val type = patterns.javaClass
+            if (type.name !in listOf("org.gradle.api.tasks.util.PatternSet", "org.gradle.api.tasks.util.internal.IntersectionPatternSet")) return false
+            if (read(patterns, "isCaseSensitive") != true) return false
+            if ((read(patterns, "getIncludeSpecs") as? Collection<*>)?.isEmpty() != true ||
+                (read(patterns, "getExcludeSpecs") as? Collection<*>)?.isEmpty() != true ||
+                (read(patterns, "getExcludes") as? Collection<*>)?.isEmpty() != true) return false
+            val includes = read(patterns, "getIncludes") as? Collection<*> ?: return false
+            if (includes.isNotEmpty() && "**/*.$suffix" !in includes) return false
+            if (includes.any { it !is String || it.lowercase(java.util.Locale.ROOT) !in listOf("**/*.java", "**/*.kt", "**/*.kts") }) return false
+            return type.name != "org.gradle.api.tasks.util.internal.IntersectionPatternSet" ||
+                (read(patterns, "getOther")?.let(::stockPatterns) == true)
+        }
+        val visitor = java.lang.reflect.Proxy.newProxyInstance(visitorType.classLoader, arrayOf(visitorType)) { _, method, args ->
+            when (method.name) {
+                "startVisit" -> true
+                "prepareForVisit" -> spec
+                "visitFileTree" -> {
+                    check(method.parameterCount == 3)
+                    val directory = (args?.get(0) as? java.io.File)?.absoluteFile?.normalize()
+                    val patterns = args?.get(1)
+                    if (directory == null) rootsComplete = false else producerRoots.add(directory)
+                    if (directory in authored && patterns != null && defaultExcludes != null && runCatching { stockPatterns(patterns) }.getOrDefault(false)) future.add(checkNotNull(directory))
+                    null
+                }
+                // Opaque, generated, transformed, archive-backed and plain exact files give no future roots.
+                "visitCollection", "visitGenericFileTree", "visitFileTreeBackedByFile" -> { rootsComplete = false; null }
+                "toString" -> "ktlsp compiler source root policy"
+                "hashCode" -> 0
+                "equals" -> false
+                else -> error("Unsupported source structure visitor method: ${method.name}")
+            }
+        }
+        check(treeType.isInstance(sources.asFileTree))
+        treeType.getMethod("visitStructure", visitorType).invoke(sources.asFileTree, visitor)
+        claims = linkedMapOf("adapter" to "gradle-producing-source-trees-v1", "language" to language,
+            "task" to task.path, "roots" to producerRoots.map { it.absolutePath }.sorted(),
+            "complete" to rootsComplete)
+        linkedMapOf("adapter" to "gradle-source-tree-stock-patterns-v1", "language" to language,
+            "task" to task.path, "authored_roots" to authored.map { it.absolutePath }.sorted(),
+            "future_roots" to future.map { it.absolutePath }.sorted(),
+            "default_excludes" to defaultExcludes,
+            "generated_roots" to generated.map { it.absoluteFile.normalize().absolutePath }.distinct().sorted())
+        }.getOrNull()
+        return claims to policy
+    }
+
     fun dump(task: Task, language: String): String {
+        // Keep producer coverage even when later SDK/recipe capture fails.
+        val sdkSources = sdkSourceFacts(task, language)
         val record = linkedMapOf<String, Any?>(
             "task" to task.path, "language" to language, "task_type" to task.javaClass.name,
             "arguments" to emptyList<String>(), "annotation_processor_path" to emptyList<String>(),
             "source_files" to emptyList<String>(), "classpath" to emptyList<String>(),
             "declared_input_files" to emptyList<String>(), "declared_output_roots" to emptyList<String>(),
-            "java_home" to null, "options" to emptyMap<String, Any?>(),
+            "java_home" to null, "options" to linkedMapOf(
+                "sdkProducerClaims" to sdkSources.first, "sdkSourcePolicy" to sdkSources.second),
             "output_roots" to emptyList<String>(), "complete" to false, "problem" to null,
         )
         try {
@@ -494,6 +592,8 @@ object KtlspCompilerConfiguration {
                     "forkExecutable" to options.forkOptions.executable,
                     "forkJvmArgs" to options.forkOptions.jvmArgs?.toList(),
                 )
+                javaOptions["sdkProducerClaims"] = sdkSources.first
+                javaOptions["sdkSourcePolicy"] = sdkSources.second
                 javaOptions["javaCompilerRecipe"] = null
                 javaOptions["javaCompilerRecipeProblem"] = null
                 try {
@@ -553,6 +653,8 @@ object KtlspCompilerConfiguration {
                 val recipe = kotlinCompilerRecipe(task, toolchain, javaHome)
                 record["kotlin_compiler"] = recipe
                 record["options"] = linkedMapOf(
+                    "sdkProducerClaims" to sdkSources.first,
+                    "sdkSourcePolicy" to sdkSources.second,
                     "kotlinClasspathSnapshotInputs" to kotlinClasspathSnapshotInputs(task, recipe),
                     "taskActionInventory" to producerActions(task),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
