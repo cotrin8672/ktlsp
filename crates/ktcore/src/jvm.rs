@@ -648,6 +648,8 @@ pub fn compiled_overrides_authored(
         container,
         nullable: false,
         args: Vec::new(),
+
+        owner: None,
     };
     !infer::walk_supertypes(index, &parent, 32, |current| {
         if current.package() == Some(package.as_str())

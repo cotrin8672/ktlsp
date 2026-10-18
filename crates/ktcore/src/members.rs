@@ -80,6 +80,7 @@ pub fn kotlin_java_array_member_type(
                 && arguments.types.len() == 1
                 && matches!(&arguments.types[0], Type::Class {
                     name, package: Some(package), container: None, nullable: false, args,
+                    owner: None,
                 } if name == "Int" && package == "kotlin" && args.is_empty())
                 && arguments.names.as_ref().is_none_or(Vec::is_empty)
                 && !arguments.has_spread
@@ -92,6 +93,7 @@ pub fn kotlin_java_array_member_type(
                 container: None,
                 nullable: false,
                 args,
+                ..
             } = &**component
             {
                 let scalar = infer::primitive_type_name(name);
@@ -1404,6 +1406,7 @@ fn parameter_identity(index: &dyn InferenceIndex, ty: Type) -> Option<Type> {
         package,
         container,
         args,
+        owner,
         ..
     } = ty
     else {
@@ -1431,6 +1434,11 @@ fn parameter_identity(index: &dyn InferenceIndex, ty: Type) -> Option<Type> {
             .into_iter()
             .map(|argument| parameter_identity(index, argument))
             .collect::<Option<_>>()?,
+
+        owner: match owner {
+            Some(owner) => Some(Box::new(parameter_identity(index, *owner)?)),
+            None => None,
+        },
     })
 }
 
@@ -1458,6 +1466,8 @@ fn owner_inheritance(
         container,
         nullable: false,
         args: Vec::new(),
+
+        owner: None,
     };
     let mut incomplete = false;
     let found = infer::walk_supertypes(index, &owner, 32, |current| {

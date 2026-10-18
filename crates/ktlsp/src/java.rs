@@ -535,10 +535,14 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
                     args.push(type_ref_from_node(argument, src, scope).unwrap_or_default());
                 }
             }
-            Some(scope.type_ref(&type_path(head, src)?, false, args))
+            let mut ty = scope.type_ref(&type_path(head, src)?, false, args);
+            ty.owner = parameterized_type_owner(head, src, scope);
+            Some(ty)
         }
         "type_identifier" | "scoped_type_identifier" => {
-            Some(scope.type_ref(&type_path(node, src)?, false, Vec::new()))
+            let mut ty = scope.type_ref(&type_path(node, src)?, false, Vec::new());
+            ty.owner = parameterized_type_owner(node, src, scope);
+            Some(ty)
         }
         "array_type" => {
             if node.has_error() {
@@ -590,6 +594,24 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
         }
         _ => Some(TypeRef::simple(text.replace("...", "[]"))),
     }
+}
+
+// Only syntax containing an earlier generic segment proves an instantiated owner;
+// package-only qualifiers and ordinary static nested names keep their existing representation.
+fn parameterized_type_owner(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Box<TypeRef>> {
+    if node.kind() != "scoped_type_identifier" {
+        return None;
+    }
+    let owner = node.named_child(0)?;
+    fn parameterized(node: Node<'_>) -> bool {
+        node.kind() == "generic_type"
+            || node.kind() == "scoped_type_identifier"
+                && node.named_child(0).is_some_and(parameterized)
+    }
+    parameterized(owner)
+        .then(|| type_ref_from_node(owner, src, scope))
+        .flatten()
+        .map(Box::new)
 }
 
 // Array shape stays in the existing TypeRef spelling. Resolving its rank-one component uses
@@ -2552,6 +2574,8 @@ fn inherited_member_type_definitions(
             container: entry.sym.container.clone(),
             nullable: false,
             args: vec![Type::Unknown; entry.sym.type_params.len()],
+
+            owner: None,
         }
     };
     let package = package_of(tree, src);
@@ -4042,6 +4066,8 @@ fn java_unshadowed_type_receiver(
             container: owner.sym.container.clone(),
             nullable: false,
             args: Vec::new(),
+
+            owner: None,
         };
         let mut complete = true;
         let _ = infer::walk_supertypes(index, &owner_type, JAVA_SUPERTYPE_WALK_CAP, |current| {

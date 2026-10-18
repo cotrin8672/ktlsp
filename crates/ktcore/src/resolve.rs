@@ -1624,6 +1624,8 @@ fn resolve_member_with_ctx(
                         selector.start_byte(),
                     );
                 }
+                // A written receiver does not belong to a globally unique, unrelated member.
+                return Vec::new();
             }
         }
     }

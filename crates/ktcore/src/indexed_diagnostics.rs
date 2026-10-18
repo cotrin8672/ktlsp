@@ -390,10 +390,14 @@ fn substitute_type_ref(tr: &TypeRef, bindings: &HashMap<String, Type>) -> TypeRe
         }
         return resolved;
     }
-    if tr.args.is_empty() {
+    if tr.args.is_empty() && tr.owner.is_none() {
         return tr.clone();
     }
     let mut out = tr.clone();
+    out.owner = tr
+        .owner
+        .as_deref()
+        .map(|owner| Box::new(substitute_type_ref(owner, bindings)));
     out.args = tr
         .args
         .iter()
@@ -410,6 +414,8 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
             container,
             nullable,
             args,
+            owner,
+            ..
         } => TypeRef {
             name: name.clone(),
             projection: Default::default(),
@@ -418,6 +424,10 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
             args: args.iter().map(type_to_type_ref).collect(),
             package_candidates: std::sync::Arc::new(package.iter().cloned().collect()),
             container_candidates: container.iter().cloned().collect(),
+
+            owner: owner
+                .as_deref()
+                .map(|owner| Box::new(type_to_type_ref(owner))),
         },
         Type::Projected { projection, bound } => {
             let mut ty = type_to_type_ref(bound);
@@ -905,6 +915,8 @@ mod tests {
             container: Some("Outer".into()),
             nullable: true,
             args: Vec::new(),
+
+            owner: None,
         };
         let tr = type_to_type_ref(&ty);
         assert_eq!(tr.container_candidates, ["Outer"]);

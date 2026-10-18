@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v32-java-enum-parents-and-values";
+const SYMCACHE_VERSION: &[u8] = b"v33-instantiated-generic-owners";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1388,22 +1388,29 @@ fn resolve_local_jar_stubs_unowned(
 
     // A previous interrupted extraction can leave a directory without a complete cache.
     let mut extracted: std::collections::BTreeMap<_, _> =
-        jar::extract_class_stubs(jar_path, &dest)?
+        jar::extract_class_stub_facts(jar_path, &dest)?
             .into_iter()
             .collect();
 
     let mut symbols = parse_dir(&dest, kotlin, java)?;
     for batch in &mut symbols {
-        if let Some(unavailable) = extracted.remove(Path::new(&batch.file)).flatten() {
-            if let Some(owner) = batch
+        if let Some(owners) = extracted.remove(Path::new(&batch.file)).flatten() {
+            for owner in batch
                 .symbols
                 .iter_mut()
-                .find(|symbol| symbol.kind.is_type_like() && symbol.container.is_none())
+                .filter(|symbol| symbol.kind.is_type_like())
             {
-                owner.unavailable_members = Some(Box::new(unavailable));
+                let name = match owner.container.as_deref() {
+                    Some(parent) => format!("{parent}.{}", owner.name),
+                    None => owner.name.clone(),
+                };
+                if let Some(unavailable) = owners.get(&name) {
+                    owner.unavailable_members = Some(Box::new(unavailable.clone()));
+                }
             }
         }
     }
+
     symcache_store(&fingerprint, &symbols);
     Ok(symbols)
 }

@@ -14,4 +14,5 @@ public class JavaGenerics {
         child.shadow(other).pong();
         Holder.ITEM.get().ping();
     }
+    public void useOuter(outerfixture.Factory factory) { factory.make().outer().special(); }
 }

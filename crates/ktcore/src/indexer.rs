@@ -181,6 +181,8 @@ fn named_type_ref(
         args,
         package_candidates,
         container_candidates: Vec::new(),
+
+        owner: None,
     }
 }
 
@@ -448,6 +450,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     }
     let mut abstract_ = false;
     let mut static_ = false;
+    let mut inner_ = false;
     let mut private = false;
     let mut protected = false;
     let mut public = false;
@@ -468,6 +471,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
                 "strictfp" if java => strictfp = true,
                 "abstract" => abstract_ = true,
                 "static" => static_ = true,
+                "inner" => inner_ = true,
                 "private" => private = true,
                 "protected" => protected = true,
                 "public" => public = true,
@@ -530,7 +534,15 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
         return if conflicting_access {
             SourceMemberFlags::default()
         } else {
-            SourceMemberFlags::for_visibility(visibility, internal).with_java_protected(java)
+            let capture = owner.is_some()
+                && if java {
+                    node.kind() == "class_declaration" && !static_ && !interface
+                } else {
+                    node.kind() == "class_declaration" && inner_
+                };
+            SourceMemberFlags::for_visibility(visibility, internal)
+                .with_type_owner_capture(owner.is_some().then_some(capture))
+                .with_java_protected(java)
         };
     }
     if value {
@@ -1107,6 +1119,10 @@ pub fn method_type_bounds(
                 .iter()
                 .any(|parameter| parameter.name == ty.name.trim_end_matches("[]"))
             || ty
+                .owner
+                .as_deref()
+                .is_some_and(|owner| mentions_parameter(owner, parameters))
+            || ty
                 .args
                 .iter()
                 .any(|argument| mentions_parameter(argument, parameters))
@@ -1365,14 +1381,37 @@ pub(crate) fn syntax_type_ref(node: Node, src: &str) -> Option<TypeRef> {
 }
 
 fn type_ref_from_user_type(ut: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
-    let names = user_type_identifiers(ut, src);
+    let mut names = Vec::new();
+    let mut arguments = Vec::new();
+    // Empty for ordinary qualified names: normalize their leaf exactly once, as before.
+    let mut owners = Vec::new();
+    let mut cursor = ut.walk();
+    for child in ut.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                if !names.is_empty() && (!arguments.is_empty() || !owners.is_empty()) {
+                    owners.push((names.len(), std::mem::take(&mut arguments)));
+                }
+                names.push(node_text(child, src));
+            }
+            "type_arguments" => arguments = type_arguments_from(child, src, scope),
+            _ => {}
+        }
+    }
     names.last()?;
-    let name = names.join(".");
-    let args = type_args_of(ut, src, scope);
-    Some(match scope {
-        Some(scope) => scope.type_ref(&name, false, args),
-        None => named_type_ref(&name, false, args, Arc::new(Vec::new())),
-    })
+    let make = |name: &str, args| match scope {
+        Some(scope) => scope.type_ref(name, false, args),
+        None => named_type_ref(name, false, args, Arc::new(Vec::new())),
+    };
+    let mut owner = None;
+    for (end, args) in owners {
+        let mut ty = make(&names[..end].join("."), args);
+        ty.owner = owner;
+        owner = Some(Box::new(ty));
+    }
+    let mut ty = make(&names.join("."), arguments);
+    ty.owner = owner;
+    Some(ty)
 }
 
 fn split_qualified_container(name: &str) -> (&str, Option<String>) {
@@ -1383,11 +1422,8 @@ fn split_qualified_container(name: &str) -> (&str, Option<String>) {
 }
 
 /// Each type argument retains its use-site projection, bound context and original position.
-fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> {
+fn type_arguments_from(ta: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> {
     let mut out = Vec::new();
-    let Some(ta) = child_of_kind(ut, "type_arguments") else {
-        return out;
-    };
     let mut cursor = ta.walk();
     for proj in ta.named_children(&mut cursor) {
         if proj.kind() != "type_projection" {
@@ -1646,6 +1682,8 @@ fn push_data_class_synthetics(
         args: Vec::new(),
         package_candidates: std::sync::Arc::new(vec![package.to_string()]),
         container_candidates: self_container.into_iter().collect(),
+
+        owner: None,
     };
     push_synthetic_member(
         out,
@@ -2245,7 +2283,7 @@ object Reg { fun add() {} }
 
     #[test]
     fn error_descent_recovers_surviving_declarations() {
-        // Terse one-line classes collapse to an ERROR node; we still recover what survives.
+        // Adjacent one-line class bodies retain their members with the current grammar.
         let src = "class A { fun alpha() {} }\nclass B { fun beta() {} }\n";
         let syms = index(src);
         let got = names(&syms);

@@ -1104,20 +1104,7 @@ impl Workspace {
             &ctx,
             ident.start_byte(),
         );
-        if receiver_type.name().is_some() || !hits.is_empty() {
-            return Some(hits);
-        }
-        let index = self.index.scoped_for_file(key);
-        let candidates = index.lookup_by_name(name);
-        if index.permits_unique_member_fallback() && candidates.len() == 1 {
-            let entry = &candidates[0];
-            return Some(vec![Def {
-                file: entry.path.to_string(),
-                start_byte: entry.sym.start_byte,
-                end_byte: entry.sym.end_byte,
-            }]);
-        }
-        Some(Vec::new())
+        Some(hits)
     }
 
     pub fn explain_resolution(
@@ -3817,6 +3804,8 @@ fn rename_type(entry: &crate::index::Entry) -> crate::types::Type {
             .iter()
             .map(|_| crate::types::Type::Unknown)
             .collect(),
+
+        owner: None,
     }
 }
 

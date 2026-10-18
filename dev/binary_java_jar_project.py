@@ -40,7 +40,8 @@ generics_fixture = fixture.parent / "binarygenerics"
 classes = repo / "crates/ktcore/tests/fixtures/classfile"
 names = ("arrayfixture/Factory.class", "arrayfixture/Item.class", "pluginfixture/Person.class",
          "gradle8142/JavaCompilerArgumentsBuilder.class", "fieldfixture/FieldOnly.class",
-         *(f"genericfixture/{name}.class" for name in ("Item", "Other", "Box", "Child", "Holder")))
+         *(f"genericfixture/{name}.class" for name in ("Item", "Other", "Box", "Child", "Holder")),
+         *(f"outerfixture/{name}.class" for name in ("Factory", "Item", "SpecialItem", "Other", "Outer", "Outer$Inner", "Outer$Shadow")))
 pins = {entry["file"]: entry for entry in json.loads((classes / "hashes.json").read_text(encoding="utf-8"))}
 binary = {}
 for name in names:
@@ -57,6 +58,7 @@ sources = {
     "src/main/java/binarygenerics/JavaGenerics.java": (generics_fixture / "JavaGenerics.java").read_bytes(),
     "src/main/kotlin/binarygenerics/KotlinGenerics.kt": (generics_fixture / "KotlinGenerics.kt").read_bytes(),
     "oracle/Holder.stub.txt": (generics_fixture / "Holder.stub.txt").read_bytes(),
+    "oracle/SpecialItem.stub.txt": (generics_fixture / "SpecialItem.stub.txt").read_bytes(),
 }
 manifest_path = repo / "dev/corpus/binary-java-jar.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -64,7 +66,7 @@ fields_manifest_path = repo / "dev/corpus/binary-java-fields.json"
 fields_manifest = json.loads(fields_manifest_path.read_text(encoding="utf-8"))
 generics_manifest_path = repo / "dev/corpus/binary-java-generics.json"
 generics_manifest = json.loads(generics_manifest_path.read_text(encoding="utf-8"))
-assert len(manifest["probes"]) == 12 and len(fields_manifest["probes"]) == 2 and len(generics_manifest["probes"]) == 18
+assert len(manifest["probes"]) == 12 and len(fields_manifest["probes"]) == 2 and len(generics_manifest["probes"]) == 19
 for selected in (manifest, fields_manifest, generics_manifest):
     for case in selected["probes"]:
         text = "\n".join(sources[case["source"]].decode("utf-8").splitlines())

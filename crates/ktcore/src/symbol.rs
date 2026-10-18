@@ -61,6 +61,17 @@ impl SourceMemberFlags {
         Self(implementation | dispatch << 2 | access << 4 | u8::from(jvm_restricted) << 7)
     }
 
+    /// Nested declaration dispatch records whether an instance captures its lexical owner.
+    pub(crate) fn with_type_owner_capture(mut self, capture: Option<bool>) -> Self {
+        self.0 = (self.0 & !0x0c)
+            | match capture {
+                Some(true) => 0x04,
+                Some(false) => 0x08,
+                None => 0,
+            };
+        self
+    }
+
     pub fn implementation(self) -> Option<MemberImplementation> {
         match self.0 & 3 {
             1 => Some(MemberImplementation::Concrete),
@@ -306,6 +317,9 @@ pub fn reshare_file_type_contexts(
             }
         } else {
             pool.insert(Arc::clone(&ty.package_candidates));
+        }
+        if let Some(owner) = ty.owner.as_deref_mut() {
+            visit(owner, pool);
         }
         for arg in &mut ty.args {
             visit(arg, pool);

@@ -142,6 +142,8 @@ impl FileCtx {
             container: owner.sym.container.clone(),
             nullable: false,
             args: Vec::new(),
+
+            owner: None,
         })
     }
 
@@ -418,6 +420,8 @@ fn infer_class_literal(index: &dyn InferenceIndex, node: Node, src: &str, ctx: &
         container: None,
         nullable: false,
         args: vec![target],
+
+        owner: None,
     }
 }
 
@@ -846,6 +850,8 @@ fn resolve_narrowed_type(
         container: qualified_container_prefix(prefix),
         nullable: node.kind() == "nullable_type",
         args: Vec::new(),
+
+        owner: None,
     })
 }
 
@@ -2066,7 +2072,7 @@ fn free_function_sig(
                     .sym
                     .params
                     .iter()
-                    .any(|p| solve::has_projection(p) || !p.args.is_empty()))
+                    .any(|p| solve::has_projection(p) || !p.args.is_empty() || p.owner.is_some()))
                 || bound
                     .arguments
                     .types
@@ -2183,6 +2189,7 @@ fn type_ref_same_shape(a: &TypeRef, b: &TypeRef) -> bool {
         && a.projection == b.projection
         && a.qualification == b.qualification
         && a.nullable == b.nullable
+        && opt_type_ref_same_shape(a.owner.as_deref(), b.owner.as_deref())
         && a.args.len() == b.args.len()
         && a.args
             .iter()
@@ -2625,6 +2632,10 @@ fn substitute_alias_type_ref(
         return Some(actual);
     }
     let mut resolved = template.clone();
+    resolved.owner = match template.owner.as_deref() {
+        Some(owner) => Some(Box::new(substitute_alias_type_ref(owner, bindings)?)),
+        None => None,
+    };
     resolved.args = template
         .args
         .iter()
@@ -2708,12 +2719,23 @@ fn resolve_with_subst_unprojected(
             .map(|a| resolve_with_subst(index, a, ctx, tparams, subst, depth + 1))
             .collect()
     };
-    Type::Class {
+    let ty = Type::Class {
         name: tr.name.clone(),
         package,
         container,
         nullable: tr.nullable,
         args,
+
+        owner: None,
+    };
+    match tr.owner.as_deref() {
+        Some(owner) if depth < MAX_DEPTH => with_instantiated_owner(
+            index,
+            ty,
+            resolve_with_subst(index, owner, ctx, tparams, subst, depth + 1),
+        ),
+        Some(_) => Type::Unknown,
+        None => ty,
     }
 }
 
@@ -3078,7 +3100,7 @@ pub fn declared_member_type(
 fn unbounded_scoped_parameter(ty: &Type) -> bool {
     matches!(ty, Type::Parameter { definition, upper_bounds, .. }
         if definition.file.ends_with(".kt") && matches!(upper_bounds.as_slice(),
-            [Type::Class { name, package, container: None, nullable: true, args }]
+            [Type::Class { name, package, container: None, nullable: true, args, owner: None }]
                 if name == "Any" && package.as_deref() == Some("kotlin") && args.is_empty()))
 }
 
@@ -3110,9 +3132,12 @@ fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize)
             return false;
         }
     }
-    ty.args()
-        .iter()
-        .all(|arg| constraint_type_is_known(index, arg, depth + 1))
+    ty.owner()
+        .is_none_or(|owner| constraint_type_is_known(index, owner, depth + 1))
+        && ty
+            .args()
+            .iter()
+            .all(|arg| constraint_type_is_known(index, arg, depth + 1))
 }
 
 // Equality can reject distinct ordinary nominal identities; JVM mapped types and aliases need
@@ -3128,6 +3153,11 @@ fn constraint_types_distinct(index: &dyn InferenceIndex, a: &Type, b: &Type, dep
     let same_head =
         a.name() == b.name() && a.package() == b.package() && a.container() == b.container();
     if same_head {
+        if let (Some(a), Some(b)) = (a.owner(), b.owner()) {
+            if constraint_types_distinct(index, a, b, depth + 1) {
+                return true;
+            }
+        }
         return a.args().len() == b.args().len()
             && a.args()
                 .iter()
@@ -3251,7 +3281,7 @@ pub(crate) fn projected_member_application(
             .sym
             .params
             .iter()
-            .any(|ty| solve::has_projection(ty) || !ty.args.is_empty())
+            .any(|ty| solve::has_projection(ty) || !ty.args.is_empty() || ty.owner.is_some())
     {
         return None;
     }
@@ -3389,9 +3419,48 @@ fn merge_type_bindings(subst: &mut HashMap<String, Type>, bindings: HashMap<Stri
 fn member_type_parameters(index: &dyn InferenceIndex, entry: &Entry) -> HashSet<String> {
     let mut params: HashSet<_> = entry.sym.type_params.iter().cloned().collect();
     if let Some(container) = entry.sym.container.as_deref() {
-        if let Some(owner) = named_type_params(index, container, &entry.sym.package) {
-            params.extend(owner);
-        }
+        params.extend(lexical_type_parameter_names(
+            index,
+            container,
+            &entry.sym.package,
+        ));
+    }
+    params
+}
+
+fn lexical_type_parameter_names(
+    index: &dyn InferenceIndex,
+    container: &str,
+    package: &str,
+) -> HashSet<String> {
+    let mut params = HashSet::new();
+    let mut current = Some(container);
+    for _ in 0..SUPERTYPE_CAP {
+        let Some(identity) = current else {
+            break;
+        };
+        let (parent, name) = identity
+            .rsplit_once('.')
+            .map_or((None, identity), |(parent, name)| (Some(parent), name));
+        let ty = Type::Class {
+            name: name.to_string(),
+            package: Some(package.to_string()),
+            container: parent.map(str::to_string),
+            nullable: false,
+            args: Vec::new(),
+            owner: None,
+        };
+        let Some(declaration) = type_declaration_shape(index, &ty) else {
+            break;
+        };
+        params.extend(declaration.sym.type_params.iter().cloned());
+        current = if declaration.sym.source_member.dispatch()
+            == Some(crate::extensions::Dispatch::Instance)
+        {
+            parent
+        } else {
+            None
+        };
     }
     params
 }
@@ -3599,6 +3668,78 @@ fn is_subtype(index: &dyn InferenceIndex, name: &str, pkg: Option<&str>, target:
     false
 }
 
+/// A qualified name alone never proves capture of an outer instance or its arguments.
+fn with_instantiated_owner(index: &dyn InferenceIndex, mut ty: Type, owner: Type) -> Type {
+    let Some(declaration) = type_declaration_shape(index, &ty) else {
+        return Type::Unknown;
+    };
+    if !unique_type_definition(index, &owner)
+        || !unique_type_definition(index, &ty)
+        || !type_head_is_known(index, &owner)
+        || !receiver_shape_is_known(index, &owner)
+        || owner.is_nullable()
+        || declaration.sym.source_member.dispatch() != Some(crate::extensions::Dispatch::Instance)
+        || owner.package() != ty.package()
+        || receiver_root_key(index, &owner).as_deref() != ty.container()
+    {
+        return Type::Unknown;
+    }
+    if let Type::Class { owner: slot, .. } = &mut ty {
+        *slot = Some(Box::new(owner));
+    } else {
+        return Type::Unknown;
+    }
+    ty
+}
+
+fn unique_type_definition(index: &dyn InferenceIndex, ty: &Type) -> bool {
+    let entries = index.lookup_type(ty.name().unwrap_or_default());
+    let mut definition = None;
+    for entry in entries.iter().filter(|entry| {
+        ty.package() == Some(entry.sym.package.as_str())
+            && ty.container() == entry.sym.container.as_deref()
+    }) {
+        let current = (
+            entry.path.as_ref(),
+            entry.sym.start_byte,
+            entry.sym.end_byte,
+        );
+        if definition.is_some_and(|previous| previous != current) {
+            return false;
+        }
+        definition = Some(current);
+    }
+    definition.is_some()
+}
+
+fn lexical_receiver_bindings(
+    index: &dyn InferenceIndex,
+    ty: &Type,
+    depth: usize,
+) -> Option<HashMap<String, Type>> {
+    if depth > SUPERTYPE_CAP {
+        return None;
+    }
+    let declaration = type_declaration_shape(index, ty)?;
+    if declaration.sym.type_params.len() != ty.args().len() {
+        return None;
+    }
+    let mut bindings = match ty.owner() {
+        Some(owner) => lexical_receiver_bindings(index, owner, depth + 1)?,
+        None => HashMap::new(),
+    };
+    // Nearer class parameters shadow lexical owners; methods shadow these below.
+    bindings.extend(
+        declaration
+            .sym
+            .type_params
+            .iter()
+            .cloned()
+            .zip(ty.args().iter().cloned()),
+    );
+    Some(bindings)
+}
+
 /// Bind the declaring type's parameters through instantiated superclass/interface paths.
 /// Multiple paths must agree; missing arguments and cycles never select arbitrary bindings.
 pub(crate) fn receiver_type_bindings(
@@ -3695,13 +3836,9 @@ pub(crate) fn receiver_type_bindings(
                 if declaration.sym.type_params.len() != current.args().len() {
                     return ControlFlow::Break(());
                 }
-                let mut bindings: HashMap<_, _> = declaration
-                    .sym
-                    .type_params
-                    .iter()
-                    .cloned()
-                    .zip(current.args().iter().cloned())
-                    .collect();
+                let Some(mut bindings) = lexical_receiver_bindings(index, current, 0) else {
+                    return ControlFlow::Break(());
+                };
                 // A method's own T shadows the owning class's T.
                 bindings.retain(|name, _| !entry.sym.type_params.contains(name));
                 match &result {
@@ -3759,6 +3896,10 @@ fn receiver_bound_mentions_parameter(bound: &TypeRef, params: &[String], depth: 
     depth > MAX_DEPTH
         || (bound.qualification.is_none() && params.contains(&bound.name))
         || bound
+            .owner
+            .as_deref()
+            .is_some_and(|owner| receiver_bound_mentions_parameter(owner, params, depth + 1))
+        || bound
             .args
             .iter()
             .any(|arg| receiver_bound_mentions_parameter(arg, params, depth + 1))
@@ -3788,14 +3929,14 @@ fn receiver_satisfies_upper_bound(index: &dyn InferenceIndex, actual: &Type, bou
             && current.container() == bound.container()
     };
     if same_head(actual) {
-        return actual.args() == bound.args();
+        return actual.args() == bound.args() && actual.owner() == bound.owner();
     }
     let mut found = false;
     let mut incomplete = false;
     let walked = walk_supertypes(index, actual, SUPERTYPE_CAP, |current| {
         incomplete |= !receiver_arguments_known(index, current, 0);
         if same_head(current) {
-            if current.args() != bound.args() {
+            if current.args() != bound.args() || current.owner() != bound.owner() {
                 return ControlFlow::Break(());
             }
             found = true;
@@ -3857,19 +3998,30 @@ fn bind_receiver_template(
     {
         return false;
     }
-    formal
-        .args
-        .iter()
-        .zip(actual.args())
-        .all(|(formal, actual)| {
+    let owners_match = match (formal.owner.as_deref(), actual.owner()) {
+        (None, None) => true,
+        (Some(formal), Some(actual)) => {
             bind_receiver_template(index, formal, actual, ctx, params, bindings, depth + 1)
-        })
+        }
+        _ => false,
+    };
+    owners_match
+        && formal
+            .args
+            .iter()
+            .zip(actual.args())
+            .all(|(formal, actual)| {
+                bind_receiver_template(index, formal, actual, ctx, params, bindings, depth + 1)
+            })
 }
 
 fn receiver_arguments_known(index: &dyn InferenceIndex, actual: &Type, depth: usize) -> bool {
     depth <= MAX_DEPTH
         && type_head_is_known(index, actual)
         && receiver_shape_is_known(index, actual)
+        && actual
+            .owner()
+            .is_none_or(|owner| receiver_arguments_known(index, owner, depth + 1))
         && actual
             .args()
             .iter()
@@ -3879,7 +4031,10 @@ fn receiver_arguments_known(index: &dyn InferenceIndex, actual: &Type, depth: us
 // Callers already prove the nominal head; this checks its declaration shape and argument count.
 fn receiver_shape_is_known(index: &dyn InferenceIndex, actual: &Type) -> bool {
     if let Some(declaration) = type_declaration_shape(index, actual) {
-        return declaration.sym.type_params.len() == actual.args().len();
+        return declaration.sym.type_params.len() == actual.args().len()
+            && actual
+                .owner()
+                .is_none_or(|owner| receiver_shape_is_known(index, owner));
     }
     // A missing fundamental type needs no source declaration. Conflicting declarations are not
     // missing: they must never fall through to the zero-argument builtin rule.
@@ -3911,6 +4066,7 @@ fn type_declaration_shape<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Optio
             if previous.sym.package != entry.sym.package
                 || previous.sym.kind != entry.sym.kind
                 || previous.sym.type_params != entry.sym.type_params
+                || previous.sym.source_member.dispatch() != entry.sym.source_member.dispatch()
             {
                 return None;
             }
@@ -4019,18 +4175,12 @@ pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
     let Some(declaration) = type_declaration(index, ty) else {
         return vec![Type::Unknown];
     };
-    let params: HashSet<_> = declaration.sym.type_params.iter().cloned().collect();
-    let subst: HashMap<_, _> = if declaration.sym.type_params.len() == ty.args().len() {
-        declaration
-            .sym
-            .type_params
-            .iter()
-            .cloned()
-            .zip(ty.args().iter().cloned())
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    let subst = lexical_receiver_bindings(index, ty, 0).unwrap_or_default();
+    let params = lexical_type_parameter_names(
+        index,
+        receiver_root_key(index, ty).as_deref().unwrap_or_default(),
+        &declaration.sym.package,
+    );
     let ctx = FileCtx::new(declaration.sym.package.clone(), Vec::new());
     if declaration.sym.supertype_refs.is_empty() {
         return declaration
@@ -4087,6 +4237,9 @@ fn collect_unbound_return_type_params(
 ) {
     if tparams.contains(&tr.name) && !subst.contains_key(&tr.name) {
         out.push(tr.name.clone());
+    }
+    if let Some(owner) = tr.owner.as_deref() {
+        collect_unbound_return_type_params(owner, tparams, subst, out);
     }
     for arg in &tr.args {
         collect_unbound_return_type_params(arg, tparams, subst, out);
@@ -4146,6 +4299,8 @@ fn named_type_params(
             container,
             nullable: false,
             args: Vec::new(),
+
+            owner: None,
         },
     )
     .map(|entry| entry.sym.type_params.clone())
@@ -4207,6 +4362,8 @@ fn resolve_type_name(
         container: resolve_container(index, name, ctx),
         nullable,
         args: Vec::new(),
+
+        owner: None,
     }
 }
 
@@ -5106,12 +5263,21 @@ fn resolve_type_ref_unprojected(
             .map(|a| resolve_type_ref(index, a, ctx, depth + 1))
             .collect()
     };
-    Type::Class {
+    let ty = Type::Class {
         name: tr.name.clone(),
         package,
         container,
         nullable: tr.nullable,
         args,
+
+        owner: None,
+    };
+    match tr.owner.as_deref() {
+        Some(owner) if depth < MAX_DEPTH => {
+            with_instantiated_owner(index, ty, resolve_type_ref(index, owner, ctx, depth + 1))
+        }
+        Some(_) => Type::Unknown,
+        None => ty,
     }
 }
 
@@ -5248,7 +5414,7 @@ pub fn declared_type_in_scope(
             let Some((package, container)) = type_ref_identity(index, tr, ctx) else {
                 return Type::Unknown;
             };
-            Type::Class {
+            let ty = Type::Class {
                 name: tr.name.clone(),
                 package,
                 container,
@@ -5269,6 +5435,25 @@ pub fn declared_type_in_scope(
                         )
                     })
                     .collect(),
+
+                owner: None,
+            };
+            match tr.owner.as_deref() {
+                Some(owner) => with_instantiated_owner(
+                    index,
+                    ty,
+                    resolve(
+                        index,
+                        owner,
+                        ctx,
+                        parameters,
+                        path,
+                        depth + 1,
+                        position,
+                        remaining,
+                    ),
+                ),
+                None => ty,
             }
         };
         Type::projected(tr.projection, resolved)

@@ -234,6 +234,9 @@ The existing `corpus` route with `dev/corpus/binary-java-jar.json` and
 import error, its current compiler result and buffer restoration. Prepare its
 Module fixture with `dev/binary_java_jar_project.py NEW_TEMP_DIRECTORY module`
 and pass the printed project path as `--root`.
+For binary-library generics, use `dev/corpus/binary-java-generics.json` and
+`dev/corpus/fixtures/binary-java-jar/binarygenerics/probes.lua` as EXTRA probes.
+These also check instantiated nonstatic owners, exact navigation and incomplete receivers.
 The same EXTRA probe selects CEM's existing `ServerGamePacketListenerImplMixin.java`
 when CEM sources are present. That probe tests an ordinary unused-import error;
 it does not establish Mixin semantic support. Its current gap is tracked in

@@ -742,6 +742,11 @@ fn member_selector_unknown_receiver_type_stays_ambiguous() {
 }
 
 #[test]
+fn member_selector_unknown_receiver_does_not_borrow_unique_member() {
+    check("class A { fun run2() {} }\nclass Factory\nfun use(factory: Factory) { factory.missing()./*^*/run2() }\n");
+}
+
+#[test]
 fn member_selector_disambiguates_same_name_by_package() {
     // Two `Greeter` types in different packages; `g: demo.Greeter` -> member goto resolves to demo's
     // member only, not the same-named member of `other.Greeter`.
@@ -785,13 +790,10 @@ fn cursor_on_whitespace_returns_none_without_panic() {
 }
 
 #[test]
-fn error_descent_recovers_symbols_for_cross_file_use() {
-    // Terse one-line classes collapse into an ERROR node in tree-sitter-kotlin-ng (a grammar
-    // limitation: most of the file is even discarded). Our indexer descends into ERROR subtrees,
-    // so the *surviving* declaration (`alpha`) is still indexed and resolvable from a file that
-    // itself parses cleanly. (`beta` does not survive the collapse — see README limitations.)
+fn one_line_classes_resolve_members_across_files() {
+    // Adjacent one-line class bodies parse normally; resolve the member through a known receiver.
     check(
-        "//- Lib.kt\nclass A { fun /*def*/alpha() {} }\nclass B { fun beta() {} }\n//- Main.kt\nfun main() { val a = makeA(); a./*^*/alpha() }\n",
+        "//- Lib.kt\nclass A { fun /*def*/alpha() {} }\nclass B { fun beta() {} }\n//- Main.kt\nfun main() { val a = A(); a./*^*/alpha() }\n",
     );
 }
 

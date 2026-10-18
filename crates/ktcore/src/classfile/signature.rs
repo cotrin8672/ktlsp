@@ -204,6 +204,14 @@ pub struct MethodSignature {
 
 /// Invalid or unsupported signatures are unknown; callers must not fall back to erasure.
 pub fn class_signature(class: &ClassFileFacts) -> Option<ClassSignature> {
+    class_signature_scoped(class, &[])
+}
+
+/// Enclosing scopes must come from a proved nonstatic InnerClasses chain, nearest first.
+pub fn class_signature_scoped(
+    class: &ClassFileFacts,
+    enclosing: &[&[SignatureParameter]],
+) -> Option<ClassSignature> {
     let mut parser = Parser::new(class.signature.as_deref()?)?;
     let type_parameters = parser.formals()?;
     let superclass = parser.class_type(0)?;
@@ -211,11 +219,11 @@ pub fn class_signature(class: &ClassFileFacts) -> Option<ClassSignature> {
     while !parser.rest.is_empty() {
         interfaces.push(parser.class_type(0)?);
     }
-    let scope = Scope {
-        inner: &type_parameters,
-        outer: &[],
-    };
-    validate_parameters(&type_parameters, &[])?;
+    let layers: Vec<_> = std::iter::once(type_parameters.as_slice())
+        .chain(enclosing.iter().copied())
+        .collect();
+    let scope = Scope { layers: &layers };
+    validate_parameters(&type_parameters, enclosing)?;
     if erase(&superclass, scope, 0)? != format!("L{};", class.super_name.as_deref()?)
         || interfaces.len() != class.interfaces.len()
     {
@@ -240,15 +248,24 @@ pub fn field_signature(
     descriptor: &str,
     class_parameters: &[SignatureParameter],
 ) -> Option<TypeRef> {
+    field_signature_scoped(signature, descriptor, class_parameters, &[])
+}
+
+pub fn field_signature_scoped(
+    signature: &str,
+    descriptor: &str,
+    class_parameters: &[SignatureParameter],
+    enclosing: &[&[SignatureParameter]],
+) -> Option<TypeRef> {
     let mut parser = Parser::new(signature)?;
     let ty = parser.reference(0)?;
     if !parser.rest.is_empty() {
         return None;
     }
-    let scope = Scope {
-        inner: class_parameters,
-        outer: &[],
-    };
+    let layers: Vec<_> = std::iter::once(class_parameters)
+        .chain(enclosing.iter().copied())
+        .collect();
+    let scope = Scope { layers: &layers };
     validate_type(&ty, scope)?;
     (erase(&ty, scope, 0)? == descriptor).then_some(ty)
 }
@@ -258,14 +275,26 @@ pub fn method_signature(
     descriptor: &str,
     class_parameters: &[SignatureParameter],
 ) -> Option<MethodSignature> {
+    method_signature_scoped(signature, descriptor, class_parameters, &[])
+}
+
+pub fn method_signature_scoped(
+    signature: &str,
+    descriptor: &str,
+    class_parameters: &[SignatureParameter],
+    enclosing: &[&[SignatureParameter]],
+) -> Option<MethodSignature> {
     let mut parser = Parser::new(signature)?;
     let type_parameters = parser.formals()?;
-    validate_parameters(&type_parameters, class_parameters)?;
+    let class_layers: Vec<_> = std::iter::once(class_parameters)
+        .chain(enclosing.iter().copied())
+        .collect();
+    validate_parameters(&type_parameters, &class_layers)?;
     // Nearest method parameters shadow class parameters, including in their own bounds.
-    let scope = Scope {
-        inner: &type_parameters,
-        outer: class_parameters,
-    };
+    let layers: Vec<_> = std::iter::once(type_parameters.as_slice())
+        .chain(class_layers.iter().copied())
+        .collect();
+    let scope = Scope { layers: &layers };
     parser.take('(')?;
     let mut parameters = Vec::new();
     while !parser.eat(')') {
@@ -310,13 +339,13 @@ pub fn method_signature(
 
 fn validate_parameters(
     parameters: &[SignatureParameter],
-    outer: &[SignatureParameter],
+    enclosing: &[&[SignatureParameter]],
 ) -> Option<()> {
     let mut names = std::collections::HashSet::new();
-    let scope = Scope {
-        inner: parameters,
-        outer,
-    };
+    let layers: Vec<_> = std::iter::once(parameters)
+        .chain(enclosing.iter().copied())
+        .collect();
+    let scope = Scope { layers: &layers };
     for parameter in parameters {
         if !names.insert(&parameter.name) {
             return None;
@@ -331,27 +360,23 @@ fn validate_parameters(
 
 #[derive(Clone, Copy)]
 struct Scope<'a> {
-    inner: &'a [SignatureParameter],
-    outer: &'a [SignatureParameter],
+    layers: &'a [&'a [SignatureParameter]],
 }
 
 impl<'a> Scope<'a> {
     fn parameter(self, name: &str) -> Option<(&'a SignatureParameter, Self)> {
-        if let Some(parameter) = self.inner.iter().find(|parameter| parameter.name == name) {
-            return Some((parameter, self));
-        }
-        self.outer
-            .iter()
-            .find(|parameter| parameter.name == name)
-            .map(|parameter| {
-                (
+        for (index, layer) in self.layers.iter().enumerate() {
+            if let Some(parameter) = layer.iter().find(|p| p.name == name) {
+                // Its bounds retain the declaration's lexical scopes under later shadowing.
+                return Some((
                     parameter,
                     Self {
-                        inner: self.outer,
-                        outer: &[],
+                        layers: &self.layers[index..],
                     },
-                )
-            })
+                ));
+            }
+        }
+        None
     }
 }
 
@@ -367,6 +392,12 @@ fn validate_type(ty: &TypeRef, scope: Scope<'_>) -> Option<()> {
     {
         return None;
     }
+    if let Some(owner) = ty.owner.as_deref() {
+        if owner.name.ends_with("[]") || owner.projection != Projection::Invariant {
+            return None;
+        }
+        validate_type(owner, scope)?;
+    }
     for argument in &ty.args {
         validate_type(argument, scope)?;
     }
@@ -379,7 +410,11 @@ fn erase(ty: &TypeRef, scope: Scope<'_>, depth: usize) -> Option<String> {
     }
     let base = ty.name.trim_end_matches("[]");
     let rank = (ty.name.len() - base.len()) / 2;
-    let erased = if let Some(package) = &ty.qualification {
+    let erased = if let Some(owner) = ty.owner.as_deref() {
+        let owner = erase(owner, scope, depth + 1)?;
+        let internal = owner.strip_prefix('L')?.strip_suffix(';')?;
+        format!("L{internal}${base};")
+    } else if let Some(package) = &ty.qualification {
         format!(
             "L{}{base};",
             if package.is_empty() {
@@ -517,6 +552,33 @@ impl<'a> Parser<'a> {
         }
         let mut ty = TypeRef::simple(name);
         ty.qualification = Some(segments.join("."));
+        ty.args = self.arguments(depth)?;
+        let mut owner_depth = depth;
+        while self.eat('.') {
+            owner_depth += 1;
+            self.nodes += 1;
+            if owner_depth >= 64 || self.nodes > 4096 {
+                return None;
+            }
+            let name = self.identifier()?.to_string();
+            if name.contains('$') {
+                return None;
+            }
+            let qualification = match ty.qualification.as_deref() {
+                Some("") | None => ty.name.clone(),
+                Some(package) => format!("{package}.{}", ty.name),
+            };
+            let mut inner = TypeRef::simple(name);
+            inner.qualification = Some(qualification);
+            inner.args = self.arguments(owner_depth)?;
+            inner.owner = Some(Box::new(ty));
+            ty = inner;
+        }
+        self.take(';')?;
+        Some(ty)
+    }
+    fn arguments(&mut self, depth: usize) -> Option<Vec<TypeRef>> {
+        let mut arguments = Vec::new();
         if self.eat('<') {
             loop {
                 self.nodes += 1;
@@ -540,15 +602,60 @@ impl<'a> Parser<'a> {
                     argument.projection = projection;
                     argument
                 };
-                ty.args.push(argument);
+                arguments.push(argument);
                 if self.eat('>') {
                     break;
                 }
             }
         }
-        // shortcut: nested-owner identities/arguments need shared owner facts; extend this
-        // projection only when the source representation can preserve every owner segment.
-        self.take(';')?;
-        Some(ty)
+        Some(arguments)
+    }
+}
+
+#[cfg(test)]
+mod binary_outer_regression_tests {
+    use super::*;
+
+    #[test]
+    fn binary_outer_factory_preserves_owner_and_inner_instantiations() {
+        let factory = crate::classfile::decode(
+            "javac:outerfixture",
+            include_bytes!("../../tests/fixtures/classfile/outerfixture/Factory.class"),
+        )
+        .unwrap();
+        let field = factory
+            .fields
+            .iter()
+            .find(|field| field.name.as_ref() == "value")
+            .unwrap();
+        let projected =
+            field_signature(field.signature.as_deref().unwrap(), &field.descriptor, &[])
+                .expect("valid javac nonstatic owner Signature must remain useful");
+        assert_eq!(projected.name, "Inner");
+        assert_eq!(projected.args[0].name, "Other");
+        let owner = projected
+            .owner
+            .as_deref()
+            .expect("instantiated lexical owner");
+        assert_eq!(owner.name, "Outer");
+        assert_eq!(owner.args[0].name, "SpecialItem");
+        let method = factory
+            .methods
+            .iter()
+            .find(|method| method.name.as_ref() == "make")
+            .unwrap();
+        let projected_method = method_signature(
+            method.signature.as_deref().unwrap(),
+            &method.descriptor,
+            &[],
+        )
+        .expect("the same actual owner type must survive method return projection");
+        assert_eq!(projected_method.returns.as_ref(), Some(&projected));
+        assert!(field_signature(
+            field.signature.as_deref().unwrap(),
+            "Louterfixture/Outer$Shadow;",
+            &[]
+        )
+        .is_none());
     }
 }

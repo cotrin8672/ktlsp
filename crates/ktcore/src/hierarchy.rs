@@ -177,6 +177,8 @@ fn direct_supertype_entries<'a>(index: &'a dyn InferenceIndex, entry: &Entry) ->
             .iter()
             .map(|_| Type::Unknown)
             .collect(),
+
+        owner: None,
     };
     infer::direct_supertypes(index, &ty)
         .into_iter()

@@ -59,6 +59,25 @@ return function(env)
       request(name .. ': malformed-local known receiver stays useful', source, 'child.get().ping', 'ping',
         'textDocument/completion', function(result) return probe.completion_has(result, 'ping') end)
     end
+    if language == 'java' then
+      local unfinished, outer_edits = original:gsub('factory%.make%(%)%.outer%(%)%.special%(%);',
+        'factory.make().outer().', 1)
+      assert(outer_edits == 1)
+      edit(name .. ' captured owner unfinished chain', source, unfinished)
+      request(name .. ': unfinished owner keeps SpecialItem completion', source,
+        'factory.make().outer().', 'factory.make().outer().', 'textDocument/completion',
+        function(result)
+          return probe.completion_has(result, 'special') and not probe.completion_has(result, 'pong')
+        end, true)
+      edit(name .. ' captured owner restore for navigation', source, original)
+      local special_oracle = vim.fn.readfile(env.project .. '/oracle/SpecialItem.stub.txt')
+      local _, special_range = probe.find(special_oracle, 'java.lang.String special()', 'special')
+      request(name .. ': captured owner exact SpecialItem declaration', source,
+        'factory.make().outer().special', 'special', 'textDocument/definition',
+        function(result)
+          return probe.exact_definition(result, nil, { special_range }, 'outerfixture/SpecialItem.java')
+        end)
+    end
     edit(name .. ' restore', source, original)
     vim.bo[source.buf].modified = false
     check(name .. ': source disk unchanged', vim.deep_equal(vim.fn.readfile(path), source.disk))

@@ -1705,6 +1705,8 @@ fn generic_java_class_property_shares_lookup_inference_navigation_and_completion
             container: None,
             nullable: false,
             args: vec![Type::class("Item", Some("app".into()))],
+
+            owner: None,
         }
     );
     assert_exact_definition(
@@ -3031,6 +3033,8 @@ fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Ot
         container: None,
         nullable: false,
         args: vec![Type::class("Invocation", Some("probe".into()))],
+
+        owner: None,
     };
     let ctx = FileCtx::new("probe".into(), Vec::new());
     let candidates = ktcore::members::candidates(&ws.index, &owner, "uncertain", &ctx);
@@ -3208,6 +3212,8 @@ fun use(request:MissingRequest,valid:Request,type:Class<Invocation>,missing:Miss
         container: None,
         nullable: false,
         args: vec![Type::class("Invocation", Some("probe".into()))],
+
+        owner: None,
     };
     let arguments = ktcore::members::CallArguments {
         count: Some(2),
@@ -6405,6 +6411,8 @@ fn projected_mapped_collection_head_remains_possible_without_mapping_proof() {
         container: None,
         nullable: false,
         args: vec![Type::class("String", Some("kotlin".into()))],
+
+        owner: None,
     };
     let owner = Type::class("MappedConsumer", Some("mapped".into()));
     let ctx = FileCtx::new("mapped".into(), Vec::new());

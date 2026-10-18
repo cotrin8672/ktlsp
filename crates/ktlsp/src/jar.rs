@@ -538,7 +538,44 @@ pub fn extract_class_stubs(
         Option<Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>>,
     )>,
 > {
-    let mut archive = open_archive(jar)?;
+    Ok(extract_class_stub_facts(jar, out_dir)?
+        .into_iter()
+        .map(|(path, owners)| {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let members = owners.and_then(|mut owners| owners.remove(name));
+            (path, members)
+        })
+        .collect())
+}
+
+pub(crate) fn extract_class_stub_facts(
+    jar: &Path,
+    out_dir: &Path,
+) -> anyhow::Result<Vec<(PathBuf, Option<BinaryOwnerMembers>)>> {
+    let bytes = fs::read(jar).with_context(|| format!("open jar {}", jar.display()))?;
+    // zip's indexed map may coalesce duplicate central names. A non-ZIP64 EOCD count
+    // must agree before it can prove a unique enclosing class; otherwise nested
+    // members remain unavailable while existing top-level extraction is preserved.
+    let declared_entries = bytes
+        .windows(4)
+        .rposition(|s| s == b"PK\x05\x06")
+        .and_then(|at| {
+            let header = bytes.get(at..at + 22)?;
+            let comment = u16::from_le_bytes([header[20], header[21]]) as usize;
+            if at + 22 + comment != bytes.len() || header[4..8] != [0, 0, 0, 0] {
+                return None;
+            }
+            let disk = u16::from_le_bytes([header[8], header[9]]);
+            let total = u16::from_le_bytes([header[10], header[11]]);
+            (disk == total && total != u16::MAX).then_some(total as usize)
+        });
+    let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes))
+        .with_context(|| format!("read jar {}", jar.display()))?;
+    let unique_entries = declared_entries == Some(archive.len());
+    let no_nested = std::collections::BTreeMap::new();
     anyhow::ensure!(
         archive.len() <= MAX_SOURCE_FILES,
         "too many binary jar entries"
@@ -580,7 +617,7 @@ pub fn extract_class_stubs(
             continue;
         }
         classes.insert(top_level.to_string());
-        if class_path != top_level || versioned.contains(class_path) {
+        if versioned.contains(class_path) {
             continue;
         }
         // Normalized duplicate base entries cannot select one member surface by archive order.
@@ -609,26 +646,24 @@ pub fn extract_class_stubs(
         }
         // Decode one bounded class at a time; a later error prevents the caller parsing/caching
         // any partial extraction. Atomic stub files can be repaired by the existing cache miss.
-        let declaration = if let Some(index) = declarations.remove(&class_path).flatten() {
-            let mut entry = archive.by_index(index)?;
-            let limit = ktcore::classfile::MAX_CLASS_FILE_BYTES;
-            if entry.size() > limit as u64 {
-                None
-            } else {
-                let mut bytes = Vec::with_capacity(entry.size().min(8192) as usize);
-                entry
-                    .by_ref()
-                    .take(limit as u64 + 1)
-                    .read_to_end(&mut bytes)?;
-                if bytes.len() > limit || bytes.len() as u64 != entry.size() {
-                    None
-                } else {
-                    ktcore::classfile::decode(&origin, &bytes)
-                        .ok()
-                        .filter(|facts| facts.identity.internal_name == class_path)
-                        .and_then(|facts| java_class_stub_facts(&facts))
-                        .map(|(source, unavailable)| (source, Some(unavailable)))
-                }
+        let declaration = if let Some(index) = declarations.get(&class_path).copied().flatten() {
+            match decoded_binary_entry(&mut archive, index, &origin, &class_path)? {
+                Some(facts) => binary_owner_source(
+                    &mut archive,
+                    if unique_entries {
+                        &declarations
+                    } else {
+                        &no_nested
+                    },
+                    &versioned,
+                    &facts,
+                    name,
+                    None,
+                    &[],
+                    0,
+                )?
+                .map(|(source, owners)| (source, Some(owners))),
+                None => None,
             }
         } else {
             None
@@ -647,6 +682,152 @@ pub fn extract_class_stubs(
         out.push((path, unavailable));
     }
     Ok(out)
+}
+
+type BinaryOwnerMembers =
+    std::collections::BTreeMap<String, Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>>;
+
+fn decoded_binary_entry<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: usize,
+    origin: &str,
+    expected: &str,
+) -> anyhow::Result<Option<ktcore::classfile::ClassFileFacts>> {
+    let mut entry = archive.by_index(index)?;
+    let limit = ktcore::classfile::MAX_CLASS_FILE_BYTES;
+    if entry.size() > limit as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(entry.size().min(8192) as usize);
+    entry
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit || bytes.len() as u64 != entry.size() {
+        return Ok(None);
+    }
+    Ok(ktcore::classfile::decode(origin, &bytes)
+        .ok()
+        .filter(|facts| facts.identity.internal_name == expected))
+}
+
+/// Only exact reciprocal InnerClasses rows introduce lexical scopes. Archive paths narrow
+/// lookup but never invent a containing class by splitting a dollar-bearing name.
+fn binary_owner_source<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    indices: &std::collections::BTreeMap<String, Option<usize>>,
+    versioned: &BTreeSet<String>,
+    class: &ktcore::classfile::ClassFileFacts,
+    owner_name: &str,
+    source_file: Option<&str>,
+    enclosing: &[&[ktcore::classfile::signature::SignatureParameter]],
+    depth: usize,
+) -> anyhow::Result<Option<(String, BinaryOwnerMembers)>> {
+    if depth >= 64 {
+        return Ok(None);
+    }
+    let own_name = owner_name.rsplit('.').next().unwrap();
+    let Some((mut source, unavailable)) =
+        java_declaration_stub_scoped(class, false, Some(own_name), enclosing, source_file)
+    else {
+        return Ok(None);
+    };
+    let signature = match &class.signature {
+        Some(_) => match ktcore::classfile::signature::class_signature_scoped(class, enclosing) {
+            Some(s) => Some(s),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let own_parameters = signature
+        .as_ref()
+        .map_or(&[][..], |s| s.type_parameters.as_slice());
+    let layers: Vec<_> = std::iter::once(own_parameters)
+        .chain(enclosing.iter().copied())
+        .collect();
+    let mut owners = BinaryOwnerMembers::from([(owner_name.to_owned(), unavailable)]);
+    let mut names = std::collections::BTreeMap::new();
+    for row in class
+        .inner_classes
+        .iter()
+        .filter(|row| row.outer.as_deref() == Some(class.identity.internal_name.as_str()))
+    {
+        if let Some(name) = row.name.as_deref() {
+            *names.entry(name).or_insert(0usize) += 1;
+        }
+    }
+    let mut nested = Vec::new();
+    for row in class
+        .inner_classes
+        .iter()
+        .filter(|row| row.outer.as_deref() == Some(class.identity.internal_name.as_str()))
+    {
+        let Some(name) = row.name.as_deref() else {
+            continue;
+        };
+        // Public nonstatic classes may be plain, final or abstract. Other InnerClasses kinds
+        // cannot establish an enclosing-instance binding; the decoded class must agree below.
+        if !is_java_identifier(name)
+            || row.access_flags & 0x0001 == 0
+            || row.access_flags & !(0x0001 | 0x0010 | 0x0400) != 0
+            || row.access_flags & 0x0410 == 0x0410
+            || names.get(name) != Some(&1)
+        {
+            continue;
+        }
+        if row.inner.as_ref() != format!("{}${name}", class.identity.internal_name)
+            || versioned.contains(row.inner.as_ref())
+        {
+            continue;
+        }
+        let Some(index) = indices.get(row.inner.as_ref()).copied().flatten() else {
+            continue;
+        };
+        let Some(child) =
+            decoded_binary_entry(archive, index, &class.identity.origin_id, &row.inner)?
+        else {
+            continue;
+        };
+        if child.source_file != class.source_file
+            || child.access_flags & !0x0020 != row.access_flags
+        {
+            continue;
+        }
+        let reciprocal: Vec<_> = child
+            .inner_classes
+            .iter()
+            .filter(|r| r.inner == row.inner)
+            .collect();
+        if reciprocal.as_slice() != [row] {
+            continue;
+        }
+        let Some((child_source, child_owners)) = binary_owner_source(
+            archive,
+            indices,
+            versioned,
+            &child,
+            &format!("{owner_name}.{name}"),
+            class.source_file.as_deref(),
+            &layers,
+            depth + 1,
+        )?
+        else {
+            continue;
+        };
+        // Every binary declaration remains tagged by its exact owner, including omitted members.
+        let Some(begin) = child_source.find("public ") else {
+            continue;
+        };
+        nested.push(child_source[begin..].to_string());
+        owners.extend(child_owners);
+    }
+    let Some(end) = source.rfind('}') else {
+        return Ok(None);
+    };
+    for child in nested.into_iter().rev() {
+        source.insert_str(end, &child);
+    }
+    Ok(Some((source, owners)))
 }
 
 #[cfg(test)]
@@ -787,6 +968,19 @@ fn java_declaration_stub_named(
     String,
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
 )> {
+    java_declaration_stub_scoped(class, selected_sdk, source_name, &[], None)
+}
+
+fn java_declaration_stub_scoped(
+    class: &ktcore::classfile::ClassFileFacts,
+    selected_sdk: bool,
+    source_name: Option<&str>,
+    enclosing: &[&[ktcore::classfile::signature::SignatureParameter]],
+    expected_source: Option<&str>,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
     const PUBLIC: u16 = 0x0001;
     const INTERFACE: u16 = 0x0200;
     const ABSTRACT: u16 = 0x0400;
@@ -800,7 +994,8 @@ fn java_declaration_stub_named(
         || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | INTERFACE | ABSTRACT) != 0
         || class.access_flags & 0x0410 == 0x0410
         || (class.source_file.is_some() || !selected_sdk)
-            && class.source_file.as_deref() != Some(format!("{name}.java").as_str())
+            && class.source_file.as_deref()
+                != Some(expected_source.unwrap_or(format!("{name}.java").as_str()))
         || class.attribute_names.iter().any(|attribute| {
             (!selected_sdk
                 && matches!(
@@ -836,14 +1031,21 @@ fn java_declaration_stub_named(
         return None;
     }
     let generic = match &class.signature {
-        Some(_) => Some(ktcore::classfile::signature::class_signature(class)?),
+        Some(_) => Some(ktcore::classfile::signature::class_signature_scoped(
+            class, enclosing,
+        )?),
         None => None,
     };
     let class_parameters = generic
         .as_ref()
         .map_or(&[][..], |signature| signature.type_parameters.as_slice());
+    let lexical_parameters: Vec<_> = class_parameters
+        .iter()
+        .chain(enclosing.iter().flat_map(|s| s.iter()))
+        .cloned()
+        .collect();
     let type_parameters =
-        java_signature_parameters(class_parameters, class_parameters, !package.is_empty())?;
+        java_signature_parameters(class_parameters, &lexical_parameters, !package.is_empty())?;
     // A Signature must agree with the erased hierarchy before its arguments become facts.
     let hierarchy_type = |internal: &str| -> Option<String> {
         if internal == class.identity.internal_name.as_str() || internal.contains('$') {
@@ -941,12 +1143,25 @@ fn java_declaration_stub_named(
         let scope = if field.access_flags & 0x0008 != 0 {
             &[][..]
         } else {
+            lexical_parameters.as_slice()
+        };
+        let field_enclosing = if field.access_flags & 0x0008 != 0 {
+            &[][..]
+        } else {
+            enclosing
+        };
+        let field_class = if field.access_flags & 0x0008 != 0 {
+            &[][..]
+        } else {
             class_parameters
         };
         let Some(ty) = (match &field.signature {
-            Some(signature) => {
-                ktcore::classfile::signature::field_signature(signature, &field.descriptor, scope)
-            }
+            Some(signature) => ktcore::classfile::signature::field_signature_scoped(
+                signature,
+                &field.descriptor,
+                field_class,
+                field_enclosing,
+            ),
             None => ktcore::classfile::field_type(&field.descriptor),
         }) else {
             continue;
@@ -1023,11 +1238,17 @@ fn java_declaration_stub_named(
         } else {
             class_parameters
         };
+        let method_enclosing = if method.access_flags & 0x0008 != 0 {
+            &[][..]
+        } else {
+            enclosing
+        };
         let generic_method = match &method.signature {
-            Some(signature) => match ktcore::classfile::signature::method_signature(
+            Some(signature) => match ktcore::classfile::signature::method_signature_scoped(
                 signature,
                 &method.descriptor,
                 class_scope,
+                method_enclosing,
             ) {
                 Some(signature) => Some(signature),
                 None => continue,
@@ -1040,6 +1261,7 @@ fn java_declaration_stub_named(
         let scope: Vec<_> = method_parameters
             .iter()
             .chain(class_scope)
+            .chain(method_enclosing.iter().flat_map(|s| s.iter()))
             .cloned()
             .collect();
         let Some(generic_declaration) =
@@ -1264,36 +1486,47 @@ fn java_descriptor_type(
         ));
     }
     let base = ty.name.trim_end_matches("[]");
-    let nominal = match ty.qualification.as_deref() {
-        None if matches!(
-            base,
-            "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
-        ) =>
-        {
-            if !ty.args.is_empty() {
-                return None;
+    let nominal = if let Some(owner) = ty.owner.as_deref() {
+        if !is_java_identifier(base) || owner.name.ends_with("[]") {
+            return None;
+        }
+        format!(
+            "{}.{}",
+            java_descriptor_type(owner, scope, named_package)?,
+            base
+        )
+    } else {
+        match ty.qualification.as_deref() {
+            None if matches!(
+                base,
+                "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+            ) =>
+            {
+                if !ty.args.is_empty() {
+                    return None;
+                }
+                Some(base.to_string())
             }
-            Some(base.to_string())
-        }
-        None if is_java_identifier(base)
-            && scope.iter().any(|parameter| parameter.name == base)
-            && ty.args.is_empty() =>
-        {
-            Some(base.to_string())
-        }
-        Some(package)
-            if is_java_identifier(base)
-                && ((!named_package && package.is_empty())
-                    || (!package.is_empty() && package.split('.').all(is_java_identifier))) =>
-        {
-            Some(if package.is_empty() {
-                base.to_string()
-            } else {
-                format!("{package}.{base}")
-            })
-        }
-        _ => None,
-    }?;
+            None if is_java_identifier(base)
+                && scope.iter().any(|parameter| parameter.name == base)
+                && ty.args.is_empty() =>
+            {
+                Some(base.to_string())
+            }
+            Some(package)
+                if is_java_identifier(base)
+                    && ((!named_package && package.is_empty())
+                        || (!package.is_empty() && package.split('.').all(is_java_identifier))) =>
+            {
+                Some(if package.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{package}.{base}")
+                })
+            }
+            _ => None,
+        }?
+    };
     let arguments = if ty.args.is_empty() {
         String::new()
     } else {
@@ -3088,5 +3321,187 @@ mod tests {
             assert!(!target.exists());
         }
         fs::remove_dir_all(root).unwrap();
+    }
+    fn outer97_binary_fixture(ownership: &str) -> (crate::workspace::Workspace, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-binary-outer-{}-{}-{ownership}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let classes = [
+            (
+                "Item",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/outerfixture/Item.class")
+                    .as_slice(),
+            ),
+            (
+                "SpecialItem",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/outerfixture/SpecialItem.class"
+                )
+                .as_slice(),
+            ),
+            (
+                "Other",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/outerfixture/Other.class")
+                    .as_slice(),
+            ),
+            (
+                "Outer",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/outerfixture/Outer.class")
+                    .as_slice(),
+            ),
+            (
+                "Outer$Inner",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/outerfixture/Outer$Inner.class"
+                )
+                .as_slice(),
+            ),
+            (
+                "Outer$Shadow",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/outerfixture/Outer$Shadow.class"
+                )
+                .as_slice(),
+            ),
+            (
+                "Factory",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/outerfixture/Factory.class")
+                    .as_slice(),
+            ),
+        ];
+        let names: Vec<_> = classes
+            .iter()
+            .filter(|(name, _)| ownership != "missing" || *name != "Outer")
+            .map(|(name, bytes)| (format!("outerfixture/{name}.class"), *bytes))
+            .collect();
+        let mut entries: Vec<_> = names
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect();
+        if ownership == "ambiguous" {
+            // Equal-length alternate path becomes a duplicate enclosing-class entry after ZIP
+            // creation, including both local/central names. No archive-order owner choice.
+            entries.push((
+                "outerfixture/Ovter.class",
+                classes.iter().find(|(n, _)| *n == "Outer").unwrap().1,
+            ));
+        }
+        let jar = root.join("api.jar");
+        write_binary_jar(&jar, &entries);
+        if ownership == "ambiguous" {
+            let bytes = fs::read(&jar).unwrap();
+            let from = b"outerfixture/Ovter.class";
+            let to = b"outerfixture/Outer.class";
+            let mut changed = bytes.clone();
+            for i in 0..bytes.len().saturating_sub(from.len()) {
+                if &bytes[i..i + from.len()] == from {
+                    changed[i..i + from.len()].copy_from_slice(to);
+                }
+            }
+            fs::write(&jar, changed).unwrap();
+        }
+        let mut workspace = crate::workspace::Workspace::new();
+        fs::create_dir_all(root.join("src")).unwrap();
+        workspace.set_project_model(std::sync::Arc::new(crate::classpath::ProjectSnapshot::new(
+            crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\touterfixture\tapi\t1\nEND\t:app\n",
+                root.display(), root.join("src").display(), jar.display(), jar.display()
+            )),
+        )));
+        let coord = crate::coords::Coordinate::parse("outerfixture:api:1").unwrap();
+        let mut kotlin = crate::parser::KotlinParser::new();
+        let mut java = crate::java::JavaParser::new();
+        for batch in crate::deps::resolve_module_binary_stubs(
+            &coord,
+            &[(jar.clone(), crate::classpath::file_origin_id(&jar))],
+            &root.join("stubs"),
+            &mut kotlin,
+            &mut java,
+        )
+        .unwrap()
+        {
+            assert!(workspace.index_dependency_batch(batch));
+        }
+        (workspace, root)
+    }
+
+    fn outer97_assert_chain(
+        workspace: &mut crate::workspace::Workspace,
+        key: &str,
+        source: &str,
+        chain: &str,
+        useful: &str,
+        wrong: &str,
+    ) {
+        let at = source.find(chain).unwrap() + chain.len();
+        let query = workspace
+            .completion_query(key, at)
+            .expect("binary generic chain query");
+        assert!(
+            query
+                .candidates
+                .iter()
+                .any(|candidate| candidate.label == useful),
+            "{key}: {chain} missing {useful}: {:?}",
+            query.candidates
+        );
+        assert!(
+            query
+                .candidates
+                .iter()
+                .all(|candidate| candidate.label != wrong),
+            "{key}: {chain} leaked {wrong}"
+        );
+        let defs = workspace.goto_definition(key, at);
+        assert_eq!(defs.len(), 1, "{key}: exact {useful} navigation");
+        let target = workspace.doc_text(&defs[0].file).unwrap();
+        assert_eq!(&target[defs[0].start_byte..defs[0].end_byte], useful);
+        assert!(defs[0].file.ends_with(if useful == "special" {
+            "SpecialItem.java"
+        } else {
+            "Other.java"
+        }));
+    }
+
+    #[test]
+    fn binary_outer_instantiation_reaches_shared_queries() {
+        let (mut workspace, root) = outer97_binary_fixture("complete");
+        for (name, source) in [
+            ("Use.java", "package outerfixture; class Use { void use(Factory factory, Other other) { factory.make().outer().special(); factory.make().inner().pong(); factory.value.outer().special(); factory.make().shadow(other).pong(); factory.shadow().own().pong(); } }"),
+            ("Use.kt", "package outerfixture\nfun use(factory: Factory, other: Other) { factory.make().outer().special(); factory.make().inner().pong(); factory.value.outer().special(); factory.make().shadow(other).pong(); factory.shadow().own().pong() }")
+        ] {
+            let key=crate::paths::file_key(&root.join("src").join(name)); workspace.open(&key,source.into()); workspace.scan(&root.join("src"));
+            for (chain,useful,wrong) in [
+                ("factory.make().outer().","special","pong"),
+                ("factory.make().inner().","pong","ping"),
+                ("factory.value.outer().","special","pong"),
+                ("factory.make().shadow(other).","pong","ping"),
+                ("factory.shadow().own().","pong","ping")
+            ] { outer97_assert_chain(&mut workspace,&key,source,chain,useful,wrong); }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_outer_requires_unique_enclosing_owner_proof() {
+        for ownership in ["missing", "ambiguous"] {
+            let (mut workspace, root) = outer97_binary_fixture(ownership);
+            for (name,source) in [
+                ("Use.java","package outerfixture; class Use { void use(Factory factory) { factory.make().outer().special(); } }"),
+                ("Use.kt","package outerfixture\nfun use(factory: Factory) { factory.make().outer().special() }")
+            ] {
+                let key=crate::paths::file_key(&root.join("src").join(name)); workspace.open(&key,source.into()); workspace.scan(&root.join("src"));
+                let at=source.find("factory.make().outer().").unwrap()+"factory.make().outer().".len();
+                assert!(workspace.completion_query(&key,at).is_none_or(|q|q.candidates.iter().all(|c|c.label!="special")), "{ownership}: unproved owner arguments must not be inferred");
+                assert!(workspace.goto_definition(&key,at).is_empty());
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

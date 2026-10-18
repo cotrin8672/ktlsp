@@ -80,6 +80,9 @@ pub struct TypeRef {
     pub nullable: bool,
     #[serde(default)]
     pub args: Vec<TypeRef>,
+    /// Instantiated lexical owner of a nonstatic nested type; arguments stay on each segment.
+    #[serde(default)]
+    pub owner: Option<Box<TypeRef>>,
     #[serde(default, with = "arc_candidates")]
     pub package_candidates: Arc<Vec<String>>,
     #[serde(default)]
@@ -110,6 +113,8 @@ impl TypeRef {
             args: Vec::new(),
             package_candidates: Arc::new(Vec::new()),
             container_candidates: Vec::new(),
+
+            owner: None,
         }
     }
 }
@@ -140,6 +145,7 @@ pub enum Type {
         container: Option<String>,
         nullable: bool,
         args: Vec<Type>,
+        owner: Option<Box<Type>>,
     },
     Parameter {
         definition: crate::symbol::Def,
@@ -190,6 +196,8 @@ impl Type {
             container: None,
             nullable: false,
             args: Vec::new(),
+
+            owner: None,
         }
     }
 
@@ -251,6 +259,14 @@ impl Type {
             _ => {}
         }
         self
+    }
+
+    pub fn owner(&self) -> Option<&Type> {
+        match self {
+            Type::Class { owner, .. } => owner.as_deref(),
+            Type::Projected { bound, .. } => bound.owner(),
+            _ => None,
+        }
     }
 
     pub fn args(&self) -> &[Type] {

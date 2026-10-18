@@ -144,7 +144,10 @@ fn type_label(ty: &TypeRef) -> String {
     if ty.name.is_empty() {
         return "_".to_string();
     }
-    let mut s = ty.name.clone();
+    let mut s = ty.owner.as_deref().map_or_else(
+        || ty.name.clone(),
+        |owner| format!("{}.{}", type_label(owner), ty.name),
+    );
     if !ty.args.is_empty() {
         s.push('<');
         s.push_str(

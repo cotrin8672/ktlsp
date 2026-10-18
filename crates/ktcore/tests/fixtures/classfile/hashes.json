@@ -243,5 +243,40 @@
     "file": "genericfixture/Holder.class",
     "sha256": "0a85f336ea4376deb53cf358b503a5046d8234d29cbaeb8ca65b0199b1fbdf5d",
     "bytes": 332
+  },
+  {
+    "file": "outerfixture/Factory.class",
+    "sha256": "753d5062024367e6affe59a94a4249a80eb7ec9b31853bf814d426c6f7ba4e73",
+    "bytes": 956
+  },
+  {
+    "file": "outerfixture/Item.class",
+    "sha256": "47c7796333a14aaa222b8374f4d2d2c9f732f1510fd5567e245cb1acb65db152",
+    "bytes": 276
+  },
+  {
+    "file": "outerfixture/Other.class",
+    "sha256": "119405a29f0605ae8434b33e550b646c7ccc788232b5e2af1ff522697afd7fb9",
+    "bytes": 279
+  },
+  {
+    "file": "outerfixture/Outer.class",
+    "sha256": "0533014a65388a381c1028ffa86123cc1ad987dc8060e2048b911b0ac14d2778",
+    "bytes": 404
+  },
+  {
+    "file": "outerfixture/Outer$Inner.class",
+    "sha256": "24d25135cf16f85304436a30eaa7cf823fd173fb7b2847e889b083e60acc5faa",
+    "bytes": 775
+  },
+  {
+    "file": "outerfixture/Outer$Shadow.class",
+    "sha256": "2799041744536422e80844da616898a33eb73bc4f519508d77be72c76f10c398",
+    "bytes": 550
+  },
+  {
+    "file": "outerfixture/SpecialItem.class",
+    "sha256": "977d8f3c062f97069a7447bda1ab8e286689e9a1089e320980d03d3af6313e83",
+    "bytes": 287
   }
 ]

@@ -38,6 +38,9 @@ pub fn unify_into(
         return;
     }
     if Some(formal.name.as_str()) == actual.name() {
+        if let (Some(formal), Some(actual)) = (formal.owner.as_deref(), actual.owner()) {
+            unify_into(formal, actual, tparams, subst);
+        }
         for (f, a) in formal.args.iter().zip(actual.args()) {
             unify_into(f, a, tparams, subst);
         }
@@ -58,7 +61,9 @@ pub struct Application {
 }
 
 pub fn has_projection(ty: &TypeRef) -> bool {
-    ty.projection != crate::types::Projection::Invariant || ty.args.iter().any(has_projection)
+    ty.projection != crate::types::Projection::Invariant
+        || ty.owner.as_deref().is_some_and(has_projection)
+        || ty.args.iter().any(has_projection)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -180,6 +185,29 @@ pub fn constrain_application(
             || relation == Relation::Equal && actual.is_nullable() != formal.nullable
         {
             return ConstraintStatus::Unknown;
+        }
+        match (formal.owner.as_deref(), actual.owner()) {
+            (Some(formal), Some(actual)) => {
+                let status = collect(
+                    formal,
+                    actual,
+                    parameters,
+                    Relation::Equal,
+                    false,
+                    constraints,
+                    resolve,
+                    known,
+                    invariant,
+                    subtype,
+                    distinct,
+                    depth + 1,
+                );
+                if status != ConstraintStatus::Matched {
+                    return status;
+                }
+            }
+            (None, None) => {}
+            _ => return ConstraintStatus::Unknown,
         }
         if formal.args.len() != actual.args().len() {
             return ConstraintStatus::Unknown;
@@ -359,6 +387,8 @@ mod tests {
             args: vec![TypeRef::simple("T")],
             package_candidates: std::sync::Arc::new(Vec::new()),
             container_candidates: Vec::new(),
+
+            owner: None,
         };
         let actual = Type::Class {
             name: "List".into(),
@@ -366,6 +396,8 @@ mod tests {
             container: None,
             nullable: false,
             args: vec![Type::class("Foo", None)],
+
+            owner: None,
         };
         let mut subst = HashMap::new();
         unify_into(&formal, &actual, &tparams(&["T"]), &mut subst);

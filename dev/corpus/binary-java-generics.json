@@ -4,7 +4,7 @@
   "probes": [
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-get",
@@ -17,7 +17,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-field",
@@ -30,7 +30,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-array",
@@ -43,7 +43,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-bounded",
@@ -56,7 +56,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-shadow",
@@ -69,7 +69,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-static",
@@ -82,7 +82,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": true,
       "completion_prefix": "",
       "id": "binary-generics-java-exact-ITEM",
@@ -97,7 +97,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-wrong-bound",
@@ -123,7 +123,7 @@
     },
     {
       "source": "src/main/java/binarygenerics/JavaGenerics.java",
-      "source_sha256": "41564cdd717c59b9f1f92e9927bcb19b58356d6f0c3d96043cc11339d777bb6b",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
       "definition": false,
       "completion_prefix": "",
       "id": "binary-generics-java-value-shadow",
@@ -291,6 +291,23 @@
         "completion_prefix": "",
         "completion_token": "ping"
       }
+    },
+    {
+      "source": "src/main/java/binarygenerics/JavaGenerics.java",
+      "source_sha256": "3b6cdf827c2fec175931ea312741469f757596fc6835bf4557c225e301d4dcad",
+      "id": "binary-generics-java-nonstatic-outer-owner",
+      "anchor": "factory.make().outer().special",
+      "token": "special",
+      "completion_prefix": "",
+      "completion_token": "special",
+      "completion_excludes": [
+        "pong"
+      ],
+      "target_file": "oracle/SpecialItem.stub.txt",
+      "target_uri_suffix": "outerfixture/SpecialItem.java",
+      "target_sha256": "cfb9fea5db81ec780ae8280d3a5031c4f570227693a3ba7a7df4d151632cc007",
+      "target_anchor": "java.lang.String special()",
+      "target_token": "special"
     }
   ]
 }

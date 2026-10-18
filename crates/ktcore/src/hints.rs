@@ -326,7 +326,10 @@ fn format_type(ty: &Type, syntax: TypeSyntax) -> Option<String> {
             if name.is_empty() {
                 return None;
             }
-            let mut out = name.clone();
+            let mut out = match ty.owner() {
+                Some(owner) => format!("{}.{}", format_type(owner, syntax)?, name),
+                None => name.clone(),
+            };
             if !args.is_empty() {
                 let formatted_args = args
                     .iter()
