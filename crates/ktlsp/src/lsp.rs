@@ -957,10 +957,11 @@ fn index_dependencies_with_source_query(
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
     cancelled: &std::sync::atomic::AtomicBool,
     load_sources: impl FnOnce(
-        &std::path::Path,
-        &Arc<classpath::ProjectSnapshot>,
-        &std::sync::atomic::AtomicBool,
-    ) -> anyhow::Result<Arc<classpath::ProjectSnapshot>>,
+            &std::path::Path,
+            &Arc<classpath::ProjectSnapshot>,
+            &std::sync::atomic::AtomicBool,
+        ) -> anyhow::Result<Arc<classpath::ProjectSnapshot>>
+        + Send,
 ) -> DepStats {
     let pending = model
         .as_ref()
@@ -969,29 +970,44 @@ fn index_dependencies_with_source_query(
     let Some(accepted) = pending else {
         return index_dependency_model(ws, root, model, gradle, generation, progress, false);
     };
-    // Publish exact binary members before repository IO can delay library completion.
-    let started = Instant::now();
-    let binary = index_dependency_model(
-        ws,
-        root,
-        Some(accepted.clone()),
-        gradle,
-        generation,
-        progress,
-        true,
-    );
-    crate::trace::span(
-        "deps.binary_preview",
-        "deps",
-        started,
-        serde_json::json!({"generation":generation, "files":binary.files, "symbols":binary.symbols}),
-    );
+    // Source selection reads only the immutable accepted model. Keep its worker owned by
+    // this blocking index job, overlap repository IO with binary preview, and publish neither
+    // its result nor source-derived facts until both phases join and acceptance checks pass.
+    let (binary, enriched) = std::thread::scope(|scope| {
+        let query_model = accepted.clone();
+        let query = std::thread::Builder::new()
+            .name("ktlsp-source-query".to_string())
+            .spawn_scoped(scope, move || load_sources(root, &query_model, cancelled));
+        let started = Instant::now();
+        let binary = index_dependency_model(
+            ws,
+            root,
+            Some(accepted.clone()),
+            gradle,
+            generation,
+            progress,
+            true,
+        );
+        crate::trace::span(
+            "deps.binary_preview",
+            "deps",
+            started,
+            serde_json::json!({"generation":generation, "files":binary.files, "symbols":binary.symbols}),
+        );
+        let enriched = match query {
+            Ok(query) => query.join().unwrap_or_else(|_| {
+                Err(anyhow::anyhow!("Gradle source selection worker panicked"))
+            }),
+            Err(error) => Err(error.into()),
+        };
+        (binary, enriched)
+    });
     if cancelled.load(std::sync::atomic::Ordering::Acquire)
         || !ws.lock().is_current_generation(generation)
     {
         return binary;
     }
-    let enriched = match load_sources(root, &accepted, cancelled) {
+    let enriched = match enriched {
         Ok(enriched) => enriched,
         Err(_) => {
             tracing::warn!("Gradle source selection enrichment is unavailable");
@@ -5292,6 +5308,181 @@ mod tests {
         }
     }
 
+    fn source_query_overlap_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        Arc<Mutex<Workspace>>,
+        Arc<classpath::ProjectSnapshot>,
+        Arc<classpath::ProjectSnapshot>,
+    ) {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-source-query-overlap-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("api.jar");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+        archive
+            .start_file(
+                "fieldfixture/FieldOnly.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class"
+            ))
+            .unwrap();
+        archive.finish().unwrap();
+        let dump = format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tfieldfixture\tapi\t1\n",
+            root.display(), root.display(), binary.display(), binary.display()
+        );
+        let accepted = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(
+            &format!("{dump}END\t:app\n"),
+        )));
+        let enriched = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(
+            &format!("{dump}SOURCEQUERY\tmain\tcomplete\nPOMQUERY\tmain\tcomplete\nEND\t:app\n"),
+        )));
+        assert!(accepted.source_enrichment_needed());
+        assert!(!enriched.source_enrichment_needed());
+        let ws = Arc::new(Mutex::new(Workspace::new()));
+        ws.lock().set_project_model(accepted.clone());
+        (root, ws, accepted, enriched)
+    }
+
+    #[test]
+    fn selected_source_query_overlaps_binary_preview_without_early_publication() {
+        let (root, ws, accepted, enriched) = source_query_overlap_fixture("overlap");
+        let binary_gate = ws.lock();
+        let generation = binary_gate.analysis_generation();
+        let (entered, pending) = std::sync::mpsc::sync_channel(1);
+        let worker_ws = ws.clone();
+        let worker_root = root.clone();
+        let worker_accepted = accepted.clone();
+        let query_result = enriched.clone();
+        let worker = std::thread::spawn(move || {
+            index_dependencies_with_source_query(
+                &worker_ws,
+                &worker_root,
+                Some(worker_accepted),
+                true,
+                generation,
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+                move |_, _, _| {
+                    entered.send(()).unwrap();
+                    Ok(query_result)
+                },
+            )
+        });
+        // The workspace lock prevents binary indexing from progressing. This is an ordering
+        // barrier, not a response-time budget or repeated semantic query.
+        let overlapped = pending.recv_timeout(Duration::from_secs(10)).is_ok();
+        let not_detached = !worker.is_finished();
+        let still_accepted = Arc::ptr_eq(&binary_gate.project_snapshot().unwrap(), &accepted);
+        drop(binary_gate);
+        worker.join().unwrap();
+        assert!(
+            overlapped,
+            "source resolution must start while binary preview is blocked"
+        );
+        assert!(
+            not_detached,
+            "the indexing owner must await binary publication"
+        );
+        assert!(
+            still_accepted,
+            "source resolution alone must not publish its model"
+        );
+        assert!(Arc::ptr_eq(
+            &ws.lock().project_snapshot().unwrap(),
+            &enriched
+        ));
+        assert!(Arc::ptr_eq(&classpath::snapshot(&root).unwrap(), &enriched));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_source_query_joins_rejected_results_without_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for rejection in ["cancelled", "superseded", "failed"] {
+            let (root, ws, accepted, enriched) = source_query_overlap_fixture(rejection);
+            let generation = ws.lock().analysis_generation();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let exited = Arc::new(AtomicBool::new(false));
+            let (entered, pending) = std::sync::mpsc::sync_channel(1);
+            let (release, query_gate) = std::sync::mpsc::sync_channel(1);
+            let worker_ws = ws.clone();
+            let worker_root = root.clone();
+            let worker_model = accepted.clone();
+            let worker_cancelled = cancelled.clone();
+            let query_exited = exited.clone();
+            let worker = std::thread::spawn(move || {
+                index_dependencies_with_source_query(
+                    &worker_ws,
+                    &worker_root,
+                    Some(worker_model),
+                    true,
+                    generation,
+                    None,
+                    &worker_cancelled,
+                    move |_, _, _| {
+                        entered.send(()).unwrap();
+                        query_gate.recv().unwrap();
+                        query_exited.store(true, Ordering::Release);
+                        if rejection == "failed" {
+                            anyhow::bail!("fixture source resolution failed");
+                        }
+                        // Deliberately return metadata even after cancellation: acceptance,
+                        // not a cooperative test closure, must reject this late result.
+                        Ok(enriched)
+                    },
+                )
+            });
+            let began = pending.recv_timeout(Duration::from_secs(10)).is_ok();
+            match rejection {
+                "cancelled" => cancelled.store(true, Ordering::Release),
+                "superseded" => {
+                    ws.lock().begin_analysis_generation();
+                }
+                _ => {}
+            }
+            let joined_owner_pending = !worker.is_finished();
+            release.send(()).ok();
+            let stats = worker.join().unwrap();
+            assert!(began, "{rejection}: query did not start");
+            assert!(joined_owner_pending, "{rejection}: query escaped its owner");
+            assert!(
+                exited.load(Ordering::Acquire),
+                "{rejection}: owner returned before query exit"
+            );
+            assert!(
+                Arc::ptr_eq(&ws.lock().project_snapshot().unwrap(), &accepted),
+                "{rejection}"
+            );
+            assert!(
+                classpath::snapshot(&root).is_none(),
+                "{rejection}: rejected model published"
+            );
+            if rejection == "failed" {
+                assert!(
+                    stats.files > 0,
+                    "source failure must retain indexed binary facts"
+                );
+                assert!(!ws
+                    .lock()
+                    .index
+                    .file_origins()
+                    .collect::<Vec<_>>()
+                    .is_empty());
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn selected_binary_completion_is_usable_before_source_query_finishes_and_shutdown_cancels_it(
     ) {
@@ -5360,6 +5551,20 @@ mod tests {
             )
         });
         pending.recv_timeout(Duration::from_secs(10)).unwrap();
+        let binary_origin = classpath::maven_origin_id(
+            &crate::coords::Coordinate::parse("fieldfixture:api:1").unwrap(),
+        );
+        let ready_started = Instant::now();
+        while !backend
+            .ws
+            .lock()
+            .index
+            .file_origins()
+            .any(|(_, origin)| origin.origin_id == binary_origin)
+            && ready_started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let mut observed = Vec::new();
         for (name, source) in [
             (
