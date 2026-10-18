@@ -6,9 +6,7 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Verified96 baseline: checks and releases pass; project validation remains partial
-
-### Latest104 source validation (baseline96 release remains the editor reference)
+## Latest104: current source and native validation
 
 The full101 workspace run compiled and returned1,672 passed/three failed/seven
 ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
@@ -57,9 +55,54 @@ the earlier intermittent shutdown issue is not declared fixed. Root verified29
 current runtime guards and12 artifact references. Evidence:
 recovery89/getter-native104/receipt.json SHA256
 f0e25155371386d01920b92c9edf5a1c92e83c1d9fcce0486e8f7b8ad89acc12.
-Current-source CEM/Gradle runs are underway. The new extension-source API still
-requires its separate external-consumer gate; no all-project or speed acceptance
-is claimed.
+CEM's unchanged original18 assertions now all match first responses on ordinary
+caches:10 canonical requests and8 Java assertions. Exact ResourceKey-only goto
+is fixed. Root verified the acceptance references and owned receipts; source,
+output and build timestamps remain unchanged. The earlier cache-junction trial
+is retained separately (two Java assertions unmeasured after compiler-watch
+rejection); it is excluded from the successful denominator. Evidence:
+recovery89/cem104-original18-1/original18-acceptance.json SHA256
+b34492867e13dfb323e03b3fd926554178f0e6af47933a145bfaa7089481bf95.
+Dependency source coverage remains one failed/three missing; typetools is kept
+as binary fallback, with no corresponding CEM consumer failure established.
+First gated useful completion is97.953s after the first trace event; earliest
+availability was not measured, so this is no cold-start/p95 acceptance claim.
+
+The separate external consumer compiles against the current public API:4 tests
+pass, release succeeds, and the original three cold first responses all match
+with useful completion, exact target navigation and clean diagnostics. Normal
+Gradle import and natural shutdown succeed. Root verified11 runtime artifact
+references;329 source inputs match the main build. Runtime evidence:
+recovery89/external-api104-cold/receipt.json SHA256
+58404ca5850ef9df4d71fdd30f8a4ae818f3d6d6214b234e24dd81561ac0d21b.
+This proves the existing test provider's separate-project composition, not a
+production Mixin extension or general compiler-plugin parity.
+
+The fresh Gradle9 attempt exposes a startup bug before any semantic request:
+unchanged build-file notifications repeatedly cancel the model import. File
+bytes match pinned HEAD and mtimes predate the run. All nine requests remain
+unmeasured; the owned run was intentionally stopped. The shared watch-refresh
+fix seeds configuration content identities before watch registration/import and
+ignores only known byte-identical Changed/save notifications. Real edits,
+creation/deletion and unknown/read-error cases still invalidate. The extended
+existing scheduler test passes (one test,3.90s). Workspace105 passes1,681/zero
+failed/seven ignored (94.594s including build), and release105 succeeds53.063s
+with344 stable inputs. Its20,190,720-byte binary is
+native-integrated105-1/bin/ktlsp.exe, SHA256
+260238804c6df8b40ea8c88db4c03fdd538b80d38b9bd342f4382998cb29333e.
+Build evidence: native-integrated105-1/receipt.json SHA256
+20112a894c5a3a29c2b1d710a090b7c31a7d062858dad45b36938a80c4231405.
+The same original Gradle9 run is active on105. Its first model generation
+converges (194 modules, model load83.066s); no refresh cancellation is observed.
+So far actual notifications cover lockfiles, not the original unchanged build
+files, so this alone does not prove the deduplication path was exercised. Useful
+first responses remain unverified. Evidence of the original failure:
+recovery89/corpus90/native-five-gradle-editor104-2/startup-watch-classification.json.
+Focused receipt: recovery89/watch-refresh105-focus2/receipt.json SHA256
+b71b952c1c9c936fc5644b22fa0063a976c53c0b94ad086ada0328945725f23e.
+The remaining four-project rerun, reload/compiler-plugin cases and full speed
+acceptance remain unproved. Implementation through this slice is pushed as
+87c0787e9c49ffb74e572f5721af78c7e51dcfcf.
 
 The requested test-efficiency audit found build work dominates the inspected
 five runs (about344.5s build versus22.4s tests). The inner loop now selects the
@@ -89,7 +132,9 @@ New-release comparison is pending. Evidence:
 recovery89/extension102-getter-native96/receipt.json SHA256
 5d7a0036dd02b5888f55689f62f4da395fb5fa3e33da6ff55c5923cf128c76f4.
 
-Current source fixes caller-specific SDK views, SDK11 legacy signatures, nested
+## Historical96 baseline
+
+The96 source fixes caller-specific SDK views, SDK11 legacy signatures, nested
 Map.Entry generic result chains, Gradle future-file selection and the exporter
 deprecation that blocked real Gradle imports. Shared extension-source readiness
 now covers semantic consumers and rejects stale close/reopen requests.

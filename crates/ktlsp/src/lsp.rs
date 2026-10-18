@@ -49,9 +49,24 @@ struct WatchState {
     registration: Option<String>,
     registered_options: Option<serde_json::Value>,
     sequence: u64,
+    configuration_contents: HashMap<String, [u8; 32]>,
+    configuration_baselined: bool,
 }
 
 impl WatchState {
+    fn unchanged_configuration(&mut self, key: &str, kind: FileChangeType) -> bool {
+        if !is_project_configuration(Path::new(key)) {
+            return false;
+        }
+        let contents = &mut self.configuration_contents;
+        let Some(current) = configuration_content(Path::new(key)) else {
+            contents.remove(key);
+            return false;
+        };
+        let previous = contents.insert(key.to_string(), current);
+        kind == FileChangeType::CHANGED && previous == Some(current)
+    }
+
     fn acknowledges(&self, expected_options: &serde_json::Value) -> bool {
         self.dynamic
             && self.registration.is_some()
@@ -1559,6 +1574,18 @@ async fn index_workspace(
 
     let scan_start = Instant::now();
     if gradle {
+        if !watches.lock().configuration_baselined {
+            let configuration_root = root.clone();
+            let contents =
+                tokio::task::spawn_blocking(move || configuration_contents(&configuration_root))
+                    .await
+                    .unwrap_or_default();
+            let mut state = watches.lock();
+            for (key, content) in contents {
+                state.configuration_contents.entry(key).or_insert(content);
+            }
+            state.configuration_baselined = true;
+        }
         let registered = watches.lock().registration.is_some();
         if !registered {
             let watch_start = Instant::now();
@@ -2094,6 +2121,49 @@ async fn register_project_watches(
     }
 }
 
+fn is_project_configuration(file: &Path) -> bool {
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    (name.ends_with(".gradle") && name != ".gradle")
+        || name.ends_with(".gradle.kts")
+        || name.ends_with(".toml")
+        || matches!(name, "gradle.properties" | "gradle-wrapper.properties")
+}
+
+fn configuration_content(path: &Path) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    Some(sha2::Sha256::digest(std::fs::read(path).ok()?).into())
+}
+
+fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
+    let paths = crate::workspace::git_project_files(
+        root,
+        &[
+            "*.gradle",
+            "*.gradle.kts",
+            "*.toml",
+            "gradle.properties",
+            "gradle-wrapper.properties",
+        ],
+    )
+    .unwrap_or_else(|| {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|entry| !crate::workspace::is_excluded(entry))
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_file() && is_project_configuration(entry.path()))
+            .map(|entry| entry.into_path())
+            .collect()
+    });
+    paths
+        .into_iter()
+        .filter(|path| is_project_configuration(path))
+        .filter_map(|path| Some((crate::paths::file_key(&path), configuration_content(&path)?)))
+        .collect()
+}
+
 /// `Some(force)` for relevant events; source-only saves reuse the published classpath.
 fn project_change(
     root: &Path,
@@ -2105,11 +2175,7 @@ fn project_change(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if (name.ends_with(".gradle") && name != ".gradle")
-        || name.ends_with(".gradle.kts")
-        || name.ends_with(".toml")
-        || matches!(name, "gradle.properties" | "gradle-wrapper.properties")
-    {
+    if is_project_configuration(file) {
         return Some(true);
     }
     if let Some(model) = model {
@@ -2614,6 +2680,13 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
+        if self
+            .watches
+            .lock()
+            .unchanged_configuration(&key, FileChangeType::CHANGED)
+        {
+            return;
+        }
         if let Some(force) = project_change(&root, model.as_deref(), &key) {
             self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
         }
@@ -2632,7 +2705,10 @@ impl LanguageServer for Backend {
             params
                 .changes
                 .iter()
-                .filter_map(|change| uri_to_key(&change.uri))
+                .filter_map(|change| {
+                    let key = uri_to_key(&change.uri)?;
+                    (!self.watches.lock().unchanged_configuration(&key, change.typ)).then_some(key)
+                })
                 .filter(|key| !ws.observe_compiled_resource(key))
                 .map(|key| {
                     let change = project_change(&root, model.as_deref(), &key);
@@ -7337,9 +7413,24 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 FileChangeType::CHANGED,
             )],
         };
+        backend.initialized(InitializedParams {}).await;
+        let invocations = || {
+            std::fs::read_to_string(root.join("invocations"))
+                .map(|text| text.lines().count())
+                .unwrap_or_default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while invocations() < 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(invocations(), 1, "initial import never started");
+        let initial = backend.refresh.lock().requested;
+        let initial_cancelled = backend.refresh.lock().cancelled.clone();
         for _ in 0..5 {
             backend.did_change_watched_files(event()).await;
         }
+        assert_eq!(backend.refresh.lock().requested, initial);
+        assert!(!initial_cancelled.load(std::sync::atomic::Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(12);
         while backend.refresh.lock().running && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7352,14 +7443,16 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 .count(),
             1
         );
-        backend.did_change_watched_files(event()).await;
+        for plugin in ["base", "java", "base", "java", "base"] {
+            std::fs::write(
+                root.join("build.gradle.kts"),
+                format!("plugins {{ {plugin} }}"),
+            )
+            .unwrap();
+            backend.did_change_watched_files(event()).await;
+        }
         // The lease file appears before logging. Wait for the durable second startup record;
         // that child then stays active until cancellation, without a 600 ms timing window.
-        let invocations = || {
-            std::fs::read_to_string(root.join("invocations"))
-                .map(|text| text.lines().count())
-                .unwrap_or_default()
-        };
         let deadline = Instant::now() + Duration::from_secs(12);
         while invocations() < 2 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7367,7 +7460,13 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         assert_eq!(invocations(), 2, "second refresh never completed startup");
         assert!(root.join("running").exists());
         let superseded = backend.ws.lock().analysis_generation();
+        let active_cancelled = backend.refresh.lock().cancelled.clone();
         backend.did_change_watched_files(event()).await;
+        assert_eq!(backend.ws.lock().analysis_generation(), superseded);
+        assert!(!active_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
+        backend.did_change_watched_files(event()).await;
+        assert!(active_cancelled.load(std::sync::atomic::Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(12);
         while backend.refresh.lock().running && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7389,6 +7488,22 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             "latest model was never published"
         );
         drop(ws);
+        let key = crate::paths::file_key(&root.join("build.gradle.kts"));
+        let mut watches = backend.watches.lock();
+        assert!(!watches.unchanged_configuration(&key, FileChangeType::CREATED));
+        std::fs::remove_file(&key).unwrap();
+        assert!(!watches.unchanged_configuration(&key, FileChangeType::DELETED));
+        assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        std::fs::create_dir(&key).unwrap();
+        assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        std::fs::remove_dir(&key).unwrap();
+        std::fs::write(&key, "plugins { java }").unwrap();
+        assert!(!watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        assert!(watches.unchanged_configuration(&key, FileChangeType::CHANGED));
+        let unknown = crate::paths::file_key(&root.join("new.gradle.kts"));
+        std::fs::write(&unknown, "plugins { java }").unwrap();
+        assert!(!watches.unchanged_configuration(&unknown, FileChangeType::CHANGED));
+        drop(watches);
         std::fs::remove_dir_all(root).unwrap();
     }
 

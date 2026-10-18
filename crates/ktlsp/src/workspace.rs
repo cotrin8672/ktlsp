@@ -3809,7 +3809,7 @@ fn tier_rank(tier: Tier) -> u8 {
 }
 
 /// Prune build output, common generated dirs, and dot directories from the scan.
-fn is_excluded(entry: &DirEntry) -> bool {
+pub(crate) fn is_excluded(entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
@@ -3992,6 +3992,10 @@ fn project_index_threads() -> usize {
 }
 
 fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
+    git_project_files(root, &["*.kt", "*.kts", "*.java"])
+}
+
+pub(crate) fn git_project_files(root: &Path, patterns: &[&str]) -> Option<Vec<std::path::PathBuf>> {
     let top = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4014,10 +4018,8 @@ fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
             "--exclude-standard",
             "--full-name",
             "--",
-            "*.kt",
-            "*.kts",
-            "*.java",
         ])
+        .args(patterns)
         .output()
         .ok()?;
     if !output.status.success() {
