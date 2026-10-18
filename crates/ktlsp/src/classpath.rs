@@ -1509,10 +1509,11 @@ fn source_set_sdk_api(
             let mut release = None;
             for argument in &mut normalized.arguments {
                 if let Some(value) = argument.strip_prefix("-Xjdk-release=") {
-                    if release.is_some() {
+                    let selected = kotlin_jdk_release_feature(value)?;
+                    if release.is_some_and(|previous| previous != selected) {
                         return None;
                     }
-                    release = Some(kotlin_jdk_release_feature(value)?);
+                    release = Some(selected);
                     *argument = format!("-Xjdk-release={feature}");
                 } else if argument.starts_with("-Xjdk-release") {
                     return None;
@@ -3739,13 +3740,20 @@ pub(crate) mod tests {
         // Actual Gradle 8.14.2 / KGP 2.0.21 metadata uses release=1.8 and target=1.8.
         // The selected compiler independently emits identical AtomicKt bytes for release 8/1.8.
         let atomic_text = "fun atomic(i: java.util.concurrent.atomic.AtomicInteger, s: java.lang.String): Int { s.strip(); s.incrementAndGet(); return i.incrementAndGet() }";
-        for release in ["8", "1.8"] {
+        // The retained Kotlin 2.0.21 / SDK17 oracle also accepts two numeric 8 flags
+        // with -Werror and emits the identical AtomicKt class. Keep authored order/count.
+        for (release, release_arguments) in [
+            ("8", vec!["-Xjdk-release=8"]),
+            ("1.8", vec!["-Xjdk-release=1.8"]),
+            ("duplicate8", vec!["-Xjdk-release=8", "-Xjdk-release=8"]),
+        ] {
             let mut legacy = module.clone();
-            legacy.source_sets[0].compiler_tasks[1].arguments = vec![
-                "-jvm-target".into(),
-                "1.8".into(),
-                format!("-Xjdk-release={release}"),
-            ];
+            let arguments: Vec<String> = ["-jvm-target", "1.8"]
+                .into_iter()
+                .chain(release_arguments)
+                .map(str::to_owned)
+                .collect();
+            legacy.source_sets[0].compiler_tasks[1].arguments = arguments.clone();
             let legacy_model = Arc::new(ProjectSnapshot::new(vec![legacy.clone()]));
             let selection = legacy_model
                 .sdk_api_for_file(&kotlin_path)
@@ -3753,6 +3761,10 @@ pub(crate) mod tests {
                     panic!("valid Kotlin release {release} needs its API inventory")
                 });
             assert_eq!(selection.release, Some(8));
+            assert_eq!(
+                legacy.source_sets[0].compiler_tasks[1].arguments, arguments,
+                "API selection must not rewrite the captured invocation"
+            );
             assert!(selection
                 .entries
                 .get("java/util/concurrent/atomic/AtomicInteger")
@@ -3803,8 +3815,11 @@ pub(crate) mod tests {
             vec!["-Xjdk-release=bogus"],
             vec!["-Xjdk-release=1.9"],
             vec!["-Xjdk-release=999"],
-            vec!["-Xjdk-release=8", "-Xjdk-release=8"],
+            vec!["-Xjdk-release=8", "-Xjdk-release=bogus"],
+            vec!["-Xjdk-release=999", "-Xjdk-release=999"],
+            vec!["-Xjdk-release=8", "-Xjdk-release"],
             vec!["-Xjdk-release=8", "-Xjdk-release=17"],
+            vec!["-jvm-target", "17", "-Xjdk-release=8", "-Xjdk-release=8"],
             vec!["-jvm-target", "17", "-Xjdk-release=8"],
         ] {
             let mut unsupported = module.clone();

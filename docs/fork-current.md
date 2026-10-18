@@ -6,7 +6,7 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Current96 broad checks pass; release and project validation pending
+## Verified96 baseline: checks and releases pass; project validation remains partial
 
 Current source fixes caller-specific SDK views, SDK11 legacy signatures, nested
 Map.Entry generic result chains, Gradle future-file selection and the exporter
@@ -17,11 +17,159 @@ workspace passes1,650/zero failed/five ignored across40 groups (495.797s includi
 build); Root independently verified raw bytes/hash, group totals, exit0 and
 owned closure. Evidence: native-integrated96-1/workspace-receipt.json SHA256
 b7b985b400a76b10468aa7b3e44861803604547a9a3b904d427a577204ffb2e1.
-Release build is active. Current native CEM and original Gradle nine-request
-acceptance remain unproved until the new immutable copy runs; the older95
-failures below are retained. AP current-generation support and Moshi dirty
+The main release exits0 (544.766s), with clean owned closure and all333 inputs
+stable. Root independently verified333 current guards and11 artifact references
+in native-integrated96-1/main-ready.json, SHA256
+39151e2a0212ac56cdbad2ad1b196c241a8d0c7bbeda5ee92d50cd53cfdc7af0.
+Its20012032-byte binary has SHA256
+68e6dbc3a1ef9bff6f3e7d87b2bf073d3d68371c2c505640d70686baeb2819f8.
+Code is pushed as4f46e449c34af651b355fbdd6eed22095cc86fa5.
+External-consumer tests pass4/zero failed and its release exits0. The final
+pipeline has stable333 inputs and clean owned closure at every stage. Root
+verified the final receipt and external-copy references before subsequent test
+edits: native-integrated96-1/receipt.json SHA256
+b844b2fc28e9a7520898e6c247da8e0ea64944d142cef0b1dae835641237de8a;
+external-copy-receipt.json SHA256
+ceac5b7ead775459cd0675ab3079e448f612c212d94adba3b588b01643fa9486.
+The copied external binary has SHA256
+31c9e34e59b9882179090c1b0d4323923c362c2e5b2f84bc51b2d64c44efa012.
+Its original three strict cold first-response runtime checks now pass: useful
+exact completion, exact navigation and clean diagnostics, one attempt each.
+Shutdown exits naturally0 without termination, all413 runtime inputs stable.
+Root independently verified the result bytes and receipt references:
+external-library96-cold1/receipt.json SHA256
+c4ffb4a12e8795434f3ba262f5c809d14e442a60fcda0069f2bf841187d7e955.
+CEM's normal offline import now succeeds (one module,65.600s). The unchanged
+original18 finish17 matched/one mismatch/zero unmeasured/unanswered, with natural
+owned closure and unchanged private properties. Root verified both owner and
+acceptance references. Evidence: recovery89/cem96-original18-96-1/original18-acceptance.json
+SHA25611266f8d745782fb59d52e521bc5ba5295730c4982641e563d6733525fbfe851.
+The remaining mismatch is precise overload goto: getOrThrow(ResourceKey<T>)
+returns its correct location plus the unrelated TagKey<T> overload. A shared
+selection fix is outside-checkout work. Both Java/Kotlin tasks also capture null
+sdkSourcePolicy/sdkProducerClaims, so CEM future-file SDK ownership is unproved.
+A real configuration-only control identifies the cause: Gradle9.6.1's visitor
+uses Visit rather than Spec. The two-line outside-checkout correction passes
+six actual CEM source-tree controls, retaining restrictive-pattern, opaque-spec
+and generated-tree exclusions. This is exporter evidence, not editor acceptance:
+recovery89/sdk-visitor96-fixed-control1/receipt.json SHA256
+a47b991ea2104dace218c8fb4fb8f1b2e06762a8668d480c437ee81cec75f31e.
+Read-only bytecode checks and15 actual configured controls also pass on the
+corpus's Gradle8.7,8.10.2 and8.14.2. Combined21 configured controls do not prove
+future-buffer editor behavior. Evidence:
+recovery89/sdk-visitor96-gradle8-controls1/receipt.json SHA256
+b188753cba192ebbc054da62b10cc33fa83735a0c7e3e0b5fcf2d01de6cbb75e.
+Original Gradle nine-request
+acceptance also remains unproved; the older95 failures below are retained.
+AP current-generation support and Moshi dirty
 mixed-producer support remain outside-checkout work. No all-six-project,
 compiler-plugin, IDEA-parity or speed acceptance is claimed.
+
+## In-progress97: enum completion, source capture and startup work
+
+Two verified slices are committed and pushed: aafbdde790d48bd790795b2e6b9aa4586ac74e66
+(source-query overlap) and d4c250ccda690ef17eacc9c2d7a3835375133982 (selected
+Kotlin SDK API policy, source capture and exporter runtime reuse). They still
+need fresh release/editor validation; no new whole-workspace green is claimed.
+
+Fixtures now use actual isolated project scans and absolute unsaved-source
+publication. The earlier completeness helper cleared project metadata and was
+not a valid caller-proof setup. Qualified18 first returns14 passed/four failed:
+qualified Java enum completion, Java Holder result chaining, an incomplete-world
+negative, and an extra implicit-extension body inference assertion. Evidence:
+focus97-qualified1/receipt.json SHA256
+2c5d262308972ef21967091eaf67cde68179e1516fdf919048598af9a630162e.
+
+Two production corrections now pass their reproduced positives. Java resolves
+qualified nested enum namespaces while retaining local/inherited/static-import
+shadow checks. Java return inference reuses its existing typed overload selection
+instead of rerunning selection with signature help's alternative-arity policy.
+The latest18-case run returns15 passed/three failed, with339 unchanged build
+inputs, successful compilation and clean owned closure. Root independently
+verified results and receipt references: focus98-selection1/receipt.json SHA256
+b6a68ee1292f849c65916bb85ab6d5bc672bef87feb09b48f20ff70a212ef27a.
+The qualified enum positive and exact ResourceKey-only Java goto/result chain
+pass; the unknown-argument and unsaved-flip controls also pass.
+
+Two remaining failures have invalid incomplete-world preconditions: the manual
+diagnostic scan-complete flag does not withdraw semantic caller proofs. The enum
+negative previously passed trivially while its qualified namespace was broken;
+its actual value-shadow controls pass now. Both negatives are being corrected
+to exercise real pending-generation transitions, with proof assertions. No
+production lifecycle defect is established by those two failures.
+
+The corrected19-case baseline returns16 passed/three failed. The private
+pending-generation proof-withdrawal/restoration test and the qualified enum
+pending negative pass. Holder's new precondition still fails at the general
+completion status; its paired-positive debug output precedes the generation
+change and proves no post-change argument type. The actual strict argument path
+must be checked before classifying a production defect. The other failures are
+the independently reproduced duplicate-release case and the getter body below.
+Evidence: focus98-pending-duplicate-red1/receipt.json SHA256
+95b9ea1383652ef9aee999a50ffdffd0d3e95346150a7b10cf945140ddd8cab2.
+
+The remaining actual inference gap is ordinary Kotlin access to a Java getter
+as a property. Both bare `level` in the extension body and `entity.level` infer
+Unknown; `entity.getLevel()`, `checkNotNull(entity.getLevel())`, and the direct
+Java generic `level.holderLookup(...)` chain retain precise types. The implicit
+extension consumer's argument/receiver, exact ResourceKey-only goto and useful
+result chain already pass, so this reduction still does not reproduce native
+CEM's overload mismatch. Temporary ENUMDBG/HOLDERDBG/DELEGATEDBG diagnostics
+must be removed before commit/release. Full workspace and editor checks have
+not yet been rerun for these changes.
+
+The proven source-visitor corrections are adopted. An invocation-scoped compiler
+loader cache is also adopted after actual Gradle8.10.2 resource/reuse controls
+and a late JAR mutation control: valid model rows print first, then service
+closure fails with the exact runtime-change error. The same existing controls
+also pass on Gradle7.4.2,7.5 and9.6.1; this does not prove the whole exporter.
+The first normal Rust importer control catches a missing runtime-provider argument in
+the opt-in observer. All observer callers are corrected; subsequent direct
+validation initially stops at a missing Gradle accessor-cache metadata file
+before model output. The exact corrupt temporary-cache entry is preserved in
+quarantine before one explicitly recorded post-repair pair. Direct late-mutation
+rejection and normal cold/warm configuration-cache semantics then pass. One
+owned Java process requires cleanup in the cache probe, so its lifecycle is not
+a clean pass. The subsequent normal Rust importer control passes1/zero failed,
+rejecting the complete model after the genuine late runtime-change failure.
+Evidence for the original service controls:
+recovery89/compiler-runtime96-controls1/receipt.json SHA256
+25126d725f38deebf32d471fa72a276302e270ae6301069a6e23bcaef9584720.
+This is a reuse/safety result, not a measured startup improvement.
+
+CEM's trace exposes another serial startup dependency:65.692s model import,
+58.393s binary preview, then70.747s source query. A source-query overlap fix is
+adopted after its ordering-barrier baseline fails while cancellation,
+stale-generation, failure and existing binary-first RPC controls pass. All three
+production controls now pass. Potential overlap is not a measured speed gain.
+
+The genuine96 Gradle slice measures all nine original first responses: three
+qualified useful matches, five missing AtomicInteger positives and one
+unqualified negative (its paired known receiver also fails). Both editor
+processes still require forced shutdown after serve.closed. The normal model
+contains194 modules/1,176 source sets/1,338 compiler records, all with null SDK
+source policy/claims. Besides the adopted exporter correction, actual Kotlin
+2.0.21 accepts -Xjdk-release=1.8 while the then-current classifier rejected it. An
+independent compiler oracle emits identical class bytes for release8 and1.8.
+Both the useful SDK completion/navigation case and the untouched captured
+SourceSet first fail release1.8 selection, then pass after normalization and
+target/release agreement validation. The actual captured null policy remains
+an independent caller-admission failure. Root verifies349 inputs and artifact
+references, and independently checks both ignored stages'1/zero results,
+exit0 and empty Jobs: focus97-sdk-green1/receipt.json SHA256
+e1d9c60669280a88be9615b6be55abe502118589f9f0f5a1de7f064fb0dbcee7.
+Equal duplicate release flags are also accepted by the compiler. A separate
+tests-only run reproduces the missing API inventory for numeric8+8. The parser
+now retains agreeing releases and still rejects conflicting, invalid, future or
+target-inconsistent settings. The exact SDK caller regression passes after the
+four-line correction, including useful Atomic completion/navigation, unavailable
+API/wrong-receiver negatives and the independent null-policy guard. Formatting,
+all339 input guards and owned closure pass; Root verifies the receipt and five
+references. Evidence: focus98-duplicate-green1/receipt.json SHA256
+b5308ecc5818e0271a63844738c0c5c80581c1a9340c0afbdd76fbf4d4f05fff.
+Only numeric8+8 has a dedicated duplicate compiler oracle; no fresh whole-suite
+or Neovim acceptance is claimed for this slice.
+No original Gradle acceptance or all-five-project completion is claimed.
 
 ## Previous95 broad and core editor checks pass; Gradle import blocked
 
