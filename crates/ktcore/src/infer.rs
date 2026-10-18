@@ -1569,6 +1569,7 @@ fn generic_lambda_receiver_type(
                 src,
                 ctx,
                 depth,
+                false,
                 child_infer,
             )?;
             if recv_ty == Type::Unknown {
@@ -1655,6 +1656,28 @@ fn infer_identifier(
     // 1. A local val/var/parameter in scope wins (so `val Dog = Dog(); Dog.` is the instance).
     if let Some((decl, _)) = resolve::local_decl(ident, name, UseKind::Value, src) {
         return decl_type(index, decl, src, ctx, depth, child_infer);
+    }
+    if let Some((receiver, selection)) = members::select_implicit_at(
+        index,
+        implicit_receiver_types(index, ident, src, ctx, depth + 1),
+        name,
+        &MemberUse::Value,
+        ctx,
+        ident.start_byte(),
+    ) {
+        return selected_member_type(
+            index,
+            &receiver,
+            name,
+            false,
+            selection,
+            None,
+            None,
+            src,
+            ctx,
+            depth,
+            child_infer,
+        );
     }
     // 2. A bare identifier naming a known type -> that type (companion / enum-entry / static access).
     if !index.lookup_type(name).is_empty() {
@@ -1870,6 +1893,7 @@ fn infer_call(
                 src,
                 ctx,
                 depth,
+                false,
                 child_infer,
             ) else {
                 return Type::Unknown;
@@ -2662,14 +2686,12 @@ fn resolve_with_subst_unprojected(
     }
     if tr.qualification.is_none() {
         if let Some(bound) = subst.get(&tr.name) {
-            if !type_head_is_known(index, bound) {
+            if !type_head_is_known(index, bound) && !unbounded_scoped_parameter(bound) {
                 return Type::Unknown;
             }
-            let mut bound = bound.clone();
-            if let Type::Class { nullable, .. } = &mut bound {
-                *nullable |= tr.nullable;
-            }
-            return bound;
+            return bound
+                .clone()
+                .with_nullability(bound.is_nullable() || tr.nullable);
         }
         if tparams.contains(&tr.name) {
             return Type::Unknown;
@@ -2739,6 +2761,7 @@ fn infer_navigation(
         src,
         ctx,
         depth,
+        true,
         child_infer,
     ) else {
         return Type::Unknown;
@@ -2767,6 +2790,7 @@ fn navigation_member_candidates<'a>(
     src: &str,
     ctx: &'a FileCtx,
     depth: usize,
+    want_value: bool,
     child_infer: &mut impl ChildInfer,
 ) -> Option<(Type, members::Candidates<'a>, bool)> {
     if receiver.kind() == "super_expression" {
@@ -2781,7 +2805,11 @@ fn navigation_member_candidates<'a>(
     let original = child_infer.infer_child(index, receiver, src, ctx, depth + 1);
     let nullable_result = original.is_nullable() && is_safe_navigation_receiver(receiver);
     let ty = member_receiver_type(receiver, original);
-    let candidates = members::candidates_at(index, &ty, name, ctx, receiver.end_byte());
+    let candidates = if want_value {
+        members::value_candidates(index, &ty, name, ctx, Some(receiver.end_byte()))
+    } else {
+        members::candidates_at(index, &ty, name, ctx, receiver.end_byte())
+    };
     Some((ty, candidates, nullable_result))
 }
 
@@ -2888,7 +2916,7 @@ fn selected_member_type(
         };
         let semantic_entry = index.semantic_entry(&definition);
         let e = semantic_entry.unwrap_or(e);
-        let tr = match member_type_ref(e, want_function) {
+        let tr = match member_type_ref(index, recv_ty, e, want_function) {
             Some(tr) => tr,
             None => return Type::Unknown,
         };
@@ -3045,9 +3073,24 @@ pub fn declared_member_type(
     resolve_with_subst(index, tr, ctx, &tparams, &subst, 0)
 }
 
+// A complete unbounded Kotlin parameter has an implicit Any? bound, but remains an opaque
+// source identity. Unresolved and recursive bounds retain Unknown and cannot enter the solver.
+fn unbounded_scoped_parameter(ty: &Type) -> bool {
+    matches!(ty, Type::Parameter { definition, upper_bounds, .. }
+        if definition.file.ends_with(".kt") && matches!(upper_bounds.as_slice(),
+            [Type::Class { name, package, container: None, nullable: true, args }]
+                if name == "Any" && package.as_deref() == Some("kotlin") && args.is_empty()))
+}
+
 // Closed type values used in projected constraints must not smuggle unmodeled aliases or bounds.
 fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize) -> bool {
-    if depth > MAX_DEPTH || !receiver_arguments_known(index, ty, depth) {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    if unbounded_scoped_parameter(ty) {
+        return true;
+    }
+    if !type_head_is_known(index, ty) || !receiver_shape_is_known(index, ty) {
         return false;
     }
     if let Some(declaration) = type_declaration_shape(index, ty) {
@@ -4110,7 +4153,12 @@ fn named_type_params(
 
 /// The declared type ref to read from a member entry: a function's `return_type` (when
 /// `want_function`) or a property's `value_type`.
-fn member_type_ref(e: &crate::index::Entry, want_function: bool) -> Option<&TypeRef> {
+fn member_type_ref<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    e: &'a crate::index::Entry,
+    want_function: bool,
+) -> Option<&'a TypeRef> {
     if want_function {
         if e.sym.kind == SymbolKind::Function {
             e.sym.return_type.as_ref()
@@ -4123,9 +4171,13 @@ fn member_type_ref(e: &crate::index::Entry, want_function: bool) -> Option<&Type
                 .map(|(_, result)| result)
         }
     } else {
-        (e.sym.kind == SymbolKind::Property)
+        matches!(e.sym.kind, SymbolKind::Property | SymbolKind::EnumEntry)
             .then(|| e.sym.value_type.as_ref())
             .flatten()
+            .or_else(|| members::kotlin_enum_property_type_ref(index, receiver, e))
+            .or_else(|| {
+                members::kotlin_java_getter_property_name(e).and(e.sym.return_type.as_ref())
+            })
     }
 }
 
@@ -5167,7 +5219,10 @@ pub fn declared_type_in_scope(
                 vec![Type::Unknown]
             };
             path.pop();
-            // shortcut: implicit roots and recursive bounds stay incomplete until separately covered.
+            if upper_bounds.is_empty() && file.ends_with(".kt") {
+                upper_bounds.push(Type::class("Any", Some("kotlin".into())).with_nullability(true));
+            }
+            // shortcut: Java implicit roots and recursive bounds stay incomplete until separately covered.
             if upper_bounds.is_empty()
                 || !upper_bounds.iter().all(|bound| bound_known(index, bound))
             {

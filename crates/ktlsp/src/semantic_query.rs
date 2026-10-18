@@ -932,6 +932,34 @@ impl<'scope> RecoveredTypeIndex<'scope> {
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
+        if self.replaced_file == Some(owner.path.as_ref()) {
+            // Body recovery can restore an owner absent from the erroneous original tree.
+            return self.source_members_complete(owner);
+        }
+        self.index
+            .entries_for_file(&owner.path)
+            .iter()
+            .any(|original| original.sym == owner.sym)
+            && self.index.source_value_namespace_complete(owner)
+    }
+
+    fn source_property_access(
+        &self,
+        property: &Entry,
+    ) -> Option<ktcore::extensions::source::JvmPropertyAccess> {
+        // Never transfer another accepted source's lowering identity to a synthetic
+        // declaration. Foreign unchanged properties retain their host proof.
+        (self.replaced_file != Some(property.path.as_ref())
+            && self
+                .index
+                .entries_for_file(&property.path)
+                .iter()
+                .any(|original| original.sym == property.sym))
+        .then(|| self.index.source_property_access(property))
+        .flatten()
+    }
+
     fn java_class_inventory(
         &self,
         owner: &Entry,
@@ -1169,8 +1197,37 @@ fn member_candidates(
             }
         }
     }
+    if language == SourceLanguage::Kotlin {
+        for entry in &shared_members.property_getters {
+            let Some(name) = ktcore::members::kotlin_java_getter_property_name(entry)
+                .filter(|name| name.starts_with(prefix))
+            else {
+                continue;
+            };
+            if seen.insert((name.clone(), SymbolKind::Property)) {
+                let mut item = ScopeCompletion::new(name, SymbolKind::Property);
+                item.package = entry.sym.package.clone();
+                item.container = entry.sym.container.clone();
+                item.tier = entry.tier;
+                out.push(item);
+            }
+        }
+    }
     for entry in &shared_members.members {
-        push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
+        if language == SourceLanguage::Kotlin
+            && entry.sym.name.starts_with(prefix)
+            && ktcore::members::kotlin_enum_property_type_ref(inference_index, ty, entry).is_some()
+        {
+            if seen.insert((entry.sym.name.clone(), SymbolKind::Property)) {
+                let mut item = ScopeCompletion::new(entry.sym.name.clone(), SymbolKind::Property);
+                item.package = entry.sym.package.clone();
+                item.container = entry.sym.container.clone();
+                item.tier = entry.tier;
+                out.push(item);
+            }
+        } else {
+            push_member_candidate(&mut out, &mut seen, entry, &entry.sym.name, prefix, None);
+        }
     }
     let _ = infer::walk_supertypes(inference_index, ty, 32, |current| {
         let Some(cur) = infer::receiver_root_key(inference_index, current) else {
@@ -3674,5 +3731,66 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             assert!(resolved.entry.is_none());
             assert!(resolved.hover_markdown().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod recovered_property_proof_tests {
+    use super::*;
+
+    #[test]
+    fn recovered_source_index_forwards_only_unchanged_foreign_property_proofs() {
+        use ktcore::extensions::source::JvmPropertyAccess;
+        let mut original = Index::new();
+        let owner =
+            crate::symbol::IndexedSymbol::new("Parent", SymbolKind::Class, "foreign", None, 1, 7);
+        let property = crate::symbol::IndexedSymbol::new(
+            "key",
+            SymbolKind::Property,
+            "foreign",
+            Some("Parent".into()),
+            20,
+            23,
+        );
+        original.replace_file(
+            "Parent.kt",
+            vec![owner, property],
+            crate::index::Tier::Volatile,
+        );
+        let owner = original.lookup_type("Parent").into_iter().next().unwrap();
+        let property = original.members_of("Parent").into_iter().next().unwrap();
+        let host = crate::binary_diagnostics::BinaryDiagnostics {
+            index: &original,
+            inventory: &|_| None,
+            source_members: &|_| false,
+            value_namespace: &|entry| entry.sym.kind == SymbolKind::Class,
+            property_access: &|entry| {
+                (entry.sym.kind == SymbolKind::Property).then_some(JvmPropertyAccess::Field)
+            },
+        };
+        let replacement = Index::new();
+        let recovered = RecoveredTypeIndex::replacing_file(&host, &replacement, "Use.java")
+            .with_source_member_proofs(true);
+        assert!(recovered.source_value_namespace_complete(owner));
+        assert!(
+            !recovered.source_members_complete(owner),
+            "value proof cannot become method inventory proof through recovery"
+        );
+        assert_eq!(
+            recovered.source_property_access(property),
+            Some(JvmPropertyAccess::Field)
+        );
+        let replaced = RecoveredTypeIndex::replacing_file(&host, &replacement, "Parent.kt");
+        assert!(!replaced.source_value_namespace_complete(owner));
+        assert_eq!(replaced.source_property_access(property), None);
+        let mut stale = property.clone();
+        let mut symbol = stale.sym.as_ref().clone();
+        symbol.start_byte += 1;
+        stale.sym = std::sync::Arc::new(symbol);
+        assert_eq!(
+            recovered.source_property_access(&stale),
+            None,
+            "a synthetic or stale declaration cannot reuse an accepted foreign field proof"
+        );
     }
 }

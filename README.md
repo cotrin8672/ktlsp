@@ -286,6 +286,11 @@ incomplete completion, and unsaved declaration rename/removal/return-type change
 The same scenario checks Kotlin `where` and Java `extends A & B` receiver completion and exact
 navigation through unsaved bound swap/removal/restoration, recording first responses and source/wire
 identity in `semantic-bounded-receivers.json`.
+The same disposable semantic project checks Java `getX` read properties from Kotlin:
+incomplete property completion, exact getter navigation, and useful result chains after an
+unsaved Java return-type change. First responses and source/wire identity are recorded in
+`semantic-java-getter-properties.json`. Acronym and `is` getter forms remain unsupported;
+mixed getter/property rename is refused until both spellings can be edited consistently.
 Shared generic interoperability tests also cover parameterized extension receivers,
 inline nominal bounds, class literals and real-stdlib expect/actual declaration shapes.
 Standalone workspaces index Kotlin stdlib 2.1.20 by default; Gradle workspaces use their resolved

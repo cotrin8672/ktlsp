@@ -1,7 +1,7 @@
 use ktcore::extensions::source::{AnnotationValue, SourceDeclaration};
 use ktcore::extensions::{Dispatch, Visibility};
 use ktcore::knowledge::Knowledge;
-use ktlsp::index::{Index, Tier};
+use ktlsp::index::{Index, InferenceIndex, Tier};
 use ktlsp::language::{self, LanguageParsers, SourceLanguage};
 
 fn facts(file: &str, source: &str) -> Vec<SourceDeclaration> {
@@ -446,4 +446,174 @@ public class Target {
             "{name} must not erase an unrelated declaration to java.lang.String"
         );
     }
+}
+
+#[test]
+fn source_jvm_property_access_distinguishes_getter_only_and_real_field() {
+    use ktcore::extensions::source::JvmPropertyAccess;
+    for (declaration, expected) in [
+        ("public val field: Int = 1", JvmPropertyAccess::GetterOnly),
+        ("public val field = 1", JvmPropertyAccess::GetterOnly),
+        ("protected val field = 1", JvmPropertyAccess::GetterOnly),
+        ("public val field: Int", JvmPropertyAccess::GetterOnly),
+        (
+            "protected val field: Int = 1",
+            JvmPropertyAccess::GetterOnly,
+        ),
+        (
+            "@kotlin.jvm.JvmField public val field: Int = 1",
+            JvmPropertyAccess::Field,
+        ),
+        (
+            "@kotlin.jvm.JvmField protected val field: Int = 1",
+            JvmPropertyAccess::Field,
+        ),
+    ] {
+        let text = format!("package oracle\nopen class Parent {{ {declaration} }}\n");
+        let declarations = facts("Parent.kt", &text);
+        let property = named(&declarations, &text, "field");
+        assert_eq!(
+            property.jvm_property,
+            Some(Knowledge::Found(expected)),
+            "{declaration}"
+        );
+        let member = property.member.as_ref().unwrap();
+        if expected == JvmPropertyAccess::Field {
+            assert_eq!(descriptor(property), "I");
+            assert_eq!(member.dispatch, Knowledge::Found(Dispatch::Instance));
+        } else {
+            assert!(
+                matches!(member.signature, Knowledge::Unknown(_)),
+                "a generated getter is not a JVM field signature: {member:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn source_jvm_property_access_withholds_unsupported_transforms_and_shapes() {
+    for text in [
+        "package oracle\nclass Parent { @other.JvmField val field: Int = 1 }",
+        "package oracle\nclass Parent { @JvmField val field: Int = 1 }",
+        "package oracle\nclass Parent { @kotlin.jvm.JvmField(1) val field: Int = 1 }",
+        "package oracle\nclass Parent { @field:kotlin.jvm.JvmField val field: Int = 1 }",
+        "package oracle\nclass Parent { val field: Int get() = 1 }",
+        "package oracle\nclass Parent { var field: Int = 1 }",
+        "package oracle\nclass Parent { @kotlin.jvm.JvmField private val field: Int = 1 }",
+        "package oracle\nopen class Parent { open val field: Int = 1 }",
+        "package oracle\nclass Parent<T> { val field: Int = 1 }",
+        "package oracle\n@other.Transform class Parent { val field: Int = 1 }",
+        "@file:other.Transform\npackage oracle\nclass Parent { val field: Int = 1 }",
+        "package oracle\nobject Parent { val field: Int = 1 }",
+    ] {
+        let declarations = facts("Parent.kt", text);
+        let property = named(&declarations, text, "field");
+        assert!(
+            matches!(property.jvm_property, Some(Knowledge::Unknown(_))),
+            "unsupported lowering must stay unknown: {text}, {property:?}"
+        );
+    }
+    let private = "package oracle\nclass Parent { private val field = 1 }";
+    let declarations = facts("Parent.kt", private);
+    assert_eq!(
+        named(&declarations, private, "field").jvm_property,
+        Some(Knowledge::Found(
+            ktcore::extensions::source::JvmPropertyAccess::GetterOnly
+        ))
+    );
+    let text = "package oracle\nclass Parent { @kotlin.jvm.JvmField val field: Int = 1 }";
+    let declarations = facts_with_types(
+        "Parent.kt",
+        text,
+        &[("Bad.kt", "package kotlin.jvm\nannotation class JvmField")],
+    );
+    assert!(
+        matches!(
+            named(&declarations, text, "field").jvm_property,
+            Some(Knowledge::Unknown(_))
+        ),
+        "an authored replacement cannot certify the intrinsic"
+    );
+}
+
+#[test]
+fn source_jvm_property_value_namespace_ignores_executable_locals_and_contextual_identifiers() {
+    let text = r#"package oracle
+open class Parent {
+    private val state = 0
+    public val key = 1
+    fun data(): Int { val data = 2; val by = data + 1; return by }
+    init { val by = 3; val data = by + 1 }
+    fun use(callback: () -> Int = { val data = 4; data }): Int = callback()
+}
+"#;
+    let mut index = Index::new();
+    let mut parsers = LanguageParsers::new();
+    let tree = parsers.parse(SourceLanguage::Kotlin, text);
+    assert!(
+        !tree.root_node().has_error(),
+        "valid ordinary executable bodies: {}",
+        tree.root_node().to_sexp()
+    );
+    let file = "Parent.kt";
+    let symbols = language::file_facts(SourceLanguage::Kotlin, &tree, text).symbols;
+    index.replace_file(file, symbols, Tier::Volatile);
+    let scope = ktcore::indexer::TypeScope::with_default_imports(
+        "oracle",
+        Vec::new(),
+        ktcore::defaults::DEFAULT_IMPORT_PACKAGES,
+    );
+    let facts =
+        ktcore::extensions::source::kotlin_value_namespace(&index, file, &tree, text, &scope)
+            .unwrap();
+    let owner = index.lookup_type("Parent").into_iter().next().unwrap();
+    assert!(
+        facts.owners.contains(&ktcore::symbol::Def {
+            file: file.into(),
+            start_byte: owner.sym.start_byte,
+            end_byte: owner.sym.end_byte
+        }),
+        "locals and contextual identifiers cannot hide an ordinary owner namespace: {facts:?}"
+    );
+    assert_eq!(facts.properties.values().filter(|fact| matches!(fact, Knowledge::Found(_))).count(), 2, "private backing state and inferred public property both have value facts; locals are not fields");
+    let transformed = text.replace("fun data()", "@other.Transform fun data()");
+    let tree = parsers.parse(SourceLanguage::Kotlin, &transformed);
+    index.replace_file(
+        file,
+        language::file_facts(SourceLanguage::Kotlin, &tree, &transformed).symbols,
+        Tier::Volatile,
+    );
+    let facts = ktcore::extensions::source::kotlin_value_namespace(
+        &index,
+        file,
+        &tree,
+        &transformed,
+        &scope,
+    )
+    .unwrap();
+    assert!(
+        facts.owners.is_empty(),
+        "skipping bodies must retain declaration transform guards"
+    );
+}
+
+#[test]
+fn source_jvm_property_qualified_intrinsic_withholds_a_shadowed_package_prefix() {
+    let names = "package consumer\nclass kotlin { class jvm { annotation class JvmField } }\n";
+    let text =
+        "package consumer\nopen class Parent { @kotlin.jvm.JvmField public val field: Int = 1 }\n";
+    let declarations = facts_with_types("Parent.kt", text, &[("Names.kt", names)]);
+    assert!(
+        matches!(
+            named(&declarations, text, "field").jvm_property,
+            Some(Knowledge::Unknown(_))
+        ),
+        "the normalized type path is not proof that its first qualifier denotes a package"
+    );
+    // Explicit aliases already expand through TypeScope; keep that path conservative too.
+    let alias = "package consumer\nimport foreign.Type as kotlin\nclass Parent { @kotlin.jvm.JvmField public val field: Int = 1 }\n";
+    assert!(matches!(
+        named(&facts("Parent.kt", alias), alias, "field").jvm_property,
+        Some(Knowledge::Unknown(_))
+    ));
 }

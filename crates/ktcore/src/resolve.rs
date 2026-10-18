@@ -1697,11 +1697,12 @@ pub fn member_defs_for_use(
     usage: &MemberUse,
     ctx: &infer::FileCtx,
 ) -> Vec<Def> {
-    entries_to_defs(
+    let candidates = if matches!(usage, MemberUse::Value) {
+        members::value_candidates(index, ty, name, ctx, None)
+    } else {
         members::candidates(index, ty, name, ctx)
-            .select(index, ty, usage, ctx)
-            .entries,
-    )
+    };
+    entries_to_defs(candidates.select(index, ty, usage, ctx).entries)
 }
 
 pub fn member_defs_for_use_at(
@@ -1712,11 +1713,12 @@ pub fn member_defs_for_use_at(
     ctx: &infer::FileCtx,
     position: usize,
 ) -> Vec<Def> {
-    entries_to_defs(
+    let candidates = if matches!(usage, MemberUse::Value) {
+        members::value_candidates(index, ty, name, ctx, Some(position))
+    } else {
         members::candidates_at(index, ty, name, ctx, position)
-            .select(index, ty, usage, ctx)
-            .entries,
-    )
+    };
+    entries_to_defs(candidates.select(index, ty, usage, ctx).entries)
 }
 
 /// Generic-receiver extensions visible under the written canonical or aliased call-site name.

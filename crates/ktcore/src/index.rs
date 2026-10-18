@@ -361,6 +361,19 @@ pub trait InferenceIndex {
         false
     }
 
+    /// Value-namespace closure does not certify synthesized methods or their absence.
+    fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
+        self.source_members_complete(owner)
+    }
+
+    /// Current, host-validated authored Kotlin property lowering. Unknown by default.
+    fn source_property_access(
+        &self,
+        _property: &Entry,
+    ) -> Option<crate::extensions::source::JvmPropertyAccess> {
+        None
+    }
+
     fn lookup_by_name(&self, name: &str) -> LookupEntries<'_>;
     fn members_of(&self, type_name: &str) -> LookupEntries<'_>;
     fn extensions_for(&self, receiver_type: &str) -> LookupEntries<'_>;
@@ -1489,6 +1502,19 @@ impl<'a> ScopedIndex<'a> {
 }
 
 impl InferenceIndex for ScopedIndex<'_> {
+    fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
+        self.entry_is_visible(owner) && self.index.source_value_namespace_complete(owner)
+    }
+
+    fn source_property_access(
+        &self,
+        property: &Entry,
+    ) -> Option<crate::extensions::source::JvmPropertyAccess> {
+        self.entry_is_visible(property)
+            .then(|| self.index.source_property_access(property))
+            .flatten()
+    }
+
     fn java_class_inventory(&self, owner: &Entry) -> Option<Arc<crate::classfile::ClassFileFacts>> {
         self.entry_is_visible(owner)
             .then(|| self.index.java_class_inventory(owner))

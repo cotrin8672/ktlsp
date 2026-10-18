@@ -1058,7 +1058,13 @@ case "$scenario" in
     fi
     ;;
   semantic)
-    project="${root_arg:-$repo/dev/semantic-fixture}"
+    if [ -n "$root_arg" ]; then
+      project="$root_arg"
+    else
+      project="$projects/semantic"
+      mkdir -p "$project"
+      cp -R "$repo/dev/semantic-fixture/." "$project/"
+    fi
     run_and_capture semantic nvim -l "$repo/dev/nvim_semantic_fixture.lua" "$project" "$bin_arg" "$artifacts" || run_status=$?
     ;;
   project)

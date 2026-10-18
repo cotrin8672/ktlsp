@@ -401,9 +401,22 @@ pub(crate) struct BinaryDiagnostics<'a> {
     pub index: &'a dyn InferenceIndex,
     pub inventory: &'a dyn Fn(&Entry) -> Option<Arc<ClassFileFacts>>,
     pub source_members: &'a dyn Fn(&Entry) -> bool,
+    pub value_namespace: &'a dyn Fn(&Entry) -> bool,
+    pub property_access:
+        &'a dyn Fn(&Entry) -> Option<ktcore::extensions::source::JvmPropertyAccess>,
 }
 
 impl InferenceIndex for BinaryDiagnostics<'_> {
+    fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
+        (self.value_namespace)(owner)
+    }
+    fn source_property_access(
+        &self,
+        property: &Entry,
+    ) -> Option<ktcore::extensions::source::JvmPropertyAccess> {
+        (self.property_access)(property)
+    }
+
     fn source_members_complete(&self, owner: &Entry) -> bool {
         (self.source_members)(owner)
     }
@@ -693,6 +706,8 @@ mod tests {
             index: &inner,
             inventory: &|_| None,
             source_members: &|_| false,
+            value_namespace: &|_| false,
+            property_access: &|_| None,
         };
         let mut facts = crate::resolve::CompletenessFacts::complete();
         facts.project_packages_complete.insert("app".into());

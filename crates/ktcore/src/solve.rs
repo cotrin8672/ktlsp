@@ -122,10 +122,17 @@ pub fn constrain_application(
         // an invariant equality slot (Pair<Class<X>> is not Pair<Class<? extends X>>).
         if formal.projection == Projection::Star
             || formal.projection != Projection::Invariant && !projection_allowed
-            || actual.projection() != Projection::Invariant
         {
             return ConstraintStatus::Unknown;
         }
+        let actual = match actual {
+            Type::Projected {
+                projection: Projection::Out,
+                bound,
+            } if formal.projection == Projection::Out && projection_allowed => bound.as_ref(),
+            actual if actual.projection() == Projection::Invariant => actual,
+            _ => return ConstraintStatus::Unknown,
+        };
         let relation = match formal.projection {
             Projection::Out => Relation::Lower,
             Projection::In => Relation::Upper,
@@ -135,7 +142,10 @@ pub fn constrain_application(
             return ConstraintStatus::Unknown;
         }
         if formal.qualification.is_none() && parameters.contains(&formal.name) {
-            if formal.nullable || !formal.args.is_empty() || !known(actual) || actual.is_nullable()
+            if formal.nullable
+                || !formal.args.is_empty()
+                || !known(actual)
+                || actual.is_nullable() && !matches!(actual, Type::Parameter { .. })
             {
                 return ConstraintStatus::Unknown;
             }
@@ -219,7 +229,7 @@ pub fn constrain_application(
         .iter()
         .filter(|(parameter, _)| parameters.contains(*parameter))
     {
-        if known(actual) && !actual.is_nullable() {
+        if known(actual) && (!actual.is_nullable() || matches!(actual, Type::Parameter { .. })) {
             constraints.push(Constraint {
                 parameter,
                 relation: Relation::Equal,

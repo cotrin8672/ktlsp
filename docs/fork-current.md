@@ -8,7 +8,7 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Verified96 baseline: checks and releases pass; project validation remains partial
 
-### Latest103 source validation (baseline96 release remains the editor reference)
+### Latest104 source validation (baseline96 release remains the editor reference)
 
 The full101 workspace run compiled and returned1,672 passed/three failed/seven
 ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
@@ -21,12 +21,55 @@ implicit Java generic delegate body, with exact identity/nullability negatives.
 Typed authored Kotlin property facts are now retained with existing source
 metadata and forwarded through scoped/recovery queries. Focus103 returns31
 passed/one failed across32 cases, including both former namespace failures.
-The remaining new failure detects initializer locals incorrectly receiving
-property-lowering facts (four Found facts instead of two); its expectation is
-retained and the production correction is pending. Full workspace/release/editor
-validation of these changes has not run. Temporary delegate/enum diagnostics
-have been removed. Evidence: focus103-property-proofs1/receipt.json SHA256
+The new failure detected initializer locals incorrectly receiving
+property-lowering facts (four Found facts instead of two). The production fix
+retains that expectation and also rejects a compiler-proven custom annotation
+whose spelling shadows the kotlin.jvm.JvmField qualifier. The selected14-case
+property/getter/recovery check now passes with344 stable inputs. Temporary
+delegate/enum diagnostics have been removed. Original red evidence:
+focus103-property-proofs1/receipt.json SHA256
 10662ace5fb22df6bb14b9c579ac45b968337985487249270cce7c502d9e283c.
+Green evidence: native-integrated104-1/receipt.json SHA256
+cde28870f049da9c5aeb053dc7ee70e9af04252fb406a38f2a955fe30319d5ac.
+
+The first full104 run exposed an unfinished Java binary-generic completion
+regression: the recovered declaration had been rejected despite the existing
+host-validated header proof. RecoveredTypeIndex now reuses that proof for its
+replacement file while retaining foreign Kotlin identity checks. The existing
+failing chain and foreign-proof regression both pass. The next full workspace
+run passes1,681/zero failed/seven ignored (100.062s including build), with344
+stable inputs. Evidence: native-integrated104-1/workspace2-receipt.json and
+workspace2.raw SHA256 a40228f0814c8c48a56f8c14a6ef942e09d7680e97b64d2588d788a77488aa5f.
+Owned cleanup reports zero live processes; the one terminated residual is
+identified separately as MSVC vctip telemetry, not a language-server process.
+The fresh release succeeds in64.672s, with344 current inputs independently
+verified unchanged by Root. Its20,133,888-byte immutable binary is at
+native-integrated104-1/bin/ktlsp.exe, SHA256
+91302b4bf64ff95bd7fb030b1193e37bc327da19bab23095266822ffcd3a413a.
+Evidence: native-integrated104-1/continuation2-receipt.json SHA256
+17cc6e3d3349264434a495800cb3110beaa3752bd4af0f727e2cfc331e8767ba.
+The unchanged real-Neovim semantic harness now passes173/zero failed on that
+binary. All seven getter first responses match (one attempt each, zero
+unmeasured);36 getter checks and the original136 semantic checks pass. Property
+completion, exact getter navigation and chain completion update through unsaved
+Java changes and restoration. Natural shutdown separately succeeds in this run;
+the earlier intermittent shutdown issue is not declared fixed. Root verified29
+current runtime guards and12 artifact references. Evidence:
+recovery89/getter-native104/receipt.json SHA256
+f0e25155371386d01920b92c9edf5a1c92e83c1d9fcce0486e8f7b8ad89acc12.
+Current-source CEM/Gradle runs are underway. The new extension-source API still
+requires its separate external-consumer gate; no all-project or speed acceptance
+is claimed.
+
+The requested test-efficiency audit found build work dominates the inspected
+five runs (about344.5s build versus22.4s tests). The inner loop now selects the
+changed semantic layer, then runs one workspace gate and one release build.
+Existing owned runner APIs/configs are reused without new controller clones.
+CPU parallelism is16 after the user's resource authorization; cache/profile
+flags remain unchanged and there is no claim of a controlled speedup. Storage
+has about435GiB free; the full validation stage added about0.3GiB. Audit:
+recovery89/test-efficiency-audit104/audit.md. Fresh CEM18/Gradle9/editor results
+take priority over additional synthetic variants.
 
 The full current exporter now completes a normal offline import of the same
 pinned CEM project:81.328s, one module/two source sets/four compiler tasks. All

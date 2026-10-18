@@ -701,19 +701,82 @@ pub(crate) fn selected_sdk_nested_stub_facts(
     String,
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
 )> {
-    selected_sdk_class_stub_facts(selection, class)?;
+    if selection.release.is_none()
+        || class.identity.origin_id != selection.origin()
+        || !selection
+            .entries
+            .get(class.identity.internal_name.as_str())
+            .is_some_and(Option::is_some)
+    {
+        return None;
+    }
     let row = class
         .inner_classes
         .iter()
         .find(|row| row.inner.as_ref() == class.identity.internal_name)?;
     if row.name.as_deref() != Some(name)
-        || row.access_flags != 0x0609
-        || class.access_flags != 0x0601
+        || !matches!(
+            (row.access_flags, class.access_flags),
+            (0x0609, 0x0601) | (0x4019, 0x4031)
+        )
         || !is_java_identifier(name)
     {
         return None;
     }
+    if class.access_flags & 0x4000 != 0 {
+        return selected_sdk_enum_stub(class, name);
+    }
     java_declaration_stub_named(class, true, Some(name))
+}
+
+/// A selected final enum has an exact implicit superclass and self-typed constants.
+/// Reuse the ordinary bounded member renderer; enum syntax restores these implicit facts
+/// through the same Java adapter used for authored source.
+fn selected_sdk_enum_stub(
+    class: &ktcore::classfile::ClassFileFacts,
+    name: &str,
+) -> Option<(
+    String,
+    Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
+)> {
+    if class.super_name.as_deref() != Some("java/lang/Enum")
+        || !class.interfaces.is_empty()
+        || class.signature.as_deref()
+            != Some(format!("Ljava/lang/Enum<L{};>;", class.identity.internal_name).as_str())
+    {
+        return None;
+    }
+    let mut constants = Vec::new();
+    let mut unique = std::collections::BTreeSet::new();
+    for field in &class.fields {
+        if field.access_flags & 0x4000 == 0 {
+            continue;
+        }
+        if field.access_flags != 0x4019
+            || field.descriptor.as_ref() != format!("L{};", class.identity.internal_name)
+            || field.signature.is_some()
+            || !field.attribute_names.is_empty()
+            || !is_java_identifier(&field.name)
+            || !unique.insert(field.name.as_ref())
+        {
+            return None;
+        }
+        constants.push(field.name.as_ref());
+    }
+    let mut declaration = class.clone();
+    declaration.access_flags &= !0x4000;
+    declaration.super_name = Some("java/lang/Object".into());
+    declaration.signature = None;
+    declaration
+        .fields
+        .retain(|field| field.access_flags & 0x4000 == 0);
+    let (source, unavailable) = java_declaration_stub_named(&declaration, true, Some(name))?;
+    let head = format!("public final class {name}");
+    let source = source.replacen(&head, &format!("public static enum {name}"), 1);
+    let opening = source.find("{\n")? + 2;
+    let mut source = source;
+    source.insert_str(opening, &format!("    {};\n", constants.join(", ")));
+    Some((source, unavailable))
 }
 
 fn java_declaration_stub_named(

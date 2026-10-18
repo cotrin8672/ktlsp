@@ -66,6 +66,7 @@ struct ProjectFileMeta {
     package: String,
     clean: bool,
     scope: Option<ProjectScope>,
+    kotlin_values: Option<Arc<ktcore::extensions::source::KotlinValueNamespaceFacts>>,
 }
 
 fn is_java_path(key: &str) -> bool {
@@ -377,6 +378,7 @@ impl Workspace {
             self.project_file_meta.insert(
                 batch.key.clone(),
                 ProjectFileMeta {
+                    kotlin_values: None,
                     package: batch.package,
                     clean: batch.clean,
                     scope: self.project_scope_for_file(&batch.key),
@@ -413,6 +415,7 @@ impl Workspace {
                 self.project_file_meta.insert(
                     key.clone(),
                     ProjectFileMeta {
+                        kotlin_values: self.kotlin_value_facts(key, &doc.text, &doc.tree),
                         package: facts.package,
                         clean: facts.clean,
                         scope: self.project_scope_for_file(key),
@@ -687,12 +690,97 @@ impl Workspace {
     }
 
     fn record_annotated_owners(&mut self, key: &str, text: &str, tree: &Tree) {
+        let values = self.kotlin_value_facts(key, text, tree);
+        if let Some(meta) = self.project_file_meta.get_mut(key) {
+            meta.kotlin_values = values;
+        }
         self.annotated_type_owners.insert(
             key.into(),
             language::annotated_type_owners(&self.index, key, tree, text)
                 .into_iter()
                 .collect(),
         );
+    }
+
+    fn kotlin_value_facts(
+        &self,
+        key: &str,
+        text: &str,
+        tree: &Tree,
+    ) -> Option<Arc<ktcore::extensions::source::KotlinValueNamespaceFacts>> {
+        if is_java_path(key) {
+            return None;
+        }
+        let scope = language::source_type_scope(key, tree, text);
+        ktcore::extensions::source::kotlin_value_namespace(&self.index, key, tree, text, &scope)
+            .map(Arc::new)
+    }
+
+    fn current_kotlin_value_facts(
+        &self,
+        key: &str,
+    ) -> Option<&ktcore::extensions::source::KotlinValueNamespaceFacts> {
+        if is_java_path(key) {
+            return None;
+        }
+        let facts = self.project_file_meta.get(key)?.kotlin_values.as_deref()?;
+        // Positive authored field/accessor identity may survive a pending scan; it never
+        // closes that generation's namespace or certifies compiler-generated methods.
+        if !self.source_only_profile_in_source(key, None)
+            || self.analysis_extensions.needs_source(key)
+        {
+            return None;
+        }
+        if self
+            .index
+            .lookup_type("JvmField")
+            .iter()
+            .any(|entry| entry.sym.package == "kotlin.jvm" && entry.tier == Tier::Volatile)
+        {
+            return None;
+        }
+        // A qualifier type can be added in another source after this file was
+        // normalized. Revalidate only actual field facts, once per file/query.
+        if facts.properties.values().any(|access| {
+            matches!(
+                access,
+                Knowledge::Found(ktcore::extensions::source::JvmPropertyAccess::Field)
+            )
+        }) {
+            let entries = self.index.entries_for_file(key);
+            for (definition, access) in &facts.properties {
+                if !matches!(
+                    access,
+                    Knowledge::Found(ktcore::extensions::source::JvmPropertyAccess::Field)
+                ) {
+                    continue;
+                }
+                let property = entries
+                    .iter()
+                    .find(|entry| rename_definition(entry) == *definition)?;
+                if !ktcore::extensions::source::kotlin_jvm_field_qualifier_unshadowed(
+                    &self.index,
+                    &property.sym,
+                    &facts.qualifier_packages,
+                ) {
+                    return None;
+                }
+            }
+        }
+        if let Some(doc) = self.open_docs.get(key) {
+            return facts.matches_source(&doc.text).then_some(facts);
+        }
+        let stamp = std::fs::metadata(key).ok().and_then(|meta| {
+            Some(SourceStamp {
+                modified: meta.modified().ok()?,
+                size: meta.len(),
+            })
+        })?;
+        if self.source_stamps.get(key) != Some(&stamp) {
+            return None;
+        }
+        let text = std::fs::read_to_string(key).ok()?;
+        facts.matches_source(&text).then_some(facts)
     }
 
     /// Current text for a key: the open buffer if present, else the file on disk.
@@ -868,6 +956,7 @@ impl Workspace {
             self.project_file_meta.insert(
                 batch.key.clone(),
                 ProjectFileMeta {
+                    kotlin_values: None,
                     package: batch.package.clone(),
                     clean: batch.clean,
                     scope: self.project_scope_for_file(&batch.key),
@@ -905,6 +994,7 @@ impl Workspace {
             self.project_file_meta.insert(
                 key.clone(),
                 ProjectFileMeta {
+                    kotlin_values: self.kotlin_value_facts(key, &doc.text, &doc.tree),
                     package: facts.package,
                     clean: facts.clean,
                     scope: self.project_scope_for_file(key),
@@ -1632,6 +1722,21 @@ impl Workspace {
         if refs.is_empty() || refs.len() > RENAME_REF_CAP || !refs.iter().any(|r| *r == target) {
             return None;
         }
+        if hierarchy::entry_for_name_range(
+            &self.index,
+            &target.file,
+            target.start_byte,
+            target.end_byte,
+        )
+        .is_some_and(|entry| ktcore::members::kotlin_java_getter_property_name(&entry).is_some())
+            && refs.iter().any(|site| {
+                self.doc_text(&site.file).is_none_or(|text| {
+                    text.get(site.start_byte..site.end_byte) != Some(name.as_str())
+                })
+            })
+        {
+            return None;
+        }
         let edits = crate::rename::edits_for_refs(refs.into_iter().collect(), new_name);
         crate::edit::validate_non_overlapping(&edits).ok()?;
         for file in edits
@@ -2280,6 +2385,32 @@ impl Workspace {
         {
             return None;
         }
+        if let Some(entry) = hierarchy::entry_for_name_range(
+            &self.index,
+            &target.file,
+            target.start_byte,
+            target.end_byte,
+        ) {
+            if let Some(property) = ktcore::members::kotlin_java_getter_property_name(&entry) {
+                let sites = self.index.lookup_refs(&property);
+                if sites.len() > RENAME_REF_CAP {
+                    return None;
+                }
+                let sites = sites.to_vec();
+                for site in sites {
+                    if SourceLanguage::for_key(&site.path).is_java() {
+                        continue;
+                    }
+                    if self
+                        .goto_definition(&site.path, site.start_byte)
+                        .contains(&target)
+                    {
+                        // Getter/property spellings need different edits; never offer a partial rename.
+                        return None;
+                    }
+                }
+            }
+        }
         Some(target)
     }
 
@@ -2578,10 +2709,40 @@ impl Workspace {
             source_proofs.borrow_mut().insert(identity, complete);
             complete
         };
+        // One freshness check per foreign file per query, never a new parse. Facts
+        // are refreshed with existing accepted source metadata on edit/scan/close.
+        let kotlin_proofs = RefCell::new(BTreeMap::new());
+        let kotlin_values = |path: &str| {
+            *kotlin_proofs
+                .borrow_mut()
+                .entry(path.to_string())
+                .or_insert_with(|| self.current_kotlin_value_facts(path))
+        };
+        let value_namespace = |owner: &crate::index::Entry| {
+            source_only()
+                && owner.tier == Tier::Volatile
+                && kotlin_values(&owner.path)
+                    .is_some_and(|facts| facts.owners.contains(&rename_definition(owner)))
+                || source_members(owner)
+        };
+        let property_access = |property: &crate::index::Entry| {
+            if property.tier != Tier::Volatile {
+                return None;
+            }
+            match kotlin_values(&property.path)?
+                .properties
+                .get(&rename_definition(property))?
+            {
+                Knowledge::Found(access) => Some(*access),
+                _ => None,
+            }
+        };
         let index = crate::binary_diagnostics::BinaryDiagnostics {
             index: &scoped,
             inventory: &inventory,
             source_members: &source_members,
+            value_namespace: &value_namespace,
+            property_access: &property_access,
         };
         query(&index)
     }
@@ -2603,8 +2764,15 @@ impl Workspace {
         key: &str,
         recovery: Option<&java::CompletionSource>,
     ) -> bool {
+        !self.project_refresh_pending && self.source_only_profile_in_source(key, recovery)
+    }
+
+    fn source_only_profile_in_source(
+        &self,
+        key: &str,
+        recovery: Option<&java::CompletionSource>,
+    ) -> bool {
         if self.project_model.is_some()
-            || self.project_refresh_pending
             || !self.project_scan_initialized
             || !self.project_file_meta.get(key).is_some_and(|meta| {
                 (meta.clean
@@ -2928,6 +3096,7 @@ impl Workspace {
         self.project_file_meta.insert(
             key.to_string(),
             ProjectFileMeta {
+                kotlin_values: None,
                 package,
                 clean,
                 scope: self.project_scope_for_file(key),
@@ -3444,6 +3613,9 @@ impl Workspace {
             target.end_byte,
         ) {
             names.insert(entry.sym.name.clone());
+            if let Some(property) = ktcore::members::kotlin_java_getter_property_name(&entry) {
+                names.insert(property);
+            }
         }
         if let Some(source) = self.index.jvm_source_for_file(&target.file) {
             for callable in &source.facts.callables {
@@ -6396,6 +6568,93 @@ mod tests {
     }
 
     #[test]
+    fn pending_project_refresh_withdraws_source_closure_until_real_rescan() {
+        let root = unique_tmp("pending-source-namespace");
+        std::fs::create_dir_all(&root).unwrap();
+        let caller_path = root.join("Caller.java");
+        let owner_path = root.join("Owner.java");
+        let caller_text =
+            "package app; import api.Owner; class Caller { int read() { return Owner.value; } }";
+        std::fs::write(&caller_path, caller_text).unwrap();
+        std::fs::write(
+            &owner_path,
+            "package api; public class Owner { public static int value; }",
+        )
+        .unwrap();
+        let caller = crate::paths::file_key(&caller_path);
+        let owner = crate::paths::file_key(&owner_path);
+        let mut ws = Workspace::new();
+        assert_eq!(ws.scan(&root), 2);
+        let overlay = caller_text.replace("read()", "currentRead()");
+        ws.open(&caller, overlay.clone());
+        let proof = |ws: &Workspace| {
+            ws.with_java_member_proofs(&caller, |index| {
+                let caller_owner = index
+                    .lookup_type("Caller")
+                    .into_iter()
+                    .find(|entry| entry.path.as_ref() == caller.as_str())
+                    .unwrap();
+                let target_owner = index
+                    .lookup_type("Owner")
+                    .into_iter()
+                    .find(|entry| entry.path.as_ref() == owner.as_str())
+                    .unwrap();
+                (
+                    index.scope_is_complete(),
+                    index.source_members_complete(caller_owner),
+                    index.source_members_complete(target_owner),
+                )
+            })
+        };
+        assert_eq!(
+            proof(&ws),
+            (true, true, true),
+            "qualify the real scanned source namespace first"
+        );
+        let previous = ws.analysis_generation();
+        let generation = ws.begin_analysis_generation();
+        assert!(!ws.is_current_generation(previous));
+        assert!(ws.is_current_generation(generation));
+        assert!(ws.project_refresh_pending);
+        assert!(ws.project_scan_initialized);
+        assert_eq!(
+            ws.project_file_meta.len(),
+            2,
+            "pending work must preserve source ownership"
+        );
+        assert_eq!(proof(&ws), (true, false, false),
+            "scope visibility remains known, but the pending producer cannot certify source closure");
+        assert!(!ws.completeness.project_scan_complete);
+        let offset = overlay.find("Owner.value").unwrap() + "Owner.".len();
+        let _ = ws.completion_query(&caller, offset);
+        let _ = ws.goto_definition(&caller, offset);
+        assert!(
+            ws.project_refresh_pending,
+            "a query must not claim the pending scan finished"
+        );
+        assert_eq!(
+            proof(&ws),
+            (true, false, false),
+            "queries cannot restore unproduced proof"
+        );
+        assert!(!ws.completeness.project_scan_complete);
+        assert_eq!(
+            ws.scan(&root),
+            1,
+            "only the closed owner is read from disk again"
+        );
+        assert!(!ws.project_refresh_pending);
+        assert!(ws.completeness.project_scan_complete);
+        assert_eq!(
+            proof(&ws),
+            (true, true, true),
+            "real publication restores closure"
+        );
+        assert_eq!(ws.doc_text(&caller).as_deref(), Some(overlay.as_str()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unsupported_gradle_source_model_stays_unknown_instead_of_using_global_facts() {
         let root = unique_tmp("model-unsupported-sources");
         std::fs::create_dir_all(&root).unwrap();
@@ -8985,5 +9244,107 @@ mod java_source_authority_tests {
         std::fs::remove_file(&owner).unwrap();
         assert!(!proof(&ws, &model, &owner, &caller));
         std::fs::remove_dir_all(&model.modules[0].project_dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod kotlin_property_value_tests {
+    use super::*;
+    use ktcore::extensions::source::JvmPropertyAccess;
+
+    #[test]
+    fn source_jvm_property_proof_tracks_edits_pending_and_plain_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-property-value-proof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ws = Workspace::new();
+        assert_eq!(ws.scan(&root), 0);
+        let parent = crate::paths::file_key(&root.join("Parent.kt"));
+        let caller = crate::paths::file_key(&root.join("Use.java"));
+        ws.open(
+            &parent,
+            "package sample\nopen class Parent { public val key: Int = 1 }\n".into(),
+        );
+        ws.open(
+            &caller,
+            "package sample; class Use extends Parent { void use() {} }".into(),
+        );
+        let owner = ws
+            .index
+            .lookup_type("Parent")
+            .into_iter()
+            .find(|entry| entry.path.as_ref() == parent)
+            .unwrap()
+            .clone();
+        let property = ws
+            .index
+            .members_of("Parent")
+            .into_iter()
+            .find(|entry| entry.sym.name == "key")
+            .unwrap()
+            .clone();
+        ws.with_java_member_proofs(&caller, |index| {
+            assert!(index.source_value_namespace_complete(&owner));
+            assert!(
+                !index.source_members_complete(&owner),
+                "value proof must not invent a generated getter inventory"
+            );
+            assert_eq!(
+                index.source_property_access(&property),
+                Some(JvmPropertyAccess::GetterOnly)
+            );
+        });
+        ws.begin_analysis_generation();
+        ws.with_java_member_proofs(&caller, |index| {
+            assert!(
+                !index.source_value_namespace_complete(&owner),
+                "pending producer proof is still withdrawn"
+            );
+            assert_eq!(
+                index.source_property_access(&property),
+                Some(JvmPropertyAccess::GetterOnly)
+            );
+        });
+        ws.change(
+            &parent,
+            "package sample\nopen class Parent { @kotlin.jvm.JvmField public val key: Int = 1 }\n"
+                .into(),
+        );
+        let property = ws
+            .index
+            .members_of("Parent")
+            .into_iter()
+            .find(|entry| entry.sym.name == "key")
+            .unwrap()
+            .clone();
+        ws.with_java_member_proofs(&caller, |index| {
+            assert!(!index.source_value_namespace_complete(&owner));
+            assert_eq!(
+                index.source_property_access(&property),
+                Some(JvmPropertyAccess::Field),
+                "unsaved lowering replacement cannot reuse getter-only facts"
+            );
+        });
+        ws.scan(&root);
+        ws.with_java_member_proofs(&caller, |index| {
+            assert!(index.source_value_namespace_complete(&owner));
+            assert!(!index.source_members_complete(&owner));
+        });
+        std::fs::write(root.join("build.gradle.kts"), "plugins {}\n").unwrap();
+        ws.with_java_member_proofs(&caller, |index| {
+            assert!(!index.source_value_namespace_complete(&owner));
+            assert_eq!(
+                index.source_property_access(&property),
+                None,
+                "a build/compiler profile needs its own transformation proof"
+            );
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

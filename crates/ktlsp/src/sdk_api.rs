@@ -221,7 +221,9 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
                 .find(|symbol| {
                     matches!(
                         symbol.kind,
-                        ktcore::symbol::SymbolKind::Class | ktcore::symbol::SymbolKind::Interface
+                        ktcore::symbol::SymbolKind::Class
+                            | ktcore::symbol::SymbolKind::Interface
+                            | ktcore::symbol::SymbolKind::EnumClass
                     ) && symbol.name == name
                         && symbol.container.as_deref() == container.as_deref()
                 })
@@ -243,7 +245,7 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
     Ok(SdkApiIndex { batches, complete })
 }
 
-/// One-level public static interfaces only: no parameterized outer or instance capture.
+/// One-level public static interfaces or final enums only: no parameterized outer or instance capture.
 fn static_nested_identity(
     class: &ktcore::classfile::ClassFileFacts,
     classes: &BTreeMap<String, ktcore::classfile::ClassFileFacts>,
@@ -257,8 +259,10 @@ fn static_nested_identity(
     if outer.contains('$')
         || name.contains('$')
         || !crate::jar::is_java_identifier(name)
-        || row.access_flags != 0x0609
-        || class.access_flags != 0x0601
+        || !matches!(
+            (row.access_flags, class.access_flags),
+            (0x0609, 0x0601) | (0x4019, 0x4031)
+        )
         || class
             .attribute_names
             .iter()
@@ -339,6 +343,28 @@ mod tests {
                 .as_slice(),
             ),
             (
+                "java/lang/Thread",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Thread.sig")
+                    .as_slice(),
+            ),
+            (
+                "java/lang/Thread$State",
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/sdk17-release8/Thread$State.sig"
+                )
+                .as_slice(),
+            ),
+            (
+                "java/lang/Enum",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Enum.sig")
+                    .as_slice(),
+            ),
+            (
+                "java/lang/Runnable",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Runnable.sig")
+                    .as_slice(),
+            ),
+            (
                 "java/util/Map",
                 include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Map.sig")
                     .as_slice(),
@@ -400,6 +426,356 @@ mod tests {
             assert_eq!(&target[defs[0].start_byte..defs[0].end_byte],"getKey");
             assert!(target[..defs[0].start_byte].contains("interface Entry"));
             assert!(!target.contains("interface Map$Entry"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_nested_enum_has_useful_constants_chains_and_exact_navigation() {
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let mut ws = crate::workspace::Workspace::new();
+        let project = root.join("consumer");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(ws.scan(&project), 0);
+        for batch in indexed.batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+        for (file, text) in [
+            ("QualifiedEnum.java", "class QualifiedEnum { String f() { return java.lang.Thread.State.RUNNABLE.name().substring(0); } int g() { return java.lang.Thread.State.RUNNABLE.ordinal(); } }"),
+            ("ImportedEnum.java", "import java.lang.Thread.State; class ImportedEnum { String f() { return State.RUNNABLE.name().substring(0); } int g() { return State.RUNNABLE.ordinal(); } }"),
+        ] {
+            let key = crate::paths::file_key(&project.join(file));
+            ws.open(&key, text.into());
+            for (prefix, wanted) in [(".RUN", "RUNNABLE"), (".na", "name"), (".sub", "substring"), (".ord", "ordinal")] {
+                let offset = text.find(prefix).unwrap() + prefix.len();
+                let result = ws.complete(&key, offset, true);
+                assert!(result.as_ref().is_some_and(|r| r.items.iter().any(|i| i.label == wanted)), "selected release8 public static enum must expose {wanted}: {result:?}");
+            }
+            for (token, target_file) in [("RUNNABLE", "java/lang/Thread.java"), ("name()", "java/lang/Enum.java"), ("ordinal()", "java/lang/Enum.java")] {
+                let defs = ws.goto_definition(&key, text.find(token).unwrap());
+                assert_eq!(defs.len(), 1, "exact SDK enum navigation {token}: {defs:?}");
+                assert!(defs[0].file.ends_with(target_file), "{defs:?}");
+                let source = std::fs::read_to_string(&defs[0].file).unwrap();
+                assert_eq!(&source[defs[0].start_byte..defs[0].end_byte], token.trim_end_matches("()"));
+                if token == "RUNNABLE" { assert!(source.contains("enum State")); assert!(!source.contains("class Thread$State")); }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_enum_parent_facts_also_support_authored_java_enum_chains() {
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let mut ws = crate::workspace::Workspace::new();
+        let project = root.join("consumer");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(ws.scan(&project), 0);
+        for batch in indexed.batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+        let key = crate::paths::file_key(&project.join("Authored.java"));
+        let text = "class Authored { enum Mode { READY } String f() { return Mode.READY.name().substring(0); } int g() { return Mode.READY.ordinal(); } }";
+        ws.open(&key, text.into());
+        for (prefix, wanted) in [
+            (".REA", "READY"),
+            (".na", "name"),
+            (".sub", "substring"),
+            (".ord", "ordinal"),
+        ] {
+            let result = ws.complete(&key, text.find(prefix).unwrap() + prefix.len(), true);
+            assert!(
+                result
+                    .as_ref()
+                    .is_some_and(|r| r.items.iter().any(|i| i.label == wanted)),
+                "authored Java enum must share {wanted}: {result:?}"
+            );
+        }
+        let defs = ws.goto_definition(&key, text.find("name()").unwrap());
+        assert_eq!(defs.len(), 1, "{defs:?}");
+        assert!(defs[0].file.ends_with("java/lang/Enum.java"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_nested_enum_is_visible_to_kotlin_constant_and_name_property() {
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let mut ws = crate::workspace::Workspace::new();
+        for batch in indexed.batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.assume_index_complete_for_tests();
+        let key = crate::paths::file_key(&root.join("EnumConsumer.kt"));
+        let text = "import java.lang.Thread.State\nfun f() = State.RUNNABLE.name.substring(0)\nfun g() = State.RUNNABLE.ordinal\n";
+        ws.open(&key, text.into());
+        for (prefix, wanted) in [
+            (".RUN", "RUNNABLE"),
+            (".na", "name"),
+            (".sub", "substring"),
+            (".ord", "ordinal"),
+        ] {
+            let result = ws.complete(&key, text.find(prefix).unwrap() + prefix.len(), true);
+            assert!(
+                result
+                    .as_ref()
+                    .is_some_and(|r| r.items.iter().any(|i| i.label == wanted
+                        && (!matches!(wanted, "name" | "ordinal")
+                            || i.kind == ktcore::symbol::SymbolKind::Property))),
+                "Kotlin SDK enum must expose property {wanted}: {result:?}"
+            );
+        }
+        let defs = ws.goto_definition(&key, text.find("RUNNABLE").unwrap());
+        assert_eq!(defs.len(), 1, "{defs:?}");
+        assert!(defs[0].file.ends_with("java/lang/Thread.java"));
+        let target = std::fs::read_to_string(&defs[0].file).unwrap();
+        assert_eq!(&target[defs[0].start_byte..defs[0].end_byte], "RUNNABLE");
+        for token in ["name.substring", "ordinal"] {
+            let defs = ws.goto_definition(&key, text.find(token).unwrap());
+            assert_eq!(
+                defs.len(),
+                1,
+                "Kotlin enum property navigates to its SDK accessor: {defs:?}"
+            );
+            assert!(defs[0].file.ends_with("java/lang/Enum.java"));
+        }
+        let java_key = crate::paths::file_key(&root.join("AuthoredEnumHost.java"));
+        ws.open(
+            &java_key,
+            "package fixture; public class AuthoredEnumHost { public enum Mode { READY } }".into(),
+        );
+        let authored = "import fixture.AuthoredEnumHost.Mode\nfun f() = Mode.READY.name.substring(0)\nfun g() = Mode.READY.ordinal\n";
+        ws.change(&key, authored.into());
+        let chain = ws.complete(&key, authored.find(".sub").unwrap() + 4, true);
+        assert!(
+            chain
+                .as_ref()
+                .is_some_and(|r| r.items.iter().any(|i| i.label == "substring")),
+            "Kotlin reads the same authored Java enum facts: {chain:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_enum_property_mapping_rejects_unrelated_receiver_and_untrusted_origin() {
+        let (root, selection) = entry_selection();
+        for untrusted in [false, true] {
+            let indexed = index(
+                &selection,
+                &root.join(if untrusted { "untrusted" } else { "trusted" }),
+            )
+            .unwrap();
+            let mut ws = crate::workspace::Workspace::new();
+            for mut batch in indexed.batches {
+                if untrusted && batch.file.ends_with("java/lang/Enum.java") {
+                    batch.origin.as_mut().unwrap().origin_id = "project-enum-homonym".into();
+                }
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.assume_index_complete_for_tests();
+            let java_key = crate::paths::file_key(&root.join("Unrelated.java"));
+            ws.open(&java_key, "package fixture; public class Unrelated { public String name() { return null; } public int ordinal() { return 0; } }".into());
+            let key = crate::paths::file_key(&root.join("Negative.kt"));
+            let text = if untrusted {
+                "import java.lang.Thread.State\nfun f() = State.RUNNABLE.name.substring(0)\n"
+            } else {
+                "import fixture.Unrelated\nfun f(value: Unrelated) = value.name.substring(0)\n"
+            };
+            ws.open(&key, text.into());
+            let result = ws.complete(&key, text.find(".sub").unwrap() + 4, true);
+            assert!(
+                !result
+                    .as_ref()
+                    .is_some_and(|r| r.items.iter().any(|i| i.label == "substring")),
+                "no enum-property projection without exact receiver/SDK origin: {result:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_nested_enum_completion_prefix_and_java_property_boundary() {
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let mut ws = crate::workspace::Workspace::new();
+        for batch in indexed.batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.assume_index_complete_for_tests();
+        let key = crate::paths::file_key(&root.join("Prefix.kt"));
+        let positive = "import java.lang.Thread.State\nval x = State.RUNNABLE.name\n";
+        ws.open(&key, positive.into());
+        let result = ws.complete(&key, positive.find(".na").unwrap() + 3, true);
+        assert!(
+            result.as_ref().is_some_and(|r| r
+                .items
+                .iter()
+                .any(|i| i.label == "name" && i.kind == ktcore::symbol::SymbolKind::Property)),
+            "known enum property remains useful: {result:?}"
+        );
+        let unrelated = "import java.lang.Thread.State\nval x = State.RUNNABLE.sub\n";
+        ws.change(&key, unrelated.into());
+        let result = ws.complete(&key, unrelated.find(".sub").unwrap() + 4, true);
+        assert!(
+            !result.as_ref().is_some_and(|r| r
+                .items
+                .iter()
+                .any(|i| matches!(i.label.as_str(), "name" | "ordinal"))),
+            "unrelated prefix must not emit mapped properties: {result:?}"
+        );
+        let java_key = crate::paths::file_key(&root.join("InvalidEnumProperties.java"));
+        let invalid = "class InvalidEnumProperties { void f() { java.lang.Thread.State.RUNNABLE.name.substring(0); int value = java.lang.Thread.State.RUNNABLE.ordinal; } }";
+        ws.open(&java_key, invalid.into());
+        for field in ["name.substring", "ordinal;"] {
+            let defs = ws.goto_definition(&java_key, invalid.find(field).unwrap());
+            assert!(
+                defs.is_empty(),
+                "Kotlin property projection is not Java field syntax: {field}: {defs:?}"
+            );
+        }
+        let completion = ws.complete(&java_key, invalid.find(".sub").unwrap() + 4, true);
+        assert!(
+            !completion
+                .as_ref()
+                .is_some_and(|r| r.items.iter().any(|i| i.label == "substring")),
+            "invalid Java property chain must stay unavailable: {completion:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_nested_enum_namespace_keeps_value_shadows_and_incomplete_world_unknown() {
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let mut ws = crate::workspace::Workspace::new();
+        let project = root.join("consumer");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(ws.scan(&project), 0);
+        for batch in indexed.batches {
+            assert!(ws.index_dependency_batch(batch));
+        }
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+        for (file, text) in [
+            ("LocalNamespaceShadow.java", "class LocalNamespaceShadow { void f(Object java) { java.lang.Thread.State.RUNNABLE.name(); } }"),
+            ("FieldNamespaceShadow.java", "class NamespaceBase { Object java; } class FieldNamespaceShadow extends NamespaceBase { void f() { java.lang.Thread.State.RUNNABLE.name(); } }"),
+            ("MalformedNamespaceShadow.java", "class MalformedNamespaceShadow { void f() { Object java = ; java.lang.Thread.State.RUNNABLE.name(); } }"),
+        ] {
+            let key = crate::paths::file_key(&project.join(file));
+            ws.open(&key, text.into());
+            assert!(ws.goto_definition(&key, text.find("RUNNABLE").unwrap()).is_empty(), "a value prefix must not become an SDK type namespace: {file}");
+            let result = ws.complete(&key, text.find(".RUN").unwrap() + ".RUN".len(), true);
+            assert!(!result.is_some_and(|r| r.items.iter().any(|item| item.label == "RUNNABLE")), "shadowed namespace completion must stay unknown: {file}");
+        }
+        let key = crate::paths::file_key(&project.join("PendingNamespace.java"));
+        let text =
+            "class PendingNamespace { void f() { java.lang.Thread.State.RUNNABLE.name(); } }";
+        ws.open(&key, text.into());
+        assert!(
+            !ws.goto_definition(&key, text.find("RUNNABLE").unwrap())
+                .is_empty(),
+            "qualify the same exact namespace before starting its refresh"
+        );
+        let ready = ws.complete(&key, text.find(".RUN").unwrap() + ".RUN".len(), true);
+        assert!(
+            ready.is_some_and(|r| r.items.iter().any(|item| item.label == "RUNNABLE")),
+            "the negative must start from a useful enum namespace"
+        );
+        let previous = ws.analysis_generation();
+        let generation = ws.begin_analysis_generation();
+        assert!(!ws.is_current_generation(previous));
+        assert!(ws.is_current_generation(generation));
+        let pending = ws
+            .completion_query(&key, text.find(".RUN").unwrap() + ".RUN".len())
+            .expect("query the exact enum namespace during its real refresh");
+        assert_eq!(
+            pending.status_label(),
+            "unknown",
+            "prove the pending source namespace before asserting no constant: {:?}",
+            pending.status
+        );
+        assert!(
+            ws.goto_definition(&key, text.find("RUNNABLE").unwrap())
+                .is_empty(),
+            "unclosed project producers cannot certify the namespace prefix"
+        );
+        let result = ws.complete(&key, text.find(".RUN").unwrap() + ".RUN".len(), true);
+        assert!(!result.is_some_and(|r| r.items.iter().any(|item| item.label == "RUNNABLE")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_nested_enum_rejects_unproved_owner_and_malformed_constants() {
+        let (root, selection) = entry_selection();
+        let parent = ktcore::classfile::decode(
+            &selection.origin(),
+            include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Thread.sig"),
+        )
+        .unwrap();
+        let child = ktcore::classfile::decode(
+            &selection.origin(),
+            include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/Thread$State.sig"),
+        )
+        .unwrap();
+        for mutation in [
+            "nonstatic",
+            "not-final",
+            "other-origin",
+            "no-reciprocal",
+            "wrong-name",
+        ] {
+            let mut parent = parent.clone();
+            let mut child = child.clone();
+            let row = child
+                .inner_classes
+                .iter_mut()
+                .find(|r| r.inner.as_ref() == child.identity.internal_name)
+                .unwrap();
+            match mutation {
+                "nonstatic" => row.access_flags &= !8,
+                "not-final" => child.access_flags &= !0x10,
+                "other-origin" => parent.identity.origin_id = "other".into(),
+                "no-reciprocal" => parent.inner_classes.clear(),
+                "wrong-name" => row.name = Some("Other".into()),
+                _ => unreachable!(),
+            }
+            let classes = BTreeMap::from([(parent.identity.internal_name.clone(), parent)]);
+            assert!(
+                static_nested_identity(&child, &classes).is_none(),
+                "{mutation}"
+            );
+        }
+        for mutation in [
+            "wrong-super",
+            "wrong-signature",
+            "wrong-field-owner",
+            "wrong-field-flags",
+            "other-origin",
+            "not-selected",
+        ] {
+            let mut child = child.clone();
+            let mut selection = selection.clone();
+            match mutation {
+                "wrong-super" => child.super_name = Some("java/lang/Object".into()),
+                "wrong-signature" => child.signature = None,
+                "wrong-field-owner" => child.fields[0].descriptor = "Ljava/lang/Thread;".into(),
+                "wrong-field-flags" => child.fields[0].access_flags &= !0x10,
+                "other-origin" => child.identity.origin_id = "other".into(),
+                "not-selected" => std::sync::Arc::make_mut(&mut selection.entries)
+                    .insert(child.identity.internal_name.to_string(), None)
+                    .map(|_| ())
+                    .unwrap_or(()),
+                _ => unreachable!(),
+            }
+            assert!(
+                crate::jar::selected_sdk_nested_stub_facts(&selection, &child, "State").is_none(),
+                "{mutation}"
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -105,6 +105,68 @@ pub fn kotlin_java_array_member_type(
     }
 }
 
+/// Kotlin exposes exactly these selected java.lang.Enum accessors as properties.
+/// Keep the original declaration entry so navigation and refactoring retain the real SDK span.
+pub fn kotlin_enum_property_type_ref<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &'a Entry,
+) -> Option<&'a TypeRef> {
+    use crate::extensions::{Dispatch, Visibility};
+    use crate::symbol::SymbolKind;
+    let sym = &entry.sym;
+    if !matches!(sym.name.as_str(), "name" | "ordinal")
+        || sym.kind != SymbolKind::Function
+        || sym.package != "java.lang"
+        || sym.container.as_deref() != Some("Enum")
+        || sym.arity != Some(0)
+        || !sym.params.is_empty()
+        || sym.source_member.dispatch() != Some(Dispatch::Instance)
+        || sym.source_member.visibility() != Some(Visibility::Public)
+    {
+        return None;
+    }
+    let origin = index.origin_facts()?.file_origin(&entry.path)?;
+    if !origin.origin_id.starts_with("jdk-api:") && !origin.origin_id.starts_with("jdk:") {
+        return None;
+    }
+    let owners = index.lookup_type(receiver.name()?);
+    let mut owners = owners.into_iter().filter(|owner| {
+        receiver.package() == Some(owner.sym.package.as_str())
+            && receiver.container() == owner.sym.container.as_deref()
+    });
+    let owner = owners.next()?;
+    if owners.next().is_some() || owner.sym.kind != SymbolKind::EnumClass {
+        return None;
+    }
+    let mut reaches_sdk_enum = false;
+    let _ = infer::walk_supertypes(index, receiver, 32, |current| {
+        if current.name() == Some("Enum")
+            && current.package() == Some("java.lang")
+            && current.container().is_none()
+        {
+            let declarations = index.lookup_type("Enum");
+            let mut declarations = declarations
+                .into_iter()
+                .filter(|d| d.sym.package == "java.lang" && d.sym.container.is_none());
+            reaches_sdk_enum = declarations.next().is_some_and(|d| d.path == entry.path)
+                && declarations.next().is_none();
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    if !reaches_sdk_enum {
+        return None;
+    }
+    let result = sym.return_type.as_ref()?;
+    let expected = match sym.name.as_str() {
+        "name" => result.name == "String" && result.qualification.as_deref() == Some("java.lang"),
+        "ordinal" => result.name == "int" && result.qualification.is_none(),
+        _ => false,
+    };
+    (expected && !result.nullable && result.args.is_empty()).then_some(result)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applicability {
     Applicable,
@@ -123,8 +185,38 @@ pub struct Selection<'a> {
     pub applicability: Applicability,
 }
 
+/// A deliberately small Java read-property projection. Keep the getter Entry/Def intact.
+/// shortcut: acronyms and boolean `is` accessors need verified naming rules before admission.
+pub fn kotlin_java_getter_property_name(entry: &Entry) -> Option<String> {
+    use crate::extensions::{Dispatch, Visibility};
+    let sym = &entry.sym;
+    let suffix = sym.name.strip_prefix("get")?;
+    let first = *suffix.as_bytes().first()?;
+    if !entry.path.ends_with(".java")
+        || sym.kind != crate::symbol::SymbolKind::Function
+        || sym.arity != Some(0)
+        || !sym.params.is_empty()
+        || !sym.type_params.is_empty()
+        || sym.has_vararg
+        || sym.extension_receiver.is_some()
+        || sym.source_member.dispatch() != Some(Dispatch::Instance)
+        || sym.source_member.visibility() != Some(Visibility::Public)
+        || !first.is_ascii_uppercase()
+        || suffix.as_bytes().get(1).is_some_and(u8::is_ascii_uppercase)
+        || sym.return_type.as_ref().is_none_or(|ty| ty.name == "void")
+    {
+        return None;
+    }
+    Some(format!(
+        "{}{}",
+        (first as char).to_ascii_lowercase(),
+        &suffix[1..]
+    ))
+}
+
 pub struct Candidates<'a> {
     pub members: Vec<&'a Entry>,
+    pub property_getters: Vec<&'a Entry>,
     pub extensions: Vec<&'a Entry>,
     local_scopes: Vec<Vec<&'a Entry>>,
     uncertain_receivers: BTreeSet<(&'a str, usize, usize)>,
@@ -180,6 +272,7 @@ pub fn super_member_candidates<'a>(
         receiver,
         Candidates {
             members,
+            property_getters: Vec::new(),
             extensions: Vec::new(),
             local_scopes: Vec::new(),
             uncertain_receivers: BTreeSet::new(),
@@ -335,9 +428,13 @@ fn select_implicit_in<'a>(
 ) -> Option<(Type, Selection<'a>)> {
     let mut rejected = None;
     for receiver in receivers {
-        let pool = match position {
-            Some(position) => candidates_at(index, &receiver, name, ctx, position),
-            None => candidates(index, &receiver, name, ctx),
+        let pool = if matches!(usage, MemberUse::Value) {
+            value_candidates(index, &receiver, name, ctx, position)
+        } else {
+            match position {
+                Some(position) => candidates_at(index, &receiver, name, ctx, position),
+                None => candidates(index, &receiver, name, ctx),
+            }
         };
         let selection = pool.select(index, &receiver, usage, ctx);
         if selection.entries.is_empty() && selection.applicability != Applicability::Unknown {
@@ -389,14 +486,23 @@ pub fn completion_candidates_at<'a>(
     position: usize,
     include_extensions: bool,
 ) -> Candidates<'a> {
-    matching_candidates_at(
+    let mut result = matching_candidates_at(
         index,
         receiver,
         MemberName::Prefix(prefix),
         ctx,
         position,
         include_extensions,
-    )
+    );
+    add_property_getters(
+        index,
+        receiver,
+        MemberName::Prefix(prefix),
+        ctx,
+        Some(position),
+        &mut result,
+    );
+    result
 }
 
 fn matching_candidates_at<'a>(
@@ -410,6 +516,9 @@ fn matching_candidates_at<'a>(
     let mut result = matching_candidates(index, receiver, name, ctx, include_extensions);
     result
         .members
+        .retain(|entry| member_accessible_at(index, receiver, entry, ctx, position));
+    result
+        .property_getters
         .retain(|entry| member_accessible_at(index, receiver, entry, ctx, position));
     if !include_extensions {
         return result;
@@ -535,6 +644,94 @@ pub(crate) fn matching_candidates<'a>(
 ) -> Candidates<'a> {
     let mut result = collect_candidates(index, receiver, name, ctx, include_extensions);
     remove_overridden_members(index, receiver, &mut result.members, ctx, false);
+    result
+}
+
+fn add_property_getters<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+    position: Option<usize>,
+    result: &mut Candidates<'a>,
+) {
+    let written = match name {
+        MemberName::Exact(name) | MemberName::Prefix(name) => name,
+    };
+    let getter_name = if written.is_empty() {
+        Some("get".to_string())
+    } else if written.as_bytes()[0].is_ascii_lowercase() {
+        Some(format!(
+            "get{}{}",
+            (written.as_bytes()[0] as char).to_ascii_uppercase(),
+            &written[1..]
+        ))
+    } else {
+        None
+    };
+    if let Some(getter_name) = getter_name {
+        let getter_query = match name {
+            MemberName::Exact(_) => MemberName::Exact(&getter_name),
+            MemberName::Prefix(_) => MemberName::Prefix(&getter_name),
+        };
+        let mut getters = collect_candidates(index, receiver, getter_query, ctx, false);
+        remove_overridden_members(index, receiver, &mut getters.members, ctx, false);
+        result.hierarchy_complete &= getters.hierarchy_complete;
+        result
+            .unavailable_members
+            .extend(getters.unavailable_members);
+        result.property_getters = getters
+            .members
+            .into_iter()
+            .filter(|entry| {
+                kotlin_java_getter_property_name(entry)
+                    .is_some_and(|property| name.matches(&property))
+            })
+            .collect();
+        let mut counts = BTreeMap::new();
+        for entry in &result.property_getters {
+            *counts
+                .entry(kotlin_java_getter_property_name(entry).unwrap())
+                .or_insert(0usize) += 1;
+        }
+        result
+            .property_getters
+            .retain(|entry| counts[&kotlin_java_getter_property_name(entry).unwrap()] == 1);
+    }
+    if let Some(position) = position {
+        result
+            .property_getters
+            .retain(|entry| member_accessible_at(index, receiver, entry, ctx, position));
+    }
+}
+
+/// Value queries discover getter aliases only when the call site uses property syntax.
+pub fn value_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    name: &str,
+    ctx: &'a FileCtx,
+    position: Option<usize>,
+) -> Candidates<'a> {
+    let mut result = match position {
+        Some(position) => candidates_at(index, receiver, name, ctx, position),
+        None => candidates(index, receiver, name, ctx),
+    };
+    // An accessible ordinary value wins before any getter projection.
+    if !result
+        .members
+        .iter()
+        .any(|entry| entry.sym.kind.is_value_like())
+    {
+        add_property_getters(
+            index,
+            receiver,
+            MemberName::Exact(name),
+            ctx,
+            position,
+            &mut result,
+        );
+    }
     result
 }
 
@@ -682,6 +879,7 @@ fn collect_candidates<'a>(
         .collect();
     Candidates {
         members,
+        property_getters: Vec::new(),
         extensions,
         local_scopes: Vec::new(),
         uncertain_receivers,
@@ -1340,7 +1538,10 @@ impl<'a> Candidates<'a> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty() && self.extensions.is_empty() && self.local_scopes.is_empty()
+        self.members.is_empty()
+            && self.property_getters.is_empty()
+            && self.extensions.is_empty()
+            && self.local_scopes.is_empty()
     }
 
     fn groups(&self) -> impl Iterator<Item = &[&'a Entry]> {
@@ -1366,11 +1567,23 @@ impl<'a> Candidates<'a> {
         }
         match usage {
             MemberUse::Value => {
-                for entries in self.groups() {
+                for (entries, getter) in std::iter::once((self.members.as_slice(), false))
+                    .chain(std::iter::once((self.property_getters.as_slice(), true)))
+                    .chain(
+                        self.local_scopes
+                            .iter()
+                            .map(|entries| (entries.as_slice(), false)),
+                    )
+                    .chain(std::iter::once((self.extensions.as_slice(), false)))
+                {
                     let values: Vec<_> = entries
                         .iter()
                         .copied()
-                        .filter(|entry| entry.sym.kind.is_value_like())
+                        .filter(|entry| {
+                            entry.sym.kind.is_value_like()
+                                || kotlin_enum_property_type_ref(index, receiver, entry).is_some()
+                                || getter && kotlin_java_getter_property_name(entry).is_some()
+                        })
                         .collect();
                     if !values.is_empty() {
                         return self.selection(values, Applicability::Applicable);
@@ -1460,6 +1673,7 @@ pub(crate) fn select_functions<'a>(
 ) -> Selection<'a> {
     Candidates {
         members: entries,
+        property_getters: Vec::new(),
         extensions: Vec::new(),
         local_scopes: Vec::new(),
         uncertain_receivers: BTreeSet::new(),

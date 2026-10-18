@@ -210,6 +210,16 @@ fn type_decl<'tree>(
     let declaration_scope = java_declaration_scope(node, src, scope);
     let scope = declaration_scope.as_ref().unwrap_or(scope);
     sym.supertype_refs = supertype_refs(node, src, scope);
+    if kind == SymbolKind::EnumClass {
+        let owner = match container {
+            Some(parent) => format!("{parent}.{}", node_text(name, src)),
+            None => node_text(name, src).to_string(),
+        };
+        let mut parent = TypeRef::simple("Enum");
+        parent.qualification = Some("java.lang".into());
+        parent.args.push(java_enum_type_ref(package, &owner));
+        sym.supertype_refs.push(parent);
+    }
     sym.supertypes = sym
         .supertype_refs
         .iter()
@@ -405,6 +415,7 @@ fn walk_declaration_container<'tree>(
                     let mut symbol =
                         indexed_symbol(name, src, SymbolKind::EnumEntry, package, container);
                     symbol.source_member = crate::indexer::source_member_flags(child, src, true);
+                    symbol.value_type = container.map(|owner| java_enum_type_ref(package, owner));
                     out.push(symbol);
                 }
             }
@@ -417,6 +428,19 @@ fn walk_declaration_container<'tree>(
             _ => {}
         }
     }
+}
+
+fn java_enum_type_ref(package: &str, owner: &str) -> TypeRef {
+    let (container, name) = owner.rsplit_once('.').unwrap_or(("", owner));
+    let mut ty = TypeRef::simple(name);
+    ty.qualification = Some(
+        [package, container]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("."),
+    );
+    ty
 }
 
 fn parameter_types(node: Node<'_>, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
@@ -3529,7 +3553,11 @@ fn receiver_type(
             {
                 return type_of_value_declaration(index, file, src, tree, decl, initializer_depth);
             }
-            receiver_type_from_type_identifier(index, file, src, tree, object)
+            java_inherited_field_receiver(index, src, tree, object).or_else(|| {
+                (!java_inherited_property_blocks_type_fallback(index, src, tree, object))
+                    .then(|| receiver_type_from_type_identifier(index, file, src, tree, object))
+                    .flatten()
+            })
         }
         "object_creation_expression" => {
             let ty = object.child_by_field_name("type")?;
@@ -3599,6 +3627,9 @@ fn receiver_type(
             }
         }
         "field_access" => {
+            if let Some(receiver) = java_nested_enum_namespace(index, file, src, tree, object) {
+                return Some(receiver);
+            }
             let (receiver, kind) =
                 java_member_receiver(index, file, src, tree, object, initializer_depth + 1)?;
             let name = node_text(object.child_by_field_name("field")?, src);
@@ -3622,7 +3653,7 @@ fn receiver_type(
                 return None;
             };
             // Kotlin properties need verified JVM field lowering before Java field syntax is valid.
-            if field.sym.kind != SymbolKind::Property
+            if !java_member_kind_matches(field.sym.kind, SymbolKind::Property)
                 || !is_java_file(&field.path)
                 || field.sym.source_member.dispatch().is_none()
                 || kind == ktcore::jvm::ReceiverKind::Type
@@ -3674,6 +3705,95 @@ fn receiver_type_from_type_identifier(
         name,
         &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
     )
+}
+
+// Positive inherited fields are values even when their spelling also names an imported type.
+// Share this authored-member selection with legacy source completion; missing fields do not
+// acquire any new namespace authority or close pending project work.
+fn java_inherited_field_receiver(
+    index: &dyn InferenceIndex,
+    src: &str,
+    tree: &Tree,
+    object: Node<'_>,
+) -> Option<Type> {
+    use ktcore::jvm::ReceiverKind;
+    let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
+    if let Some(owner) = enclosing_type_name(object, src) {
+        let enclosing = infer::declared_type(
+            index,
+            &type_scope(tree, src).type_ref(&owner, false, Vec::new()),
+            &ctx,
+        );
+        let fields = ktcore::members::candidates(index, &enclosing, node_text(object, src), &ctx)
+            .members
+            .into_iter()
+            .filter(|entry| {
+                entry.sym.kind == SymbolKind::Property
+                    && (is_java_file(&entry.path)
+                        || index.source_property_access(entry)
+                            == Some(ktcore::extensions::source::JvmPropertyAccess::Field))
+            })
+            .collect::<Vec<_>>();
+        let mut complete = index.scope_is_complete();
+        let _ = infer::walk_supertypes(index, &enclosing, JAVA_SUPERTYPE_WALK_CAP, |current| {
+            complete &= current.name().is_some() && current.package().is_some();
+            ControlFlow::Continue(())
+        });
+        if let [field] = fields.as_slice() {
+            let visible = matches!(
+                field.sym.source_member.visibility(),
+                Some(
+                    ktcore::extensions::Visibility::Public
+                        | ktcore::extensions::Visibility::Protected
+                )
+            ) || field.sym.source_member.visibility()
+                == Some(ktcore::extensions::Visibility::Package)
+                && field.sym.package == ctx.package;
+            let dispatch = field.sym.source_member.dispatch();
+            if complete
+                && visible
+                && !static_imports_of(tree, src).may_resolve(node_text(object, src))
+                && (dispatch == Some(ktcore::extensions::Dispatch::Static)
+                    || dispatch == Some(ktcore::extensions::Dispatch::Instance)
+                        && implicit_receiver_kind(object, src) == ReceiverKind::Value)
+            {
+                if let Some(value) = &field.sym.value_type {
+                    let ty = infer::declared_member_type(index, &enclosing, field, value, &ctx);
+                    return Some(ty);
+                }
+            }
+        }
+    }
+    None
+}
+
+// Missing/unsupported Kotlin JVM field lowering cannot turn a value into a type.
+// Getter-only facts leave legacy useful type candidates available without claiming
+// that a pending producer namespace is complete.
+fn java_inherited_property_blocks_type_fallback(
+    index: &dyn InferenceIndex,
+    src: &str,
+    tree: &Tree,
+    object: Node<'_>,
+) -> bool {
+    let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
+    let Some(owner) = enclosing_type_name(object, src) else {
+        return false;
+    };
+    let receiver = infer::declared_type(
+        index,
+        &type_scope(tree, src).type_ref(&owner, false, Vec::new()),
+        &ctx,
+    );
+    ktcore::members::candidates(index, &receiver, node_text(object, src), &ctx)
+        .members
+        .iter()
+        .any(|entry| {
+            entry.sym.kind == SymbolKind::Property
+                && !is_java_file(&entry.path)
+                && index.source_property_access(entry)
+                    != Some(ktcore::extensions::source::JvmPropertyAccess::GetterOnly)
+        })
 }
 
 /// Classify the call receiver once. Known values win over identically named types.
@@ -3736,50 +3856,8 @@ fn java_member_receiver(
                     kind,
                 ));
             }
-            let ctx = FileCtx::new(package_of(tree, src), inference_imports(tree, src));
-            if let Some(owner) = enclosing_type_name(object, src) {
-                let enclosing = infer::declared_type(
-                    index,
-                    &type_scope(tree, src).type_ref(&owner, false, Vec::new()),
-                    &ctx,
-                );
-                let fields =
-                    ktcore::members::candidates(index, &enclosing, node_text(object, src), &ctx)
-                        .members
-                        .into_iter()
-                        .filter(|entry| entry.sym.kind == SymbolKind::Property)
-                        .collect::<Vec<_>>();
-                let mut complete = index.scope_is_complete();
-                let _ =
-                    infer::walk_supertypes(index, &enclosing, JAVA_SUPERTYPE_WALK_CAP, |current| {
-                        complete &= current.name().is_some() && current.package().is_some();
-                        ControlFlow::Continue(())
-                    });
-                if let [field] = fields.as_slice() {
-                    let visible = matches!(
-                        field.sym.source_member.visibility(),
-                        Some(
-                            ktcore::extensions::Visibility::Public
-                                | ktcore::extensions::Visibility::Protected
-                        )
-                    ) || field.sym.source_member.visibility()
-                        == Some(ktcore::extensions::Visibility::Package)
-                        && field.sym.package == ctx.package;
-                    let dispatch = field.sym.source_member.dispatch();
-                    if complete
-                        && visible
-                        && !static_imports_of(tree, src).may_resolve(node_text(object, src))
-                        && (dispatch == Some(ktcore::extensions::Dispatch::Static)
-                            || dispatch == Some(ktcore::extensions::Dispatch::Instance)
-                                && implicit_receiver_kind(call, src) == ReceiverKind::Value)
-                    {
-                        if let Some(value) = &field.sym.value_type {
-                            let ty =
-                                infer::declared_member_type(index, &enclosing, field, value, &ctx);
-                            return Some((ty, ReceiverKind::Value));
-                        }
-                    }
-                }
+            if let Some(receiver) = java_inherited_field_receiver(index, src, tree, object) {
+                return Some((receiver, ReceiverKind::Value));
             }
             if let Some(receiver) = java_unshadowed_type_receiver(index, file, src, tree, object) {
                 return Some((receiver, ReceiverKind::Type));
@@ -3788,7 +3866,14 @@ fn java_member_receiver(
             receiver_type_from_type_identifier(index, file, src, tree, object)
                 .map(|receiver| (receiver, ReceiverKind::Unknown))
         }
-        "object_creation_expression" | "method_invocation" | "field_access" => {
+        "field_access" => {
+            if let Some(receiver) = java_nested_enum_namespace(index, file, src, tree, object) {
+                return Some((receiver, ReceiverKind::Type));
+            }
+            receiver_type(index, file, src, tree, object, initializer_depth)
+                .map(|receiver| (receiver, ReceiverKind::Value))
+        }
+        "object_creation_expression" | "method_invocation" => {
             receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
@@ -3799,6 +3884,58 @@ fn java_member_receiver(
     }
 }
 
+/// Java enum declarations are implicitly static when nested. Selected SDK enum stubs
+/// have already passed reciprocal InnerClasses/origin admission before entering the index.
+/// Reuse the caller namespace proof rather than interpreting arbitrary dotted values as types.
+fn java_nested_enum_namespace(
+    index: &dyn InferenceIndex,
+    file: &str,
+    src: &str,
+    tree: &Tree,
+    object: Node<'_>,
+) -> Option<Type> {
+    let receiver = java_unshadowed_type_receiver(index, file, src, tree, object)?;
+    let owners = index.lookup_type(receiver.name()?);
+    let owner = owners.iter().find(|entry| {
+        Some(entry.sym.package.as_str()) == receiver.package()
+            && entry.sym.container.as_deref() == receiver.container()
+    })?;
+    let container = owner.sym.container.as_deref()?;
+    if owner.sym.kind != SymbolKind::EnumClass
+        || container.contains('.')
+        || !is_java_file(&owner.path)
+    {
+        return None;
+    }
+    let outer_owners = index.lookup_type(container);
+    let mut outers = outer_owners.iter().filter(|entry| {
+        entry.sym.package == owner.sym.package
+            && entry.sym.container.is_none()
+            && entry.path == owner.path
+            && matches!(entry.sym.kind, SymbolKind::Class | SymbolKind::Interface)
+    });
+    let outer = outers.next()?;
+    if outers.next().is_some() {
+        return None;
+    }
+    let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
+    ctx.package = package_of(tree, src);
+    ctx.imports = inference_imports(tree, src);
+    [owner, *outer]
+        .iter()
+        .all(|entry| {
+            entry.sym.source_member.visibility().is_some()
+                && ktcore::members::member_accessible_at(
+                    index,
+                    &receiver,
+                    entry,
+                    &ctx,
+                    object.start_byte(),
+                )
+        })
+        .then_some(receiver)
+}
+
 fn java_unshadowed_type_receiver(
     index: &dyn InferenceIndex,
     file: &str,
@@ -3807,6 +3944,18 @@ fn java_unshadowed_type_receiver(
     object: Node<'_>,
 ) -> Option<Type> {
     let name = node_text(object, src);
+    let mut first = object;
+    while first.kind() == "field_access" {
+        first = first.child_by_field_name("object")?;
+    }
+    if first.kind() != "identifier"
+        || object.kind() == "field_access"
+            && (local_declaration_node(src, first).is_some()
+                || same_file_field_declaration(src, first).is_some())
+    {
+        return None;
+    }
+    let shadow_name = node_text(first, src);
     let mut enclosing = object.parent();
     while let Some(node) = enclosing {
         enclosing = node.parent();
@@ -3830,7 +3979,7 @@ fn java_unshadowed_type_receiver(
         }
         break;
     }
-    if !index.scope_is_complete() || static_imports_of(tree, src).may_resolve(name) {
+    if !index.scope_is_complete() || static_imports_of(tree, src).may_resolve(shadow_name) {
         return None;
     }
     let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
@@ -3909,10 +4058,12 @@ fn java_unshadowed_type_receiver(
                 })
                 .collect();
             if declarations.len() != 1
-                || !index.source_members_complete(declarations[0])
+                || !index.source_value_namespace_complete(declarations[0])
                 || index.members_of(&root).iter().any(|entry| {
-                    entry.sym.name == name
+                    entry.sym.name == shadow_name
                         && entry.sym.kind.is_value_like()
+                        && index.source_property_access(entry)
+                            != Some(ktcore::extensions::source::JvmPropertyAccess::GetterOnly)
                         && Some(entry.sym.package.as_str()) == current.package()
                         && entry.sym.container.as_deref() == Some(root.as_str())
                 })
@@ -4210,6 +4361,7 @@ fn java_method_invocation_return_type(
             }
         }
     }
+    let mut selected_authored = None;
     if let Some(candidates) = java_member_call_candidates_with_arguments(
         index,
         file,
@@ -4260,22 +4412,36 @@ fn java_method_invocation_return_type(
                     )
             });
         }
+        // Return inference must keep the same typed selection used by navigation.
+        // Signature help separately retains alternative arities while editing arguments.
+        selected_authored = Some(
+            candidates
+                .consumable_candidates()
+                .iter()
+                .filter_map(|candidate| match candidate {
+                    ktcore::jvm::CallableCandidate::Authored(entry) => Some((**entry).clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
     }
     let package = package_of(tree, src);
     let imports = imports_of(tree, src);
-    let entries = java_call_entries_with_arguments(
-        index,
-        file,
-        src,
-        tree,
-        call,
-        name,
-        symbol,
-        &package,
-        &imports,
-        &arguments,
-        initializer_depth,
-    );
+    let entries = selected_authored.unwrap_or_else(|| {
+        java_call_entries_with_arguments(
+            index,
+            file,
+            src,
+            tree,
+            call,
+            name,
+            symbol,
+            &package,
+            &imports,
+            &arguments,
+            initializer_depth,
+        )
+    });
     if entries.is_empty() {
         return None;
     }
@@ -4901,6 +5067,7 @@ pub(crate) fn completion_query_with_source(
         let recovered = recovery.recovered_index(index, file);
         let index: &dyn InferenceIndex = recovered.as_ref().map_or(index, |recovered| recovered);
         let receiver = completion_receiver_at(synthetic_tree, syn_offset);
+
         let (ty, receiver_kind) = if index.may_have_compiled_callables() {
             receiver
                 .and_then(|receiver| {

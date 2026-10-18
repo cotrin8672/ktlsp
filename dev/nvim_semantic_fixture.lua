@@ -807,6 +807,7 @@ if client then
       end
     end
   end)
+  local tracked_notify = client.rpc.notify
   client.rpc.notify = rpc_notify
   if not ran then alias_check("slice executes", false, run_error) end
   if not restored then alias_check("cleanup executes", false, restore_error) end
@@ -814,6 +815,121 @@ if client then
   report.counts = { checks = #report.checks, failures = #report.failures, unmeasured = #report.unmeasured,
     first_responses = #report.first_responses }
   save_alias()
+
+  -- Reuse the same first-response transport and reconstructed outbound-source checks.
+  client.rpc.notify = tracked_notify
+  report = { checks = {}, failures = {}, unmeasured = {}, first_responses = {}, deliveries = {},
+    notifications = {}, disk = {}, wire = {}, source_keys = {}, edits = {}, request_timeout_ms = 4000,
+    timeout_policy = "execution bound, not latency acceptance",
+    coverage = "getX read properties; acronym/is getters and mixed-spelling rename remain unsupported" }
+  artifact_name, check_prefix = "semantic-java-getter-properties.json", "Java getter property "
+  paths = { bean = root .. "/probe/getter/PlainBean.java", payload = root .. "/probe/getter/Payload.java",
+    replacement = root .. "/probe/getter/Replacement.java", use = root .. "/probe/getter/GetterUse.kt" }
+  buffers, original, disk, sent_versions, order = {}, {}, {}, {}, { "bean", "payload", "replacement", "use" }
+  local modified_getter = {}
+  local function getter_query(name, method, anchor, token, accepts, expected)
+    local before = snapshots()
+    local _, _, row = ask(name, "use", method, anchor, token,
+      method == "textDocument/completion" and { context = { triggerKind = 1 } } or nil)
+    row.before, row.after, row.expected = before, snapshots(), expected
+    for _, key in ipairs(order) do
+      local first, last = row.before[key], row.after[key]
+      if not first.wire_matches_source or first.version == nil or first.version ~= first.sent_version
+          or not vim.deep_equal(first, last) then row.error = "source-wire-version-identity-unavailable: " .. key end
+    end
+    row.outcome = probe.request_outcome(row.response, row.error, accepts, row.attempts == 1)
+    if row.outcome == "matched" or row.outcome == "mismatch" then
+      alias_check(name, row.outcome == "matched", row)
+    else
+      report.unmeasured[#report.unmeasured + 1] = name
+      report.checks[#report.checks + 1] = { name = name, kind = "unmeasured", outcome = row.outcome, detail = row }
+      failures[#failures + 1] = check_prefix .. name .. " (unmeasured)"
+      print("UNMEASURED  " .. check_prefix .. name .. "  (" .. tostring(row.error or row.outcome) .. ")")
+      save_alias()
+    end
+  end
+  local function getter_phase(phase, expected, payload, replacement)
+    local exact = true
+    for _, key in ipairs(order) do
+      if not vim.deep_equal(lines(key), expected[key]) then
+        vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, expected[key])
+      end
+      exact = exact and vim.deep_equal(lines(key), expected[key])
+    end
+    report.edits[#report.edits + 1] = { phase = phase, expected = vim.deepcopy(expected), exact = exact }
+    alias_check(phase .. " applies exact whole source buffers", exact)
+    deliver(phase, order)
+    local _, range = probe.find(expected.bean, "getPayload()", "getPayload")
+    getter_query(phase .. " property navigates only to the actual Java getter", "textDocument/definition",
+      "bean.payload.payloadOnly()", "payload", function(raw)
+        return probe.exact_definition(raw, paths.bean, { range })
+      end, { path = paths.bean, range = range })
+    getter_query(phase .. " return chain reflects the current Java getter type", "textDocument/completion",
+      "bean.payload.payloadOnly()", "bean.payload.", function(raw)
+        return type(raw) == "table" and probe.completion_has(raw, "payloadOnly") == payload
+          and probe.completion_has(raw, "replacementOnly") == replacement
+      end, { payloadOnly = payload, replacementOnly = replacement })
+  end
+  local getter_ran, getter_error = xpcall(function()
+    local same_client = true
+    for _, key in ipairs(order) do
+      report.source_keys[probe.path_key(paths[key])] = key
+      buffers[key] = open_file(paths[key])
+      same_client = same_client and id == client.id
+      original[key], disk[key], modified_getter[key] = lines(key), vim.fn.readfile(paths[key], "b"), vim.bo[buffers[key]].modified
+      report.disk[key] = { path = paths[key], before_sha256 = vim.fn.sha256(table.concat(disk[key], "\n")) }
+    end
+    alias_check("Java producer and Kotlin consumer share the existing client", same_client)
+    local partial = replaced(original.use, "bean.payload.payloadOnly()", "bean.pa")
+    vim.api.nvim_buf_set_lines(buffers.use, 0, -1, false, partial)
+    deliver("incomplete", order)
+    getter_query("incomplete pa offers the Java getter as a property", "textDocument/completion", "bean.pa", "pa",
+      function(raw)
+        for _, item in ipairs(type(raw) == "table" and (raw.items or raw) or {}) do
+          if item.label == "payload" and item.kind == 10 then return true end
+        end
+        return false
+      end, { label = "payload", kind = 10 })
+    getter_phase("initial", original, true, false)
+    local changed = vim.deepcopy(original)
+    local replacements = 0
+    for index, line in ipairs(changed.bean) do
+      local count
+      changed.bean[index], count = line:gsub("Payload ", "Replacement ")
+      replacements = replacements + count
+    end
+    alias_check("unsaved Java change replaces only field and getter return types", replacements == 2, changed.bean)
+    getter_phase("unsaved-java", changed, false, true)
+    getter_phase("restored", original, true, false)
+  end, debug.traceback)
+  local getter_restored, getter_restore_error = pcall(function()
+    for _, key in ipairs(order) do
+      if original[key] and vim.api.nvim_buf_is_valid(buffers[key]) and not vim.deep_equal(lines(key), original[key]) then
+        vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, original[key])
+      end
+    end
+    require("vim.lsp._changetracking").flush(client)
+    for _, key in ipairs(order) do
+      if original[key] then
+        local current = vim.fn.readfile(paths[key], "b")
+        report.disk[key].after_sha256 = vim.fn.sha256(table.concat(current, "\n"))
+        local exact = vim.deep_equal(lines(key), original[key]) and vim.deep_equal(current, disk[key])
+        alias_check("cleanup restores buffers and untouched disk: " .. key, exact, report.disk[key])
+        alias_check("cleanup restoration reaches the wire: " .. key,
+          report.wire[key] == probe.buffer_full_text(buffers[key])
+            and sent_versions[vim.uri_from_bufnr(buffers[key])] == vim.lsp.util.buf_versions[buffers[key]])
+        if exact then vim.bo[buffers[key]].modified = modified_getter[key] end
+      end
+    end
+  end)
+  client.rpc.notify = rpc_notify
+  if not getter_ran then alias_check("slice executes", false, getter_error) end
+  if not getter_restored then alias_check("cleanup executes", false, getter_restore_error) end
+  report.completed = getter_ran and getter_restored
+  report.counts = { checks = #report.checks, failures = #report.failures, unmeasured = #report.unmeasured,
+    first_responses = #report.first_responses }
+  save_alias()
+
 else
   check("extension alias uses the existing initialized client", false)
 end

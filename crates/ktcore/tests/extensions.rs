@@ -173,6 +173,7 @@ fn normalized_source_rejects_foreign_owners_and_invalid_nested_ranges_atomically
         definition: def(MIXIN_FILE, &method.sym),
         owner: Some(def(MIXIN_FILE, &owner.sym)),
         member: None,
+        jvm_property: None,
         annotations: vec![SourceAnnotation {
             ty: ktcore::types::TypeRef::simple("Shadow"),
             use_site_target: None,

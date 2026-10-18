@@ -22,6 +22,33 @@ pub struct SourceDeclaration {
     pub owner: Option<Def>,
     pub annotations: Vec<SourceAnnotation>,
     pub member: Option<DeclaredMemberFacts>,
+    /// Current authored property lowering; not a complete method inventory.
+    pub jvm_property: Option<Fact<JvmPropertyAccess>>,
+}
+
+/// JVM value namespace facts are distinct from generated accessor/callable inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JvmPropertyAccess {
+    /// No Java-exposed/inherited field; a private JVM backing field may still exist.
+    GetterOnly,
+    Field,
+}
+
+/// Derived from one accepted tree, retained with the host's existing per-file metadata.
+/// It is never serialized or admitted as compiler output.
+#[derive(Clone, Debug)]
+pub struct KotlinValueNamespaceFacts {
+    pub input_sha256: [u8; 32],
+    pub qualifier_packages: std::sync::Arc<Vec<String>>,
+    pub owners: std::collections::BTreeSet<Def>,
+    pub properties: std::collections::BTreeMap<Def, Fact<JvmPropertyAccess>>,
+}
+
+impl KotlinValueNamespaceFacts {
+    pub fn matches_source(&self, text: &str) -> bool {
+        use sha2::Digest;
+        self.input_sha256 == <[u8; 32]>::from(sha2::Sha256::digest(text.as_bytes()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,14 +147,29 @@ fn extract_declarations(
             })
             .map(|entry| definition(file, &entry.sym));
         let annotations = annotations(node, text, scope, java);
+        let jvm_property = (include_members && !java && symbol.kind == SymbolKind::Property)
+            .then(|| kotlin_property_access(index, symbol, node, text, &annotations));
         let member = (include_members
             && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Property))
-        .then(|| member_facts(index, file, text, symbol, node, scope, java, &annotations));
+        .then(|| {
+            member_facts(
+                index,
+                file,
+                text,
+                symbol,
+                node,
+                scope,
+                java,
+                &annotations,
+                jvm_property.as_ref(),
+            )
+        });
         result.push(SourceDeclaration {
             definition: definition(file, symbol),
             owner,
             annotations,
             member,
+            jvm_property,
         });
     }
     result
@@ -187,6 +229,269 @@ fn declaration_node<'a>(tree: &'a Tree, symbol: &IndexedSymbol, java: bool) -> O
         }
         node = node.parent()?;
     }
+}
+
+/// Certify only the small, compiler-controlled ordinary property slice. The host still
+/// has to prove current source identity and absence of unknown compiler transformations.
+fn kotlin_property_access(
+    index: &dyn InferenceIndex,
+    symbol: &IndexedSymbol,
+    node: Node<'_>,
+    text: &str,
+    annotations: &[SourceAnnotation],
+) -> Fact<JvmPropertyAccess> {
+    if node.kind() != "property_declaration"
+        || node.has_error()
+        || symbol.container.is_none()
+        || symbol.ext_receiver.is_some()
+        || symbol.source_member.dispatch() != Some(Dispatch::Instance)
+        || !matches!(
+            symbol.source_member.visibility(),
+            Some(Visibility::Public | Visibility::Protected | Visibility::Private)
+        )
+        || symbol.source_member.jvm_restricted()
+        || !node
+            .children(&mut node.walk())
+            .any(|child| node_text(child, text) == "val")
+        || ["getter", "setter", "property_delegate"]
+            .iter()
+            .any(|kind| child_of_kind(node, kind).is_some())
+    {
+        return unsupported();
+    }
+    if let Some(modifiers) = child_of_kind(node, "modifiers") {
+        if modifiers.named_children(&mut modifiers.walk()).any(|word| {
+            !matches!(word.kind(), "annotation" | "marker_annotation")
+                && !matches!(
+                    node_text(word, text),
+                    "public" | "protected" | "private" | "final"
+                )
+        }) {
+            return unsupported();
+        }
+        let count = modifiers
+            .named_children(&mut modifiers.walk())
+            .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
+            .count();
+        if count != annotations.len() {
+            return unsupported();
+        }
+    }
+    let mut ancestor = node.parent();
+    let mut class = false;
+    while let Some(parent) = ancestor {
+        if parent.kind() == "class_declaration" {
+            if class
+                || child_of_kind(parent, "type_parameters").is_some()
+                || crate::parser::class_kind(parent) != SymbolKind::Class
+            {
+                return unsupported();
+            }
+            class = true;
+            if child_of_kind(parent, "modifiers").is_some_and(|mods| {
+                mods.named_children(&mut mods.walk()).any(|modifier| {
+                    matches!(modifier.kind(), "annotation" | "marker_annotation")
+                        || !matches!(node_text(modifier, text), "public" | "open" | "final")
+                })
+            }) {
+                return unsupported();
+            }
+        } else if parent.kind() == "source_file"
+            && parent
+                .named_children(&mut parent.walk())
+                .any(|child| child.kind() == "file_annotation")
+        {
+            return unsupported();
+        } else if matches!(
+            parent.kind(),
+            "object_declaration"
+                | "companion_object"
+                | "function_declaration"
+                | "lambda_literal"
+                | "block"
+                | "anonymous_initializer"
+                | "init_block"
+        ) {
+            return unsupported();
+        }
+        ancestor = parent.parent();
+    }
+    if !class {
+        return unsupported();
+    }
+    match annotations {
+        [] => Knowledge::Found(JvmPropertyAccess::GetterOnly),
+        [annotation]
+            if matches!(symbol.source_member.visibility(), Some(Visibility::Public | Visibility::Protected))
+            && annotation.ty.name == "JvmField"
+            && annotation.ty.qualification.as_deref() == Some("kotlin.jvm")
+            && kotlin_jvm_field_qualifier_unshadowed(index, symbol, &annotation.ty.package_candidates)
+            && annotation.ty.args.is_empty()
+            && annotation.arguments.is_empty()
+            && annotation.use_site_target.is_none()
+            // The fully qualified compiler intrinsic cannot be replaced by an authored
+            // declaration in the forbidden kotlin package under the supported plain profile.
+            && !index.lookup_type("JvmField").iter().any(|entry| {
+                entry.sym.package == "kotlin.jvm" && entry.tier == crate::index::Tier::Volatile
+            }) =>
+        {
+            Knowledge::Found(JvmPropertyAccess::Field)
+        }
+        _ => unsupported(),
+    }
+}
+
+/// A qualified type path may start with an in-scope type rather than the root
+/// package. Recheck this namespace dependency against the current index as well
+/// as at source normalization; a later source edit can introduce the qualifier.
+pub fn kotlin_jvm_field_qualifier_unshadowed(
+    index: &dyn InferenceIndex,
+    property: &IndexedSymbol,
+    packages: &[String],
+) -> bool {
+    use std::ops::ControlFlow;
+    let qualifiers = index.lookup_type("kotlin");
+    if qualifiers
+        .iter()
+        .any(|entry| entry.sym.container.is_none() && packages.contains(&entry.sym.package))
+    {
+        return false;
+    }
+    let Some(owner) = property.container.as_deref() else {
+        return false;
+    };
+    let receiver = Type::class(owner, Some(property.package.clone()));
+    let mut unshadowed = true;
+    let _ = infer::walk_supertypes(index, &receiver, 64, |current| {
+        let Some(root) = infer::receiver_root_key(index, current) else {
+            unshadowed = false;
+            return ControlFlow::Break(());
+        };
+        if qualifiers.iter().any(|entry| {
+            Some(entry.sym.package.as_str()) == current.package()
+                && entry.sym.container.as_deref() == Some(root.as_str())
+        }) {
+            unshadowed = false;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    unshadowed
+}
+
+/// Normalize once per accepted source publication, using the same SourceDeclaration facts
+/// consumed by extensions. Only the value namespace is closed; accessors remain independent.
+pub fn kotlin_value_namespace(
+    index: &dyn InferenceIndex,
+    file: &str,
+    tree: &Tree,
+    text: &str,
+    scope: &TypeScope,
+) -> Option<KotlinValueNamespaceFacts> {
+    use sha2::Digest;
+    if tree.root_node().kind() != "source_file" {
+        return None;
+    }
+    let declarations = extract(index, file, tree, text, scope);
+    let properties = declarations
+        .iter()
+        .filter_map(|decl| Some((decl.definition.clone(), decl.jvm_property.clone()?)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut owners = std::collections::BTreeSet::new();
+    for entry in index.entries_for_file(file) {
+        if entry.sym.kind != SymbolKind::Class
+            || entry.sym.container.is_some()
+            || !entry.sym.type_params.is_empty()
+        {
+            continue;
+        }
+        let Some(node) = declaration_node(tree, &entry.sym, false) else {
+            continue;
+        };
+        let mut pending = vec![node];
+        let mut complete = !tree
+            .root_node()
+            .named_children(&mut tree.root_node().walk())
+            .any(|n| n.kind() == "file_annotation");
+        while let Some(child) = pending.pop() {
+            // Executable bodies contain locals, not declarations in this owner's
+            // JVM value namespace. Inspect member headers and transforms only.
+            if matches!(
+                child.kind(),
+                "function_body"
+                    | "anonymous_initializer"
+                    | "init_block"
+                    | "block"
+                    | "lambda_literal"
+            ) {
+                continue;
+            }
+            if child.is_error() || child.is_missing() {
+                complete = false;
+                break;
+            }
+            if child.kind() == "property_declaration" {
+                let Some(name) = crate::parser::name_field(child).or_else(|| {
+                    child_of_kind(child, "variable_declaration").and_then(|var| {
+                        crate::parser::name_field(var).or_else(|| var.named_child(0))
+                    })
+                }) else {
+                    complete = false;
+                    break;
+                };
+                if !matches!(
+                    properties.get(&Def {
+                        file: file.into(),
+                        start_byte: name.start_byte(),
+                        end_byte: name.end_byte()
+                    }),
+                    Some(Knowledge::Found(_))
+                ) {
+                    complete = false;
+                    break;
+                }
+                continue;
+            }
+            if matches!(
+                child.kind(),
+                "annotation"
+                    | "marker_annotation"
+                    | "object_declaration"
+                    | "companion_object"
+                    | "class_parameter"
+                    | "type_parameters"
+            ) || child.kind() == "class_declaration" && child.id() != node.id()
+                || matches!(
+                    child.kind(),
+                    "data"
+                        | "enum"
+                        | "annotation"
+                        | "value"
+                        | "expect"
+                        | "external"
+                        | "inline"
+                        | "suspend"
+                        | "by"
+                        | "context"
+                )
+            {
+                complete = false;
+                break;
+            }
+            pending.extend(child.children(&mut child.walk()));
+        }
+        if complete {
+            owners.insert(definition(file, &entry.sym));
+        }
+    }
+    Some(KotlinValueNamespaceFacts {
+        input_sha256: sha2::Sha256::digest(text.as_bytes()).into(),
+        qualifier_packages: scope
+            .type_ref("kotlin", false, Vec::new())
+            .package_candidates,
+        owners,
+        properties,
+    })
 }
 
 fn annotations(node: Node<'_>, text: &str, scope: &TypeScope, java: bool) -> Vec<SourceAnnotation> {
@@ -355,6 +660,7 @@ fn member_facts(
     scope: &TypeScope,
     java: bool,
     annotations: &[SourceAnnotation],
+    property_access: Option<&Fact<JvmPropertyAccess>>,
 ) -> DeclaredMemberFacts {
     let modifiers = child_of_kind(node, "modifiers");
     let mut words = Vec::new();
@@ -382,14 +688,19 @@ fn member_facts(
     } else {
         Visibility::Package
     };
+    let jvm_field = matches!(
+        property_access,
+        Some(Knowledge::Found(JvmPropertyAccess::Field))
+    );
     let unsupported_jvm = annotations.iter().any(|annotation| {
         matches!(
             annotation.ty.qualification.as_deref(),
             None | Some("kotlin.jvm")
-        ) && matches!(
-            annotation.ty.name.as_str(),
-            "JvmName" | "JvmStatic" | "JvmField" | "JvmSynthetic" | "JvmOverloads"
-        )
+        ) && !(jvm_field && annotation.ty.name == "JvmField")
+            && matches!(
+                annotation.ty.name.as_str(),
+                "JvmName" | "JvmStatic" | "JvmField" | "JvmSynthetic" | "JvmOverloads"
+            )
     }) || flags.jvm_restricted()
         || words.iter().any(|word| {
             matches!(
@@ -401,6 +712,7 @@ fn member_facts(
     // A Kotlin public property denotes accessors as well as a backing field. Only a private
     // authored property has a field identity in this slice; generated accessor identity is separate.
     let field_known = java
+        || jvm_field
         || symbol.kind != SymbolKind::Property
         || visibility == Visibility::Private
             && !words.contains(&"abstract")

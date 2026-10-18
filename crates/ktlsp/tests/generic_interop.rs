@@ -3799,7 +3799,7 @@ fun use(left:Class<Invocation>,right:Class<Other>,known:Other) { pick(second=rig
 #[test]
 fn named_calls_do_not_treat_java_parameter_spelling_as_kotlin_source_names() {
     let source = "package probe
-fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,wrong:Class<Other>,known:Other) { request.tag(type=type);kotlin.upper(type=type);kotlin.star(type=type);kotlin.bounded(type=type)!!.service();kotlin.bounded(type=wrong);kotlin.tag(type=captured);kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
+fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,wrong:Class<Other>,known:Other) { request.tag(type=type);kotlin.upper(type=type);kotlin.star(type=type);kotlin.bounded(type=type)!!.service();kotlin.bounded(type=wrong);kotlin.both(exact=captured,lower=type);kotlin.tag(type=captured)!!.service();kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
 ";
     let mut ws = projected_workspace(source);
     for expression in [
@@ -3807,7 +3807,7 @@ fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Cla
         "kotlin.upper(type=type)",
         "kotlin.star(type=type)",
         "kotlin.bounded(type=wrong)",
-        "kotlin.tag(type=captured)",
+        "kotlin.both(exact=captured,lower=type)",
     ] {
         assert_eq!(
             infer_expression(&ws, "Use.kt", expression),
@@ -3815,6 +3815,26 @@ fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Cla
             "{expression}"
         );
     }
+    // Matching out containment infers Invocation?, while the invariant named slot above
+    // cannot replace a captured argument with its upper bound.
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "kotlin.tag(type=captured)"),
+        Type::class("Invocation", Some("probe".into())).with_nullability(true),
+    );
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "kotlin.tag(type=captured)!!.",
+        "service",
+        "body",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "kotlin.tag(type=captured)!!.service()",
+        "Invocation.java",
+        "service",
+    );
     assert_member(
         &mut ws,
         "Use.kt",
@@ -6413,4 +6433,826 @@ fn projected_mapped_collection_head_remains_possible_without_mapping_proof() {
         "the java.util.List candidate remains possible"
     );
     assert_eq!(selection.entries[0].sym.params[0].name, "List");
+}
+
+#[test]
+fn holder_key_overload_kotlin_actual_nested_returns_preserve_exact_target() {
+    let mut ws = holder_key_overload_workspace();
+    ws.open("Holder.java", "package holder; public interface Holder<T> { public static class Reference<T> implements Holder<T> { public void resourceOnly() {} } }".into());
+    ws.open("HolderSet.java", "package holder; public interface HolderSet<T> { public static class Named<T> implements HolderSet<T> { public void tagOnly() {} } }".into());
+    ws.change("HolderGetter.java", "package holder; import keys.ResourceKey; import tags.TagKey; public interface HolderGetter<T> { Holder.Reference<T> getOrThrow(ResourceKey<T> key); HolderSet.Named<T> getOrThrow(TagKey<T> key); }".into());
+    ws.change("HolderLookup.java", "package holder; public interface HolderLookup<T> extends HolderOwner<T>, HolderGetter<T> {}".into());
+    let text = "package consumer\nimport holder.holderLookup\nimport registries.Registries\nimport enchantments.Enchantments\nfun use() { holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY).resourceOnly() }\n";
+    ws.open("NestedHolderUse.kt", text.into());
+    let argument = infer_expression(&ws, "NestedHolderUse.kt", "Enchantments.EFFICIENCY");
+    let receiver = infer_expression(
+        &ws,
+        "NestedHolderUse.kt",
+        "holderLookup(Registries.ENCHANTMENT)",
+    );
+    eprintln!("actual nested holder reduction: argument={argument:?}, receiver={receiver:?}");
+    assert_eq!(argument.name(), Some("ResourceKey"), "{argument:?}");
+    assert_eq!(receiver.name(), Some("HolderLookup"), "{receiver:?}");
+    assert_holder_overload(&mut ws, "NestedHolderUse.kt", "ResourceKey");
+    assert_member(
+        &mut ws,
+        "NestedHolderUse.kt",
+        "getOrThrow(Enchantments.EFFICIENCY).resourceOnly",
+        "resourceOnly",
+        "tagOnly",
+    );
+}
+
+#[test]
+fn holder_key_overload_kotlin_implicit_block_entity_extension_over_java_level_method() {
+    let mut source = holder_key_overload_workspace();
+    // Kotlin 2.1.20 commonMain/kotlin/util/Preconditions.kt API signature.
+    // Copyright JetBrains s.r.o. and Kotlin contributors; Apache-2.0.
+    // The small executable body supplies the same nullable -> nonnull type API.
+    source.open(
+        "Preconditions.kt",
+        "package kotlin\npublic inline fun <T : Any> checkNotNull(value: T?): T = value!!\n".into(),
+    );
+    source.open("Holder.java", "package holder; public interface Holder<T> { public static class Reference<T> implements Holder<T> { public void resourceOnly() {} } }".into());
+    source.open("HolderSet.java", "package holder; public interface HolderSet<T> { public static class Named<T> implements HolderSet<T> { public void tagOnly() {} } }".into());
+    source.change("HolderGetter.java", "package holder; import keys.ResourceKey; import tags.TagKey; public interface HolderGetter<T> { Holder.Reference<T> getOrThrow(ResourceKey<T> key); HolderSet.Named<T> getOrThrow(TagKey<T> key); }".into());
+    source.change("HolderLookup.java", "package holder; public interface HolderLookup<T> extends HolderOwner<T>, HolderGetter<T> {}".into());
+    for (file, text) in [
+        ("Nullable.java", "package javax.annotation; public @interface Nullable {}"),
+        ("LevelReader.java", "package world; import holder.HolderLookup; import holder.Registry; import keys.ResourceKey; public interface LevelReader { default <T> HolderLookup<T> holderLookup(ResourceKey<? extends Registry<? extends T>> registryKey) { return null; } }"),
+        ("CommonLevelAccessor.java", "package world; public interface CommonLevelAccessor extends LevelReader {}"),
+        ("LevelAccessor.java", "package world; public interface LevelAccessor extends CommonLevelAccessor {}"),
+        ("Level.java", "package world; public abstract class Level implements LevelAccessor {}"),
+        ("BlockEntity.java", "package world; import javax.annotation.Nullable; public abstract class BlockEntity { @Nullable protected Level level; @Nullable public Level getLevel() { return level; } }"),
+        ("DrillBlockEntity.java", "package world; public abstract class DrillBlockEntity extends BlockEntity { public float getBreakSpeed() { return 0; } }"),
+    ] {
+        source.open(file, text.into());
+    }
+    source.change("Lookup.kt", "package holder\nimport keys.ResourceKey\nimport world.BlockEntity\nfun <T> BlockEntity.holderLookup(registryKey: ResourceKey<out Registry<out T>>): HolderLookup<T> = checkNotNull(level).holderLookup(registryKey)\n".into());
+    let text = "package consumer\nimport holder.holderLookup\nimport world.DrillBlockEntity\nimport registries.Registries\nimport enchantments.Enchantments\nclass EnchantableDrillBlockEntity : DrillBlockEntity() {\n override fun getBreakSpeed(): Float {\n  val efficiency = holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)\n  efficiency.resourceOnly()\n  return 0f\n }\n}\n";
+    let root = std::env::temp_dir().join(format!(
+        "ktlsp-holder-implicit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut ws = Workspace::new();
+    assert_eq!(ws.scan(&root), 0);
+    ws.set_library_index_complete(true);
+    ws.set_jdk_index_complete(true);
+    for file in source.open_doc_keys() {
+        let key = ktlsp::paths::file_key(&root.join(&file));
+        ws.open(&key, source.doc_text(&file).unwrap());
+    }
+    let file = ktlsp::paths::file_key(&root.join("ImplicitHolderUse.kt"));
+    let lookup_file = ktlsp::paths::file_key(&root.join("Lookup.kt"));
+    let api_file = ktlsp::paths::file_key(&root.join("HolderGetter.java"));
+    ws.open(&file, text.into());
+    let argument = infer_expression(&ws, &file, "Enchantments.EFFICIENCY");
+    let receiver = infer_expression(&ws, &file, "holderLookup(Registries.ENCHANTMENT)");
+    eprintln!("actual implicit BlockEntity holder reduction: argument={argument:?}, receiver={receiver:?}");
+    assert_eq!(argument.name(), Some("ResourceKey"), "{argument:?}");
+    assert_eq!(receiver.name(), Some("HolderLookup"), "{receiver:?}");
+    assert_holder_overload_at(&mut ws, &file, &api_file, "ResourceKey");
+    assert_member(
+        &mut ws,
+        &file,
+        "efficiency.resourceOnly",
+        "resourceOnly",
+        "tagOnly",
+    );
+    let delegated = infer_expression(
+        &ws,
+        &lookup_file,
+        "checkNotNull(level).holderLookup(registryKey)",
+    );
+    assert_eq!(
+        delegated.name(),
+        Some("HolderLookup"),
+        "the real Java generic delegate remains a typed lookup: {delegated:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn holder_key_overload_workspace() -> Workspace {
+    workspace(&[
+        ("Comparable.java", "package java.lang; public interface Comparable<T> { int compareTo(T other); }"),
+        ("ResourceKey.java", "package keys; public class ResourceKey<T> implements java.lang.Comparable<ResourceKey<?>> { public int compareTo(ResourceKey<?> other) { return 0; } }"),
+        ("TagKey.java", "package tags; import keys.ResourceKey; import holder.Registry; public record TagKey<T>(ResourceKey<? extends Registry<T>> registry) {}"),
+        ("Registry.java", "package holder; public class Registry<T> {}"),
+        ("Enchantment.java", "package enchantments; public class Enchantment {}"),
+        ("Reference.java", "package holder; public class Reference<T> { public void resourceOnly() {} }"),
+        ("NamedTag.java", "package holder; public class NamedTag<T> { public void tagOnly() {} }"),
+        ("HolderGetter.java", "package holder; import keys.ResourceKey; import tags.TagKey; public interface HolderGetter<T> { Reference<T> getOrThrow(ResourceKey<T> key); NamedTag<T> getOrThrow(TagKey<T> key); }"),
+        ("HolderOwner.java", "package holder; public interface HolderOwner<T> {}"),
+        ("HolderLookup.java", "package holder; public interface HolderLookup<T> extends HolderGetter<T>, HolderOwner<T> {}"),
+        ("Enchantments.java", "package enchantments; import keys.ResourceKey; import tags.TagKey; public class Enchantments { public static final ResourceKey<Enchantment> EFFICIENCY = null; public static final TagKey<Enchantment> EFFICIENCY_TAG = null; }"),
+        ("Registries.java", "package registries; import keys.ResourceKey; import holder.Registry; import enchantments.Enchantment; public class Registries { public static final ResourceKey<Registry<Enchantment>> ENCHANTMENT = null; }"),
+        ("Lookup.kt", "package holder\nimport keys.ResourceKey\nfun <T> holderLookup(key: ResourceKey<out Registry<out T>>): HolderLookup<T> = error(\"fixture\")\n"),
+    ])
+}
+
+fn assert_holder_overload(ws: &mut Workspace, file: &str, parameter: &str) {
+    assert_holder_overload_at(ws, file, "HolderGetter.java", parameter);
+}
+
+fn assert_holder_overload_at(ws: &mut Workspace, file: &str, api_file: &str, parameter: &str) {
+    let source = ws.doc_text(file).unwrap();
+    let offset = source.find("getOrThrow(").unwrap();
+    let defs = ws.goto_definition(file, offset);
+    let api = ws.doc_text(api_file).unwrap();
+    let signature = format!("getOrThrow({parameter}<T>");
+    let expected = api.find(&signature).unwrap();
+    assert_eq!(
+        defs.len(),
+        1,
+        "the typed argument must select only {parameter}, not every same-arity overload: {defs:?}"
+    );
+    assert_eq!(defs[0].file, api_file);
+    assert_eq!(defs[0].start_byte, expected);
+    assert_eq!(&api[defs[0].start_byte..defs[0].end_byte], "getOrThrow");
+}
+
+#[test]
+fn holder_key_overload_kotlin_chained_static_argument_selects_exact_resource_key() {
+    let mut ws = holder_key_overload_workspace();
+    let text = "package consumer\nimport holder.holderLookup\nimport registries.Registries\nimport enchantments.Enchantments\nfun use() { holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY).resourceOnly() }\n";
+    ws.open("HolderUse.kt", text.into());
+    let argument = infer_expression(&ws, "HolderUse.kt", "Enchantments.EFFICIENCY");
+    let receiver = infer_expression(&ws, "HolderUse.kt", "holderLookup(Registries.ENCHANTMENT)");
+    eprintln!("actual holder reduction: argument={argument:?}, receiver={receiver:?}");
+    assert_eq!(
+        argument.name(),
+        Some("ResourceKey"),
+        "preserve the real static-field argument's declared type: {argument:?}"
+    );
+    assert_eq!(
+        receiver.name(),
+        Some("HolderLookup"),
+        "preserve the chained generic lookup receiver: {receiver:?}"
+    );
+    assert_holder_overload(&mut ws, "HolderUse.kt", "ResourceKey");
+    assert_member(
+        &mut ws,
+        "HolderUse.kt",
+        "getOrThrow(Enchantments.EFFICIENCY).resourceOnly",
+        "resourceOnly",
+        "tagOnly",
+    );
+}
+
+fn holder_key_overload_absolute_java_workspace() -> (std::path::PathBuf, Workspace, String, String)
+{
+    let source = holder_key_overload_workspace();
+    let root = std::env::temp_dir().join(format!(
+        "ktlsp-holder-qualified-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut ws = Workspace::new();
+    assert_eq!(
+        ws.scan(&root),
+        0,
+        "start from an actually scanned empty standalone project"
+    );
+    ws.set_library_index_complete(true);
+    ws.set_jdk_index_complete(true);
+    for file in [
+        "Comparable.java",
+        "ResourceKey.java",
+        "TagKey.java",
+        "Registry.java",
+        "Enchantment.java",
+        "Reference.java",
+        "NamedTag.java",
+        "HolderGetter.java",
+        "HolderOwner.java",
+        "HolderLookup.java",
+        "Enchantments.java",
+        "Registries.java",
+        "Lookup.kt",
+    ] {
+        let key = ktlsp::paths::file_key(&root.join(file));
+        ws.open(&key, source.doc_text(file).unwrap().to_string());
+    }
+    let file = ktlsp::paths::file_key(&root.join("HolderUse.java"));
+    let api_file = ktlsp::paths::file_key(&root.join("HolderGetter.java"));
+    ws.open(&file, "package consumer; import holder.HolderLookup; import enchantments.Enchantment; import enchantments.Enchantments; class HolderUse { void use(HolderLookup<Enchantment> lookup) { lookup.getOrThrow(Enchantments.EFFICIENCY).resourceOnly(); } }".into());
+    (root, ws, file, api_file)
+}
+
+#[test]
+fn holder_key_overload_java_static_argument_selects_exact_resource_key() {
+    let (root, mut ws, file, api_file) = holder_key_overload_absolute_java_workspace();
+    assert_holder_overload_at(&mut ws, &file, &api_file, "ResourceKey");
+    assert_member(
+        &mut ws,
+        &file,
+        "getOrThrow(Enchantments.EFFICIENCY).resourceOnly",
+        "resourceOnly",
+        "tagOnly",
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn holder_key_overload_unknown_argument_retains_both_possible_declarations() {
+    let mut ws = holder_key_overload_workspace();
+    for (file, text) in [
+        ("Unknown.kt", "package consumer\nimport holder.HolderLookup\nimport enchantments.Enchantment\nfun use(lookup: HolderLookup<Enchantment>) { lookup.getOrThrow(missing) }\n"),
+        ("Unknown.java", "package consumer; import holder.HolderLookup; import enchantments.Enchantment; class Unknown { void use(HolderLookup<Enchantment> lookup) { lookup.getOrThrow(missing); } }"),
+    ] {
+        ws.open(file, text.into());
+        let defs = ws.goto_definition(file, text.find("getOrThrow(").unwrap());
+        let api = ws.doc_text("HolderGetter.java").unwrap();
+        let mut starts: Vec<_> = defs.iter().map(|d| { assert_eq!(d.file, "HolderGetter.java"); d.start_byte }).collect();
+        starts.sort();
+        assert_eq!(starts, vec![api.find("getOrThrow(ResourceKey<T>").unwrap(), api.find("getOrThrow(TagKey<T>").unwrap()], "an unknown argument cannot choose arbitrarily: {defs:?}");
+    }
+}
+
+#[test]
+fn holder_key_overload_unsaved_argument_flip_replaces_navigation_and_result_chain() {
+    let mut ws = holder_key_overload_workspace();
+    let original = "package consumer\nimport holder.HolderLookup\nimport enchantments.Enchantment\nimport enchantments.Enchantments\nfun use(lookup: HolderLookup<Enchantment>) { lookup.getOrThrow(Enchantments.EFFICIENCY).resourceOnly() }\n";
+    ws.open("Flip.kt", original.into());
+    assert_holder_overload(&mut ws, "Flip.kt", "ResourceKey");
+    let edited = original.replace("EFFICIENCY).resourceOnly", "EFFICIENCY_TAG).tagOnly");
+    ws.change("Flip.kt", edited);
+    assert_holder_overload(&mut ws, "Flip.kt", "TagKey");
+    assert_member(
+        &mut ws,
+        "Flip.kt",
+        "getOrThrow(Enchantments.EFFICIENCY_TAG).tagOnly",
+        "tagOnly",
+        "resourceOnly",
+    );
+    ws.change("Flip.kt", original.into());
+    assert_holder_overload(&mut ws, "Flip.kt", "ResourceKey");
+}
+
+#[test]
+fn holder_key_overload_kotlin_getter_property_is_not_a_java_inherited_field() {
+    // K2.4 + javac controls prove these properties have private backing fields/getters.
+    // They do not shadow this Java type import as a public inherited JVM field would.
+    for visibility in ["public", "protected"] {
+        for pending in [false, true] {
+            for explicit_type in [false, true] {
+                let root = std::env::temp_dir().join(format!(
+                    "ktlsp-kotlin-getter-not-field-{}-{}-{visibility}-{pending}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let mut ws = Workspace::new();
+                assert_eq!(ws.scan(&root), 0);
+                ws.set_library_index_complete(true);
+                ws.set_jdk_index_complete(true);
+                let imported = ktlsp::paths::file_key(&root.join("names/Enchantments.java"));
+                let shadow = ktlsp::paths::file_key(&root.join("values/ShadowFields.java"));
+                let parent = ktlsp::paths::file_key(&root.join("consumer/Parent.kt"));
+                let file = ktlsp::paths::file_key(&root.join("consumer/Use.java"));
+                ws.open(
+                    &imported,
+                    "package names; public class Enchantments { public static int TYPE_ONLY; }"
+                        .into(),
+                );
+                ws.open(
+                    &shadow,
+                    "package values; public class ShadowFields { public int VALUE_ONLY; }".into(),
+                );
+                let type_annotation = if explicit_type {
+                    ": values.ShadowFields"
+                } else {
+                    ""
+                };
+                ws.open(&parent, format!("package consumer\nopen class Parent {{ private val state = 1; {visibility} val Enchantments{type_annotation} = values.ShadowFields(); fun data(): Int {{ val data = state; return data }}; init {{ val by = 1 }} }}\n"));
+                let text = "package consumer; import names.Enchantments; public class Use extends Parent { public int read() { return Enchantments.TYPE_ONLY; } }";
+                ws.open(&file, text.into());
+                {
+                    let declarations =
+                        ktlsp::index::InferenceIndex::lookup_by_name(&ws.index, "Enchantments");
+                    let property = declarations
+                        .into_iter()
+                        .find(|entry| {
+                            entry.path.as_ref() == parent.as_str()
+                                && entry.sym.kind == ktcore::symbol::SymbolKind::Property
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        property.sym.source_member.dispatch(),
+                        Some(ktcore::extensions::Dispatch::Instance),
+                        "qualify that Kotlin property dispatch alone cannot certify a Java field"
+                    );
+                    assert_eq!(
+                        property.sym.source_member.visibility(),
+                        Some(if visibility == "public" {
+                            ktcore::extensions::Visibility::Public
+                        } else {
+                            ktcore::extensions::Visibility::Protected
+                        })
+                    );
+                }
+                // The compiler proves that a getter-only property does not hide the
+                // explicit Java type import. Require its exact field target while the
+                // real source generation is ready, before withdrawing producer proof.
+                let definitions = ws.goto_definition(&file, text.find("TYPE_ONLY").unwrap());
+                let imported_text = ws.doc_text(&imported).unwrap();
+                assert_eq!(definitions.len(), 1, "getter-only property must preserve useful Java type navigation: {visibility}, pending={pending}, {definitions:?}");
+                assert_eq!(definitions[0].file, imported);
+                assert_eq!(
+                    definitions[0].start_byte,
+                    imported_text.find("TYPE_ONLY").unwrap()
+                );
+                assert_eq!(
+                    definitions[0].end_byte,
+                    imported_text.find("TYPE_ONLY").unwrap() + "TYPE_ONLY".len()
+                );
+                if pending {
+                    ws.begin_analysis_generation();
+                }
+                assert_member(&mut ws, &file, "Enchantments.", "TYPE_ONLY", "VALUE_ONLY");
+                let invalid_field = text.replace("TYPE_ONLY", "VALUE_ONLY");
+                ws.change(&file, invalid_field.clone());
+                let definitions =
+                    ws.goto_definition(&file, invalid_field.find("VALUE_ONLY").unwrap());
+                assert!(definitions.is_empty(), "a getter-backed Kotlin property cannot become Java field syntax: {visibility}, pending={pending}, {definitions:?}");
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn holder_key_overload_kotlin_jvm_field_does_not_fall_back_to_imported_type() {
+    // Independent K2.4+javac controls prove this annotation emits a real public
+    // field. Even without a source JVM-field projection, it cannot expose the
+    // hidden TYPE_ONLY member from the explicit Java type import.
+    for pending in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-kotlin-jvm-field-shadows-import-{}-{}-{pending}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ws = Workspace::new();
+        assert_eq!(ws.scan(&root), 0);
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+        let imported = ktlsp::paths::file_key(&root.join("names/Enchantments.java"));
+        let shadow = ktlsp::paths::file_key(&root.join("values/ShadowFields.java"));
+        let parent = ktlsp::paths::file_key(&root.join("consumer/Parent.kt"));
+        let file = ktlsp::paths::file_key(&root.join("consumer/Use.java"));
+        ws.open(
+            &imported,
+            "package names; public class Enchantments { public static int TYPE_ONLY; }".into(),
+        );
+        ws.open(
+            &shadow,
+            "package values; public class ShadowFields { public int VALUE_ONLY; }".into(),
+        );
+        ws.open(&parent, "package consumer\nopen class Parent { @kotlin.jvm.JvmField public val Enchantments: values.ShadowFields = values.ShadowFields() }\n".into());
+        let text = "package consumer; import names.Enchantments; public class Use extends Parent { public int read() { return Enchantments.TYPE_ONLY; } }";
+        ws.open(&file, text.into());
+        let property = ktlsp::index::InferenceIndex::lookup_by_name(&ws.index, "Enchantments")
+            .into_iter()
+            .find(|entry| {
+                entry.path.as_ref() == parent.as_str()
+                    && entry.sym.kind == ktcore::symbol::SymbolKind::Property
+            })
+            .unwrap();
+        assert_eq!(
+            property.sym.source_member.dispatch(),
+            Some(ktcore::extensions::Dispatch::Instance)
+        );
+        assert_eq!(
+            property.sym.source_member.visibility(),
+            Some(ktcore::extensions::Visibility::Public)
+        );
+        if pending {
+            ws.begin_analysis_generation();
+        }
+        let items = labels(&mut ws, &file, "Enchantments.");
+        assert!(!items.contains("TYPE_ONLY"),
+            "a real Kotlin JVM field hides the imported Java type; unsupported field projection must not invent TYPE_ONLY: pending={pending}, {items:?}");
+        let definitions = ws.goto_definition(&file, text.find("TYPE_ONLY").unwrap());
+        assert!(definitions.is_empty(), "invalid Java member cannot navigate to the hidden imported type: pending={pending}, {definitions:?}");
+        let valid = text.replace("TYPE_ONLY", "VALUE_ONLY");
+        ws.change(&file, valid.clone());
+        assert_member(&mut ws, &file, "Enchantments.", "VALUE_ONLY", "TYPE_ONLY");
+        let definitions = ws.goto_definition(&file, valid.find("VALUE_ONLY").unwrap());
+        let shadow_text = ws.doc_text(&shadow).unwrap();
+        assert_eq!(definitions.len(), 1, "a normalized JVM field must give useful member navigation: pending={pending}, {definitions:?}");
+        assert_eq!(definitions[0].file, shadow);
+        assert_eq!(
+            definitions[0].start_byte,
+            shadow_text.find("VALUE_ONLY").unwrap()
+        );
+        assert_eq!(
+            definitions[0].end_byte,
+            shadow_text.find("VALUE_ONLY").unwrap() + "VALUE_ONLY".len()
+        );
+        // An unsaved lowering flip replaces the accepted per-file facts immediately.
+        ws.change(&parent, "package consumer\nopen class Parent { public val Enchantments: values.ShadowFields = values.ShadowFields() }\n".into());
+        ws.change(&file, text.into());
+        assert_member(&mut ws, &file, "Enchantments.", "TYPE_ONLY", "VALUE_ONLY");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn holder_key_overload_inherited_value_shadow_wins_over_imported_type_completion() {
+    // javac --release 17 independently proves that an inherited value wins over this
+    // explicit type import. Exercise the same unsaved edit both ready and during refresh.
+    for pending in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-inherited-import-shadow-{}-{}-{pending}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ws = Workspace::new();
+        assert_eq!(ws.scan(&root), 0);
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+        let imported = ktlsp::paths::file_key(&root.join("names/Enchantments.java"));
+        let shadow = ktlsp::paths::file_key(&root.join("values/ShadowFields.java"));
+        let parent = ktlsp::paths::file_key(&root.join("consumer/Parent.java"));
+        let file = ktlsp::paths::file_key(&root.join("consumer/Use.java"));
+        let shadow_text = "package values; public class ShadowFields { public int VALUE_ONLY; }";
+        ws.open(
+            &imported,
+            "package names; public class Enchantments { public static int TYPE_ONLY; }".into(),
+        );
+        ws.open(&shadow, shadow_text.into());
+        ws.open(&parent, "package consumer; public class Parent {}".into());
+        let before = "package consumer; import names.Enchantments; public class Use extends Parent { public int read() { return Enchantments.TYPE_ONLY; } }";
+        ws.open(&file, before.into());
+        assert!(!ktlsp::index::InferenceIndex::may_have_compiled_callables(
+            &ws.index
+        ));
+        assert_member(&mut ws, &file, "Enchantments.", "TYPE_ONLY", "VALUE_ONLY");
+        if pending {
+            ws.begin_analysis_generation();
+        }
+        ws.change(
+            &parent,
+            "package consumer; public class Parent { protected values.ShadowFields Enchantments; }"
+                .into(),
+        );
+        let after = before.replace("TYPE_ONLY", "VALUE_ONLY");
+        ws.change(&file, after.clone());
+        assert_member(&mut ws, &file, "Enchantments.", "VALUE_ONLY", "TYPE_ONLY");
+        let definitions = ws.goto_definition(&file, after.find("VALUE_ONLY").unwrap());
+        assert_eq!(
+            definitions.len(),
+            1,
+            "the value member must have one exact target: {definitions:?}"
+        );
+        assert_eq!(definitions[0].file, shadow);
+        assert_eq!(
+            definitions[0].start_byte,
+            shadow_text.find("VALUE_ONLY").unwrap()
+        );
+        assert_eq!(
+            &shadow_text[definitions[0].start_byte..definitions[0].end_byte],
+            "VALUE_ONLY"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn holder_key_overload_incomplete_java_namespace_retains_possible_overloads() {
+    let (root, mut ws, file, api_file) = holder_key_overload_absolute_java_workspace();
+    assert_holder_overload_at(&mut ws, &file, &api_file, "ResourceKey");
+    let previous = ws.analysis_generation();
+    let generation = ws.begin_analysis_generation();
+    assert!(!ws.is_current_generation(previous));
+    assert!(ws.is_current_generation(generation));
+    let text = ws.doc_text(&file).unwrap().to_string();
+    let argument_offset = text.find("Enchantments.EFFICIENCY").unwrap() + "Enchantments.".len();
+    let argument = ws
+        .resolved_symbol_query(&file, argument_offset)
+        .expect("query the exact argument field while its real refresh is pending");
+    assert_eq!(
+        argument.reference().status_label(),
+        "unknown",
+        "qualify unavailable argument-field authority before conservative overload selection: {:?}",
+        argument.targets
+    );
+    assert!(
+        argument.targets.is_empty(),
+        "the pending argument must not claim a field target: {:?}",
+        argument.targets
+    );
+    assert!(
+        ws.goto_definition(&file, argument_offset).is_empty(),
+        "strict field navigation must agree with the unknown argument proof"
+    );
+    // A selected ordinary field cannot be assumed before generated/imported name shadows close.
+    let defs = ws.goto_definition(&file, text.find("getOrThrow(").unwrap());
+    let api = ws.doc_text(&api_file).unwrap();
+    let mut starts: Vec<_> = defs
+        .iter()
+        .map(|d| {
+            assert_eq!(d.file, api_file);
+            d.start_byte
+        })
+        .collect();
+    starts.sort();
+    assert_eq!(
+        starts,
+        vec![
+            api.find("getOrThrow(ResourceKey<T>").unwrap(),
+            api.find("getOrThrow(TagKey<T>").unwrap()
+        ],
+        "incomplete namespace must not invent a typed static argument: {defs:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn java_getter_projection_workspace() -> Workspace {
+    workspace(&[
+        ("Payload.java", "package bean; public class Payload { public void touch() {} }"),
+        ("Other.java", "package bean; public class Other { public void otherOnly() {} }"),
+        ("PlainBean.java", "package bean; public class PlainBean { protected Payload payload; public Payload getPayload() { return payload; } }"),
+    ])
+}
+
+#[test]
+fn java_getter_property_explicit_and_implicit_use_original_getter_definition() {
+    let mut ws = java_getter_projection_workspace();
+    let text = "package consumer\nimport bean.PlainBean\nfun PlainBean.read() = payload\nfun explicit(bean: PlainBean) = bean.payload.touch()\n";
+    ws.open("GetterUse.kt", text.into());
+    ws.open("JavaGetterUse.java", "package consumer; import bean.PlainBean; class JavaGetterUse { void use(PlainBean bean) { bean.getPayload().touch(); } }".into());
+    for marker in ["payload", "bean.payload"] {
+        let ty = infer_expression(&ws, "GetterUse.kt", marker);
+        assert_eq!(
+            ty.name(),
+            Some("Payload"),
+            "ordinary getter property must type {marker}: {ty:?}"
+        );
+        assert_eq!(ty.package(), Some("bean"));
+    }
+    let api = ws.doc_text("PlainBean.java").unwrap();
+    let target = api.find("getPayload").unwrap();
+    for offset in [
+        text.find("payload").unwrap(),
+        text.find("bean.payload").unwrap() + "bean.".len(),
+    ] {
+        let defs = ws.goto_definition("GetterUse.kt", offset);
+        assert_eq!(
+            defs.len(),
+            1,
+            "the property must navigate to the real getter: {defs:?}"
+        );
+        assert_eq!(
+            (defs[0].file.as_str(), defs[0].start_byte, defs[0].end_byte),
+            ("PlainBean.java", target, target + "getPayload".len())
+        );
+    }
+    let result = ws
+        .complete(
+            "GetterUse.kt",
+            text.find("bean.payload").unwrap() + "bean.pa".len(),
+            true,
+        )
+        .unwrap();
+    assert!(
+        result.items.iter().any(
+            |item| item.label == "payload" && item.kind == ktcore::symbol::SymbolKind::Property
+        ),
+        "getter property completion must be useful: {result:?}"
+    );
+    assert_member(
+        &mut ws,
+        "GetterUse.kt",
+        "bean.payload.touch",
+        "touch",
+        "otherOnly",
+    );
+    let java = ws.doc_text("JavaGetterUse.java").unwrap();
+    let mut refs: Vec<_> = ws
+        .references("PlainBean.java", target, true)
+        .into_iter()
+        .map(|site| (site.file, site.start_byte, site.end_byte))
+        .collect();
+    refs.sort();
+    let mut expected = vec![
+        (
+            "PlainBean.java".to_string(),
+            target,
+            target + "getPayload".len(),
+        ),
+        (
+            "JavaGetterUse.java".to_string(),
+            java.find("getPayload").unwrap(),
+            java.find("getPayload").unwrap() + "getPayload".len(),
+        ),
+    ];
+    for (start, _) in text.match_indices("payload") {
+        expected.push(("GetterUse.kt".into(), start, start + "payload".len()));
+    }
+    expected.sort();
+    assert_eq!(
+        refs, expected,
+        "both spellings must resolve through the same getter identity"
+    );
+    // Mixed method/property spellings require distinct edits; this slice refuses partial rename.
+    assert!(ws
+        .prepare_rename("GetterUse.kt", text.find("payload").unwrap())
+        .is_none());
+    assert!(ws.prepare_rename("PlainBean.java", target).is_none());
+    assert!(ws
+        .rename("GetterUse.kt", text.find("payload").unwrap(), "other")
+        .is_none());
+    assert!(ws.rename("PlainBean.java", target, "getOther").is_none());
+}
+
+#[test]
+fn java_getter_property_projection_preserves_language_dispatch_and_shape_boundaries() {
+    let mut ws = java_getter_projection_workspace();
+    ws.open("RejectedBean.java", "package bean; public class RejectedBean { public static Payload getStatic() { return null; } private Payload getSecret() { return null; } public Payload getArgument(int value) { return null; } public <T> T getGeneric() { return null; } public void getNothing() {} public Payload getURL() { return null; } public boolean isReady() { return true; } }".into());
+    ws.open(
+        "KotlinBean.kt",
+        "package bean\nclass KotlinBean { fun getPayload(): Payload = Payload() }\n".into(),
+    );
+    for (owner, written) in [
+        ("RejectedBean", "static"),
+        ("RejectedBean", "secret"),
+        ("RejectedBean", "argument"),
+        ("RejectedBean", "generic"),
+        ("RejectedBean", "nothing"),
+        ("RejectedBean", "URL"),
+        ("RejectedBean", "isReady"),
+        ("KotlinBean", "payload"),
+        ("PlainBean", "payload()"),
+    ] {
+        let text = format!(
+            "package consumer\nimport bean.{owner}\nfun probe(bean: {owner}) = bean.{written}\n"
+        );
+        ws.open("GetterNegative.kt", text.clone());
+        let offset = text.rfind("bean.").unwrap() + "bean.".len();
+        assert!(text[offset..].starts_with(written));
+        let defs = ws.goto_definition("GetterNegative.kt", offset);
+        assert!(
+            defs.is_empty(),
+            "unsupported or invalid property must stay unknown: {owner}.{written}: {defs:?}"
+        );
+    }
+    let java = "package consumer; import bean.PlainBean; class JavaFieldUse { void use(PlainBean bean) { bean.payload.touch(); } }";
+    ws.open("JavaFieldUse.java", java.into());
+    assert!(
+        ws.goto_definition("JavaFieldUse.java", java.find("payload").unwrap())
+            .is_empty(),
+        "Kotlin's synthetic getter property must not expose a protected Java field"
+    );
+    // A local value remains stronger than the extension receiver's property.
+    let local = "package consumer\nimport bean.PlainBean\nimport bean.Other\nfun PlainBean.local() { val payload: Other = Other(); payload.otherOnly() }\n";
+    ws.open("GetterLocal.kt", local.into());
+    assert_member(
+        &mut ws,
+        "GetterLocal.kt",
+        "payload.otherOnly",
+        "otherOnly",
+        "touch",
+    );
+}
+
+#[test]
+fn java_getter_property_return_and_target_update_after_unsaved_java_edit() {
+    let mut ws = java_getter_projection_workspace();
+    let text = "package consumer\nimport bean.PlainBean\nfun use(bean: PlainBean) = bean.payload.touch()\n";
+    ws.open("GetterChange.kt", text.into());
+    assert_eq!(
+        infer_expression(&ws, "GetterChange.kt", "bean.payload").name(),
+        Some("Payload")
+    );
+    ws.change("PlainBean.java", "package bean; public class PlainBean { protected Other payload; public Other getPayload() { return payload; } }".into());
+    assert_eq!(
+        infer_expression(&ws, "GetterChange.kt", "bean.payload").name(),
+        Some("Other")
+    );
+    assert_member(
+        &mut ws,
+        "GetterChange.kt",
+        "bean.payload.",
+        "otherOnly",
+        "touch",
+    );
+    let api = ws.doc_text("PlainBean.java").unwrap();
+    let defs = ws.goto_definition("GetterChange.kt", text.find("payload").unwrap());
+    assert_eq!(defs.len(), 1, "{defs:?}");
+    assert_eq!(defs[0].file, "PlainBean.java");
+    assert_eq!(defs[0].start_byte, api.find("getPayload").unwrap());
+}
+
+#[test]
+fn projected_passthrough_preserves_scoped_parameter_identity_and_nullability() {
+    let source = r#"package probe
+fun <S> invariant(request: Request, key: Class<Class<S>>) = request.nested(key)
+fun <S> projected(request: Request, key: Class<out Class<S>>) = request.nested(key)
+fun <S> nestedProjected(pass: Passage, key: Class<out Class<out S>>) = pass.pass(key)
+fun concrete(pass: Passage, key: Class<out Class<out Invocation>>) = pass.pass(key)
+"#;
+    let mut ws = projected_workspace(source);
+    ws.open("Passage.java", "package probe; public class Passage { public <T> T pass(Class<? extends Class<? extends T>> key) { return null; } }".into());
+    for (expression, parameter) in [
+        ("request.nested(key)", "fun <S> invariant"),
+        ("pass.pass(key)", "fun <S> nestedProjected"),
+    ] {
+        let ty = infer_expression(&ws, "Use.kt", expression);
+        let Type::Parameter {
+            definition,
+            name,
+            nullable,
+            ..
+        } = ty
+        else {
+            panic!("{expression} lost scoped identity: {ty:?}")
+        };
+        assert_eq!(name, "S");
+        assert!(
+            nullable,
+            "unbounded S retains its nullable-capable identity"
+        );
+        assert_eq!(definition.file, "Use.kt");
+        assert_eq!(definition.start_byte, source.find(parameter).unwrap() + 5);
+        assert_eq!(definition.end_byte, definition.start_byte + 1);
+    }
+    // Separate files/scopes with the same spelling are never unified by name.
+    let first = infer_expression(&ws, "Use.kt", "request.nested(key)");
+    ws.open("Second.kt", source.into());
+    assert_ne!(
+        first,
+        infer_expression(&ws, "Second.kt", "request.nested(key)")
+    );
+    // Probe each body separately so repeated argument spellings cannot select the wrong scope.
+    for (file, declaration, expected) in [
+        (
+            "Projected.kt",
+            "fun <S> projected(request: Request, key: Class<out Class<S>>) = request.nested(key)",
+            None,
+        ),
+        (
+            "Concrete.kt",
+            "fun concrete(pass: Passage, key: Class<out Class<out Invocation>>) = pass.pass(key)",
+            Some("Invocation"),
+        ),
+    ] {
+        ws.open(file, format!("package probe\n{declaration}\n"));
+        let expression = if file == "Projected.kt" {
+            "request.nested(key)"
+        } else {
+            "pass.pass(key)"
+        };
+        let ty = infer_expression(&ws, file, expression);
+        if let Some(expected) = expected {
+            assert_eq!(ty.name(), Some(expected), "{ty:?}");
+        } else {
+            assert!(matches!(ty, Type::Parameter { .. }), "{ty:?}");
+        }
+    }
+}
+
+#[test]
+fn projected_passthrough_keeps_unresolved_and_incompatible_inputs_unknown() {
+    for declaration in [
+        "fun <S : Missing> use(pass: Passage, key: Class<out Class<out S>>) = pass.pass(key)",
+        "fun <S : S> use(pass: Passage, key: Class<out Class<out S>>) = pass.pass(key)",
+        "fun use(pass: Passage, key: Class<in Class<out Invocation>>) = pass.pass(key)",
+        "fun use(pass: Passage, key: Class<out Class<*>>) = pass.pass(key)",
+        "fun use(pass: Passage, key: Class<out Class<Missing>>) = pass.pass(key)",
+    ] {
+        let mut ws = projected_workspace(&format!("package probe\n{declaration}\n"));
+        ws.open("Passage.java", "package probe; public class Passage { public <T> T pass(Class<? extends Class<? extends T>> key) { return null; } }".into());
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", "pass.pass(key)"),
+            Type::Unknown,
+            "{declaration}"
+        );
+    }
+    let mut ws = projected_workspace("package probe\nfun use(request: Request, key: Class<out Invocation>) = request.both(key,key)\n");
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.both(key,key)"),
+        Type::Unknown,
+        "projection is not equality in an invariant slot"
+    );
 }
