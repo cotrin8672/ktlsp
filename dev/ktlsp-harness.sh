@@ -46,6 +46,7 @@ mixed/corpus environment:
   KTLSP_UI_SAMPLES         mixed builtin completion cycles per language (default: 1)
   KTLSP_UI_CASES           optional corpus popup/accepted-text manifest; uses the same UI probe
   KTLSP_PROBE_SERVER       corpus backend: ktlsp (default) or intellij
+  KTLSP_CORPUS_SHUTDOWN_OBSERVE_MS  optional corpus exit-observation wait (default: 15000)
   IJLS_PLUGIN/IJLS_SERVER  intellij-lsp.nvim plugin and server paths for intellij
   IJLS_JDK/JAVA_HOME       JDK for the IntelliJ server
 

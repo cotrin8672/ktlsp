@@ -38,6 +38,30 @@ observation deadline therefore leaves the native-to-editor certificate
 unproved. This is a diagnostic coverage gap, not evidence of a store bug.
 The explicit-import control and safe body-diagnostic extension are in progress.
 
+The separate explicit-import control now proves current new-Java native error
+to canonical store and standard diagnostic pull. Removing the import produces
+native Javac success and a version5 empty diagnostic push. The fixed standard
+pull remains unrun: the control incorrectly waited for a clean Java canonical
+event, which the positive-only contract does not generate. This observation
+deadline is retained; it is not a publisher failure or Java clean authority.
+Evidence: recovery89/java-native-import107-control1/owned-1/summary.json SHA256
+ca5eaf9a6b5ebcd8dc85ae4256c74de3d487e24457ae2e41cffb330fb78d906a.
+
+One diagnostic Gradle ordinary-session repeat keeps all three first responses
+and exits naturally in18.172s with zero termination calls. The optional corpus
+shutdown observation setting preserves the15s default and records an overrun
+as information; the original105 failures remain unchanged. Query-only sampling
+shows15.719 CPU seconds across18.222s from just after serve closure to native
+exit detection, while working set falls from3,704.82MiB. The final Workspace
+field marker occurs18.123s after serve closure and9.365ms before exact native
+exit. This supports active teardown work; the last Arc owner and expensive
+field are not yet identified. The run indexes1,654,554 library symbols versus
+the original105 ordinary run's2,067,696, so it is not a speed comparison.
+Root verified six artifact references and15 current guards, with owned live
+and terminated counts both zero. Evidence:
+recovery89/shutdown107-natural1/receipt.json SHA256
+11eb8235bba243c04b29852c08baac340e35a404ecc2ef19d36026e6ffe3c603.
+
 The full101 workspace run compiled and returned1,672 passed/three failed/seven
 ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
 `@JvmField`; the third expected Unknown for a compiler-valid projected named

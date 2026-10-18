@@ -155,7 +155,9 @@ local sent_versions, outbound_changes, delivery_records = {}, {}, {}
 local active_case
 local function finish()
   if client then
-    local stopped = probe.shutdown(client, shutdown_state, 15000)
+    local stopped = probe.shutdown(client, shutdown_state,
+      tonumber(vim.env.KTLSP_CORPUS_SHUTDOWN_OBSERVE_MS) or 15000)
+    stopped.exceeds_prior_observation_wait = stopped.finished_ns - stopped.started_ns > 15000 * 1000000
     operational('client shuts down gracefully', stopped.clean, vim.inspect(stopped))
   end
   for path, source in pairs(sources) do
