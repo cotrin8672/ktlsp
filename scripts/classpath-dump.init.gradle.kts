@@ -576,7 +576,7 @@ object KtlspCompilerConfiguration {
                 (read(patterns, "getExcludes") as? Collection<*>)?.isEmpty() != true) return false
             val includes = read(patterns, "getIncludes") as? Collection<*> ?: return false
             if (includes.isNotEmpty() && "**/*.$suffix" !in includes) return false
-            if (includes.any { it !is String || it.lowercase(java.util.Locale.ROOT) !in listOf("**/*.java", "**/*.kt", "**/*.kts") }) return false
+            if (includes.any { it !is String || it.map { character -> java.lang.Character.toLowerCase(character) }.joinToString("") !in listOf("**/*.java", "**/*.kt", "**/*.kts") }) return false
             return type.name != "org.gradle.api.tasks.util.internal.IntersectionPatternSet" ||
                 (read(patterns, "getOther")?.let(::stockPatterns) == true)
         }

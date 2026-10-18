@@ -8,6 +8,44 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Verified96 baseline: checks and releases pass; project validation remains partial
 
+### Latest103 source validation (baseline96 release remains the editor reference)
+
+The full101 workspace run compiled and returned1,672 passed/three failed/seven
+ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
+`@JvmField`; the third expected Unknown for a compiler-valid projected named
+call. Independent Kotlin compiler controls establish Invocation? for that call;
+the corrected positive and invariant-slot negative pass in focus102 (four/zero).
+The shared scoped-type-parameter/projection correction also passes the real
+implicit Java generic delegate body, with exact identity/nullability negatives.
+
+Typed authored Kotlin property facts are now retained with existing source
+metadata and forwarded through scoped/recovery queries. Focus103 returns31
+passed/one failed across32 cases, including both former namespace failures.
+The remaining new failure detects initializer locals incorrectly receiving
+property-lowering facts (four Found facts instead of two); its expectation is
+retained and the production correction is pending. Full workspace/release/editor
+validation of these changes has not run. Temporary delegate/enum diagnostics
+have been removed. Evidence: focus103-property-proofs1/receipt.json SHA256
+10662ace5fb22df6bb14b9c579ac45b968337985487249270cce7c502d9e283c.
+
+The full current exporter now completes a normal offline import of the same
+pinned CEM project:81.328s, one module/two source sets/four compiler tasks. All
+four tasks have complete non-null SDK producer claims and source policies,
+where baseline96's main Java/Kotlin policies were null. This proves export,
+not future-buffer editor behavior or a speed improvement. Evidence:
+recovery89/corpus90/cem-model101-1/receipt.json SHA256
+324c1cabbe39b8329ebc5ba389ca8979b08032102ed553dc347a79cd977bf7ef.
+The Gradle7.4 full-script Kotlin API incompatibility is corrected independently;
+actual7.4.2/9.6.1 controls preserve restrictive/opaque/Unicode-pattern rejection.
+
+The existing Neovim semantic harness confirms all seven new getter requests
+return empty first responses on the immutable96 release, with correct cursors,
+wire contents and unsaved-edit restoration; other136 semantic checks pass.
+Shutdown fails separately (no natural exit before the existing15s observation).
+New-release comparison is pending. Evidence:
+recovery89/extension102-getter-native96/receipt.json SHA256
+5d7a0036dd02b5888f55689f62f4da395fb5fa3e33da6ff55c5923cf128c76f4.
+
 Current source fixes caller-specific SDK views, SDK11 legacy signatures, nested
 Map.Entry generic result chains, Gradle future-file selection and the exporter
 deprecation that blocked real Gradle imports. Shared extension-source readiness
@@ -108,15 +146,37 @@ the independently reproduced duplicate-release case and the getter body below.
 Evidence: focus98-pending-duplicate-red1/receipt.json SHA256
 95b9ea1383652ef9aee999a50ffdffd0d3e95346150a7b10cf945140ddd8cab2.
 
-The remaining actual inference gap is ordinary Kotlin access to a Java getter
-as a property. Both bare `level` in the extension body and `entity.level` infer
-Unknown; `entity.getLevel()`, `checkNotNull(entity.getLevel())`, and the direct
-Java generic `level.holderLookup(...)` chain retain precise types. The implicit
-extension consumer's argument/receiver, exact ResourceKey-only goto and useful
-result chain already pass, so this reduction still does not reproduce native
-CEM's overload mismatch. Temporary ENUMDBG/HOLDERDBG/DELEGATEDBG diagnostics
-must be removed before commit/release. Full workspace and editor checks have
-not yet been rerun for these changes.
+Ordinary Kotlin access to a Java getter as a property is now corrected in the
+shared value-selection layer. The qualified tests-only baseline returns one
+passed/two failed: both explicit/implicit typing and unsaved Java edits produce
+Unknown. The boundary negative uses a checked receiver-expression cursor; its
+first draft accidentally targeted the import and is not production evidence.
+Evidence: focus99-getter-qualified-red1/receipt.json SHA256
+0ccca38ffdc2d6f1f168cfe3748426f4a3e413b18713638534cd8caf32af3a9e.
+All three getter tests pass after the correction: useful incomplete completion,
+precise types, exact original-getter navigation, both-spelling references,
+safe refusal of mixed-spelling rename, language/access/shape boundaries and
+unsaved return-type updates. Ordinary method lookup retains its original
+traversal; getter discovery is limited to value/completion queries. Prefix
+completion still gathers all getter properties. Acronym/is getter forms remain
+coverage gaps. The existing rename-reference cap is also applied before an
+alias scan; that tiny follow-up is not yet rerun.
+
+The latest23-case run returns21 passed/two failed, with339 stable inputs and
+clean owned closure. The strict pending-argument negative and real project
+refresh proof tests pass. Root independently verifies counts and five receipt
+references: focus99-getter-green-shadow-red1/receipt.json SHA256
+fe74e6c2a069c1a6b479a25debe9f0bb6d03a676f31f1e6af5bdc482262a0e6b.
+Remaining failures are imported-type completion incorrectly winning over an
+inherited Java value after an unsaved edit, and the generic extension-body
+delegate result. For the latter, bare `level`, `checkNotNull(level)` and
+`entity.level` now retain world.Level; the concrete Java generic call also
+retains HolderLookup<Enchantment>. The body using projected symbolic `T` remains
+Unknown. Consumer argument/receiver, exact ResourceKey-only goto and useful
+result chain already pass, so native CEM's overload mismatch is still not
+reproduced by this reduction. Temporary ENUMDBG/HOLDERDBG/DELEGATEDBG diagnostics
+must be removed before commit/release. Full workspace checks and fresh-release
+Neovim checks, including the added semantic getter probe, remain unrun.
 
 The proven source-visitor corrections are adopted. An invocation-scoped compiler
 loader cache is also adopted after actual Gradle8.10.2 resource/reuse controls
