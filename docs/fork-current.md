@@ -6,7 +6,7 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest105: current source and native validation
+## Latest106: current source and native validation
 
 The full101 workspace run compiled and returned1,672 passed/three failed/seven
 ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
@@ -111,9 +111,56 @@ Evidence of the original startup cancellation failure:
 recovery89/corpus90/native-five-gradle-editor104-2/startup-watch-classification.json.
 Focused receipt: recovery89/watch-refresh105-focus2/receipt.json SHA256
 b71b952c1c9c936fc5644b22fa0063a976c53c0b94ad086ada0328945725f23e.
-The remaining four-project rerun, reload/compiler-plugin cases and full speed
-acceptance remain unproved. Implementation through this slice is pushed as
-13dd759d73a21c5e35d94f16308d6250bc8b92d7.
+The same105 binary also passes the unchanged Moshi9, OkHttp10 and Retrofit12
+qualified first responses:40/40 across these four projects including Gradle.
+Root verified each direct receipt's artifact references/current guards/closure.
+Moshi and OkHttp exit cleanly; both Retrofit sessions retain the15s graceful
+shutdown failure. Spring's ten cases are still running. Receipts under
+recovery89/corpus90/native-five-{moshi,okhttp,retrofit}-editor105-1/receipt.json
+have SHA256 respectively:
+4a2d3d8939f21d4e03f2577dae7d9117bdfc6f9c994decf73e90ff25c0d86fcc,
+a8eeb05005f7ae003615166b03058b06c6ffbe5362a4fb7ed053f3a4c61dba3c,
+6aabfd31d993cf303003c551e382bb1b1f83534f955e1677a7e5a5930094f511.
+
+Actual Moshi/Retrofit notifications expose a narrower remaining baseline gap:
+literal Git pathspecs omit nested gradle.properties/gradle-wrapper.properties,
+although their bytes match pinned HEAD.106 changes only those two patterns;
+the existing scheduler regression now covers root/nested properties and a Git
+subroot, retaining real edits, lifecycle and unknown-input negatives. The focused
+case passes, then workspace106 passes1,681/zero failed/seven ignored and release
+succeeds. Root independently verified344 current inputs, both raw logs, the
+per-target test totals and immutable binary. Binary:
+native-integrated106-1/bin/ktlsp.exe,20,190,720 bytes, SHA256
+160f57005434bc89da027f63095a10de8e8ba132d9c05cbf284ec5449f847210.
+Receipt: native-integrated106-1/receipt.json SHA256
+ab7e3666b18634b0b2868e238758e8854be89719167416b52b291e7bce32d6d2.
+Real-project revalidation of106 remains pending. Wrapper-JAR notifications are
+separate from this fix; their same-byte baseline handling is not yet changed.
+
+The unchanged dependency/generated-source reload probe on105 records82/86
+checks, four failed assertions and two readiness deadlines. All four offline
+builds pass; new-library/generated-source completion and initial source goto
+work in Java and Kotlin. The v2 source-goto requests occur before source
+enrichment is accepted and return a correct v2 binary stub; two later failures
+derive from those failed prerequisites. This does not establish stale v1 facts
+or wrong source selection after readiness. Root verified230 current runtime
+guards and five artifact references. Evidence:
+recovery89/gradle-reload105-1/receipt.json SHA256
+49a1f446d4963b85ab16c0760814f5dc794e8f3f73e0923023d2a689e151f42e.
+Java diagnostics use the fast path: the compiler rejects the new unsaved source
+membership, so empty Java diagnostics are not compiler-certified. The106 repeat
+retains all expectations and raises only the existing readiness wait, to test
+post-readiness semantics; this cannot qualify speed. It is currently running.
+
+Readiness investigation confirms corpus timing waits for all libraries, while
+product completion has no equivalent global barrier. The Gradle105 canonical
+completion itself takes7.075ms after indexing; this does not establish earliest
+usefulness. Existing FIRST_USE can measure that separately and warms caches;
+no new timing framework is required. See recovery89/readiness106/report.md.
+Reload/compiler-plugin cases, complete five-project validation and full speed
+acceptance remain unproved. The AP-only candidate is not adopted: independent
+review found missing original-copy input invalidation and a root-producer
+read-set contradiction (processor-ap106-rebase1/review-blockers.json).
 
 The requested test-efficiency audit found build work dominates the inspected
 five runs (about344.5s build versus22.4s tests). The inner loop now selects the

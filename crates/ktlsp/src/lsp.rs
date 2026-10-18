@@ -2144,8 +2144,8 @@ fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
             "*.gradle",
             "*.gradle.kts",
             "*.toml",
-            "gradle.properties",
-            "gradle-wrapper.properties",
+            "*gradle.properties",
+            "*gradle-wrapper.properties",
         ],
     )
     .unwrap_or_else(|| {
@@ -7374,6 +7374,43 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
     #[tokio::test]
     async fn watched_file_bursts_coalesce_and_active_refreshes_remain_singleflight() {
         let root = gradle_import_request_fixture("refresh-scheduler");
+        let nested = root.join("included");
+        let configuration_files = [
+            root.join("gradle.properties"),
+            root.join("gradle/wrapper/gradle-wrapper.properties"),
+            nested.join("gradle.properties"),
+            nested.join("gradle/wrapper/gradle-wrapper.properties"),
+        ];
+        for file in &configuration_files {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "baseline=true\n").unwrap();
+        }
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["add", "--", "."])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let root_contents = configuration_contents(&root);
+        let nested_contents = configuration_contents(&nested);
+        for file in &configuration_files {
+            let key = crate::paths::file_key(file);
+            assert!(
+                root_contents.contains_key(&key),
+                "missing Git baseline: {key}"
+            );
+            assert_eq!(
+                nested_contents.contains_key(&key),
+                file.starts_with(&nested),
+                "Git subroot baseline must stay scoped: {key}"
+            );
+        }
         let dump = format!(
             "PROJECT\t:app\t{}\nCP\t{}\nEND\t:app\n",
             root.display(),
@@ -7408,10 +7445,12 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             .await
             .unwrap();
         let event = || DidChangeWatchedFilesParams {
-            changes: vec![FileEvent::new(
-                Uri::from_file_path(root.join("build.gradle.kts")).unwrap(),
-                FileChangeType::CHANGED,
-            )],
+            changes: std::iter::once(root.join("build.gradle.kts"))
+                .chain(configuration_files.iter().cloned())
+                .map(|file| {
+                    FileEvent::new(Uri::from_file_path(file).unwrap(), FileChangeType::CHANGED)
+                })
+                .collect(),
         };
         backend.initialized(InitializedParams {}).await;
         let invocations = || {
