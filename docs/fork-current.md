@@ -6,7 +6,7 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest104: current source and native validation
+## Latest105: current source and native validation
 
 The full101 workspace run compiled and returned1,672 passed/three failed/seven
 ignored. Two failures exposed Java lookup of ordinary Kotlin properties versus
@@ -92,17 +92,28 @@ native-integrated105-1/bin/ktlsp.exe, SHA256
 260238804c6df8b40ea8c88db4c03fdd538b80d38b9bd342f4382998cb29333e.
 Build evidence: native-integrated105-1/receipt.json SHA256
 20112a894c5a3a29c2b1d710a090b7c31a7d062858dad45b36938a80c4231405.
-The same original Gradle9 run is active on105. Its first model generation
-converges (194 modules, model load83.066s); no refresh cancellation is observed.
-So far actual notifications cover lockfiles, not the original unchanged build
-files, so this alone does not prove the deduplication path was exercised. Useful
-first responses remain unverified. Evidence of the original failure:
+The unchanged original Gradle9 cases now all have qualified first
+responses on105:9 matched, zero mismatched/unmeasured/unqualified, one attempt
+each. Both ordinary and incomplete-code sessions converge in generation1
+(194 modules, initial model load83.066s), without refresh cancellation. Captured
+notifications cover lockfiles rather than unchanged build configurations, so
+this runtime alone does not prove the deduplication branch was exercised.
+The ordinary session still fails graceful shutdown after15s and is terminated
+by the client; its three semantic successes are retained separately from that
+lifecycle failure. The incomplete session exits cleanly. Both owned Jobs close
+with zero live/residual processes. Root verified10 semantic artifact references,
+the direct receipt's four references and11 current input guards. Evidence:
+recovery89/corpus90/native-five-gradle-editor105-1/semantic-receipt.json SHA256
+f1dab7a856bc277065e3ef5c54efbf15e88277ef16c6a9cdf90c403bcc265b15.
+Direct receipt SHA256
+d71f1c07b58e269f053d3ca5c37647260fc8b3d97da225c1d611231ff9006a38.
+Evidence of the original startup cancellation failure:
 recovery89/corpus90/native-five-gradle-editor104-2/startup-watch-classification.json.
 Focused receipt: recovery89/watch-refresh105-focus2/receipt.json SHA256
 b71b952c1c9c936fc5644b22fa0063a976c53c0b94ad086ada0328945725f23e.
 The remaining four-project rerun, reload/compiler-plugin cases and full speed
 acceptance remain unproved. Implementation through this slice is pushed as
-87c0787e9c49ffb74e572f5721af78c7e51dcfcf.
+13dd759d73a21c5e35d94f16308d6250bc8b92d7.
 
 The requested test-efficiency audit found build work dominates the inspected
 five runs (about344.5s build versus22.4s tests). The inner loop now selects the
