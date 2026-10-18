@@ -15,6 +15,10 @@ use tracing_subscriber::EnvFilter;
 
 use ktlsp::lsp::Backend;
 
+#[cfg(windows)]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(unix)]
 struct FlamegraphProfiler {
     path: PathBuf,

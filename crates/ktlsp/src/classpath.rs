@@ -2482,24 +2482,41 @@ fn log_unresolved(modules: &[ModuleClasspath]) {
 }
 
 fn create_dump_script() -> anyhow::Result<PathBuf> {
+    cached_dump_script(&crate::deps::cache_home().join("classpath"), INIT_SCRIPT)
+}
+
+fn cached_dump_script(directory: &Path, contents: &str) -> anyhow::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let directory = directory.join(format!("init-{:x}", Sha256::digest(contents.as_bytes())));
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("ktlsp-classpath.init.gradle.kts");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            anyhow::ensure!(
+                bytes == contents.as_bytes(),
+                "cached Gradle init script differs"
+            );
+            return Ok(path);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "ktlsp-classpath-{}-{nonce}-{sequence}.init.gradle.kts",
-        std::process::id()
-    ));
+    let tmp = path.with_extension(format!("kts.{}.{sequence}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)?;
-    if let Err(error) = file.write_all(INIT_SCRIPT.as_bytes()) {
-        drop(file);
-        let _ = std::fs::remove_file(&path);
-        return Err(error.into());
-    }
+        .open(&tmp)?;
+    let write_result = file.write_all(contents.as_bytes());
+    drop(file);
+    let _cleanup = TempFile(&tmp);
+    write_result?;
+    // Windows may have a concurrent complete winner; never truncate a published script.
+    let published = std::fs::rename(&tmp, &path);
+    anyhow::ensure!(
+        std::fs::read(&path)? == contents.as_bytes(),
+        "cached Gradle init script publication differs: {published:?}"
+    );
     Ok(path)
 }
 
@@ -2531,9 +2548,8 @@ fn run_dump_cancellable(
         "gradlew"
     }))
     .map_err(|_| anyhow::anyhow!("no gradle wrapper under {}", gradle.display()))?;
-    // Write the embedded init script to a temp file (avoids depending on ktlsp's install layout).
+    // Keep the content-addressed script for Gradle Kotlin DSL compilation reuse.
     let script = create_dump_script()?;
-    let _guard = TempFile(&script);
 
     let mut command = Command::new(&gradlew);
     command
@@ -4515,31 +4531,44 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn source_queries_use_independent_complete_init_scripts() {
+    fn source_queries_share_complete_content_addressed_init_scripts() {
+        let directory = std::env::temp_dir().join(format!(
+            "ktlsp-init-cache-{}-{}",
+            std::process::id(),
+            CACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
         let threads: Vec<_> = (0..8)
-            .map(|_| std::thread::spawn(create_dump_script))
+            .map(|_| {
+                let directory = directory.clone();
+                std::thread::spawn(move || cached_dump_script(&directory, INIT_SCRIPT))
+            })
             .collect();
         let scripts: Vec<_> = threads
             .into_iter()
             .map(|thread| thread.join().unwrap().unwrap())
             .collect();
+        assert_eq!(scripts.iter().collect::<BTreeSet<_>>().len(), 1);
+        assert_eq!(std::fs::read(&scripts[0]).unwrap(), INIT_SCRIPT.as_bytes());
         assert_eq!(
-            scripts
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            8
+            cached_dump_script(&directory, INIT_SCRIPT).unwrap(),
+            scripts[0]
         );
-        for script in &scripts {
-            assert_eq!(std::fs::read(script).unwrap(), INIT_SCRIPT.as_bytes());
+        let changed = cached_dump_script(&directory, "different current init script").unwrap();
+        assert_ne!(changed, scripts[0]);
+        assert_eq!(
+            std::fs::read(&changed).unwrap(),
+            b"different current init script"
+        );
+        std::fs::write(&scripts[0], "corrupt").unwrap();
+        assert!(cached_dump_script(&directory, INIT_SCRIPT).is_err());
+        assert_eq!(std::fs::read(&scripts[0]).unwrap(), b"corrupt");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        for version in std::fs::read_dir(&directory).unwrap() {
+            let version = version.unwrap();
+            assert!(version.file_type().unwrap().is_dir());
+            assert_eq!(std::fs::read_dir(version.path()).unwrap().count(), 1);
         }
-        let first = TempFile(&scripts[0]);
-        drop(first);
-        assert!(!scripts[0].exists());
-        for script in scripts.iter().skip(1) {
-            assert_eq!(std::fs::read(script).unwrap(), INIT_SCRIPT.as_bytes());
-            std::fs::remove_file(script).unwrap();
-        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
