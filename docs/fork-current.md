@@ -6,6 +6,69 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
+## Current93 verification in progress
+
+The narrow SDK21/target17 InProcess compiler profile now passes the40-test
+compiler group after its new captured-profile regression first failed. Other
+execution strategies and opaque daemon arguments remain rejected. This is not
+yet a passing native CEM reload86 run.
+
+Source enrichment now compares unique modules by build/project identity while
+preserving every other model fact and all inner ordering. The four source-snapshot
+tests and the retained actual194-module pair pass after reproducing the failure
+before the fix. Duplicate identities and binary/compiler/build-file drift remain
+rejected. A fresh normal Gradle import with this binary is still unrun.
+
+The Gradle exporter reuses its securely configured XML factory while reading
+fresh bounded POM bytes and creating a new builder per document. Extracted actual
+exporter checks cover37 real POMs and14 invalid/security/fresh-byte cases. Nine
+paired warm333-call samples improve the median from360.595ms to229.405ms; these
+are function measurements, not whole-project startup or p95 acceptance.
+
+Five optional startup trace types attribute JDK planning/parsing/cache-store/
+publication and jar resolution. Three focused LSP tests pass; a target-project
+startup comparison has not been collected. Formatting and the complete93 workspace
+suite pass:1,616 passed/zero failed/five ignored across40 groups. Root verified
+the raw artifact hash, counts, exit0/EOF/live0/residual0 and438.578s closure.
+The additional ignored case is the separately passing retained194-module
+source-order replay. Workspace receipt: native-integrated93-1/workspace-receipt.json,
+SHA2567dfb9d017a57aa496aa11f447d6ec14efacf326c2a6517bacc66a2b63151f394.
+Release93 also passes (431.187s build observation). Root verified all311 current
+build-input hashes, five artifact refs and the immutable19,691,008-byte copy:
+native-integrated93-1/bin/ktlsp.exe SHA256
+0a85b4e1a09af2865a3f67c51612e8bdb011485aa2e8e1bdee69d124e3d433d3.
+Main receipt: native-integrated93-1/main-ready.json SHA256
+d88784cd4250f943ba957277a7b544400c5cbc7c73dc5a68b5e497c9ecb6d334.
+Actual Neovim basic and semantic harness runs on this copy return exit0/ALL PASS:
+nine and137 assertions respectively, not146 independent requests. The semantic
+run verifies graceful shutdown; basic reports its forced client cleanup. Evidence:
+root-native93-{basic,semantic}/artifacts/{summary.txt,basic.out,semantic.out},
+using each scenario's matching output file. Runs overlap other work and do not
+establish latency distributions. The separate owned Java harness passes367
+assertions and its graceful-shutdown check on the same copy; Root verified all28
+bound artifact refs. Receipt: recovery89/cem90/editor-smoke93-1/receipt.json,
+SHA25607bda16e8cfde90f79f40e503a4cd32bf51c3b31e35fce18e3aadd8bc596bc05.
+That existing Java trace emits all five new span types (plan1, parse-shard8,
+symcache-store1, publication1, jar-resolution1); no extra measurement run was
+required. External-extension tests also pass4/4; its release build is still
+running with the single Cargo owner and CARGO_BUILD_JOBS=1.
+Focused evidence: recovery89/cem90/focus93-summary.json,
+SHA256e6ead20f7b26748be641fa5826b868b750d78c7cac53224ef8921e8590a0a439.
+
+The processor114 failures are now bound to an absent current Java diagnostic
+store: the active KAPT/KSP bridge was not admitted, rather than a compiler run
+certifying the obsolete calls. An independent compiler control produces all
+three expected missing-method errors. Current processor-input/output ownership
+is still missing; saved generated files alone must not qualify dirty inputs.
+
+The genuine external-library run passed20 new source-navigation/descriptor/
+diagnostic checks but retained a baseline binding failure. Closed trace comparison
+shows that failing completion finished before the selected Shadow.java source
+was materialized; the first responses succeed in a separate warm diagnostic run.
+The scoped unit regression passes and does not reproduce this readiness race.
+No production fix or stable acceptance is claimed. Exact hydration publication
+timing is not traced. Evidence: recovery89/extension93-closed-readiness-comparison.json.
+
 ## Verified91 baseline
 
 The coherent native-integrated91-1 workspace
@@ -63,7 +126,13 @@ Receipt: native-integrated92-3/receipt.json SHA256
 9eb5d983ef3ce9ff705fc8df61a769d96ce9162be08e29d49ac56cf81606fe1a;
 bin/ktlsp.exe SHA256
 442fe755ae952a706f6558ceb51e8b9e95d5b2d7a0a3e9798f16e2d01de8b726.
-Actual unchanged native32 validation now uses this copy; it remains pending.
+Actual unchanged native32 validation now passes32/32 on this copy, including both
+previous Java recovery failures. Root verified all four receipt artifact refs,
+the24 ordinary first-response records and eight bound raw extra responses. This
+is one correctness run, not a performance distribution. Evidence:
+binary-generic92-native-editor/receipt.json SHA256
+83e3d5c941e6248aa791bb7405ecb675a9b72b156d0ada11c0c215c972cd83f8;
+report SHA2568f783b00d637230e02d1733232308ec7b313974221ebe57c8e82128cc125c9f2.
 
 The initial92 full suite closed with1,611 passed/one failed/four ignored across40
 groups; Root verified both raw hashes, counts and clean subprocess closure.
@@ -100,8 +169,17 @@ the same roles as the91 baseline; no passing total includes them.
   fe4757b9b2d220d2e3ba49dd248beb67bba82e31fb45dfaf6d6953c366cc711d.
   The source-enrichment query completes normally but its model-consistency check
   rejects the result. Read-only comparison finds identical module facts/compiler
-  records/build mtimes and only differing outer PROJECT order; the focused Rust
-  replay/fix is pending. Actual KAPT/KSP114 editor validation has started.
+  records/build mtimes and only differing outer PROJECT order. Test-only Rust
+  execution now reproduces the failure on both a small case and the actual194
+  module pair; the93 production fix and focused green checks are recorded above.
+  Actual KAPT/KSP114 validation closes with111 passed/three measured failures.
+  The failures are missing Java diagnostics for obsolete generated APIs from
+  KspKotlin, KspJava and KaptJava. Compiler generation/builds, source navigation,
+  disabled/restored states and dirty Kotlin completion are exercised separately;
+  no complete plugin acceptance follows from111 passing assertions. The exact
+  Java accepted-store/bridge cause is bound in the93 findings above. Evidence:
+  recovery89/corpus90/native-processor114-editor91-1/receipt.json SHA256
+  bf6ad48e925bf3a66131a8933c81f163741572de809cf8ba7dc759e39c99d169.
 - The actual source-less generic fixture returned30/32 matching first responses:
   all original18 pass, with one mismatched and one unanswered extra. Both failures
   affect an earlier known-instance Java call when a later statement is unfinished.
@@ -112,7 +190,8 @@ the same roles as the91 baseline; no passing total includes them.
   hashes and clean closures: Java frontend27, member-selection65 and generic125
   pass (217 total). Evidence: binary-generic92-green2/receipt.json SHA256
   e2fc2e4cc46f2ef1da3d55a39acbe1f66e801bb2d906edc79d7f1a318ed50b97.
-  The new release passes; the unchanged native32 replay remains pending.
+  The new release and unchanged native32 replay pass; the old30/32 failure is
+  retained for comparison rather than relabeled successful.
 - Spring's actual91 unsaved-edit probe passes all16 first-attempt requests and17
   semantic assertions. Completion, exact navigation, references, applied rename,
   restored rename and API retraction are useful. Returned rename edits were
@@ -133,8 +212,9 @@ the same roles as the91 baseline; no passing total includes them.
   However, none of the three refreshed index generations finishes within the
   existing observation window. Stale completion/source-navigation responses are
   recorded as returned; they do not establish a failure after a ready generation.
-  Separately, the actual SDK21/in-process Kotlin profile is explicitly unsupported
-  by the Java header-diagnostic adapter. Do not retarget the SDK or increase the
+  Separately, the actual SDK21/in-process Kotlin profile was unsupported by that91
+  Java header-diagnostic adapter; the93 focused admission fix is recorded above.
+  Do not retarget the SDK or increase the
   window to hide either gap. Root verified19 referenced artifacts. Evidence:
   recovery89/cem90/gradle-reload91-summary.json SHA256
   47c611d4c82902ce48bd5356546fb213f826a5250e8cd4476575632abdc35865.

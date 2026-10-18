@@ -1942,6 +1942,12 @@ fn selected_k2_jdk21(request: &mut KotlinDiagnosticRequest) {
 // Actual unchanged generic fixture getter: SDK21, target17, default UTF8, seventeen API options.
 fn selected_captured_k2_jdk21_target17(request: &mut KotlinDiagnosticRequest) {
     selected_k2_jdk21(request);
+    request
+        .task
+        .kotlin_compiler
+        .as_mut()
+        .unwrap()
+        .execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::InProcess;
     let mut recipe = request
         .java_task
         .as_ref()
@@ -2071,7 +2077,7 @@ fn captured_gradle961_jdk21_target17_default_utf8_rejects_unproved_policies() {
                     .as_mut()
                     .unwrap()
                     .execution_strategy =
-                    crate::classpath::KotlinCompilerExecutionStrategy::InProcess
+                    crate::classpath::KotlinCompilerExecutionStrategy::OutOfProcess
             }
             _ => {
                 let mut recipe = request
@@ -2091,6 +2097,32 @@ fn captured_gradle961_jdk21_target17_default_utf8_rejects_unproved_policies() {
             }
         }
         assert!(configured_recipe(&request).is_err(), "{kind}");
+    }
+}
+
+#[test]
+fn captured_target17_retains_daemon_but_rejects_opaque_jvm_options_for_both_strategies() {
+    for strategy in [
+        crate::classpath::KotlinCompilerExecutionStrategy::InProcess,
+        crate::classpath::KotlinCompilerExecutionStrategy::Daemon,
+    ] {
+        let (_owner, mut request) = fixture();
+        selected_captured_k2_jdk21_target17(&mut request);
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .execution_strategy = strategy;
+        assert!(configured_recipe(&request).is_ok());
+        request
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .normalized_daemon_jvm_arguments
+            .push("-Dopaque=true".into());
+        assert!(configured_recipe(&request).is_err());
     }
 }
 

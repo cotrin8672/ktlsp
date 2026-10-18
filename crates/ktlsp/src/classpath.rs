@@ -1575,20 +1575,26 @@ fn source_snapshot(
     modules: Vec<ModuleClasspath>,
 ) -> anyhow::Result<Arc<ProjectSnapshot>> {
     let without_sources = |modules: &[ModuleClasspath]| {
-        let mut modules = modules.to_vec();
-        for source in modules
-            .iter_mut()
-            .flat_map(|module| &mut module.source_sets)
-        {
-            source.source_artifacts = None;
-            source.source_artifacts_incomplete = false;
-            source.source_poms = None;
-            source.source_poms_incomplete = false;
+        let mut by_identity = BTreeMap::new();
+        for mut module in modules.to_vec() {
+            for source in &mut module.source_sets {
+                source.source_artifacts = None;
+                source.source_artifacts_incomplete = false;
+                source.source_poms = None;
+                source.source_poms_incomplete = false;
+            }
+            // Parallel Gradle tasks may emit complete modules in a different order. A project
+            // path belongs to its build; preserve every other fact and every inner ordering.
+            let identity = (module.build.clone(), module.module.clone());
+            anyhow::ensure!(
+                by_identity.insert(identity, module).is_none(),
+                "Duplicate Gradle module identity during source resolution"
+            );
         }
-        modules
+        Ok::<_, anyhow::Error>(by_identity)
     };
     anyhow::ensure!(
-        without_sources(&modules) == without_sources(&accepted.modules)
+        without_sources(&modules)? == without_sources(&accepted.modules)?
             && accepted.mtimes == build_file_mtimes(root, &accepted.modules),
         "Gradle model changed during source resolution"
     );
@@ -3281,6 +3287,213 @@ mod tests {
             "MODEL14 remains valid before enrichment"
         );
         assert!(!previous.source_artifacts_incomplete);
+    }
+
+    fn source_snapshot_order_fixture() -> (PathBuf, ProjectSnapshot, Vec<ModuleClasspath>) {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-source-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let compiler = serde_json::json!({
+            "task": ":app:compileJava", "language": "java",
+            "task_type": "org.gradle.api.tasks.compile.JavaCompile",
+            "arguments": ["-g", "-parameters"], "annotation_processor_path": [],
+            "java_home": "/jdk", "options": {"release": 8},
+            "output_roots": [], "complete": true, "problem": null
+        });
+        let dump = format!(
+            "PROJECT\t:app\t/repo/app\nCP\t/jars/a.jar\nCP\t/jars/b.jar\n\
+             SOURCESET\tmain\nSCP\tmain\t/jars/a.jar\nSCP\tmain\t/jars/b.jar\n\
+             ARTIFACT\tmain\t/jars/api.jar\tMODULE\tvendor\tapi\t1\n\
+             COMPILER\tmain\t{compiler}\nSOURCESET\ttest\nEND\t:app\n\
+             PROJECT\t:lib\t/repo/lib\nSOURCESET\tmain\nEND\t:lib\n"
+        );
+        let modules = parse_dump_reader(dump.as_bytes(), true).unwrap();
+        assert_eq!(modules.len(), 2);
+        let mut accepted = ProjectSnapshot::new(modules.clone());
+        accepted.mtimes = build_file_mtimes(&root, &accepted.modules);
+        let mut queried = modules;
+        for source in queried
+            .iter_mut()
+            .flat_map(|module| &mut module.source_sets)
+        {
+            source.source_artifacts = Some(Vec::new());
+            source.source_poms = Some(Vec::new());
+        }
+        queried[0].source_sets[0].source_artifacts = Some(vec![ResolvedArtifact {
+            path: PathBuf::from("/sources/api-sources.jar"),
+            component: ComponentId::Module {
+                group: "vendor".into(),
+                name: "api".into(),
+                version: "1".into(),
+            },
+        }]);
+        (root, accepted, queried)
+    }
+
+    #[test]
+    fn source_snapshot_accepts_unique_reordered_modules_and_retains_sources() {
+        let (root, accepted, mut queried) = source_snapshot_order_fixture();
+        queried.reverse();
+        let enriched = source_snapshot(&root, &accepted, queried.clone()).unwrap();
+        assert!(accepted.source_enrichment_needed());
+        assert!(!enriched.source_enrichment_needed());
+        assert_eq!(
+            enriched.modules, queried,
+            "keep returned order and exact enriched facts"
+        );
+        assert_eq!(enriched.modules[0].module, ":lib");
+        assert_eq!(
+            enriched.modules[1].source_sets[0]
+                .source_artifacts
+                .as_ref()
+                .unwrap()[0]
+                .path,
+            PathBuf::from("/sources/api-sources.jar")
+        );
+
+        // A project path is scoped to its Gradle build; these identities are distinct.
+        let mut modules = accepted.modules.clone();
+        modules[1].module = modules[0].module.clone();
+        modules[1].build = ":included".into();
+        let mut accepted = ProjectSnapshot::new(modules.clone());
+        accepted.mtimes = build_file_mtimes(&root, &accepted.modules);
+        modules.reverse();
+        assert!(source_snapshot(&root, &accepted, modules).is_ok());
+    }
+
+    #[test]
+    fn source_snapshot_reordered_modules_reject_binary_drift_and_duplicate_identities() {
+        let (root, accepted, queried) = source_snapshot_order_fixture();
+        let changes: [(&str, fn(&mut [ModuleClasspath])); 7] = [
+            ("module directory", |modules| {
+                modules[0].project_dir = PathBuf::from("/changed")
+            }),
+            ("module identity", |modules| {
+                modules[0].build = ":other".into()
+            }),
+            ("compiler arguments order", |modules| {
+                modules[0].source_sets[0].compiler_tasks[0]
+                    .arguments
+                    .swap(0, 1)
+            }),
+            ("compiler options", |modules| {
+                modules[0].source_sets[0].compiler_tasks[0]
+                    .options
+                    .insert("release".into(), serde_json::json!(9));
+            }),
+            ("source classpath order", |modules| {
+                modules[0].source_sets[0].entries.swap(0, 1)
+            }),
+            ("module classpath order", |modules| {
+                modules[0].entries.swap(0, 1)
+            }),
+            ("source set order", |modules| {
+                modules[0].source_sets.swap(0, 1)
+            }),
+        ];
+        for (label, change) in changes {
+            let mut changed = queried.clone();
+            change(&mut changed);
+            changed.reverse();
+            assert!(
+                source_snapshot(&root, &accepted, changed).is_err(),
+                "{label}"
+            );
+        }
+
+        // Both sides duplicated identically would be silently accepted by collect-to-map.
+        for same_directory in [true, false] {
+            let mut duplicated = vec![queried[0].clone(), queried[0].clone()];
+            if !same_directory {
+                duplicated[1].project_dir = PathBuf::from("/repo/duplicate-app");
+            }
+            let mut duplicate_accepted = ProjectSnapshot::new(duplicated.clone());
+            duplicate_accepted.mtimes = build_file_mtimes(&root, &duplicate_accepted.modules);
+            assert!(source_snapshot(&root, &duplicate_accepted, duplicated.clone()).is_err());
+            assert!(source_snapshot(&root, &accepted, duplicated).is_err());
+        }
+    }
+
+    #[test]
+    fn source_snapshot_reordered_modules_reject_changed_build_file_mtime() {
+        let (root, mut accepted, mut queried) = source_snapshot_order_fixture();
+        std::fs::create_dir(&root).unwrap();
+        let build = root.join("build.gradle.kts");
+        std::fs::write(&build, "// source snapshot build input\n").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&build)
+            .unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        accepted.mtimes = build_file_mtimes(&root, &accepted.modules);
+        queried.reverse();
+        assert!(source_snapshot(&root, &accepted, queried.clone()).is_ok());
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert!(source_snapshot(&root, &accepted, queried).is_err());
+        drop(file);
+        std::fs::remove_file(build).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "local real paired Gradle protocol replay; requires KTLSP_CLOSED_GRADLE_INITIAL_PROTOCOL, KTLSP_CLOSED_GRADLE_SOURCES_PROTOCOL and KTLSP_CLOSED_GRADLE_ROOT"]
+    fn retained_gradle_8142_source_query_reordering_preserves_binary_model() {
+        let parse = |name| {
+            let file = std::fs::File::open(std::env::var_os(name).expect("retained protocol path"))
+                .unwrap();
+            parse_dump_reader(BufReader::new(file), true).unwrap()
+        };
+        let initial = parse("KTLSP_CLOSED_GRADLE_INITIAL_PROTOCOL");
+        let queried = parse("KTLSP_CLOSED_GRADLE_SOURCES_PROTOCOL");
+        assert_eq!(initial.len(), 194);
+        assert_eq!(queried.len(), 194);
+        let identities = |modules: &[ModuleClasspath]| {
+            modules
+                .iter()
+                .map(|module| (module.build.clone(), module.module.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            identities(&initial),
+            identities(&queried),
+            "retain actual completion-order change"
+        );
+        let root = PathBuf::from(
+            std::env::var_os("KTLSP_CLOSED_GRADLE_ROOT").expect("actual pinned root"),
+        );
+        let mut accepted = ProjectSnapshot::new(initial);
+        accepted.mtimes = build_file_mtimes(&root, &accepted.modules);
+        let enriched = source_snapshot(&root, &accepted, queried)
+            .expect("only outer order and source/POM facts differ");
+        let sources = enriched
+            .modules
+            .iter()
+            .flat_map(|module| &module.source_sets)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.source_artifacts.as_ref().unwrap().len())
+                .sum::<usize>(),
+            49_390
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.source_poms.as_ref().unwrap().len())
+                .sum::<usize>(),
+            72_307
+        );
     }
 
     #[test]

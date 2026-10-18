@@ -486,6 +486,7 @@ fn spawn_jdk_shard_workers(
     plan: crate::deps::JdkParsePlan,
     origin: String,
     shards: usize,
+    generation: u64,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) -> usize {
     let mut spawned = 0;
@@ -501,6 +502,7 @@ fn spawn_jdk_shard_workers(
                 use crate::java::JavaParser;
                 use crate::parser::KotlinParser;
 
+                let resolve_started = crate::trace::enabled().then(Instant::now);
                 let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
@@ -536,6 +538,14 @@ fn spawn_jdk_shard_workers(
                         }
                     }
                 };
+                if let Some(started) = resolve_started {
+                    crate::trace::span(
+                        "deps.jdk_parse_shard",
+                        "deps",
+                        started,
+                        serde_json::json!({"generation":generation, "origin":result.local_origin.as_deref(), "shard":shard, "shards":shards, "files":result.batches.len(), "failed":result.failed}),
+                    );
+                }
                 let _ = tx.send(result);
             })
             .is_ok();
@@ -574,6 +584,7 @@ fn spawn_local_jar_index_worker(
     jar_path: std::path::PathBuf,
     origin_id: String,
     extract_root: std::path::PathBuf,
+    generation: u64,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let label = jar_path
@@ -590,6 +601,7 @@ fn spawn_local_jar_index_worker(
             use crate::java::JavaParser;
             use crate::parser::KotlinParser;
 
+            let resolve_started = crate::trace::enabled().then(Instant::now);
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut kotlin = KotlinParser::new();
                 let mut java = JavaParser::new();
@@ -634,6 +646,14 @@ fn spawn_local_jar_index_worker(
                     }
                 }
             };
+            if let Some(started) = resolve_started {
+                crate::trace::span(
+                    "deps.jar_resolve",
+                    "deps",
+                    started,
+                    serde_json::json!({"generation":generation, "label":&result.label, "origin":result.local_origin.as_deref(), "local":true, "binary_only":true, "files":result.batches.len(), "failed":result.failed}),
+                );
+            }
             let _ = tx.send(result);
         });
 }
@@ -665,6 +685,7 @@ fn spawn_coordinate_index_worker(
     selected_binaries: Vec<(std::path::PathBuf, String)>,
     model: Option<Arc<classpath::ProjectSnapshot>>,
     binary_only: bool,
+    generation: u64,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
@@ -677,6 +698,7 @@ fn spawn_coordinate_index_worker(
             use crate::parser::KotlinParser;
 
             let label = coord.label();
+            let resolve_started = crate::trace::enabled().then(Instant::now);
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let (source, source_failed) = if binary_only {
                     (None, false)
@@ -806,6 +828,14 @@ fn spawn_coordinate_index_worker(
                     local_origin: None,
                 },
             };
+            if let Some(started) = resolve_started {
+                crate::trace::span(
+                    "deps.jar_resolve",
+                    "deps",
+                    started,
+                    serde_json::json!({"generation":generation, "label":&result.label, "local":false, "binary_only":binary_only, "files":result.batches.len(), "failed":result.failed, "skipped":result.skipped}),
+                );
+            }
             let _ = tx.send(result);
         });
 }
@@ -1017,7 +1047,18 @@ fn index_dependency_model(
             serde_json::json!({"generation":generation, "archive":source, "origin":origin, "authoritative":authoritative}),
         );
         if !ws.lock().dependency_origin_complete(origin) {
-            if let Some(plan) = deps::plan_jdk_index(&source, &extract_root) {
+            let plan_started = crate::trace::enabled().then(Instant::now);
+            let plan = deps::plan_jdk_index(&source, &extract_root);
+            if let Some(started) = plan_started {
+                crate::trace::span(
+                    "deps.jdk_plan",
+                    "deps",
+                    started,
+                    serde_json::json!({"generation":generation, "origin":origin, "available":plan.is_some(),
+                        "cached":matches!(&plan, Some(deps::JdkIndexPlan::Cached(_)))}),
+                );
+            }
+            if let Some(plan) = plan {
                 jdk_pending.push_back((origin.clone(), plan));
             }
         }
@@ -1056,6 +1097,7 @@ fn index_dependency_model(
                             plan.clone(),
                             origin.clone(),
                             jdk_shards,
+                            generation,
                             tx.clone(),
                         );
                         if spawned < jdk_shards {
@@ -1098,7 +1140,13 @@ fn index_dependency_model(
                     stats.reused_local_jars += 1;
                     continue;
                 }
-                spawn_local_jar_index_worker(jar_path, origin_id, extract_root.clone(), tx.clone());
+                spawn_local_jar_index_worker(
+                    jar_path,
+                    origin_id,
+                    extract_root.clone(),
+                    generation,
+                    tx.clone(),
+                );
                 active += 1;
                 continue;
             }
@@ -1162,6 +1210,7 @@ fn index_dependency_model(
                     .unwrap_or_default(),
                 model.clone(),
                 binary_only,
+                generation,
                 tx.clone(),
             );
             active += 1;
@@ -1195,8 +1244,21 @@ fn index_dependency_model(
             if state.pending == 0 {
                 let mut state = jdk_states.remove(origin).unwrap();
                 if !state.failed {
+                    let store_started = crate::trace::enabled().then(Instant::now);
                     deps::store_jdk_symcache(&state.plan, &state.batches);
+                    if let Some(started) = store_started {
+                        crate::trace::span(
+                            "deps.jdk_symcache_store",
+                            "deps",
+                            started,
+                            serde_json::json!({"generation":generation, "origin":origin,
+                                "files":state.batches.len(), "attempted":true}),
+                        );
+                    }
                 }
+                let publish_started = crate::trace::enabled().then(Instant::now);
+                let expected_files = state.batches.len();
+                let previous_jdk_files = stats.jdk_files;
                 for batch in state.batches.drain(..) {
                     let mut guard = ws.lock();
                     if !guard.is_current_generation(generation) {
@@ -1209,12 +1271,25 @@ fn index_dependency_model(
                     guard.index_dependency_batch_for_generation(generation, batch);
                     stats.files += 1;
                 }
-                let mut guard = ws.lock();
-                if guard.is_current_generation(generation) {
-                    guard.bump_index_revision();
-                    if !state.failed {
-                        guard.complete_dependency_origin(origin.clone());
+                {
+                    let mut guard = ws.lock();
+                    if guard.is_current_generation(generation) {
+                        guard.bump_index_revision();
+                        if !state.failed {
+                            guard.complete_dependency_origin(origin.clone());
+                        }
                     }
+                }
+                if let Some(started) = publish_started {
+                    crate::trace::span(
+                        "deps.jdk_publish",
+                        "deps",
+                        started,
+                        serde_json::json!({"generation":generation, "origin":origin,
+                            "expected_files":expected_files, "attempted_files":stats.jdk_files - previous_jdk_files,
+                            "skipped_generation_files":expected_files - (stats.jdk_files - previous_jdk_files),
+                            "parse_failed":state.failed}),
+                    );
                 }
             }
             continue;
@@ -4774,6 +4849,7 @@ mod tests {
                     binary.clone(),
                     classpath::file_origin_id(&binary),
                     root.join("extracted"),
+                    1,
                     tx,
                 );
                 let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4847,6 +4923,7 @@ mod tests {
                     vec![(binary.clone(), classpath::file_origin_id(&binary))],
                     None,
                     false,
+                    1,
                     tx,
                 );
                 rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -4953,6 +5030,7 @@ mod tests {
                 binaries,
                 None,
                 false,
+                1,
                 tx,
             );
             rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -5026,6 +5104,7 @@ mod tests {
                     binary.clone(),
                     classpath::file_origin_id(&binary),
                     root.join("local-extracted"),
+                    1,
                     tx,
                 );
                 let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5052,6 +5131,7 @@ mod tests {
                     )],
                     None,
                     false,
+                    1,
                     tx,
                 );
                 let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5140,6 +5220,7 @@ mod tests {
                         vec![(binary.clone(), classpath::file_origin_id(&binary))],
                         None,
                         false,
+                        1,
                         tx,
                     );
                     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5155,6 +5236,7 @@ mod tests {
                         binary.clone(),
                         classpath::file_origin_id(&binary),
                         root.join("local-extracted"),
+                        1,
                         tx,
                     );
                     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5240,6 +5322,7 @@ mod tests {
                 binaries,
                 None,
                 false,
+                1,
                 tx,
             );
             rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -5510,6 +5593,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 },
                 None,
                 false,
+                1,
                 tx,
             );
             let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5552,7 +5636,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         };
         let (tx, rx) = std::sync::mpsc::channel();
         assert_eq!(
-            spawn_jdk_shard_workers(plan, classpath::jdk_origin_id(&jar), 1, tx),
+            spawn_jdk_shard_workers(plan, classpath::jdk_origin_id(&jar), 1, 1, tx),
             1
         );
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5602,6 +5686,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 jar.clone(),
                 classpath::file_origin_id(&jar),
                 root.join("extracted"),
+                1,
                 tx,
             );
             let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();

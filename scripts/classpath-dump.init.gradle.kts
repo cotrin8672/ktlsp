@@ -683,8 +683,7 @@ class KtlspDumpClasspathAction(
             sourceModules[sourceSet.name] = seen.filterIsInstance<ModuleComponentIdentifier>().toSet()
         }
         if (task.name == "ktlspDumpSources") {
-            fun parentCoordinate(file: java.io.File): Triple<String, String, String>? {
-                require(file.length() in 1..(1L shl 20))
+            val parentXmlFactory by lazy {
                 val factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
                 factory.isNamespaceAware = true
                 factory.setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true)
@@ -696,7 +695,11 @@ class KtlspDumpClasspathAction(
                 // Older Gradle XML APIs lack these constants; the JAXP property names are stable.
                 factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalDTD", "")
                 factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalSchema", "")
-                val builder = factory.newDocumentBuilder()
+                factory
+            }
+            fun parentCoordinate(file: java.io.File): Triple<String, String, String>? {
+                require(file.length() in 1..(1L shl 20))
+                val builder = parentXmlFactory.newDocumentBuilder()
                 builder.setErrorHandler(org.xml.sax.helpers.DefaultHandler())
                 val bytes = file.inputStream().use { it.readNBytes((1 shl 20) + 1) }
                 require(bytes.size <= (1 shl 20))

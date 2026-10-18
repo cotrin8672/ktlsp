@@ -965,6 +965,9 @@ pub(super) fn configured_recipe(
                         "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
                             | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1",
                         crate::classpath::KotlinCompilerExecutionStrategy::Daemon
+                    ) | (
+                        "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1",
+                        crate::classpath::KotlinCompilerExecutionStrategy::InProcess
                     )
                 )))
             && kotlin.normalized_daemon_jvm_arguments.is_empty(),

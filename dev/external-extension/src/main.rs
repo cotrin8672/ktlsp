@@ -387,4 +387,105 @@ mod tests {
             .iter()
             .any(|target| target.file == "NominalTarget.java"));
     }
+
+    #[test]
+    fn scoped_closed_project_target_binds_after_open_consumer_precedes_model() {
+        use std::sync::Mutex;
+        struct ObservedProvider(Arc<Mutex<Vec<String>>>);
+        impl AnalysisProvider for ObservedProvider {
+            fn id(&self) -> &str {
+                PROVIDER
+            }
+            fn analyze(&self, read: &mut ReadSession<'_>) -> Result<(), ContractError> {
+                if read.source().contains("class CaseMixin") {
+                    let mut notes =
+                        vec![format!("target={:?}", read.resolve_type("fixture.Target"))];
+                    for declaration in read.declarations().to_vec() {
+                        for annotation in declaration.annotations {
+                            notes.push(format!(
+                                "annotation {:?} => {:?}",
+                                annotation.ty,
+                                read.resolve_type_ref(&annotation.ty)
+                            ));
+                            for argument in annotation.arguments {
+                                if let Knowledge::Found(AnnotationValue::Class(ty)) = argument.value
+                                {
+                                    notes.push(format!(
+                                        "literal {ty:?} => {:?}",
+                                        read.resolve_type_ref(&ty)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    *self.0.lock().unwrap() = notes;
+                }
+                ShadowProvider.analyze(read)
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-external-scoped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source_root = root.join("src/main/java");
+        for (relative, source) in [
+            (
+                "org/spongepowered/asm/mixin/Mixin.java",
+                include_str!("../project/org/spongepowered/asm/mixin/Mixin.java"),
+            ),
+            (
+                "org/spongepowered/asm/mixin/Shadow.java",
+                include_str!("../project/org/spongepowered/asm/mixin/Shadow.java"),
+            ),
+            (
+                "fixture/Target.java",
+                include_str!("../project/fixture/Target.java"),
+            ),
+            (
+                "fixture/CaseMixin.java",
+                include_str!("../project/fixture/CaseMixin.java"),
+            ),
+        ] {
+            let path = source_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let source = include_str!("../project/fixture/CaseMixin.java");
+        let consumer = ktlsp::paths::file_key(&source_root.join("fixture/CaseMixin.java"));
+        let target = ktlsp::paths::file_key(&source_root.join("fixture/Target.java"));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let mut workspace = ktlsp::workspace::Workspace::with_analysis_providers(vec![Arc::new(
+            ObservedProvider(observations.clone()),
+        )]);
+        // The editor opens its first buffer while the Gradle model is still pending.
+        workspace.set_project_model(Arc::new(ktlsp::classpath::ProjectSnapshot::new(Vec::new())));
+        workspace.open(&consumer, source.into());
+        let dump = format!(
+            "PROJECT\t:\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nEND\t:\n",
+            root.display(),
+            source_root.display()
+        );
+        workspace.set_project_model(Arc::new(ktlsp::classpath::ProjectSnapshot::new(
+            ktlsp::classpath::parse_dump(&dump),
+        )));
+        assert_eq!(
+            workspace.scan_model_sources(),
+            3,
+            "open consumer excluded from scan count"
+        );
+        workspace.set_library_index_complete(true);
+        workspace.set_jdk_index_complete(true);
+        workspace.bump_index_revision();
+        let targets = workspace.goto_definition(&consumer, source.find("shadow$twice").unwrap());
+        let diagnostics = workspace.diagnostics(&consumer);
+        let entries = workspace.index.lookup_type("Target");
+        let notes = observations.lock().unwrap().clone();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(targets.len() == 1 && targets[0].file == target,
+            "targets={targets:?}; entries={entries:?}; observations={notes:?}; diagnostics={diagnostics:?}");
+    }
 }
