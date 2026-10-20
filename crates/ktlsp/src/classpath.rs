@@ -154,6 +154,7 @@ impl CompilerTask {
                 "gradle-7.4.2-current-jdk17-javac-api-v1"
                     | "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
                     | "gradle-7.5-current-jdk17-utf8-javac-api-v1"
+                    | "gradle-8.10.2-current-jdk17-release17-javac-api-with-processors-v1"
                     | "gradle-9.6.1-current-jdk17-javac-api-v1",
                 "17"
             ) | ("gradle-9.6.1-current-jdk21-utf8-javac-api-v1", "21")

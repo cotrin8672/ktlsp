@@ -59,7 +59,13 @@ fn rebase<T: serde::Serialize + serde::de::DeserializeOwned>(
         }
     }
     let mut value = serde_json::to_value(value)?;
-    rewrite(&mut value, &path_text(original)?, &path_text(private)?);
+    let from = path_text(original)?;
+    let to = path_text(private)?;
+    // Preserve each captured spelling, rather than inserting a mixed-separator root into
+    // raw compiler/plugin strings. PathBuf equality alone cannot normalize those strings.
+    #[cfg(windows)]
+    let (from, to) = (from.replace('/', "\\"), to.replace('/', "\\"));
+    rewrite(&mut value, &from, &to);
     Ok(serde_json::from_value(value)?)
 }
 
@@ -398,11 +404,196 @@ fn generated_input(path: &Path, tasks: &Tasks) -> bool {
         .any(|root| path.starts_with(root))
 }
 
+// KAPT stubs are current task outputs, not authored main-source roots or editor API sources.
+fn current_generated_read(
+    plan: &Plan,
+    original: &Path,
+    fact: &Value,
+    produced: &BTreeMap<String, String>,
+) -> bool {
+    fact["kind"] == "file"
+        && generated_input(original, &plan.tasks)
+        && fact["path"].as_str().is_some_and(|path| {
+            produced
+                .get(&header_key(Path::new(path)))
+                .is_some_and(|digest| fact["sha256"] == *digest)
+        })
+}
+
 /// Preserve all compiler-affecting options and ordered classpaths. Membership is checked against
 /// the actual private current source selection and owned generated outputs, not the old saved tree.
+/// KSP observed this one future KAPT class slot as absent. The later closed KAPT task
+/// creates only an empty directory, so it cannot contribute a class to KSP's earlier lookup.
+fn empty_future_kapt_classes(
+    snapshot: &Snapshot,
+    plan: &Plan,
+    rows: &[Value],
+    start: &Value,
+    read: &Value,
+) -> bool {
+    if start["event"] != "processor-start"
+        || start["task"] != plan.tasks.ksp.task
+        || read["kind"] != "absent"
+    {
+        return false;
+    }
+    let Some(before) = start["sequence"].as_u64() else {
+        return false;
+    };
+    let Some(path) = read["path"].as_str().map(Path::new) else {
+        return false;
+    };
+    let Ok(owner) = project_path(&plan.owner.project_dir, &plan.root, &snapshot.root) else {
+        return false;
+    };
+    if !same_path(path, &owner.join("build/tmp/kapt3/classes/main"))
+        || ![
+            &plan.tasks.kapt.output_roots,
+            &plan.tasks.kapt.declared_output_roots,
+        ]
+        .iter()
+        .all(|roots| {
+            roots.iter().any(|root| {
+                project_path(root, &plan.root, &snapshot.root)
+                    .is_ok_and(|root| same_path(path, &root))
+            })
+        })
+    {
+        return false;
+    }
+    rows.iter()
+        .filter(|row| {
+            row["event"] == "processor-task-end"
+                && row["task"] == plan.tasks.kapt.task
+                && row["sequence"].as_u64().is_some_and(|end| end > before)
+                && successful_state(&row["state"]).is_ok()
+        })
+        .filter_map(|row| row["outputs"].as_array())
+        .flatten()
+        .any(|fact| {
+            fact["kind"] == "directory"
+                && fact["path"]
+                    .as_str()
+                    .is_some_and(|p| same_path(Path::new(p), path))
+                && fact["entries"].as_array().is_some_and(Vec::is_empty)
+                && inventory(path).is_ok_and(|current| current == *fact)
+        })
+}
+
+fn project_ksp_recipe(
+    current: &CompilerTask,
+    expected: &CompilerTask,
+    snapshot: &Snapshot,
+    plan: &Plan,
+    rows: &[Value],
+    start: &Value,
+) -> CompilerTask {
+    let mut recipe = current.clone();
+    if current.task == plan.tasks.ksp.task
+        && expected.task == current.task
+        && current.classpath.len() == expected.classpath.len() + 1
+        && current.classpath[..expected.classpath.len()] == expected.classpath
+        && start["inputs"].as_array().is_some_and(|reads| {
+            reads.iter().any(|read| {
+                read["path"]
+                    .as_str()
+                    .is_some_and(|p| same_path(Path::new(p), current.classpath.last().unwrap()))
+                    && empty_future_kapt_classes(snapshot, plan, rows, start, read)
+            })
+        })
+    {
+        // Comparison-only view. Retain the complete observed task/read set for execution and
+        // validate its one absent-to-owned-empty transition again at the read boundary.
+        recipe.classpath.pop();
+    }
+    recipe
+}
+
+/// Native capture canonically decodes this pinned KAPT primitive stream. Bind each side's
+/// raw argument before comparing its complete ordered decoded view across the private root.
+fn project_kapt_configuration(task: &mut CompilerTask) -> anyhow::Result<()> {
+    const PREFIX: &str = "plugin:org.jetbrains.kotlin.kapt3:configuration=";
+    const KEY: &str = "kaptStubsConfiguration";
+    let slots: Vec<_> = task
+        .arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.starts_with(PREFIX))
+        .map(|(i, _)| i)
+        .collect();
+    if slots.is_empty() {
+        anyhow::ensure!(
+            !task.options.contains_key(KEY),
+            "kapt-stubs-configuration-without-argument"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        slots.len() == 1
+            && slots[0] > 0
+            && task.arguments[slots[0] - 1] == "-P"
+            && task.task_type
+                == "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated"
+            && task
+                .kotlin_compiler
+                .as_ref()
+                .is_some_and(|runtime| runtime.compiler_version == "1.8.21"
+                    && runtime.gradle_plugin_version == "1.8.21"),
+        "kapt-stubs-configuration-profile-unproved"
+    );
+    let facts = task
+        .options
+        .get(KEY)
+        .ok_or_else(|| anyhow::anyhow!("kapt-stubs-configuration-absent"))?;
+    anyhow::ensure!(
+        facts["adapter"] == "kgp-1.8.21-kapt-stubs-primitive-options-v1"
+            && facts["encodedSha256"].as_str()
+                == Some(sha(task.arguments[slots[0]].as_bytes()).as_str()),
+        "kapt-stubs-configuration-argument-unbound"
+    );
+    let entries = facts["entries"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("kapt-stubs-configuration-not-primitive"))?;
+    anyhow::ensure!(
+        !entries.is_empty() && entries.len() <= 256,
+        "kapt-stubs-configuration-count"
+    );
+    let mut keys = BTreeSet::new();
+    for entry in entries {
+        let pair = entry
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| anyhow::anyhow!("kapt-stubs-configuration-not-primitive"))?;
+        let key = pair[0]
+            .as_str()
+            .filter(|key| !key.is_empty() && key.len() <= 256)
+            .ok_or_else(|| anyhow::anyhow!("kapt-stubs-configuration-key"))?;
+        anyhow::ensure!(keys.insert(key), "kapt-stubs-configuration-duplicate-key");
+        anyhow::ensure!(
+            pair[1].as_array().is_some_and(|values| values.len() <= 4096
+                && values
+                    .iter()
+                    .all(|v| v.as_str().is_some_and(|v| v.len() <= 1024 * 1024))),
+            "kapt-stubs-configuration-not-primitive"
+        );
+    }
+    let comparison = format!("{PREFIX}{}", serde_json::to_string(entries)?);
+    task.arguments[slots[0]] = comparison;
+    // The raw hash binds the pre-rebase argument on EACH side. Its path-dependent bytes are
+    // intentionally not the comparison view; all ordered primitive keys/values stay compared.
+    task.options
+        .get_mut(KEY)
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .remove("encodedSha256");
+    Ok(())
+}
+
 fn same_recipe(observed: &CompilerTask, expected: &CompilerTask) -> anyhow::Result<()> {
     let mut actual = observed.clone();
     let mut selected = expected.clone();
+    project_kapt_configuration(&mut actual)?;
+    project_kapt_configuration(&mut selected)?;
     // Pinned KGP 1.8's classpath contributor filters absent declared entries. Private current
     // producer class slots may be absent/empty instead of their previous saved-build state.
     if selected.kotlin_compiler.is_some() {
@@ -554,6 +745,94 @@ fn validate_graph(
     Ok(())
 }
 
+/// Jar's default manifest is synthesized by its input tree before the task action, so it
+/// is neither authored input nor an earlier task output. Admit only this fixed payload for a
+/// selected processor Jar with its modeled artifact completed in the same closed invocation.
+fn stock_jar_manifest(
+    snapshot: &Snapshot,
+    plan: &Plan,
+    rows: &[Value],
+    start: &Value,
+    path: &Path,
+    digest: &str,
+) -> bool {
+    if start["event"] != "processor-bootstrap-start"
+        || digest != sha(b"Manifest-Version: 1.0\r\n\r\n")
+    {
+        return false;
+    }
+    let Some(task) = start["task"].as_str() else {
+        return false;
+    };
+    let Some(contract) = rows
+        .iter()
+        .filter(|row| row["event"] == "processor-graph")
+        .filter_map(|row| row["contracts"].as_array())
+        .flatten()
+        .find(|contract| contract["task"] == task)
+    else {
+        return false;
+    };
+    if contract["taskType"] != "org.gradle.api.tasks.bundling.Jar_Decorated" {
+        return false;
+    }
+    let Some(end) = rows.iter().find(|row| {
+        row["event"] == "processor-task-end"
+            && row["task"] == task
+            && row["sequence"]
+                .as_u64()
+                .zip(start["sequence"].as_u64())
+                .is_some_and(|(end, start)| end > start)
+    }) else {
+        return false;
+    };
+    if successful_state(&end["state"]).is_err() {
+        return false;
+    }
+    plan.processor_modules.iter().any(|module| {
+        if task != format!("{}:jar", module.module.trim_end_matches(':')) {
+            return false;
+        }
+        let Ok(directory) = project_path(&module.project_dir, &plan.root, &snapshot.root) else {
+            return false;
+        };
+        if !contract["projectDir"]
+            .as_str()
+            .is_some_and(|p| same_path(Path::new(p), &directory))
+            || !same_path(path, &directory.join("build/tmp/jar/MANIFEST.MF"))
+        {
+            return false;
+        }
+        module
+            .source_sets
+            .iter()
+            .filter(|set| set.name == "main")
+            .flat_map(|set| &set.provided_artifacts)
+            .any(|artifact| {
+                let Ok(output) = project_path(artifact, &plan.root, &snapshot.root) else {
+                    return false;
+                };
+                artifact.extension().and_then(|s| s.to_str()) == Some("jar")
+                    && contract["declaredOutputPaths"]
+                        .as_array()
+                        .is_some_and(|paths| {
+                            paths.iter().any(|p| {
+                                p.as_str().is_some_and(|p| same_path(Path::new(p), &output))
+                            })
+                        })
+                    && end["outputs"].as_array().is_some_and(|outputs| {
+                        outputs.iter().any(|fact| {
+                            fact["kind"] == "file"
+                                && fact["path"]
+                                    .as_str()
+                                    .is_some_and(|p| same_path(Path::new(p), &output))
+                                && inventory(&output).is_ok_and(|current| current == *fact)
+                        })
+                    })
+            })
+    })
+}
+
 /// Current private reads must be authored bytes or the exact closed output of an earlier stock
 /// task in THIS invocation. External reads must already be covered by the retained input watch.
 fn validate_reads(
@@ -615,6 +894,9 @@ fn validate_reads(
     }
     for read in array(start, "inputs")? {
         let path = Path::new(value_string(read, "path")?);
+        if empty_future_kapt_classes(snapshot, plan, rows, start, read) {
+            continue;
+        }
         anyhow::ensure!(
             inventory(path)? == *read,
             "processor-execution-boundary-read-changed"
@@ -636,8 +918,11 @@ fn validate_reads(
         }
         let original = project_path(path, &snapshot.root, &plan.root)?;
         anyhow::ensure!(
-            plan.owns_bootstrap_read(&original, read["kind"] != "file"),
-            "processor-bootstrap-read-outside-current-overlay-closure"
+            plan.owns_bootstrap_read(&original, read["kind"] != "file")
+                || current_generated_read(plan, &original, read, &produced),
+            "processor-bootstrap-read-outside-current-overlay-closure: task={} path={}",
+            start["task"].as_str().unwrap_or("<unknown>"),
+            path.display()
         );
         let files = if read["kind"] == "file" {
             vec![read]
@@ -651,14 +936,20 @@ fn validate_reads(
             let path = Path::new(value_string(file, "path")?);
             let original = project_path(path, &snapshot.root, &plan.root)?;
             anyhow::ensure!(
-                plan.owns_bootstrap_read(&original, false),
-                "processor-bootstrap-file-outside-current-overlay-closure"
+                plan.owns_bootstrap_read(&original, false)
+                    || current_generated_read(plan, &original, file, &produced),
+                "processor-bootstrap-file-outside-current-overlay-closure: task={} path={}",
+                start["task"].as_str().unwrap_or("<unknown>"),
+                path.display()
             );
             let digest = value_string(file, "sha256")?;
             anyhow::ensure!(
                 snapshot.authored.get(path).is_some_and(|s| s == digest)
-                    || produced.get(&header_key(path)).is_some_and(|s| s == digest),
-                "processor-private-read-has-no-current-owner"
+                    || produced.get(&header_key(path)).is_some_and(|s| s == digest)
+                    || stock_jar_manifest(snapshot, plan, rows, start, path, digest),
+                "processor-private-read-has-no-current-owner: task={} path={}",
+                start["task"].as_str().unwrap_or("<unknown>"),
+                path.display()
             );
         }
     }
@@ -842,7 +1133,8 @@ pub(super) fn run(
         );
         last_end = end["sequence"].as_u64();
         let current: CompilerTask = serde_json::from_value(start["configuration"].clone())?;
-        same_recipe(&current, task)?;
+        let recipe = project_ksp_recipe(&current, task, &snapshot, plan, &rows, start);
+        same_recipe(&recipe, task)?;
         validate_current_inputs(&snapshot, &current, task, &private_tasks)?;
         validate_reads(
             &snapshot,
@@ -1020,13 +1312,28 @@ mod tests {
         let app = root.join("app");
         let processor = root.join("processor");
         for (relative, text) in [
-            ("app/src/main/kotlin/Source.kt", "class Source { fun current() = 1 }"),
-            ("processor/src/main/java/P.java", "class P { int current = 1; }"),
-            ("processor/src/main/resources/META-INF/services/javax.annotation.processing.Processor", "P"),
+            (
+                "app/src/main/kotlin/Source.kt",
+                "class Source { fun current() = 1 }",
+            ),
+            (
+                "processor/src/main/java/P.java",
+                "class P { int current = 1; }",
+            ),
+            (
+                "processor/src/main/resources/META-INF/services/javax.annotation.processing.Processor",
+                "P",
+            ),
             ("settings.gradle.kts", "include(\":app\", \":processor\")"),
             ("app/build.gradle.kts", "// generation=2"),
-            ("app/build/generated/ksp/main/kotlin/Stale.kt", "class Stale"),
-            ("processor/build/libs/processor.jar", "saved-artifact-is-not-a-lease"),
+            (
+                "app/build/generated/ksp/main/kotlin/Stale.kt",
+                "class Stale",
+            ),
+            (
+                "processor/build/libs/processor.jar",
+                "saved-artifact-is-not-a-lease",
+            ),
         ] {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1072,6 +1379,258 @@ mod tests {
             unselected_source_roots: Vec::new(),
         };
         (owner, plan, request)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn processor_recipe_projection_preserves_windows_path_spelling() {
+        let value = serde_json::json!({
+            "native": r"C:\original\app\source.kt", "forward": "C:/original/app/source.kt",
+            "unrelated": r"--pattern=\generated\.*"
+        });
+        let changed: Value = rebase(
+            &value,
+            Path::new("C:/original"),
+            Path::new(r"C:/scratch\private"),
+        )
+        .unwrap();
+        assert_eq!(changed["native"], r"C:\scratch\private\app\source.kt");
+        assert_eq!(changed["forward"], "C:/scratch/private/app/source.kt");
+        assert_eq!(changed["unrelated"], value["unrelated"]);
+    }
+
+    #[test]
+    fn processor_recipe_projection_binds_all_kapt_primitive_options() {
+        let (owner, _, _) = setup();
+        let mut selected = kotlin_test_request(&owner.directory).task;
+        selected.task_type =
+            "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated".into();
+        let runtime = selected.kotlin_compiler.as_mut().unwrap();
+        runtime.compiler_version = "1.8.21".into();
+        runtime.gradle_plugin_version = "1.8.21".into();
+        let prefix = "plugin:org.jetbrains.kotlin.kapt3:configuration=";
+        let original = format!(
+            "{prefix}rO0ABXdDAAAAAgAHc291cmNlcwAAAAEAAAAVQzpcb3JpZ2luYWxcZ2VuZXJhdGVkAApzdHJpY3RNb2RlAAAAAQAAAAVmYWxzZQ=="
+        );
+        let private = format!(
+            "{prefix}rO0ABXdCAAAAAgAHc291cmNlcwAAAAEAAAAUQzpccHJpdmF0ZVxnZW5lcmF0ZWQACnN0cmljdE1vZGUAAAABAAAABWZhbHNl"
+        );
+        selected.arguments.extend(["-P".into(), original.clone()]);
+        let entries = serde_json::json!([
+            ["sources", [r"C:\private\generated"]],
+            ["strictMode", ["false"]]
+        ]);
+        selected.options.insert(
+            "kaptStubsConfiguration".into(),
+            serde_json::json!({
+                "adapter":"kgp-1.8.21-kapt-stubs-primitive-options-v1",
+                "encodedSha256":sha(original.as_bytes()),"entries":entries,
+            }),
+        );
+        let mut observed = selected.clone();
+        *observed.arguments.last_mut().unwrap() = private.clone();
+        observed.options.get_mut("kaptStubsConfiguration").unwrap()["encodedSha256"] =
+            serde_json::json!(sha(private.as_bytes()));
+        same_recipe(&observed, &selected).unwrap();
+        for mutation in [
+            "raw-binding",
+            "flag",
+            "order",
+            "nonprimitive",
+            "duplicate",
+            "adapter",
+            "extra-arg",
+        ] {
+            let mut changed = observed.clone();
+            match mutation {
+                "raw-binding" => {
+                    changed.options.get_mut("kaptStubsConfiguration").unwrap()["encodedSha256"] =
+                        serde_json::json!("stale")
+                }
+                "flag" => {
+                    changed.options.get_mut("kaptStubsConfiguration").unwrap()["entries"][1][1][0] =
+                        serde_json::json!("true")
+                }
+                "order" => changed.options.get_mut("kaptStubsConfiguration").unwrap()["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .reverse(),
+                "nonprimitive" => {
+                    changed.options.get_mut("kaptStubsConfiguration").unwrap()["entries"][1][1][0] =
+                        serde_json::json!({"not":"a string"})
+                }
+                "duplicate" => {
+                    let entries = changed.options.get_mut("kaptStubsConfiguration").unwrap()
+                        ["entries"]
+                        .as_array_mut()
+                        .unwrap();
+                    entries.push(entries[0].clone());
+                }
+                "adapter" => {
+                    changed.options.get_mut("kaptStubsConfiguration").unwrap()["adapter"] =
+                        serde_json::json!("unknown")
+                }
+                "extra-arg" => changed.arguments.push("-Xunproved".into()),
+                _ => unreachable!(),
+            }
+            assert!(same_recipe(&changed, &selected).is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn processor_recipe_projection_requires_absent_then_owned_empty_kapt_classes() {
+        let (owner, mut plan, request) = setup();
+        plan.tasks.ksp.task = ":app:kspKotlin".into();
+        plan.tasks.kapt.task = ":app:kaptKotlin".into();
+        let original_classes = plan.owner.project_dir.join("build/tmp/kapt3/classes/main");
+        plan.tasks.kapt.output_roots = vec![original_classes.clone()];
+        plan.tasks.kapt.declared_output_roots = vec![original_classes];
+        let snapshot =
+            Snapshot::create_in(&plan, &request, &owner.directory.join("empty-kapt")).unwrap();
+        let classes = snapshot.root.join("app/build/tmp/kapt3/classes/main");
+        std::fs::create_dir_all(&classes).unwrap();
+        let read = serde_json::json!({"path":classes,"kind":"absent"});
+        let start = serde_json::json!({"event":"processor-start","task":plan.tasks.ksp.task,
+            "sequence":1,"inputs":[read]});
+        let rows = vec![
+            serde_json::json!({"event":"processor-task-end","task":plan.tasks.kapt.task,
+            "sequence":3,"state":{"executed":true,"failure":null,"skipped":false,
+                "up_to_date":false,"no_source":false,"did_work":true},
+            "outputs":[inventory(&classes).unwrap()]}),
+        ];
+        assert!(empty_future_kapt_classes(
+            &snapshot, &plan, &rows, &start, &read
+        ));
+        let mut expected = request.task.clone();
+        expected.task = plan.tasks.ksp.task.clone();
+        expected.classpath = vec![snapshot.root.join("ordinary.jar")];
+        let mut observed = expected.clone();
+        observed.classpath.push(classes.clone());
+        let projected = project_ksp_recipe(&observed, &expected, &snapshot, &plan, &rows, &start);
+        same_recipe(&projected, &expected).unwrap();
+        assert_eq!(
+            observed.classpath.len(),
+            expected.classpath.len() + 1,
+            "actual selected inputs remain retained"
+        );
+        for mutation in [
+            "task",
+            "not-absent",
+            "path",
+            "owner",
+            "order",
+            "completion",
+            "nonempty",
+            "unmodeled",
+        ] {
+            let mut plan = plan.clone();
+            let mut rows = rows.clone();
+            let mut start = start.clone();
+            let mut read = read.clone();
+            match mutation {
+                "task" => start["task"] = serde_json::json!(":other:kspKotlin"),
+                "not-absent" => read["kind"] = serde_json::json!("directory"),
+                "path" => {
+                    read["path"] = serde_json::json!(snapshot.root.join("app/build/tmp/unproved"))
+                }
+                "owner" => rows[0]["task"] = serde_json::json!(":other:kaptKotlin"),
+                "order" => rows[0]["sequence"] = serde_json::json!(0),
+                "completion" => rows[0]["state"]["skipped"] = serde_json::json!(true),
+                "nonempty" => {
+                    rows[0]["outputs"][0]["entries"] = serde_json::json!([{"kind":"file"}])
+                }
+                "unmodeled" => plan.tasks.kapt.declared_output_roots.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !empty_future_kapt_classes(&snapshot, &plan, &rows, &start, &read),
+                "{mutation}"
+            );
+        }
+        std::fs::write(classes.join("unexpected.class"), b"new class bytes").unwrap();
+        assert!(!empty_future_kapt_classes(
+            &snapshot, &plan, &rows, &start, &read
+        ));
+    }
+
+    #[test]
+    fn processor_default_jar_manifest_requires_current_selected_stock_owner() {
+        let (owner, mut plan, request) = setup();
+        plan.processor_modules[0].source_sets[0].provided_artifacts =
+            vec![plan.root.join("processor/build/libs/processor.jar")];
+        let snapshot =
+            Snapshot::create_in(&plan, &request, &owner.directory.join("manifest")).unwrap();
+        let directory = snapshot.root.join("processor");
+        let manifest = directory.join("build/tmp/jar/MANIFEST.MF");
+        let artifact = directory.join("build/libs/processor.jar");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"current-closed-processor-artifact").unwrap();
+        let start = serde_json::json!({
+            "event":"processor-bootstrap-start", "task":":processor:jar", "sequence":3
+        });
+        let rows = vec![
+            serde_json::json!({"event":"processor-graph", "contracts":[{
+                "task":":processor:jar", "taskType":"org.gradle.api.tasks.bundling.Jar_Decorated",
+                "projectDir":directory, "declaredOutputPaths":[artifact]
+            }]}),
+            serde_json::json!({"event":"processor-task-end", "task":":processor:jar",
+                "sequence":4, "state":{"executed":true,"failure":null,"skipped":false,
+                    "up_to_date":false,"no_source":false,"did_work":true},
+                "outputs":[inventory(&artifact).unwrap()]
+            }),
+        ];
+        let digest = sha(b"Manifest-Version: 1.0\r\n\r\n");
+        assert!(stock_jar_manifest(
+            &snapshot, &plan, &rows, &start, &manifest, &digest
+        ));
+        assert!(!stock_jar_manifest(
+            &snapshot,
+            &plan,
+            &rows,
+            &start,
+            &manifest,
+            &sha(b"Manifest-Version: 1.0\r\nClass-Path: foreign.jar\r\n\r\n")
+        ));
+        assert!(!stock_jar_manifest(
+            &snapshot,
+            &plan,
+            &rows,
+            &start,
+            &directory.join("build/tmp/jar/other.tmp"),
+            &digest
+        ));
+        assert!(!stock_jar_manifest(
+            &snapshot,
+            &plan,
+            &rows,
+            &start,
+            &snapshot.root.join("app/build/tmp/jar/MANIFEST.MF"),
+            &digest
+        ));
+        for mutation in [
+            "task",
+            "type",
+            "output",
+            "completion",
+            "order",
+            "output-bytes",
+        ] {
+            let mut start = start.clone();
+            let mut rows = rows.clone();
+            match mutation {
+                "task" => start["task"] = serde_json::json!(":other:jar"),
+                "type" => rows[0]["contracts"][0]["taskType"] = serde_json::json!("custom.Jar"),
+                "output" => rows[0]["contracts"][0]["declaredOutputPaths"] = serde_json::json!([]),
+                "completion" => rows[1]["state"]["skipped"] = serde_json::json!(true),
+                "order" => rows[1]["sequence"] = serde_json::json!(2),
+                "output-bytes" => rows[1]["outputs"][0]["sha256"] = serde_json::json!("stale"),
+                _ => unreachable!(),
+            }
+            assert!(
+                !stock_jar_manifest(&snapshot, &plan, &rows, &start, &manifest, &digest),
+                "{mutation}"
+            );
+        }
     }
 
     #[test]
@@ -1468,6 +2027,59 @@ mod tests {
             !plan.owns_bootstrap_read(&plan.root, true),
             "a broad read must not silently capture every unrelated module"
         );
+    }
+
+    #[test]
+    fn processor_current_stubs_require_declared_output_and_predecessor_bytes() {
+        let (owner, mut plan, request) = setup();
+        let output = plan.owner.project_dir.join("build/tmp/kapt3/stubs/main");
+        plan.tasks.stubs.declared_output_roots = vec![output.clone()];
+        let snapshot =
+            Snapshot::create_in(&plan, &request, &owner.directory.join("private")).unwrap();
+        let original = output.join("error/NonExistentClass.java");
+        assert!(!plan.owns_bootstrap_read(&original, false));
+        let path = project_path(&original, &plan.root, &snapshot.root).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            b"package error; public final class NonExistentClass {}",
+        )
+        .unwrap();
+        let fact = inventory(&path).unwrap();
+        let produced = BTreeMap::from([(
+            header_key(&path),
+            value_string(&fact, "sha256").unwrap().to_owned(),
+        )]);
+        assert!(current_generated_read(&plan, &original, &fact, &produced));
+        assert!(!current_generated_read(
+            &plan,
+            &original,
+            &fact,
+            &BTreeMap::new()
+        ));
+        let mut changed = fact.clone();
+        changed["sha256"] = serde_json::json!("stale");
+        assert!(!current_generated_read(
+            &plan, &original, &changed, &produced
+        ));
+        changed = fact.clone();
+        changed["kind"] = serde_json::json!("directory");
+        assert!(!current_generated_read(
+            &plan, &original, &changed, &produced
+        ));
+        for unowned in [
+            plan.root.join("unrelated/src/main/java/Other.java"),
+            output.parent().unwrap().join("other/Unmodeled.java"),
+        ] {
+            assert!(!current_generated_read(&plan, &unowned, &fact, &produced));
+        }
+        std::fs::write(&path, b"package error; public final class Changed {}").unwrap();
+        assert!(!current_generated_read(
+            &plan,
+            &original,
+            &inventory(&path).unwrap(),
+            &produced
+        ));
     }
 }
 

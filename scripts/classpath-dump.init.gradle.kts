@@ -118,6 +118,7 @@ object KtlspCompilerConfiguration {
     private fun javaGradleProfile(task: Task): JavaGradleProfile = when (task.project.gradle.gradleVersion) {
         "7.4.2" -> JavaGradleProfile("7.4.2", "isConfigurationCache", "IncrementalInputsTaskAction")
         "7.5" -> JavaGradleProfile("7.5", "isConfigurationCache", "IncrementalInputsTaskAction")
+        "8.10.2" -> JavaGradleProfile("8.10.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         else -> error("Unsupported Java recipe Gradle adapter")
     }
@@ -179,6 +180,12 @@ object KtlspCompilerConfiguration {
             o.encoding == null && java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
         val explicitUtf8Jdk17 = profile.version == "7.5" && o.release.orNull == null &&
             task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" && o.encoding == "UTF-8"
+        val processors = o.annotationProcessorPath?.files?.toList().orEmpty()
+        // Capture metadata only; this profile does not grant processor completion or absence authority.
+        val release17ProcessorsJdk17 = profile.version == "8.10.2" && o.release.orNull == 17 &&
+            task.sourceCompatibility == "17" && task.targetCompatibility == "17" && o.encoding == null &&
+            java.nio.charset.Charset.defaultCharset().name() == "UTF-8" && o.compilerArgs.isEmpty() &&
+            processors.isNotEmpty() && processors.all { it.isAbsolute && it.isFile }
         // allJvmArgs invokes providers even when fork=false; reject before reading it.
         check(o.forkOptions.jvmArgumentProviders.isEmpty()) { "Java JVM argument providers are unhandled" }
         check(!o.isFork && o.forkOptions.executable == null && o.forkOptions.jvmArgs.isNullOrEmpty() &&
@@ -186,9 +193,9 @@ object KtlspCompilerConfiguration {
             o.forkOptions.memoryMaximumSize == null && o.forkOptions.tempDir == null) { "Unsupported Java compiler fork policy" }
         check(o.compilerArgumentProviders.isEmpty()) { "Java compiler argument providers are unhandled" }
         check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none")) { "Opaque Java compiler arguments are unhandled" }
-        check(o.annotationProcessorPath?.files?.isEmpty() != false) { "Java annotation processing is unhandled" }
+        check(processors.isEmpty() || release17ProcessorsJdk17) { "Java annotation processing is unhandled" }
         check(o.sourcepath == null && o.bootstrapClasspath == null && o.extensionDirs == null &&
-            (o.release.orNull == null || release8Utf8Jdk17) &&
+            (o.release.orNull == null || release8Utf8Jdk17 || release17ProcessorsJdk17) &&
             (o.encoding == null || explicitUtf8Jdk21 || explicitUtf8Jdk17)) { "Unsupported Java source/SDK/encoding policy" }
         check(o.javaModuleVersion.orNull == null && o.javaModuleMainClass.orNull == null &&
             task.source.files.none { it.name == "module-info.java" }) { "Java modules are unhandled" }
@@ -200,7 +207,7 @@ object KtlspCompilerConfiguration {
         check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
         val selected = when (profile.version) {
             "7.4.2", "7.5" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
-            "9.6.1" -> task.javaCompiler.orNull
+            "8.10.2", "9.6.1" -> task.javaCompiler.orNull
             else -> error("Unsupported Java compiler selector")
         } ?: error("Selected Java compiler is unavailable")
         check(selected.javaClass.name == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler") {
@@ -232,7 +239,7 @@ object KtlspCompilerConfiguration {
         }
         val compileOptions = read(spec, "getCompileOptions") ?: error("Java compile options are unavailable")
         check((read(spec, "getModulePath") as? Collection<*>)?.isEmpty() == true &&
-            (read(spec, "getAnnotationProcessorPath") as? Collection<*>)?.isEmpty() == true &&
+            read(spec, "getAnnotationProcessorPath") == processors &&
             read(spec, "getRelease") == o.release.orNull && read(compileOptions, "getSourcepath") == null &&
             read(compileOptions, "getBootClasspath") == null && read(compileOptions, "getExtensionDirs") == null) {
             "Unsupported Java compiler effective inputs"
@@ -249,7 +256,12 @@ object KtlspCompilerConfiguration {
             it.parameterCount == 1 && it.parameterTypes[0].isInstance(spec)
         }.newInstance(spec)
         val arguments = read(builder, "build") as? List<*> ?: error("Java API compiler options are unavailable")
-        check(arguments.all { it is String } && "-proc:none" in arguments) { "Unsupported Java API compiler options" }
+        check(arguments.all { it is String } && if (release17ProcessorsJdk17) {
+            val index = arguments.indexOf("-processorpath")
+            arguments.count { it == "-processorpath" } == 1 && index >= 0 &&
+                arguments.getOrNull(index + 1) == processors.joinToString(java.io.File.pathSeparator) { it.path } &&
+                "-proc:none" !in arguments
+        } else "-proc:none" in arguments) { "Unsupported Java API compiler options" }
         val runtimeVersion = read(metadata, "getJavaRuntimeVersion") as? String
             ?: error("Selected Java runtime version is unavailable")
         val gradleVersion = System.getProperty("java.version") ?: error("Gradle JVM version is unavailable")
@@ -259,6 +271,7 @@ object KtlspCompilerConfiguration {
         }
         return linkedMapOf(
             "adapter" to when {
+                release17ProcessorsJdk17 -> "gradle-8.10.2-current-jdk17-release17-javac-api-with-processors-v1"
                 explicitUtf8Jdk21 -> "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
                 defaultUtf8Target17Jdk21 -> "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
                 release8Utf8Jdk17 -> "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
@@ -433,6 +446,57 @@ object KtlspCompilerConfiguration {
             ?: error("Compiler task does not expose $getter")
         val value = method.invoke(bean)
         return if (value is Provider<*>) value.orNull else value
+    }
+
+    // KGP 1.8.21 writes only ordered primitive entries through ObjectOutputStream. Never
+    // deserialize objects; a canonical round trip rejects nonprimitive/trailing/unknown framing.
+    private fun kaptStubsConfiguration(arguments: List<*>): Map<String, Any?> {
+        val prefix = "plugin:org.jetbrains.kotlin.kapt3:configuration="
+        val slots = arguments.withIndex().filter { (it.value as? String)?.startsWith(prefix) == true }
+        check(slots.size == 1 && slots.single().index > 0 && arguments[slots.single().index - 1] == "-P")
+        val argument = slots.single().value as? String ?: error("KAPT configuration is unavailable")
+        val encoded = argument.removePrefix(prefix)
+        check(encoded.length <= 2 * 1024 * 1024)
+        val bytes = java.util.Base64.getDecoder().decode(encoded)
+        check(java.util.Base64.getEncoder().encodeToString(bytes) == encoded)
+        val entries = mutableListOf<Pair<String, List<String>>>()
+        java.io.ObjectInputStream(java.io.ByteArrayInputStream(bytes)).use { input ->
+            val count = input.readInt()
+            check(count in 1..256)
+            val keys = mutableSetOf<String>()
+            repeat(count) {
+                val key = input.readUTF()
+                check(key.isNotEmpty() && key.length <= 256 && keys.add(key))
+                val valueCount = input.readInt()
+                check(valueCount in 0..4096)
+                val values = (0 until valueCount).map {
+                    val size = input.readInt()
+                    check(size in 0..1024 * 1024)
+                    val value = ByteArray(size)
+                    input.readFully(value)
+                    Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(value)).toString()
+                }
+                entries.add(key to values)
+            }
+        }
+        val canonical = java.io.ByteArrayOutputStream()
+        java.io.ObjectOutputStream(canonical).use { output ->
+            output.writeInt(entries.size)
+            for ((key, values) in entries) {
+                output.writeUTF(key)
+                output.writeInt(values.size)
+                for (value in values) {
+                    val data = value.toByteArray(Charsets.UTF_8)
+                    output.writeInt(data.size)
+                    output.write(data)
+                }
+            }
+        }
+        check(bytes.contentEquals(canonical.toByteArray())) { "Noncanonical KAPT primitive configuration" }
+        val fingerprint = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(argument.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it.toInt() and 255) }
+        return linkedMapOf("adapter" to "kgp-1.8.21-kapt-stubs-primitive-options-v1",
+            "encodedSha256" to fingerprint, "entries" to entries.map { listOf<Any>(it.first, it.second) })
     }
 
     // Public JVM compilation ownership, independent of names used by KAPT/KSP auxiliary tasks.
@@ -789,6 +853,10 @@ object KtlspCompilerConfiguration {
                     "taskOnlyIfInventory" to producerOnlyIf(task),
                 )
                 record["options"] = options
+                if (task.javaClass.name == "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated"
+                    && recipe["compiler_version"] == "1.8.21" && recipe["gradle_plugin_version"] == "1.8.21") {
+                    options["kaptStubsConfiguration"] = kaptStubsConfiguration(arguments)
+                }
                 if (task.javaClass.name == "com.google.devtools.ksp.gradle.KspTaskJvm_Decorated") {
                     options["kspProcessorInputs"] = null
                     options["kspProcessorInputsProblem"] = null

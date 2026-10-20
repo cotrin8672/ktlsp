@@ -42,9 +42,17 @@ The observed stale token is not evidence of an independent source-lifetime bug.
 Release validation and the original114 remain pending. Evidence:
 processor120/phase54-2/{receipt.json,lifecycle-timeline.json}.
 
+The real serialization fixture uses Gradle8.10.2, not the initially assumed8.7.
+Its actual distribution ABI and upstream source establish a separate Java17/
+release17 processor-enabled metadata adapter. Twenty capture/negative checks
+pass with unchanged project/wrapper inputs and no remaining owned processes.
+Custom task actions/predicates remain unproved; metadata alone grants neither
+processor API nor absence authority. Evidence:
+processor120/java8102-model1/receipt.json and processor120/java8102-abi/.
+
 Serialization now passes the original Kotlin golden, partial and dangling-dot
 completion cases on the first response (3/3). The original Java cases still
-return unknown receivers (0/3); the real Gradle8.7/Lombok caller needs an actual
+return unknown receivers (0/3); the real Gradle/Lombok caller needs an actual
 javac namespace witness rather than the plain-Java absence proof. Positive
 root/child class facts share extension readsets and callable selection; the
 generic-result tests pass. The earlier observer-directory collision is fixed.
