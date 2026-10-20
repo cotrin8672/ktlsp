@@ -1,12 +1,159 @@
 # Current fork state
 
-Updated 2026-10-18 (Asia/Tokyo). Goal active; IDEA parity and speed acceptance remain unproved.
+Updated 2026-10-21 (Asia/Tokyo). Goal active; IDEA parity and speed acceptance remain unproved.
 History: docs/fork-acceptance.md, docs/fork-corpus.md and Git.
 BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest112 investigation: processor input ownership and speed candidates
+## Latest120: faster development builds; outstanding functional gaps
+
+Commit a886d2b reduces dev debug information while retaining workspace panic
+file/line data. Release optimization and linker settings are unchanged. Three
+local edit/test samples have medians5.819s before and4.646s after; the same
+profile change alone does not establish a server build speedup. A separate
+Windows final-binary linker comparison measures13.784s with MSVC versus12.810s
+with the bundled LLD, each n=3. Use the documented dev command rather than
+rebuilding release during focused iteration. Root reruns the five selected core
+tests successfully and verifies both native-editor basic summaries/assertions.
+See docs/build-performance.md and build-speed120/summary.json for method,
+raw evidence and limitations; cold-build and release runtime gains are unproved.
+
+The four Java Holder.ITEM chain failures are fixed. An unbuilt Kotlin output
+directory was treated as unknown compiler-service inventory, invalidating the
+Java caller's value-namespace proof. NotFound now proves current absence without
+caching it; later directory/Jar services and classpath changes retract the proof.
+Other IO failures and invalid archives remain unknown. Five related tests pass
+after the focused regression fails before the fix; an independent javac17
+control compiles the same static chain. The unchanged original19-case editor
+run now matches66/66 checks, with no failed/unmeasured result, clean shutdown
+and unchanged buffers. Root verifies the raw report and snapshot provenance.
+Evidence: binary-static120/result-summary.json and binary-static120/joint/receipt.json; binary
+SHA256 a3df1df10c54f99f2c04de2f791805745ebc17d2625d87e7a1974c120ed24c39.
+
+The processor snapshot now accepts a source read only when its declared generated
+output root and exact earlier closed output SHA establish current ownership.
+This covers KAPT stubs without adding them as authored/editor sources. Focused
+tests pass24/0 with one existing ignored test; Root reruns the new owner test.
+The real dev phase54 closes47/54, passing the previous owner boundary and saving
+all26 events. Its remaining checks exceed the120s observation window; shutdown
+then cancels the active Java-helper work and produces stale-kotlin-source.
+The observed stale token is not evidence of an independent source-lifetime bug.
+Release validation and the original114 remain pending. Evidence:
+processor120/phase54-2/{receipt.json,lifecycle-timeline.json}.
+
+Serialization now passes the original Kotlin golden, partial and dangling-dot
+completion cases on the first response (3/3). The original Java cases still
+return unknown receivers (0/3); the real Gradle8.7/Lombok caller needs an actual
+javac namespace witness rather than the plain-Java absence proof. Positive
+root/child class facts share extension readsets and callable selection; the
+generic-result tests pass. The earlier observer-directory collision is fixed.
+Evidence: serialization120/editor3/receipt.json and
+serialization120/editor3-harness/artifacts/corpus-results.json. All six editor
+requests use one attempt; Kotlin success does not establish Java acceptance.
+
+The separately built extension consumer passes4/4 Rust tests with the current
+host/core and a synchronized lockfile (19 added lines; existing versions stay
+unchanged). One real-Neovim composed-provider case using the pinned upstream
+Mixin/Shadow declarations matches98 semantic checks across50 first-attempt RPCs.
+Rename edits are applied; unsaved/configuration changes retract prior facts.
+Inputs stay unchanged, shutdown is clean and no owned processes remain. This
+is a dev correctness result, not release performance or production Mixin/game
+acceptance. Shape-only editor extras remain unrun. Evidence:
+sdk120/{result-summary.json,native-receipt.json,upstream-inputs.json} and
+sdk120/native/artifacts/corpus-results.json. Earlier SDK104's three cold
+responses were three RPCs in one case, not three complete SDK runs.
+
+CEM binary projection now retains supported Java interface default/static
+methods and constants. A bounded shared completion proof preserves a concrete
+zero-argument inherited method below a missing upper ancestor; unresolved
+sibling/overload cases still stay unknown. The actual CEM/Create reduction
+changes from RED to GREEN without source jars. Focused Rust checks pass15+67;
+four new native-editor cases pass12 assertions after independent Gradle
+compilation. Full original CEM release validation remains pending, and partial
+hierarchy navigation/inference still return Unknown. See
+docs/fork-cem-startup120.md for exact scope and evidence.
+
+Additional-five-project oracle checks continue. The closed current IDEA
+evidence covers41/50 original cases;
+Gradle's9 remain pending. CEM's warm UI probe receives IDEA's synthetic-property
+label breakSpeed (from getBreakSpeed()), failing the unchanged exact-method-label
+expectation on its first cycle;30 later cycles are unrun. Cold import/index
+readiness attempts are separately unmeasured, not semantic passes. No comparable
+IDEA UI-speed result is established. Evidence: oracle120/closed-oracle-audit.json
+and oracle120/c4/artifacts/completion-ui.json.
+
+No acceptance expectations or first-response timing are relaxed. Remaining
+processor/plugin, CEM startup/navigation and full-corpus gaps prevent claiming
+the complete requested editing experience.
+
+## Latest113: integrated owner types, navigation and Windows allocation
+
+Root runs the combined workspace and release build with the Windows allocator
+enabled by default. Final results are1,715 passing/zero failed/eight ignored
+across40 test-result blocks; release succeeds. Root independently verifies
+all545 current input hashes, identical before/after snapshots and three raw/
+binary references. Both Jobs close with no live residuals after cleaning one
+owned MSVC helper each. Evidence: native-integrated113-2/receipt.json SHA256
+5f7dbef0bb72c3aea46af52c24ec232eb0e353f1441fe890d437496d3d3374c2.
+The21,147,136-byte immutable binary is native-integrated113-2/bin/ktlsp.exe,
+SHA25642ca19f87daf29329b6b3012210da197a4d9aa7187566a88c231475b3a4deeb5.
+
+Nonstatic binary inner types retain separate enclosing and inner arguments.
+Exact reciprocal InnerClasses records establish capture; missing/ambiguous
+owners remain unknown. Typed classfile projection and Java/Kotlin result chains
+pass the focused checks. Symcache identity changes to v33. The existing binary
+editor scenario retains its original18 cases and adds one owner-chain case.
+The real19-case run has62 matched and four mismatched checks: the new enclosing
+owner case passes, while original Java Holder.ITEM completion/navigation checks
+fail in normal and unfinished code. Kotlin's equivalent static chain passes.
+Causality with the new owner implementation is not established. Evidence:
+binary-generics113-native1/harness/artifacts/corpus-results.json.
+
+Explicit Kotlin navigation no longer falls back from an unknown receiver to
+an unrelated globally unique member. Its public goto reproduction fails before
+the fix and passes after it, alongside the existing selector checks. The first
+full run exposes an old test relying on undefined makeA() to find A.alpha();
+the fixture now constructs A(), keeping the alpha target. Its old grammar-error
+comment is corrected: the pinned parser reads both one-line classes normally.
+The original full-run failure and focused checks are retained, not relabeled.
+
+KAPT/KSP recipe checks now bind the full ordered primitive KAPT configuration
+to each raw argument before rebasing, preserve native path spelling, and admit
+only a proved later empty KAPT classes slot for the selected KSP task. All three
+focused reproductions pass after failing before the fix. Native phase54 then
+passes47/54, next rejecting processor-bootstrap-read-outside-current-overlay-closure.
+The original114 is not rerun until this subset passes; Rust success does not
+establish processor acceptance. Evidence:
+recovery89/corpus90/native-processor-owner113-phase1-2/receipt.json.
+
+The latest real serialization fixture compiles and emits Companion.serializer()
+returning KSerializer<Model>, but all six original Java/Kotlin golden, partial
+and dangling-dot completions mismatch on112, with first responses received and
+no retry. Root verifies its raw/report references. The selected compiler also
+rejects captured annotation -P options in the current adapter. An external
+current-frontend observation finds the generated public synthetic method even
+for partial/dot inputs; publishing these facts through shared analysis is next.
+Evidence: serialization113/editor/receipt.json and
+serialization113/frontend-probe/{valid,partial,dot}/receipt.json.
+
+Old Temp corpus inputs disappear during preflight. All five checkouts are
+recovered outside Temp at their pinned commits with67 original semantic buffer
+hashes preserved. CEM's40 missing inputs match the user's read-only originals;
+the recovered snapshot and118 dependency hashes match previous evidence. Ten
+initially reported missing Gradle files are instead Windows long-path audit
+false negatives; the extended-path audit records the correction. Bootstrap is
+separate from timing. Current-binary CEM cold/warm checks pass8/8 each and UI
+accepts31/31 cycles of one getBreakSpeed case. First observed useful completion
+is170.189s cold and3.453s warm, each n=1. Warm30 RPC p50/p95 is15.234/32.586ms;
+menu handoff is49.980/68.388ms, not physical display latency. The final dependency
+inventories agree; full logical-symbol coverage equivalence is unproved. All
+three sessions close without owned residuals. Evidence:
+recovery89/cem-first-readiness113-1/performance-summary.json. The original CEM18
+and whole additional-five-project acceptance still require the corrected build;
+no final speed or parity is claimed.
+
+## Previous112 investigation: processor input ownership and speed candidates
 
 The generated-method diagnostic adapter no longer rejects Japanese receiver
 and method identifiers merely for being non-ASCII. The focused reproduction
