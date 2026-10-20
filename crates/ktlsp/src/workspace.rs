@@ -101,6 +101,8 @@ pub struct Workspace {
     kotlin_source_generations: BTreeMap<ProjectScope, u64>,
     kotlin_diagnostic_store_epoch: u64,
     kotlin_diagnostic_changes: BTreeSet<String>,
+    compiler_api_environments:
+        BTreeMap<ProjectScope, Arc<crate::compile::KotlinDiagnosticEnvironment>>,
     class_inventory: RefCell<crate::binary_diagnostics::ClassInventoryCache>,
     // Keep this last: its destructor observes completion of all preceding field destruction.
     _drop_marker: WorkspaceDropMarker,
@@ -162,6 +164,7 @@ impl Workspace {
             kotlin_source_generations: BTreeMap::new(),
             kotlin_diagnostic_store_epoch: 0,
             kotlin_diagnostic_changes: BTreeSet::new(),
+            compiler_api_environments: BTreeMap::new(),
             class_inventory: RefCell::default(),
             _drop_marker: WorkspaceDropMarker("workspace.fields.dropped"),
         }
@@ -2734,10 +2737,11 @@ impl Workspace {
                 .or_insert_with(|| self.current_kotlin_value_facts(path))
         };
         let value_namespace = |owner: &crate::index::Entry| {
-            source_only()
-                && owner.tier == Tier::Volatile
-                && kotlin_values(&owner.path)
-                    .is_some_and(|facts| facts.owners.contains(&rename_definition(owner)))
+            ktcore::jvm::compiler_value_namespace(&scoped, owner)
+                || source_only()
+                    && owner.tier == Tier::Volatile
+                    && kotlin_values(&owner.path)
+                        .is_some_and(|facts| facts.owners.contains(&rename_definition(owner)))
                 || source_members(owner)
         };
         let property_access = |property: &crate::index::Entry| {
@@ -7484,6 +7488,17 @@ impl Workspace {
     }
 
     fn refresh_compiled_freshness(&mut self) {
+        if self.compiler_api_environments.values().any(|environment| {
+            environment
+                .invalid
+                .load(std::sync::atomic::Ordering::Acquire)
+        }) {
+            self.compiler_api_environments.clear();
+            self.analysis_extensions.clear_compiler_api(&self.index);
+            if self.analysis_extensions.publish(&mut self.index) {
+                self.index_revision = self.index_revision.wrapping_add(1).max(1);
+            }
+        }
         let invalid = self
             .analysis_extensions
             .compiled_receipt()
@@ -8257,6 +8272,21 @@ impl Workspace {
         &mut self,
         key: &str,
     ) -> Result<Arc<crate::compile::KotlinDiagnosticRequest>, &'static str> {
+        self.begin_kotlin_diagnostics_for_sources(key, false)
+    }
+
+    pub(crate) fn begin_kotlin_compiler_api(
+        &mut self,
+        key: &str,
+    ) -> Result<Arc<crate::compile::KotlinDiagnosticRequest>, &'static str> {
+        self.begin_kotlin_diagnostics_for_sources(key, true)
+    }
+
+    fn begin_kotlin_diagnostics_for_sources(
+        &mut self,
+        key: &str,
+        allow_closed: bool,
+    ) -> Result<Arc<crate::compile::KotlinDiagnosticRequest>, &'static str> {
         use crate::classpath::CompilerLanguage;
         if self.project_refresh_pending {
             return Err("kotlin-project-model-pending");
@@ -8372,7 +8402,7 @@ impl Workspace {
                 ));
             }
         }
-        if !overlays.iter().any(|source| source.key.ends_with(".kt")) {
+        if !allow_closed && !overlays.iter().any(|source| source.key.ends_with(".kt")) {
             return Err("no-open-owned-kotlin-source");
         }
         overlays.sort_by(|a, b| a.key.cmp(&b.key));
@@ -8408,6 +8438,24 @@ impl Workspace {
         }
         let (java_task, java_dependencies) = match java_inputs {
             Some((task, dependencies)) => (Some(task), dependencies),
+            None if crate::compile::compiler_api_candidate(task) => {
+                let java: Vec<_> = source
+                    .compiler_tasks
+                    .iter()
+                    .filter(|task| {
+                        task.language == CompilerLanguage::Java
+                            && task.complete
+                            && task.problem.is_none()
+                    })
+                    .collect();
+                (
+                    match java.as_slice() {
+                        [task] => Some((*task).clone()),
+                        _ => None,
+                    },
+                    Vec::new(),
+                )
+            }
             None => (None, Vec::new()),
         };
         let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
@@ -8459,6 +8507,88 @@ impl Workspace {
             },
         );
         Ok(request)
+    }
+
+    pub(crate) fn compiler_api_targets(&self) -> Vec<String> {
+        let mut targets = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        if let Some(model) = &self.project_model {
+            for key in self
+                .project_file_meta
+                .keys()
+                .filter(|key| key.ends_with(".kt"))
+            {
+                let Some((_, Some(source))) = model.owner_for_key(key) else {
+                    continue;
+                };
+                let Some(scope) = self.project_scope_for_file(key) else {
+                    continue;
+                };
+                if !visited.insert(scope.clone()) {
+                    continue;
+                }
+                if source
+                    .compiler_tasks
+                    .iter()
+                    .any(crate::compile::compiler_api_supported)
+                {
+                    targets.entry(scope).or_insert_with(|| key.clone());
+                }
+            }
+        }
+        targets.into_values().collect()
+    }
+
+    pub(crate) fn compiler_api_environment(
+        &self,
+        request: &crate::compile::KotlinDiagnosticRequest,
+    ) -> Option<Arc<crate::compile::KotlinDiagnosticEnvironment>> {
+        self.compiler_api_environments
+            .get(&request.scope)
+            .filter(|environment| environment.matches(request))
+            .cloned()
+    }
+
+    pub(crate) fn accept_kotlin_compiler_api(
+        &mut self,
+        request: &Arc<crate::compile::KotlinDiagnosticRequest>,
+        environment: Arc<crate::compile::KotlinDiagnosticEnvironment>,
+        snapshot: crate::compile::CompilerApiSnapshot,
+    ) -> Result<(), String> {
+        if request.check_live().is_err()
+            || environment
+                .invalid
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !self.kotlin_overlay_matches(request)
+            || !self
+                .kotlin_diagnostic_tickets
+                .get(&request.scope)
+                .is_some_and(|ticket| {
+                    Arc::ptr_eq(&ticket.request, request)
+                        && ticket.analysis_generation == self.analysis_generation
+                        && self
+                            .project_model
+                            .as_ref()
+                            .is_some_and(|model| Arc::ptr_eq(model, &ticket.model))
+                })
+        {
+            return Err("compiler-api-inputs-superseded".into());
+        }
+        if self
+            .compiler_api_environments
+            .get(&request.scope)
+            .is_some_and(|previous| !Arc::ptr_eq(previous, &environment))
+        {
+            self.analysis_extensions.clear_compiler_api(&self.index);
+        }
+        self.analysis_extensions
+            .accept_compiler_api(&self.index, snapshot)?;
+        self.compiler_api_environments
+            .insert(request.scope.clone(), environment);
+        if self.analysis_extensions.publish(&mut self.index) {
+            self.index_revision = self.index_revision.wrapping_add(1).max(1);
+        }
+        Ok(())
     }
 
     fn kotlin_overlay_matches(&self, request: &crate::compile::KotlinDiagnosticRequest) -> bool {

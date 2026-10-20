@@ -8,6 +8,48 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Latest120: faster development builds; outstanding functional gaps
 
+The joint120-2 integration passes the full workspace:1729 passed,0 failed,
+8 ignored. Release build also passes;564 guarded inputs stay unchanged.
+The copied release SHA256 is
+a099aeee9084d54e277a81db8c765bb67053ef6256c044e19f5dbf14437d8f44.
+The first integration exposed a duplicate source-hierarchy walk; the fix reuses
+already collected candidates without changing the cycle-test expectation.
+Evidence: native-integrated120-2/{workspace-summary.json,receipt.json,main-ready.json}.
+
+With that release, serialization editor6 passes5/6 original first-response
+checks: Kotlin golden/partial/dot and Java golden/partial pass. Java dangling-dot
+still returns an unknown receiver and is the next focused fix. Actual backend
+class output supplies Noarg's constructor; scoped private watches avoid overlay
+self-invalidation. Language-aware parsing fixes Java source normalization and
+preserves accepted Kotlin API through Java body edits. Shutdown is clean.
+Evidence: serialization120/editor6/receipt.json and
+serialization120/editor6-harness/artifacts/corpus-results.json. These selected
+plugin results do not establish arbitrary compiler-plugin support.
+
+The Java dangling-dot recovery fix now retains the original owner's independently
+verified value-namespace proof when recovered declaration headers still match.
+It does not promote that proof to complete source members. The actual FULL-output
+host regression covers partial/dot with and without this proof; Root reruns it
+successfully. All-workspace formatting also passes. Native six-case verification
+with a binary containing this last fix remains pending. Evidence:
+serialization120/{dot-host-focused-receipt.json,root-dot-check.log}.
+
+The release's six additional library cases pass5/6: Patchy and TypeTools both
+languages, and Kotlin Pair.first. Java Pair.getFirst completion and goto both
+fail despite actual Java compilation succeeding. The ordinary Kotlin constructor
+property is indexed, but its Java getter projection is missing; this is a real
+coverage gap, not evidence that missing source jars alone remove all library APIs.
+Evidence: cem-startup120/coverage/native-release1/harness/artifacts/corpus-results.json.
+
+Current-release five-project runs have closed Moshi9/9, OkHttp10/10 and
+Retrofit12/12, first attempts with clean shutdown and stable inputs. Gradle and
+Spring are still running. LiveGradle's first run performs a successful phase0
+build but reaches the harness's fixed120s build wait before any of its90 semantic
+checks. It is operationally incomplete, not90 semantic failures. The harness
+now waits for actual build exit; outer owned-process cleanup and semantic
+expectations remain unchanged. A separate rerun follows the remaining corpus runs.
+Evidence: oracle120/joint-{m,o,r,l}1/{receipt.json,operational-audit.json}.
+
 Commit a886d2b reduces dev debug information while retaining workspace panic
 file/line data. Release optimization and linker settings are unchanged. Three
 local edit/test samples have medians5.819s before and4.646s after; the same
@@ -63,10 +105,13 @@ The shared5 integration then regresses to0/6 (six received first-response
 mismatches, zero unmeasured); Root verifies its raw report. Actual javac rejects
 the observed Kotlin headers because Noarg's real generated NeedsLabel()
 constructor is absent from the KAPT3 header output. No Java namespace authority
-is published. Preserve independently verified Kotlin positives when the Java
-side is unavailable; actual backend generation for the selected compiler plugins
-is the next fix. Cold model/JDK rebuild and a superseded API ticket are separate
-observations, not warm timing evidence. Shutdown also fails to finish after its
+is published. The code retains independently verified Kotlin positives when the
+Java side fails; it does not discard them merely for a Java error. Another
+observed invalidation occurs when long-lived input watches include owned overlay
+lombok.config paths: removing the temporary overlay invalidates its own accepted
+environment before publication. The rejection precedes shutdown. Scoped private
+watches and actual backend generation for the selected compiler plugins were
+subsequently implemented; see editor6 above. Cold model/JDK rebuilding is not warm timing evidence. Shutdown also fails to finish after its
 response/exit notification. Evidence: serialization120/editor4/receipt.json and
 serialization120/editor4-harness/artifacts/corpus-results.json.
 
@@ -98,18 +143,35 @@ the actual read/write nested parameters, with16 binary-Java tests passing and
 three actual javac super calls compiling. Three native partial-completion
 requests match on their first response, but that run needs forced shutdown and
 is operationally incomplete. Full original CEM release validation remains
-pending. See
+pending. The shared5 original CEM main run now passes its original eight checks
+plus one new Float inlay assertion on five first-attempt RPCs. Root verifies its
+raw report (9 matched, zero mismatched/unmeasured, clean shutdown). The new
+unsaved subclass and observed CRLF wire buffer independently compile against
+the actual111-entry Kotlin2.4/JDK21 classpath. Original incomplete probes also
+pass:17/17 assertions, bringing the two CEM stages to26 assertions across11
+first-attempt requests, with clean shutdown. These are shared5 dev results;
+joint120-2 release CEM and additional-five-project reruns are now assigned.
+Evidence: cem-startup120/editor-original19-1/cem-working-copy/artifacts/corpus-results.json
+and cem-startup120/inlay-wire-control/receipt.json. See
 docs/fork-cem-startup120.md for exact scope and evidence.
 
-The shutdown problem is reproduced by two shared5 native runs after
-server.serve.closed; its cause is still being tested. No timing threshold is
-extended and no forced process exit is counted as clean shutdown. Evidence:
-cem-startup120/parameter-summary.json. The current release integration has not
-started while the compiler and lifecycle fixes remain in progress.
+The shutdown problem came from cancelled dependency-index workers continuing
+to parse and cache the stdlib. Existing generation checks now stop source
+resolution and per-file parsing, without publishing a partial cache. The same
+stdin-open reproduction changes from17.047s to125ms natural exit; the original
+three native completion probes then pass with clean shutdown. These are focused
+dev observations, not release runtime benchmarks. Evidence:
+lifecycle120/{green2/receipt.json,summary.json} and
+cem-startup120/parameter-native-fixed/receipt.json.
 
-Additional-five-project oracle checks continue. The closed current IDEA
-evidence covers41/50 original cases;
-Gradle's9 remain pending. CEM's warm UI probe receives IDEA's synthetic-property
+The additional-five-project IDEA oracle has closed all50 original requests:
+43 qualified matches, one empty negative without its required positive control,
+six unmeasured completion requests and zero measured semantic mismatches.
+Gradle's two goto requests match; its six completions reach the unchanged5s
+deadline and return cancellation, not useful late results. The empty unknown-
+receiver result is not counted as a qualified pass. These IDEA-side deadlines
+do not establish a ktlsp semantic failure or a whole-root parity result.
+CEM's warm UI probe receives IDEA's synthetic-property
 label breakSpeed (from getBreakSpeed()), failing the unchanged exact-method-label
 expectation on its first cycle;30 later cycles are unrun. Cold import/index
 readiness attempts are separately unmeasured, not semantic passes. No comparable

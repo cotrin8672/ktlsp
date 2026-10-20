@@ -392,7 +392,7 @@ fn walk_declaration_container<'tree>(
                 }
                 // Do NOT recurse into the body (only locals live there).
             }
-            "field_declaration" => {
+            "field_declaration" | "constant_declaration" => {
                 let flags = crate::indexer::source_member_flags(child, src, true);
                 let value_type = child
                     .child_by_field_name("type")
@@ -517,6 +517,41 @@ pub(crate) fn declaration_headers_complete(tree: &Tree, src: &str) -> bool {
         );
     }
     true
+}
+
+/// Exact declaration text for a compiler profile independently proved insensitive to body edits.
+pub(crate) fn declaration_header_text(tree: &Tree, src: &str) -> Option<String> {
+    if !declaration_headers_complete(tree, src) {
+        return None;
+    }
+    let mut pending = vec![tree.root_node()];
+    let mut bodies = Vec::new();
+    while let Some(node) = pending.pop() {
+        let body = matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration"
+        )
+        .then(|| node.child_by_field_name("body"))
+        .flatten();
+        if let Some(body) = body {
+            bodies.push(body.byte_range());
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .filter(|child| Some(*child) != body),
+        );
+    }
+    bodies.sort_by_key(|body| body.start);
+    let mut result = String::new();
+    let mut offset = 0;
+    for body in bodies {
+        result.push_str(src.get(offset..body.start)?);
+        result.push_str("{}");
+        offset = body.end;
+    }
+    result.push_str(src.get(offset..)?);
+    Some(result)
 }
 
 fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<TypeRef> {
@@ -3657,6 +3692,11 @@ fn receiver_type(
             let (receiver, kind) =
                 java_member_receiver(index, file, src, tree, object, initializer_depth + 1)?;
             let name = node_text(object.child_by_field_name("field")?, src);
+            if kind != ktcore::jvm::ReceiverKind::Unknown {
+                if let Some(ty) = ktcore::jvm::compiler_field_type(index, &receiver, name) {
+                    return Some(ty);
+                }
+            }
             if let Some(ty) = ktcore::members::java_array_member_type(
                 &receiver,
                 name,
@@ -3996,6 +4036,26 @@ fn java_unshadowed_type_receiver(
             }
             // A malformed earlier local declaration can hide a value with this type's name.
             if before.is_error() || before.is_missing() {
+                return None;
+            }
+            if matches!(
+                before.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+            ) && name_field(before).is_some_and(|name| node_text(name, src) == shadow_name)
+                && before.parent().is_some_and(|scope| {
+                    let mut current = Some(object);
+                    while let Some(node) = current {
+                        if node == scope {
+                            return true;
+                        }
+                        current = node.parent();
+                    }
+                    false
+                })
+            {
                 return None;
             }
             let mut cursor = before.walk();

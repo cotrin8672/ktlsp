@@ -3,6 +3,11 @@
 These small classfiles were compiled from the paired sources, not assembled by the decoder under
 test. `hashes.json` records the exact inputs. Tests read bytes only; no JVM or compiler is needed.
 
+`defaultfixture/Overlay.class` was compiled from its paired source with Oracle JDK 21.0.3
+`javac --release 17 -encoding UTF-8 -proc:none -sourcepath ""` into an external output directory.
+It exercises a generic default method, a static method/constant, a private helper, and a
+nested enum parameter. Missing or contradictory InnerClasses records keep that member unavailable.
+
 ## Generic Java declarations
 
 `genericfixture/{Item,Other,Box,Child,Holder,Lexical}.class` were emitted by Oracle JDK 21.0.3

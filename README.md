@@ -262,6 +262,11 @@ and pass the printed project path as `--root`.
 For binary-library generics, use `dev/corpus/binary-java-generics.json` and
 `dev/corpus/fixtures/binary-java-jar/binarygenerics/probes.lua` as EXTRA probes.
 These also check instantiated nonstatic owners, exact navigation and incomplete receivers.
+Use `dev/corpus/binary-java-defaults.json` with the same fixture to check Java/Kotlin
+completion through binary default interfaces and inherited protected methods.
+With the original CEM corpus, `KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_cem_inference.lua"`
+also checks an exact `Float` inlay on a separate compiler-checked unsaved subclass.
+It retains the Java compiler controls and leaves the original corpus buffers unchanged.
 The same EXTRA probe selects CEM's existing `ServerGamePacketListenerImplMixin.java`
 when CEM sources are present. That probe tests an ordinary unused-import error;
 it does not establish Mixin semantic support. Its current gap is tracked in

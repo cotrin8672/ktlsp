@@ -278,5 +278,15 @@
     "file": "outerfixture/SpecialItem.class",
     "sha256": "977d8f3c062f97069a7447bda1ab8e286689e9a1089e320980d03d3af6313e83",
     "bytes": 287
+  },
+  {
+    "file": "defaultfixture/Overlay.class",
+    "sha256": "54b3513257309ffa82b0d602289bc3d0dc3611c5a3508804fe12c6fa809780d1",
+    "bytes": 581
+  },
+  {
+    "file": "create6010/DrillBlockEntity.class",
+    "sha256": "3a8771550ae144bdfb7e791b5c129a4d0fb0d7772113eda0d3765ba698d9c261",
+    "bytes": 7131
   }
 ]

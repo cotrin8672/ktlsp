@@ -1,6 +1,6 @@
 # Create 6.0.10-280 classfile regression fixtures
 
-These two unmodified classfiles come from the selected Maven artifact
+These three unmodified classfiles come from the selected Maven artifact
 `com.simibubi.create:create-1.21.1:6.0.10-280`.
 The paired `../sources/create6010/BlockBreakingKineticBlockEntity.java` is
 the exact source retained by the earlier dependency-source editor run.
@@ -16,6 +16,9 @@ Classfile byte identities and LF-normalized source SHA-256:
 - `../sources/create6010/BlockBreakingKineticBlockEntity.java`: `6b0b21f66a7f08bf43ee7eb8d71843d8b21e08446045da799ed10b70515105c7`
 
 - `KineticBlockEntity.class`: `3bce80f18d09ccff5e6c1b5cdbeeb2793f0a507006879b267148cde0df443572`
+
+`DrillBlockEntity.class` adds the real intermediate superclass used by CEM;
+its byte identity is pinned in `../hashes.json`. No paired Drill source is claimed.
 
 The source hash uses LF line endings; a Windows CRLF checkout has SHA-256
 `036438f533f84d72cbf46f298182894f1a2db0846d2ba3ff58974dde3c75d780`.

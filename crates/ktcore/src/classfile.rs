@@ -224,6 +224,45 @@ pub fn method_types(
     ))
 }
 
+/// Project erased symbolic references whose public static nested names are explicitly recorded.
+/// This does not prove that the referenced declaration exists or is accessible on the classpath.
+/// Captured/nonstatic owners and missing or contradictory identities remain unsupported.
+pub fn method_types_with_inner_classes(
+    descriptor: &str,
+    inner_classes: &[InnerClassFacts],
+) -> Option<(Vec<crate::types::TypeRef>, Option<crate::types::TypeRef>)> {
+    if let Some(types) = method_types(descriptor) {
+        return Some(types);
+    }
+    let mut signature = descriptor.to_string();
+    let mut seen = HashSet::new();
+    for row in inner_classes {
+        let token = format!("L{};", row.inner);
+        if !descriptor.contains(&token) {
+            continue;
+        }
+        let outer = row.outer.as_deref()?;
+        let name = row.name.as_deref()?;
+        if !seen.insert(row.inner.as_ref())
+            || !matches!(
+                row.access_flags,
+                0x0009 | 0x0019 | 0x0409 | 0x0609 | 0x2609 | 0x4009 | 0x4019 | 0x4409
+            )
+            || outer.contains('$')
+            || name.contains('$')
+            || !internal_name(outer)
+            || !unqualified_name(name)
+            || row.inner.as_ref() != format!("{outer}${name}")
+        {
+            return None;
+        }
+        signature = signature.replace(&token, &format!("L{outer}.{name};"));
+    }
+    // The existing Signature parser validates identifiers and exact erasure against the input.
+    let projected = signature::method_signature(&signature, descriptor, &[])?;
+    Some((projected.parameters, projected.returns))
+}
+
 /// Count descriptor parameters without claiming that their binary names are source types.
 pub fn method_parameter_count(descriptor: &str) -> Option<u8> {
     let encoded = noak::MString::from(descriptor);

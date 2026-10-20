@@ -232,6 +232,20 @@ pub struct CompiledClassHandle {
     owner: TypeId,
     revision: u64,
     class: Arc<crate::classfile::ClassFileFacts>,
+    kotlin_methods: Option<BTreeSet<String>>,
+    value_namespace: bool,
+}
+
+/// Current compiler observations, anchored to an authored owner by the host. A frontend
+/// descriptor proves a non-null Kotlin callable; classfile visibility alone only proves the JVM surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompilerClassInput {
+    pub class: Arc<crate::classfile::ClassFileFacts>,
+    pub kotlin_methods: BTreeSet<String>,
+    pub companion: bool,
+    /// A fresh complete Javac observation under a host-verified body-insensitive profile.
+    /// This closes only the value namespace of this source owner, never its method inventory.
+    pub value_namespace: bool,
 }
 
 #[derive(Clone)]
@@ -246,6 +260,21 @@ struct CompiledCallable {
     class: Arc<crate::classfile::ClassFileFacts>,
     method: usize,
     facts: crate::jvm::CallableFacts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompiledField {
+    owner: TypeId,
+    class: Arc<crate::classfile::ClassFileFacts>,
+    field: usize,
+    ty: crate::types::TypeRef,
+    companion: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompiledValueNamespace {
+    owner: TypeId,
+    class: Arc<crate::classfile::ClassFileFacts>,
 }
 
 impl TypeId {
@@ -391,9 +420,41 @@ pub struct ContributionSet {
     sites: Vec<BoundSite>,
     diagnostics: Vec<Diagnostic>,
     compiled: Vec<CompiledCallable>,
+    compiled_fields: Vec<CompiledField>,
+    compiled_value_namespaces: Vec<CompiledValueNamespace>,
 }
 
 impl ContributionSet {
+    pub fn compiled_value_namespace(
+        &self,
+        owner: &Def,
+    ) -> Option<&crate::classfile::ClassFileFacts> {
+        self.compiled_value_namespaces
+            .iter()
+            .find(|namespace| namespace.owner.definition() == owner)
+            .map(|namespace| namespace.class.as_ref())
+    }
+    pub(crate) fn compiled_fields(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &Def,
+            &crate::classfile::ClassFileFacts,
+            &crate::classfile::MemberFacts,
+            &crate::types::TypeRef,
+            bool,
+        ),
+    > {
+        self.compiled_fields.iter().map(|field| {
+            (
+                field.owner.definition(),
+                field.class.as_ref(),
+                &field.class.fields[field.field],
+                &field.ty,
+                field.companion,
+            )
+        })
+    }
     pub(crate) fn compiled_callables(
         &self,
     ) -> impl Iterator<
@@ -544,6 +605,7 @@ struct SourceFacts {
     declarations: Vec<source::SourceDeclaration>,
     compiled_revision: u64,
     compiled: Option<(TypeId, Arc<crate::classfile::ClassFileFacts>)>,
+    compiler_classes: Vec<(TypeId, CompilerClassInput)>,
 }
 
 #[derive(Clone)]
@@ -629,7 +691,8 @@ impl ExtensionStore {
     pub fn clear_compiled_inputs(&mut self) {
         let mut changed = Vec::new();
         for (file, source) in &mut self.sources {
-            if source.compiled.take().is_some() {
+            if source.compiled.take().is_some() || !source.compiler_classes.is_empty() {
+                source.compiler_classes.clear();
                 self.next_generation += 1;
                 source.compiled_revision = self.next_generation;
                 changed.push(file.clone());
@@ -710,6 +773,101 @@ impl ExtensionStore {
         let source = self.sources.get_mut(file).unwrap();
         source.compiled_revision = self.next_generation;
         source.compiled = replacement;
+        self.remove_stale_sets();
+        for (provider, state) in &self.providers {
+            if state.enabled {
+                self.dirty.insert((provider.clone(), file.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Positive compiler API observations share source/model/read-set generations with compiled
+    /// Java inputs. Only reciprocal public static nested identities can extend a source owner.
+    pub fn replace_compiler_classes(
+        &mut self,
+        index: &dyn InferenceIndex,
+        owner: &TypeId,
+        classes: Vec<CompilerClassInput>,
+    ) -> Result<(), ContractError> {
+        if owner.declaration.host != self.host {
+            return Err(ContractError::ForeignIdentity);
+        }
+        let file = &owner.definition().file;
+        let source = self.sources.get(file).ok_or(ContractError::MissingSource)?;
+        if source.generation != owner.declaration.generation
+            || owner.model_generation != self.model_generation
+        {
+            return Err(ContractError::Stale);
+        }
+        let scoped = ScopedIndex::new(index, file);
+        let entries = scoped.entries_for_file(file);
+        let entry = entries
+            .iter()
+            .find(|entry| definition(entry) == *owner.definition())
+            .ok_or(ContractError::NotIndexedDeclaration)?;
+        let origin = scoped
+            .origin_facts()
+            .and_then(|facts| facts.file_origin(file))
+            .filter(|origin| origin.project_scope.is_some())
+            .ok_or(ContractError::ForeignIdentity)?;
+        if !(file.ends_with(".kt") || file.ends_with(".java"))
+            || entry.sym.container.is_some()
+            || !entry.sym.type_params.is_empty()
+            || qualified_type_name(entry) != owner.qualified_name
+        {
+            return Err(ContractError::NotIndexedDeclaration);
+        }
+        let root = owner.qualified_name.replace('.', "/");
+        let Some(parent) = classes
+            .iter()
+            .find(|input| input.class.identity.internal_name == root)
+        else {
+            return Err(ContractError::MissingSource);
+        };
+        let mut names = BTreeSet::new();
+        for input in &classes {
+            let class = &input.class;
+            if !names.insert(&class.identity.internal_name)
+                || class.identity.origin_id != origin.origin_id
+                || !matches!(
+                    class.identity.input,
+                    crate::jvm::InputIdentity::Binary { .. }
+                )
+            {
+                return Err(ContractError::ForeignIdentity);
+            }
+            if class.identity.internal_name != root {
+                let Some(inner) = class
+                    .inner_classes
+                    .iter()
+                    .find(|inner| inner.inner.as_ref() == class.identity.internal_name)
+                else {
+                    return Err(ContractError::ForeignIdentity);
+                };
+                if inner.outer.as_deref() != Some(root.as_str())
+                    || inner.access_flags & 0x0009 != 0x0009
+                    || !parent.class.inner_classes.contains(inner)
+                    || inner
+                        .name
+                        .as_ref()
+                        .is_none_or(|name| format!("{root}${name}") != class.identity.internal_name)
+                {
+                    return Err(ContractError::ForeignIdentity);
+                }
+            }
+        }
+        let replacement: Vec<_> = classes
+            .into_iter()
+            .map(|input| (owner.clone(), input))
+            .collect();
+        if source.compiler_classes == replacement {
+            return Ok(());
+        }
+        self.next_generation += 1;
+        let source = self.sources.get_mut(file).unwrap();
+        source.compiled_revision = self.next_generation;
+        source.compiler_classes = replacement;
         self.remove_stale_sets();
         for (provider, state) in &self.providers {
             if state.enabled {
@@ -929,6 +1087,7 @@ impl ExtensionStore {
                 declarations: Vec::new(),
                 compiled_revision: self.next_generation,
                 compiled: None,
+                compiler_classes: Vec::new(),
             },
         );
         if namespace_changed {
@@ -959,6 +1118,7 @@ impl ExtensionStore {
             self.next_generation += 1;
             source.compiled_revision = self.next_generation;
             source.compiled = None;
+            source.compiler_classes.clear();
         }
         self.namespace_coverage = unknown(IncompleteReason::IncompleteScope);
         self.remove_stale_sets();
@@ -1142,6 +1302,136 @@ pub struct ReadSession<'a> {
 }
 
 impl ReadSession<'_> {
+    pub fn compiler_classes(
+        &mut self,
+        owner: &TypeId,
+    ) -> Result<Vec<CompiledClassHandle>, ContractError> {
+        self.check_type(owner)?;
+        let source = &self.store.sources[&owner.definition().file];
+        self.reads
+            .compiled
+            .insert(owner.definition().file.clone(), source.compiled_revision);
+        Ok(source
+            .compiler_classes
+            .iter()
+            .filter(|(anchor, _)| anchor == owner)
+            .map(|(_, input)| CompiledClassHandle {
+                session: self.session,
+                owner: owner.clone(),
+                revision: source.compiled_revision,
+                class: input.class.clone(),
+                kotlin_methods: Some(input.kotlin_methods.clone()),
+                value_namespace: input.value_namespace,
+            })
+            .collect())
+    }
+
+    /// The host's current frontend descriptor and the classfile's checked Signature must agree.
+    pub fn admit_compiler_class(
+        &mut self,
+        handle: &CompiledClassHandle,
+    ) -> Result<(), ContractError> {
+        self.check_compiled_class(handle)?;
+        let Some(surface) = &handle.kotlin_methods else {
+            return Err(ContractError::ForeignIdentity);
+        };
+        let class = &handle.class;
+        if handle.value_namespace {
+            self.set
+                .compiled_value_namespaces
+                .push(CompiledValueNamespace {
+                    owner: handle.owner.clone(),
+                    class: class.clone(),
+                });
+        }
+        if class.access_flags & 0x0001 == 0 || class.signature.is_some() {
+            return Ok(());
+        }
+        for (method, raw) in class.methods.iter().enumerate() {
+            if raw.access_flags & 0x0001 == 0
+                || raw.access_flags & (0x0040 | 0x0080 | 0x1000) != 0
+                || raw.name.starts_with('<')
+                || !surface.contains(&format!("{}{}", raw.name, raw.descriptor))
+            {
+                continue;
+            }
+            let types = match &raw.signature {
+                Some(signature) => {
+                    crate::classfile::signature::method_signature(signature, &raw.descriptor, &[])
+                        .filter(|signature| signature.type_parameters.is_empty())
+                        .map(|signature| (signature.parameters, signature.returns))
+                }
+                None => crate::classfile::method_types(&raw.descriptor),
+            };
+            let Some((params, Some(return_type))) = types else {
+                continue;
+            };
+            self.set.compiled.push(CompiledCallable {
+                owner: handle.owner.clone(),
+                class: class.clone(),
+                method,
+                facts: crate::jvm::CallableFacts {
+                    name: raw.name.to_string(),
+                    params,
+                    return_type,
+                    type_params: Vec::new(),
+                    definition: None,
+                    fixed_name: None,
+                    jvm_name_annotation: None,
+                    is_static: raw.access_flags & 0x0008 != 0,
+                },
+            });
+        }
+        for (field, raw) in class.fields.iter().enumerate() {
+            if raw.access_flags & 0x0019 != 0x0019
+                || raw.access_flags & 0x1000 != 0
+                || raw.signature.is_some()
+            {
+                continue;
+            }
+            // Nested descriptors are usable only through the reciprocal class inventory above.
+            let target = raw
+                .descriptor
+                .strip_prefix('L')
+                .and_then(|d| d.strip_suffix(';'));
+            let Some(target) = target else {
+                continue;
+            };
+            let source = &self.store.sources[&handle.owner.definition().file];
+            if !source
+                .compiler_classes
+                .iter()
+                .any(|(_, input)| input.class.identity.internal_name == target)
+            {
+                continue;
+            }
+            let Some((package, binary)) = target.rsplit_once('/') else {
+                continue;
+            };
+            let Some((container, name)) = binary.rsplit_once('$') else {
+                continue;
+            };
+            self.set.compiled_fields.push(CompiledField {
+                owner: handle.owner.clone(),
+                class: class.clone(),
+                field,
+                companion: source.compiler_classes.iter().any(|(_, input)| {
+                    input.class.identity.internal_name == target && input.companion
+                }),
+                ty: crate::types::TypeRef {
+                    name: name.into(),
+                    qualification: Some(format!(
+                        "{}.{}",
+                        package.replace('/', "."),
+                        container.replace('$', ".")
+                    )),
+                    ..Default::default()
+                },
+            });
+        }
+        Ok(())
+    }
+
     pub fn compiled_class(
         &mut self,
         owner: &TypeId,
@@ -1158,6 +1448,8 @@ impl ReadSession<'_> {
                     owner: owner.clone(),
                     revision: source.compiled_revision,
                     class: class.clone(),
+                    kotlin_methods: None,
+                    value_namespace: false,
                 })
             }
             _ => unknown(IncompleteReason::MissingFacts),
@@ -1265,9 +1557,14 @@ impl ReadSession<'_> {
         self.check_type(&class.owner)?;
         let source = &self.store.sources[&class.owner.definition().file];
         if source.compiled_revision != class.revision
-            || !source.compiled.as_ref().is_some_and(|(owner, current)| {
+            || !(source.compiled.as_ref().is_some_and(|(owner, current)| {
                 owner == &class.owner && current.identity == class.class.identity
-            })
+            }) || source.compiler_classes.iter().any(|(owner, input)| {
+                owner == &class.owner
+                    && input.class.identity == class.class.identity
+                    && class.kotlin_methods.as_ref() == Some(&input.kotlin_methods)
+                    && class.value_namespace == input.value_namespace
+            }))
         {
             return Err(ContractError::Stale);
         }

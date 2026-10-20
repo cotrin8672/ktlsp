@@ -1687,7 +1687,18 @@ fn infer_identifier(
     }
     // 2. A bare identifier naming a known type -> that type (companion / enum-entry / static access).
     if !index.lookup_type(name).is_empty() {
-        return resolve_type_name(index, name, ctx, false);
+        let ty = resolve_type_name(index, name, ctx, false);
+        if ident
+            .parent()
+            .filter(|parent| parent.kind() == "navigation_expression")
+            .and_then(|parent| parent.named_child(1))
+            .is_some_and(|selector| {
+                crate::jvm::compiler_field_type(index, &ty, node_text(selector, src)).is_some()
+            })
+        {
+            return ty;
+        }
+        return crate::jvm::compiler_companion_type(index, &ty).unwrap_or(ty);
     }
     // 3. A visible cross-file top-level property of that name.
     if let Some(tr) = top_level_property_type(index, name, ctx) {
@@ -2892,6 +2903,31 @@ fn member_type(
     };
     if let Some(result) = members::kotlin_java_array_member_type(recv_ty, name, &usage) {
         return result;
+    }
+    if !want_function {
+        if let Some(ty) = crate::jvm::compiler_field_type(index, recv_ty, name) {
+            return ty;
+        }
+    } else if let MemberUse::Call(arguments) = &usage {
+        let jvm_candidates =
+            crate::jvm::member_candidates_from(index, recv_ty, name, ctx, 0, &candidates.members);
+        if jvm_candidates.iter().any(|candidate| {
+            matches!(
+                candidate,
+                crate::jvm::CallableCandidate::Jvm {
+                    owner: crate::jvm::JvmOwner::Compiled { .. },
+                    ..
+                }
+            )
+        }) {
+            let selected =
+                crate::jvm::select_call(index, recv_ty, jvm_candidates, name, arguments, ctx);
+            if let [candidate] = selected.consumable_candidates() {
+                return crate::jvm::projected_return_type_in_context(index, *candidate, ctx)
+                    .unwrap_or(Type::Unknown);
+            }
+            return Type::Unknown;
+        }
     }
     let group = candidates.select(index, recv_ty, &usage, ctx);
     selected_member_type(

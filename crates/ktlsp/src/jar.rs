@@ -1013,20 +1013,9 @@ fn java_declaration_stub_scoped(
     {
         return None;
     }
-    // A partial interface surface could hide a competing default super implementation.
-    // Start with exact public abstract methods; other interface forms remain unavailable.
     if is_interface
         && (class.access_flags != PUBLIC | INTERFACE | ABSTRACT
-            || class.super_name.as_deref() != Some("java/lang/Object")
-            || !selected_sdk
-                && (!class.fields.is_empty()
-                    || class.methods.iter().any(|method| {
-                        method.access_flags != PUBLIC | ABSTRACT
-                            || method
-                                .attribute_names
-                                .iter()
-                                .any(|name| name.as_ref() != "Signature")
-                    })))
+            || class.super_name.as_deref() != Some("java/lang/Object"))
     {
         return None;
     }
@@ -1128,6 +1117,15 @@ fn java_declaration_stub_scoped(
     let mut fields = std::collections::BTreeMap::new();
     for field in &class.fields {
         if field.access_flags & (PUBLIC | 0x0004) == 0
+            || is_interface && field.access_flags != PUBLIC | 0x0008 | 0x0010
+            || is_interface
+                && !selected_sdk
+                && field.attribute_names.iter().any(|attribute| {
+                    !matches!(
+                        attribute.as_ref(),
+                        "ConstantValue" | "Signature" | "Deprecated"
+                    )
+                })
             || field.access_flags & 0x0005 == 0x0005
             || field.access_flags & !(PUBLIC | 0x0004 | 0x0008 | 0x0010 | 0x0040 | 0x0080) != 0
             || field.access_flags & 0x0050 == 0x0050
@@ -1208,6 +1206,15 @@ fn java_declaration_stub_scoped(
     let mut methods = std::collections::BTreeMap::new();
     for method in &class.methods {
         if method.access_flags & (PUBLIC | 0x0004) == 0
+            || is_interface && !matches!(method.access_flags, 0x0401 | 0x0001 | 0x0009)
+            || is_interface
+                && !selected_sdk
+                && method.attribute_names.iter().any(|attribute| {
+                    !matches!(
+                        attribute.as_ref(),
+                        "Code" | "Signature" | "Exceptions" | "MethodParameters" | "Deprecated"
+                    )
+                })
             || method.access_flags & 0x0005 == 0x0005
             || method.access_flags
                 & !(PUBLIC
@@ -1271,7 +1278,10 @@ fn java_declaration_stub_scoped(
         };
         let (parameters, returns) = match generic_method {
             Some(signature) => (signature.parameters, signature.returns),
-            None => match ktcore::classfile::method_types(&method.descriptor) {
+            None => match ktcore::classfile::method_types_with_inner_classes(
+                &method.descriptor,
+                &class.inner_classes,
+            ) {
                 Some(types) => types,
                 None => continue,
             },
@@ -1320,12 +1330,11 @@ fn java_declaration_stub_scoped(
         } else {
             "protected"
         };
-        let default_ =
-            if selected_sdk && is_interface && method.access_flags & (0x0008 | ABSTRACT) == 0 {
-                "default "
-            } else {
-                ""
-            };
+        let default_ = if is_interface && method.access_flags & (0x0008 | ABSTRACT) == 0 {
+            "default "
+        } else {
+            ""
+        };
         let declaration = if method.access_flags & ABSTRACT != 0 {
             format!(
                 "    {access} abstract {generic_declaration}{returns} {}({});\n",
@@ -1341,9 +1350,7 @@ fn java_declaration_stub_scoped(
         };
         methods.insert(key, declaration);
     }
-    if is_interface && !selected_sdk && methods.len() != class.methods.len() {
-        return None;
-    }
+    // Keep the interface identity and hierarchy; unsupported members block only their own names.
     let mut unavailable_fields = std::collections::BTreeSet::new();
     for field in &class.fields {
         if is_java_identifier(&field.name)
@@ -2174,11 +2181,234 @@ mod tests {
             invalid.access_flags = flags;
             assert!(java_class_stub(&invalid).is_none());
         }
-        for (flags, signature) in [(0x0001, None), (0x0401, Some("()TT;"))] {
-            let mut unsupported = class.clone();
-            unsupported.methods[0].access_flags = flags;
-            unsupported.methods[0].signature = signature.map(Into::into);
-            assert!(java_class_stub(&unsupported).is_none());
+        let mut default = class.clone();
+        default.methods[0].access_flags = 0x0001;
+        assert!(java_class_stub(&default)
+            .unwrap()
+            .contains("default void markVirtual()"));
+        let mut unsupported = class.clone();
+        unsupported.methods[0].signature = Some("()TT;".into());
+        let (source, unavailable) = java_class_stub_facts(&unsupported).unwrap();
+        assert!(!source.contains(" markVirtual("));
+        assert!(unavailable.iter().any(|(name, _, _)| name == "markVirtual"));
+    }
+
+    #[test]
+    fn binary_java_default_interface_keeps_hierarchy_and_name_specific_unknowns() {
+        use ktcore::extensions::{Dispatch, Visibility};
+        let source = "package defaultfixture; interface Implicit { int VALUE = 1; }";
+        let tree = crate::java::JavaParser::new().parse(source);
+        let symbols = crate::java::extract_symbols(&tree, source);
+        let constant = symbols
+            .iter()
+            .find(|symbol| symbol.name == "VALUE")
+            .unwrap();
+        assert_eq!(constant.source_member.dispatch(), Some(Dispatch::Static));
+        assert_eq!(
+            constant.source_member.visibility(),
+            Some(Visibility::Public)
+        );
+        assert_eq!(constant.value_type.as_ref().unwrap().name, "int");
+        let original = ktcore::classfile::decode(
+            "javac:defaultfixture",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/defaultfixture/Overlay.class"),
+        )
+        .unwrap();
+        let (complete, unavailable) = java_class_stub_facts(&original).unwrap();
+        assert!(complete.contains("void writeSafe(java.lang.Thread.State p0)"));
+        assert!(!unavailable.iter().any(|(name, _, _)| name == "writeSafe"));
+        for blocked in [false, true] {
+            let mut class = original.clone();
+            // A missing identity, rather than the enum type itself, makes this name unavailable.
+            class
+                .inner_classes
+                .retain(|row| row.inner.as_ref() != "java/lang/Thread$State");
+            if blocked {
+                class
+                    .methods
+                    .iter_mut()
+                    .find(|method| method.name.as_ref() == "writeSafe")
+                    .unwrap()
+                    .name = "getBreakSpeed".into();
+            }
+            let (source, unavailable) = java_class_stub_facts(&class).unwrap();
+            assert!(source.contains("public interface Overlay"), "{source}");
+            assert!(
+                source.contains("default <T extends java.lang.Object> T tooltip(T p0)"),
+                "{source}"
+            );
+            assert!(
+                source.contains("public static int fromStatic()"),
+                "{source}"
+            );
+            assert!(!source.contains(" helper("));
+            let mut java = crate::java::JavaParser::new();
+            let tree = java.parse(&source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let mut symbols = crate::java::extract_symbols(&tree, &source);
+            for (name, dispatch) in [
+                ("tooltip", Dispatch::Instance),
+                ("fromStatic", Dispatch::Static),
+                ("MARKER", Dispatch::Static),
+            ] {
+                let symbol = symbols.iter().find(|symbol| symbol.name == name).unwrap();
+                assert_eq!(symbol.source_member.dispatch(), Some(dispatch));
+                assert_eq!(symbol.source_member.visibility(), Some(Visibility::Public));
+            }
+            assert!(
+                source.contains("public static final int MARKER;"),
+                "{source}"
+            );
+            let unknown = if blocked {
+                "getBreakSpeed"
+            } else {
+                "writeSafe"
+            };
+            assert!(unavailable.iter().any(|(name, _, _)| name == unknown));
+            symbols
+                .iter_mut()
+                .find(|symbol| symbol.name == "Overlay")
+                .unwrap()
+                .unavailable_members = Some(Box::new(unavailable));
+            let mut ws = crate::workspace::Workspace::new();
+            ws.index
+                .replace_file("Overlay.java", symbols, crate::index::Tier::Durable);
+            ws.open("Base.java", "package defaultfixture; public class Base { protected float getBreakSpeed() { return 1; } }".into());
+            ws.open("Mid.java", "package defaultfixture; public abstract class Mid extends Base implements Overlay {}".into());
+            let kotlin = "package defaultfixture\ninterface Other\nabstract class Leaf : Mid(), Other { fun use() { super.getBreakSpeed() } }";
+            ws.open("Use.kt", kotlin.into());
+            let at = kotlin.find("super.getBreakSpeed").unwrap() + "super.getBreakSpeed".len();
+            let query = ws.completion_query("Use.kt", at).unwrap();
+            assert_eq!(
+                query
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.label == "getBreakSpeed"),
+                !blocked,
+                "{:?}",
+                query.candidates
+            );
+            let targets = ws.goto_definition("Use.kt", at - 1);
+            if blocked {
+                assert!(targets.is_empty(), "{targets:?}");
+            } else {
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].file, "Base.java");
+            }
+            for name in ["fromStatic", "MARKER", "helper"] {
+                let source = kotlin.replace("getBreakSpeed", name);
+                ws.open("Use.kt", source.clone());
+                let at =
+                    source.find(&format!("super.{name}")).unwrap() + "super.".len() + name.len();
+                assert!(ws
+                    .completion_query("Use.kt", at)
+                    .unwrap()
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.label != name));
+            }
+        }
+        let mut annotated = original.clone();
+        annotated
+            .attribute_names
+            .push("RuntimeVisibleAnnotations".into());
+        assert!(java_class_stub(&annotated).is_none());
+        for failure in ["annotation", "flags", "signature"] {
+            let mut unsupported = original.clone();
+            let method = unsupported
+                .methods
+                .iter_mut()
+                .find(|method| method.name.as_ref() == "tooltip")
+                .unwrap();
+            match failure {
+                "annotation" => method
+                    .attribute_names
+                    .push("RuntimeVisibleAnnotations".into()),
+                "flags" => method.access_flags = 0x0409,
+                _ => method.signature = Some("()TT;".into()),
+            }
+            let (source, unavailable) = java_class_stub_facts(&unsupported).unwrap();
+            assert!(source.contains("public interface Overlay"));
+            assert!(!source.contains(" tooltip("));
+            assert!(unavailable.iter().any(|(name, _, _)| name == "tooltip"));
+        }
+    }
+
+    #[test]
+    fn binary_java_actual_create_nested_parameter_requires_inner_identity() {
+        let original = ktcore::classfile::decode(
+            "create:6.0.10-280",
+            include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/create6010/KineticBlockEntity.class"
+            ),
+        )
+        .unwrap();
+        let internal = "net/minecraft/core/HolderLookup$Provider";
+        let descriptor = &original
+            .methods
+            .iter()
+            .find(|method| method.name.as_ref() == "read")
+            .unwrap()
+            .descriptor;
+        assert!(
+            ktcore::classfile::method_types(descriptor).is_none(),
+            "unscoped descriptors must stay unknown"
+        );
+        let (parameters, returns) =
+            ktcore::classfile::method_types_with_inner_classes(descriptor, &original.inner_classes)
+                .unwrap();
+        assert!(returns.is_none());
+        assert_eq!(parameters[1].name, "Provider");
+        assert_eq!(parameters[1].owner.as_ref().unwrap().name, "HolderLookup");
+        assert_eq!(
+            parameters[1]
+                .owner
+                .as_ref()
+                .unwrap()
+                .qualification
+                .as_deref(),
+            Some("net.minecraft.core")
+        );
+        for failure in [
+            "known",
+            "missing",
+            "duplicate",
+            "outer",
+            "name",
+            "nonstatic",
+            "private",
+        ] {
+            let mut class = original.clone();
+            let at = class
+                .inner_classes
+                .iter()
+                .position(|row| row.inner.as_ref() == internal)
+                .unwrap();
+            match failure {
+                "missing" => {
+                    class.inner_classes.remove(at);
+                }
+                "duplicate" => class.inner_classes.push(class.inner_classes[at].clone()),
+                "outer" => class.inner_classes[at].outer = Some("net/minecraft/core/Other".into()),
+                "name" => class.inner_classes[at].name = Some("Other".into()),
+                "nonstatic" => class.inner_classes[at].access_flags &= !0x0008,
+                "private" => class.inner_classes[at].access_flags = 0x060a,
+                _ => {}
+            }
+            let (source, unavailable) = java_class_stub_facts(&class).unwrap();
+            for method in ["read", "write"] {
+                let expected = format!("void {method}(net.minecraft.nbt.CompoundTag p0, net.minecraft.core.HolderLookup.Provider p1, boolean p2)");
+                assert_eq!(
+                    source.contains(&expected),
+                    failure == "known",
+                    "{failure} {method}: {source}"
+                );
+                assert_eq!(
+                    unavailable.iter().any(|(name, _, _)| name == method),
+                    failure != "known",
+                    "{failure} {method}"
+                );
+            }
         }
     }
 

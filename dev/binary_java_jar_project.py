@@ -39,6 +39,7 @@ fields_fixture = fixture.parent / "binaryfields"
 generics_fixture = fixture.parent / "binarygenerics"
 classes = repo / "crates/ktcore/tests/fixtures/classfile"
 names = ("arrayfixture/Factory.class", "arrayfixture/Item.class", "pluginfixture/Person.class",
+         "defaultfixture/Overlay.class",
          "gradle8142/JavaCompilerArgumentsBuilder.class", "fieldfixture/FieldOnly.class",
          *(f"genericfixture/{name}.class" for name in ("Item", "Other", "Box", "Child", "Holder")),
          *(f"outerfixture/{name}.class" for name in ("Factory", "Item", "SpecialItem", "Other", "Outer", "Outer$Inner", "Outer$Shadow")))
@@ -51,6 +52,8 @@ for name in names:
     binary[entry] = raw
 
 sources = {
+    "src/main/java/defaultfixture/JavaDefaults.java": (fixture.parent / "binarydefaults/JavaDefaults.java").read_bytes(),
+    "src/main/kotlin/defaultfixture/KotlinDefaults.kt": (fixture.parent / "binarydefaults/KotlinDefaults.kt").read_bytes(),
     "src/main/java/binaryuse/JavaUse.java": (fixture / "JavaUse.java").read_bytes(),
     "src/main/kotlin/binaryuse/KotlinUse.kt": (fixture / "KotlinUse.kt").read_bytes(),
     "src/main/java/binaryfields/JavaFields.java": (fields_fixture / "JavaFields.java").read_bytes(),
@@ -66,8 +69,11 @@ fields_manifest_path = repo / "dev/corpus/binary-java-fields.json"
 fields_manifest = json.loads(fields_manifest_path.read_text(encoding="utf-8"))
 generics_manifest_path = repo / "dev/corpus/binary-java-generics.json"
 generics_manifest = json.loads(generics_manifest_path.read_text(encoding="utf-8"))
+defaults_manifest_path = repo / "dev/corpus/binary-java-defaults.json"
+defaults_manifest = json.loads(defaults_manifest_path.read_text(encoding="utf-8"))
 assert len(manifest["probes"]) == 12 and len(fields_manifest["probes"]) == 2 and len(generics_manifest["probes"]) == 19
-for selected in (manifest, fields_manifest, generics_manifest):
+assert len(defaults_manifest["probes"]) == 4
+for selected in (manifest, fields_manifest, generics_manifest, defaults_manifest):
     for case in selected["probes"]:
         text = "\n".join(sources[case["source"]].decode("utf-8").splitlines())
         assert hashlib.sha256(text.encode("utf-8")).hexdigest() == case["source_sha256"]
@@ -117,6 +123,7 @@ receipt = {
     "class_inputs": [identity(classes / name) for name in names],
     "harness": identity(harness_path), "manifest": identity(manifest_path),
     "fields_manifest": identity(fields_manifest_path), "generics_manifest": identity(generics_manifest_path),
+    "defaults_manifest": identity(defaults_manifest_path),
     "generics_probes": identity(generics_fixture / "probes.lua"), "bash_argv": bash_argv,
     "library_function_sha256": hashlib.sha256(function.encode("utf-8")).hexdigest(),
     "project_files": [identity(path) for path in sorted(project.rglob("*")) if path.is_file()],

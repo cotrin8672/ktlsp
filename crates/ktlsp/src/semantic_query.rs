@@ -484,13 +484,19 @@ fn member_completion_query_with_ctx(
         });
     }
     let ty = infer::member_receiver_type(receiver, infer::infer(index, receiver, src, &ctx));
+    let receiver_kind =
+        if ktcore::jvm::compiler_object_value(index, &ty) || receiver.kind() == "call_expression" {
+            ktcore::jvm::ReceiverKind::Value
+        } else {
+            ktcore::jvm::ReceiverKind::Unknown
+        };
     member_completion_query_for_type_with_ctx(
         index,
         SourceLanguage::Kotlin,
         tree,
         src,
         ty,
-        ktcore::jvm::ReceiverKind::Unknown,
+        receiver_kind,
         prefix,
         max_candidates,
         Some((ctx, receiver.end_byte())),
@@ -935,7 +941,14 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
     fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
         if self.replaced_file == Some(owner.path.as_ref()) {
             // Body recovery can restore an owner absent from the erroneous original tree.
-            return self.source_members_complete(owner);
+            return self.source_members_complete(owner)
+                || self.source_member_proofs
+                    && self
+                        .index
+                        .entries_for_file(&owner.path)
+                        .iter()
+                        .any(|original| original.sym == owner.sym)
+                    && self.index.source_value_namespace_complete(owner);
         }
         self.index
             .entries_for_file(&owner.path)
@@ -1164,11 +1177,10 @@ fn member_candidates(
     );
     // Prefer the accepted generated declaration's presentation to an inherited homonym.
     // Recovery still supplies authored members; exact call selection remains in ktcore::jvm.
-    let mut java_callables = (language == SourceLanguage::Java)
-        .then(|| {
-            ktcore::jvm::member_candidates_at(inference_index, ty, prefix, member_ctx, position)
-        })
-        .unwrap_or_default();
+    let mut java_callables = (language == SourceLanguage::Java
+        || index.may_have_compiled_callables())
+    .then(|| ktcore::jvm::member_candidates_at(inference_index, ty, prefix, member_ctx, position))
+    .unwrap_or_default();
     let mut withheld_compiled = false;
     java_callables.retain(|candidate| {
         let blocked = matches!(candidate, ktcore::jvm::CallableCandidate::Jvm {
@@ -2685,6 +2697,362 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
     }
 
     const COMPILED_OWNER: &str = "/compiled/a/Person.java";
+
+    #[test]
+    fn compiler_companion_api_uses_binary_identity_for_java_kotlin_and_generic_results() {
+        use ktcore::extensions::{CompilerClassInput, ExtensionStore};
+        use ktcore::project_model::{
+            FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation,
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+        let owner_file = "/compiler-api/Model.kt";
+        let kotlin_file = "/compiler-api/Use.kt";
+        let java_file = "/compiler-api/Use.java";
+        let source = include_str!("../../ktcore/tests/fixtures/classfile/serialization/Model.kt");
+        let mut ws = Workspace::new();
+        let kotlin = "package pluginfixture\nfun use() { Model.serializer() }";
+        let java =
+            "package pluginfixture; class Use { void use() { Model.Companion.serializer(); } }";
+        for (file, text) in [
+            (owner_file, source),
+            (kotlin_file, kotlin),
+            (java_file, java),
+            (
+                "/compiler-api/KSerializer.kt",
+                "package kotlinx.serialization\ninterface KSerializer<T>",
+            ),
+        ] {
+            ws.open(file, text.into());
+            ws.index.set_file_origin(
+                file,
+                FileOrigin {
+                    origin_id: "selected".into(),
+                    representation: SourceRepresentation::Source,
+                    project_scope: Some(ProjectScope {
+                        module: "app".into(),
+                        source_set: "main".into(),
+                    }),
+                },
+            );
+        }
+        ws.index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope: ProjectScope {
+                module: "app".into(),
+                source_set: "main".into(),
+            },
+            ordered_origins: vec!["selected".into()],
+        }]);
+        ws.assume_index_complete_for_tests();
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(source);
+        let mut store = ExtensionStore::default();
+        store.configure_provider("current-compiler", true, Arc::from("{}"));
+        store.set_namespace_coverage(Knowledge::Found(()));
+        store
+            .replace_source_declarations(
+                &ws.index,
+                owner_file,
+                Arc::from(source),
+                Knowledge::Found(()),
+                crate::language::extension_source_facts(
+                    &ws.index.scoped_for_file(owner_file),
+                    owner_file,
+                    &tree,
+                    source,
+                ),
+            )
+            .unwrap();
+        let owner = {
+            let mut read = store
+                .begin(&ws.index, "current-compiler", owner_file)
+                .unwrap();
+            let Knowledge::Found(owner) = read.resolve_type("pluginfixture.Model") else {
+                panic!("source owner")
+            };
+            owner
+        };
+        let classes = [
+            (
+                include_bytes!("../../ktcore/tests/fixtures/classfile/serialization/Model.class")
+                    .as_slice(),
+                false,
+            ),
+            (
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/serialization/Model$Companion.class"
+                )
+                .as_slice(),
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(|(bytes, companion)| CompilerClassInput {
+            class: Arc::new(ktcore::classfile::decode("selected", bytes).unwrap()),
+            companion,
+            value_namespace: false,
+            kotlin_methods: if companion {
+                ["serializer()Lkotlinx/serialization/KSerializer;".into()]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            },
+        })
+        .collect();
+        store
+            .replace_compiler_classes(&ws.index, &owner, classes)
+            .unwrap();
+        let mut read = store
+            .begin(&ws.index, "current-compiler", owner_file)
+            .unwrap();
+        for class in read.compiler_classes(&owner).unwrap() {
+            read.admit_compiler_class(&class).unwrap();
+        }
+        let pending = read.finish();
+        store.commit(pending).unwrap();
+        ws.index.replace_contributions(BTreeMap::from([(
+            owner_file.into(),
+            vec![store
+                .contributions("current-compiler", owner_file)
+                .unwrap()
+                .clone()],
+        )]));
+        let mut identity = None;
+        for (file, text) in [(java_file, java), (kotlin_file, kotlin)] {
+            let scoped = ws.index.scoped_for_file(file);
+            let parent = Type::class("Model", Some("pluginfixture".into()));
+            let receiver = ktcore::jvm::compiler_field_type(&scoped, &parent, "Companion").unwrap();
+            assert_eq!(
+                ktcore::jvm::compiler_companion_type(&scoped, &parent),
+                Some(receiver.clone())
+            );
+            let candidates = ktcore::jvm::member_candidates(&scoped, &receiver, "serializer");
+            let [candidate] = candidates.as_slice() else {
+                panic!("one generated method")
+            };
+            let current = candidate.identity(&scoped).unwrap();
+            assert!(matches!(
+                current.class.input,
+                ktcore::jvm::InputIdentity::Binary { .. }
+            ));
+            assert_eq!(current.class.internal_name, "pluginfixture/Model$Companion");
+            assert_eq!(candidate.definition(), None);
+            if let Some(identity) = &identity {
+                assert_eq!(identity, &current);
+            }
+            identity = Some(current);
+            let ty = ktcore::jvm::projected_return_type_in_context(
+                &scoped,
+                *candidate,
+                &infer::FileCtx::new("pluginfixture".into(), Vec::new()),
+            )
+            .unwrap();
+            assert_eq!(ty.name(), Some("KSerializer"));
+            assert_eq!(ty.args()[0].name(), Some("Model"));
+            let offset = text.find("serializer").unwrap() + "ser".len();
+            let result = if file.ends_with(".java") {
+                let tree = crate::java::JavaParser::new().parse(text);
+                let index = crate::binary_diagnostics::BinaryDiagnostics {
+                    index: &scoped,
+                    inventory: &|_| None,
+                    source_members: &|owner| {
+                        owner.path.as_ref() == java_file
+                            && crate::java::declaration_headers_complete(&tree, text)
+                    },
+                    value_namespace: &|owner| owner.path.as_ref() == java_file,
+                    property_access: &|_| None,
+                };
+                crate::java::completion_query(&index, file, text, &tree, offset, 100).unwrap()
+            } else {
+                let tree = parser.parse(text);
+                let mut pending = vec![tree.root_node()];
+                let call = loop {
+                    let node = pending.pop().expect("Kotlin serializer call");
+                    if node.kind() == "call_expression"
+                        && node_text(node, text) == "Model.serializer()"
+                    {
+                        break node;
+                    }
+                    let mut cursor = node.walk();
+                    pending.extend(node.named_children(&mut cursor));
+                };
+                let inferred = infer::infer(
+                    &scoped,
+                    call,
+                    text,
+                    &infer::FileCtx::from_tree_in_file(&tree, text, file),
+                );
+                assert_eq!(inferred, ty);
+                completion_query(&scoped, &mut parser, file, text, offset, 100).unwrap()
+            };
+            assert_eq!(
+                result
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.label == "serializer")
+                    .count(),
+                1,
+                "{file}: {:?}",
+                result
+                    .candidates
+                    .iter()
+                    .map(|item| &item.label)
+                    .collect::<Vec<_>>()
+            );
+        }
+        for java in [
+            "package pluginfixture; class Use { void use() { Object Model = null; Model.Companion.serializer(); } }",
+            "package pluginfixture; class Use { void use() { class Model {} Model.Companion.serializer(); } }",
+            "package pluginfixture; class Use { void use(Object Model) { Model.Companion.serializer(); } }",
+            "package pluginfixture; class Use { void use() { Object Model = ; Model.Companion.serializer(); } }",
+        ] {
+            ws.open(java_file, java.into());
+            let tree = crate::java::JavaParser::new().parse(java);
+            let scoped = ws.index.scoped_for_file(java_file);
+            let index = crate::binary_diagnostics::BinaryDiagnostics {
+                index: &scoped,
+                inventory: &|_| None,
+                source_members: &|owner| owner.path.as_ref() == java_file && owner.sym.name == "Use",
+                value_namespace: &|owner| owner.path.as_ref() == java_file && owner.sym.name == "Use",
+                property_access: &|_| None,
+            };
+            let result = crate::java::completion_query(
+                &index, java_file, java, &tree,
+                java.find("serializer").unwrap() + "ser".len(), 100,
+            );
+            assert!(result.is_none_or(|query| query.candidates.iter().all(|candidate| candidate.label != "serializer")), "{java}");
+        }
+        // Exercise the host snapshot path too: a Java source must retain a Java tree, and
+        // replacing only its body must not erase the independent Kotlin producer facts.
+        let full_java_file = "/compiler-api/JavaUse.java";
+        let full_java =
+            include_str!("../../ktcore/tests/fixtures/classfile/serialization/JavaUse.java");
+        ws.open(full_java_file, full_java.into());
+        ws.index.set_file_origin(
+            full_java_file,
+            FileOrigin {
+                origin_id: "selected".into(),
+                representation: SourceRepresentation::Source,
+                project_scope: Some(ProjectScope {
+                    module: "app".into(),
+                    source_set: "main".into(),
+                }),
+            },
+        );
+        let full_classes: Vec<_> = [
+            (
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/serialization/ModelFull.class"
+                )
+                .as_slice(),
+                false,
+            ),
+            (
+                include_bytes!(
+                    "../../ktcore/tests/fixtures/classfile/serialization/CompanionFull.class"
+                )
+                .as_slice(),
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(|(bytes, companion)| CompilerClassInput {
+            class: Arc::new(ktcore::classfile::decode("selected", bytes).unwrap()),
+            companion,
+            value_namespace: false,
+            kotlin_methods: if companion {
+                ["serializer()Lkotlinx/serialization/KSerializer;".into()]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            },
+        })
+        .collect();
+        let mut host = crate::analysis_extensions::AnalysisExtensions::new(Vec::new());
+        host.accept_compiler_api(&ws.index, crate::compile::CompilerApiSnapshot {
+            sources: BTreeMap::from([(owner_file.into(), Arc::from(source)), (full_java_file.into(), Arc::from(full_java))]),
+            classes: BTreeMap::from([
+                (owner_file.into(), full_classes),
+                (full_java_file.into(), vec![CompilerClassInput {
+                    class: Arc::new(ktcore::classfile::decode("selected", include_bytes!("../../ktcore/tests/fixtures/classfile/serialization/JavaUse.class")).unwrap()),
+                    companion: false, value_namespace: true, kotlin_methods: Default::default(),
+                }]),
+            ]),
+        }).unwrap();
+        host.publish(&mut ws.index);
+        let java_owner = ws
+            .index
+            .lookup_type("JavaUse")
+            .into_iter()
+            .find(|entry| entry.path.as_ref() == full_java_file)
+            .unwrap();
+        assert!(
+            ktcore::jvm::compiler_value_namespace(
+                &ws.index.scoped_for_file(full_java_file),
+                &java_owner
+            ),
+            "actual Javac namespace must survive host normalization"
+        );
+        for expression in ["Model.Companion.seri", "Model.Companion."] {
+            let edited = full_java.replace("Model.Companion.serializer()", expression);
+            let tree = crate::java::JavaParser::new().parse(&edited);
+            ws.open(full_java_file, edited.clone());
+            host.replace_sources(
+                &ws.index,
+                vec![(
+                    full_java_file.into(),
+                    Arc::from(edited.as_str()),
+                    tree.clone(),
+                )],
+            );
+            host.publish(&mut ws.index);
+            let kotlin = ws.index.scoped_for_file(kotlin_file);
+            let companion = ktcore::jvm::compiler_companion_type(
+                &kotlin,
+                &Type::class("Model", Some("pluginfixture".into())),
+            )
+            .expect("consumer body edit keeps current producer");
+            assert_eq!(
+                ktcore::jvm::member_candidates(&kotlin, &companion, "serializer").len(),
+                1
+            );
+            let scoped = ws.index.scoped_for_file(full_java_file);
+            let offset = edited.find(expression).unwrap() + expression.len();
+            for proven_namespace in [true, false] {
+                let index = crate::binary_diagnostics::BinaryDiagnostics {
+                    index: &scoped,
+                    inventory: &|_| None,
+                    source_members: &|_| false,
+                    value_namespace: &|owner| {
+                        proven_namespace && ktcore::jvm::compiler_value_namespace(&scoped, owner)
+                    },
+                    property_access: &|_| None,
+                };
+                let result = crate::java::completion_query(
+                    &index,
+                    full_java_file,
+                    &edited,
+                    &tree,
+                    offset,
+                    100,
+                )
+                .unwrap();
+                assert_eq!(
+                    result
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.label == "serializer"),
+                    proven_namespace,
+                    "{expression}: namespace={proven_namespace}"
+                );
+            }
+        }
+        store.clear_compiled_inputs();
+        assert!(store
+            .contributions("current-compiler", owner_file)
+            .is_none());
+    }
     const COMPILED_BASE: &str = "/compiled/common/Base.java";
     const COMPILED_USE: &str = "/compiled/a/Use.java";
     const COMPILED_OTHER_SCOPE: &str = "/compiled/b/Use.java";

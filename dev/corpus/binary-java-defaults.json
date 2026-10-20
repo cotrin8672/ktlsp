@@ -1,0 +1,57 @@
+{
+  "build_tool": "gradle",
+  "probes": [
+    {
+      "id": "binary-defaults-java-getBreakSpeed",
+      "source": "src/main/java/defaultfixture/JavaDefaults.java",
+      "source_sha256": "4ad983a1f124d21b7fefad437fe7e9733ba72ec250f33e071151b550944fb870",
+      "anchor": "super.getBreakSpeed",
+      "token": "getBreakSpeed",
+      "completion_token": "getBreakSpeed",
+      "definition": false,
+      "completion_excludes": [
+        "fromStatic",
+        "helper"
+      ]
+    },
+    {
+      "id": "binary-defaults-java-tooltip",
+      "source": "src/main/java/defaultfixture/JavaDefaults.java",
+      "source_sha256": "4ad983a1f124d21b7fefad437fe7e9733ba72ec250f33e071151b550944fb870",
+      "anchor": "value.tooltip",
+      "token": "tooltip",
+      "completion_token": "tooltip",
+      "definition": false,
+      "completion_excludes": [
+        "fromStatic",
+        "helper"
+      ]
+    },
+    {
+      "id": "binary-defaults-kotlin-getBreakSpeed",
+      "source": "src/main/kotlin/defaultfixture/KotlinDefaults.kt",
+      "source_sha256": "5d67f9ec083aa913525de11b682029cd80607c9c23609dbfa0f392c7b44fdd26",
+      "anchor": "super.getBreakSpeed",
+      "token": "getBreakSpeed",
+      "completion_token": "getBreakSpeed",
+      "definition": false,
+      "completion_excludes": [
+        "fromStatic",
+        "helper"
+      ]
+    },
+    {
+      "id": "binary-defaults-kotlin-tooltip",
+      "source": "src/main/kotlin/defaultfixture/KotlinDefaults.kt",
+      "source_sha256": "5d67f9ec083aa913525de11b682029cd80607c9c23609dbfa0f392c7b44fdd26",
+      "anchor": "value.tooltip",
+      "token": "tooltip",
+      "completion_token": "tooltip",
+      "definition": false,
+      "completion_excludes": [
+        "fromStatic",
+        "helper"
+      ]
+    }
+  ]
+}

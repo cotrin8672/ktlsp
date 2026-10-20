@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v33-instantiated-generic-owners";
+const SYMCACHE_VERSION: &[u8] = b"v34-java-interface-constants";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -944,8 +944,18 @@ fn parse_dir(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    parse_dir_while_current(dest, kotlin, java, &|| true)
+}
+
+fn parse_dir_while_current(
+    dest: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
+) -> anyhow::Result<Vec<FileSymbols>> {
     let mut out = Vec::new();
     for path in jar::collect_sources(dest)? {
+        anyhow::ensure!(current(), "source indexing generation cancelled");
         let text =
             fs::read_to_string(&path).with_context(|| format!("read source {}", path.display()))?;
         if let Some(file) = parse_source_file(&path, &text, kotlin, java) {
@@ -961,13 +971,18 @@ fn parse_source_jar(
     java_encoding: JavaSourceEncoding,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<FileSymbols>> {
     let mut out = Vec::new();
     jar::visit_sources_with_encoding(jar_path, dest, java_encoding, |path, text| {
+        if !current() {
+            return;
+        }
         if let Some(file) = parse_source_file(path, text, kotlin, java) {
             out.push(file);
         }
     })?;
+    anyhow::ensure!(current(), "source indexing generation cancelled");
     Ok(out)
 }
 
@@ -1145,7 +1160,16 @@ pub fn resolve_library_source(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
-    let mut batches = resolve_library_source_unowned(source, None, kotlin, java)?;
+    resolve_library_source_while_current(source, kotlin, java, &|| true)
+}
+
+pub(crate) fn resolve_library_source_while_current(
+    source: &LibrarySource,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
+) -> anyhow::Result<Vec<FileSymbols>> {
+    let mut batches = resolve_library_source_unowned(source, None, kotlin, java, current)?;
     tag_batches(
         &mut batches,
         &source.origin_id,
@@ -1169,7 +1193,9 @@ fn resolve_library_source_unowned(
     cache_fingerprint: Option<&str>,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    anyhow::ensure!(current(), "source indexing generation cancelled");
     let policy = match &source.policy {
         Ok(policy) => policy,
         Err(reason) => {
@@ -1188,7 +1214,10 @@ fn resolve_library_source_unowned(
         return Err(error);
     }
     let Some(jar) = &source.jar else {
-        return parse_dir(&source.dest, kotlin, java).map(|batches| source.stamp_batches(batches));
+        return parse_dir_while_current(&source.dest, kotlin, java, current).and_then(|batches| {
+            anyhow::ensure!(current(), "source indexing generation cancelled");
+            Ok(source.stamp_batches(batches))
+        });
     };
 
     let archive_fingerprint = source
@@ -1206,6 +1235,7 @@ fn resolve_library_source_unowned(
     let fingerprint = policy.cache_key(cache_fingerprint.unwrap_or(archive_fingerprint));
     // Symbol cache: a hit skips the (dominant) parse cost entirely.
     if let Some(cached) = symcache_load(&fingerprint, &source.dest) {
+        anyhow::ensure!(current(), "source indexing generation cancelled");
         anyhow::ensure!(
             jar_fingerprint(jar).as_deref() == Some(archive_fingerprint),
             "source archive {} changed while loading cached symbols",
@@ -1214,13 +1244,14 @@ fn resolve_library_source_unowned(
         policy.validate()?;
         return Ok(source.stamp_batches(cached));
     }
-    let symbols = parse_source_jar(jar, &source.dest, policy.java, kotlin, java)?;
+    let symbols = parse_source_jar(jar, &source.dest, policy.java, kotlin, java, current)?;
     anyhow::ensure!(
         jar_fingerprint(jar).as_deref() == Some(archive_fingerprint),
         "source archive {} changed while parsing symbols",
         jar.display()
     );
     policy.validate()?;
+    anyhow::ensure!(current(), "source indexing generation cancelled");
     symcache_store(&fingerprint, &symbols);
     Ok(source.stamp_batches(symbols))
 }
@@ -1280,7 +1311,7 @@ pub fn resolve_local_jar_stubs_for_origin(
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
     // Binary stubs without hierarchy and shadow facts must miss.
-    hasher.update(b"|local-jar-java-members-v7|");
+    hasher.update(b"|local-jar-java-members-v8|");
     hasher.update(origin_id.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
@@ -1294,7 +1325,7 @@ pub fn resolve_local_jar_stubs_for_origin(
             policy: Ok(SourceTextPolicy::default()),
         };
         (
-            resolve_library_source_unowned(&source, Some(&fingerprint), kotlin, java)?,
+            resolve_library_source_unowned(&source, Some(&fingerprint), kotlin, java, &|| true)?,
             SourceRepresentation::Source,
         )
     } else {
@@ -1343,7 +1374,7 @@ pub(crate) fn resolve_module_binary_stubs(
     let origin_id = crate::classpath::maven_origin_id(coord);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|module-jar-java-members-v7|");
+    hasher.update(b"|module-jar-java-members-v8|");
     hasher.update(origin_id.as_bytes());
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
@@ -2755,6 +2786,84 @@ mod tests {
                 assert!(materialize_source_file(path));
                 assert_eq!(fs::read_to_string(path).unwrap(), text);
             }
+        }
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn source_interface_constant_rejects_pre_constant_symbol_cache() {
+        use ktcore::extensions::{Dispatch, Visibility};
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_source_constants_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        write_sources_jar(
+            &jar,
+            &[(
+                "api/Only.java",
+                "package api; public interface Only { int LIMIT = 7; }",
+            )],
+        );
+        let source = LibrarySource {
+            dest: tmp.join("extracted"),
+            jar: Some(jar.clone()),
+            fingerprint: jar_fingerprint(&jar),
+            origin_id: "maven:fixture:constants:1".into(),
+            policy: Ok(SourceTextPolicy::default()),
+        };
+        let meta = fs::metadata(&jar).unwrap();
+        let mut old = Sha256::new();
+        old.update(b"v33-instantiated-generic-owners");
+        old.update(b"|");
+        old.update(jar.to_string_lossy().as_bytes());
+        old.update(b"|");
+        old.update(
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        old.update(b"|");
+        old.update(meta.len().to_le_bytes());
+        let old_fingerprint = format!("{:x}", old.finalize());
+        assert_ne!(Some(&old_fingerprint), source.fingerprint.as_ref());
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        assert!(prepare_lazy_source_dir(
+            &jar,
+            &source.dest,
+            source.fingerprint.as_deref().unwrap()
+        ));
+        let mut legacy = parse_source_jar(
+            &jar,
+            &source.dest,
+            source.policy.as_ref().unwrap().java,
+            &mut kotlin,
+            &mut java,
+            &|| true,
+        )
+        .unwrap();
+        for batch in &mut legacy {
+            batch.symbols.retain(|symbol| symbol.name != "LIMIT");
+        }
+        let old_key = source.policy.as_ref().unwrap().cache_key(&old_fingerprint);
+        symcache_store(&old_key, &legacy);
+        assert!(symcache_load(&old_key, &source.dest).is_some());
+        for _ in 0..2 {
+            let batches = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+            let constant = batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .find(|symbol| symbol.name == "LIMIT")
+                .unwrap();
+            assert_eq!(constant.value_type.as_ref().unwrap().name, "int");
+            assert_eq!(constant.source_member.dispatch(), Some(Dispatch::Static));
+            assert_eq!(
+                constant.source_member.visibility(),
+                Some(Visibility::Public)
+            );
         }
         fs::remove_dir_all(tmp).unwrap();
     }
@@ -4182,12 +4291,12 @@ public class ParameterUse<Iterable> {
             (
                 false,
                 origin.as_str(),
-                b"|local-jar-java-members-v7|".as_slice(),
+                b"|local-jar-java-members-v8|".as_slice(),
             ),
             (
                 true,
                 module_origin.as_str(),
-                b"|module-jar-java-members-v7|".as_slice(),
+                b"|module-jar-java-members-v8|".as_slice(),
             ),
         ] {
             let mut hasher = Sha256::new();
@@ -4649,7 +4758,7 @@ public class ParameterUse<Iterable> {
                 symcache_load(&old_key, &legacy_dir).is_some(),
                 "legacy placeholder cache must exist"
             );
-            let current_key = fingerprint(7);
+            let current_key = fingerprint(8);
             let dest = extract.join("local-jars").join(&current_key);
             let cache = symcache_dir().join(format!("{current_key}.zst"));
             for warm in [false, true] {
@@ -4805,9 +4914,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if module {
-                b"|module-jar-java-members-v7|".as_slice()
+                b"|module-jar-java-members-v8|".as_slice()
             } else {
-                b"|local-jar-java-members-v7|".as_slice()
+                b"|local-jar-java-members-v8|".as_slice()
             });
             if module {
                 hash.update(crate::classpath::maven_origin_id(&coord).as_bytes());
@@ -5261,6 +5370,7 @@ public class ParameterUse<Iterable> {
             for (name, bytes) in [
                 ("com/simibubi/create/content/kinetics/base/BlockBreakingKineticBlockEntity.class", include_bytes!("../../ktcore/tests/fixtures/classfile/create6010/BlockBreakingKineticBlockEntity.class").as_slice()),
                 ("com/simibubi/create/content/kinetics/base/KineticBlockEntity.class", include_bytes!("../../ktcore/tests/fixtures/classfile/create6010/KineticBlockEntity.class").as_slice()),
+                ("com/simibubi/create/content/kinetics/drill/DrillBlockEntity.class", include_bytes!("../../ktcore/tests/fixtures/classfile/create6010/DrillBlockEntity.class").as_slice()),
             ] {
                 archive.start_file(name, SimpleFileOptions::default()).unwrap();
                 archive.write_all(bytes).unwrap();
@@ -5311,9 +5421,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if is_module {
-                b"|module-jar-java-members-v7|".as_slice()
+                b"|module-jar-java-members-v8|".as_slice()
             } else {
-                b"|local-jar-java-members-v7|".as_slice()
+                b"|local-jar-java-members-v8|".as_slice()
             });
             hash.update(owner.as_bytes());
             if is_module {
@@ -5325,12 +5435,12 @@ public class ParameterUse<Iterable> {
             let dest = extract.join("local-jars").join(&fingerprint);
             assert!(
                 symcache_load(&fingerprint, &dest).is_none(),
-                "v6 cold cache must be absent"
+                "current cold cache must be absent"
             );
             for warm in [false, true] {
                 if warm {
-                    let cached =
-                        symcache_load(&fingerprint, &dest).expect("v6 warm cache must be usable");
+                    let cached = symcache_load(&fingerprint, &dest)
+                        .expect("current warm cache must be usable");
                     let child = cached
                         .iter()
                         .flat_map(|batch| &batch.symbols)
@@ -5440,6 +5550,69 @@ public class ParameterUse<Iterable> {
                         );
                     }
                 }
+                let caller =
+                    include_str!("../tests/fixtures/cem-selected/EnchantableDrillBlockEntity.kt");
+                workspace.open(
+                    "cem/EnchantableBlockEntity.kt",
+                    include_str!("../tests/fixtures/cem-selected/EnchantableBlockEntity.kt").into(),
+                );
+                let file = "cem/drill/EnchantableDrillBlockEntity.kt";
+                workspace.open(file, caller.into());
+                for member in ["addToGoggleTooltip", "read", "write"] {
+                    let selector = format!("super.{member}");
+                    let start = caller.find(&selector).unwrap();
+                    let query = workspace
+                        .completion_query(file, start + "super.".len() + 2)
+                        .unwrap();
+                    assert!(
+                        query.candidates.iter().any(|item| item.label == member),
+                        "actual CEM parameter completion {member}: module={is_module} warm={warm}: {} {:?}",
+                        query.status_label(), query.candidates
+                    );
+                }
+                let selector = "super.getBreakSpeed";
+                let start = caller.find(selector).unwrap();
+                let query = workspace
+                    .completion_query(file, start + selector.len())
+                    .unwrap();
+                assert!(query
+                    .candidates
+                    .iter()
+                    .any(|item| item.label == "getBreakSpeed"));
+                let expected = workspace
+                    .index
+                    .lookup_by_name("getBreakSpeed")
+                    .into_iter()
+                    .find(|entry| {
+                        entry.sym.container.as_deref() == Some("BlockBreakingKineticBlockEntity")
+                    })
+                    .unwrap();
+                let expected = crate::symbol::Def {
+                    file: expected.path.to_string(),
+                    start_byte: expected.sym.start_byte,
+                    end_byte: expected.sym.end_byte,
+                };
+                assert_eq!(
+                    workspace.goto_definition(file, start + "super.".len()),
+                    [expected],
+                    "actual CEM zeroarg goto: module={is_module} warm={warm}"
+                );
+                let tree = kotlin.parse(caller);
+                let call = tree
+                    .root_node()
+                    .named_descendant_for_byte_range(start, start + selector.len() + 2)
+                    .unwrap();
+                assert_eq!(call.kind(), "call_expression");
+                assert_eq!(
+                    ktcore::infer::infer(
+                        &workspace.index.scoped_for_file(file),
+                        call,
+                        caller,
+                        &ktcore::infer::FileCtx::from_tree_in_file(&tree, caller, file)
+                    ),
+                    ktcore::types::Type::class("Float", Some("kotlin".into())),
+                    "actual CEM zeroarg inferred return: module={is_module} warm={warm}"
+                );
             }
         }
         fs::remove_dir_all(root).unwrap();
@@ -5866,6 +6039,66 @@ public class ParameterUse<Iterable> {
             );
         }
         fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn cancelled_source_parse_never_caches_a_partial_library() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-cancel-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("source.jar");
+        write_sources_jar(
+            &jar,
+            &[("First.kt", "class First"), ("Second.kt", "class Second")],
+        );
+        let fingerprint = jar_fingerprint(&jar).unwrap();
+        let source = LibrarySource {
+            dest: root.join("source"),
+            jar: Some(jar),
+            fingerprint: Some(fingerprint.clone()),
+            origin_id: "fixture:cancel-source".into(),
+            policy: Ok(SourceTextPolicy::default()),
+        };
+        let cache = source.policy.as_ref().unwrap().cache_key(&fingerprint);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let visits = std::cell::Cell::new(0);
+        // Become stale after the resolver entry and the first source visit.
+        let current = || {
+            let n = visits.get();
+            visits.set(n + 1);
+            n < 2
+        };
+        assert!(
+            resolve_library_source_while_current(&source, &mut kotlin, &mut java, &current)
+                .is_err()
+        );
+        assert!(visits.get() > 2);
+        assert!(symcache_load(&cache, &source.dest).is_none());
+        for _ in 0..2 {
+            let full = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+            assert_eq!(
+                full.len(),
+                2,
+                "normal cold/warm indexing retains both files"
+            );
+        }
+        assert!(
+            resolve_library_source_while_current(&source, &mut kotlin, &mut java, &|| false)
+                .is_err()
+        );
+        assert_eq!(
+            symcache_load(&cache, &source.dest).unwrap().len(),
+            2,
+            "cancellation preserves a completed cache"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

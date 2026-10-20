@@ -98,6 +98,117 @@ fn kotlin_super_completion_offers_superclass_member() {
 }
 
 #[test]
+fn super_known_class_members_above_missing_ancestor() {
+    for case in [
+        "known",
+        "nearest",
+        "abstract-nearest",
+        "unknown-sibling",
+        "class-sibling",
+        "between",
+        "arguments",
+        "generic",
+        "vararg",
+        "overload",
+        "competing",
+    ] {
+        let mut ws = Workspace::new();
+        let method = match case {
+            "arguments" => "protected float getBreakSpeed(int value) { return 1; }",
+            "generic" => "protected <T> float getBreakSpeed() { return 1; }",
+            "vararg" => "protected float getBreakSpeed(Object... values) { return 1; }",
+            "overload" => "protected float getBreakSpeed() { return 1; } protected float getBreakSpeed(int value) { return 2; }",
+            _ => "protected float getBreakSpeed() { return 1; }",
+        };
+        ws.open(
+            "Base.java",
+            format!("package probe; public class Base extends Missing {{ {method} }}"),
+        );
+        ws.open(
+            "Mid.java",
+            format!(
+                "package probe; public abstract class Mid extends {} {{ {} }}",
+                if case == "between" {
+                    "Unavailable"
+                } else {
+                    "Base"
+                },
+                match case {
+                    "nearest" => "protected float getBreakSpeed() { return 2; }",
+                    "abstract-nearest" => "protected abstract float getBreakSpeed();",
+                    _ => "",
+                }
+            ),
+        );
+        match case {
+            "unknown-sibling" => {}
+            "class-sibling" => ws.open("Other.kt", "package probe\nopen class Other".into()),
+            "competing" => ws.open(
+                "Other.kt",
+                "package probe\ninterface Other { fun getBreakSpeed(): Float = 2f }".into(),
+            ),
+            _ => ws.open("Other.kt", "package probe\ninterface Other".into()),
+        }
+        let source =
+            "package probe\nclass Use : Mid(), Other { fun use() = super.getBreakSpeed() }";
+        ws.open("Use.kt", source.into());
+        let at = source.find("super.getBreakSpeed").unwrap() + "super.getBreakSpeed".len();
+        let query = ws.completion_query("Use.kt", at).unwrap();
+        assert_eq!(
+            query
+                .candidates
+                .iter()
+                .any(|candidate| candidate.label == "getBreakSpeed"),
+            matches!(case, "known" | "nearest" | "arguments" | "overload"),
+            "{case}: {:?}",
+            query.candidates
+        );
+        assert_eq!(
+            query.status_label(),
+            "unknown",
+            "partial hierarchy stays incomplete"
+        );
+        let exact = matches!(case, "known" | "nearest");
+        let expected = if exact {
+            vec![target(
+                &ws,
+                if case == "nearest" {
+                    "Mid.java"
+                } else {
+                    "Base.java"
+                },
+                "getBreakSpeed",
+            )]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            goto(&mut ws, "Use.kt", "super.getBreakSpeed()", "getBreakSpeed"),
+            expected,
+            "{case}"
+        );
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", "super.getBreakSpeed()"),
+            if exact {
+                Type::class("Float", Some("kotlin".into()))
+            } else {
+                Type::Unknown
+            },
+            "{case}"
+        );
+        if case == "known" {
+            ws.change("Base.java", "package probe; public class Base extends Missing { protected float renamed() { return 1; } }".into());
+            assert!(!labels(&mut ws, "Use.kt", "super.get").contains("getBreakSpeed"));
+            ws.change(
+                "Base.java",
+                format!("package probe; public class Base extends Missing {{ {method} }}"),
+            );
+            assert!(labels(&mut ws, "Use.kt", "super.get").contains("getBreakSpeed"));
+        }
+    }
+}
+
+#[test]
 fn kotlin_super_goto_selects_superclass_not_override_or_unrelated_member() {
     let mut ws = workspace();
     let expected = target(&ws, "Base.java", "getBreakSpeed");

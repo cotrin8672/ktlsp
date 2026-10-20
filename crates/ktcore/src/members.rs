@@ -257,6 +257,124 @@ pub fn super_candidates<'a>(
     super_matching_candidates(index, receivers, MemberName::Prefix(prefix), ctx)
 }
 
+// Missing ancestors above a concrete class declaration cannot override that declaration.
+// shortcut: exact calls require a single fixed zero-argument declaration until overload proof exists.
+fn partial_class_super_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: &[Type],
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+) -> Option<(Type, Vec<&'a Entry>)> {
+    use crate::symbol::SymbolKind;
+    let owner = |ty: &Type| {
+        if !ty.args().is_empty() || ty.container().is_some() {
+            return None;
+        }
+        let matches: Vec<_> = index
+            .lookup_type(&infer::receiver_root_key(index, ty)?)
+            .into_iter()
+            .filter(|entry| {
+                ty.package()
+                    .is_none_or(|package| package == entry.sym.package)
+                    && entry.sym.container.is_none()
+                    && entry.sym.type_params.is_empty()
+            })
+            .collect();
+        match matches.as_slice() {
+            [entry] => Some(*entry),
+            _ => None,
+        }
+    };
+    let mut class = None;
+    let mut interfaces = Vec::new();
+    for receiver in receivers {
+        match owner(receiver)?.sym.kind {
+            SymbolKind::Class if class.is_none() => class = Some(receiver),
+            SymbolKind::Interface => interfaces.push(receiver),
+            _ => return None,
+        }
+    }
+    let class = class?;
+    let raw = collect_candidates(index, class, name, ctx, false);
+    let absent_in_interface = |interface: &Type, name| {
+        let pool = collect_candidates(index, interface, MemberName::Exact(name), ctx, false);
+        pool.hierarchy_complete && pool.members.is_empty()
+    };
+    let mut members = Vec::new();
+    for entry in &raw.members {
+        if entry.sym.kind != SymbolKind::Function
+            || !entry.sym.type_params.is_empty()
+            || entry.sym.has_vararg
+            || super_eligibility(entry, ctx) != Some(true)
+            || matches!(name, MemberName::Exact(_))
+                && (entry.sym.arity != Some(0) || !entry.sym.params.is_empty())
+            || !interfaces
+                .iter()
+                .all(|interface| absent_in_interface(interface, &entry.sym.name))
+        {
+            continue;
+        }
+        let mut current = class.clone();
+        for _ in 0..32 {
+            let Some(declaration) = owner(&current) else {
+                break;
+            };
+            if declaration
+                .sym
+                .unavailable_members
+                .as_ref()
+                .is_some_and(|members| members.iter().any(|(name, _, _)| *name == entry.sym.name))
+            {
+                break;
+            }
+            if entry.sym.package == declaration.sym.package
+                && entry.sym.container.as_deref() == Some(declaration.sym.name.as_str())
+            {
+                if !matches!(name, MemberName::Exact(_))
+                    || raw
+                        .members
+                        .iter()
+                        .filter(|other| {
+                            other.sym.name == entry.sym.name
+                                && other.sym.package == declaration.sym.package
+                                && other.sym.container.as_deref()
+                                    == Some(declaration.sym.name.as_str())
+                        })
+                        .count()
+                        == 1
+                {
+                    members.push(*entry);
+                }
+                break;
+            }
+            // A nearer declaration (including abstract or unsupported overrides) owns this name.
+            if raw.members.iter().any(|other| {
+                other.sym.name == entry.sym.name
+                    && other.sym.package == declaration.sym.package
+                    && other.sym.container.as_deref() == Some(declaration.sym.name.as_str())
+            }) {
+                break;
+            }
+            let mut next = None;
+            let known = infer::direct_supertypes(index, &current)
+                .into_iter()
+                .all(|parent| match owner(&parent).map(|owner| owner.sym.kind) {
+                    Some(SymbolKind::Class) if next.is_none() => {
+                        next = Some(parent);
+                        true
+                    }
+                    Some(SymbolKind::Interface) => absent_in_interface(&parent, &entry.sym.name),
+                    _ => false,
+                });
+            let Some(parent) = next.filter(|_| known) else {
+                break;
+            };
+            current = parent;
+        }
+    }
+    (!members.is_empty()).then(|| (class.clone(), members))
+}
+
 /// Keep the effective source-super pool through later call/value selection. Returning only its
 /// receiver and collecting ordinary members again would reintroduce private/abstract declarations.
 pub fn super_member_candidates<'a>(
@@ -300,6 +418,21 @@ pub(crate) fn unique_super_receiver(
 }
 
 fn super_matching_candidates<'a>(
+    index: &'a dyn InferenceIndex,
+    receivers: Vec<Type>,
+    name: MemberName<'_>,
+    ctx: &FileCtx,
+) -> SuperCandidates<'a> {
+    let mut selected = resolved_super_matching_candidates(index, receivers.clone(), name, ctx);
+    if selected.incomplete && selected.providers.is_empty() && receivers.len() > 1 {
+        if let Some(provider) = partial_class_super_candidates(index, &receivers, name, ctx) {
+            selected.providers.push(provider);
+        }
+    }
+    selected
+}
+
+fn resolved_super_matching_candidates<'a>(
     index: &'a dyn InferenceIndex,
     receivers: Vec<Type>,
     name: MemberName<'_>,

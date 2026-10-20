@@ -3561,6 +3561,10 @@ mod observed_path_cache_tests {
 #[path = "compiler/java.rs"]
 mod java_diagnostics;
 
+pub(crate) use java_diagnostics::positive::{
+    candidate as compiler_api_candidate, supported as compiler_api_supported,
+    Snapshot as CompilerApiSnapshot,
+};
 pub(crate) use java_diagnostics::processor::Plan as ProcessorPlan;
 
 pub(crate) fn java_import_dependencies(
@@ -3794,7 +3798,8 @@ impl KotlinEnvironmentKey {
             })
             .cloned()
             .collect();
-        let java_available = java_diagnostics::configured_recipe(request).is_ok();
+        let java_available = java_diagnostics::configured_recipe(request).is_ok()
+            || java_diagnostics::positive::candidate(&request.task);
         Ok(Self {
             project_dir: request.project_dir.clone(),
             arguments: request.task.arguments.clone(),
@@ -3855,6 +3860,9 @@ pub(crate) struct KotlinDiagnosticEnvironment {
     // Failed helper builds retain their watched assets and cannot erase canonical Kotlin results.
     java_tools: std::sync::Mutex<Option<(java_diagnostics::Tools, Result<(), String>)>>,
     processor_artifacts: std::sync::Mutex<Option<java_diagnostics::processor::CachedArtifacts>>,
+    positive_tools: std::sync::Mutex<Option<java_diagnostics::positive::Tools>>,
+    positive_supported: bool,
+    pub(crate) compiler_api: std::sync::Mutex<Option<java_diagnostics::positive::Snapshot>>,
 }
 
 impl KotlinDiagnosticEnvironment {
@@ -3947,6 +3955,7 @@ impl KotlinDiagnosticEnvironment {
             );
             stamps.push((input, before));
         }
+        let positive_supported = java_diagnostics::positive::supported(&request.task);
         let environment = std::sync::Arc::new(Self {
             key,
             invalid,
@@ -3958,6 +3967,9 @@ impl KotlinDiagnosticEnvironment {
             watch,
             java_tools: std::sync::Mutex::new(None),
             processor_artifacts: std::sync::Mutex::new(None),
+            positive_tools: std::sync::Mutex::new(None),
+            positive_supported,
+            compiler_api: std::sync::Mutex::new(None),
         });
         environment.check_live()?;
         request.check_live()?;
@@ -4012,6 +4024,24 @@ fn kotlin_plugin_paths(arguments: &[String]) -> anyhow::Result<Vec<PathBuf>> {
     Ok(result)
 }
 
+fn kotlin_scalar_annotation_options(value: &str) -> bool {
+    value.split(',').all(|option| {
+        let Some(annotation) = option
+            .strip_prefix("plugin:org.jetbrains.kotlin.allopen:annotation=")
+            .or_else(|| option.strip_prefix("plugin:org.jetbrains.kotlin.noarg:annotation="))
+        else {
+            return false;
+        };
+        annotation.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '$')
+                && chars.all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+        })
+    })
+}
+
 fn kotlin_editor_arguments(
     request: &KotlinDiagnosticRequest,
     output: &Path,
@@ -4039,6 +4069,18 @@ fn kotlin_editor_arguments(
         let argument = &request.task.arguments[i];
         anyhow::ensure!(!argument.contains('\0'), "kotlin-nul-argument");
         match argument.as_str() {
+            "-P" => {
+                let value = request
+                    .task
+                    .arguments
+                    .get(i + 1)
+                    .filter(|value| kotlin_scalar_annotation_options(value))
+                    .ok_or_else(|| anyhow::anyhow!("kotlin-plugin-option-unhandled-at-{i}"))?;
+                // These options name annotations, not files; preserve their exact selected order.
+                result.extend([argument.clone(), value.clone()]);
+                i += 2;
+                continue;
+            }
             "-classpath" | "-cp" => {
                 anyhow::ensure!(!explicit_classpath, "kotlin-duplicate-classpath-argument");
                 let value = request
@@ -4419,6 +4461,9 @@ fn run_selected_kotlin_editor_compile(
         request.check_live()?;
         environment.check_live()?;
         anyhow::ensure!(environment.matches(request), "kotlin-stale-recipe");
+        if environment.positive_supported {
+            return java_diagnostics::positive::run(request, environment);
+        }
         let overlay = KotlinEditorOverlay::create(request)?;
         let arguments = kotlin_editor_arguments(
             request,
@@ -5054,6 +5099,35 @@ mod kotlin_editor_compile_tests {
             request.task.arguments.insert(position, flag.into());
         }
         assert_eq!(request.task.arguments, selected);
+
+        let baseline_arguments = arguments;
+        let options = "plugin:org.jetbrains.kotlin.allopen:annotation=pluginfixture.OpenForTesting,plugin:org.jetbrains.kotlin.noarg:annotation=pluginfixture.GenerateNoArg";
+        request.task.arguments.extend(["-P".into(), options.into()]);
+        let selected = request.task.arguments.clone();
+        let mut arguments = kotlin_editor_arguments(&request, &private, &sources).unwrap();
+        let position = arguments
+            .iter()
+            .position(|argument| argument == "-P")
+            .unwrap();
+        assert_eq!(arguments[position + 1], options);
+        assert!(
+            position
+                > arguments
+                    .iter()
+                    .position(|argument| argument == flags[3])
+                    .unwrap()
+                && position < arguments.len() - sources.len()
+        );
+        arguments.drain(position..position + 2);
+        assert_eq!(
+            arguments, baseline_arguments,
+            "other argument order stays intact"
+        );
+        assert_eq!(request.task.arguments, selected);
+        let key = KotlinEnvironmentKey::new(&request).unwrap();
+        *request.task.arguments.last_mut().unwrap() =
+            options.replace("GenerateNoArg", "OtherAnnotation");
+        assert!(KotlinEnvironmentKey::new(&request).unwrap() != key);
     }
 
     #[test]
@@ -5073,6 +5147,28 @@ mod kotlin_editor_compile_tests {
             vec!["-opt-in", "kotlin.RequiresOptIn"],
             vec!["-java-parameters\u{0}"],
             vec!["-P", "plugin:opaque:value=1"],
+            vec!["-P", "plugin:org.jetbrains.kotlin.allopen:preset=spring"],
+            vec![
+                "-P",
+                "plugin:org.jetbrains.kotlin.noarg:invokeInitializers=true",
+            ],
+            vec![
+                "-P",
+                "plugin:org.jetbrains.kotlin.noarg:annotation=C:/config/Anno",
+            ],
+            vec!["-P", "plugin:org.jetbrains.kotlin.noarg:annotation="],
+            vec![
+                "-P",
+                "plugin:org.jetbrains.kotlin.allopen:annotation=api..Anno",
+            ],
+            vec![
+                "-P",
+                "plugin:org.jetbrains.kotlin.noarg:annotation=api.1Anno",
+            ],
+            vec![
+                "-P",
+                "plugin:org.jetbrains.kotlin.noarg:annotation=api.Anno,plugin:opaque:value=1",
+            ],
             vec!["-Xunknown"],
         ] {
             let mut request = kotlin_test_request(&root);

@@ -259,6 +259,7 @@ impl Backend {
                     force,
                     watches.clone(),
                     cancelled,
+                    compiler_workers.clone(),
                 )
                 .await;
                 schedule_selected_kotlin_diagnostics(
@@ -785,6 +786,7 @@ fn spawn_coordinate_index_worker(
     model: Option<Arc<classpath::ProjectSnapshot>>,
     binary_only: bool,
     generation: u64,
+    workspace: Arc<Mutex<Workspace>>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
@@ -799,6 +801,10 @@ fn spawn_coordinate_index_worker(
             let label = coord.label();
             let resolve_started = crate::trace::enabled().then(Instant::now);
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let current = || workspace.lock().is_current_generation(generation);
+                if !current() {
+                    return (Vec::new(), false, Vec::new(), true, false);
+                }
                 let (source, source_failed) = if binary_only {
                     (None, false)
                 } else {
@@ -815,6 +821,9 @@ fn spawn_coordinate_index_worker(
                         }
                     }
                 };
+                if !current() {
+                    return (Vec::new(), false, Vec::new(), true, false);
+                }
                 let mut source_missing = source.is_none();
                 let skipped = source
                     .as_ref()
@@ -833,9 +842,14 @@ fn spawn_coordinate_index_worker(
                 } else if let Some(source) = source {
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
-                    match deps::resolve_library_source(&source, &mut kotlin, &mut java) {
+                    match deps::resolve_library_source_while_current(
+                        &source, &mut kotlin, &mut java, &current,
+                    ) {
                         Ok(batches) => (batches, false),
                         Err(error) => {
+                            if !current() {
+                                return (Vec::new(), false, Vec::new(), true, false);
+                            }
                             tracing::warn!("index {label} source failed: {error:#}");
                             source_missing = true;
                             let batches = if authoritative {
@@ -860,7 +874,7 @@ fn spawn_coordinate_index_worker(
                             (batches, true)
                         }
                     }
-                } else if authoritative {
+                } else if authoritative && current() {
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
                     match deps::resolve_module_binary_stubs(
@@ -894,7 +908,7 @@ fn spawn_coordinate_index_worker(
                     false
                 };
                 let missing_source = empty_input && !verified_empty_binary;
-                let discovered = if authoritative {
+                let discovered = if authoritative || !current() {
                     Vec::new()
                 } else {
                     artifacts::dependency_coordinates(&repos, &coord)
@@ -1353,6 +1367,7 @@ fn index_dependency_model(
                 model.clone(),
                 binary_only,
                 generation,
+                ws.clone(),
                 tx.clone(),
             );
             active += 1;
@@ -1540,6 +1555,43 @@ fn index_dependency_model(
 /// Warm the index off the request path, reporting progress to the client when it supports work-done
 /// progress (rust-analyzer-style status: "scanning project", then "indexing <coordinate> (n/total)").
 /// Falls back to log messages otherwise. Summaries are always logged.
+async fn prime_selected_compiler_api(
+    ws: &Arc<Mutex<Workspace>>,
+    workers: &Arc<tokio::sync::Semaphore>,
+) {
+    let targets = ws.lock().compiler_api_targets();
+    for key in targets {
+        let Ok(permit) = workers.clone().acquire_owned().await else {
+            return;
+        };
+        let request = match ws.lock().begin_kotlin_compiler_api(&key) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let ws = ws.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let start = Instant::now();
+            let (wake, _events) = tokio::sync::mpsc::channel(1);
+            let environment = match crate::compile::KotlinDiagnosticEnvironment::prepare(&request, wake) {
+                Ok(environment) => environment,
+                Err(error) => { tracing::debug!(%error, "initial compiler API environment unavailable"); return; }
+            };
+            let outcome = crate::compile::run_kotlin_editor_compile(&request, &environment);
+            let compiler_error = match &outcome {
+                crate::compile::KotlinDiagnosticOutcome::Unverified(reason) => Some(reason.clone()),
+                _ => None,
+            };
+            let snapshot = environment.compiler_api.lock().ok().and_then(|mut snapshot| snapshot.take());
+            let mut ws = ws.lock();
+            let accepted = snapshot.map(|snapshot| ws.accept_kotlin_compiler_api(&request, environment.clone(), snapshot));
+            ws.finish_kotlin_diagnostics(&request, outcome, environment.invalid.clone());
+            crate::trace::span("compiler.api.initialize", "compiler", start,
+                serde_json::json!({"generation": request.generation, "accepted": accepted.as_ref().is_some_and(|result| result.is_ok()), "error": accepted.and_then(|result| result.err()), "compiler_error": compiler_error, "processor_plan": request.processor_plan.is_some()}));
+        }).await;
+    }
+}
+
 async fn index_workspace(
     client: Client,
     ws: Arc<Mutex<Workspace>>,
@@ -1551,6 +1603,7 @@ async fn index_workspace(
     force: bool,
     watches: Arc<Mutex<WatchState>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    compiler_workers: Arc<tokio::sync::Semaphore>,
 ) {
     // 1. Project sources (fast).
     let scan_ws = ws.clone();
@@ -1793,32 +1846,6 @@ async fn index_workspace(
         }
         return;
     }
-    crate::trace::span(
-        "deps.index_workspace",
-        "deps",
-        deps_start,
-        serde_json::json!({
-            "root": root.to_string_lossy(),
-            "generation": generation,
-            "coordinates": stats.coordinates,
-            "localJars": stats.local_jars,
-            "reusedCoordinates": stats.reused_coordinates,
-            "reusedLocalJars": stats.reused_local_jars,
-            "files": stats.files,
-            "symbols": stats.symbols,
-            "failed": stats.failed,
-            "missingSources": stats.missing_sources,
-            "jdkFiles": stats.jdk_files,
-            "jdkReused": stats.jdk_reused,
-            "jdkComplete": stats.jdk_complete,
-            "jdkSymbols": stats.jdk_symbols,
-            "localStubFiles": stats.local_stub_files,
-            "localStubSymbols": stats.local_stub_symbols,
-            "localSourceFiles": stats.local_source_files,
-            "localSourceSymbols": stats.local_source_symbols,
-            "classpathComplete": !stats.incomplete_classpath,
-        }),
-    );
 
     let jdk_summary = if stats.jdk_files > 0 {
         format!(
@@ -1880,6 +1907,21 @@ async fn index_workspace(
         }
         return;
     }
+    prime_selected_compiler_api(&ws, &compiler_workers).await;
+    crate::trace::span(
+        "deps.index_workspace",
+        "deps",
+        deps_start,
+        serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+            "coordinates": stats.coordinates, "localJars": stats.local_jars,
+            "reusedCoordinates": stats.reused_coordinates, "reusedLocalJars": stats.reused_local_jars,
+            "files": stats.files, "symbols": stats.symbols, "failed": stats.failed,
+            "missingSources": stats.missing_sources, "jdkFiles": stats.jdk_files, "jdkReused": stats.jdk_reused,
+            "jdkComplete": stats.jdk_complete, "jdkSymbols": stats.jdk_symbols,
+            "localStubFiles": stats.local_stub_files, "localStubSymbols": stats.local_stub_symbols,
+            "localSourceFiles": stats.local_source_files, "localSourceSymbols": stats.local_source_symbols,
+            "classpathComplete": !stats.incomplete_classpath}),
+    );
     // Open buffers may have received conservative diagnostics before dependency/JDK indexing
     // completed. Republish them now that the library completeness facts and durable symbols are in.
     let open_keys = {
@@ -4745,6 +4787,12 @@ fn def_to_range(ws: &Workspace, d: &Def) -> Option<Range> {
 
 #[cfg(test)]
 mod tests {
+    fn generation_one_workspace() -> Arc<Mutex<Workspace>> {
+        let mut workspace = Workspace::new();
+        assert_eq!(workspace.begin_analysis_generation(), 1);
+        Arc::new(Mutex::new(workspace))
+    }
+
     #[test]
     fn selected_sdk_seed_waits_for_gradle_model_and_preserves_standalone_default() {
         let file = Path::new("/pending/src/Use.java");
@@ -5897,6 +5945,7 @@ mod tests {
                     None,
                     false,
                     1,
+                    generation_one_workspace(),
                     tx,
                 );
                 rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -6004,6 +6053,7 @@ mod tests {
                 None,
                 false,
                 1,
+                generation_one_workspace(),
                 tx,
             );
             rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -6105,6 +6155,7 @@ mod tests {
                     None,
                     false,
                     1,
+                    generation_one_workspace(),
                     tx,
                 );
                 let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -6194,6 +6245,7 @@ mod tests {
                         None,
                         false,
                         1,
+                        generation_one_workspace(),
                         tx,
                     );
                     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -6296,6 +6348,7 @@ mod tests {
                 None,
                 false,
                 1,
+                generation_one_workspace(),
                 tx,
             );
             rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -6567,6 +6620,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 None,
                 false,
                 1,
+                generation_one_workspace(),
                 tx,
             );
             let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -8434,7 +8488,8 @@ fn schedule_selected_kotlin_diagnostics(
                 let start = Instant::now();
                 let scope = worker_request.scope.clone();
                 let cached = worker_state.lock().environments.get(&scope)
-                    .filter(|environment| environment.matches(&worker_request)).cloned();
+                    .filter(|environment| environment.matches(&worker_request)).cloned()
+                    .or_else(|| worker_ws.lock().compiler_api_environment(&worker_request));
                 let environment = match cached {
                     Some(environment) => { drop(wake); Ok((environment, false)) }
                     None => {
@@ -8494,6 +8549,11 @@ fn schedule_selected_kotlin_diagnostics(
                 }
                 let (keys, proofs) = {
                     let mut ws = worker_ws.lock();
+                    if let Some(snapshot) = environment.compiler_api.lock().ok().and_then(|mut snapshot| snapshot.take()) {
+                        if let Err(error) = ws.accept_kotlin_compiler_api(&worker_request, environment.clone(), snapshot) {
+                            tracing::debug!(%error, "current compiler API observation rejected");
+                        }
+                    }
                     let keys = ws.finish_kotlin_diagnostics(&worker_request, outcome, environment.invalid.clone());
                     let proofs: Vec<_> = keys.iter().filter_map(|key| ws.kotlin_diagnostic_trace(key)).collect();
                     (keys, proofs)

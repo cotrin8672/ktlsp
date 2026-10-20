@@ -14,6 +14,8 @@ const JAVA_SOURCE: &str = include_str!("JavacDiagnostics.java");
 
 #[path = "method_diagnostics.rs"]
 mod method_diagnostics;
+#[path = "positive.rs"]
+pub(crate) mod positive;
 #[path = "processor.rs"]
 pub(super) mod processor;
 
@@ -24,6 +26,7 @@ pub(super) fn assets_sha256() -> String {
         DOMAIN_SOURCE,
         K2_HEADER_SOURCE,
         JAVA_SOURCE,
+        include_str!("PositiveHeaders.kt"),
         processor::OBSERVER,
         include_str!("../../../../scripts/classpath-dump.init.gradle.kts"),
     ] {
@@ -137,7 +140,7 @@ fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &s
         Some("gradle-7.4.2-stock-actions-v1" | "gradle-7.5-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
         }
-        Some("gradle-9.6.1-stock-actions-v1") => {
+        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalTaskAction"
         }
         _ => return false,
@@ -160,7 +163,7 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
     };
     match fact.get("adapter").and_then(Value::as_str) {
         Some("gradle-7.4.2-stock-onlyif-v1" | "gradle-7.5-stock-onlyif-v1") => {}
-        Some("gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
+        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
         _ => return false,
     }
     let Some(predicates) = fact.get("predicates").and_then(Value::as_array) else {

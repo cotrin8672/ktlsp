@@ -400,21 +400,35 @@ pub fn member_candidates_at<'a>(
         .map(CallableCandidate::Authored)
         .collect();
     }
-    let mut out: Vec<_> = crate::members::matching_candidates(
+    let source_members = crate::members::matching_candidates(
         index,
         receiver,
         crate::members::MemberName::Prefix(prefix),
         ctx,
         false,
     )
-    .members
-    .into_iter()
-    .filter(|entry| {
-        entry.sym.kind == SymbolKind::Function
-            && crate::members::member_accessible_at(index, receiver, entry, ctx, position)
-    })
-    .map(CallableCandidate::Authored)
-    .collect();
+    .members;
+    member_candidates_from(index, receiver, prefix, ctx, position, &source_members)
+}
+
+/// Add JVM projections to an already collected source pool without walking its hierarchy again.
+pub(crate) fn member_candidates_from<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    prefix: &str,
+    ctx: &FileCtx,
+    position: usize,
+    source_members: &[&'a Entry],
+) -> Vec<CallableCandidate<'a>> {
+    let mut out: Vec<_> = source_members
+        .iter()
+        .copied()
+        .filter(|entry| {
+            entry.sym.kind == SymbolKind::Function
+                && crate::members::member_accessible_at(index, receiver, entry, ctx, position)
+        })
+        .map(CallableCandidate::Authored)
+        .collect();
     if let (Some(name), Some(package)) = (receiver.name(), receiver.package()) {
         for source in index
             .jvm_sources(name)
@@ -452,11 +466,20 @@ pub fn member_candidates_at<'a>(
         } = receiver
         {
             let owners: Vec<_> = index
-                .lookup_type(name)
+                .lookup_type(
+                    container
+                        .as_deref()
+                        .and_then(|container| container.split('.').next())
+                        .unwrap_or(name),
+                )
                 .into_iter()
                 .filter(|entry| {
                     entry.sym.package == *package
-                        && entry.sym.container.as_ref() == container.as_ref()
+                        && if container.is_some() {
+                            entry.sym.container.is_none()
+                        } else {
+                            entry.sym.container.as_ref() == container.as_ref()
+                        }
                 })
                 .collect();
             if let [owner] = owners.as_slice() {
@@ -468,7 +491,11 @@ pub fn member_candidates_at<'a>(
                     };
                     for set in index.contributions_for_file(&definition.file) {
                         for (source_owner, class, descriptor, facts) in set.compiled_callables() {
-                            if source_owner == &definition && facts.name.starts_with(prefix) {
+                            if source_owner == &definition
+                                && facts.name.starts_with(prefix)
+                                && class.identity.internal_name
+                                    == receiver_internal_name(receiver).unwrap_or_default()
+                            {
                                 out.push(CallableCandidate::Jvm {
                                     owner: JvmOwner::Compiled {
                                         class: &class.identity,
@@ -486,6 +513,153 @@ pub fn member_candidates_at<'a>(
     }
     normalize_compiled_candidates(index, receiver, &mut out);
     out
+}
+
+fn receiver_internal_name(receiver: &Type) -> Option<String> {
+    let Type::Class {
+        name,
+        package: Some(package),
+        container,
+        ..
+    } = receiver
+    else {
+        return None;
+    };
+    Some(format!(
+        "{}{name}",
+        match container {
+            Some(container) => format!(
+                "{}/{}$",
+                package.replace('.', "/"),
+                container.replace('.', "$")
+            ),
+            None if package.is_empty() => String::new(),
+            None => format!("{}/", package.replace('.', "/")),
+        }
+    ))
+}
+
+/// Static final object fields from current compiler observations retain their binary nested identity.
+pub fn compiler_field_type(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    name: &str,
+) -> Option<Type> {
+    compiler_object_field_type(index, receiver, Some(name))
+}
+
+pub fn compiler_companion_type(index: &dyn InferenceIndex, receiver: &Type) -> Option<Type> {
+    compiler_object_field_type(index, receiver, None)
+}
+
+pub fn compiler_object_value(index: &dyn InferenceIndex, receiver: &Type) -> bool {
+    let Type::Class {
+        package: Some(package),
+        container: Some(container),
+        ..
+    } = receiver
+    else {
+        return false;
+    };
+    let root = Type::class(container, Some(package.clone()));
+    compiler_companion_type(index, &root).as_ref() == Some(receiver)
+}
+
+/// This source anchor has a current complete, field-free Object-rooted Javac namespace.
+/// It proves no method inventory or project-wide producer closure.
+pub fn compiler_value_namespace(index: &dyn InferenceIndex, owner: &Entry) -> bool {
+    if !owner.path.ends_with(".java")
+        || owner.sym.container.is_some()
+        || !owner.sym.type_params.is_empty()
+        || !owner.sym.supertypes.is_empty()
+        || !owner.sym.supertype_refs.is_empty()
+    {
+        return false;
+    }
+    let definition = Def {
+        file: owner.path.to_string(),
+        start_byte: owner.sym.start_byte,
+        end_byte: owner.sym.end_byte,
+    };
+    index.contributions_for_file(&owner.path).iter().any(|set| {
+        set.compiled_value_namespace(&definition)
+            .is_some_and(|class| {
+                class.fields.is_empty()
+                    && class.super_name.as_deref() == Some("java/lang/Object")
+                    && class.interfaces.is_empty()
+                    && class.signature.is_none()
+                    && class
+                        .inner_classes
+                        .iter()
+                        .all(|inner| inner.inner.as_ref() != class.identity.internal_name)
+                    && class
+                        .attribute_names
+                        .iter()
+                        .all(|name| name.as_ref() != "EnclosingMethod")
+            })
+    })
+}
+
+fn compiler_object_field_type(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    name: Option<&str>,
+) -> Option<Type> {
+    if !index.may_have_compiled_callables() || !index.scope_is_complete() {
+        return None;
+    }
+    let internal = receiver_internal_name(receiver)?;
+    let Type::Class {
+        name: owner_name,
+        package: Some(package),
+        container,
+        ..
+    } = receiver
+    else {
+        return None;
+    };
+    let root_name = container
+        .as_deref()
+        .and_then(|container| container.split('.').next())
+        .unwrap_or(owner_name);
+    let owners: Vec<_> = index
+        .lookup_type(root_name)
+        .into_iter()
+        .filter(|entry| entry.sym.package == *package && entry.sym.container.is_none())
+        .collect();
+    let [owner] = owners.as_slice() else {
+        return None;
+    };
+    let mut result = None;
+    for set in index.contributions_for_file(&owner.path) {
+        for (anchor, class, field, _, companion) in set.compiled_fields() {
+            if anchor.start_byte != owner.sym.start_byte
+                || class.identity.internal_name != internal
+                || match name {
+                    Some(name) => field.name.as_ref() != name,
+                    None => !companion,
+                }
+            {
+                continue;
+            }
+            let target = field.descriptor.strip_prefix('L')?.strip_suffix(';')?;
+            let (package, binary) = target.rsplit_once('/')?;
+            let (container, name) = binary.rsplit_once('$')?;
+            let ty = Type::Class {
+                name: name.into(),
+                package: Some(package.replace('/', ".")),
+                container: Some(container.replace('$', ".")),
+                nullable: false,
+                args: Vec::new(),
+                owner: None,
+            };
+            if result.as_ref().is_some_and(|previous| previous != &ty) {
+                return None;
+            }
+            result = Some(ty);
+        }
+    }
+    result
 }
 
 fn compiled_key<'a>(

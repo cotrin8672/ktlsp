@@ -21,6 +21,7 @@ pub(crate) struct AnalysisExtensions {
     retain_all_sources: bool,
     compiled_enabled: bool,
     compiled_receipt: Option<Arc<crate::compile::SuccessfulCompileReceipt>>,
+    compiler_api_sources: BTreeSet<String>,
     store: ExtensionStore,
     changed: BTreeSet<String>,
     suspended: bool,
@@ -62,7 +63,9 @@ impl AnalysisExtensions {
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.retain_all_sources && self.compiled_receipt.is_none()
+        !self.retain_all_sources
+            && self.compiled_receipt.is_none()
+            && self.compiler_api_sources.is_empty()
     }
 
     pub fn configure(
@@ -77,6 +80,7 @@ impl AnalysisExtensions {
         }
         if id == COMPILED_JAVA_PROVIDER {
             self.clear_compiled();
+            self.clear_compiler_api(index);
             self.compiled_enabled = enabled;
         }
         self.changed.extend(
@@ -98,6 +102,15 @@ impl AnalysisExtensions {
         if self.is_empty() || sources.is_empty() {
             return;
         }
+        if sources.iter().any(|(key, text, tree)| {
+            self.compiler_api_sources.contains(key)
+                && self
+                    .inputs
+                    .get(key)
+                    .is_none_or(|input| !input.compiler_source_matches(text, tree))
+        }) {
+            self.clear_compiler_api(index);
+        }
         if self.compiled_receipt.as_ref().is_some_and(|receipt| {
             sources.iter().any(|(key, text, _)| {
                 receipt.observes_path(key) && !receipt.source_matches(key, text)
@@ -118,16 +131,20 @@ impl AnalysisExtensions {
             self.forget_source_producer(&key);
             self.changed.insert(key.clone());
             // A host source replacement cannot transfer a prior build's binary authority.
-            let compiled = self
+            let previous = self
                 .inputs
                 .remove(&key)
-                .and_then(|input| (input.text == text).then_some(input.compiled).flatten());
+                .filter(|input| input.compiler_source_matches(&text, &tree));
+            let (compiled, compiler_classes) = previous
+                .map(|input| (input.compiled, input.compiler_classes))
+                .unwrap_or_default();
             self.inputs.insert(
                 key,
                 SourceInput {
                     text,
                     tree,
                     compiled,
+                    compiler_classes,
                     prepared_references: None,
                 },
             );
@@ -143,6 +160,9 @@ impl AnalysisExtensions {
     }
 
     pub fn remove_source(&mut self, index: &dyn InferenceIndex, key: &str) {
+        if self.compiler_api_sources.contains(key) {
+            self.clear_compiler_api(index);
+        }
         if self
             .compiled_receipt
             .as_ref()
@@ -178,6 +198,7 @@ impl AnalysisExtensions {
         self.suspended = true;
         self.invalidate_hydrated_sources();
         self.clear_compiled();
+        self.compiler_api_sources.clear();
         self.store.invalidate_model();
     }
 
@@ -188,6 +209,7 @@ impl AnalysisExtensions {
         self.mark_published();
         self.invalidate_hydrated_sources();
         self.clear_compiled();
+        self.clear_compiler_api(index);
         self.store.invalidate_model();
         self.normalize_all(index);
         self.evaluate(index);
@@ -302,10 +324,9 @@ impl AnalysisExtensions {
         }
         for (provider, owner) in self.store.take_dirty() {
             if provider == COMPILED_JAVA_PROVIDER
-                && !self
-                    .inputs
-                    .get(&owner)
-                    .is_some_and(|input| input.compiled.is_some())
+                && !self.inputs.get(&owner).is_some_and(|input| {
+                    input.compiled.is_some() || !input.compiler_classes.is_empty()
+                })
             {
                 continue;
             }
@@ -367,13 +388,15 @@ impl AnalysisProvider for CompiledJavaProvider {
             if owner.definition() != def {
                 continue;
             }
-            let Knowledge::Found(class) = read.compiled_class(&owner)? else {
-                continue;
-            };
-            for method in read.compiled_methods(&class)? {
-                // The shared core validates language surface and descriptor; this provider cannot
-                // create a signature, source position or a framework-specific completion item.
-                let _ = read.admit_java_method(&method)?;
+            if let Knowledge::Found(class) = read.compiled_class(&owner)? {
+                for method in read.compiled_methods(&class)? {
+                    // The shared core validates language surface and descriptor; this provider cannot
+                    // create a signature, source position or a framework-specific completion item.
+                    let _ = read.admit_java_method(&method)?;
+                }
+            }
+            for class in read.compiler_classes(&owner)? {
+                read.admit_compiler_class(&class)?;
             }
         }
         Ok(())
@@ -384,7 +407,79 @@ struct SourceInput {
     text: Arc<str>,
     tree: Tree,
     compiled: Option<Arc<ktcore::classfile::ClassFileFacts>>,
+    compiler_classes: Vec<ktcore::extensions::CompilerClassInput>,
     prepared_references: Option<ktcore::extensions::source::PreparedSourceReferences>,
+}
+
+impl SourceInput {
+    fn compiler_source_matches(&self, text: &str, tree: &Tree) -> bool {
+        self.text.as_ref() == text
+            || !self.compiler_classes.is_empty()
+                && self.compiler_classes.iter().all(|input| {
+                    input.value_namespace && input.kotlin_methods.is_empty() && !input.companion
+                })
+                && crate::java::declaration_header_text(&self.tree, &self.text).is_some_and(
+                    |header| {
+                        crate::java::declaration_header_text(tree, text).as_ref() == Some(&header)
+                    },
+                )
+    }
+}
+
+#[cfg(test)]
+mod compiler_source_tests {
+    use super::*;
+
+    fn input(text: &str, value_namespace: bool) -> SourceInput {
+        SourceInput {
+            text: Arc::from(text),
+            tree: crate::java::JavaParser::new().parse(text),
+            compiled: None,
+            compiler_classes: vec![ktcore::extensions::CompilerClassInput {
+                class: Arc::new(
+                    ktcore::classfile::decode(
+                        "test",
+                        include_bytes!(
+                            "../../ktcore/tests/fixtures/classfile/serialization/Model.class"
+                        ),
+                    )
+                    .unwrap(),
+                ),
+                kotlin_methods: Default::default(),
+                companion: false,
+                value_namespace,
+            }],
+            prepared_references: None,
+        }
+    }
+
+    #[test]
+    fn only_independently_bounded_namespace_observations_reuse_consumer_bodies() {
+        let text = "package sample; class Use { void run() { Model.Companion.serializer(); } }";
+        let partial = "package sample; class Use { void run() { Model.Companion.seri } }";
+        let tree = crate::java::JavaParser::new().parse(partial);
+        assert!(!input(text, false).compiler_source_matches(partial, &tree));
+        assert!(input(text, true).compiler_source_matches(partial, &tree));
+        for changed in [
+            "package sample; class Use { Object Model; void run() { Model.Companion.seri } }",
+            "package sample; class Use extends Base { void run() { Model.Companion.seri } }",
+            "package other; class Use { void run() { Model.Companion.seri } }",
+            "package sample; class Use { @Generated void run() { Model.Companion.seri } }",
+        ] {
+            assert!(
+                !input(text, true).compiler_source_matches(
+                    changed,
+                    &crate::java::JavaParser::new().parse(changed)
+                ),
+                "{changed}"
+            );
+        }
+        let mut generated = input(text, true);
+        generated.compiler_classes[0]
+            .kotlin_methods
+            .insert("generated()V".into());
+        assert!(!generated.compiler_source_matches(partial, &tree));
+    }
 }
 
 impl AnalysisExtensions {
@@ -475,6 +570,7 @@ impl AnalysisExtensions {
                     text: owner.text,
                     tree: owner.tree,
                     compiled: Some(owner.class),
+                    compiler_classes: Vec::new(),
                     prepared_references: None,
                 },
             );
@@ -501,6 +597,35 @@ impl AnalysisExtensions {
     }
 
     fn attach_compiled(&mut self, index: &dyn InferenceIndex, key: &str) -> Result<(), String> {
+        if let Some(input) = self
+            .inputs
+            .get(key)
+            .filter(|input| !input.compiler_classes.is_empty())
+        {
+            let mut read = self
+                .store
+                .begin(index, COMPILED_JAVA_PROVIDER, key)
+                .map_err(|error| format!("{error:?}"))?;
+            let roots: Vec<_> = input
+                .compiler_classes
+                .iter()
+                .filter(|class| !class.class.identity.internal_name.contains('$'))
+                .collect();
+            let [root] = roots.as_slice() else {
+                return Err("compiler-api-root-unknown".into());
+            };
+            let owner = read.resolve_type(&root.class.identity.internal_name.replace('/', "."));
+            let pending = read.finish();
+            self.store
+                .commit(pending)
+                .map_err(|error| format!("{error:?}"))?;
+            let Knowledge::Found(owner) = owner else {
+                return Err("compiler-api-owner-unknown".into());
+            };
+            self.store
+                .replace_compiler_classes(index, &owner, input.compiler_classes.clone())
+                .map_err(|error| format!("{error:?}"))?;
+        }
         let Some(class) = self
             .inputs
             .get(key)
@@ -524,5 +649,79 @@ impl AnalysisExtensions {
         self.store
             .replace_compiled_input(index, &owner, Some(class))
             .map_err(|error| format!("{error:?}"))
+    }
+}
+
+impl AnalysisExtensions {
+    pub fn clear_compiler_api(&mut self, index: &dyn InferenceIndex) {
+        if self.compiler_api_sources.is_empty() {
+            return;
+        }
+        self.store.clear_compiled_inputs();
+        for key in std::mem::take(&mut self.compiler_api_sources) {
+            self.changed.insert(key.clone());
+            if self.retain_all_sources {
+                if let Some(input) = self.inputs.get_mut(&key) {
+                    input.compiler_classes.clear();
+                }
+            } else {
+                self.inputs.remove(&key);
+                self.store.remove_source(&key);
+            }
+        }
+        self.evaluate(index);
+    }
+
+    pub fn accept_compiler_api(
+        &mut self,
+        index: &dyn InferenceIndex,
+        snapshot: crate::compile::CompilerApiSnapshot,
+    ) -> Result<(), String> {
+        if !self.compiled_enabled || self.suspended {
+            return Err("compiler-api-provider-disabled".into());
+        }
+        let mut parsers = crate::language::LanguageParsers::new();
+        let result = (|| {
+            for (key, mut classes) in snapshot.classes {
+                if !classes
+                    .iter()
+                    .any(|class| !class.kotlin_methods.is_empty() || class.value_namespace)
+                {
+                    continue;
+                }
+                let text = snapshot
+                    .sources
+                    .get(&key)
+                    .ok_or("compiler-api-source-missing")?
+                    .clone();
+                let tree = parsers.parse_for_key(&key, &text);
+                let origin = index
+                    .origin_facts()
+                    .and_then(|facts| facts.file_origin(&key))
+                    .ok_or("compiler-api-origin-unknown")?;
+                for class in &mut classes {
+                    Arc::make_mut(&mut class.class).identity.origin_id = origin.origin_id.clone();
+                }
+                self.compiler_api_sources.insert(key.clone());
+                self.changed.insert(key.clone());
+                self.inputs.insert(
+                    key.clone(),
+                    SourceInput {
+                        text,
+                        tree,
+                        compiled: None,
+                        compiler_classes: classes,
+                        prepared_references: None,
+                    },
+                );
+                self.normalize(index, &key)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.clear_compiler_api(index);
+        }
+        self.evaluate(index);
+        result
     }
 }

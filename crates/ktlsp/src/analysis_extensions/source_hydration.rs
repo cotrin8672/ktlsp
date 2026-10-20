@@ -822,6 +822,7 @@ impl AnalysisExtensions {
                     text: source.text,
                     tree: source.tree,
                     compiled: None,
+                    compiler_classes: Vec::new(),
                     prepared_references: Some(source.references),
                 },
             );

@@ -395,7 +395,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     }
     let value = matches!(
         node.kind(),
-        "property_declaration" | "class_parameter" | "field_declaration"
+        "property_declaration" | "class_parameter" | "field_declaration" | "constant_declaration"
     );
     let type_declaration = matches!(
         node.kind(),
@@ -429,7 +429,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
                         | "nullable_type"
                         | "type_constraints"
                 )
-            } else if node.kind() == "field_declaration" {
+            } else if matches!(node.kind(), "field_declaration" | "constant_declaration") {
                 child.kind() != "variable_declarator"
             } else {
                 !matches!(
