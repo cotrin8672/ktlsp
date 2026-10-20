@@ -50,7 +50,7 @@ Custom task actions/predicates remain unproved; metadata alone grants neither
 processor API nor absence authority. Evidence:
 processor120/java8102-model1/receipt.json and processor120/java8102-abi/.
 
-Serialization now passes the original Kotlin golden, partial and dangling-dot
+Serialization's earlier editor3 passes the original Kotlin golden, partial and dangling-dot
 completion cases on the first response (3/3). The original Java cases still
 return unknown receivers (0/3); the real Gradle/Lombok caller needs an actual
 javac namespace witness rather than the plain-Java absence proof. Positive
@@ -59,6 +59,16 @@ generic-result tests pass. The earlier observer-directory collision is fixed.
 Evidence: serialization120/editor3/receipt.json and
 serialization120/editor3-harness/artifacts/corpus-results.json. All six editor
 requests use one attempt; Kotlin success does not establish Java acceptance.
+The shared5 integration then regresses to0/6 (six received first-response
+mismatches, zero unmeasured); Root verifies its raw report. Actual javac rejects
+the observed Kotlin headers because Noarg's real generated NeedsLabel()
+constructor is absent from the KAPT3 header output. No Java namespace authority
+is published. Preserve independently verified Kotlin positives when the Java
+side is unavailable; actual backend generation for the selected compiler plugins
+is the next fix. Cold model/JDK rebuild and a superseded API ticket are separate
+observations, not warm timing evidence. Shutdown also fails to finish after its
+response/exit notification. Evidence: serialization120/editor4/receipt.json and
+serialization120/editor4-harness/artifacts/corpus-results.json.
 
 The separately built extension consumer passes4/4 Rust tests with the current
 host/core and a synchronized lockfile (19 added lines; existing versions stay
@@ -78,9 +88,24 @@ zero-argument inherited method below a missing upper ancestor; unresolved
 sibling/overload cases still stay unknown. The actual CEM/Create reduction
 changes from RED to GREEN without source jars. Focused Rust checks pass15+67;
 four new native-editor cases pass12 assertions after independent Gradle
-compilation. Full original CEM release validation remains pending, and partial
-hierarchy navigation/inference still return Unknown. See
+compilation. A subsequent shared proof now resolves the nearest concrete
+zero-argument declaration for completion, goto and Float inference on the actual
+CEM buffers across local/module and cold/warm caches; the focused67 receiver
+checks and two actual-Create checks pass. Exact selection retains its bounded
+arity/generic/vararg guards. Source caches advance to v34 so old cached interface
+constant omissions cannot persist. Explicit InnerClasses ownership also retains
+the actual read/write nested parameters, with16 binary-Java tests passing and
+three actual javac super calls compiling. Three native partial-completion
+requests match on their first response, but that run needs forced shutdown and
+is operationally incomplete. Full original CEM release validation remains
+pending. See
 docs/fork-cem-startup120.md for exact scope and evidence.
+
+The shutdown problem is reproduced by two shared5 native runs after
+server.serve.closed; its cause is still being tested. No timing threshold is
+extended and no forced process exit is counted as clean shutdown. Evidence:
+cem-startup120/parameter-summary.json. The current release integration has not
+started while the compiler and lifecycle fixes remain in progress.
 
 Additional-five-project oracle checks continue. The closed current IDEA
 evidence covers41/50 original cases;
