@@ -187,6 +187,31 @@ readiness and native memory checks, including a real protocol peer process.
 The workspace contains the shared semantic engine (`ktcore`), language server (`ktlsp`), and
 static-analysis CLI (`ktcheck`).
 
+Development and test builds keep workspace backtrace file/line information and omit
+dependency debug information to reduce compile/link time. For quick iteration, check or
+test the affected package first, then run the broader checks below:
+
+```sh
+cargo check -p ktcore
+cargo test -p ktcore --lib coords::tests
+cargo build -p ktlsp --bin ktlsp
+```
+
+On Windows MSVC, the bundled Rust LLD linker reduced the measured server edit/build
+median by about 7%. Use it for a development server build without changing other
+targets or the release linker:
+
+```sh
+cargo rustc -p ktlsp --bin ktlsp -- -C linker=rust-lld.exe
+dev/ktlsp-harness.sh basic --no-build
+```
+
+Use `cargo --config profile.dev.debug=2 build -p ktlsp --bin ktlsp` when workspace
+variable/type debugging is needed; dependencies still omit debug information.
+Use `cargo build --release --bin ktlsp` for runtime measurements and production.
+The release optimization settings are unchanged. Build measurements and limitations
+are recorded in [docs/build-performance.md](docs/build-performance.md).
+
 ```sh
 cargo test --workspace
 cargo fmt --all -- --check

@@ -32,3 +32,10 @@ parking_lot = "0.12"
 [patch.crates-io]
 ls-types = { path = "vendor/ls-types" }
 notify = { path = "vendor/notify" }
+
+[profile.dev]
+# Keep workspace panic file/line information without generating debugger variable/type data.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
