@@ -198,8 +198,11 @@ impl ClassInventoryCache {
                 // Nested service files can change without changing the classpath root's mtime.
                 return crate::jar::plain_java_classpath_entry(path, processors_disabled);
             }
-            let Ok(Some(before)) = file_stamp(path) else {
-                return false;
+            let before = match file_stamp(path) {
+                Ok(Some(stamp)) => stamp,
+                // An unbuilt output has no services; recheck instead of caching this absence.
+                Ok(None) => return true,
+                Err(()) => return false,
             };
             let key = (path.clone(), processors_disabled);
             if let Some((stamp, absent)) = self.services.get(&key) {
@@ -623,6 +626,58 @@ mod tests {
             "origin".into()
         )));
         assert!(cache.classes.len() <= MAX_CACHE_ENTRIES && cache.class_bytes <= MAX_CLASS_BYTES);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_classpath_entries_are_rechecked_before_certifying_no_compiler_services() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_absent_classpath_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = root.join("classes/kotlin/main");
+        let archive = root.join("generated.jar");
+        let java = task(&[output.clone(), archive.clone()]);
+        let mut cache = ClassInventoryCache::default();
+        assert!(
+            cache.plain_caller(&java),
+            "unbuilt outputs contain no services"
+        );
+        let service = output.join("META-INF/services/javax.annotation.processing.Processor");
+        std::fs::create_dir_all(service.parent().unwrap()).unwrap();
+        std::fs::write(&service, b"generated.Processor").unwrap();
+        assert!(
+            !cache.plain_caller(&java),
+            "new directory service retracts the proof"
+        );
+        std::fs::remove_file(service).unwrap();
+        assert!(cache.plain_caller(&java));
+        jar(
+            &archive,
+            &[(
+                "META-INF/services/com.sun.source.util.Plugin",
+                b"generated.Plugin",
+            )],
+        );
+        assert!(
+            !cache.plain_caller(&java),
+            "new archive service retracts the proof"
+        );
+        std::fs::write(&archive, b"invalid archive").unwrap();
+        assert!(!cache.plain_caller(&java), "invalid inputs remain unknown");
+        std::fs::remove_file(&archive).unwrap();
+        assert!(cache.plain_caller(&java));
+        let changed = task(&[root.join("other.jar")]);
+        jar(
+            &changed.classpath[0],
+            &[(
+                "META-INF/services/javax.annotation.processing.Processor",
+                b"other.Processor",
+            )],
+        );
+        assert!(
+            !cache.plain_caller(&changed),
+            "a changed classpath has its own service facts"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
