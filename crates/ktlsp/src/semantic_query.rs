@@ -1005,6 +1005,17 @@ impl InferenceIndex for RecoveredTypeIndex<'_> {
             self.source.lookup_by_name(name),
         )
     }
+    fn entries_for_file(&self, file: &str) -> Vec<Entry> {
+        let mut entries = if self.replaced_file == Some(file) {
+            Vec::new()
+        } else {
+            self.index.entries_for_file(file)
+        };
+        if self.replaced_file.is_some() {
+            entries.extend(self.source.entries_for_file(file));
+        }
+        entries
+    }
     fn members_of(&self, name: &str) -> LookupEntries<'_> {
         if self.replaced_file.is_some() {
             return self
@@ -4202,6 +4213,105 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
 #[cfg(test)]
 mod recovered_property_proof_tests {
     use super::*;
+
+    #[test]
+    fn recovered_file_lookup_preserves_replacement_and_scope_without_global_scan() {
+        use crate::index::Tier;
+        use crate::symbol::IndexedSymbol;
+        use std::cell::Cell;
+
+        struct FileScope {
+            index: Index,
+            global_scans: Cell<usize>,
+        }
+        impl InferenceIndex for FileScope {
+            fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::lookup_by_name(&self.index, name)
+            }
+            fn members_of(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::members_of(&self.index, name)
+            }
+            fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+                InferenceIndex::extensions_for(&self.index, name)
+            }
+            fn entries_for_file(&self, file: &str) -> Vec<Entry> {
+                if file == "Hidden.java" {
+                    Vec::new()
+                } else {
+                    self.index.entries_for_file(file)
+                }
+            }
+            fn entries_with_prefix<'a>(
+                &'a self,
+                prefix: &'a str,
+                top_level_only: bool,
+            ) -> Box<dyn Iterator<Item = &'a Entry> + 'a> {
+                if prefix.is_empty() {
+                    self.global_scans.set(self.global_scans.get() + 1);
+                }
+                Box::new(
+                    self.index
+                        .entries_with_prefix(prefix, top_level_only)
+                        .filter(|entry| entry.path.as_ref() != "Hidden.java"),
+                )
+            }
+            fn scope_is_complete(&self) -> bool {
+                false
+            }
+        }
+        let class =
+            |name: &str| IndexedSymbol::new(name, SymbolKind::Class, "demo", None, 0, name.len());
+        let mut original = Index::new();
+        for (file, name) in [
+            ("Use.java", "OldOwner"),
+            ("Visible.java", "Visible"),
+            ("Hidden.java", "Hidden"),
+        ] {
+            original.replace_file(file, vec![class(name)], Tier::Volatile);
+        }
+        let scoped = FileScope {
+            index: original,
+            global_scans: Cell::new(0),
+        };
+        let mut source = Index::new();
+        source.replace_file("Use.java", vec![class("NewOwner")], Tier::Volatile);
+        source.replace_file("Extra.java", vec![class("Extra")], Tier::Volatile);
+        for replaced_file in [Some("Use.java"), None] {
+            let recovered = RecoveredTypeIndex {
+                index: &scoped,
+                source: &source,
+                replaced_file,
+                source_member_proofs: false,
+            };
+            let selected = recovered.entries_for_file("Use.java");
+            assert_eq!(selected.len(), 1);
+            assert_eq!(
+                selected[0].sym.name,
+                if replaced_file.is_some() {
+                    "NewOwner"
+                } else {
+                    "OldOwner"
+                }
+            );
+            assert!(!recovered.source_value_namespace_complete(&selected[0]));
+            assert!(!recovered.scope_is_complete());
+            assert_eq!(
+                recovered.entries_for_file("Visible.java")[0].sym.name,
+                "Visible"
+            );
+            assert!(recovered.entries_for_file("Hidden.java").is_empty());
+            assert!(recovered.entries_for_file("Missing.java").is_empty());
+            assert_eq!(
+                recovered.entries_for_file("Extra.java").len(),
+                usize::from(replaced_file.is_some())
+            );
+        }
+        assert_eq!(
+            scoped.global_scans.get(),
+            0,
+            "file lookup must not enumerate unrelated workspace symbols"
+        );
+    }
 
     #[test]
     fn recovered_source_index_forwards_only_unchanged_foreign_property_proofs() {
