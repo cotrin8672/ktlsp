@@ -2,11 +2,102 @@
 
 Updated 2026-10-21 (Asia/Tokyo). Goal active; IDEA parity and speed acceptance remain unproved.
 History: docs/fork-acceptance.md, docs/fork-corpus.md and Git.
+Prospective speed targets and comparison rules: [performance budgets](fork-performance-budgets.md).
 BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest120: getter and configured SDK coverage
+## Integrated checkpoint120-6
+
+Source through6619400 is pushed. The current full workspace passes1746 tests,
+0 fail,9 are ignored (40 targets). Release compilation also passes. Both stages
+close normally with573 guarded inputs unchanged, no forced cleanup and no owned
+residuals. Evidence: native-integrated120-6/{workspace-summary.json,receipt.json,
+main-ready.json}. The immutable release SHA256 is
+2a02365ab3eb974941f21f9d73f9e675cf92e4dc9eb8bf3129d1e7eba381e158.
+
+| Slice | Current evidence | Remaining limit |
+| --- | --- | --- |
+| File-local Java recovery | Pushed91d8145; counted regression and74 existing checks pass; original quiet Retrofit handler1689.496ms ->6.613ms, useful first response retained | Each timing is n=1; no general p95 claim |
+| Plugin API beside sibling errors | Pusheda99cfe1; joint dev88b72502 passes15/15 checks, retaining original errors and rejecting invalid producers | Selected Noarg/serializer cases, not arbitrary plugin parity |
+| Kotlin properties called from Java | Pushed6619400; actual stdlib expect/actual scalar boundary repaired;84 focused tests and17/17 editor checks pass, all16 RPCs first response on devb86293a6 | Inferred property types and derived-name rename still open |
+| External semantic SDK | Freshly linked joint88 source passes unchanged50 first requests/98 checks | This precedes the later scalar-ABI guard adjustment; final broad SDK sweep remains separate |
+| CEM / five additional projects | Earlier release18938 passes original26 /50 checks; lazy-binary devfe0977b6 also passes original CEM26 | Same-release final sweep and IDEA comparison remain open |
+
+Quiet release120-6 now observes CEM first useful completion at35.969s cold and
+1.700s warm (n=1 each,500ms polling). Thirty warm RPCs have p50/p95/max of
+10.063/17.046/21.133ms; input-to-menu handoff is43.158/51.228/54.600ms. All31 UI
+samples accept actual text, restore the whole buffer and leave disk unchanged.
+The original8 checks match in each run;439 guards stay unchanged and shutdown is
+normal. Source coverage still has one failed and three missing lookups. Cold30s
+is missed; warm3s/RPC p95 50ms/menu p95 100ms are met in these finite observations.
+Earlier same-policy observations were52.547s/1.689s cold/warm; the binary Create
+preview falls from17.367s to1.284s, while Gradle dump now takes29.279s and remains
+the dominant cold cost. No startup p95 or universal speedup is established.
+Evidence: cem-speed120-6/{performance-summary.json,sessions-receipt.json}.
+
+The budget document's observed-result paragraph changed between preparation and
+the actual run, before its input capture; both runs' before/after hashes match.
+The target table and comparison conditions are byte-identical. Evidence:
+cem-speed120-6/budget-guard-audit.json. The quiet Retrofit replay also passes with
+unchanged guards and normal shutdown:
+oracle120/retrofit1752-release6-quiet1/receipt.json. Next: inferred-getter shared
+inference, the dominant Gradle cold cost and the remaining IDEA probes. Keep
+compiler/control failures and native REDs below.
+
+## Earlier120 integration queue
+
+At this earlier point, pushed source was91d8145. The workspace/release checkpoint below
+predates the subsequent getter-body, plugin-sibling and lazy-binary changes;
+its 1740 passing tests must not be attributed to today's pending source.
+
+Retrofit's original incomplete completion takes 1689.496ms even in a quiet replay
+of release18938. Existing trace instrumentation isolates receiver resolution:
+RecoveredTypeIndex inherits entries_for_file's whole-index fallback, causing two
+global scans for file-local type lookup. The targeted adapter fix and counted
+regression now pass, together with74 existing regressions, and are pushed in
+91d8145. Temporary timing spans are removed. No post-fix runtime improvement is
+claimed yet.
+Evidence: oracle120/retrofit1752-quiet1/receipt.json and phase-build3 artifacts.
+
+A further plugin case exposes a real distinction between class output and typed
+facts: a semantic error in a sibling top-level function leaves Model's actual
+serializer bytecode usable by javac, but the file-wide error guard drops Model's
+typed API. The class-level eligibility fix passes external compiler controls,
+retains the original MissingName diagnostic and still rejects an erroneous
+class's own initializer. The old binary's editor RED closes with the original12
+checks passing, the added diagnostic passing and only the two new completion
+checks failing (13 pass,2 fail). Joint dev88b72502 now passes all15 checks with
+current diagnostics, unchanged guards, clean exit and no owned residuals.
+Evidence: processor120/noarg-semantic-controls.json and
+processor120/noarg-semantic-slice-summary.json. The unchanged external SDK's
+50 first requests/98 checks also pass when freshly linked from this source:
+sdk-final120-2/verified-summary.json.
+
+Java setter projection is also pending integration. Actual Kotlin/javac controls
+establish generic parameter types, void results, naming and private-setter
+visibility. Focused84 tests pass, but actual editor validation exposes missing
+concrete scalar setter candidates while the generic setter succeeds. This slice
+is not accepted; the editor RED is retained in
+cem-startup120/coverage/native-setter-fixed1/receipt.json.
+
+The next complete workspace attempt (native-integrated120-5) closes naturally
+with exit101 after86.828s and stable573 inputs. Its two failures are obsolete
+assumptions about eager binary files and class-member facts on extension
+functions; their original invariants are being updated to the new contracts.
+The release stage does not run. Do not present the joint dev as a fully passing
+workspace/release checkpoint. Inferred property getters also have an independent
+compiler-positive/editor-negative reproduction in cem-inferred120/receipt.json;
+they need current-source lazy inference rather than cached inferred parse facts.
+
+The two test-contract repairs pass their focused runs (legacy cache1 and source
+facts19). One earlier focused runner omitted an explicit KTLSP_CACHE_DIR; its
+inherited value was not recorded, so actual default-cache effects are unknown.
+The wrapper now pins and records a dedicated cache, and the repaired cache test
+passes there. User cache contents were neither inspected nor cleaned. Evidence:
+cem-speed120/cache-environment-audit.json. Editor runs already use isolated caches.
+
+## Latest verified120: getter and configured SDK coverage
 
 The joint120-4 checkpoint passes the complete Rust workspace:1740 passed,
 0 failed,9 ignored. The release build succeeds with569 guarded inputs unchanged
