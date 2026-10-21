@@ -938,6 +938,16 @@ impl<'scope> RecoveredTypeIndex<'scope> {
 }
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
+    fn source_declaration_type(&self, entry: &crate::index::Entry) -> Option<Type> {
+        (self.replaced_file != Some(entry.path.as_ref())
+            && self
+                .index
+                .entries_for_file(&entry.path)
+                .iter()
+                .any(|original| original.sym == entry.sym))
+        .then(|| self.index.source_declaration_type(entry))
+        .flatten()
+    }
     fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
         if self.replaced_file == Some(owner.path.as_ref()) {
             // Body recovery can restore an owner absent from the erroneous original tree.
@@ -4334,8 +4344,12 @@ mod recovered_property_proof_tests {
         );
         let owner = original.lookup_type("Parent").into_iter().next().unwrap();
         let property = original.members_of("Parent").into_iter().next().unwrap();
+        let declaration = |_: &Entry| Some(Type::class("Int", Some("kotlin".into())));
+        let scoped = original
+            .scoped_for_file("Use.java")
+            .with_declaration_types(&declaration);
         let host = crate::binary_diagnostics::BinaryDiagnostics {
-            index: &original,
+            index: &scoped,
             inventory: &|_| None,
             source_members: &|_| false,
             value_namespace: &|entry| entry.sym.kind == SymbolKind::Class,
@@ -4355,13 +4369,19 @@ mod recovered_property_proof_tests {
             recovered.source_property_access(property),
             Some(JvmPropertyAccess::Field)
         );
+        assert_eq!(
+            recovered.source_declaration_type(property),
+            Some(Type::class("Int", Some("kotlin".into())))
+        );
         let replaced = RecoveredTypeIndex::replacing_file(&host, &replacement, "Parent.kt");
         assert!(!replaced.source_value_namespace_complete(owner));
         assert_eq!(replaced.source_property_access(property), None);
+        assert_eq!(replaced.source_declaration_type(property), None);
         let mut stale = property.clone();
         let mut symbol = stale.sym.as_ref().clone();
         symbol.start_byte += 1;
         stale.sym = std::sync::Arc::new(symbol);
+        assert_eq!(recovered.source_declaration_type(&stale), None);
         assert_eq!(
             recovered.source_property_access(&stale),
             None,

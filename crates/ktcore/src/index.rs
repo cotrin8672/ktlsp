@@ -336,6 +336,10 @@ impl OriginFacts {
 }
 
 pub trait InferenceIndex {
+    /// Current-source inference, never a value persisted in parsed declaration facts.
+    fn source_declaration_type(&self, _entry: &Entry) -> Option<crate::types::Type> {
+        None
+    }
     /// Conservative by default so adapters cannot silently hide accepted compiler facts.
     fn may_have_compiled_callables(&self) -> bool {
         true
@@ -1257,6 +1261,7 @@ pub struct ScopedIndex<'a> {
     scope: QueryScope<'a>,
     owners: RefCell<FxHashMap<(String, String), Option<SelectedOwner<'a>>>>,
     missing_ownership: Cell<bool>,
+    declaration_types: Option<&'a dyn Fn(&Entry) -> Option<crate::types::Type>>,
 }
 
 impl<'a> ScopedIndex<'a> {
@@ -1302,7 +1307,16 @@ impl<'a> ScopedIndex<'a> {
             scope,
             owners: RefCell::new(FxHashMap::default()),
             missing_ownership: Cell::new(false),
+            declaration_types: None,
         }
+    }
+
+    pub fn with_declaration_types(
+        mut self,
+        query: &'a dyn Fn(&Entry) -> Option<crate::types::Type>,
+    ) -> Self {
+        self.declaration_types = Some(query);
+        self
     }
 
     fn file_origin(&self, file: &str) -> Option<&'a FileOrigin> {
@@ -1506,6 +1520,14 @@ impl<'a> ScopedIndex<'a> {
 }
 
 impl InferenceIndex for ScopedIndex<'_> {
+    fn source_declaration_type(&self, entry: &Entry) -> Option<crate::types::Type> {
+        self.entry_is_visible(entry)
+            .then(|| match self.declaration_types {
+                Some(query) => query(entry),
+                None => self.index.source_declaration_type(entry),
+            })
+            .flatten()
+    }
     fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
         self.entry_is_visible(owner) && self.index.source_value_namespace_complete(owner)
     }

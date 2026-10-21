@@ -134,10 +134,16 @@ fn java_constructor_getters_share_completion_goto_and_generic_result_binding() {
         );
     }
     let rename_offset = properties.find("val value").unwrap() + "val ".len();
-    assert!(
-        ws.rename("Properties.kt", rename_offset, "renamed")
-            .is_none(),
-        "mixed getter rename cannot use the Kotlin spelling in Java"
+    let edits = ws
+        .rename("Properties.kt", rename_offset, "renamed")
+        .unwrap();
+    assert_eq!(
+        apply_to_text("Properties.kt", properties, &edits).unwrap(),
+        properties.replace("val value", "val renamed")
+    );
+    assert_eq!(
+        apply_to_text("GetterUse.java", caller, &edits).unwrap(),
+        caller.replace("box.getValue", "box.getRenamed")
     );
     let mut kotlin_only = Workspace::new();
     kotlin_only.open("Properties.kt", properties.into());
@@ -157,14 +163,25 @@ fn java_constructor_getters_share_completion_goto_and_generic_result_binding() {
     let is_property = properties.replace("val value", "val isValue");
     ws.change("Properties.kt", is_property.clone());
     ws.change("GetterUse.java", caller.replace("getValue", "isValue"));
-    assert!(
-        ws.rename(
+    let edits = ws
+        .rename(
             "Properties.kt",
             is_property.find("val isValue").unwrap() + 4,
-            "renamed"
+            "renamed",
         )
-        .is_none(),
-        "equal current spellings still have a derived JVM name after rename"
+        .unwrap();
+    assert_eq!(
+        apply_to_text("Properties.kt", &is_property, &edits).unwrap(),
+        is_property.replace("val isValue", "val renamed")
+    );
+    assert_eq!(
+        apply_to_text(
+            "GetterUse.java",
+            &caller.replace("getValue", "isValue"),
+            &edits
+        )
+        .unwrap(),
+        caller.replace("getValue", "getRenamed")
     );
     ws.change("Properties.kt", properties.into());
     ws.change("GetterUse.java", caller.into());
@@ -371,8 +388,14 @@ fn java_property_setters_share_generic_parameters_unit_return_and_source_definit
     // Stdlib 2.4.0 indexes common expect and JVM actual headers for the same intrinsic types.
     // Their expect marker is not evidence that an ordinary scalar accessor is value-class mangled.
     for (file, source) in [
-        ("CommonPrimitives.kt", "package kotlin\npublic expect class String : Comparable<String>, CharSequence\npublic expect class Boolean : Comparable<Boolean>\npublic expect class Int : Number, Comparable<Int>\n"),
-        ("JvmPrimitives.kt", "package kotlin\npublic actual class String : Comparable<String>, CharSequence\npublic actual class Boolean private constructor() : Comparable<Boolean>\npublic actual class Int private constructor() : Number(), Comparable<Int>\n"),
+        (
+            "CommonPrimitives.kt",
+            "package kotlin\npublic expect class String : Comparable<String>, CharSequence\npublic expect class Boolean : Comparable<Boolean>\npublic expect class Int : Number, Comparable<Int>\n",
+        ),
+        (
+            "JvmPrimitives.kt",
+            "package kotlin\npublic actual class String : Comparable<String>, CharSequence\npublic actual class Boolean private constructor() : Comparable<Boolean>\npublic actual class Int private constructor() : Number(), Comparable<Int>\n",
+        ),
     ] {
         ws.open(file, source.into());
     }
@@ -512,6 +535,228 @@ fn java_property_setters_share_generic_parameters_unit_return_and_source_definit
 }
 
 #[test]
+fn inferred_property_accessors_follow_current_source_and_foreign_return_type_edits() {
+    let mut ws = Workspace::new();
+    let model = "package probe\nclass Model { val title = \"x\"\n var value = produce()\n}\n";
+    let provider = "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\nclass Other { fun otherOnly(): Int = 2 }\nfun produce(): Payload = Payload()\n";
+    ws.open("Inferred.kt", model.into());
+    ws.open("Provider.kt", provider.into());
+    ws.open(
+        "String.java",
+        "package java.lang; public class String { public int length() { return 1; } }".into(),
+    );
+    ws.open(
+        "Decoy.kt",
+        "package probe\nclass Decoy { fun payloadOnly(): Int = 3\n fun otherOnly(): Int = 4 }\n"
+            .into(),
+    );
+    let caller = "package probe; class Use { void use(Model model, Payload payload, Other other) { model.getTitle().length(); model.getValue().payloadOnly(); model.getValue().otherOnly(); model.setValue(payload); model.setValue(other); } }";
+    ws.open("InferredUse.java", caller.into());
+    assert!(labels(&mut ws, "InferredUse.java", "model.getTitle").contains("getTitle"));
+    assert_eq!(
+        goto(
+            &mut ws,
+            "InferredUse.java",
+            "model.getTitle().length()",
+            "length"
+        ),
+        vec![target(&ws, "String.java", "length")]
+    );
+    for (source, member, absent) in [
+        (provider.to_string(), "payloadOnly", "otherOnly"),
+        (
+            provider.replace(
+                "produce(): Payload = Payload()",
+                "produce(): Other = Other()",
+            ),
+            "otherOnly",
+            "payloadOnly",
+        ),
+        (provider.to_string(), "payloadOnly", "otherOnly"),
+    ] {
+        ws.change("Provider.kt", source);
+        let entry = ws
+            .index
+            .lookup_by_name("value")
+            .iter()
+            .find(|entry| entry.path.as_ref() == "Inferred.kt")
+            .unwrap();
+        let definition = Def {
+            file: "Inferred.kt".into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        };
+        assert!(labels(&mut ws, "InferredUse.java", "model.getValue").contains("getValue"));
+        assert_eq!(
+            goto(&mut ws, "InferredUse.java", "model.getValue()", "getValue"),
+            vec![definition]
+        );
+        assert_eq!(
+            goto(
+                &mut ws,
+                "InferredUse.java",
+                &format!("model.getValue().{member}()"),
+                member
+            ),
+            vec![target(&ws, "Provider.kt", member)]
+        );
+        assert!(goto(
+            &mut ws,
+            "InferredUse.java",
+            &format!("model.getValue().{absent}()"),
+            absent
+        )
+        .is_empty());
+        assert!(labels(&mut ws, "InferredUse.java", "model.setValue").contains("setValue"));
+        let help = ws
+            .signature_help(
+                "InferredUse.java",
+                caller.find("model.setValue(").unwrap() + "model.setValue(".len(),
+            )
+            .unwrap();
+        assert_eq!(
+            help.signatures[0].label,
+            format!(
+                "setValue(p1: {}): Unit",
+                if member == "payloadOnly" {
+                    "Payload"
+                } else {
+                    "Other"
+                }
+            )
+        );
+    }
+    ws.change(
+        "Provider.kt",
+        provider.replace("produce(): Payload", "produce(): Missing"),
+    );
+    assert!(!labels(&mut ws, "InferredUse.java", "model.getValue").contains("getValue"));
+    assert!(!labels(&mut ws, "InferredUse.java", "model.setValue").contains("setValue"));
+    assert!(goto(&mut ws, "InferredUse.java", "model.getValue()", "getValue").is_empty());
+    ws.change("Provider.kt", provider.into());
+    ws.change(
+        "Inferred.kt",
+        model.replace("var value = produce()", "var value = value"),
+    );
+    assert!(!labels(&mut ws, "InferredUse.java", "model.getValue").contains("getValue"));
+    assert!(!labels(&mut ws, "InferredUse.java", "model.setValue").contains("setValue"));
+    ws.change("Inferred.kt", model.into());
+    assert!(labels(&mut ws, "InferredUse.java", "model.getValue").contains("getValue"));
+    assert!(labels(&mut ws, "InferredUse.java", "model.setValue").contains("setValue"));
+    ws.open(
+        "Layer.kt",
+        "package probe\nclass Layer { val value = produce() }\n".into(),
+    );
+    ws.change(
+        "Inferred.kt",
+        model.replace("var value = produce()", "var value = Layer().value"),
+    );
+    assert_eq!(
+        goto(
+            &mut ws,
+            "InferredUse.java",
+            "model.getValue().payloadOnly()",
+            "payloadOnly"
+        ),
+        vec![target(&ws, "Provider.kt", "payloadOnly")]
+    );
+    // A two-file cycle must withdraw both accessors and recover when the initializer is restored.
+    ws.change(
+        "Layer.kt",
+        "package probe\nclass Layer { val value = Model().value }\n".into(),
+    );
+    assert!(!labels(&mut ws, "InferredUse.java", "model.getValue").contains("getValue"));
+    assert!(!labels(&mut ws, "InferredUse.java", "model.setValue").contains("setValue"));
+    ws.change(
+        "Layer.kt",
+        "package probe\nclass Layer { val value = produce() }\n".into(),
+    );
+    assert_eq!(
+        goto(
+            &mut ws,
+            "InferredUse.java",
+            "model.getValue().payloadOnly()",
+            "payloadOnly"
+        ),
+        vec![target(&ws, "Provider.kt", "payloadOnly")]
+    );
+}
+
+#[test]
+fn inferred_accessors_hydrate_closed_source_chains_and_follow_unsaved_middle_edits() {
+    let directory = std::env::temp_dir().join(format!(
+        "ktlsp-inferred-closed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let key = |name: &str| directory.join(name).to_string_lossy().replace('\\', "/");
+    let a = "package probe\nclass A { var value = B().value }\n";
+    let b = "package probe\nclass B { val value = C().value }\n";
+    let c = "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\nclass Other { fun otherOnly(): Int = 2 }\nclass C { val value = produce() }\nfun produce(): Payload = Payload()\n";
+    let mut ws = Workspace::new();
+    for (name, source) in [("A.kt", a), ("B.kt", b), ("C.kt", c)] {
+        std::fs::write(key(name), source).unwrap();
+        // Dependency/cache facts arrive without an open document or registered Salsa source input.
+        let tree = ktlsp::parser::KotlinParser::new().parse(source);
+        let symbols = ktcore::indexer::extract_symbols(&tree, source, "probe");
+        let facts = ktcore::jvm::source_facts(&key(name), &tree, source, &symbols);
+        ws.index
+            .replace_file(&key(name), symbols, ktlsp::index::Tier::Volatile);
+        ws.index
+            .replace_jvm_source(&key(name), facts, ktlsp::index::Tier::Volatile);
+    }
+    ws.bump_index_revision();
+    let caller = "package probe; class Use { void use(A a) { a.getValue().payloadOnly(); a.getValue().otherOnly(); a.setValue(null); } }";
+    ws.open(key("Use.java"), caller.into());
+    assert_eq!(
+        goto(
+            &mut ws,
+            &key("Use.java"),
+            "a.getValue().payloadOnly()",
+            "payloadOnly"
+        ),
+        vec![target(&ws, &key("C.kt"), "payloadOnly")]
+    );
+    assert!(labels(&mut ws, &key("Use.java"), "a.setValue").contains("setValue"));
+    ws.open(key("B.kt"), b.replace("C().value", "Other()"));
+    assert_eq!(
+        goto(
+            &mut ws,
+            &key("Use.java"),
+            "a.getValue().otherOnly()",
+            "otherOnly"
+        ),
+        vec![target(&ws, &key("C.kt"), "otherOnly")]
+    );
+    assert!(goto(
+        &mut ws,
+        &key("Use.java"),
+        "a.getValue().payloadOnly()",
+        "payloadOnly"
+    )
+    .is_empty());
+    ws.change(&key("B.kt"), b.replace("C().value", "A().value"));
+    assert!(!labels(&mut ws, &key("Use.java"), "a.getValue").contains("getValue"));
+    assert!(!labels(&mut ws, &key("Use.java"), "a.setValue").contains("setValue"));
+    ws.change(&key("B.kt"), b.into());
+    assert_eq!(
+        goto(
+            &mut ws,
+            &key("Use.java"),
+            "a.getValue().payloadOnly()",
+            "payloadOnly"
+        ),
+        vec![target(&ws, &key("C.kt"), "payloadOnly")]
+    );
+    drop(ws);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn java_constructor_string_getter_resolves_java_string_members() {
     let mut ws = Workspace::new();
     ws.open(
@@ -625,7 +870,9 @@ fn super_known_class_members_above_missing_ancestor() {
             "arguments" => "protected float getBreakSpeed(int value) { return 1; }",
             "generic" => "protected <T> float getBreakSpeed() { return 1; }",
             "vararg" => "protected float getBreakSpeed(Object... values) { return 1; }",
-            "overload" => "protected float getBreakSpeed() { return 1; } protected float getBreakSpeed(int value) { return 2; }",
+            "overload" => {
+                "protected float getBreakSpeed() { return 1; } protected float getBreakSpeed(int value) { return 2; }"
+            }
             _ => "protected float getBreakSpeed() { return 1; }",
         };
         ws.open(
@@ -862,13 +1109,25 @@ fn generic_super_receiver_preserves_arguments_and_dispatch_for_both_languages() 
         "package probe; public interface Marker {}".to_string(),
     );
     for (file, source) in [
-        ("GenericUse.kt", "package probe\nclass GenericUse : GenericBase<Payload>() {\n    fun run(): Payload = super.inherited().payloadOnly()\n}\n"),
-        ("JavaGenericUse.java", "package probe; class JavaGenericUse extends GenericBase<Payload> implements Marker { Payload run() { return super.inherited().payloadOnly(); } }"),
+        (
+            "GenericUse.kt",
+            "package probe\nclass GenericUse : GenericBase<Payload>() {\n    fun run(): Payload = super.inherited().payloadOnly()\n}\n",
+        ),
+        (
+            "JavaGenericUse.java",
+            "package probe; class JavaGenericUse extends GenericBase<Payload> implements Marker { Payload run() { return super.inherited().payloadOnly(); } }",
+        ),
     ] {
         ws.open(file, source.to_string());
-        assert!(labels(&mut ws, file, "super.inherited().pay").contains("payloadOnly"), "{file}");
+        assert!(
+            labels(&mut ws, file, "super.inherited().pay").contains("payloadOnly"),
+            "{file}"
+        );
         let expected = target(&ws, "GenericBase.java", "inherited");
-        assert_eq!(goto(&mut ws, file, "super.inherited()", "inherited"), vec![expected]);
+        assert_eq!(
+            goto(&mut ws, file, "super.inherited()", "inherited"),
+            vec![expected]
+        );
     }
     assert_eq!(
         infer_expression(&ws, "GenericUse.kt", "super.inherited()"),
@@ -919,9 +1178,21 @@ fn missing_or_ambiguous_super_receivers_never_use_global_member_homonyms() {
         "package probe\nclass Use : Base() {\n    fun run() = super<Other>.getBreakSpeed()\n}\n",
     ] {
         ws.open("Use.kt", source.to_string());
-        let expression = if source.contains("super<Other>") { "super<Other>" } else { "super" };
+        let expression = if source.contains("super<Other>") {
+            "super<Other>"
+        } else {
+            "super"
+        };
         assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::Unknown);
-        assert!(goto(&mut ws, "Use.kt", &format!("{expression}.getBreakSpeed()"), "getBreakSpeed").is_empty());
+        assert!(
+            goto(
+                &mut ws,
+                "Use.kt",
+                &format!("{expression}.getBreakSpeed()"),
+                "getBreakSpeed"
+            )
+            .is_empty()
+        );
         assert!(labels(&mut ws, "Use.kt", &format!("{expression}.get")).is_empty());
     }
 }
@@ -967,7 +1238,9 @@ fn kotlin_super_selects_unique_member_provider_with_distinct_interfaces() {
         "Base(), ParentMarker",
         "Base(), Marker by MarkerImpl()",
     ] {
-        let source = format!("package probe\nclass Multiple : {inheritance} {{\n    override fun marker(): Float = 3f\n    override fun getBreakSpeed(): Float = super.getBreakSpeed()\n}}\n");
+        let source = format!(
+            "package probe\nclass Multiple : {inheritance} {{\n    override fun marker(): Float = 3f\n    override fun getBreakSpeed(): Float = super.getBreakSpeed()\n}}\n"
+        );
         ws.open("Multiple.kt", source.clone());
         assert!(
             labels(&mut ws, "Multiple.kt", "super.getB").contains("getBreakSpeed"),
@@ -1336,7 +1609,9 @@ fn super_candidates_preserves_concrete_property_type_target_and_result_chain() {
         );
         ws.open("Base.kt", base.into());
         let constructor = if base.contains("interface") { "" } else { "()" };
-        let source = format!("package probe\nclass Use : Base{constructor} {{ override val value: Payload get() = super.value\n fun chain() = super.value.payloadOnly()\n fun incomplete() {{ super. }} }}\n");
+        let source = format!(
+            "package probe\nclass Use : Base{constructor} {{ override val value: Payload get() = super.value\n fun chain() = super.value.payloadOnly()\n fun incomplete() {{ super. }} }}\n"
+        );
         ws.open("Use.kt", source);
         assert_eq!(
             infer_expression(&ws, "Use.kt", "super.value"),
@@ -1451,12 +1726,25 @@ fn super_candidates_default_getter_is_independent_of_class_initialization_style(
         "package probe\nopen class Base<T> { open val value: T by lazy { TODO() } }\n",
     ] {
         let mut ws = Workspace::new();
-        ws.open("Payload.kt", "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\n".into());
+        ws.open(
+            "Payload.kt",
+            "package probe\nclass Payload { fun payloadOnly(): Int = 1 }\n".into(),
+        );
         ws.open("Base.kt", base.into());
         ws.open("Use.kt", "package probe\nclass Use : Base<Payload>() { fun exact() = super.value\n fun chain() = super.value.payloadOnly()\n fun incomplete() { super. } }\n".into());
-        assert_eq!(infer_expression(&ws, "Use.kt", "super.value"), Type::class("Payload", Some("probe".into())), "{base}");
-        assert!(labels(&mut ws, "Use.kt", "super.").contains("value"), "{base}");
-        assert!(labels(&mut ws, "Use.kt", "super.value.pay").contains("payloadOnly"), "{base}");
+        assert_eq!(
+            infer_expression(&ws, "Use.kt", "super.value"),
+            Type::class("Payload", Some("probe".into())),
+            "{base}"
+        );
+        assert!(
+            labels(&mut ws, "Use.kt", "super.").contains("value"),
+            "{base}"
+        );
+        assert!(
+            labels(&mut ws, "Use.kt", "super.value.pay").contains("payloadOnly"),
+            "{base}"
+        );
     }
 }
 
@@ -2155,7 +2443,9 @@ fn local_extension_unproved_receiver_never_becomes_a_known_target_or_type() {
         "fun <T> T.oldApi(): Payload where T : Missing = Payload()",
     ] {
         let mut ws = Workspace::new();
-        let source = format!("package app\nclass Versioned {{\n    fun newApi(): Int = 2\n}}\nclass Payload {{\n    fun payloadOnly(): Int = 7\n}}\nfun use(v: Versioned) {{\n    {declaration}\n    v.oldApi()\n    v.newApi()\n}}\n");
+        let source = format!(
+            "package app\nclass Versioned {{\n    fun newApi(): Int = 2\n}}\nclass Payload {{\n    fun payloadOnly(): Int = 7\n}}\nfun use(v: Versioned) {{\n    {declaration}\n    v.oldApi()\n    v.newApi()\n}}\n"
+        );
         let offset = source.rfind("oldApi()").unwrap();
         ws.open("Local.kt", source);
         assert_eq!(
@@ -2267,7 +2557,9 @@ fn local_extension_lambda_receiver_precedes_scope_function_intrinsics() {
         ),
     ] {
         let mut ws = Workspace::new();
-        let source = format!("package app\nclass Versioned {{\n    fun payloadOnly(): String = \"decoy\"\n}}\nclass Payload {{\n    fun payloadOnly(): Int = 7\n}}\nfun use(v: Versioned) {{\n    {declaration}\n    {body}\n}}\n");
+        let source = format!(
+            "package app\nclass Versioned {{\n    fun payloadOnly(): String = \"decoy\"\n}}\nclass Payload {{\n    fun payloadOnly(): Int = 7\n}}\nfun use(v: Versioned) {{\n    {declaration}\n    {body}\n}}\n"
+        );
         let use_offset = source.rfind("payloadOnly()").unwrap();
         let definition = source
             .find(if expected == "Int" {

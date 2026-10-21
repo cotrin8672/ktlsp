@@ -1373,7 +1373,7 @@ impl ReadSession<'_> {
                 facts: crate::jvm::CallableFacts {
                     name: raw.name.to_string(),
                     params,
-                    return_type,
+                    return_type: Some(return_type),
                     type_params: Vec::new(),
                     definition: None,
                     fixed_name: None,
@@ -1540,7 +1540,7 @@ impl ReadSession<'_> {
             facts: crate::jvm::CallableFacts {
                 name: method.name.to_string(),
                 params: Vec::new(),
-                return_type,
+                return_type: Some(return_type),
                 type_params: Vec::new(),
                 definition: None,
                 fixed_name: None,

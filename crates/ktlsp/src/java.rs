@@ -4414,7 +4414,9 @@ pub fn jvm_call_signatures(
         .iter()
         .copied()
         .filter(|candidate| matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { .. }))
-        .map(crate::signature::signature_for_callable)
+        .filter_map(|candidate| {
+            crate::signature::signature_for_callable_in_context(index, candidate)
+        })
         .collect();
     (signatures, allow_fallback)
 }

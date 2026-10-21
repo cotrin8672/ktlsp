@@ -80,7 +80,7 @@ pub struct Workspace {
     /// Open buffers, keyed by canonical identity. Take precedence over disk.
     open_docs: HashMap<String, DocState>,
     parsers: LanguageParsers,
-    salsa: SalsaState,
+    salsa: RefCell<SalsaState>,
     index_revision: u64,
     completeness: resolve::CompletenessFacts,
     project_file_meta: HashMap<String, ProjectFileMeta>,
@@ -143,7 +143,7 @@ impl Workspace {
             _index_drop_marker: WorkspaceDropMarker("workspace.index.dropped"),
             open_docs: HashMap::new(),
             parsers: LanguageParsers::new(),
-            salsa: SalsaState::new(),
+            salsa: RefCell::new(SalsaState::new()),
             index_revision: 0,
             completeness: resolve::CompletenessFacts::default(),
             project_file_meta: HashMap::new(),
@@ -336,7 +336,7 @@ impl Workspace {
             self.index.remove_file(&key);
             self.analysis_extensions.remove_source(&self.index, &key);
             self.annotated_type_owners.remove(&key);
-            self.salsa.forget(&key);
+            self.salsa.get_mut().forget(&key);
             self.project_file_meta.remove(&key);
         }
         self.completed_dependency_origins.retain(|origin| {
@@ -396,7 +396,24 @@ impl Workspace {
             self.index
                 .replace_jvm_source(&batch.key, batch.jvm, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
-            self.salsa.forget(&batch.key);
+            if self
+                .index
+                .jvm_source_for_file(&batch.key)
+                .is_some_and(|source| {
+                    source.facts.callables.iter().any(|callable| {
+                        callable
+                            .source_property
+                            .as_ref()
+                            .is_some_and(|p| p.deferred.is_some())
+                    })
+                })
+            {
+                self.salsa
+                    .get_mut()
+                    .record_text(&batch.key, &batch.source.0, Durability::LOW);
+            } else {
+                self.salsa.get_mut().forget(&batch.key);
+            }
             self.record_annotated_owners(&batch.key, &batch.source.0, &batch.source.1);
             if self.analysis_extensions.needs_source(&batch.key) {
                 extension_sources.push((batch.key, batch.source.0, batch.source.1));
@@ -470,7 +487,7 @@ impl Workspace {
                 self.index.remove_file(key);
                 self.analysis_extensions.remove_source(&self.index, key);
                 self.annotated_type_owners.remove(key);
-                self.salsa.forget(key);
+                self.salsa.get_mut().forget(key);
             }
             self.project_file_meta.remove(key);
             self.source_stamps.remove(key);
@@ -595,7 +612,7 @@ impl Workspace {
         self.analysis_extensions.remove_source(&self.index, key);
         self.analysis_extensions.mark_index_changed();
         self.annotated_type_owners.remove(key);
-        self.salsa.forget(key);
+        self.salsa.get_mut().forget(key);
     }
 
     pub fn project_doc_keys(&self) -> Vec<String> {
@@ -839,9 +856,9 @@ impl Workspace {
     /// where there is no cached tree to reuse.
     pub fn reindex(&mut self, key: &str, text: &str) {
         self.observe_compiled_source(key, Some(text), false);
-        let facts = self.salsa.file_facts(key, text, Durability::LOW);
+        let facts = self.salsa.get_mut().file_facts(key, text, Durability::LOW);
         self.apply_file_facts(key, facts);
-        let tree = self.salsa.parsed_tree(key, text, Durability::LOW);
+        let tree = self.salsa.get_mut().parsed_tree(key, text, Durability::LOW);
         self.replace_extension_source(key, text, &tree);
     }
 
@@ -850,8 +867,14 @@ impl Workspace {
         let key = key.into();
         self.invalidate_kotlin_source(&key);
         self.observe_compiled_source(&key, Some(&text), false);
-        let tree = self.salsa.parsed_tree(&key, &text, Durability::LOW);
-        let facts = self.salsa.file_facts(&key, &text, Durability::LOW);
+        let tree = self
+            .salsa
+            .get_mut()
+            .parsed_tree(&key, &text, Durability::LOW);
+        let facts = self
+            .salsa
+            .get_mut()
+            .file_facts(&key, &text, Durability::LOW);
         self.apply_file_facts(&key, facts);
         self.replace_extension_source(&key, &text, &tree);
         self.open_docs.insert(key, DocState { text, tree });
@@ -870,7 +893,9 @@ impl Workspace {
             }
             None => self.parse_text(key, &text),
         };
-        self.salsa.record_text(key, &text, Durability::LOW);
+        self.salsa
+            .get_mut()
+            .record_text(key, &text, Durability::LOW);
         self.index_from_tree(key, &text, &tree);
         self.open_docs
             .insert(key.to_string(), DocState { text, tree });
@@ -898,7 +923,7 @@ impl Workspace {
             self.index.remove_file(key);
             self.analysis_extensions.remove_source(&self.index, key);
             self.annotated_type_owners.remove(key);
-            self.salsa.forget(key);
+            self.salsa.get_mut().forget(key);
             self.project_file_meta.remove(key);
             self.bump_index_revision();
             self.recompute_project_completeness();
@@ -911,7 +936,7 @@ impl Workspace {
                 self.analysis_extensions.remove_source(&self.index, key);
                 self.annotated_type_owners.remove(key);
                 self.bump_index_revision();
-                self.salsa.forget(key);
+                self.salsa.get_mut().forget(key);
                 if self.project_scan_initialized {
                     self.project_file_meta.remove(key);
                     self.recompute_project_completeness();
@@ -922,7 +947,10 @@ impl Workspace {
 
     fn parsed_closed_doc(&mut self, key: &str) -> Option<(String, Tree)> {
         let text = self.doc_text(key)?;
-        let tree = self.salsa.parsed_tree(key, &text, Durability::LOW);
+        let tree = self
+            .salsa
+            .get_mut()
+            .parsed_tree(key, &text, Durability::LOW);
         Some((text, tree))
     }
 
@@ -1089,7 +1117,7 @@ impl Workspace {
             return None;
         }
         let ctx = infer::FileCtx::from_tree_in_file(tree, text, key);
-        let receiver_type = self.salsa.expr_type(
+        let receiver_type = self.salsa.get_mut().expr_type(
             key,
             text,
             Durability::LOW,
@@ -1264,7 +1292,10 @@ impl Workspace {
         offset: usize,
     ) -> Option<semantic_query::CompletionQuery> {
         let text = self.doc_text(key)?;
-        let tree = self.salsa.parsed_tree(key, &text, Durability::LOW);
+        let tree = self
+            .salsa
+            .get_mut()
+            .parsed_tree(key, &text, Durability::LOW);
         if tree.root_node().has_error()
             || complete::completion_context(&tree, &text, offset)
                 != complete::CompletionContext::AfterDot
@@ -1273,11 +1304,12 @@ impl Workspace {
         }
         let (prefix, synthetic, syn_offset) = complete::dot_recovery(&text, offset)?;
         let synthetic_key = format!("{key}#completion");
-        let synthetic_tree = self
-            .salsa
-            .parsed_tree(&synthetic_key, &synthetic, Durability::LOW);
+        let synthetic_tree =
+            self.salsa
+                .get_mut()
+                .parsed_tree(&synthetic_key, &synthetic, Durability::LOW);
         let receiver = complete::navigation_receiver_at(&synthetic_tree, syn_offset)?;
-        let receiver_type = self.salsa.expr_type_in_file(
+        let receiver_type = self.salsa.get_mut().expr_type_in_file(
             &synthetic_key,
             key,
             &synthetic,
@@ -1657,16 +1689,36 @@ impl Workspace {
         new_name: &str,
     ) -> Option<Vec<crate::edit::TextEdit>> {
         self.refresh_compiled_freshness();
-        if !language::is_valid_identifier(SourceLanguage::for_key(key), new_name) {
-            return None;
-        }
+        let valid_input = language::is_valid_identifier(SourceLanguage::for_key(key), new_name);
         if let Some(subject) = self.extension_rename_subject(key, offset) {
+            if !valid_input {
+                return None;
+            }
             return self.rename_contribution(key, offset, subject, new_name);
         }
         if let Some(member) = self.jvm_rename_subject(key, offset) {
+            if !valid_input {
+                return None;
+            }
             return self.rename_jvm_alias(key, offset, member, new_name);
         }
         let target = self.rename_target(key, offset)?;
+        let target_language = if !SourceLanguage::for_key(&target.file).is_java()
+            && hierarchy::entry_for_name_range(
+                &self.index,
+                &target.file,
+                target.start_byte,
+                target.end_byte,
+            )
+            .is_some_and(|entry| entry.sym.kind == SymbolKind::Property)
+        {
+            SourceLanguage::Kotlin
+        } else {
+            SourceLanguage::for_key(key)
+        };
+        if !language::is_valid_identifier(target_language, new_name) {
+            return None;
+        }
         let name = self.name_at(key, offset)?;
         if self.index.lookup_refs(&name).len() > RENAME_REF_CAP {
             return None;
@@ -1716,23 +1768,14 @@ impl Workspace {
         if refs.is_empty() || refs.len() > RENAME_REF_CAP || !refs.iter().any(|r| *r == target) {
             return None;
         }
-        let constructor_getter =
-            self.index
-                .jvm_source_for_file(&target.file)
-                .is_some_and(|source| {
-                    source.facts.callables.iter().any(|facts| {
-                        facts.source_property.is_some()
-                            && facts.definition.as_ref() == Some(&target)
-                    })
-                });
-        // Derived JVM names need a separate edit spelling, including isX -> getY changes.
-        if constructor_getter
-            && refs
-                .iter()
-                .any(|site| SourceLanguage::for_key(&site.file) == SourceLanguage::Java)
-        {
-            return None;
-        }
+        let property = self
+            .index
+            .jvm_source_for_file(&target.file)
+            .is_some_and(|source| {
+                source.facts.callables.iter().any(|facts| {
+                    facts.source_property.is_some() && facts.definition.as_ref() == Some(&target)
+                })
+            });
         if hierarchy::entry_for_name_range(
             &self.index,
             &target.file,
@@ -1748,7 +1791,38 @@ impl Workspace {
         {
             return None;
         }
-        let edits = crate::rename::edits_for_refs(refs.into_iter().collect(), new_name);
+        let edits = if property {
+            let text = self.doc_text(&target.file)?;
+            let property_name = text.get(target.start_byte..target.end_byte)?.to_string();
+            let entry = hierarchy::entry_for_name_range(
+                &self.index,
+                &target.file,
+                target.start_byte,
+                target.end_byte,
+            )?;
+            self.rename_property_family_isolated(&entry, new_name)?;
+            self.rename_property_argument_labels(&target, &property_name, &mut refs)?;
+            refs.into_iter()
+                .map(|site| {
+                    let text = self.doc_text(&site.file)?;
+                    let current = text.get(site.start_byte..site.end_byte)?;
+                    let spelling = crate::rename::property_edit_spelling(
+                        &property_name,
+                        current,
+                        new_name,
+                        SourceLanguage::for_key(&site.file).is_java(),
+                    )?;
+                    Some(crate::edit::TextEdit::new(
+                        site.file,
+                        site.start_byte,
+                        site.end_byte,
+                        spelling,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            crate::rename::edits_for_refs(refs.into_iter().collect(), new_name)
+        };
         crate::edit::validate_non_overlapping(&edits).ok()?;
         for file in edits
             .iter()
@@ -1760,13 +1834,172 @@ impl Workspace {
                 .entries_for_file(&file)
                 .iter()
                 .any(|entry| entry.tier == Tier::Durable)
-                || !language::is_valid_identifier(SourceLanguage::for_key(&file), new_name)
+                || edits.iter().filter(|edit| edit.file == file).any(|edit| {
+                    !language::is_valid_identifier(SourceLanguage::for_key(&file), &edit.new_text)
+                })
             {
                 return None;
             }
             crate::edit::apply_to_text(&file, &self.doc_text(&file)?, &edits).ok()?;
         }
         Some(edits)
+    }
+
+    fn rename_property_argument_labels(
+        &mut self,
+        target: &Def,
+        property: &str,
+        refs: &mut BTreeSet<Def>,
+    ) -> Option<()> {
+        let entry = hierarchy::entry_for_name_range(
+            &self.index,
+            &target.file,
+            target.start_byte,
+            target.end_byte,
+        )?;
+        let tree = if let Some(doc) = self.open_docs.get(&target.file) {
+            doc.tree.clone()
+        } else {
+            self.parsed_closed_doc(&target.file)?.1
+        };
+        let mut node = tree
+            .root_node()
+            .named_descendant_for_byte_range(target.start_byte, target.end_byte)?;
+        while !matches!(node.kind(), "class_parameter" | "property_declaration") {
+            node = node.parent()?;
+        }
+        if node.kind() != "class_parameter" {
+            return Some(());
+        }
+        let owner = self.rename_member_owner(&entry)?;
+        while node.kind() != "class_declaration" {
+            node = node.parent()?;
+        }
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            // A class identity alone cannot select one of several constructor parameter lists.
+            if node.kind() == "secondary_constructor" {
+                return None;
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+        if self
+            .index
+            .lookup_by_name(&owner.sym.name)
+            .iter()
+            .any(|candidate| {
+                candidate.sym.kind == SymbolKind::Function
+                    && candidate.sym.container.is_none()
+                    && candidate.sym.package == owner.sym.package
+            })
+        {
+            return None;
+        }
+        let owner_def = rename_definition(&owner);
+        let names = self.reference_names(&owner_def);
+        let (candidates, _) = self.reference_candidates(&owner_def, &names, true)?;
+        if candidates.len() + refs.len() > RENAME_REF_CAP {
+            return None;
+        }
+        for site in candidates {
+            if SourceLanguage::for_key(&site.path).is_java() {
+                continue;
+            }
+            if self.goto_definition(&site.path, site.start_byte).as_slice() != [owner_def.clone()] {
+                continue;
+            }
+            let (text, tree) = if let Some(doc) = self.open_docs.get(site.path.as_ref()) {
+                (doc.text.clone(), doc.tree.clone())
+            } else {
+                self.parsed_closed_doc(&site.path)?
+            };
+            let definition = Def {
+                file: site.path.to_string(),
+                start_byte: site.start_byte,
+                end_byte: site.end_byte,
+            };
+            for range in
+                crate::rename::constructor_argument_labels(&tree, &definition, property, &text)
+            {
+                refs.insert(Def {
+                    file: site.path.to_string(),
+                    start_byte: range.start,
+                    end_byte: range.end,
+                });
+                if refs.len() > RENAME_REF_CAP {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn rename_property_family_isolated(
+        &mut self,
+        property: &crate::index::Entry,
+        spelling: &str,
+    ) -> Option<()> {
+        if property.sym.source_member.visibility() == Some(ktcore::extensions::Visibility::Private)
+        {
+            return Some(());
+        }
+        let owner = self.rename_member_owner(property)?;
+        // Override families need a shared accessor-family identity before atomic rename.
+        if !owner.sym.supertypes.is_empty() {
+            return None;
+        }
+        let names = [
+            spelling.to_string(),
+            ktcore::jvm::property_getter_name(spelling)?,
+            ktcore::jvm::property_setter_name(spelling)?,
+        ];
+        let candidates: Vec<_> = names
+            .iter()
+            .flat_map(|name| self.index.lookup_by_name(name))
+            .cloned()
+            .collect();
+        if candidates.len() > RENAME_REF_CAP {
+            return None;
+        }
+        let mut pending = VecDeque::from([hierarchy::item_from_entry(&owner)]);
+        let mut seen = BTreeSet::new();
+        while let Some(owner) = pending.pop_front() {
+            if !seen.insert((owner.file.clone(), owner.start_byte, owner.end_byte)) {
+                continue;
+            }
+            if seen.len() > RENAME_REF_CAP {
+                return None;
+            }
+            let owner_entry = hierarchy::entry_for_name_range(
+                &self.index,
+                &owner.file,
+                owner.start_byte,
+                owner.end_byte,
+            )?;
+            if owner_entry.tier == Tier::Durable {
+                return None;
+            }
+            let owner_name = owner_entry.sym.container.as_ref().map_or_else(
+                || owner.name.clone(),
+                |parent| format!("{parent}.{}", owner.name),
+            );
+            if candidates.iter().any(|candidate| {
+                rename_definition(candidate) != rename_definition(property)
+                    && candidate.path.as_ref() == owner.file
+                    && candidate.sym.package == owner.package
+                    && candidate.sym.container.as_deref() == Some(owner_name.as_str())
+                    && (candidate.sym.kind == SymbolKind::Property
+                        || candidate.sym.kind == SymbolKind::Function
+                            && (candidate.sym.name == names[1]
+                                && candidate.sym.arity.is_none_or(|arity| arity == 0)
+                                || candidate.sym.name == names[2]
+                                    && candidate.sym.arity.is_none_or(|arity| arity == 1)))
+            }) {
+                return None;
+            }
+            pending.extend(hierarchy::subtypes(&self.index, &owner));
+        }
+        Some(())
     }
 
     fn rename_member_family(&mut self, target: &Def) -> Option<Vec<Def>> {
@@ -1779,6 +2012,12 @@ impl Workspace {
         ) else {
             return Some(vec![target.clone()]);
         };
+        if entry.sym.kind == SymbolKind::Property
+            && entry.sym.container.is_some()
+            && !SourceLanguage::for_key(&entry.path).is_java()
+        {
+            self.rename_property_family_isolated(&entry, &entry.sym.name)?;
+        }
         if entry.sym.kind != SymbolKind::Function || entry.sym.container.is_none() {
             return Some(vec![target.clone()]);
         }
@@ -2021,16 +2260,14 @@ impl Workspace {
 
     fn jvm_member_at(&mut self, key: &str, offset: usize) -> Option<ktcore::jvm::ResolvedMember> {
         if let Some(doc) = self.open_docs.get(key) {
-            return language::jvm_member_at(
-                &self.index.scoped_for_file(key),
-                key,
-                &doc.text,
-                &doc.tree,
-                offset,
-            );
+            return self.with_java_member_proofs(key, |index| {
+                language::jvm_member_at(index, key, &doc.text, &doc.tree, offset)
+            });
         }
         let (text, tree) = self.parsed_closed_doc(key)?;
-        language::jvm_member_at(&self.index.scoped_for_file(key), key, &text, &tree, offset)
+        self.with_java_member_proofs(key, |index| {
+            language::jvm_member_at(index, key, &text, &tree, offset)
+        })
     }
 
     fn jvm_rename_subject(
@@ -2050,11 +2287,10 @@ impl Workspace {
                 fixed.definition.start_byte <= offset && offset <= fixed.definition.end_byte
             })
         })?;
-        ktcore::jvm::CallableCandidate::Jvm {
+        self.with_java_member_proofs(key, |index| ktcore::jvm::CallableCandidate::Jvm {
             owner: ktcore::jvm::JvmOwner::Source(source),
             facts,
-        }
-        .resolved(&self.index.scoped_for_file(key))
+        }.resolved(index))
     }
 
     fn rename_jvm_alias(
@@ -2072,9 +2308,10 @@ impl Workspace {
         let target = member.definition.as_ref()?;
         let source = self.doc_text(&fixed.definition.file)?;
         // Validate the complete currently accepted annotation, not merely an equal substring.
-        let tree = self
-            .salsa
-            .parsed_tree(&fixed.definition.file, &source, Durability::LOW);
+        let tree =
+            self.salsa
+                .get_mut()
+                .parsed_tree(&fixed.definition.file, &source, Durability::LOW);
         let symbols = language::symbol_facts(SourceLanguage::Kotlin, &tree, &source).symbols;
         let verified = ktcore::jvm::source_facts(&fixed.definition.file, &tree, &source, &symbols)?;
         if !verified.callables.iter().any(|facts| {
@@ -2666,7 +2903,40 @@ impl Workspace {
         recovery: Option<&java::CompletionSource>,
         query: impl FnOnce(&dyn crate::index::InferenceIndex) -> T,
     ) -> T {
-        let scoped = self.index.scoped_for_file(key);
+        let prepared_sources = RefCell::new(HashSet::new());
+        let declaration = |entry: &crate::index::Entry| {
+            let mut pending = vec![entry.path.to_string()];
+            loop {
+                for file in pending {
+                    if !prepared_sources.borrow_mut().insert(file.clone()) {
+                        continue;
+                    }
+                    if let Some(text) = self.doc_text(&file) {
+                        self.salsa.borrow_mut().prepare_declaration(
+                            &file,
+                            &text,
+                            &self.index,
+                            self.index_revision,
+                        );
+                    }
+                }
+                // No input writes or mutable borrow during tracked/nested inference.
+                let result = self.salsa.borrow().declaration_query(entry);
+                pending = result
+                    .missing_sources
+                    .iter()
+                    .cloned()
+                    .filter(|file| !prepared_sources.borrow().contains(file))
+                    .collect();
+                if pending.is_empty() {
+                    return result.into_type();
+                }
+            }
+        };
+        let scoped = self
+            .index
+            .scoped_for_file(key)
+            .with_declaration_types(&declaration);
         let model = self
             .project_model
             .as_deref()

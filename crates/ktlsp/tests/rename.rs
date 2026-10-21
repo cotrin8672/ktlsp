@@ -2,6 +2,180 @@ use ktlsp::edit::apply_to_text;
 use ktlsp::workspace::Workspace;
 
 #[test]
+fn kotlin_property_rename_applies_each_java_accessor_and_constructor_label_spelling() {
+    let properties = "package probe\nclass Payload\nopen class Box<T>(var value: T)\nclass Child : Box<Payload>(Payload())\nclass Other(var value: Payload)\n";
+    let kotlin = "package use\nimport probe.Box as Alias\nimport probe.Payload\nimport probe.Other\nfun use(box: Alias<Payload>, other: Other) { box.value = Payload(); Alias(value = Payload()); Other(value = Payload()); other.value }\n";
+    let java = "package probe; class Use { void use(Box<Payload> box, Child child, Other other) { box.setValue(new Payload()); box.getValue(); child.getValue(); other.getValue(); other.setValue(new Payload()); } }";
+    for (file, cursor, placeholder) in [
+        (
+            "Properties.kt",
+            properties.find("var value").unwrap() + 4,
+            "value",
+        ),
+        ("Use.java", java.find("getValue").unwrap(), "value"),
+        ("Use.java", java.find("setValue").unwrap(), "value"),
+    ] {
+        let mut ws = Workspace::new();
+        for (key, source) in [
+            ("Properties.kt", properties),
+            ("Use.kt", kotlin),
+            ("Use.java", java),
+        ] {
+            ws.open(key, source.into());
+        }
+        let prepared = ws
+            .prepare_rename(file, cursor)
+            .expect("an accessor renames its authored property");
+        assert_eq!(prepared.placeholder, placeholder);
+        let source = if file.ends_with(".java") {
+            java
+        } else {
+            properties
+        };
+        assert_eq!(
+            &source[prepared.range.start_byte..prepared.range.end_byte],
+            if file.ends_with(".java") {
+                &source[cursor..cursor + 8]
+            } else {
+                "value"
+            }
+        );
+        let edits = ws
+            .rename(file, cursor, "renamed")
+            .expect("mixed property rename");
+        let expected_properties = properties.replacen("var value", "var renamed", 1);
+        let expected_kotlin = kotlin
+            .replace("box.value", "box.renamed")
+            .replace("Alias(value", "Alias(renamed");
+        let expected_java = java
+            .replace("box.setValue", "box.setRenamed")
+            .replace("box.getValue", "box.getRenamed")
+            .replace("child.getValue", "child.getRenamed");
+        for (key, original, expected) in [
+            ("Properties.kt", properties, expected_properties.as_str()),
+            ("Use.kt", kotlin, expected_kotlin.as_str()),
+            ("Use.java", java, expected_java.as_str()),
+        ] {
+            let actual = apply_to_text(key, original, &edits).unwrap();
+            assert_eq!(actual, expected, "whole buffer {file} -> {key}");
+            ws.change(key, actual);
+        }
+        let definitions = ws.goto_definition(
+            "Use.java",
+            expected_java.find("box.getRenamed").unwrap() + 4,
+        );
+        assert_eq!(definitions.len(), 1, "{definitions:?}");
+        assert_eq!(definitions[0].file, "Properties.kt");
+        assert_eq!(
+            &expected_properties[definitions[0].start_byte..definitions[0].end_byte],
+            "renamed"
+        );
+    }
+}
+
+#[test]
+fn property_rename_preserves_is_prefix_rules_in_both_directions() {
+    for (old, new, old_getter, new_getter) in [
+        ("isReady", "ready", "isReady", "getReady"),
+        ("ready", "isReady", "getReady", "isReady"),
+    ] {
+        let mut ws = Workspace::new();
+        let properties = format!("package probe\nclass Flag(var {old}: Boolean)\n");
+        let kotlin = format!(
+            "package probe\nfun use(flag: Flag) {{ flag.{old} = true; Flag({old} = true) }}\n"
+        );
+        let java = format!("package probe; class Use {{ void use(Flag flag) {{ flag.{old_getter}(); flag.setReady(true); }} }}");
+        for (file, text) in [
+            ("Flag.kt", &properties),
+            ("Use.kt", &kotlin),
+            ("Use.java", &java),
+        ] {
+            ws.open(file, text.clone());
+        }
+        let cursor = java.find(old_getter).unwrap();
+        let prepared = ws.prepare_rename("Use.java", cursor).unwrap();
+        assert_eq!(prepared.placeholder, old);
+        assert_eq!(
+            &java[prepared.range.start_byte..prepared.range.end_byte],
+            old_getter
+        );
+        let edits = ws.rename("Use.java", cursor, new).unwrap();
+        for (file, original, expected) in [
+            ("Flag.kt", properties.as_str(), properties.replace(old, new)),
+            ("Use.kt", kotlin.as_str(), kotlin.replace(old, new)),
+            (
+                "Use.java",
+                java.as_str(),
+                java.replace(old_getter, new_getter),
+            ),
+        ] {
+            assert_eq!(
+                apply_to_text(file, original, &edits).unwrap(),
+                expected,
+                "whole buffer {old} -> {new}: {file}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_rename_refuses_overrides_cycles_unknown_and_non_primary_constructor_labels() {
+    for source in [
+        "package probe\nopen class Box(open val value: Int)\nclass Child : Box(1) { override val value: Int = 2 }\n",
+        "package probe\nopen class Box(val value: Int)\nclass Child : Box(1)\nclass BoxCycle(val value: Int) : OtherCycle()\nclass OtherCycle : BoxCycle(1)\n",
+        "package probe\nclass Box(val value: Int) { constructor(value: String) : this(1) }\n",
+        "package probe\nclass Box(val value: Int, val renamed: Int)\n",
+    ] {
+        let mut ws = Workspace::new();
+        ws.open("Properties.kt", source.into());
+        let target = if source.contains("BoxCycle") { "val value: Int) : OtherCycle" } else { "val value: Int" };
+        let cursor = source.find(target).unwrap() + 4;
+        assert!(ws.rename("Properties.kt", cursor, "renamed").is_none(), "must refuse a partial family: {source}");
+    }
+    let mut ws = Workspace::new();
+    let private =
+        "package probe\nclass Hidden(private val value: Int) { fun read(): Int = value }\n";
+    let java = "package probe; class Use { void use(Hidden hidden, Missing unknown) { hidden.getValue(); unknown.getValue(); } }";
+    ws.open("Private.kt", private.into());
+    ws.open("Use.java", java.into());
+    assert!(ws
+        .prepare_rename("Use.java", java.find("getValue").unwrap())
+        .is_none());
+    assert!(ws
+        .rename("Use.java", java.rfind("getValue").unwrap(), "renamed")
+        .is_none());
+    let edits = ws
+        .rename(
+            "Private.kt",
+            private.find("val value").unwrap() + 4,
+            "renamed",
+        )
+        .unwrap();
+    assert_eq!(
+        apply_to_text("Private.kt", private, &edits).unwrap(),
+        private.replace("value", "renamed")
+    );
+    assert_eq!(apply_to_text("Use.java", java, &edits).unwrap(), java);
+    let fixed = "package probe\nclass Fixed { @get:JvmName(\"fixedGetter\") val value: Int = 1 }\nfun use(f: Fixed) = f.value\n";
+    let fixed_java = "package probe; class Use { int use(Fixed f) { return f.fixedGetter(); } }";
+    ws.open("Fixed.kt", fixed.into());
+    ws.change("Use.java", fixed_java.into());
+    let edits = ws
+        .rename("Fixed.kt", fixed.find("val value").unwrap() + 4, "renamed")
+        .unwrap();
+    assert_eq!(
+        apply_to_text("Fixed.kt", fixed, &edits).unwrap(),
+        fixed
+            .replace("val value", "val renamed")
+            .replace("f.value", "f.renamed")
+    );
+    assert_eq!(
+        apply_to_text("Use.java", fixed_java, &edits).unwrap(),
+        fixed_java
+    );
+}
+
+#[test]
 fn rename_top_level_function_across_files() {
     let mut ws = Workspace::new();
     let helper_key = "mem:///Helper.kt".to_string();

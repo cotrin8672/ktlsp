@@ -99,6 +99,14 @@ pub fn signature_for_callable(candidate: crate::jvm::CallableCandidate<'_>) -> S
     )
 }
 
+pub fn signature_for_callable_in_context(
+    index: &dyn crate::index::InferenceIndex,
+    candidate: crate::jvm::CallableCandidate<'_>,
+) -> Option<Signature> {
+    let (params, returns) = crate::jvm::resolved_signature_types(index, candidate)?;
+    Some(signature(candidate.name(), &params, returns.as_ref()))
+}
+
 fn signature(name: &str, declared_params: &[TypeRef], return_type: Option<&TypeRef>) -> Signature {
     let params = declared_params
         .iter()

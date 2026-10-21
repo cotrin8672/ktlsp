@@ -7,7 +7,54 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Integrated checkpoint120-6
+## Integrated checkpoint120-9
+
+The current source passes1755 Rust tests,0 fail,9 ignored (40 targets), and a
+release build. Both stages close normally with573 guarded inputs unchanged and
+zero owned residuals. Evidence: native-integrated120-9/{workspace-summary.json,
+receipt.json,main-ready.json}. The immutable release SHA256 is
+6e21a28d2f85669183a411204512086e6a872c93c7ab775ee2bfdeae217a96d7.
+
+Deferred Kotlin property accessors now obtain their types through shared,
+current-source inference. Parsed facts retain no inferred result; cache v38
+invalidates the changed positional schema. Nested source registration, unsaved
+initializer edits, unknown types and cycles have focused regressions. Independent
+Kotlin/Javac controls verify both the getter result and setter argument type.
+On release120-9, the stricter real-editor slice passes9 cases/20 semantic checks,
+all18 RPCs on their first response. Explicit excluded-candidate assertions verify
+that unknown/cyclic types withdraw getValue while a same-phase getTitle control
+remains useful. All23 inputs stay unchanged; shutdown is normal with no forced
+cleanup or owned residuals. Evidence: cem-startup120/inferred-summary.json.
+The earlier availability-only negative assertions are retained but are not used
+to prove candidate absence. Original CEM26 is still in progress.
+
+Mixed property/accessor rename passes14/14 checks in real Neovim on the joint
+dev9 binary (SHA7d84c1dbcf87fcfa3b6cd088df0e5a6c81739032bc21047149f4425dc13e4c6e).
+The actual WorkspaceEdit updates all three complete Kotlin/Java buffers, including
+an aliased constructor argument and inherited getter use, preserves an unrelated
+owner, and resolves the renamed getter to the new declaration before restoring
+the buffers. Shutdown is normal and input hashes remain unchanged. Evidence:
+rename120/{native-dev9-summary.json,editor-dev9/receipt.json}. Property override
+families and ambiguous constructor families still refuse partial rename; this
+does not establish full refactoring parity.
+
+An external SDK consumer has been rebuilt against this exact source. Its composed
+server passes the unchanged50 first requests and98/98 checks, including applied
+rename, unsaved edits and configuration invalidation. The real Mixin JAR and
+earlier independent compiler control remain bound to the evidence. Build and
+editor processes close normally with unchanged guards and zero owned residuals.
+Evidence: sdk-final120-9/{verified-summary.json,closed-api-summary.json}.
+This is external-extension evidence, not production Mixin support in ktlsp.
+
+JDK cache planning now runs within the bounded dependency worker pool rather than
+blocking all useful module work. A gated regression verifies useful navigation
+while planning is pending and rejects results from an obsolete generation;
+scoped workers join before their owner returns. The new release's warm-startup
+timing and same-release CEM/five-project sweep are pending. The previous1.700s
+warm observation below is not a measurement of this change. Warm startup under1s
+is the current priority; cold30s is a lower-priority aspiration.
+
+## Earlier integrated checkpoint120-6
 
 Source through6619400 is pushed. The current full workspace passes1746 tests,
 0 fail,9 are ignored (40 targets). Release compilation also passes. Both stages

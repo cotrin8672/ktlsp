@@ -359,7 +359,7 @@ pub fn reshare_file_type_contexts(
             for ty in callable
                 .params
                 .iter_mut()
-                .chain(std::iter::once(&mut callable.return_type))
+                .chain(callable.return_type.iter_mut())
                 .chain(callable.jvm_name_annotation.iter_mut())
             {
                 visit(ty, &mut pool);
@@ -430,7 +430,7 @@ mod tests {
             callables: vec![crate::jvm::CallableFacts {
                 name: "lowered".into(),
                 params: vec![ty()],
-                return_type: ty(),
+                return_type: Some(ty()),
                 type_params: Vec::new(),
                 definition: None,
                 fixed_name: None,
@@ -458,7 +458,7 @@ mod tests {
             &symbol.params[0],
             jvm.owner_annotation.as_ref().unwrap(),
             &jvm.callables[0].params[0],
-            &jvm.callables[0].return_type,
+            jvm.callables[0].return_type.as_ref().unwrap(),
             jvm.callables[0].jvm_name_annotation.as_ref().unwrap(),
         ] {
             assert!(Arc::ptr_eq(&shared, &ty.package_candidates));

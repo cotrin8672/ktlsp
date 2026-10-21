@@ -410,6 +410,9 @@ pub(crate) struct BinaryDiagnostics<'a> {
 }
 
 impl InferenceIndex for BinaryDiagnostics<'_> {
+    fn source_declaration_type(&self, entry: &Entry) -> Option<crate::types::Type> {
+        self.index.source_declaration_type(entry)
+    }
     fn source_value_namespace_complete(&self, owner: &Entry) -> bool {
         (self.value_namespace)(owner)
     }

@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v37-property-setters-lazy-binary";
+const SYMCACHE_VERSION: &[u8] = b"v38-deferred-property-accessors-lazy-binary";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 const BINARY_JAR_MARKER: &str = ".ktlsp-binary-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
@@ -4254,7 +4254,7 @@ public class ParameterUse<Iterable> {
                     pointers[0],
                     &jvm.callables[0].params[0].package_candidates
                 ));
-                let result = &jvm.callables[0].return_type;
+                let result = jvm.callables[0].return_type.as_ref().unwrap();
                 assert_eq!(result.name, "Object");
                 assert_eq!(result.qualification.as_deref(), Some("java.lang"));
                 assert!(Arc::ptr_eq(pointers[0], &result.package_candidates));

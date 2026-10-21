@@ -1,5 +1,6 @@
 //! JVM-visible callable facts. Authored declarations keep their source names and signatures.
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::index::{Entry, InferenceIndex, Tier};
 use crate::indexer::{self, TypeScope};
@@ -40,7 +41,7 @@ pub struct FixedName {
 pub struct CallableFacts {
     pub name: String,
     pub params: Vec<TypeRef>,
-    pub return_type: TypeRef,
+    pub return_type: Option<TypeRef>,
     pub type_params: Vec<String>,
     pub definition: Option<Def>,
     pub fixed_name: Option<FixedName>,
@@ -55,6 +56,13 @@ pub struct SourceProperty {
     pub name: String,
     pub type_params: Vec<String>,
     pub requires_binary_witness: bool,
+    pub deferred: Option<PropertyAccessor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PropertyAccessor {
+    Getter,
+    Setter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +139,7 @@ impl<'a> CallableCandidate<'a> {
     pub fn arity(self) -> Option<u8> {
         match self {
             Self::Authored(e) => e.sym.arity,
+            Self::Jvm { facts, .. } if deferred_setter(facts) => Some(1),
             Self::Jvm { facts, .. } => facts.params.len().try_into().ok(),
         }
     }
@@ -151,7 +160,7 @@ impl<'a> CallableCandidate<'a> {
     pub fn return_type(self) -> Option<&'a TypeRef> {
         match self {
             Self::Authored(e) => e.sym.return_type.as_ref(),
-            Self::Jvm { facts, .. } => Some(&facts.return_type),
+            Self::Jvm { facts, .. } => facts.return_type.as_ref(),
         }
     }
     pub fn identity(self, index: &dyn InferenceIndex) -> Option<MemberIdentity> {
@@ -180,20 +189,17 @@ impl<'a> CallableCandidate<'a> {
             return None;
         }
         let ctx = FileCtx::new(source.facts.package.clone(), Vec::new());
+        let params = resolved_params(index, source, facts)?;
+        let returns = resolved_return(index, source, facts)?;
         let mut descriptor = "(".to_string();
-        for ty in &facts.params {
+        for ty in params.iter() {
             descriptor.push_str(&source_value_descriptor(index, facts, ty, &ctx)?);
         }
         descriptor.push(')');
         if property_setter(facts) {
             descriptor.push('V');
         } else {
-            descriptor.push_str(&source_value_descriptor(
-                index,
-                facts,
-                &facts.return_type,
-                &ctx,
-            )?);
+            descriptor.push_str(&source_value_descriptor(index, facts, &returns, &ctx)?);
         }
         let origin_id = index
             .origin_facts()
@@ -320,12 +326,111 @@ fn source_value_descriptor(
 }
 
 fn property_setter(facts: &CallableFacts) -> bool {
-    facts.source_property.is_some()
-        && facts.params.len() == 1
-        && facts.return_type.name == "Unit"
-        && facts.return_type.qualification.as_deref() == Some("kotlin")
-        && !facts.return_type.nullable
-        && facts.return_type.args.is_empty()
+    deferred_setter(facts)
+        || facts.source_property.is_some()
+            && facts.params.len() == 1
+            && facts.return_type.as_ref().is_some_and(|ty| {
+                ty.name == "Unit"
+                    && ty.qualification.as_deref() == Some("kotlin")
+                    && !ty.nullable
+                    && ty.args.is_empty()
+            })
+}
+
+fn deferred_setter(facts: &CallableFacts) -> bool {
+    facts
+        .source_property
+        .as_ref()
+        .is_some_and(|p| p.deferred == Some(PropertyAccessor::Setter))
+}
+
+fn inferred_property_ref(
+    index: &dyn InferenceIndex,
+    source: &SourceFile,
+    facts: &CallableFacts,
+) -> Option<TypeRef> {
+    let entry = source_property_entry(index, source, facts)?;
+    inferred_type_ref(&index.source_declaration_type(entry)?)
+}
+
+/// Reify only resolved nominal identities; unresolved/foreign type parameters never acquire an ABI.
+pub fn inferred_type_ref(ty: &Type) -> Option<TypeRef> {
+    let Type::Class {
+        name,
+        package: Some(package),
+        container,
+        nullable,
+        args,
+        owner,
+    } = ty
+    else {
+        return None;
+    };
+    let qualification = container.as_ref().map_or_else(
+        || package.clone(),
+        |container| {
+            if package.is_empty() {
+                container.clone()
+            } else {
+                format!("{package}.{container}")
+            }
+        },
+    );
+    Some(TypeRef {
+        name: name.clone(),
+        qualification: Some(qualification),
+        nullable: *nullable,
+        args: args.iter().map(inferred_type_ref).collect::<Option<_>>()?,
+        owner: match owner {
+            Some(owner) => Some(Box::new(inferred_type_ref(owner)?)),
+            None => None,
+        },
+        ..TypeRef::default()
+    })
+}
+
+fn resolved_params<'a>(
+    index: &dyn InferenceIndex,
+    source: &SourceFile,
+    facts: &'a CallableFacts,
+) -> Option<Cow<'a, [TypeRef]>> {
+    if deferred_setter(facts) {
+        Some(Cow::Owned(vec![inferred_property_ref(
+            index, source, facts,
+        )?]))
+    } else {
+        Some(Cow::Borrowed(&facts.params))
+    }
+}
+
+fn resolved_return<'a>(
+    index: &dyn InferenceIndex,
+    source: &SourceFile,
+    facts: &'a CallableFacts,
+) -> Option<Cow<'a, TypeRef>> {
+    match facts.return_type.as_ref() {
+        Some(ty) => Some(Cow::Borrowed(ty)),
+        None => inferred_property_ref(index, source, facts).map(Cow::Owned),
+    }
+}
+
+pub fn resolved_signature_types(
+    index: &dyn InferenceIndex,
+    candidate: CallableCandidate<'_>,
+) -> Option<(Vec<TypeRef>, Option<TypeRef>)> {
+    match candidate {
+        CallableCandidate::Jvm {
+            owner: JvmOwner::Source(source),
+            facts,
+        } => Some((
+            resolved_params(index, source, facts)?.into_owned(),
+            Some(resolved_return(index, source, facts)?.into_owned()),
+        )),
+        _ => Some((
+            candidate.params().to_vec(),
+            candidate.return_type().cloned(),
+        )),
+    }
 }
 
 fn property_accessor_is_admitted(
@@ -383,6 +488,12 @@ fn property_accessor_is_admitted(
     if method.descriptor.as_ref() != identity.descriptor {
         return false;
     }
+    let Some(params) = resolved_params(index, source, facts) else {
+        return false;
+    };
+    let Some(returns) = resolved_return(index, source, facts) else {
+        return false;
+    };
     if property.type_params.is_empty() {
         return method.signature.is_none();
     }
@@ -416,11 +527,11 @@ fn property_accessor_is_admitted(
             && left.args == right.args
     };
     projected.type_parameters.is_empty()
-        && projected.parameters.len() == facts.params.len()
+        && projected.parameters.len() == params.len()
         && projected
             .parameters
             .iter()
-            .zip(&facts.params)
+            .zip(params.iter())
             .all(|(left, right)| same_type(left, right))
         && if property_setter(facts) {
             projected.returns.is_none()
@@ -428,7 +539,7 @@ fn property_accessor_is_admitted(
             projected
                 .returns
                 .as_ref()
-                .is_some_and(|ty| same_type(ty, &facts.return_type))
+                .is_some_and(|ty| same_type(ty, &returns))
         }
 }
 
@@ -1254,7 +1365,12 @@ pub fn select_call<'a>(
                         index,
                         args,
                         |position| {
-                            let Some(ty) = facts.params.get(position) else {
+                            let params = match owner {
+                                JvmOwner::Source(source) => resolved_params(index, source, facts),
+                                _ => Some(Cow::Borrowed(facts.params.as_slice())),
+                            };
+                            let Some(ty) = params.as_ref().and_then(|params| params.get(position))
+                            else {
                                 return Type::Unknown;
                             };
                             if let JvmOwner::Source(source) = owner {
@@ -1348,9 +1464,9 @@ pub fn projected_return_type(candidate: CallableCandidate<'_>) -> Option<Type> {
     let CallableCandidate::Jvm { facts, .. } = candidate else {
         return None;
     };
-    (facts.return_type.name == "Object"
-        && facts.return_type.qualification.as_deref() == Some("java.lang"))
-    .then(|| Type::class("Object", Some("java.lang".into())))
+    let returns = facts.return_type.as_ref()?;
+    (returns.name == "Object" && returns.qualification.as_deref() == Some("java.lang"))
+        .then(|| Type::class("Object", Some("java.lang".into())))
 }
 
 /// Preserve the source-JVM lowering behavior; derive admitted Java results through the current
@@ -1367,8 +1483,8 @@ pub fn projected_return_type_in_context(
     } = candidate
     {
         if let Some(entry) = source_property_entry(index, source, facts) {
-            let result =
-                infer::declared_member_type(index, receiver, entry, &facts.return_type, ctx);
+            let returns = resolved_return(index, source, facts)?;
+            let result = infer::declared_member_type(index, receiver, entry, &returns, ctx);
             return (!matches!(result, Type::Unknown)).then_some(result);
         }
     }
@@ -1377,20 +1493,21 @@ pub fn projected_return_type_in_context(
         facts,
     } = candidate
     {
-        let component = facts.return_type.name.trim_end_matches("[]");
-        if facts.return_type.qualification.is_none()
-            && component != facts.return_type.name
+        let returns = facts.return_type.as_ref()?;
+        let component = returns.name.trim_end_matches("[]");
+        if returns.qualification.is_none()
+            && component != returns.name
             && infer::primitive_type_name(component) != component
         {
             // Exact Java primitive descriptors cannot bind a Kotlin class with the same spelling.
-            let rank = (facts.return_type.name.len() - component.len()) / 2;
+            let rank = (returns.name.len() - component.len()) / 2;
             let mut result = Type::class(component, None);
             for _ in 0..rank {
                 result = Type::array(result, false);
             }
             return Some(result);
         }
-        let result = infer::declared_type(index, &facts.return_type, ctx);
+        let result = infer::declared_type(index, returns, ctx);
         return (!matches!(result, Type::Unknown)).then_some(result);
     }
     projected_return_type(candidate)
@@ -1548,7 +1665,7 @@ pub fn source_facts(
         callables.push(CallableFacts {
             name,
             params,
-            return_type: scope.type_ref("java.lang.Object", false, Vec::new()),
+            return_type: Some(scope.type_ref("java.lang.Object", false, Vec::new())),
             type_params: symbol.type_params.clone(),
             definition: Some(Def {
                 file: file.into(),
@@ -1661,9 +1778,8 @@ pub fn source_facts(
         }) {
             continue;
         }
-        let Some(return_type) = symbol.value_type.clone() else {
-            continue;
-        };
+        let return_type = symbol.value_type.clone();
+        let deferred = return_type.is_none().then_some(PropertyAccessor::Getter);
         let Some(name) = property_getter_name(&symbol.name) else {
             continue;
         };
@@ -1685,6 +1801,7 @@ pub fn source_facts(
                 name: symbol.name.clone(),
                 type_params: owner.type_params.clone(),
                 requires_binary_witness,
+                deferred,
             }),
         };
         let mutable = node
@@ -1707,8 +1824,12 @@ pub fn source_facts(
         if mutable && public_setter {
             let mut setter = getter.clone();
             setter.name = property_setter_name(&symbol.name).unwrap();
-            setter.params.push(setter.return_type.clone());
-            setter.return_type = scope.type_ref("kotlin.Unit", false, Vec::new());
+            if let Some(ty) = &setter.return_type {
+                setter.params.push(ty.clone());
+            } else {
+                setter.source_property.as_mut().unwrap().deferred = Some(PropertyAccessor::Setter);
+            }
+            setter.return_type = Some(scope.type_ref("kotlin.Unit", false, Vec::new()));
             callables.push(setter);
         }
         callables.push(getter);
@@ -1726,7 +1847,7 @@ pub fn source_facts(
 }
 
 /// The supported Kotlin property spelling, shared by source facts and Java candidate lookup.
-pub(crate) fn property_getter_name(name: &str) -> Option<String> {
+pub fn property_getter_name(name: &str) -> Option<String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
@@ -1742,7 +1863,7 @@ pub(crate) fn property_getter_name(name: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn property_setter_name(name: &str) -> Option<String> {
+pub fn property_setter_name(name: &str) -> Option<String> {
     let getter = property_getter_name(name)?;
     Some(format!(
         "set{}",
@@ -1868,6 +1989,60 @@ mod tests {
         index.replace_jvm_source(file, None, Tier::Volatile);
         assert!(member_candidates(&index, &receiver, "getValue").is_empty());
         assert_eq!(member_candidates(&snapshot, &receiver, "getValue").len(), 1);
+    }
+
+    #[test]
+    fn deferred_property_accessors_require_one_current_type_for_both_abi_surfaces() {
+        let file = "/getter/Inferred.kt";
+        let text = "package getter\nclass Inferred { var value = produce() }\n";
+        let tree = crate::parser::KotlinParser::new().parse(text);
+        let symbols = indexer::extract_symbols(&tree, text, "getter");
+        let facts = source_facts(file, &tree, text, &symbols).unwrap();
+        let getter = facts
+            .callables
+            .iter()
+            .find(|f| f.name == "getValue")
+            .unwrap();
+        assert_eq!(getter.return_type, None);
+        assert_eq!(
+            getter.source_property.as_ref().unwrap().deferred,
+            Some(PropertyAccessor::Getter)
+        );
+        let setter = facts
+            .callables
+            .iter()
+            .find(|f| f.name == "setValue")
+            .unwrap();
+        assert!(setter.params.is_empty());
+        assert_eq!(
+            setter.source_property.as_ref().unwrap().deferred,
+            Some(PropertyAccessor::Setter)
+        );
+        let mut index = crate::index::Index::new();
+        index.replace_file(file, symbols, Tier::Volatile);
+        index.replace_jvm_source(file, Some(facts), Tier::Volatile);
+        let receiver = Type::class("Inferred", Some("getter".into()));
+        assert!(member_candidates(&index, &receiver, "").is_empty());
+        let current = |_: &Entry| Some(Type::class("String", Some("kotlin".into())));
+        let scoped = index
+            .scoped_for_file("Use.java")
+            .with_declaration_types(&current);
+        for (name, arity, descriptor) in [
+            ("getValue", 0, "()Ljava/lang/String;"),
+            ("setValue", 1, "(Ljava/lang/String;)V"),
+        ] {
+            let candidates = member_candidates(&scoped, &receiver, name);
+            let [candidate] = candidates.as_slice() else {
+                panic!("one admitted accessor")
+            };
+            assert_eq!(candidate.arity(), Some(arity));
+            assert_eq!(candidate.identity(&scoped).unwrap().descriptor, descriptor);
+        }
+        let unknown = |_: &Entry| Some(Type::Unknown);
+        let scoped = index
+            .scoped_for_file("Use.java")
+            .with_declaration_types(&unknown);
+        assert!(member_candidates(&scoped, &receiver, "").is_empty());
     }
 
     #[test]
@@ -2125,12 +2300,12 @@ mod tests {
         let facts = CallableFacts {
             name: member.name.to_string(),
             params: Vec::new(),
-            return_type: TypeRef {
+            return_type: Some(TypeRef {
                 name: "String".into(),
                 projection: Default::default(),
                 qualification: Some("java.lang".into()),
                 ..TypeRef::default()
-            },
+            }),
             type_params: Vec::new(),
             definition: None,
             fixed_name: None,
@@ -2192,12 +2367,12 @@ mod tests {
         let facts = CallableFacts {
             name: "getName".into(),
             params: Vec::new(),
-            return_type: TypeRef {
+            return_type: Some(TypeRef {
                 name: "String".into(),
                 projection: Default::default(),
                 qualification: Some("java.lang".into()),
                 ..TypeRef::default()
-            },
+            }),
             type_params: Vec::new(),
             definition: None,
             fixed_name: None,
@@ -2292,12 +2467,12 @@ mod tests {
         let facts = CallableFacts {
             name: "getName".into(),
             params: Vec::new(),
-            return_type: TypeRef {
+            return_type: Some(TypeRef {
                 name: "String".into(),
                 projection: Default::default(),
                 qualification: Some("java.lang".into()),
                 ..TypeRef::default()
-            },
+            }),
             type_params: Vec::new(),
             definition: None,
             fixed_name: None,

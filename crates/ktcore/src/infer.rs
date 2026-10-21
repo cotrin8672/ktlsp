@@ -1709,7 +1709,7 @@ fn infer_identifier(
 
 /// The type a declaration's name node binds: an explicit annotation, or (recursively) the inferred
 /// type of its initializer (`val x = foo()` -> foo's return type).
-fn decl_type(
+pub fn decl_type(
     index: &dyn InferenceIndex,
     decl: Node,
     src: &str,
@@ -2976,8 +2976,19 @@ fn selected_member_type(
         };
         let semantic_entry = index.semantic_entry(&definition);
         let e = semantic_entry.unwrap_or(e);
+        let inferred;
         let tr = match member_type_ref(index, recv_ty, e, want_function) {
             Some(tr) => tr,
+            None if !want_function && e.sym.kind == SymbolKind::Property => {
+                inferred = index
+                    .source_declaration_type(e)
+                    .as_ref()
+                    .and_then(crate::jvm::inferred_type_ref);
+                let Some(tr) = inferred.as_ref() else {
+                    return Type::Unknown;
+                };
+                tr
+            }
             None => return Type::Unknown,
         };
         let scalar = primitive_type_name(&tr.name);
