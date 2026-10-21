@@ -216,9 +216,31 @@ fn incomplete_method_body_does_not_erase_a_known_authored_header() {
 
 #[test]
 fn source_properties_or_extension_receivers_do_not_invent_jvm_fields_or_descriptors() {
-    let source = "package oracle\nclass Owner {\n private val computed: Int get() = 42\n private val delegated: Int by lazy { 42 }\n fun String.extension(value: Int): Int = value\n internal fun mangled(value: Int): Int = value\n @JvmName(\"other\") fun renamed(value: Int): Int = value\n}\n";
+    let source = "package oracle\nclass Owner {\n private val computed: Int get() = 42\n private val delegated: Int by lazy { 42 }\n @Marker(\"receiver\") fun String.extension(value: Int): Int = value\n internal fun mangled(value: Int): Int = value\n @JvmName(\"other\") fun renamed(value: Int): Int = value\n}\n";
     let facts = facts("Owner.kt", source);
-    for name in ["computed", "delegated", "extension", "mangled", "renamed"] {
+    let extension = named(&facts, source, "extension");
+    assert_eq!(
+        extension.owner.as_ref(),
+        Some(&named(&facts, source, "Owner").definition)
+    );
+    assert!(
+        extension.member.is_none(),
+        "extension receivers are not ordinary class members"
+    );
+    assert!(extension.jvm_property.is_none());
+    assert_eq!(extension.annotations.len(), 1);
+    let annotation = &extension.annotations[0];
+    assert_eq!(annotation.ty.name, "Marker");
+    let Knowledge::Found(AnnotationValue::String {
+        value,
+        content_range,
+    }) = &annotation.arguments[0].value
+    else {
+        panic!("extension annotation must retain its authored argument")
+    };
+    assert_eq!(value, "receiver");
+    assert_eq!(&source[content_range.clone()], "receiver");
+    for name in ["computed", "delegated", "mangled", "renamed"] {
         assert!(
             matches!(
                 named(&facts, source, name)

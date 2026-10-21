@@ -1,8 +1,10 @@
 -- Extra probe for the compiler-plugins corpus, using only unsaved source edits.
 return function(ctx)
   local probe = dofile(ctx.repo .. '/dev/nvim_lsp_probe.lua')
-  for _, name in ipairs({ 'Model', 'OpenBase' }) do
-  local path = vim.fs.abspath(ctx.project .. '/src/main/kotlin/pluginfixture/' .. name .. '.kt')
+  for _, name in ipairs({ 'Model', 'OpenBase', 'ModelSemantic' }) do
+  local semantic = name == 'ModelSemantic'
+  local file = semantic and 'Model' or name
+  local path = vim.fs.abspath(ctx.project .. '/src/main/kotlin/pluginfixture/' .. file .. '.kt')
   local disk = vim.fn.readfile(path)
   local buf = vim.fn.bufadd(path)
   vim.fn.bufload(buf)
@@ -13,7 +15,7 @@ return function(ctx)
   local ok, err = xpcall(function()
     local lines = vim.deepcopy(disk)
     lines[#lines + 1] = ''
-    lines[#lines + 1] = 'fun incompleteSameFile() = Model.'
+    lines[#lines + 1] = semantic and 'fun brokenSibling() = MissingName.value' or 'fun incompleteSameFile() = Model.'
     local diagnostics, observation = probe.canonical_kotlin_diagnostics(ctx.client, buf, {
       observation_timeout_ms = 120000, request_timeout_ms = 5000, compiler_version = '1.9.23',
       edit_label = 'unfinished package function beside valid ' .. name .. ' classes',
@@ -23,9 +25,9 @@ return function(ctx)
     local retained = false
     for _, diagnostic in ipairs(diagnostics and diagnostics.items or {}) do
       if diagnostic.severity == 1 and diagnostic.range.start.line == #lines - 1
-        and diagnostic.message:lower():find('expecting an element', 1, true) then retained = true end
+        and diagnostic.message:lower():find(semantic and 'unresolved reference: missingname' or 'expecting an element', 1, true) then retained = true end
     end
-    ctx.check('same-file ' .. name .. ': current compiler syntax diagnostic retained',
+    ctx.check('same-file ' .. name .. ': current compiler ' .. (semantic and 'semantic' or 'syntax') .. ' diagnostic retained',
       observation.canonical_certified and retained, observation.error, 'semantic', observation.availability)
     if not observation.canonical_certified then return end
     for _, consumer in ipairs({

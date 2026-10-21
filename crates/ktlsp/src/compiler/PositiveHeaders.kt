@@ -92,10 +92,13 @@ private class PositiveExtension(private val original: CompilerConfiguration) : A
             check(files.map { key(File(it.virtualFile.path)) }.toSet() == expected.keys)
             files.forEach { check(sha(it.text.toByteArray(Charsets.UTF_8)) == expected.getValue(key(File(it.virtualFile.path)))) }
             val errors = context.diagnostics.all().filter { it.severity == Severity.ERROR }
+            fun eligible(element: KtElement): Boolean =
+                !org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil.hasErrorElements(element) &&
+                errors.none { diagnostic -> diagnostic.psiFile === element.containingKtFile &&
+                    diagnostic.textRanges.any { element.textRange.intersects(it) } }
             val classes = mutableListOf<Map<String, Any?>>()
             for (file in files) {
-                // An erroneous producer cannot certify its API; errors in a consumer retain their original diagnostics.
-                if (errors.any { it.psiFile === file }) continue
+                // An erroneous class cannot certify its API; sibling errors retain their original diagnostics.
                 fun observe(owner: ClassDescriptor) {
                     if (owner.visibility != DescriptorVisibilities.PUBLIC || ErrorUtils.isError(owner)) return
                     // Signature omits Kotlin nullability; nullable surfaces remain unknown until normalized.
@@ -109,7 +112,7 @@ private class PositiveExtension(private val original: CompilerConfiguration) : A
                         "source" to key(File(file.virtualFile.path)), "methods" to methods))
                     owner.companionObjectDescriptor?.let(::observe)
                 }
-                file.declarations.filterIsInstance<KtClassOrObject>().forEach { declaration ->
+                file.declarations.filterIsInstance<KtClassOrObject>().filter(::eligible).forEach { declaration ->
                     context[BindingContext.CLASS, declaration]?.let(::observe)
                 }
             }
@@ -121,10 +124,6 @@ private class PositiveExtension(private val original: CompilerConfiguration) : A
                 val state = GenerationState.Builder(project, OriginCollectingClassBuilderFactory(mode), module, context, configuration)
                     .isIrBackend(true).ignoreErrors(true).diagnosticReporter(reporter)
                     .generateDeclaredClassFilter(if (mode != ClassBuilderMode.FULL) GenerationState.GenerateClassFilter.GENERATE_ALL else object : GenerationState.GenerateClassFilter() {
-                        fun eligible(element: KtElement): Boolean =
-                            !org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil.hasErrorElements(element) &&
-                            errors.none { diagnostic -> diagnostic.psiFile === element.containingKtFile &&
-                                diagnostic.textRanges.any { element.textRange.intersects(it) } }
                         override fun shouldGenerateClass(processingClassOrObject: KtClassOrObject) = eligible(processingClassOrObject)
                         override fun shouldAnnotateClass(processingClassOrObject: KtClassOrObject) = eligible(processingClassOrObject)
                         override fun shouldGenerateClassMembers(processingClassOrObject: KtClassOrObject) = eligible(processingClassOrObject)
