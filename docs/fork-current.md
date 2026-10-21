@@ -43,8 +43,19 @@ Both sessions nevertheless require forced termination after the shutdown wait.
 Their traces reach workspace.drop.start but not workspace.index.dropped; the
 Gradle child had already exited. Index destruction is a candidate cause, not yet
 a proven cause or a passing lifecycle result. Evidence: spring120/{native1,
-native1-incomplete}/receipt.json. Gradle's original nine-case native run is still
-in progress; its outcome and final release cold/warm/UI measurements remain open.
+native1-incomplete}/receipt.json.
+
+Gradle's original nine-case run now closes with9/9 qualified first-response
+matches, including the known positive control for its unknown-receiver negative.
+Both normal3 and incomplete6 sessions close cleanly with stable inputs and no
+owned residuals. Evidence: oracle120/gradle-sdk-native1/closed-audit.json.
+The new normal Gradle import also resolves all compiler tasks successfully;
+isolation of the per-language SDK fix therefore comes from the preserved old
+captured-model RED/GREEN, not this recovered import alone. Across recorded runs,
+all50 original five-project semantic expectations now match, using earlier
+release120-2 for Moshi/OkHttp/Retrofit and joint dev07fc12c2 for Spring/Gradle.
+This is not yet a same-release sweep or full-project semantic coverage. Final
+release cold/warm/UI measurements and the Spring lifecycle result remain open.
 
 ## Earlier120: development builds and functional baselines
 
