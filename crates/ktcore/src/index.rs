@@ -617,10 +617,12 @@ impl Index {
         }
         let sources = Arc::make_mut(&mut self.jvm_sources);
         if let Some(previous) = sources.files.remove(file) {
-            if let Some(bucket) = sources.owners.get_mut(&previous.facts.owner) {
-                bucket.retain(|source| source.file != file);
-                if bucket.is_empty() {
-                    sources.owners.remove(&previous.facts.owner);
+            for owner in previous.owners() {
+                if let Some(bucket) = sources.owners.get_mut(owner) {
+                    bucket.retain(|source| source.file != file);
+                    if bucket.is_empty() {
+                        sources.owners.remove(owner);
+                    }
                 }
             }
         }
@@ -632,11 +634,13 @@ impl Index {
                 tier,
                 facts,
             });
-            sources
-                .owners
-                .entry(source.facts.owner.clone())
-                .or_default()
-                .push(source.clone());
+            for owner in source.owners() {
+                sources
+                    .owners
+                    .entry(owner.into())
+                    .or_default()
+                    .push(source.clone());
+            }
             sources.files.insert(file.into(), source);
         }
     }

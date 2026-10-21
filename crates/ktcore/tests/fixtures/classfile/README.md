@@ -180,6 +180,17 @@ Tests check field metadata and Java/Kotlin positive completion, not source
 navigation, compiler-plugin support, enum completeness or negative closure.
 Independent whole Java/Kotlin consumer compilation remains a separate control.
 
+## Kotlin constructor property getters
+
+`kotlin240/Pair.class` and `kotlin240/Tuples.kt` are unchanged entries from the
+Kotlin stdlib 2.4.0 binary and sources artifacts. The upstream Apache 2.0 notice
+is retained in the source; `kotlin240/provenance.json` records the artifact and
+entry hashes. Tests compare the real getter descriptor and generic Signature
+with the source property, retaining its declaration location. Altered flags,
+owner identity, class bounds and method Signature are negative controls.
+This admits selected Java getter calls without treating unknown annotations
+as a complete Kotlin or JVM member surface.
+
 
 ## Field-only public member fixture
 

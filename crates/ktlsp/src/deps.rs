@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v34-java-interface-constants";
+const SYMCACHE_VERSION: &[u8] = b"v35-kotlin-constructor-getters";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2786,6 +2786,78 @@ mod tests {
                 assert!(materialize_source_file(path));
                 assert_eq!(fs::read_to_string(path).unwrap(), text);
             }
+        }
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn constructor_getters_reject_pre_projection_source_cache() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_ctor_getter_cache_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let jar = tmp.join("api-sources.jar");
+        write_sources_jar(
+            &jar,
+            &[("api/Box.kt", "package api\nclass Box<T>(val value: T)\n")],
+        );
+        let source = LibrarySource {
+            dest: tmp.join("extracted"),
+            jar: Some(jar.clone()),
+            fingerprint: jar_fingerprint(&jar),
+            origin_id: "maven:fixture:getter:1".into(),
+            policy: Ok(SourceTextPolicy::default()),
+        };
+        let meta = fs::metadata(&jar).unwrap();
+        let mut old = Sha256::new();
+        old.update(b"v34-java-interface-constants");
+        old.update(b"|");
+        old.update(jar.to_string_lossy().as_bytes());
+        old.update(b"|");
+        old.update(
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        old.update(b"|");
+        old.update(meta.len().to_le_bytes());
+        let old_fingerprint = format!("{:x}", old.finalize());
+        assert_ne!(Some(&old_fingerprint), source.fingerprint.as_ref());
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        assert!(prepare_lazy_source_dir(
+            &jar,
+            &source.dest,
+            source.fingerprint.as_deref().unwrap()
+        ));
+        let mut legacy = parse_source_jar(
+            &jar,
+            &source.dest,
+            source.policy.as_ref().unwrap().java,
+            &mut kotlin,
+            &mut java,
+            &|| true,
+        )
+        .unwrap();
+        for batch in &mut legacy {
+            batch.jvm = None;
+        }
+        let old_key = source.policy.as_ref().unwrap().cache_key(&old_fingerprint);
+        symcache_store(&old_key, &legacy);
+        assert!(symcache_load(&old_key, &source.dest).is_some());
+        for _ in 0..2 {
+            let batches = resolve_library_source(&source, &mut kotlin, &mut java).unwrap();
+            assert_eq!(
+                batches
+                    .iter()
+                    .filter_map(|batch| batch.jvm.as_ref())
+                    .flat_map(|facts| &facts.callables)
+                    .filter(|facts| facts.name == "getValue")
+                    .count(),
+                1
+            );
         }
         fs::remove_dir_all(tmp).unwrap();
     }

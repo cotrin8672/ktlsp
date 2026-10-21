@@ -488,7 +488,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
                     expect = true;
                     jvm_restricted = true;
                 }
-                "suspend" | "inline" => jvm_restricted = true,
+                "suspend" | "inline" | "value" => jvm_restricted = true,
                 "default" => default_ = true,
                 "final" => final_ = true,
                 _ => {}
@@ -541,6 +541,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
                     node.kind() == "class_declaration" && inner_
                 };
             SourceMemberFlags::for_visibility(visibility, internal)
+                .with_jvm_restricted(jvm_restricted)
                 .with_type_owner_capture(owner.is_some().then_some(capture))
                 .with_java_protected(java)
         };
@@ -1978,6 +1979,8 @@ fn walk(
                         Vec::new(),
                         documentation.as_deref(),
                     );
+                    out.last_mut().unwrap().source_member =
+                        out.last().unwrap().source_member.with_jvm_restricted(true);
                 }
                 walk(child, src, package, container, scope, out);
             }
@@ -2312,6 +2315,7 @@ internal constructor(private val rawValue: Long) :
         let duration = syms.iter().find(|s| s.name == "Duration").unwrap();
         assert_eq!(duration.kind, SymbolKind::Class);
         assert_eq!(duration.package, "kotlin.time");
+        assert!(duration.source_member.jvm_restricted());
     }
 
     #[test]

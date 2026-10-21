@@ -6,7 +6,47 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
-## Latest120: faster development builds; outstanding functional gaps
+## Latest120: getter and configured SDK coverage
+
+The joint120-4 checkpoint passes the complete Rust workspace:1740 passed,
+0 failed,9 ignored. The release build succeeds with569 guarded inputs unchanged
+and no forced or owned residual processes. Its immutable binary SHA256 is
+18938e7be4e847ad687e4c1c64559d48a19beb80315f80c128f8b16522141b61.
+Evidence: native-integrated120-4/{workspace-summary.json,receipt.json,main-ready.json}.
+The preceding120-3 attempt failed to compile one old test caller after a function
+gained a receiver argument; that caller is fixed. A subsequent formatting-only
+change passes cargo fmt --all --check. These are build/correctness results,
+not runtime speed acceptance.
+
+Java constructor-property getters now share source definitions and receiver-bound
+return types with the Kotlin property. Annotated library owners require the
+selected classfile's actual getter descriptor and generic signature. Source cache
+v35 invalidates entries that lack these facts. The original additional six library
+cases now match12/12 first-response assertions on joint dev07fc12c2, with clean
+exit and all36 semantic input guards stable. The raw guard result remains false:
+two Gradle-generated probe/lock files changed, with no unexpected input change.
+Evidence: cem-startup120/coverage/native-getter-fixed1/{summary.json,guard-audit.json}.
+Mixed Java/Kotlin getter rename is rejected after an actual wrong-spelling edit
+was reproduced; full derived-name rename and inherited getter coverage remain gaps.
+
+An incomplete compiler recipe no longer withdraws another language's independently
+verified SDK. For KGP1.9.25, configured SDK inputs are also captured before compiler
+classpath resolution can fail; this narrow view does not certify compiler execution,
+generated output or producer closure. The actual KGP toolchain/provider and runner
+source confirm the selected JVM path. The actual11-case Gradle contract passes;
+a separate build-JVM17/task-JVM21 contrast failed during listener setup and is not
+claimed as verified. Evidence: spring120/{capture1,contract3}/receipt.json.
+
+Spring now matches all10 original first responses on the same dev07fc12c2 binary:
+normal4/4 and incomplete6/6, including only the expected ResolvableType overload.
+Both sessions nevertheless require forced termination after the shutdown wait.
+Their traces reach workspace.drop.start but not workspace.index.dropped; the
+Gradle child had already exited. Index destruction is a candidate cause, not yet
+a proven cause or a passing lifecycle result. Evidence: spring120/{native1,
+native1-incomplete}/receipt.json. Gradle's original nine-case native run is still
+in progress; its outcome and final release cold/warm/UI measurements remain open.
+
+## Earlier120: development builds and functional baselines
 
 The joint120-2 integration passes the full workspace:1729 passed,0 failed,
 8 ignored. Release build also passes;564 guarded inputs stay unchanged.

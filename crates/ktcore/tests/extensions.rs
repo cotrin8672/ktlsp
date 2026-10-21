@@ -1780,6 +1780,7 @@ fn selected_compiled_java_array_factories_keep_exact_descriptor_rank_origin_and_
         assert_eq!(identity.descriptor, descriptor);
         let mut result = jvm::projected_return_type_in_context(
             &scoped,
+            &receiver,
             *candidate,
             &FileCtx::new("consumer".into(), Vec::new()),
         )

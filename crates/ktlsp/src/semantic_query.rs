@@ -1184,7 +1184,7 @@ fn member_candidates(
     let mut withheld_compiled = false;
     java_callables.retain(|candidate| {
         let blocked = matches!(candidate, ktcore::jvm::CallableCandidate::Jvm {
-            owner: ktcore::jvm::JvmOwner::Compiled { .. }, facts
+            facts, ..
         } if !facts.is_static && receiver_kind != ktcore::jvm::ReceiverKind::Value);
         withheld_compiled |= blocked;
         !blocked
@@ -1312,9 +1312,14 @@ fn member_candidates(
                     item.arity = candidate.arity();
                     item.tier = owner.tier();
                     let (package, container) = match owner {
-                        ktcore::jvm::JvmOwner::Source(source) => {
-                            (source.facts.package.clone(), source.facts.owner.clone())
-                        }
+                        ktcore::jvm::JvmOwner::Source(source) => (
+                            source.facts.package.clone(),
+                            facts
+                                .source_property
+                                .as_ref()
+                                .map(|property| property.owner.clone())
+                                .unwrap_or_else(|| source.facts.owner.clone()),
+                        ),
                         ktcore::jvm::JvmOwner::Compiled { class, .. } => {
                             let (package, name) = class
                                 .internal_name
@@ -1667,6 +1672,96 @@ mod tests {
     use crate::workspace::Workspace;
 
     use super::*;
+
+    #[test]
+    fn sdk_selection_keeps_factory_overloads_scoped_when_compiler_inputs_fail() {
+        let (root, mut original) = crate::classpath::tests::sdk_selection_fixture();
+        original.truncate(1);
+        let source = &mut original[0].source_sets[0];
+        source.compiler_metadata_incomplete = true;
+        let kotlin = source
+            .compiler_tasks
+            .iter_mut()
+            .find(|task| task.language == crate::classpath::CompilerLanguage::Kotlin)
+            .unwrap();
+        let home = kotlin.java_home.take().unwrap();
+        kotlin.complete = false;
+        kotlin.problem = Some("unavailable dependency snapshot".into());
+        let selection = serde_json::json!({
+            "adapter": "kgp-1.9.25-jvm-sdk-options-v1", "task": kotlin.task,
+            "language": "kotlin", "java_home": home, "arguments": ["-jvm-target", "17"],
+        });
+        let authored = original[0].source_sets[0].source_roots[0].clone();
+        let file = crate::paths::file_key(&authored.join("Use.kt"));
+        for witnessed in [false, true] {
+            let mut modules = original.clone();
+            if witnessed {
+                modules[0].source_sets[0]
+                    .compiler_tasks
+                    .iter_mut()
+                    .find(|task| task.language == crate::classpath::CompilerLanguage::Kotlin)
+                    .unwrap()
+                    .options
+                    .insert("sdkSelection".into(), selection.clone());
+            }
+            let model = std::sync::Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+            assert_eq!(
+                model
+                    .sdk_api_for_file(std::path::Path::new(&file))
+                    .is_some(),
+                witnessed
+            );
+            // This SDK-only witness must not certify current compiler or processor execution.
+            let task = model.modules[0].source_sets[0]
+                .compiler_tasks
+                .iter()
+                .find(|task| task.language == crate::classpath::CompilerLanguage::Kotlin)
+                .unwrap();
+            assert!(!task.complete && task.problem.is_some() && task.java_home.is_none());
+            let mut ws = Workspace::new();
+            ws.set_project_model(model);
+            for (name, text) in [
+                ("BeanFactory.java", include_str!("../../../dev/corpus/fixtures/spring-provider/BeanFactory.java")),
+                ("ObjectProvider.java", include_str!("../../../dev/corpus/fixtures/spring-provider/ObjectProvider.java")),
+                ("ResolvableType.java", include_str!("../../../dev/corpus/fixtures/spring-provider/ResolvableType.java")),
+                ("ParameterizedTypeReference.java", include_str!("../../../dev/corpus/fixtures/spring-provider/ParameterizedTypeReference.java")),
+                ("Use.kt", include_str!("../../../dev/corpus/fixtures/spring-provider/BeanFactoryExtensions.kt")),
+            ] {
+                ws.open(crate::paths::file_key(&authored.join(name)), text.into());
+            }
+            let class = crate::paths::file_key(&root.join("sdk/Class.java"));
+            ws.open(
+                &class,
+                "package java.lang; public final class Class<T> {}".into(),
+            );
+            ws.index.set_file_origin(
+                &class,
+                ktcore::project_model::FileOrigin {
+                    origin_id: crate::classpath::jdk_origin_id(&home.join("lib/src.zip")),
+                    representation: ktcore::project_model::SourceRepresentation::Source,
+                    project_scope: None,
+                },
+            );
+            let src = ws.doc_text(&file).unwrap();
+            let outer = src.find("getBeanProvider(ResolvableType.forType(").unwrap();
+            let actual = ws.goto_definition(&file, outer);
+            assert_eq!(
+                actual.len(),
+                if witnessed { 1 } else { 2 },
+                "{witnessed}: {actual:?}"
+            );
+            if witnessed {
+                let entries = ws.index.entries_for_file(&actual[0].file);
+                let target = &entries
+                    .iter()
+                    .find(|entry| entry.sym.start_byte == actual[0].start_byte)
+                    .unwrap()
+                    .sym;
+                assert_eq!(target.params[0].name, "ResolvableType");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn annotation_completion_uses_exact_types_and_qualified_owners_across_languages() {
@@ -2843,6 +2938,7 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             identity = Some(current);
             let ty = ktcore::jvm::projected_return_type_in_context(
                 &scoped,
+                &receiver,
                 *candidate,
                 &infer::FileCtx::new("pluginfixture".into(), Vec::new()),
             )
@@ -3513,6 +3609,7 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
         assert!(selection.candidates[0].definition().is_none());
         assert!(ktcore::jvm::projected_return_type_in_context(
             &scoped,
+            &Type::class("Person", Some("oracle".into())),
             selection.candidates[0],
             &infer::FileCtx::new("oracle".into(), Vec::new())
         )

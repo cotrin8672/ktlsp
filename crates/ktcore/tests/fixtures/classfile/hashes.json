@@ -288,5 +288,10 @@
     "file": "create6010/DrillBlockEntity.class",
     "sha256": "3a8771550ae144bdfb7e791b5c129a4d0fb0d7772113eda0d3765ba698d9c261",
     "bytes": 7131
+  },
+  {
+    "file": "kotlin240/Pair.class",
+    "sha256": "197a524bc398868de9b81332da07474ca7fe476990736e612d566e729c911a62",
+    "bytes": 3012
   }
 ]

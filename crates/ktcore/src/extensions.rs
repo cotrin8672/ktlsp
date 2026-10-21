@@ -1379,6 +1379,7 @@ impl ReadSession<'_> {
                     fixed_name: None,
                     jvm_name_annotation: None,
                     is_static: raw.access_flags & 0x0008 != 0,
+                    source_property: None,
                 },
             });
         }
@@ -1545,6 +1546,7 @@ impl ReadSession<'_> {
                 fixed_name: None,
                 jvm_name_annotation: None,
                 is_static: false,
+                source_property: None,
             },
         });
         Ok(Knowledge::Found(()))

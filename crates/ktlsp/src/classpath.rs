@@ -710,9 +710,6 @@ impl ProjectSnapshot {
                         inputs_proved,
                     ));
                 }
-                let Some(task) = sdk_producing_task(source, &language) else {
-                    continue;
-                };
                 let selection = self
                     .sdk_selections
                     .get(&visibility.scope)
@@ -720,6 +717,14 @@ impl ProjectSnapshot {
                 if require_sdk && selection.is_none() {
                     continue;
                 }
+                let task = if require_sdk {
+                    producing_task(source, &language)
+                } else {
+                    sdk_producing_task(source, &language)
+                };
+                let Some(task) = task else {
+                    continue;
+                };
                 let Some(policy) = sdk_source_policy(task, source, suffix) else {
                     continue;
                 };
@@ -1185,120 +1190,23 @@ fn source_set_jdk_home(
         if !task.complete || task.problem.is_some() {
             return None;
         }
-        let selected = task.java_home.as_deref()?;
-        if !selected.is_absolute() {
-            return None;
+        if task.language == CompilerLanguage::Kotlin {
+            selected_kotlin += 1;
         }
-        let feature = *features.entry(path_key(selected)).or_insert_with(|| {
-            let bytes = std::fs::read(selected.join("release")).ok()?;
-            (bytes.len() <= 64 * 1024).then_some(())?;
-            sdk_feature_version(std::str::from_utf8(&bytes).ok()?)
-        });
-        let feature = feature?;
-        match task.language {
-            CompilerLanguage::Java => {
-                if !matches!(
-                    task.task_type.as_str(),
-                    "org.gradle.api.tasks.compile.JavaCompile"
-                        | "org.gradle.api.tasks.compile.JavaCompile_Decorated"
-                ) || task.options.get("bootstrapClasspath") != Some(&serde_json::Value::Null)
-                {
-                    return None;
-                }
-                if task.options.get("forkJavaHome").is_some_and(|home| {
-                    !home.is_null()
-                        && home
-                            .as_str()
-                            .is_none_or(|home| path_key(Path::new(home)) != path_key(selected))
-                }) || task
-                    .options
-                    .get("forkExecutable")
-                    .is_some_and(|value| !value.is_null())
-                {
-                    return None;
-                }
-                match task.options.get("release") {
-                    Some(serde_json::Value::Null) => {}
-                    Some(serde_json::Value::Number(release))
-                        if release.as_u64() == Some(u64::from(feature)) => {}
-                    _ => return None,
-                }
-                if task
-                    .options
-                    .get("javaCompilerRecipe")
-                    .is_some_and(|recipe| !recipe.is_null())
-                {
-                    let recorded = task
-                        .options
-                        .get("javaCompilerRecipe")?
-                        .get("language_version")?
-                        .as_str()?
-                        .parse::<u16>()
-                        .ok()?;
-                    if recorded != feature {
-                        return None;
-                    }
-                    let options: Vec<String> = serde_json::from_value(
-                        task.options
-                            .get("javaCompilerRecipe")?
-                            .get("api_options")?
-                            .clone(),
-                    )
-                    .ok()?;
-                    if !sdk_java_arguments_match(&options, feature) {
-                        return None;
-                    }
-                }
-                if !sdk_java_arguments_match(&task.arguments, feature) {
-                    return None;
-                }
-            }
-            CompilerLanguage::Kotlin => {
-                selected_kotlin += 1;
-                if !matches!(
-                    task.task_type.as_str(),
-                    "org.jetbrains.kotlin.gradle.tasks.KotlinCompile"
-                        | "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated"
-                ) {
-                    return None;
-                }
-                let mut arguments = task.arguments.iter();
-                while let Some(argument) = arguments.next() {
-                    if argument == "-no-jdk"
-                        || argument.starts_with('@')
-                        || argument.starts_with("-Xbuild-file")
-                        || argument == "-module"
-                        || argument.starts_with("-module=")
-                    {
-                        return None;
-                    }
-                    if argument == "-jdk-home"
-                        && path_key(Path::new(arguments.next()?)) != path_key(selected)
-                    {
-                        return None;
-                    }
-                    if let Some(home) = argument.strip_prefix("-jdk-home=") {
-                        if path_key(Path::new(home)) != path_key(selected) {
-                            return None;
-                        }
-                    }
-                    if let Some(release) = argument.strip_prefix("-Xjdk-release=") {
-                        if kotlin_jdk_release_feature(release) != Some(feature) {
-                            return None;
-                        }
-                    } else if argument.starts_with("-Xjdk-release") {
-                        return None;
-                    }
-                }
-            }
-        }
+        let selected = validated_sdk_task_home(
+            task,
+            task.java_home.as_deref()?,
+            &task.arguments,
+            &task.options,
+            features,
+        )?;
         if home
             .as_ref()
-            .is_some_and(|previous: &PathBuf| path_key(previous) != path_key(selected))
+            .is_some_and(|previous: &PathBuf| path_key(previous) != path_key(&selected))
         {
             return None;
         }
-        home = Some(selected.to_path_buf());
+        home = Some(selected);
     }
     if source.kotlin_compile_task.is_some() && selected_kotlin != 1 {
         return None;
@@ -1306,7 +1214,172 @@ fn source_set_jdk_home(
     home
 }
 
+fn validated_sdk_task_home(
+    task: &CompilerTask,
+    selected: &Path,
+    arguments: &[String],
+    options: &BTreeMap<String, serde_json::Value>,
+    features: &mut BTreeMap<String, Option<u16>>,
+) -> Option<PathBuf> {
+    if !selected.is_absolute() {
+        return None;
+    }
+    let feature = *features.entry(path_key(selected)).or_insert_with(|| {
+        let bytes = std::fs::read(selected.join("release")).ok()?;
+        (bytes.len() <= 64 * 1024).then_some(())?;
+        sdk_feature_version(std::str::from_utf8(&bytes).ok()?)
+    });
+    let feature = feature?;
+    match task.language {
+        CompilerLanguage::Java => {
+            if !matches!(
+                task.task_type.as_str(),
+                "org.gradle.api.tasks.compile.JavaCompile"
+                    | "org.gradle.api.tasks.compile.JavaCompile_Decorated"
+            ) || options.get("bootstrapClasspath") != Some(&serde_json::Value::Null)
+            {
+                return None;
+            }
+            if options.get("forkJavaHome").is_some_and(|home| {
+                !home.is_null()
+                    && home
+                        .as_str()
+                        .is_none_or(|home| path_key(Path::new(home)) != path_key(selected))
+            }) || options
+                .get("forkExecutable")
+                .is_some_and(|value| !value.is_null())
+            {
+                return None;
+            }
+            match options.get("release") {
+                Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Number(release))
+                    if release.as_u64() == Some(u64::from(feature)) => {}
+                _ => return None,
+            }
+            if options
+                .get("javaCompilerRecipe")
+                .is_some_and(|recipe| !recipe.is_null())
+            {
+                let recorded = options
+                    .get("javaCompilerRecipe")?
+                    .get("language_version")?
+                    .as_str()?
+                    .parse::<u16>()
+                    .ok()?;
+                if recorded != feature {
+                    return None;
+                }
+                let options: Vec<String> = serde_json::from_value(
+                    options
+                        .get("javaCompilerRecipe")?
+                        .get("api_options")?
+                        .clone(),
+                )
+                .ok()?;
+                if !sdk_java_arguments_match(&options, feature) {
+                    return None;
+                }
+            }
+            if !sdk_java_arguments_match(arguments, feature) {
+                return None;
+            }
+        }
+        CompilerLanguage::Kotlin => {
+            if !matches!(
+                task.task_type.as_str(),
+                "org.jetbrains.kotlin.gradle.tasks.KotlinCompile"
+                    | "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated"
+            ) {
+                return None;
+            }
+            let mut arguments = arguments.iter();
+            while let Some(argument) = arguments.next() {
+                if argument == "-no-jdk"
+                    || argument.starts_with('@')
+                    || argument.starts_with("-Xbuild-file")
+                    || argument == "-module"
+                    || argument.starts_with("-module=")
+                {
+                    return None;
+                }
+                if argument == "-jdk-home"
+                    && path_key(Path::new(arguments.next()?)) != path_key(selected)
+                {
+                    return None;
+                }
+                if let Some(home) = argument.strip_prefix("-jdk-home=") {
+                    if path_key(Path::new(home)) != path_key(selected) {
+                        return None;
+                    }
+                }
+                if let Some(release) = argument.strip_prefix("-Xjdk-release=") {
+                    if kotlin_jdk_release_feature(release) != Some(feature) {
+                        return None;
+                    }
+                } else if argument.starts_with("-Xjdk-release") {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(selected.to_path_buf())
+}
+
+struct SdkInputs<'a> {
+    home: std::borrow::Cow<'a, Path>,
+    arguments: std::borrow::Cow<'a, [String]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KotlinSdkSelection {
+    adapter: String,
+    task: String,
+    language: CompilerLanguage,
+    java_home: PathBuf,
+    arguments: Vec<String>,
+}
+
+fn sdk_inputs(task: &CompilerTask) -> Option<SdkInputs<'_>> {
+    if task.complete && task.problem.is_none() {
+        return Some(SdkInputs {
+            home: std::borrow::Cow::Borrowed(task.java_home.as_deref()?),
+            arguments: std::borrow::Cow::Borrowed(&task.arguments),
+        });
+    }
+    let selection: KotlinSdkSelection =
+        serde_json::from_value(task.options.get("sdkSelection")?.clone()).ok()?;
+    if task.language != CompilerLanguage::Kotlin
+        || selection.adapter != "kgp-1.9.25-jvm-sdk-options-v1"
+        || selection.language != task.language
+        || selection.task != task.task
+        || !selection.java_home.is_absolute()
+        || task
+            .kotlin_compiler
+            .as_ref()
+            .is_some_and(|compiler| compiler.gradle_plugin_version != "1.9.25")
+        || !matches!(selection.arguments.as_slice(), [flag, target, ..]
+            if flag == "-jvm-target" && kotlin_jdk_release_feature(target).is_some_and(|target| (8..=21).contains(&target)))
+    {
+        return None;
+    }
+    // Only SDK inputs are projected. The compiler task and its incomplete execution recipe stay intact.
+    Some(SdkInputs {
+        home: std::borrow::Cow::Owned(selection.java_home),
+        arguments: std::borrow::Cow::Owned(selection.arguments),
+    })
+}
+
 fn sdk_producing_task<'a>(
+    source: &'a SourceSetClasspath,
+    language: &CompilerLanguage,
+) -> Option<&'a CompilerTask> {
+    let task = producing_task(source, language)?;
+    (task.complete && task.problem.is_none()).then_some(task)
+}
+
+fn producing_task<'a>(
     source: &'a SourceSetClasspath,
     language: &CompilerLanguage,
 ) -> Option<&'a CompilerTask> {
@@ -1319,7 +1392,7 @@ fn sdk_producing_task<'a>(
         &task.language == language && selected.is_none_or(|selected| task.task == selected)
     });
     let task = tasks.next()?;
-    (tasks.next().is_none() && task.complete && task.problem.is_none()).then_some(task)
+    tasks.next().is_none().then_some(task)
 }
 
 #[derive(Deserialize)]
@@ -1471,22 +1544,25 @@ fn source_set_sdk_api(
     digests: &mut BTreeMap<String, Option<SdkApiSelection>>,
 ) -> Option<SdkApiSelection> {
     use sha2::{Digest, Sha256};
-    if source.compiler_metadata_incomplete {
+    let task = producing_task(source, &language)?;
+    let inputs = sdk_inputs(task)?;
+    // Another language's failed compiler classpath cannot revoke this proved SDK producer.
+    if source.compiler_metadata_incomplete
+        && (!sdk_producer_roots(task).is_some_and(|(_, complete)| complete)
+            || sdk_source_policy(
+                task,
+                source,
+                if language == CompilerLanguage::Java {
+                    "java"
+                } else {
+                    "kt"
+                },
+            )
+            .is_none())
+    {
         return None;
     }
-    let selected_kotlin = if language == CompilerLanguage::Kotlin {
-        Some(source.kotlin_compile_task.as_deref()?)
-    } else {
-        None
-    };
-    let mut tasks = source.compiler_tasks.iter().filter(|task| {
-        task.language == language && selected_kotlin.is_none_or(|selected| task.task == selected)
-    });
-    let task = tasks.next()?;
-    if tasks.next().is_some() || !task.complete || task.problem.is_some() {
-        return None;
-    }
-    let home = task.java_home.as_ref()?;
+    let home = inputs.home.as_ref();
     if !home.is_absolute() {
         return None;
     }
@@ -1496,7 +1572,8 @@ fn source_set_sdk_api(
         sdk_feature_version(std::str::from_utf8(&bytes).ok()?)
     });
     let feature = feature?;
-    let mut normalized = task.clone();
+    let mut normalized_arguments = inputs.arguments.into_owned();
+    let mut normalized_options = task.options.clone();
     let release = match language {
         CompilerLanguage::Java => {
             let release = match task.options.get("release")? {
@@ -1505,12 +1582,11 @@ fn source_set_sdk_api(
                 _ => return None,
             };
             let target = release.unwrap_or(feature);
-            if !sdk_java_arguments_match(&task.arguments, target) {
+            if !sdk_java_arguments_match(&normalized_arguments, target) {
                 return None;
             }
-            normalize_java_release(&mut normalized.arguments, feature)?;
-            if let Some(recipe) = normalized
-                .options
+            normalize_java_release(&mut normalized_arguments, feature)?;
+            if let Some(recipe) = normalized_options
                 .get_mut("javaCompilerRecipe")
                 .filter(|recipe| !recipe.is_null())
             {
@@ -1522,14 +1598,12 @@ fn source_set_sdk_api(
                 normalize_java_release(&mut arguments, feature)?;
                 recipe["api_options"] = serde_json::to_value(arguments).ok()?;
             }
-            normalized
-                .options
-                .insert("release".into(), serde_json::json!(feature));
+            normalized_options.insert("release".into(), serde_json::json!(feature));
             release
         }
         CompilerLanguage::Kotlin => {
             let mut target = None;
-            let mut arguments = task.arguments.iter();
+            let mut arguments = normalized_arguments.iter();
             while let Some(argument) = arguments.next() {
                 let value = if argument == "-jvm-target" {
                     Some(arguments.next()?.as_str())
@@ -1544,7 +1618,7 @@ fn source_set_sdk_api(
                 }
             }
             let mut release = None;
-            for argument in &mut normalized.arguments {
+            for argument in &mut normalized_arguments {
                 if let Some(value) = argument.strip_prefix("-Xjdk-release=") {
                     let selected = kotlin_jdk_release_feature(value)?;
                     if release.is_some_and(|previous| previous != selected) {
@@ -1569,16 +1643,20 @@ fn source_set_sdk_api(
     if release.is_some_and(|release| release < 8 || release > feature) {
         return None;
     }
-    // Reuse the existing task/SDK validation, varying only the independently checked API release.
-    let checked = SourceSetClasspath {
-        compiler_tasks: vec![normalized],
-        kotlin_compile_task: selected_kotlin.map(str::to_owned),
-        ..Default::default()
-    };
-    if source_set_jdk_home(&checked, features).as_ref() != Some(home) {
+    // Reuse the same SDK guards with normalized SDK-only options, never a promoted compiler task.
+    if validated_sdk_task_home(
+        task,
+        home,
+        &normalized_arguments,
+        &normalized_options,
+        features,
+    )
+    .as_deref()
+        != Some(home)
+    {
         return None;
     }
-    let source_zip = crate::deps::src_zip_for_home(home.clone());
+    let source_zip = crate::deps::src_zip_for_home(home.to_path_buf());
     let release = release.filter(|release| *release != feature);
     let archive = match release {
         Some(_) => home.join("lib/ct.sym"),
@@ -1606,7 +1684,7 @@ fn source_set_sdk_api(
                 None => BTreeMap::new(),
             };
             Some(SdkApiSelection {
-                home: home.clone(),
+                home: home.to_path_buf(),
                 source_zip,
                 release,
                 archive: archive.clone(),
@@ -3106,6 +3184,211 @@ pub(crate) mod tests {
             });
         }
         (root, modules)
+    }
+
+    #[test]
+    fn kotlin_sdk_witness_is_narrow_and_never_promotes_the_compiler_recipe() {
+        let (root, modules) = sdk_selection_fixture();
+        let mut original = modules[0].clone();
+        let source = &mut original.source_sets[0];
+        source.compiler_metadata_incomplete = true;
+        let caller = source.source_roots[0].join("Use.kt");
+        let task = source
+            .compiler_tasks
+            .iter_mut()
+            .find(|task| task.language == CompilerLanguage::Kotlin)
+            .unwrap();
+        let home = task.java_home.take().unwrap();
+        task.complete = false;
+        task.problem = Some("compiler classpath is unavailable".into());
+        task.arguments = vec!["original incomplete compiler arguments".into()];
+        let witness = serde_json::json!({
+            "adapter": "kgp-1.9.25-jvm-sdk-options-v1", "task": task.task,
+            "language": "kotlin", "java_home": home,
+            "arguments": ["-jvm-target", "17"],
+        });
+        for fault in [
+            "valid",
+            "missing",
+            "adapter",
+            "task",
+            "language",
+            "home",
+            "target",
+            "no-jdk",
+            "foreign-jdk",
+            "opaque",
+            "release",
+            "extra",
+            "type",
+            "claims",
+            "policy",
+        ] {
+            let mut module = original.clone();
+            let task = module.source_sets[0]
+                .compiler_tasks
+                .iter_mut()
+                .find(|task| task.language == CompilerLanguage::Kotlin)
+                .unwrap();
+            let mut proof = witness.clone();
+            match fault {
+                "adapter" => proof["adapter"] = "unverified".into(),
+                "task" => proof["task"] = ":different:compileKotlin".into(),
+                "language" => proof["language"] = "java".into(),
+                "home" => proof["java_home"] = "relative-sdk".into(),
+                "target" => proof["arguments"] = serde_json::json!(["-jvm-target", "999"]),
+                "no-jdk" => {
+                    proof["arguments"] = serde_json::json!(["-jvm-target", "17", "-no-jdk"])
+                }
+                "foreign-jdk" => {
+                    proof["arguments"] =
+                        serde_json::json!(["-jvm-target", "17", "-jdk-home", root.join("jdk21")])
+                }
+                "opaque" => {
+                    proof["arguments"] = serde_json::json!(["-jvm-target", "17", "@opaque.args"])
+                }
+                "release" => {
+                    proof["arguments"] =
+                        serde_json::json!(["-jvm-target", "17", "-Xjdk-release=1.8"])
+                }
+                "extra" => proof["unverified_override"] = true.into(),
+                "type" => task.task_type = "custom.KotlinCompiler".into(),
+                "claims" => {
+                    task.options.get_mut("sdkProducerClaims").unwrap()["complete"] = false.into()
+                }
+                "policy" => {
+                    task.options
+                        .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+                }
+                _ => {}
+            }
+            if fault != "missing" {
+                task.options.insert("sdkSelection".into(), proof);
+            }
+            let model = ProjectSnapshot::new(vec![module]);
+            assert_eq!(
+                model.sdk_api_for_file(&caller).is_some(),
+                fault == "valid",
+                "{fault}"
+            );
+            assert!(
+                !model
+                    .compiler_source_views()
+                    .iter()
+                    .any(|view| view.suffix == "kt"),
+                "SDK inputs do not authorize compiler execution"
+            );
+            let task = model.modules[0].source_sets[0]
+                .compiler_tasks
+                .iter()
+                .find(|task| task.language == CompilerLanguage::Kotlin)
+                .unwrap();
+            assert!(!task.complete && task.problem.is_some() && task.java_home.is_none());
+            assert_eq!(task.arguments, ["original incomplete compiler arguments"]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_sdk_failure_in_another_language_keeps_proved_sdk_inputs() {
+        let (root, modules) = sdk_selection_fixture();
+        for (language, suffix) in [
+            (CompilerLanguage::Java, "java"),
+            (CompilerLanguage::Kotlin, "kt"),
+        ] {
+            let mut module = modules[0].clone();
+            let source = &mut module.source_sets[0];
+            source.compiler_metadata_incomplete = true;
+            let failed = source
+                .compiler_tasks
+                .iter_mut()
+                .find(|task| task.language != language)
+                .unwrap();
+            failed.complete = false;
+            failed.problem = Some("unrelated compiler classpath resolution failed".into());
+            failed.java_home = None;
+            let caller = source.source_roots[0].join(format!("Use.{suffix}"));
+            let future = source.source_roots[0].join(format!("New.{suffix}"));
+            let model = ProjectSnapshot::new(vec![module.clone()]);
+            assert!(
+                model.sdk_api_for_file(&caller).is_some(),
+                "{suffix}: the other language's missing classpath is not this caller's SDK"
+            );
+            assert!(model.sdk_api_for_file(&future).is_some());
+            for fault in ["claim", "policy", "own-task", "duplicate"] {
+                let mut changed = module.clone();
+                let source = &mut changed.source_sets[0];
+                let task = source
+                    .compiler_tasks
+                    .iter_mut()
+                    .find(|task| task.language == language)
+                    .unwrap();
+                match fault {
+                    "claim" => {
+                        task.options.get_mut("sdkProducerClaims").unwrap()["complete"] =
+                            false.into();
+                    }
+                    "policy" => {
+                        task.options
+                            .insert("sdkSourcePolicy".into(), serde_json::Value::Null);
+                    }
+                    "own-task" => task.complete = false,
+                    "duplicate" => {
+                        let duplicate = task.clone();
+                        source.compiler_tasks.push(duplicate);
+                    }
+                    _ => unreachable!(),
+                }
+                let model = ProjectSnapshot::new(vec![changed]);
+                assert!(
+                    model.sdk_api_for_file(&caller).is_none(),
+                    "{suffix}/{fault}"
+                );
+                assert!(
+                    model.sdk_api_for_file(&future).is_none(),
+                    "{suffix}/{fault}"
+                );
+            }
+            assert!(model
+                .sdk_api_for_file(&root.join(format!("unclaimed/Use.{suffix}")))
+                .is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the unmodified captured Gradle module and its selected SDK"]
+    fn captured_gradle_complete_kotlin_task_keeps_its_atomic_sdk() {
+        let captured = PathBuf::from(std::env::var_os("KTLSP_SDK_CAPTURED_MODULE").unwrap());
+        let module: ModuleClasspath =
+            serde_json::from_slice(&std::fs::read(captured).unwrap()).unwrap();
+        let caller = PathBuf::from(std::env::var_os("KTLSP_SDK_CAPTURED_FILE").unwrap());
+        let source = module
+            .source_sets
+            .iter()
+            .find(|source| source.name == "main")
+            .unwrap();
+        assert!(source.compiler_metadata_incomplete);
+        let kotlin = sdk_producing_task(source, &CompilerLanguage::Kotlin).unwrap();
+        assert!(kotlin
+            .arguments
+            .iter()
+            .any(|argument| argument == "-Xjdk-release=1.8"));
+        assert!(source
+            .compiler_tasks
+            .iter()
+            .any(|task| task.language == CompilerLanguage::Java
+                && !task.complete
+                && task.problem.is_some()));
+        let model = ProjectSnapshot::new(vec![module]);
+        let selection = model
+            .sdk_api_for_file(&caller)
+            .expect("complete Kotlin producing task must retain its independently proved SDK API");
+        assert_eq!(selection.release, Some(8));
+        assert!(selection
+            .entries
+            .get("java/util/concurrent/atomic/AtomicInteger")
+            .is_some_and(Option::is_some));
     }
 
     #[test]

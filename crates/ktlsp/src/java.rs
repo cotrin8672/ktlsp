@@ -4249,7 +4249,8 @@ fn java_member_call_candidates_with_arguments<'a>(
                 owner: ktcore::jvm::JvmOwner::Compiled { .. },
                 ..
             }
-        )
+        ) || matches!(candidate, ktcore::jvm::CallableCandidate::Jvm { facts, .. }
+            if facts.source_property.is_some())
     }) {
         let (verified_receiver, kind) =
             java_member_receiver(index, file, src, tree, call, initializer_depth)?;
@@ -4481,9 +4482,12 @@ fn java_method_invocation_return_type(
             {
                 return None;
             }
-            // Only exact admitted Java descriptors may supply arrays; source-JVM lowering stays unknown.
+            let receiver = java_member_receiver(index, file, src, tree, call, initializer_depth)
+                .map(|(receiver, _)| receiver)
+                .unwrap_or(Type::Unknown);
             return ktcore::jvm::projected_return_type_in_context(
                 index,
+                &receiver,
                 *candidate,
                 &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
             )
@@ -5168,14 +5172,26 @@ pub(crate) fn completion_query_with_source(
                 })
                 .unwrap_or((Type::Unknown, ktcore::jvm::ReceiverKind::Unknown))
         } else {
-            (
-                receiver
-                    .and_then(|receiver| {
-                        receiver_type(index, file, synthetic, synthetic_tree, receiver, 0)
-                    })
-                    .unwrap_or(Type::Unknown),
-                ktcore::jvm::ReceiverKind::Unknown,
-            )
+            let ty = receiver
+                .and_then(|receiver| {
+                    receiver_type(index, file, synthetic, synthetic_tree, receiver, 0)
+                })
+                .unwrap_or(Type::Unknown);
+            let kind = receiver
+                .and_then(|receiver| {
+                    java_member_receiver(
+                        index,
+                        file,
+                        synthetic,
+                        synthetic_tree,
+                        receiver.parent()?,
+                        0,
+                    )
+                })
+                .filter(|(verified, _)| *verified == ty)
+                .map(|(_, kind)| kind)
+                .unwrap_or(ktcore::jvm::ReceiverKind::Unknown);
+            (ty, kind)
         };
         let mut ctx = FileCtx::from_tree_in_file(synthetic_tree, synthetic, file);
         ctx.package = package_of(synthetic_tree, synthetic);

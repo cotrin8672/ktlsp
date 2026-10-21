@@ -739,16 +739,57 @@ object KtlspCompilerConfiguration {
         return claims to policy
     }
 
+    private fun kotlinSdkSelection(task: Task): Map<String, Any?>? = runCatching {
+        // This witnesses configured SDK analysis only, never compiler execution or generated output.
+        // Full compiler-task completeness and its failure remain independently recorded below.
+        check(task.javaClass.name in setOf("org.jetbrains.kotlin.gradle.tasks.KotlinCompile",
+            "org.jetbrains.kotlin.gradle.tasks.KotlinCompile_Decorated"))
+        val loader = task.javaClass.classLoader
+        val versionHelper = Class.forName("org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapperKt", true, loader)
+        val version = versionHelper.getMethod("getKotlinPluginVersion", Project::class.java)
+            .invoke(null, task.project) as? String
+        // KGP 1.9.25 fills these SDK options independently of its dependency/plugin classpaths.
+        check(version == "1.9.25")
+        check(read(task, "getExecutionTimeFreeCompilerArgs\$kotlin_gradle_plugin_common") == null)
+        val options = read(task, "getCompilerOptions") ?: error("Kotlin SDK options are unavailable")
+        check(Class.forName("org.jetbrains.kotlin.gradle.dsl.KotlinJvmCompilerOptions", false, loader).isInstance(options))
+        val target = read(options, "getJvmTarget") ?: error("Kotlin SDK target is unavailable")
+        val targetValue = read(target, "getTarget") as? String ?: error("Kotlin SDK target is unavailable")
+        val noJdk = read(options, "getNoJdk") as? Boolean ?: error("Kotlin SDK runtime policy is unavailable")
+        val free = read(options, "getFreeCompilerArgs") as? List<*> ?: error("Kotlin SDK arguments are unavailable")
+        check(free.all { it is String })
+        val arguments = listOf("-jvm-target", targetValue) +
+            (if (noJdk) listOf("-no-jdk") else emptyList()) + free.filterIsInstance<String>()
+        val toolchain = read(task, "getKotlinJavaToolchainProvider") ?: error("Kotlin SDK toolchain is unavailable")
+        val jvm = read(toolchain, "getBuildJvm\$kotlin_gradle_plugin_common") ?: error("Kotlin SDK JVM is unavailable")
+        val home = read(jvm, "getJavaHome") as? java.io.File ?: error("Kotlin SDK home is unavailable")
+        check(home.isAbsolute)
+        val explicit = arguments.mapIndexedNotNull { index, argument ->
+            when {
+                argument == "-jdk-home" -> arguments.getOrNull(index + 1) ?: error("Missing Kotlin SDK home")
+                argument.startsWith("-jdk-home=") -> argument.substringAfter('=')
+                else -> null
+            }
+        }
+        check(explicit.size <= 1)
+        val selected = explicit.singleOrNull()?.let { java.io.File(it) } ?: home
+        check(selected.isAbsolute)
+        linkedMapOf("adapter" to "kgp-1.9.25-jvm-sdk-options-v1", "task" to task.path,
+            "language" to "kotlin", "java_home" to selected.absolutePath, "arguments" to arguments)
+    }.getOrNull()
+
     fun dump(task: Task, language: String, runtimes: Provider<KtlspCompilerRuntimes>): String {
         // Keep producer coverage even when later SDK/recipe capture fails.
         val sdkSources = sdkSourceFacts(task, language)
+        val sdkSelection = if (language == "kotlin") kotlinSdkSelection(task) else null
         val record = linkedMapOf<String, Any?>(
             "task" to task.path, "language" to language, "task_type" to task.javaClass.name,
             "arguments" to emptyList<String>(), "annotation_processor_path" to emptyList<String>(),
             "source_files" to emptyList<String>(), "classpath" to emptyList<String>(),
             "declared_input_files" to emptyList<String>(), "declared_output_roots" to emptyList<String>(),
             "java_home" to null, "options" to linkedMapOf(
-                "sdkProducerClaims" to sdkSources.first, "sdkSourcePolicy" to sdkSources.second),
+                "sdkProducerClaims" to sdkSources.first, "sdkSourcePolicy" to sdkSources.second,
+                "sdkSelection" to sdkSelection),
             "output_roots" to emptyList<String>(), "complete" to false, "problem" to null,
         )
         try {
@@ -848,6 +889,7 @@ object KtlspCompilerConfiguration {
                 val options = linkedMapOf<String, Any?>(
                     "sdkProducerClaims" to sdkSources.first,
                     "sdkSourcePolicy" to sdkSources.second,
+                    "sdkSelection" to sdkSelection,
                     "kotlinClasspathSnapshotInputs" to kotlinClasspathSnapshotInputs(task, recipe),
                     "taskActionInventory" to producerActions(task),
                     "taskOnlyIfInventory" to producerOnlyIf(task),

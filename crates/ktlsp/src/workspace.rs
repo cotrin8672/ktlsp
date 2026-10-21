@@ -1716,6 +1716,23 @@ impl Workspace {
         if refs.is_empty() || refs.len() > RENAME_REF_CAP || !refs.iter().any(|r| *r == target) {
             return None;
         }
+        let constructor_getter =
+            self.index
+                .jvm_source_for_file(&target.file)
+                .is_some_and(|source| {
+                    source.facts.callables.iter().any(|facts| {
+                        facts.source_property.is_some()
+                            && facts.definition.as_ref() == Some(&target)
+                    })
+                });
+        // Derived JVM names need a separate edit spelling, including isX -> getY changes.
+        if constructor_getter
+            && refs
+                .iter()
+                .any(|site| SourceLanguage::for_key(&site.file) == SourceLanguage::Java)
+        {
+            return None;
+        }
         if hierarchy::entry_for_name_range(
             &self.index,
             &target.file,

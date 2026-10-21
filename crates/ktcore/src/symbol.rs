@@ -118,6 +118,11 @@ impl SourceMemberFlags {
     pub fn jvm_restricted(self) -> bool {
         self.0 & 128 != 0
     }
+
+    pub(crate) fn with_jvm_restricted(mut self, restricted: bool) -> Self {
+        self.0 |= u8::from(restricted) << 7;
+        self
+    }
 }
 
 /// Authored Kotlin call syntax, distinct from names in a lowered JVM signature.
@@ -431,6 +436,7 @@ mod tests {
                 fixed_name: None,
                 jvm_name_annotation: Some(ty()),
                 is_static: true,
+                source_property: None,
             }],
         };
         let before = (symbols.clone(), jvm.clone());

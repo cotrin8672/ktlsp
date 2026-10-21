@@ -88,6 +88,187 @@ fn infer_expression(ws: &Workspace, file: &str, expression: &str) -> Type {
 }
 
 #[test]
+fn java_constructor_getters_share_completion_goto_and_generic_result_binding() {
+    let mut ws = Workspace::new();
+    let properties = "package probe\nclass Payload { fun work(): Int = 1 }\nclass Box<T>(val value: T)\nclass Plain(val payload: Payload)\n";
+    let caller = "package probe; class Use { void use(Box<Payload> box, Plain plain) { box.getValue().work(); plain.getPayload().work(); } }";
+    ws.open("Properties.kt", properties.into());
+    ws.open(
+        "Decoy.kt",
+        "package probe\nclass Decoy { fun work(): Int = 2 }\n".into(),
+    );
+    ws.open("GetterUse.java", caller.into());
+    for (expression, name, property) in [
+        ("box.getValue()", "getValue", "value"),
+        ("plain.getPayload()", "getPayload", "payload"),
+    ] {
+        let completion = labels(&mut ws, "GetterUse.java", &expression.replace("()", ""));
+        assert!(
+            completion.contains(name),
+            "{expression}: {completion:?}; facts {:?}",
+            ws.index.jvm_source_for_file("Properties.kt")
+        );
+        let expected = ws
+            .index
+            .lookup_by_name(property)
+            .iter()
+            .find(|entry| entry.path.as_ref() == "Properties.kt")
+            .unwrap();
+        let expected = Def {
+            file: "Properties.kt".into(),
+            start_byte: expected.sym.start_byte,
+            end_byte: expected.sym.end_byte,
+        };
+        assert_eq!(
+            goto(&mut ws, "GetterUse.java", expression, name),
+            vec![expected]
+        );
+        assert_eq!(
+            goto(
+                &mut ws,
+                "GetterUse.java",
+                &format!("{expression}.work()"),
+                "work"
+            ),
+            vec![target(&ws, "Properties.kt", "work")]
+        );
+    }
+    let rename_offset = properties.find("val value").unwrap() + "val ".len();
+    assert!(
+        ws.rename("Properties.kt", rename_offset, "renamed")
+            .is_none(),
+        "mixed getter rename cannot use the Kotlin spelling in Java"
+    );
+    let mut kotlin_only = Workspace::new();
+    kotlin_only.open("Properties.kt", properties.into());
+    let kotlin_use = "package probe\nfun use(box: Box<Payload>) = box.value\n";
+    kotlin_only.open("PropertyUse.kt", kotlin_use.into());
+    let edits = kotlin_only
+        .rename("Properties.kt", rename_offset, "renamed")
+        .expect("ordinary Kotlin-only property rename");
+    assert_eq!(
+        apply_to_text("Properties.kt", properties, &edits).unwrap(),
+        properties.replace("val value", "val renamed")
+    );
+    assert_eq!(
+        apply_to_text("PropertyUse.kt", kotlin_use, &edits).unwrap(),
+        kotlin_use.replace("box.value", "box.renamed")
+    );
+    let is_property = properties.replace("val value", "val isValue");
+    ws.change("Properties.kt", is_property.clone());
+    ws.change("GetterUse.java", caller.replace("getValue", "isValue"));
+    assert!(
+        ws.rename(
+            "Properties.kt",
+            is_property.find("val isValue").unwrap() + 4,
+            "renamed"
+        )
+        .is_none(),
+        "equal current spellings still have a derived JVM name after rename"
+    );
+    ws.change("Properties.kt", properties.into());
+    ws.change("GetterUse.java", caller.into());
+    ws.change(
+        "Properties.kt",
+        properties.replace("val value", "private val value"),
+    );
+    assert!(!labels(&mut ws, "GetterUse.java", "box.getValue").contains("getValue"));
+    assert!(goto(&mut ws, "GetterUse.java", "box.getValue()", "getValue").is_empty());
+    ws.change("Properties.kt", properties.into());
+    assert!(labels(&mut ws, "GetterUse.java", "box.getValue").contains("getValue"));
+    ws.change(
+        "GetterUse.java",
+        caller.replace("box.getValue()", "Box.getValue()"),
+    );
+    assert!(!labels(&mut ws, "GetterUse.java", "Box.getValue").contains("getValue"));
+    assert!(goto(&mut ws, "GetterUse.java", "Box.getValue()", "getValue").is_empty());
+}
+
+#[test]
+fn java_constructor_string_getter_resolves_java_string_members() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Text.kt",
+        "package probe\nclass Text(val text: String)\n".into(),
+    );
+    ws.open(
+        "String.java",
+        "package java.lang; public final class String { public int length() { return 0; } }".into(),
+    );
+    ws.open(
+        "Other.java",
+        "package probe; public class Other { public int length() { return 1; } }".into(),
+    );
+    let caller =
+        "package probe; class Use { int use(Text value) { return value.getText().length(); } }";
+    ws.open("TextUse.java", caller.into());
+    assert_eq!(
+        goto(
+            &mut ws,
+            "TextUse.java",
+            "value.getText().length()",
+            "length"
+        ),
+        vec![target(&ws, "String.java", "length")]
+    );
+}
+
+#[test]
+fn kotlin_constructor_properties_do_not_expose_java_getters_when_compiled_calls_are_possible() {
+    use ktlsp::index::{Index, InferenceIndex, LookupEntries};
+    struct CompiledPossible<'a>(&'a Index);
+    impl InferenceIndex for CompiledPossible<'_> {
+        fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+            LookupEntries::All(self.0.lookup_by_name(name))
+        }
+        fn members_of(&self, name: &str) -> LookupEntries<'_> {
+            LookupEntries::All(self.0.members_of(name))
+        }
+        fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+            LookupEntries::All(self.0.extensions_for(name))
+        }
+        fn jvm_sources(&self, owner: &str) -> Vec<&ktcore::jvm::SourceFile> {
+            self.0.jvm_sources(owner)
+        }
+    }
+    let mut ws = Workspace::new();
+    ws.open(
+        "Box.kt",
+        "package probe\nclass Box(val value: Int)\n".into(),
+    );
+    let source = "package probe\nfun use(box: Box) = box.getValue()\n";
+    ws.open("GetterUse.kt", source.into());
+    let index = CompiledPossible(&ws.index);
+    assert!(index.may_have_compiled_callables());
+    assert_eq!(
+        ktcore::jvm::member_candidates(
+            &index,
+            &Type::class("Box", Some("probe".into())),
+            "getValue"
+        )
+        .len(),
+        1
+    );
+    let tree = KotlinParser::new().parse(source);
+    let completion = ktlsp::semantic_query::member_completion_query_for_type(
+        &index,
+        ktlsp::language::SourceLanguage::Kotlin,
+        &tree,
+        source,
+        Type::class("Box", Some("probe".into())),
+        ktcore::jvm::ReceiverKind::Value,
+        "get".into(),
+        100,
+    )
+    .unwrap();
+    assert!(!completion
+        .candidates
+        .iter()
+        .any(|candidate| candidate.label == "getValue"));
+    assert!(goto(&mut ws, "GetterUse.kt", "box.getValue()", "getValue").is_empty());
+}
+
+#[test]
 fn kotlin_super_completion_offers_superclass_member() {
     let mut ws = workspace();
     let got = labels(&mut ws, "Drill.kt", "super.get");

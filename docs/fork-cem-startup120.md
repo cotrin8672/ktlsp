@@ -100,4 +100,49 @@ the four existing requests and four K2 checks, then adds one inference request;
 the incomplete corpus retains its six requests and four K2 checks. Both runs
 retain the coverage observations `missing_sources=3` and `failed=1`; selected
 passing probes do not certify complete dependency-source coverage. Performance
-awaits an integrated release build.
+has not yet been compared. The integrated `native-integrated120-2` release
+(SHA-256 `a099aeee9084d54e277a81db8c765bb67053ef6256c044e19f5dbf14437d8f44`)
+subsequently passed all 26 original CEM semantic checks, with clean shutdown,
+439 stable input guards and no live owned processes. Evidence is
+`E/editor-original26-release1/summary.json`.
+
+## Java calls to Kotlin constructor getters
+
+The remaining source-coverage observations identify Patchy, TypeTools and the
+KotlinForForge aggregate artifact; TypeTools also records an unsupported source
+encoding failure. Missing source does not imply a missing API: representative
+Patchy and TypeTools completion/navigation passed in both languages. All eight
+nested KotlinForForge archives match separately selected dependency binaries.
+The six-case external API probe isolated one real gap: Java `Pair.getFirst()`
+completion and navigation were empty, while Kotlin `Pair.first` passed.
+
+Kotlin primary-constructor properties now contribute JVM callable facts with
+their real class owner, source definition and class type-parameter bindings.
+Java completion, navigation and result chains consume the same candidate.
+Annotated owners require an exact selected classfile getter and matching class
+and method signatures; unknown property annotations, bounded parameters,
+nested owners and value-class lowering remain unsupported in this slice.
+The source-cache version is v35, rejecting pre-getter v34 caches.
+
+Actual stdlib 2.4.0 Pair bytes and source, altered witness negatives, value-class
+compiler controls and Kotlin getter-name controls cover this boundary. Core
+tests pass 139 cases; the existing implicit-receiver suite passes 70, including
+Java generic/String result chains, source edits and a Kotlin presentation
+negative with compiled callables enabled. Evidence is `E/getter-summary.json`.
+The unchanged six-case native API probe passed all 12 completion/navigation
+assertions on their first responses with shared dev SHA-256
+`07fc12c203d30cb5d391c4bca1ad06aa79de1067a858e7d6bd6fee4478292519`.
+Shutdown completed with exit 0, EOF and no live or forcibly terminated owned
+processes. All 36 semantic input guards remained stable. The original broad
+guard result remains false because Gradle changed its generated filesystem
+probe and file-hash lock; the extended-path audit classifies those two runtime
+files separately and finds no unexpected input changes. Evidence is
+`E/coverage/native-getter-fixed1/{summary,guard-audit,receipt}.json`.
+
+Mixed Java/Kotlin constructor-property rename remains a UX gap: converting
+`getValue` to `getRenamed` requires distinct edit spellings. Such mixed renames
+return no edits instead of writing an invalid Java `renamed()` call. Kotlin-only
+property rename remains supported and is checked by applying all returned edits.
+Inherited constructor getters on Java subclasses are the next queued control;
+the current projection queries the receiver's own class. This slice does not
+establish complete getter, rename or IDEA parity.

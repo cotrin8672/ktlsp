@@ -2923,8 +2923,10 @@ fn member_type(
             let selected =
                 crate::jvm::select_call(index, recv_ty, jvm_candidates, name, arguments, ctx);
             if let [candidate] = selected.consumable_candidates() {
-                return crate::jvm::projected_return_type_in_context(index, *candidate, ctx)
-                    .unwrap_or(Type::Unknown);
+                return crate::jvm::projected_return_type_in_context(
+                    index, recv_ty, *candidate, ctx,
+                )
+                .unwrap_or(Type::Unknown);
             }
             return Type::Unknown;
         }

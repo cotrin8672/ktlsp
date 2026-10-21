@@ -1,0 +1,10 @@
+{
+  "artifact": "org.jetbrains.kotlin:kotlin-stdlib:2.4.0",
+  "artifact_sha256": "ccb14ff83fabcb11458b798dbc9824748ccdffeec79c9aba789e6ed1cda86b1c",
+  "files": {
+    "Pair.class": "197a524bc398868de9b81332da07474ca7fe476990736e612d566e729c911a62",
+    "Tuples.kt": "1eaf3b3334dbd646a6b93dbe31db7adba72fdb92e8a5d3ea6b249aff5a7d9e9f"
+  },
+  "source_artifact": "org.jetbrains.kotlin:kotlin-stdlib:2.4.0:sources",
+  "source_entry": "commonMain/kotlin/util/Tuples.kt"
+}
