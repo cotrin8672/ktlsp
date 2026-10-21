@@ -51,6 +51,8 @@ struct WatchState {
     sequence: u64,
     configuration_contents: HashMap<String, [u8; 32]>,
     configuration_baselined: bool,
+    model_loading: bool,
+    pending_model_jar: bool,
 }
 
 impl WatchState {
@@ -185,6 +187,10 @@ impl Backend {
     }
 
     fn schedule_project_refresh(&self, force: bool, initial_delay: Duration) {
+        self.request_project_refresh(force, initial_delay, false);
+    }
+
+    fn request_project_refresh(&self, force: bool, initial_delay: Duration, jar_only: bool) {
         let Some(root) = self.root.lock().clone() else {
             return;
         };
@@ -192,10 +198,27 @@ impl Backend {
         if state.stopped {
             return;
         }
-        state
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-        state.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let defer = {
+            let mut watches = self.watches.lock();
+            if jar_only && watches.model_loading {
+                if watches.pending_model_jar {
+                    return;
+                }
+                watches.pending_model_jar = true;
+                true
+            } else {
+                false
+            }
+        };
+        // Gradle may recreate build-logic JARs while importing its own model. Retain
+        // every such change, but let this owned dump close its tasks before retrying.
+        // Advancing the generation prevents its unsettled model from being published.
+        if !defer {
+            state
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            state.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        }
         let changed = {
             let mut ws = self.ws.lock();
             state.requested = ws.begin_analysis_generation();
@@ -203,7 +226,8 @@ impl Backend {
                 "workspace.refresh_requested",
                 "workspace",
                 Instant::now(),
-                serde_json::json!({"root": root.to_string_lossy(), "generation": state.requested}),
+                serde_json::json!({"root": root.to_string_lossy(), "generation": state.requested,
+                    "deferredJar": defer}),
             );
             self.jdk_source_seeds.lock().clear();
             ws.take_extension_diagnostic_changes()
@@ -1658,6 +1682,7 @@ async fn index_workspace(
         return;
     }
     let model = if gradle {
+        watches.lock().model_loading = true;
         let model_start = Instant::now();
         let load_root = root.clone();
         let model_cancelled = cancelled.clone();
@@ -1665,6 +1690,11 @@ async fn index_workspace(
             classpath::load_snapshot_cancellable(&load_root, force, Some(&model_cancelled))
         })
         .await;
+        {
+            let mut watches = watches.lock();
+            watches.model_loading = false;
+            watches.pending_model_jar = false;
+        }
         crate::trace::span(
             "workspace.model_load",
             "workspace",
@@ -1672,6 +1702,12 @@ async fn index_workspace(
             serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
                 "forcedModel": force, "ok": matches!(&result, Ok(Ok(_)))}),
         );
+        if !ws.lock().is_current_generation(generation) {
+            if let Some(p) = ongoing {
+                p.finish_with_message("superseded by project changes").await;
+            }
+            return;
+        }
         match result {
             Ok(Ok(model)) => Some(model),
             _ => {
@@ -2764,6 +2800,7 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
+        let mut jar_only = true;
         let changes = {
             let mut ws = self.ws.lock();
             params
@@ -2777,6 +2814,8 @@ impl LanguageServer for Backend {
                 .map(|key| {
                     let change = project_change(&root, model.as_deref(), &key);
                     if change.is_some() {
+                        jar_only &= key.ends_with(".jar")
+                            && !is_project_configuration(Path::new(&key));
                         tracing::debug!(path = key, force = ?change, "project refresh requested by client watch");
                     }
                     change
@@ -2789,7 +2828,7 @@ impl LanguageServer for Backend {
         }
         let force = project_changes(changes.into_iter());
         if let Some(force) = force {
-            self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
+            self.request_project_refresh(force, PROJECT_REFRESH_DEBOUNCE, jar_only);
         }
     }
 
@@ -7612,14 +7651,56 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         backend.did_change_watched_files(event()).await;
         assert_eq!(backend.ws.lock().analysis_generation(), superseded);
         assert!(!active_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        let build_jar = root.join("buildSrc/build/libs/buildSrc.jar");
+        std::fs::create_dir_all(build_jar.parent().unwrap()).unwrap();
+        std::fs::write(&build_jar, "first build-logic bytes").unwrap();
+        let jar_event = |kind| DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(
+                Uri::from_file_path(&build_jar).unwrap(),
+                kind,
+            )],
+        };
+        assert!(backend.watches.lock().model_loading);
+        backend
+            .did_change_watched_files(jar_event(FileChangeType::CHANGED))
+            .await;
+        let pending = backend.ws.lock().analysis_generation();
+        assert_eq!(pending, superseded + 1);
+        assert!(backend.refresh.lock().force);
+        assert!(backend.watches.lock().pending_model_jar);
+        assert!(
+            !active_cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "a build-logic JAR must not kill its own model dump"
+        );
+        std::fs::write(&build_jar, "genuinely different build-logic bytes").unwrap();
+        backend
+            .did_change_watched_files(jar_event(FileChangeType::CHANGED))
+            .await;
+        std::fs::remove_file(&build_jar).unwrap();
+        backend
+            .did_change_watched_files(jar_event(FileChangeType::DELETED))
+            .await;
+        std::fs::write(&build_jar, "replacement build-logic bytes").unwrap();
+        backend
+            .did_change_watched_files(jar_event(FileChangeType::CREATED))
+            .await;
+        assert_eq!(backend.ws.lock().analysis_generation(), pending);
+        assert!(backend.refresh.lock().force);
+        assert!(!active_cancelled.load(std::sync::atomic::Ordering::Acquire));
         std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
-        backend.did_change_watched_files(event()).await;
+        let mut mixed = event();
+        mixed
+            .changes
+            .extend(jar_event(FileChangeType::CHANGED).changes);
+        backend.did_change_watched_files(mixed).await;
         assert!(active_cancelled.load(std::sync::atomic::Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(12);
         while backend.refresh.lock().running && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!backend.refresh.lock().running);
+        assert!(!backend.watches.lock().model_loading);
+        assert!(!backend.watches.lock().pending_model_jar);
         assert_eq!(
             std::fs::read_to_string(root.join("invocations"))
                 .unwrap()
@@ -7629,7 +7710,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         );
         assert!(!root.join("overlap").exists());
         let mut ws = backend.ws.lock();
-        assert_eq!(ws.analysis_generation(), superseded + 1);
+        assert_eq!(ws.analysis_generation(), pending + 1);
         assert!(!ws.finish_analysis_generation(superseded, true, true));
         assert!(
             !ws.project_snapshot().unwrap().modules.is_empty(),

@@ -68,13 +68,29 @@ termination. Source coverage still records three missing sources and one failed
 source lookup; the additional library probes above distinguish API coverage.
 Evidence: cem-startup120/editor-original26-release1/summary.json.
 
-The processor54 release run reaches49 passing checks, one missing Java obsolete-
-API diagnostic and four unrun Kotlin checks. Its first cold observer script and
-configuration consume94s before the26s producer DAG, then the observation window
-initiates shutdown. This does not prove a producer hang or Kotlin acceptance.
-A warm functional rerun and the Java diagnostic investigation are in progress;
-the original114 remains unverified. Evidence:
-processor120/phase54-release120-2-originalhome/closed-specific-reasons.json.
+The first processor54 release run reaches49 checks, one missing Java obsolete-
+API diagnostic and four unrun Kotlin checks. Its cold observer script and
+configuration consume94s before the26s producer DAG, then observation-window
+shutdown cancels the producer. Reusing the populated observer cache, the same
+release now passes54/54 and the unchanged original114/114, including disabled
+and restored generation, both languages' obsolete-API diagnostics and current
+canonical observations. Both runs close naturally with stable inputs and no
+owned residuals. The Java diagnostic issue does not reproduce once the current
+observation is available; no semantic guard is relaxed. Global producer closure
+remains unproved, and cold preparation latency remains a performance gap.
+Evidence: processor120/acceptance-release120-2.json and
+processor120/original114-release120-2-warm/run/artifacts/processor-reload.json.
+
+An actual Spring buildSrc replica reproduces model imports cancelling themselves
+when Gradle recreates its JAR (the17 file contents stay identical; ZIP timestamps
+change). During an owned model load, JAR notifications now coalesce into a pending
+forced refresh without killing the dump. Its unsettled generation is discarded;
+only the subsequent model is installed and persisted. Configuration changes and
+mixed batches retain immediate cancellation. The existing singleflight test and
+cold native replica verify actual changes/reload, two useful first responses,
+stable inputs and clean exit. An earlier candidate's shutdown timeout remains
+recorded; this is not a release speed comparison or full Spring acceptance.
+Evidence: project-refresh120/result-summary.json and project-refresh120/green-native2/receipt.json.
 
 Commit a886d2b reduces dev debug information while retaining workspace panic
 file/line data. Release optimization and linker settings are unchanged. Three
