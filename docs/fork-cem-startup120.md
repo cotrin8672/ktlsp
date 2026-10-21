@@ -58,7 +58,7 @@ declaration does not certify the whole hierarchy.
 | Existing implicit/super receiver behavior and shared bounded declaration proof | 67/67 GREEN | `E/implicit-shared-exact.log`; earlier completion-only checkpoint in `E/rust-final/receipt.json` |
 | Pinned default-interface fixture and its Java/Kotlin consumers compile independently | GREEN, Gradle `classes --offline` | `E/compiler-control2/receipt.json`; initial public Kotlin/package-private Java fixture visibility error was corrected by making the new Kotlin fixture private |
 | Four real-Neovim Java/Kotlin completion probes return useful protected/default methods on the first response and exclude static/private names | GREEN: four first responses, 12 assertions; guards stable, EOF, zero live owned processes | `E/editor-defaults3/receipt.json` and `harness/artifacts/summary.txt`; one deliberately source-less binary module remains reported as missing source |
-| Full release CEM cold/warm/UI and broad workspace checks | Pending integrated validation | No current speed or IDEA-parity claim from these reductions |
+| Full release CEM cold/warm/UI and broad workspace checks | Selected original eight checks pass in both timing sessions; UI31 accepted; workspace1740 passed,9 ignored | `cem-speed120/performance-summary.json`; cache-state and coverage qualifications below, no IDEA-parity claim |
 | Integrated dev original CEM main and incomplete cases plus one inference check | Main9/9 and incomplete17/17 semantic assertions GREEN; ten original corpus requests plus one inlay all first-response matched. Both native exit0, EOF, live0, no forced termination, 439 guards stable each | `E/editor-original19-1/summary.json`, `receipt.json`; original18 accounting counts ten corpus requests plus eight K2 checks, while actual assertions also include exclusions/controls |
 
 The disposable binary fixture now includes `defaultfixture/Overlay.class`, so its
@@ -82,9 +82,8 @@ Use the bundled absolute Python path on this Windows host: the ordinary Python
 alias is unavailable. Preserve an explicit private `KTLSP_CACHE_DIR` and use the
 existing owned runner for native child cleanup. The final editor receipt confirms
 source/binary guards, EOF and no live owned processes. Next use the integrated release binary and the existing CEM
-first-use harness to measure whether useful completion now precedes source
-enrichment, retaining the original assertions and distinguishing protocol time
-from menu-display time. This slice supplies no new performance budget or sample.
+first-use harness to repeat the measurements below, retaining the original
+assertions and distinguishing protocol time from menu-display time.
 
 `E/cem-original-plan.json` records the recovered-root commands, JDK/home,
 manifest/source expectations and UI recipe. Original eight checks mean four
@@ -99,8 +98,9 @@ with 430 recovered-input guards matched before launch. The main corpus retains
 the four existing requests and four K2 checks, then adds one inference request;
 the incomplete corpus retains its six requests and four K2 checks. Both runs
 retain the coverage observations `missing_sources=3` and `failed=1`; selected
-passing probes do not certify complete dependency-source coverage. Performance
-has not yet been compared. The integrated `native-integrated120-2` release
+passing probes do not certify complete dependency-source coverage. That
+checkpoint supplied no performance comparison; the measurements below use a
+later integrated release. The integrated `native-integrated120-2` release
 (SHA-256 `a099aeee9084d54e277a81db8c765bb67053ef6256c044e19f5dbf14437d8f44`)
 subsequently passed all 26 original CEM semantic checks, with clean shutdown,
 439 stable input guards and no live owned processes. Evidence is
@@ -143,6 +143,87 @@ Mixed Java/Kotlin constructor-property rename remains a UX gap: converting
 `getValue` to `getRenamed` requires distinct edit spellings. Such mixed renames
 return no edits instead of writing an invalid Java `renamed()` call. Kotlin-only
 property rename remains supported and is checked by applying all returned edits.
-Inherited constructor getters on Java subclasses are the next queued control;
-the current projection queries the receiver's own class. This slice does not
-establish complete getter, rename or IDEA parity.
+This slice does not establish complete getter, rename or IDEA parity.
+
+### Inherited constructor getters
+
+An independent Kotlin 2.4.0/Javac 21 control confirms that Java
+`Child extends KotlinBase<String>` inherits `getValue()` from
+`KotlinBase<T>(val value: T)`, including the `getValue().length()` chain.
+The corresponding Rust probe initially failed to offer the inherited getter.
+Java callable collection now retains the original source property under its
+derived JVM getter name during the existing single hierarchy traversal.
+The existing visibility, unavailable-name and nearest-property override filters
+run before projection. The callable keeps the declaring class identity and
+exact source property definition; existing receiver bindings substitute the
+full child receiver. Static facade lookup remains restricted to its own owner.
+Serialized facts are unchanged, so this query change requires no cache bump.
+
+The JVM focused suite passes 11 tests and the existing implicit-receiver suite
+passes 71. The added regressions cover `getValue`/`isReady`, generic result
+chains, private unsaved edits, a nearer unavailable property, empty-prefix
+presentation and one source collection per child/base owner. Kotlin getter
+presentation remains excluded by the existing negative case.
+
+The existing corpus harness passes both native cases, all four
+completion/navigation assertions on the first response, using shared dev
+SHA-256 `902417c9e2abc7c3c6d2c9a0fce1410dd245110ccf0c4e291be72316a1c1c6b2`.
+It verifies navigation to the exact Kotlin property and JDK `String.length`
+declarations. Operations complete, shutdown exits 0, all input guards remain
+stable, EOF is observed and no owned processes remain or require termination.
+The first launch failed before semantic requests because the external manifest
+used raw-byte hashes instead of the harness's joined-line hash contract.
+That failed receipt is retained; correcting the hash metadata changed neither
+source bytes nor expected declarations. Evidence is
+`E/getter-inherited-summary.json` and
+`E/coverage/native-inherited-fixed{1,2}/receipt.json`.
+
+Constructor `open val` and ordinary class-body property getters are separate
+pending coverage controls. The inherited case proves the currently admitted
+constructor-property subset; mixed getter rename remains the gap above.
+
+## Integrated release first readiness and Neovim completion
+
+`S = C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda/cem-speed120`.
+`S/acceptance-plan.json` records commands and cache conditions;
+`S/performance-summary.json` and `S/sessions-receipt.json` record results.
+The immutable release is `native-integrated120-4/bin/ktlsp.exe`, SHA-256
+`18938e7be4e847ad687e4c1c64559d48a19beb80315f80c128f8b16522141b61`.
+The existing harness, original eight assertions, recovered CEM source/config,
+JDK21 and Gradle home are preserved. All 438 input guards match before/after.
+The initial heavy-process inventory was empty and peer heavy jobs were held.
+Cold uses an absent LSP cache; warm and UI reuse that same cache without seeds,
+copies or relocation. Both corpus sessions pass all eight assertions; all four
+post-readiness requests match on their first response. All three server
+sessions exit naturally with code0, EOF, no live owned processes or forced
+termination. One failed dependency and three missing sources remain reported.
+
+| Measurement | Historical113 | Current120-4 |
+| --- | ---: | ---: |
+| Cold first useful getBreakSpeed completion, n=1 | 170.189s | 52.547s |
+| Warm first useful completion, n=1 | 3.453s | 1.689s |
+| Warm RPC p50 / p95, n=30 | 15.234 / 32.586ms | 10.421 / 16.547ms |
+| Warm input-to-menu p50 / p95, n=30 | 49.980 / 68.388ms | 44.026 / 51.686ms |
+
+First-use polling remains 500ms and retains early empty/mismatched responses;
+startup n=1 supplies no startup p95. UI has one separate first-after-readiness
+sample (RPC9.916ms, input-to-menu44.662ms) followed by 30 warm samples.
+Quantiles use linear interpolation at `(n-1)*q`, matching113. All 31 selections
+are accepted with one completion request each, the whole original buffer hash
+is restored, and disk bytes remain unchanged. Menu timing ends at Neovim's
+`popupmenu_show` handoff, not physical display.
+
+Current cold Gradle dump takes27.756s. Binary preview spans28.314–58.283s,
+source query28.315–65.576s, and dependency indexing ends78.362s. Useful
+completion at52.547s therefore precedes both complete binary preview and source
+query completion: partial facts are usable before final source enrichment.
+These overlapping wall-clock spans are not CPU samples.
+
+Historical113 cold included first source-query use in the recovered Gradle
+home; the current mandated home is already warm. The cold difference cannot
+be attributed solely to the binary. An old-binary/new-cache control in the
+same current Gradle home is deferred to a separate quiet window. Current cold
+and warm library inventories also differ (46208/36040 files); selected eight
+checks do not establish whole-index semantic equality. Broader functional
+evidence remains separate, and these samples establish neither a global
+latency budget nor complete dependency coverage or IDEA parity.

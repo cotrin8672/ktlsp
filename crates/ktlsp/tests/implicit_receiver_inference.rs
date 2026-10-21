@@ -185,6 +185,121 @@ fn java_constructor_getters_share_completion_goto_and_generic_result_binding() {
 }
 
 #[test]
+fn java_inherited_constructor_getters_keep_source_identity_and_generic_binding() {
+    let mut ws = Workspace::new();
+    let properties = "package probe\nclass Payload { fun work(): Int = 1 }\nopen class KotlinBase<T>(val value: T, val isReady: Boolean)\n";
+    ws.open("Inherited.kt", properties.into());
+    ws.open(
+        "Child.java",
+        "package probe; public class Child extends KotlinBase<Payload> { public Child() { super(null, true); } }".into(),
+    );
+    ws.open(
+        "Decoy.kt",
+        "package probe\nclass Decoy { fun work(): Int = 2 }\n".into(),
+    );
+    let caller = "package probe; class Use { void use(Child child) { child.getValue().work(); child.isReady(); } }";
+    ws.open("InheritedUse.java", caller.into());
+    for (name, property) in [("getValue", "value"), ("isReady", "isReady")] {
+        assert!(labels(&mut ws, "InheritedUse.java", &format!("child.{name}")).contains(name));
+        let entry = ws
+            .index
+            .lookup_by_name(property)
+            .iter()
+            .find(|entry| {
+                entry.path.as_ref() == "Inherited.kt" && entry.sym.kind == SymbolKind::Property
+            })
+            .unwrap();
+        let expected = Def {
+            file: "Inherited.kt".into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        };
+        assert_eq!(
+            goto(
+                &mut ws,
+                "InheritedUse.java",
+                &format!("child.{name}()"),
+                name
+            ),
+            vec![expected]
+        );
+    }
+    assert_eq!(
+        goto(
+            &mut ws,
+            "InheritedUse.java",
+            "child.getValue().work()",
+            "work"
+        ),
+        vec![target(&ws, "Inherited.kt", "work")]
+    );
+
+    // Completion with an empty prefix still traverses each owner once, and source properties
+    // only appear as JVM callables with their declaring owner, never as authored functions.
+    {
+        use ktlsp::index::{Index, InferenceIndex, LookupEntries};
+        use std::cell::RefCell;
+        struct Counted<'a> {
+            index: &'a Index,
+            owners: RefCell<Vec<String>>,
+        }
+        impl InferenceIndex for Counted<'_> {
+            fn lookup_by_name(&self, name: &str) -> LookupEntries<'_> {
+                LookupEntries::All(self.index.lookup_by_name(name))
+            }
+            fn members_of(&self, name: &str) -> LookupEntries<'_> {
+                self.owners.borrow_mut().push(name.into());
+                LookupEntries::All(self.index.members_of(name))
+            }
+            fn extensions_for(&self, name: &str) -> LookupEntries<'_> {
+                LookupEntries::All(self.index.extensions_for(name))
+            }
+            fn jvm_sources(&self, owner: &str) -> Vec<&ktcore::jvm::SourceFile> {
+                self.index.jvm_sources(owner)
+            }
+        }
+        let index = Counted {
+            index: &ws.index,
+            owners: RefCell::new(Vec::new()),
+        };
+        let candidates =
+            ktcore::jvm::member_candidates(&index, &Type::class("Child", Some("probe".into())), "");
+        let getters: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| matches!(candidate.name(), "getValue" | "isReady"))
+            .collect();
+        assert_eq!(getters.len(), 2);
+        for getter in getters {
+            assert_eq!(
+                getter.identity(&index).unwrap().class.internal_name,
+                "probe/KotlinBase"
+            );
+        }
+        assert!(candidates.iter().all(|candidate| !matches!(candidate, ktcore::jvm::CallableCandidate::Authored(entry) if entry.sym.kind == SymbolKind::Property)));
+        for owner in ["Child", "KotlinBase"] {
+            assert_eq!(
+                index
+                    .owners
+                    .borrow()
+                    .iter()
+                    .filter(|name| *name == owner)
+                    .count(),
+                1,
+                "one source candidate walk for {owner}"
+            );
+        }
+    }
+    ws.change(
+        "Inherited.kt",
+        properties.replace("val value", "private val value"),
+    );
+    assert!(!labels(&mut ws, "InheritedUse.java", "child.getValue").contains("getValue"));
+    assert!(goto(&mut ws, "InheritedUse.java", "child.getValue()", "getValue").is_empty());
+    ws.change("Inherited.kt", properties.into());
+    assert!(labels(&mut ws, "InheritedUse.java", "child.getValue").contains("getValue"));
+}
+
+#[test]
 fn java_constructor_string_getter_resolves_java_string_members() {
     let mut ws = Workspace::new();
     ws.open(

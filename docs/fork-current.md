@@ -57,6 +57,44 @@ release120-2 for Moshi/OkHttp/Retrofit and joint dev07fc12c2 for Spring/Gradle.
 This is not yet a same-release sweep or full-project semantic coverage. Final
 release cold/warm/UI measurements and the Spring lifecycle result remain open.
 
+The same joint120-4 release subsequently passes all50 original five-project
+first responses: Gradle9, Moshi9, OkHttp10, Retrofit12 and Spring10. All ten
+sessions close normally with stable inputs and no owned residuals. Spring's
+Index destruction takes10.212s/2.754s in these functional runs; passing lifecycle
+does not establish a startup/completion speed target. Evidence:
+oracle120/release120-4-corpus40-summary.json and spring120/release1-native10-summary.json.
+One Retrofit incomplete completion takes1.753s; its cause remains under review.
+
+Quiet CEM measurements on that release observe useful completion at52.547s cold
+and1.689s warm (n=1 each,500ms polling). The cold useful response precedes both
+binary-preview and source-query completion. Warm30 RPC p50/p95 is10.421/16.547ms;
+input-to-menu handoff is44.026/51.686ms, using linear interpolated quantiles.
+All31 UI samples accept and inspect the edit, restore the whole buffer and leave
+disk unchanged. Both sessions close normally;438 guards stay unchanged. Source
+coverage still reports one failed lookup and three missing sources. Historical
+113's Gradle artifact cache was less populated, so these observations do not
+isolate a binary speedup or establish startup p95. Evidence:
+cem-speed120/performance-summary.json and docs/fork-cem-startup120.md.
+
+Inherited Java calls now obtain constructor-property getters from the existing
+single hierarchy walk. Source definitions, declaring owner and generic receiver
+bindings are preserved. Focused11+71 tests and four native first responses pass
+on joint dev902417c9 with clean exit and stable inputs; the independent Kotlin/
+Javac control compiles the unchanged fixture. Evidence:
+cem-startup120/getter-inherited-summary.json. Class-body properties, open-property
+coverage and mixed getter rename remain separate unfinished work.
+
+A fresh separate extension consumer linked from that same source passes the
+unchanged50 first requests/98 checks, including applied rename, unsaved buffers
+and configuration invalidation. The upstream Mixin inputs match the previously
+compiled control; this run does not recompile that upstream control or verify
+game launch/remapping. Evidence: sdk-final120/verified-summary.json.
+The current Noarg FULL-codegen filter improves the OpenBase same-file case but
+still fails two serializer completions when the unfinished function is beside
+Model itself. A current compiler namespace is accepted, followed by a normalized
+source rejection (NotIndexedDeclaration); that shared admission gap is being
+fixed rather than counted as passing. Evidence: serialization120/editor-noarg1.
+
 ## Earlier120: development builds and functional baselines
 
 The joint120-2 integration passes the full workspace:1729 passed,0 failed,

@@ -167,7 +167,7 @@ impl<'a> CallableCandidate<'a> {
                     class: class.clone(),
                     name: facts.name.clone(),
                     descriptor: descriptor.into(),
-                })
+                });
             }
         };
         if (facts.source_property.is_none() && !owner_annotation_known(index, source))
@@ -584,7 +584,7 @@ pub fn member_candidates_at<'a>(
     let source_members = crate::members::matching_candidates(
         index,
         receiver,
-        crate::members::MemberName::Prefix(prefix),
+        crate::members::MemberName::JvmPrefix(prefix),
         ctx,
         false,
     )
@@ -623,23 +623,49 @@ pub(crate) fn member_candidates_from<'a>(
                     .iter()
                     .filter(|facts| {
                         facts.name.starts_with(prefix)
-                            && match &facts.source_property {
-                                Some(property) => {
-                                    property.owner == name
-                                        && getter_is_admitted(
-                                            index, source, facts, receiver, ctx, position,
-                                        )
-                                }
-                                None => {
-                                    source.facts.owner == name
-                                        && owner_annotation_known(index, source)
-                                }
-                            }
+                            && facts.source_property.is_none()
+                            && source.facts.owner == name
+                            && owner_annotation_known(index, source)
                             && annotation_known(
                                 index,
                                 facts.jvm_name_annotation.as_ref(),
                                 &source.facts.package,
                             )
+                    })
+                    .map(|facts| CallableCandidate::Jvm {
+                        owner: JvmOwner::Source(source),
+                        facts,
+                    }),
+            );
+        }
+    }
+    // The pool has already applied visibility, unavailable names and nearest-property overrides.
+    // Project only its surviving exact source definitions, including inherited properties.
+    for entry in source_members
+        .iter()
+        .filter(|entry| entry.sym.kind == SymbolKind::Property)
+    {
+        let Some(owner) = entry.sym.container.as_deref() else {
+            continue;
+        };
+        for source in index.jvm_sources(owner).into_iter().filter(|source| {
+            source.file == entry.path.as_ref() && source.facts.package == entry.sym.package
+        }) {
+            out.extend(
+                source
+                    .facts
+                    .callables
+                    .iter()
+                    .filter(|facts| {
+                        facts.name.starts_with(prefix)
+                            && facts.source_property.as_ref().is_some_and(|property| {
+                                property.owner == owner && property.name == entry.sym.name
+                            })
+                            && facts.definition.as_ref().is_some_and(|definition| {
+                                definition.start_byte == entry.sym.start_byte
+                                    && definition.end_byte == entry.sym.end_byte
+                            })
+                            && getter_is_admitted(index, source, facts, receiver, ctx, position)
                     })
                     .map(|facts| CallableCandidate::Jvm {
                         owner: JvmOwner::Source(source),
@@ -1564,29 +1590,8 @@ pub fn source_facts(
         let Some(return_type) = symbol.value_type.clone() else {
             continue;
         };
-        if symbol.name.is_empty()
-            || !symbol
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        let Some(name) = property_getter_name(&symbol.name) else {
             continue;
-        }
-        let name = if symbol.name.starts_with("is")
-            && symbol
-                .name
-                .chars()
-                .nth(2)
-                .is_some_and(|c| !c.is_ascii_lowercase())
-        {
-            symbol.name.clone()
-        } else {
-            let mut chars = symbol.name.chars();
-            format!(
-                "get{}{}",
-                chars.next().unwrap().to_ascii_uppercase(),
-                chars.as_str()
-            )
         };
         callables.push(CallableFacts {
             name,
@@ -1619,6 +1624,23 @@ pub fn source_facts(
         owner_annotation,
         callables,
     })
+}
+
+/// The supported Kotlin property spelling, shared by source facts and Java candidate lookup.
+pub(crate) fn property_getter_name(name: &str) -> Option<String> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if name.starts_with("is") && name.chars().nth(2).is_some_and(|c| !c.is_ascii_lowercase()) {
+        Some(name.into())
+    } else {
+        let mut chars = name.chars();
+        Some(format!(
+            "get{}{}",
+            chars.next()?.to_ascii_uppercase(),
+            chars.as_str()
+        ))
+    }
 }
 
 /// Accept only a whole, plain JVM-name annotation; spelling substrings are not semantic names.
@@ -1735,6 +1757,33 @@ mod tests {
         index.replace_jvm_source(file, None, Tier::Volatile);
         assert!(member_candidates(&index, &receiver, "getValue").is_empty());
         assert_eq!(member_candidates(&snapshot, &receiver, "getValue").len(), 1);
+    }
+
+    #[test]
+    fn inherited_constructor_getters_respect_nearer_unavailable_properties() {
+        let file = "/getter/Inherited.kt";
+        let text =
+            "package getter\nopen class Base<T>(val value: T)\nclass Child : Base<String>()\n";
+        let tree = crate::parser::KotlinParser::new().parse(text);
+        let symbols = indexer::extract_symbols(&tree, text, "getter");
+        let facts = source_facts(file, &tree, text, &symbols).unwrap();
+        let mut index = crate::index::Index::new();
+        index.replace_file(file, symbols.clone(), Tier::Volatile);
+        index.replace_jvm_source(file, Some(facts), Tier::Volatile);
+        let receiver = Type::class("Child", Some("getter".into()));
+        assert_eq!(member_candidates(&index, &receiver, "getValue").len(), 1);
+        let mut unavailable = symbols;
+        unavailable
+            .iter_mut()
+            .find(|symbol| symbol.name == "Child")
+            .unwrap()
+            .unavailable_members =
+            Some(Box::new(vec![("value".into(), SymbolKind::Property, None)]));
+        index.replace_file(file, unavailable, Tier::Volatile);
+        assert!(
+            member_candidates(&index, &receiver, "getValue").is_empty(),
+            "an unknown nearer property must block the ancestor getter"
+        );
     }
 
     #[test]

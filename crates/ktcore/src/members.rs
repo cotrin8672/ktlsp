@@ -230,14 +230,24 @@ pub struct Candidates<'a> {
 pub(crate) enum MemberName<'a> {
     Exact(&'a str),
     Prefix(&'a str),
+    /// Java callable lookup also retains source properties under their derived getter name.
+    JvmPrefix(&'a str),
 }
 
 impl MemberName<'_> {
     fn matches(self, name: &str) -> bool {
         match self {
             Self::Exact(written) => name == written,
-            Self::Prefix(written) => name.starts_with(written),
+            Self::Prefix(written) | Self::JvmPrefix(written) => name.starts_with(written),
         }
+    }
+
+    fn matches_member(self, name: &str, kind: crate::symbol::SymbolKind) -> bool {
+        self.matches(name)
+            || matches!(self, Self::JvmPrefix(_))
+                && kind == crate::symbol::SymbolKind::Property
+                && crate::jvm::property_getter_name(name)
+                    .is_some_and(|getter| self.matches(&getter))
     }
 }
 
@@ -791,7 +801,7 @@ fn add_property_getters<'a>(
     result: &mut Candidates<'a>,
 ) {
     let written = match name {
-        MemberName::Exact(name) | MemberName::Prefix(name) => name,
+        MemberName::Exact(name) | MemberName::Prefix(name) | MemberName::JvmPrefix(name) => name,
     };
     let getter_name = if written.is_empty() {
         Some("get".to_string())
@@ -807,7 +817,7 @@ fn add_property_getters<'a>(
     if let Some(getter_name) = getter_name {
         let getter_query = match name {
             MemberName::Exact(_) => MemberName::Exact(&getter_name),
-            MemberName::Prefix(_) => MemberName::Prefix(&getter_name),
+            MemberName::Prefix(_) | MemberName::JvmPrefix(_) => MemberName::Prefix(&getter_name),
         };
         let mut getters = collect_candidates(index, receiver, getter_query, ctx, false);
         remove_overridden_members(index, receiver, &mut getters.members, ctx, false);
@@ -892,12 +902,15 @@ fn collect_candidates<'a>(
                 && current.container() == owner.sym.container.as_deref()
         }) {
             if let Some(names) = owner.sym.unavailable_members.as_deref() {
-                if names.iter().any(|(written, _, _)| name.matches(written)) {
+                if names
+                    .iter()
+                    .any(|(written, kind, _)| name.matches_member(written, *kind))
+                {
                     blockers.push((current.clone(), names));
                     unavailable_members.extend(
                         names
                             .iter()
-                            .filter(|(written, _, _)| name.matches(written))
+                            .filter(|(written, kind, _)| name.matches_member(written, *kind))
                             .map(|(written, kind, arity)| (written.as_str(), *kind, *arity)),
                     );
                     hierarchy_complete = false;
@@ -905,7 +918,7 @@ fn collect_candidates<'a>(
             }
         }
         members.extend(index.members_of(&root).into_iter().filter(|entry| {
-            name.matches(&entry.sym.name)
+            name.matches_member(&entry.sym.name, entry.sym.kind)
                 && current.package().is_none_or(|pkg| entry.sym.package == pkg)
                 && receiver_member_accessible(receiver, entry)
         }));
