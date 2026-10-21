@@ -555,6 +555,60 @@ pub(crate) fn extract_class_stub_facts(
     jar: &Path,
     out_dir: &Path,
 ) -> anyhow::Result<Vec<(PathBuf, Option<BinaryOwnerMembers>)>> {
+    let mut out = Vec::new();
+    visit_class_stub_facts(jar, out_dir, |path, source, owners| {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_source_text(path, source)?;
+        out.push((path.to_path_buf(), owners));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Render the same bounded binary declarations without an eager disk round trip.
+pub(crate) fn visit_class_stub_facts(
+    jar: &Path,
+    out_dir: &Path,
+    visit: impl FnMut(&Path, &str, Option<BinaryOwnerMembers>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    visit_class_stub_facts_selected(jar, out_dir, None, visit)
+}
+
+pub(crate) fn extract_class_stub_file(
+    jar: &Path,
+    out_dir: &Path,
+    path: &Path,
+) -> anyhow::Result<bool> {
+    let Ok(relative) = path.strip_prefix(out_dir) else {
+        return Ok(false);
+    };
+    if relative.extension().and_then(|ext| ext.to_str()) != Some("java")
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    let mut found = false;
+    visit_class_stub_facts_selected(jar, out_dir, Some(path), |path, source, _| {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_source_text(path, source)?;
+        found = true;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn visit_class_stub_facts_selected(
+    jar: &Path,
+    out_dir: &Path,
+    selected: Option<&Path>,
+    mut visit: impl FnMut(&Path, &str, Option<BinaryOwnerMembers>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let bytes = fs::read(jar).with_context(|| format!("open jar {}", jar.display()))?;
     // zip's indexed map may coalesce duplicate central names. A non-ZIP64 EOCD count
     // must agree before it can prove a unique enclosing class; otherwise nested
@@ -630,22 +684,17 @@ pub(crate) fn extract_class_stub_facts(
             }
         }
     }
-    fs::create_dir_all(out_dir)?;
-    let mut out = Vec::new();
     for class_path in classes {
         let mut parts = class_path.rsplitn(2, '/');
         let name = parts.next().unwrap_or_default();
         let package_path = parts.next().unwrap_or_default();
         let package = package_path.replace('/', ".");
         let path = out_dir.join(format!("{class_path}.java"));
-        if !path.starts_with(out_dir) {
+        if !path.starts_with(out_dir) || selected.is_some_and(|selected| selected != path) {
             continue;
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // Decode one bounded class at a time; a later error prevents the caller parsing/caching
-        // any partial extraction. Atomic stub files can be repaired by the existing cache miss.
+        // Decode one bounded class at a time; a later error prevents the caller publishing/caching
+        // partial facts. Atomic stub files can be repaired by the existing cache miss.
         let declaration = if let Some(index) = declarations.get(&class_path).copied().flatten() {
             match decoded_binary_entry(&mut archive, index, &origin, &class_path)? {
                 Some(facts) => binary_owner_source(
@@ -678,13 +727,12 @@ pub(crate) fn extract_class_stub_facts(
                 )
             }
         });
-        write_source_text(&path, &src)?;
-        out.push((path, unavailable));
+        visit(&path, &src, unavailable)?;
     }
-    Ok(out)
+    Ok(())
 }
 
-type BinaryOwnerMembers =
+pub(crate) type BinaryOwnerMembers =
     std::collections::BTreeMap<String, Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>>;
 
 fn decoded_binary_entry<R: Read + io::Seek>(

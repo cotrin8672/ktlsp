@@ -178,9 +178,38 @@ source bytes nor expected declarations. Evidence is
 `E/getter-inherited-summary.json` and
 `E/coverage/native-inherited-fixed{1,2}/receipt.json`.
 
-Constructor `open val` and ordinary class-body property getters are separate
-pending coverage controls. The inherited case proves the currently admitted
-constructor-property subset; mixed getter rename remains the gap above.
+### Typed class-body and overriding property getters
+
+The next compiler control confirms ordinary public typed class-body `val`/`var`
+getters, a custom getter, generic constructor `open val`, and constructor/body
+`override val`. Kotlin 2.4.0 and Javac 21 both exit 0 for all six Java getter
+and result-chain calls. The Rust probe initially fails on the open constructor
+getter. The source producer now accepts these supported property headers into
+the same `SourceProperty` facts, retaining existing access, annotation,
+value-class, owner and generic-bound checks. A member extension property is
+excluded because its JVM getter has a receiver parameter. No new callable
+selection or hierarchy traversal is added. The coordinated parser/binary
+cache version is `v36-source-getters-lazy-binary`.
+
+The JVM focused suite passes 11 tests and the implicit-receiver suite passes
+72, including exact nearest override definitions and result chains. An unsaved
+nearest override with unknown getter metadata yields no inherited base target;
+restoring the source restores its getter. Body-property negatives retain
+`JvmField`, `JvmName`, private/internal access, unknown owner annotations,
+value-class returns and unavailable inferred types as unsupported.
+
+The existing native corpus route passes six cases and all 12 first-response
+completion/navigation assertions on shared dev SHA-256
+`fe0977b6eda74847bb3250c33c607850c260ca16e2391bcaa45fc7d7fafbedfd`.
+It checks the exact Base, Child, Body and BodyChild property definitions.
+All 21 immutable input guards remain stable; operations complete with native
+exit 0, EOF and no live or forcibly terminated owned processes. Evidence is
+`E/getter-body-summary.json` and
+`E/coverage/native-body-fixed1/receipt.json`.
+
+Properties without an explicit type remain an inference coverage gap.
+This slice checks a `var` getter only; generated setters and mixed derived
+getter rename remain outside its verified support.
 
 ## Integrated release first readiness and Neovim completion
 
@@ -227,3 +256,43 @@ and warm library inventories also differ (46208/36040 files); selected eight
 checks do not establish whole-index semantic equality. Broader functional
 evidence remains separate, and these samples establish neither a global
 latency budget nor complete dependency coverage or IDEA parity.
+
+The next measured scope is Create's binary resolver:1627 files take17.367s,
+ending52.423s immediately before first useful completion. JDK parsing already
+ends33.039s. The binary path eagerly wrote every rendered Java stub and then
+walked/read that directory to parse the same texts. It now visits the existing
+renderer output directly, retains all selected class/descriptor/owner facts,
+and materializes only a requested goto stub. A separate binary marker checks
+the original artifact identity before/after work; it does not establish source
+closure. The shared cache version is v36, also covering the subsequent source
+property-getter parser changes.
+
+The existing actual-three-Create-class test first failed its new no-eager-stub
+assertion, then passed local/module cold/warm completion, exact goto bytes,
+Float inference and parameter completion. It also checks changed/deleted JAR
+rejection, removal of stale materialized text, and recovery after reappearance.
+Repeated materialization validates identity but preserves the already generated
+file's mtime instead of rendering again. A malformed marker rejects cached facts
+and removes its old materialized text. Initial goto still reads the archive and
+walks its inventory before decoding the selected owner; this residual cost is
+not measured separately.
+The existing binary suite passes16 tests and JAR suite29. Evidence is
+`S/lazy-{red,green1,binary-suite,jar-suite,repeat-marker-green}.log`. This follow-up has no measured
+runtime improvement yet: the preceding release timings predate it. Its next
+check is the same native CEM probe and a fresh-LSP-cache release measurement
+in a separate quiet window. Without CPU samples, the relative cost of I/O,
+class decoding and parsing remains unmeasured.
+
+Shared immutable dev SHA-256
+`fe0977b6eda74847bb3250c33c607850c260ca16e2391bcaa45fc7d7fafbedfd`
+then passed the unchanged original CEM26 (main9/incomplete17), retaining K2 and
+Float inlay checks. Both runs exit naturally with code0, EOF, no live/forcibly
+terminated owned processes, and439 stable guards. Each fresh v36 LSP cache
+contains101 binary markers and zero eagerly materialized binary Java files.
+The two returned goto URIs resolve to real files; their UTF-16 ranges select
+the expected names and their complete normalized contents match the pinned
+target hashes. These post-index goto targets use source markers, so this is
+not a native binary-only goto proof. The portable actual-class test supplies
+the binary-specific materialization coverage above. Evidence is
+`S/editor-original26-lazy-dev1/{summary,receipt}.json`. This dev run supplies
+functional evidence only; optimized-release performance remains pending.

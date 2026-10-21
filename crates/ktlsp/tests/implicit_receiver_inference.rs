@@ -300,6 +300,72 @@ fn java_inherited_constructor_getters_keep_source_identity_and_generic_binding()
 }
 
 #[test]
+fn java_typed_body_and_overriding_property_getters_share_the_nearest_definition() {
+    let mut ws = Workspace::new();
+    let source = "package probe\nclass Payload { fun work(): Int = 1 }\nopen class Base<T>(open val value: T)\nclass Child(override val value: Payload) : Base<Payload>(value)\nopen class Body(seed: Payload) {\n open val body: Payload = seed\n var mutable: Payload = seed\n val computed: Payload get() = body\n}\nclass BodyChild(seed: Payload) : Body(seed) { override val body: Payload = seed }\n";
+    ws.open("BodyProperties.kt", source.into());
+    ws.open(
+        "Decoy.kt",
+        "package probe\nclass Decoy { fun work(): Int = 2 }\n".into(),
+    );
+    let caller = "package probe; class Use { void use(Base<Payload> base, Child child, Body body, BodyChild derived) { base.getValue().work(); child.getValue().work(); body.getBody().work(); body.getMutable().work(); body.getComputed().work(); derived.getBody().work(); } }";
+    ws.open("BodyUse.java", caller.into());
+    for (receiver, name, property, owner) in [
+        ("base", "getValue", "value", "Base"),
+        ("child", "getValue", "value", "Child"),
+        ("body", "getBody", "body", "Body"),
+        ("body", "getMutable", "mutable", "Body"),
+        ("body", "getComputed", "computed", "Body"),
+        ("derived", "getBody", "body", "BodyChild"),
+    ] {
+        let expression = format!("{receiver}.{name}()");
+        assert!(
+            labels(&mut ws, "BodyUse.java", &format!("{receiver}.{name}")).contains(name),
+            "{expression}"
+        );
+        let entry = ws
+            .index
+            .lookup_by_name(property)
+            .iter()
+            .find(|entry| {
+                entry.sym.container.as_deref() == Some(owner)
+                    && entry.sym.kind == SymbolKind::Property
+            })
+            .unwrap();
+        let expected = Def {
+            file: "BodyProperties.kt".into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        };
+        assert_eq!(
+            goto(&mut ws, "BodyUse.java", &expression, name),
+            vec![expected],
+            "{expression}"
+        );
+        assert_eq!(
+            goto(
+                &mut ws,
+                "BodyUse.java",
+                &format!("{expression}.work()"),
+                "work"
+            ),
+            vec![target(&ws, "BodyProperties.kt", "work")]
+        );
+    }
+    ws.change(
+        "BodyProperties.kt",
+        source.replace("override val body", "@get:Unknown override val body"),
+    );
+    assert!(!labels(&mut ws, "BodyUse.java", "derived.getBody").contains("getBody"));
+    assert!(
+        goto(&mut ws, "BodyUse.java", "derived.getBody()", "getBody").is_empty(),
+        "an unknown nearest override must not navigate to the base property"
+    );
+    ws.change("BodyProperties.kt", source.into());
+    assert!(labels(&mut ws, "BodyUse.java", "derived.getBody").contains("getBody"));
+}
+
+#[test]
 fn java_constructor_string_getter_resolves_java_string_members() {
     let mut ws = Workspace::new();
     ws.open(

@@ -46,11 +46,11 @@ pub struct CallableFacts {
     pub fixed_name: Option<FixedName>,
     pub jvm_name_annotation: Option<TypeRef>,
     pub is_static: bool,
-    pub source_property: Option<ConstructorProperty>,
+    pub source_property: Option<SourceProperty>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConstructorProperty {
+pub struct SourceProperty {
     pub owner: String,
     pub name: String,
     pub type_params: Vec<String>,
@@ -1523,10 +1523,19 @@ pub fn source_facts(
         else {
             continue;
         };
-        while node.kind() != "class_parameter" && node.parent().is_some() {
+        while !matches!(node.kind(), "class_parameter" | "property_declaration")
+            && node.parent().is_some()
+        {
             node = node.parent().unwrap();
         }
-        if node.kind() != "class_parameter" || node.has_error() {
+        if !matches!(node.kind(), "class_parameter" | "property_declaration")
+            || node.kind() == "class_parameter" && node.has_error()
+            || symbol.source_member.visibility() != Some(crate::extensions::Visibility::Public)
+            || symbol.source_member.dispatch() != Some(crate::extensions::Dispatch::Instance)
+            || symbol.source_member.jvm_restricted()
+            || symbol.ext_receiver.is_some()
+            || symbol.extension_receiver.is_some()
+        {
             continue;
         }
         let modifiers = child_of_kind(node, "modifiers");
@@ -1535,17 +1544,34 @@ pub fn source_facts(
                 .any(|n| n.kind() == "annotation")
                 || node_text(m, text)
                     .split_whitespace()
-                    .any(|w| !matches!(w, "public" | "final"))
+                    .any(|w| !matches!(w, "public" | "final" | "open" | "override" | "abstract"))
         }) {
             continue;
         }
-        let Some(class) = node
-            .parent()
-            .and_then(|n| n.parent())
-            .and_then(|n| n.parent())
-        else {
+        // An accessor annotation/unknown modifier can change the emitted method independently
+        // of the property's spelling. Getter bodies do not change an explicit property type.
+        if child_of_kind(node, "getter").is_some_and(|getter| {
+            child_of_kind(getter, "modifiers").is_some_and(|modifiers| {
+                modifiers
+                    .named_children(&mut modifiers.walk())
+                    .any(|n| n.kind() == "annotation")
+                    || node_text(modifiers, text)
+                        .split_whitespace()
+                        .any(|word| word != "public")
+            })
+        }) {
             continue;
+        }
+        let class = if node.kind() == "class_parameter" {
+            node.parent()
+                .and_then(|n| n.parent())
+                .and_then(|n| n.parent())
+        } else {
+            node.parent()
+                .filter(|parent| parent.kind() == "class_body")
+                .and_then(|body| body.parent())
         };
+        let Some(class) = class else { continue };
         if class.kind() != "class_declaration"
             || class
                 .parent()
@@ -1606,7 +1632,7 @@ pub fn source_facts(
             fixed_name: None,
             jvm_name_annotation: None,
             is_static: false,
-            source_property: Some(ConstructorProperty {
+            source_property: Some(SourceProperty {
                 owner: owner.name.clone(),
                 name: symbol.name.clone(),
                 type_params: owner.type_params.clone(),
@@ -1923,6 +1949,14 @@ mod tests {
             "value class Box(val value: Int)",
             "class Box<T: Number>(val value: T)",
             "@JvmInline value class Token(val raw: Int)\nclass Box(val value: Token)",
+            "class Box { @JvmField val value: Int = 1 }",
+            "class Box { @get:JvmName(\"other\") val value: Int = 1 }",
+            "class Box { private val value: Int = 1 }",
+            "class Box { internal val value: Int = 1 }",
+            "@Unknown class Box { val value: Int = 1 }",
+            "class Box { val String.value: Int get() = 1 }",
+            "class Box { val value = 1 }",
+            "@JvmInline value class Token(val raw: Int)\nclass Box { val value: Token = Token(1) }",
         ] {
             let text = format!("package getter\n{declaration}\n");
             let mut parser = crate::parser::KotlinParser::new();

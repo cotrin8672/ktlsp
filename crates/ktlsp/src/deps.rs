@@ -717,8 +717,9 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v35-kotlin-constructor-getters";
+const SYMCACHE_VERSION: &[u8] = b"v36-source-getters-lazy-binary";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
+const BINARY_JAR_MARKER: &str = ".ktlsp-binary-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
 static SYMCACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -785,9 +786,21 @@ fn symcache_load_file(cache_file: &Path, source_dir: &Path) -> Option<Vec<FileSy
     for batch in &mut cached {
         batch.file = crate::paths::file_key(Path::new(&batch.file));
     }
-    // A lazy source directory can recreate indexed entries from its recorded source identity. Legacy
+    // A lazy jar directory can recreate indexed entries from its recorded artifact identity. Legacy
     // fully-extracted directories still require each cached file to exist.
-    if source_dir.join(SOURCE_JAR_MARKER).is_file()
+    let binary_marker = source_dir.join(BINARY_JAR_MARKER);
+    let lazy_binary = if binary_marker.is_file() {
+        let marker: BinaryJarMarker =
+            serde_json::from_slice(&fs::read(binary_marker).ok()?).ok()?;
+        if !marker.current() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+    if lazy_binary
+        || source_dir.join(SOURCE_JAR_MARKER).is_file()
         || cached.iter().all(|fs| Path::new(&fs.file).exists())
     {
         for batch in &mut cached {
@@ -819,6 +832,44 @@ struct SourceJarMarker {
     jar: PathBuf,
     fingerprint: String,
     policy: SourceTextPolicy,
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+struct BinaryJarMarker {
+    jar: PathBuf,
+    fingerprint: String,
+    origin: String,
+}
+
+impl BinaryJarMarker {
+    fn current(&self) -> bool {
+        self.jar.is_file()
+            && jar_fingerprint(&self.jar).as_deref() == Some(self.fingerprint.as_str())
+            && crate::classpath::file_origin_id(&self.jar) == self.origin
+    }
+}
+
+fn prepare_lazy_binary_dir(jar: &Path, dest: &Path) -> anyhow::Result<BinaryJarMarker> {
+    let expected = BinaryJarMarker {
+        jar: jar.to_path_buf(),
+        fingerprint: jar_fingerprint(jar).context("missing binary artifact")?,
+        origin: crate::classpath::file_origin_id(jar),
+    };
+    anyhow::ensure!(
+        expected.current(),
+        "binary artifact changed before indexing"
+    );
+    let marker = dest.join(BINARY_JAR_MARKER);
+    let matches = fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BinaryJarMarker>(&bytes).ok())
+        .is_some_and(|stored| stored == expected);
+    if !matches {
+        anyhow::ensure!(discard_lazy_source_dir(dest), "discard stale binary stubs");
+        fs::create_dir_all(dest)?;
+        jar::write_source_text(&marker, &serde_json::to_string(&expected)?)?;
+    }
+    Ok(expected)
 }
 
 /// Discard materialized text when its source identity changes, including legacy path-only markers.
@@ -865,11 +916,39 @@ fn prepare_lazy_source_dir_with_policy(
     fs::write(&tmp, bytes).is_ok() && fs::rename(tmp, marker).is_ok()
 }
 
-/// Materialize a lazily indexed source path, if it belongs to a directory owned by a source-jar
-/// marker. This is intentionally path-based so `Workspace` can remain unaware of dependency
+/// Materialize a lazily indexed source or binary stub path from its recorded jar marker.
+/// This is intentionally path-based so `Workspace` can remain unaware of dependency
 /// coordinates and cache serialization details.
 pub fn materialize_source_file(path: &Path) -> bool {
     for source_dir in path.ancestors().skip(1) {
+        if let Ok(bytes) = fs::read(source_dir.join(BINARY_JAR_MARKER)) {
+            let Ok(relative) = path.strip_prefix(source_dir) else {
+                return false;
+            };
+            if relative.extension().and_then(|ext| ext.to_str()) != Some("java")
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return false;
+            }
+            let Ok(marker) = serde_json::from_slice::<BinaryJarMarker>(&bytes) else {
+                let _ = fs::remove_file(path);
+                return false;
+            };
+            let extracted = marker.current()
+                && (path.is_file()
+                    || jar::extract_class_stub_file(&marker.jar, source_dir, path)
+                        .inspect_err(|error| {
+                            tracing::warn!("materialize {} failed: {error}", path.display())
+                        })
+                        .unwrap_or(false))
+                && marker.current();
+            if !extracted {
+                let _ = fs::remove_file(path);
+            }
+            return extracted;
+        }
         let marker = source_dir.join(SOURCE_JAR_MARKER);
         let Ok(bytes) = fs::read(&marker) else {
             continue;
@@ -1417,31 +1496,30 @@ fn resolve_local_jar_stubs_unowned(
         return Ok(cached);
     }
 
-    // A previous interrupted extraction can leave a directory without a complete cache.
-    let mut extracted: std::collections::BTreeMap<_, _> =
-        jar::extract_class_stub_facts(jar_path, &dest)?
-            .into_iter()
-            .collect();
-
-    let mut symbols = parse_dir(&dest, kotlin, java)?;
-    for batch in &mut symbols {
-        if let Some(owners) = extracted.remove(Path::new(&batch.file)).flatten() {
-            for owner in batch
-                .symbols
-                .iter_mut()
-                .filter(|symbol| symbol.kind.is_type_like())
-            {
-                let name = match owner.container.as_deref() {
-                    Some(parent) => format!("{parent}.{}", owner.name),
-                    None => owner.name.clone(),
-                };
-                if let Some(unavailable) = owners.get(&name) {
-                    owner.unavailable_members = Some(Box::new(unavailable.clone()));
+    let marker = prepare_lazy_binary_dir(jar_path, &dest)?;
+    let mut symbols = Vec::new();
+    jar::visit_class_stub_facts(jar_path, &dest, |path, text, owners| {
+        if let Some(mut batch) = parse_source_file(path, text, kotlin, java) {
+            if let Some(owners) = owners {
+                for owner in batch
+                    .symbols
+                    .iter_mut()
+                    .filter(|symbol| symbol.kind.is_type_like())
+                {
+                    let name = match owner.container.as_deref() {
+                        Some(parent) => format!("{parent}.{}", owner.name),
+                        None => owner.name.clone(),
+                    };
+                    if let Some(unavailable) = owners.get(&name) {
+                        owner.unavailable_members = Some(Box::new(unavailable.clone()));
+                    }
                 }
             }
+            symbols.push(batch);
         }
-    }
-
+        Ok(())
+    })?;
+    anyhow::ensure!(marker.current(), "binary artifact changed while indexing");
     symcache_store(&fingerprint, &symbols);
     Ok(symbols)
 }
@@ -5463,6 +5541,7 @@ public class ParameterUse<Iterable> {
                 symbol.supertype_refs.clear();
             }
         }
+        let mut lazy_definitions = Vec::new();
         for (is_module, owner, tag) in [
             (
                 false,
@@ -5543,6 +5622,12 @@ public class ParameterUse<Iterable> {
                     )
                 }
                 .unwrap();
+                if !warm {
+                    assert!(
+                        batches.iter().all(|batch| !Path::new(&batch.file).exists()),
+                        "cold binary indexing must not materialize every Java stub"
+                    );
+                }
                 let child = batches
                     .iter()
                     .flat_map(|batch| &batch.symbols)
@@ -5664,11 +5749,37 @@ public class ParameterUse<Iterable> {
                     start_byte: expected.sym.start_byte,
                     end_byte: expected.sym.end_byte,
                 };
+                let definition_path = PathBuf::from(&expected.file);
                 assert_eq!(
                     workspace.goto_definition(file, start + "super.".len()),
                     [expected],
                     "actual CEM zeroarg goto: module={is_module} warm={warm}"
                 );
+                let relative = definition_path.strip_prefix(&dest).unwrap();
+                assert_eq!(
+                    fs::read(&definition_path).unwrap(),
+                    fs::read(legacy_dir.join(relative)).unwrap(),
+                    "lazy goto must preserve exact renderer bytes and byte offsets"
+                );
+                assert_eq!(
+                    jar::collect_sources(&dest).unwrap(),
+                    [definition_path.clone()]
+                );
+                let retained_time =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(900_000_000);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&definition_path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(retained_time))
+                    .unwrap();
+                assert!(materialize_source_file(&definition_path));
+                assert_eq!(
+                    fs::metadata(&definition_path).unwrap().modified().unwrap(),
+                    retained_time,
+                    "repeat materialization must not render/write the same current stub again"
+                );
+                lazy_definitions.push((definition_path, dest.clone(), fingerprint.clone()));
                 let tree = kotlin.parse(caller);
                 let call = tree
                     .root_node()
@@ -5687,6 +5798,39 @@ public class ParameterUse<Iterable> {
                 );
             }
         }
+        let (path, dest, fingerprint) = &lazy_definitions[0];
+        let marker_path = dest.join(BINARY_JAR_MARKER);
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        fs::write(&marker_path, b"malformed marker").unwrap();
+        assert!(symcache_load(fingerprint, dest).is_none());
+        assert!(!materialize_source_file(path));
+        assert!(!path.exists());
+        fs::write(marker_path, marker_bytes).unwrap();
+        assert!(materialize_source_file(path));
+        let original_jar = fs::read(&jar).unwrap();
+        fs::write(&jar, b"changed binary artifact").unwrap();
+        for (path, dest, fingerprint) in &lazy_definitions {
+            assert!(symcache_load(fingerprint, dest).is_none());
+            assert!(!materialize_source_file(path));
+            assert!(!path.exists(), "stale materialized text must be withdrawn");
+        }
+        fs::remove_file(&jar).unwrap();
+        assert!(lazy_definitions
+            .iter()
+            .all(|(path, _, _)| !materialize_source_file(path)));
+        fs::write(&jar, original_jar).unwrap();
+        let restored = resolve_module_binary_stubs(
+            &coord,
+            &[(jar.clone(), crate::classpath::file_origin_id(&jar))],
+            &root.join("restored"),
+            &mut kotlin,
+            &mut java,
+        )
+        .unwrap();
+        assert!(!restored.is_empty());
+        let restored_file = Path::new(&restored[0].file);
+        assert!(!restored_file.exists());
+        assert!(materialize_source_file(restored_file));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -104,6 +104,26 @@ source-normalization tests, five profile tests and43 core extension tests pass.
 Producer completeness and diagnostic absence are not certified. Evidence:
 processor120/noarg-slice-summary.json and serialization120/editor-noarg2/receipt.json.
 
+The same devfe0977b6 now passes12/12 native first responses for explicit-type
+class-body/open/override properties, preserving nearest declarations and generic
+return chains. The83 related Rust tests pass. Its parser cache is v36; inferred
+property types, setters and mixed getter rename remain unfinished. Evidence:
+cem-startup120/getter-body-summary.json.
+
+Binary preview now parses the existing rendered headers directly, recording a
+binary-specific marker instead of writing and rereading every stub. Navigation
+materializes the selected file; valid repeated reads avoid regenerating it.
+Changed/deleted/malformed identities reject cached facts and retract old text.
+The renderer, descriptor/member inventory and declaration offsets are retained.
+Related binary16/JAR29 tests pass, including byte-identical lazy goto, warm-cache
+reuse, repeated-read mtime preservation and identity failures. On devfe0977b6,
+the unchanged CEM main9/incomplete17 all pass with439 guards stable and clean
+exit. Each cache has101 binary markers and zero eager binary Java files. Its
+two final goto targets are actual source paths; binary-only navigation is proved
+by the focused Rust cases rather than these two editor requests. Improvement in
+cold time still needs a release measurement. Evidence: cem-speed120/lazy-result.json
+and cem-speed120/editor-original26-lazy-dev1/summary.json.
+
 ## Earlier120: development builds and functional baselines
 
 The joint120-2 integration passes the full workspace:1729 passed,0 failed,
