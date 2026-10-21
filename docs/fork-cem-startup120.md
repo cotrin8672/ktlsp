@@ -208,8 +208,52 @@ exit 0, EOF and no live or forcibly terminated owned processes. Evidence is
 `E/coverage/native-body-fixed1/receipt.json`.
 
 Properties without an explicit type remain an inference coverage gap.
-This slice checks a `var` getter only; generated setters and mixed derived
-getter rename remain outside its verified support.
+That typed-getter control checks a `var` getter only; setter coverage follows
+below. Mixed derived getter rename remains unsupported.
+
+### Java setters for mutable Kotlin properties
+
+Supported public typed constructor/body `var` declarations now contribute
+one-parameter setter facts beside their getters, sharing the same source
+property definition and declaring class identity. Setter parameters use the
+full receiver's existing generic binding; setter results are `Unit` and JVM
+`void`, independently of the property's value type. The classfile witness
+checks the real public instance method, parameter Signature and return
+descriptor. No serialized field is added; the parser cache version is
+`v37-property-setters-lazy-binary`.
+
+Independent Kotlin 2.4.0/Javac 21 controls accept `Box<String>.setValue(String)`,
+the nearest override, a body setter, and the actual `setReady`, `set_foo`,
+`set0` and `setIsfoo` spellings. Javac rejects an Int argument, a String result
+from the void setter, and a private setter. The shared solver asserts String
+`Applicable` and Int `Rejected`, rather than accepting an unknown type.
+One known invalid-call target retains the existing Java navigation contract;
+argument rejection does not erase the known method's identity. Public getters
+remain available when setters are private. Unsaved `var` to `val` edits remove
+the setter and restoring the declaration restores it. The actual generic Box
+classfile and source are portable fixtures with descriptor, generic Signature
+and altered access/return negative controls.
+
+The first native run exposed a real SDK-scope gap: generic erasure passed, but
+concrete String/Boolean/Int accessors were missing (3 matched, 14 mismatched).
+The value-class guard treated stdlib common `expect` declarations as proof of
+mangled accessors, even with JVM `actual` declarations present. A portable
+reduction using their real headers reproduces the same failure. The guard now
+respects the existing intrinsic identity and scalar ABI proof together;
+custom value classes and same-spelling user types do not gain that proof.
+Annotations, unsupported bounds and unresolved types remain guarded.
+
+After that fix, the JVM focused suite passes 11 tests and the implicit-receiver
+suite passes 73. The unchanged native manifest passes eight cases: all 16 RPCs
+match on their first response and all 17 semantic checks pass, including the
+private-setter negative with a useful same-phase control. The shared dev is
+SHA-256 `b86293a6cb243af4d77dfc58819d53c435f9831aaa56f36e3362e82eabbce571`.
+Operations complete, native exit is 0, all 21 immutable input guards are stable,
+EOF is observed and no owned processes remain or require termination.
+The failed native receipt remains preserved. Evidence is `E/setter-summary.json`
+and `E/coverage/native-setter-fixed{1,2}/receipt.json`. These are functional
+checks, not a performance comparison or complete Kotlin property coverage;
+inferred body properties and mixed derived accessor rename remain gaps.
 
 ## Integrated release first readiness and Neovim completion
 
@@ -277,10 +321,9 @@ and removes its old materialized text. Initial goto still reads the archive and
 walks its inventory before decoding the selected owner; this residual cost is
 not measured separately.
 The existing binary suite passes16 tests and JAR suite29. Evidence is
-`S/lazy-{red,green1,binary-suite,jar-suite,repeat-marker-green}.log`. This follow-up has no measured
-runtime improvement yet: the preceding release timings predate it. Its next
-check is the same native CEM probe and a fresh-LSP-cache release measurement
-in a separate quiet window. Without CPU samples, the relative cost of I/O,
+`S/lazy-{red,green1,binary-suite,jar-suite,repeat-marker-green}.log`. At this
+focused checkpoint, release timing was pending; the comparison below follows
+the native check. Without CPU samples, the relative cost of I/O,
 class decoding and parsing remains unmeasured.
 
 Shared immutable dev SHA-256
@@ -295,4 +338,52 @@ target hashes. These post-index goto targets use source markers, so this is
 not a native binary-only goto proof. The portable actual-class test supplies
 the binary-specific materialization coverage above. Evidence is
 `S/editor-original26-lazy-dev1/{summary,receipt}.json`. This dev run supplies
-functional evidence only; optimized-release performance remains pending.
+functional evidence only; optimized-release measurements follow.
+
+### Release120-6 comparison
+
+`T = C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda/cem-speed120-6`.
+The immutable optimized release is `native-integrated120-6/bin/ktlsp.exe`,
+SHA-256 `2a02365ab3eb974941f21f9d73f9e675cf92e4dc9eb8bf3129d1e7eba381e158`.
+The existing runner uses the same recovered CEM/JDK21/ordinary warm Gradle
+home, original eight assertions and500ms first-use polling. Cold starts with
+an absent LSP cache; warm/UI reuse exactly that cache, with no relocation or
+seed. Start process inventory contains zero heavy processes and peers held
+heavy work. All439 guards match before/after. Both corpus sessions pass8/8
+with first-response matching; all31 UI selections are accepted, one request
+each, with whole-buffer restoration and unchanged disk bytes. All three
+servers exit naturally with code0, EOF, no live or forcibly terminated owned
+processes. Failed1/missing sources3 remain coverage gaps.
+
+| Measurement | Release120-4 | Release120-6 | Prospective target / observation |
+| --- | ---: | ---: | --- |
+| Cold first useful completion, n=1 | 52.547s | 35.969s | <=30s: missed |
+| Full dependency-index span ends, n=1 | 78.362s | 56.696s | Reported separately |
+| Warm first useful completion, n=1 | 1.689s | 1.700s | <=3s: within target in this observation |
+| Warm RPC p95, n=30 | 16.547ms | 17.046ms | <=50ms: within target in this sample |
+| Input-to-menu p95, n=30 | 51.686ms | 51.228ms | <=100ms: within target in this sample |
+
+Current warm RPC p50/max are10.063/21.133ms; input-to-menu p50/max are
+43.158/54.600ms. The separate first-after-readiness UI sample is RPC9.924ms,
+input-to-menu43.822ms. Quantiles retain linear interpolation at `(n-1)*q`;
+menu timing ends at Neovim's notification handoff, not physical display.
+
+Cold first useful completion precedes the dependency-index span's end by
+20.727s. Create binary resolution still covers1627 files and takes1.284s,
+versus17.367s before; its end35.559s precedes the useful response35.969s.
+The full binary-preview phase takes12.541s, with Gradle dump29.279s and
+overlapping source query16.649s. These are wall-clock spans, not CPU samples.
+The observed cold reduction is31.55%, but this compares whole releases and
+does not isolate one patch or external Gradle state. Startup n=1 supplies no
+startup p95 or reproducible attainment, and the cold target remains unmet.
+Selected checks do not prove whole-index equivalence or IDEA parity. This
+CEM run does not measure the separate five-project target.
+
+Targets and conditions in `docs/fork-performance-budgets.md` were recorded
+before measurement. Root updated only its closing observation paragraph
+with a known Retrofit result after greenlight, before the actual guard
+capture (06:13:08.357UTC versus06:13:29.262UTC). Both sessions retain the same
+updated document hash. Reconstructing the prior closing paragraph reproduces
+the prepared hash exactly, proving the target table and conditions unchanged.
+Evidence: `T/{acceptance-plan,sessions-receipt,performance-summary,budget-guard-audit}.json`;
+raw first-use and UI observations remain in `T/{cold,warm-ui}/artifacts/`.
