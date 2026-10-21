@@ -89,11 +89,20 @@ unchanged50 first requests/98 checks, including applied rename, unsaved buffers
 and configuration invalidation. The upstream Mixin inputs match the previously
 compiled control; this run does not recompile that upstream control or verify
 game launch/remapping. Evidence: sdk-final120/verified-summary.json.
-The current Noarg FULL-codegen filter improves the OpenBase same-file case but
-still fails two serializer completions when the unfinished function is beside
-Model itself. A current compiler namespace is accepted, followed by a normalized
-source rejection (NotIndexedDeclaration); that shared admission gap is being
-fixed rather than counted as passing. Evidence: serialization120/editor-noarg1.
+The first Noarg FULL-codegen filter improves the OpenBase same-file case but
+still fails two serializer completions beside Model itself. The accepted current
+compiler namespace is followed by NotIndexedDeclaration: the source extractor
+incorrectly labels a top-level function as a class member. Normalization now
+retains top-level and extension-function declarations without that invalid member
+claim; the host validation contract stays unchanged. Actual FULL codegen filters
+out erroneous package parts/classes while retaining current plugin output from
+valid classes, original diagnostics and KAPT3 fallback. On joint devfe0977b6,
+all12 checks now pass: the original six plus current canonical syntax diagnostics
+and Java/Kotlin completion at both Model/OpenBase unsaved edit positions. Inputs
+and hook hash stay unchanged; shutdown is clean with no owned residuals. The two
+source-normalization tests, five profile tests and43 core extension tests pass.
+Producer completeness and diagnostic absence are not certified. Evidence:
+processor120/noarg-slice-summary.json and serialization120/editor-noarg2/receipt.json.
 
 ## Earlier120: development builds and functional baselines
 

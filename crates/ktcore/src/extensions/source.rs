@@ -150,6 +150,8 @@ fn extract_declarations(
         let jvm_property = (include_members && !java && symbol.kind == SymbolKind::Property)
             .then(|| kotlin_property_access(index, symbol, node, text, &annotations));
         let member = (include_members
+            && symbol.container.is_some()
+            && symbol.ext_receiver.is_none()
             && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Property))
         .then(|| {
             member_facts(

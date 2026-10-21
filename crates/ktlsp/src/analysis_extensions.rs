@@ -430,6 +430,42 @@ impl SourceInput {
 mod compiler_source_tests {
     use super::*;
 
+    #[test]
+    fn valid_class_declarations_survive_an_unfinished_sibling_function() {
+        let file = "/compiler-api/Model.kt";
+        let source = include_str!("../../ktcore/tests/fixtures/classfile/serialization/Model.kt");
+        for extension in [
+            "",
+            "fun Model.topLevelExtension() = this\nclass Owner { fun Model.memberExtension() = this }\n",
+        ] {
+            let edited = format!("{source}\n{extension}fun incompleteSameFile() = Model.\n");
+            let mut workspace = crate::workspace::Workspace::new();
+            workspace.open(file, source.into());
+            workspace.change(file, edited.clone());
+            let tree = crate::language::LanguageParsers::new().parse_for_key(file, &edited);
+            let facts = crate::language::extension_source_facts(&workspace.index, file, &tree, &edited);
+            assert!(facts.iter().any(|fact| !fact.annotations.is_empty()));
+            for name in ["incompleteSameFile", "topLevelExtension", "memberExtension"] {
+                if name != "incompleteSameFile" && extension.is_empty() {
+                    continue;
+                }
+                assert!(facts.iter().any(|fact| {
+                    edited.get(fact.definition.start_byte..fact.definition.end_byte) == Some(name)
+                        && fact.member.is_none()
+                }), "authored {name} declaration must survive without a class-member claim");
+            }
+            let mut store = ktcore::extensions::ExtensionStore::default();
+            let result = store.replace_source_declarations(
+                &workspace.index,
+                file,
+                Arc::from(edited),
+                Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]),
+                facts.clone(),
+            );
+            assert!(result.is_ok(), "{result:?}; {facts:?}");
+        }
+    }
+
     fn input(text: &str, value_namespace: bool) -> SourceInput {
         SourceInput {
             text: Arc::from(text),

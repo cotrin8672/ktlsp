@@ -92,8 +92,6 @@ private class PositiveExtension(private val original: CompilerConfiguration) : A
             check(files.map { key(File(it.virtualFile.path)) }.toSet() == expected.keys)
             files.forEach { check(sha(it.text.toByteArray(Charsets.UTF_8)) == expected.getValue(key(File(it.virtualFile.path)))) }
             val errors = context.diagnostics.all().filter { it.severity == Severity.ERROR }
-            val producers = files.filter { file -> errors.none { it.psiFile === file } &&
-                !org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil.hasErrorElements(file) }
             val classes = mutableListOf<Map<String, Any?>>()
             for (file in files) {
                 // An erroneous producer cannot certify its API; errors in a consumer retain their original diagnostics.
@@ -119,8 +117,21 @@ private class PositiveExtension(private val original: CompilerConfiguration) : A
             val configuration = original.copy().apply { put(JVMConfigurationKeys.DO_NOT_CLEAR_BINDING_CONTEXT, true) }
             fun generate(mode: ClassBuilderMode, selected: Collection<KtFile>): List<Triple<String, List<String>, ByteArray>> {
                 val reporter = DiagnosticReporterFactory.createReporter()
+                // A broken package part must not prevent actual plugin codegen for a valid sibling class.
                 val state = GenerationState.Builder(project, OriginCollectingClassBuilderFactory(mode), module, context, configuration)
-                    .isIrBackend(true).ignoreErrors(true).diagnosticReporter(reporter).build()
+                    .isIrBackend(true).ignoreErrors(true).diagnosticReporter(reporter)
+                    .generateDeclaredClassFilter(if (mode != ClassBuilderMode.FULL) GenerationState.GenerateClassFilter.GENERATE_ALL else object : GenerationState.GenerateClassFilter() {
+                        fun eligible(element: KtElement): Boolean =
+                            !org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil.hasErrorElements(element) &&
+                            errors.none { diagnostic -> diagnostic.psiFile === element.containingKtFile &&
+                                diagnostic.textRanges.any { element.textRange.intersects(it) } }
+                        override fun shouldGenerateClass(processingClassOrObject: KtClassOrObject) = eligible(processingClassOrObject)
+                        override fun shouldAnnotateClass(processingClassOrObject: KtClassOrObject) = eligible(processingClassOrObject)
+                        override fun shouldGenerateClassMembers(processingClassOrObject: KtClassOrObject) = eligible(processingClassOrObject)
+                        override fun shouldGeneratePackagePart(ktFile: KtFile) = eligible(ktFile)
+                        override fun shouldGenerateScript(script: KtScript) = false
+                        override fun shouldGenerateCodeFragment(script: KtCodeFragment) = false
+                    }).build()
                 return try {
                     KotlinCodegenFacade.compileCorrectFiles(selected, state,
                         JvmIrCodegenFactory(configuration, configuration.get(CLIConfigurationKeys.PHASE_CONFIG)))
@@ -130,7 +141,7 @@ private class PositiveExtension(private val original: CompilerConfiguration) : A
             }
             val headers = generate(ClassBuilderMode.KAPT3, files)
             check(bindingTrace.bindingContext === context && diagnostics() == before)
-            val full = try { generate(ClassBuilderMode.FULL, producers) } catch (failure: Throwable) {
+            val full = try { generate(ClassBuilderMode.FULL, files) } catch (failure: Throwable) {
                 facts["fullFailure"] = failure.javaClass.name + ": " + failure.message
                 emptyList()
             }
