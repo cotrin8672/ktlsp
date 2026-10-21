@@ -38,17 +38,13 @@ if not automatic_watches then
 end
 
 -- Redirect the build in the native shell so a reused Gradle daemon cannot retain the editor's
--- capture pipe. Every build has a real exit status and a bounded wait.
+-- capture pipe. Wait for the real exit; the outer owned runner handles interruption and cleanup.
 local runner = artifacts .. '/gradle-build.ps1'
 vim.fn.writefile(vim.split([=[param([string]$Project, [string]$Log)
 $buildArgs = '/d /c call ' + [char]34 + (Join-Path $Project 'gradlew.bat') + [char]34 + ' fixtureJars :app:classes --offline --console=plain --max-workers=2 > ' + [char]34 + $Log + [char]34 + ' 2>&1'
 $buildJob = Start-Process -FilePath $env:ComSpec -ArgumentList $buildArgs -WorkingDirectory $Project -WindowStyle Hidden -PassThru
 $processHandle = $buildJob.Handle
-if (-not $buildJob.WaitForExit(120000)) {
-    & taskkill.exe /PID $buildJob.Id /T /F | Out-Null
-    $buildJob.WaitForExit()
-    exit 124
-}
+$buildJob.WaitForExit()
 $buildExit = $buildJob.ExitCode
 if ($null -eq $buildExit) { throw 'Gradle process exit code unavailable' }
 exit $buildExit
@@ -63,7 +59,7 @@ local function build(phase)
       'gradle-reload', root .. '/gradlew', log }
   end
   local start = vim.uv.hrtime()
-  local result = vim.system(command, { cwd = root, text = true }):wait(125000)
+  local result = vim.system(command, { cwd = root, text = true }):wait()
   report.phases[#report.phases + 1] = { phase = phase, compile_exit = result.code,
     compile_signal = result.signal, elapsed_ms = (vim.uv.hrtime() - start) / 1e6,
     capture_stderr = result.stderr, log = log }

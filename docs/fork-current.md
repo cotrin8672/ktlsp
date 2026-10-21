@@ -30,9 +30,12 @@ The Java dangling-dot recovery fix now retains the original owner's independentl
 verified value-namespace proof when recovered declaration headers still match.
 It does not promote that proof to complete source members. The actual FULL-output
 host regression covers partial/dot with and without this proof; Root reruns it
-successfully. All-workspace formatting also passes. Native six-case verification
-with a binary containing this last fix remains pending. Evidence:
-serialization120/{dot-host-focused-receipt.json,root-dot-check.log}.
+successfully. All-workspace formatting also passes. Native editor7 now matches
+all six original Java/Kotlin golden, partial and dangling-dot first responses,
+with unchanged inputs, clean shutdown and no owned residuals. This uses the
+15s incremental dev build, not a release speed comparison. Evidence:
+serialization120/{dot-host-focused-receipt.json,root-dot-check.log,editor7/receipt.json}
+and serialization120/editor7-harness/artifacts/corpus-results.json.
 
 The release's six additional library cases pass5/6: Patchy and TypeTools both
 languages, and Kotlin Pair.first. Java Pair.getFirst completion and goto both
@@ -41,14 +44,37 @@ property is indexed, but its Java getter projection is missing; this is a real
 coverage gap, not evidence that missing source jars alone remove all library APIs.
 Evidence: cem-startup120/coverage/native-release1/harness/artifacts/corpus-results.json.
 
-Current-release five-project runs have closed Moshi9/9, OkHttp10/10 and
-Retrofit12/12, first attempts with clean shutdown and stable inputs. Gradle and
-Spring are still running. LiveGradle's first run performs a successful phase0
+Current-release five-project runs close all50 original first-response queries:
+Moshi9/9, OkHttp10/10, Retrofit12/12, Spring9/10 and Gradle4/9 raw matches.
+There are43 qualified matches, one unqualified negative whose known control
+fails, six semantic mismatches and zero unmeasured requests. Spring goto includes
+both Class<T> and ResolvableType overloads instead of the latter alone. Gradle's
+five known AtomicInteger completion requests return null; the independent
+compiler controls still establish the expected member. Every session closes
+cleanly with stable inputs. LiveGradle's first run performs a successful phase0
 build but reaches the harness's fixed120s build wait before any of its90 semantic
 checks. It is operationally incomplete, not90 semantic failures. The harness
 now waits for actual build exit; outer owned-process cleanup and semantic
-expectations remain unchanged. A separate rerun follows the remaining corpus runs.
-Evidence: oracle120/joint-{m,o,r,l}1/{receipt.json,operational-audit.json}.
+expectations remain unchanged. The separate joint-l2 rerun now passes90/90,
+including61 first requests and four actual Gradle builds, dependency/generated
+source replacement and removal, preserved unsaved Kotlin edits and Java Unicode
+diagnostic correction. Shutdown is clean; no forced or owned residuals remain.
+Evidence: oracle120/joint120-summary.json, joint-l2/receipt.json and
+C:/Users/gummy/.codex/ktlsp-oracle120/n/l2/harness/artifacts/gradle-reload.json.
+
+The current-release CEM main and incomplete sessions also pass all26 assertions
+on11 first requests, with439 input guards stable, clean exit and no forced
+termination. Source coverage still records three missing sources and one failed
+source lookup; the additional library probes above distinguish API coverage.
+Evidence: cem-startup120/editor-original26-release1/summary.json.
+
+The processor54 release run reaches49 passing checks, one missing Java obsolete-
+API diagnostic and four unrun Kotlin checks. Its first cold observer script and
+configuration consume94s before the26s producer DAG, then the observation window
+initiates shutdown. This does not prove a producer hang or Kotlin acceptance.
+A warm functional rerun and the Java diagnostic investigation are in progress;
+the original114 remains unverified. Evidence:
+processor120/phase54-release120-2-originalhome/closed-specific-reasons.json.
 
 Commit a886d2b reduces dev debug information while retaining workspace panic
 file/line data. Release optimization and linker settings are unchanged. Three
