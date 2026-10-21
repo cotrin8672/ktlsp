@@ -36,14 +36,41 @@ preview falls from17.367s to1.284s, while Gradle dump now takes29.279s and remai
 the dominant cold cost. No startup p95 or universal speedup is established.
 Evidence: cem-speed120-6/{performance-summary.json,sessions-receipt.json}.
 
+The user subsequently lowered cold startup's priority and requested warm startup
+under1s. Thus1.700s is still an improvement target, despite meeting the former3s
+budget; cold30s is a lower-priority aspiration. Next speed work profiles warm
+startup's actual critical path rather than treating a faster request RPC as a
+substitute for startup.
+
 The budget document's observed-result paragraph changed between preparation and
 the actual run, before its input capture; both runs' before/after hashes match.
 The target table and comparison conditions are byte-identical. Evidence:
 cem-speed120-6/budget-guard-audit.json. The quiet Retrofit replay also passes with
 unchanged guards and normal shutdown:
 oracle120/retrofit1752-release6-quiet1/receipt.json. Next: inferred-getter shared
-inference, the dominant Gradle cold cost and the remaining IDEA probes. Keep
+inference, warm startup under1s and the remaining IDEA probes. Keep
 compiler/control failures and native REDs below.
+
+## IDEA follow-up120
+
+The original Gradle9 cases now all match on their first request, including the
+constructor completion, five AtomicInteger cases and the negative whose known
+receiver control now succeeds. The engine is the pinned ILS-263.6379.0 server;
+execution-authority.json binds its process image/job, launcher/plugin/import
+hashes and initialize response. The old ktlsp binary field in the shared receipt
+is unused bookkeeping, not the executed server. Original receipts are preserved.
+Both harness stages remain operationally incomplete because shutdown requested
+forced termination. Evidence:
+idea-followup120/gradle1/{qualified-summary.json,execution-authority.json}.
+
+The separate CEM property-form auxiliary case also completes one actual insertion:
+raw breakSpeed item, resolve/apply command and workspace edit produce exactly
+`return super.breakSpeed * (efficiencyLevel + 1)`, with the expected whole-buffer
+hash and unchanged disk. This is one new request, not a replacement for the
+preserved failed31-sample getBreakSpeed-method expectation. The native ILS exits0;
+an exact-identity RTK tail wrapper needs cleanup, and the run is still classified
+as an operational failure. All owned handles/processes are closed. Evidence:
+idea-followup120/cem-property1/{verified-summary.json,rtk-root-operational-termination.json}.
 
 ## Earlier120 integration queue
 

@@ -1,5 +1,7 @@
 # Performance targets for the next release comparison
 
+User priority update: cold startup is lower priority; warm first useful startup
+under1s is the requested improvement. The former3s warm target below is superseded.
 These are prospective editing targets on the originating Windows machine, not
 semantic correctness deadlines or universal hardware requirements. Record results
 even when a target is missed; a slow useful answer is not a semantic failure and
@@ -15,8 +17,8 @@ and the recovered-index file-lookup fix.
 
 | Measured behavior | Next-release target | Required interpretation |
 | --- | --- | --- |
-| CEM cold first useful completion | <=30s | Fresh LSP cache, existing Gradle artifact home; also report full-index time separately |
-| CEM warm first useful completion | <=3s | Reuse the exact cache from the cold run |
+| CEM cold first useful completion | <=30s, lower-priority aspiration | Fresh LSP cache, existing Gradle artifact home; also report full-index time separately |
+| CEM warm first useful completion | <1s | Reuse the exact cache from the cold run; previously <=3s |
 | CEM warm useful RPCs, n=30 | p95 <=50ms | Keep every observation and report p50/p95/max |
 | CEM input-to-menu handoff, n=30 | p95 <=100ms | Inspect actual accepted text and restore the whole buffer; this is not pixel-display timing |
 | Original five-project completion cases | Each <=100ms after readiness | First response only, unchanged semantic expectations; report startup/producer waiting separately |
@@ -35,7 +37,8 @@ normally with unchanged guards and no owned residuals. This demonstrates this
 case's improvement, not a latency distribution or the remaining cases' targets.
 Evidence: oracle120/retrofit1752-release6-quiet1/receipt.json.
 
-The new CEM run observes35.969s cold (MISS),1.700s warm (within target), warm30
+The new CEM run observes35.969s cold (above the lower-priority aspiration),1.700s
+warm (met the old3s target, misses the new1s goal), warm30
 RPC p95 17.046ms and menu p95 51.228ms (within targets). All expected results,
 actual UI insertions, unchanged guards and normal shutdown are retained. These
 finite observations establish neither a startup distribution nor the entire
