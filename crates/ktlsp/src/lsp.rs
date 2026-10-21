@@ -511,6 +511,7 @@ struct IndexedDependencyFile {
 }
 
 struct DependencyResult {
+    jdk_parse_plan: Option<crate::deps::JdkParsePlan>,
     coord: Option<crate::coords::Coordinate>,
     label: String,
     batches: Vec<crate::deps::FileSymbols>,
@@ -598,6 +599,7 @@ fn spawn_jdk_shard_workers(
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("JDK index worker panicked")));
                 let result = match resolved {
                     Ok(batches) => DependencyResult {
+                        jdk_parse_plan: None,
                         coord: None,
                         label: format!("JDK sources (shard {shard}/{shards})"),
                         batches,
@@ -612,6 +614,7 @@ fn spawn_jdk_shard_workers(
                     Err(error) => {
                         tracing::warn!(%error, shard, "JDK source indexing failed");
                         DependencyResult {
+                            jdk_parse_plan: None,
                             coord: None,
                             label: format!("JDK sources (shard {shard}/{shards})"),
                             batches: Vec::new(),
@@ -663,6 +666,7 @@ fn spawn_sdk_api_worker(
                 }
             };
             let _ = tx.send(DependencyResult {
+                jdk_parse_plan: None,
                 coord: None,
                 label: "selected SDK API signatures".into(),
                 batches,
@@ -678,22 +682,53 @@ fn spawn_sdk_api_worker(
         .is_ok()
 }
 
-/// Cached-JDK fast path: no parsing, so a single result carries the whole symcache load.
-fn spawn_jdk_cached_worker(
-    batches: Vec<crate::deps::FileSymbols>,
+type JdkPlanner =
+    dyn Fn(&std::path::Path, &std::path::Path) -> Option<crate::deps::JdkIndexPlan> + Send + Sync;
+
+fn spawn_jdk_plan_worker<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    source: PathBuf,
+    extract_root: PathBuf,
     origin: String,
+    generation: u64,
+    planner: Arc<JdkPlanner>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) -> bool {
     std::thread::Builder::new()
-        .name("ktlsp-jdk-index".to_string())
+        .name("ktlsp-jdk-plan".to_string())
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
+        .spawn_scoped(scope, move || {
+            let started = crate::trace::enabled().then(Instant::now);
+            let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                planner(&source, &extract_root)
+            }))
+            .unwrap_or_else(|_| {
+                tracing::warn!(%origin, "JDK index planning worker panicked");
+                None
+            });
+            if let Some(started) = started {
+                crate::trace::span(
+                    "deps.jdk_plan",
+                    "deps",
+                    started,
+                    serde_json::json!({"generation":generation, "origin":origin,
+                        "available":plan.is_some(),
+                        "cached":matches!(&plan, Some(crate::deps::JdkIndexPlan::Cached(_)))}),
+                );
+            }
+            let failed = plan.is_none();
+            let (jdk_parse_plan, batches) = match plan {
+                Some(crate::deps::JdkIndexPlan::Cached(batches)) => (None, batches),
+                Some(crate::deps::JdkIndexPlan::Parse(plan)) => (Some(plan), Vec::new()),
+                None => (None, Vec::new()),
+            };
             let _ = tx.send(DependencyResult {
+                jdk_parse_plan,
                 coord: None,
                 label: "JDK sources".to_string(),
                 batches,
                 discovered: Vec::new(),
-                failed: false,
+                failed,
                 skipped: false,
                 missing_source: false,
                 jdk: true,
@@ -743,6 +778,7 @@ fn spawn_local_jar_index_worker(
             .unwrap_or_else(|_| Err(anyhow::anyhow!("local artifact index worker panicked")));
             let result = match resolved {
                 Ok((batches, missing_source)) => DependencyResult {
+                    jdk_parse_plan: None,
                     coord: None,
                     label,
                     failed: false,
@@ -757,6 +793,7 @@ fn spawn_local_jar_index_worker(
                 Err(error) => {
                     tracing::warn!("index {label} failed: {error:#}");
                     DependencyResult {
+                        jdk_parse_plan: None,
                         coord: None,
                         label,
                         batches: Vec::new(),
@@ -941,6 +978,7 @@ fn spawn_coordinate_index_worker(
             }));
             let result = match resolved {
                 Ok((batches, failed, discovered, skipped, missing_source)) => DependencyResult {
+                    jdk_parse_plan: None,
                     coord: Some(coord),
                     label,
                     failed,
@@ -953,6 +991,7 @@ fn spawn_coordinate_index_worker(
                     local_origin: None,
                 },
                 Err(_) => DependencyResult {
+                    jdk_parse_plan: None,
                     coord: Some(coord),
                     label,
                     batches: Vec::new(),
@@ -1113,6 +1152,34 @@ fn index_dependency_model(
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
     binary_only: bool,
 ) -> DepStats {
+    std::thread::scope(|scope| {
+        index_dependency_model_with_jdk_plan(
+            scope,
+            ws,
+            root,
+            model,
+            gradle,
+            generation,
+            progress,
+            binary_only,
+            dependency_index_threads(),
+            Arc::new(crate::deps::plan_jdk_index),
+        )
+    })
+}
+
+fn index_dependency_model_with_jdk_plan<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    ws: &Arc<Mutex<Workspace>>,
+    root: &std::path::Path,
+    model: Option<Arc<classpath::ProjectSnapshot>>,
+    gradle: bool,
+    generation: u64,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
+    binary_only: bool,
+    max_workers: usize,
+    planner: Arc<JdkPlanner>,
+) -> DepStats {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     use crate::artifacts::Repos;
@@ -1168,7 +1235,6 @@ fn index_dependency_model(
         ..Default::default()
     };
     const MAX_DEPENDENCY_COORDINATES: usize = 1024;
-    let max_workers = dependency_index_threads();
     let indexed_sources = std::sync::Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
     let (tx, rx) = std::sync::mpsc::channel::<DependencyResult>();
     let mut active = 0usize;
@@ -1182,7 +1248,8 @@ fn index_dependency_model(
         batches: Vec<deps::FileSymbols>,
     }
     let mut jdk_states: BTreeMap<String, JdkShardState> = BTreeMap::new();
-    let mut jdk_pending = VecDeque::new();
+    let mut jdk_pending: VecDeque<(String, deps::JdkParsePlan)> = VecDeque::new();
+    let mut jdk_plans = VecDeque::new();
     let mut jdk_origins = jdk_sources
         .iter()
         .map(|source| classpath::jdk_origin_id(source))
@@ -1213,24 +1280,12 @@ fn index_dependency_model(
             serde_json::json!({"generation":generation, "archive":source, "origin":origin, "authoritative":authoritative}),
         );
         if !ws.lock().dependency_origin_complete(origin) {
-            let plan_started = crate::trace::enabled().then(Instant::now);
-            let plan = deps::plan_jdk_index(&source, &extract_root);
-            if let Some(started) = plan_started {
-                crate::trace::span(
-                    "deps.jdk_plan",
-                    "deps",
-                    started,
-                    serde_json::json!({"generation":generation, "origin":origin, "available":plan.is_some(),
-                        "cached":matches!(&plan, Some(deps::JdkIndexPlan::Cached(_)))}),
-                );
-            }
-            if let Some(plan) = plan {
-                jdk_pending.push_back((origin.clone(), plan));
-            }
+            jdk_plans.push_back((source, origin.clone()));
         }
     }
 
     while active > 0
+        || !jdk_plans.is_empty()
         || !jdk_pending.is_empty()
         || !sdk_api_pending.is_empty()
         || !local_jars.is_empty()
@@ -1239,6 +1294,7 @@ fn index_dependency_model(
         if !ws.lock().is_current_generation(generation) {
             queue.clear();
             local_jars.clear();
+            jdk_plans.clear();
             jdk_pending.clear();
             sdk_api_pending.clear();
         }
@@ -1251,10 +1307,23 @@ fn index_dependency_model(
                 }
                 continue;
             }
-            let jdk_slots = jdk_pending.front().map(|(_, plan)| match plan {
-                deps::JdkIndexPlan::Cached(_) => 1,
-                deps::JdkIndexPlan::Parse(_) => jdk_shards,
-            });
+            if let Some((source, origin)) = jdk_plans.pop_front() {
+                if spawn_jdk_plan_worker(
+                    scope,
+                    source,
+                    extract_root.clone(),
+                    origin,
+                    generation,
+                    planner.clone(),
+                    tx.clone(),
+                ) {
+                    active += 1;
+                } else {
+                    stats.failed += 1;
+                }
+                continue;
+            }
+            let jdk_slots = (!jdk_pending.is_empty()).then_some(jdk_shards);
             if jdk_slots.is_some_and(|slots| slots <= max_workers - active) {
                 let (origin, plan) = jdk_pending.pop_front().unwrap();
                 if let Some(progress) = progress {
@@ -1264,38 +1333,27 @@ fn index_dependency_model(
                         "JDK sources".to_string(),
                     ));
                 }
-                match plan {
-                    deps::JdkIndexPlan::Cached(batches) => {
-                        if spawn_jdk_cached_worker(batches, origin, tx.clone()) {
-                            active += 1;
-                        } else {
-                            stats.failed += 1;
-                        }
-                    }
-                    deps::JdkIndexPlan::Parse(plan) => {
-                        let spawned = spawn_jdk_shard_workers(
-                            plan.clone(),
-                            origin.clone(),
-                            jdk_shards,
-                            generation,
-                            tx.clone(),
-                        );
-                        if spawned < jdk_shards {
-                            stats.failed += 1;
-                        }
-                        if spawned > 0 {
-                            jdk_states.insert(
-                                origin,
-                                JdkShardState {
-                                    pending: spawned,
-                                    failed: spawned < jdk_shards,
-                                    plan,
-                                    batches: Vec::new(),
-                                },
-                            );
-                            active += spawned;
-                        }
-                    }
+                let spawned = spawn_jdk_shard_workers(
+                    plan.clone(),
+                    origin.clone(),
+                    jdk_shards,
+                    generation,
+                    tx.clone(),
+                );
+                if spawned < jdk_shards {
+                    stats.failed += 1;
+                }
+                if spawned > 0 {
+                    jdk_states.insert(
+                        origin,
+                        JdkShardState {
+                            pending: spawned,
+                            failed: spawned < jdk_shards,
+                            plan,
+                            batches: Vec::new(),
+                        },
+                    );
+                    active += spawned;
                 }
                 continue;
             }
@@ -1401,10 +1459,16 @@ fn index_dependency_model(
             continue;
         }
 
-        let Ok(result) = rx.recv() else {
+        let Ok(mut result) = rx.recv() else {
             break;
         };
         active = active.saturating_sub(1);
+        if let Some(plan) = result.jdk_parse_plan.take() {
+            if ws.lock().is_current_generation(generation) {
+                jdk_pending.push_back((result.local_origin.unwrap(), plan));
+            }
+            continue;
+        }
         completed += 1;
 
         if result.jdk
@@ -5588,6 +5652,133 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&classpath::snapshot(&root).unwrap(), &enriched));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jdk_cache_planning_overlaps_useful_modules_and_joins_stale_results() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for superseded in [false, true] {
+            let (root, ws, accepted, _) = source_query_overlap_fixture(if superseded {
+                "jdk-plan-stale"
+            } else {
+                "jdk-plan-overlap"
+            });
+            let home = root.join("jdk17");
+            std::fs::create_dir_all(home.join("lib")).unwrap();
+            std::fs::write(home.join("release"), "JAVA_VERSION=\"17.0.1\"\n").unwrap();
+            let src = home.join("lib/src.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&src).unwrap());
+            zip.start_file(
+                "java.base/java/lang/PlannerJdk.java",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"package java.lang; public class PlannerJdk { public int value; }")
+                .unwrap();
+            zip.finish().unwrap();
+            let extract_root = crate::deps::extract_root();
+            let mut kotlin = crate::parser::KotlinParser::new();
+            let mut java = crate::java::JavaParser::new();
+            assert_eq!(
+                crate::deps::resolve_jdk_sources(&src, &extract_root, &mut kotlin, &mut java).len(),
+                1
+            );
+            assert!(matches!(
+                crate::deps::plan_jdk_index(&src, &extract_root),
+                Some(crate::deps::JdkIndexPlan::Cached(_))
+            ));
+
+            let mut modules = accepted.modules.clone();
+            modules[0].source_sets[0].compiler_tasks.push(serde_json::from_value(serde_json::json!({
+                "task":":app:compileJava", "language":"java",
+                "task_type":"org.gradle.api.tasks.compile.JavaCompile_Decorated",
+                "arguments":[], "annotation_processor_path":[], "source_files":[],
+                "classpath":[root.join("api.jar")], "java_home":home, "output_roots":[], "complete":true, "problem":null,
+                "options":{"fork":false,"forkJavaHome":null,"forkExecutable":null,"forkJvmArgs":[],
+                    "release":null,"bootstrapClasspath":null,"javaCompilerRecipe":{
+                        "adapter":"gradle-7.4.2-current-jdk17-javac-api-v1",
+                        "compiler_type":"org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler",
+                        "java_runtime_version":"17.0.1","language_version":"17",
+                        "gradle_java_version":"17.0.7","gradle_file_encoding":"UTF-8",
+                        "effective_charset":"UTF-8","locale":"en-US","api_options":[]}}
+            })).unwrap());
+            let model = Arc::new(classpath::ProjectSnapshot::new(modules));
+            assert_eq!(model.selected_jdk_sources(), [src.clone()]);
+            let source =
+                "package probe; import fieldfixture.FieldOnly; class Use { FieldOnly value; }";
+            let key = crate::paths::file_key(&root.join("Use.java"));
+            ws.lock().set_project_model(model.clone());
+            ws.lock().open(&key, source.into());
+            let generation = ws.lock().analysis_generation();
+            let (entered, pending) = std::sync::mpsc::sync_channel(1);
+            let (release, blocked) = std::sync::mpsc::sync_channel(1);
+            let blocked = Arc::new(Mutex::new(blocked));
+            let exited = Arc::new(AtomicBool::new(false));
+            let planner_exited = exited.clone();
+            let planner: Arc<JdkPlanner> = Arc::new(move |src, extract_root| {
+                entered.send(()).unwrap();
+                blocked.lock().recv().unwrap();
+                let plan = crate::deps::plan_jdk_index(src, extract_root);
+                planner_exited.store(true, Ordering::Release);
+                plan
+            });
+            let worker_ws = ws.clone();
+            let worker_root = root.clone();
+            let worker = std::thread::spawn(move || {
+                std::thread::scope(|scope| {
+                    index_dependency_model_with_jdk_plan(
+                        scope,
+                        &worker_ws,
+                        &worker_root,
+                        Some(model),
+                        true,
+                        generation,
+                        None,
+                        true,
+                        2,
+                        planner,
+                    )
+                })
+            });
+            let began = pending.recv_timeout(Duration::from_secs(10)).is_ok();
+            // Observe publication, not repeated content requests, while the planner is gated.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while ws.lock().index.lookup_by_name("FieldOnly").is_empty()
+                && !worker.is_finished()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let useful = !ws
+                .lock()
+                .goto_definition(&key, source.rfind("FieldOnly").unwrap())
+                .is_empty();
+            let owned = !worker.is_finished();
+            let origin = classpath::jdk_origin_id(&src);
+            let unpublished = !ws.lock().dependency_origin_complete(&origin);
+            if superseded {
+                ws.lock().begin_analysis_generation();
+            }
+            release.send(()).ok();
+            let stats = worker.join().unwrap();
+            assert!(
+                began && useful,
+                "module navigation must work while JDK cache planning is blocked"
+            );
+            assert!(
+                owned && unpublished,
+                "the planner must remain owned and unpublished until released"
+            );
+            assert!(exited.load(Ordering::Acquire));
+            assert_eq!(stats.jdk_complete, !superseded);
+            assert_eq!(ws.lock().dependency_origin_complete(&origin), !superseded);
+            assert_eq!(
+                !ws.lock().index.lookup_by_name("PlannerJdk").is_empty(),
+                !superseded
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
