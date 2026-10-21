@@ -246,8 +246,10 @@ impl MemberName<'_> {
         self.matches(name)
             || matches!(self, Self::JvmPrefix(_))
                 && kind == crate::symbol::SymbolKind::Property
-                && crate::jvm::property_getter_name(name)
+                && (crate::jvm::property_getter_name(name)
                     .is_some_and(|getter| self.matches(&getter))
+                    || crate::jvm::property_setter_name(name)
+                        .is_some_and(|setter| self.matches(&setter)))
     }
 }
 

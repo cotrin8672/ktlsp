@@ -191,6 +191,15 @@ owner identity, class bounds and method Signature are negative controls.
 This admits selected Java getter calls without treating unknown annotations
 as a complete Kotlin or JVM member surface.
 
+`kotlin240/VarBox.class` is Kotlin 2.4.0/JDK 21 output for the original
+`settercontrol.Box<T>` in the paired `VarProperties.kt` (original filename
+`Properties.kt`). `var-provenance.json` pins both hashes. Independent Javac
+accepts the String setter, override and is-prefix controls, and rejects Int
+arguments, a String result from the void setter, and private setter calls.
+The Rust witness test checks `(Ljava/lang/Object;)V`, `(TT;)V`, the declaring
+class identity and public instance flags; altered signatures/flags/returns
+remain rejected. The fixture contains no compiler plugin.
+
 
 ## Field-only public member fixture
 

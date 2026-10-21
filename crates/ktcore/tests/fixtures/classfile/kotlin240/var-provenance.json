@@ -1,0 +1,11 @@
+{
+  "description": "Ordinary generic mutable source property, compiled independently with Kotlin2.4.0/JDK21; original class name settercontrol.Box, original source filename Properties.kt. Stored fixture filenames avoid namespace confusion with the actual Pair stdlib fixture.",
+  "compiler": "org.jetbrains.kotlin:kotlin-compiler-embeddable:2.4.0",
+  "jdk": "21.0.3",
+  "positive_java_compile_exit": 0,
+  "kotlin_compile_exit": 0,
+  "files": {
+    "VarBox.class": "cb9c1a8201c1f98bd95762df8759fbc9a8ec8a39a3314d90753abb46514206b5",
+    "VarProperties.kt": "917dfa2725321aeeca97fe085331e31dd0ada6d1fd2d9a90f77c7446a91bac4f"
+  }
+}

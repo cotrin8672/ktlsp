@@ -182,10 +182,19 @@ impl<'a> CallableCandidate<'a> {
         let ctx = FileCtx::new(source.facts.package.clone(), Vec::new());
         let mut descriptor = "(".to_string();
         for ty in &facts.params {
-            descriptor.push_str(&erased_descriptor(index, ty, &ctx, &facts.type_params)?);
+            descriptor.push_str(&source_value_descriptor(index, facts, ty, &ctx)?);
         }
         descriptor.push(')');
-        descriptor.push_str(&getter_return_descriptor(index, facts, &ctx)?);
+        if property_setter(facts) {
+            descriptor.push('V');
+        } else {
+            descriptor.push_str(&source_value_descriptor(
+                index,
+                facts,
+                &facts.return_type,
+                &ctx,
+            )?);
+        }
         let origin_id = index
             .origin_facts()
             .and_then(|origins| origins.file_origin(&source.file))
@@ -248,7 +257,7 @@ impl SourceFile {
     }
 }
 
-fn getter_property<'a>(
+fn source_property_entry<'a>(
     index: &'a dyn InferenceIndex,
     source: &SourceFile,
     facts: &CallableFacts,
@@ -272,32 +281,54 @@ fn getter_property<'a>(
     Some(*entry)
 }
 
-fn getter_return_descriptor(
+fn source_value_descriptor(
     index: &dyn InferenceIndex,
     facts: &CallableFacts,
+    ty: &TypeRef,
     ctx: &FileCtx,
 ) -> Option<String> {
     if facts.source_property.as_ref().is_some_and(|property| {
-        facts.return_type.qualification.is_none()
-            && property.type_params.contains(&facts.return_type.name)
+        ty.qualification.is_none() && property.type_params.contains(&ty.name)
     }) {
         // The source producer admits only unbounded class parameters here.
         return Some("Ljava/lang/Object;".into());
     }
     if facts.source_property.is_some() {
-        let resolved = infer::declared_type(index, &facts.return_type, ctx);
-        if index.lookup_type(resolved.name()?).iter().any(|entry| {
-            Some(entry.sym.package.as_str()) == resolved.package()
-                && entry.sym.container.as_deref() == resolved.container()
-                && entry.sym.source_member.jvm_restricted()
-        }) {
+        let resolved = infer::declared_type(index, ty, ctx);
+        let mut non_nullable = ty.clone();
+        non_nullable.nullable = false;
+        let scalar_abi = infer::is_intrinsic_type_ref(index, ty, ctx)
+            && crate::extensions::source::source_scalar_jvm_type(
+                index,
+                &non_nullable,
+                ctx,
+                false,
+                &facts.type_params,
+            )
+            .is_some();
+        if !scalar_abi
+            && index.lookup_type(resolved.name()?).iter().any(|entry| {
+                Some(entry.sym.package.as_str()) == resolved.package()
+                    && entry.sym.container.as_deref() == resolved.container()
+                    && entry.sym.source_member.jvm_restricted()
+            })
+        {
             return None;
         }
     }
-    erased_descriptor(index, &facts.return_type, ctx, &facts.type_params)
+    erased_descriptor(index, ty, ctx, &facts.type_params)
 }
 
-fn getter_is_admitted(
+fn property_setter(facts: &CallableFacts) -> bool {
+    facts.source_property.is_some()
+        && facts.params.len() == 1
+        && facts.return_type.name == "Unit"
+        && facts.return_type.qualification.as_deref() == Some("kotlin")
+        && !facts.return_type.nullable
+        && facts.return_type.args.is_empty()
+}
+
+fn property_accessor_is_admitted(
     index: &dyn InferenceIndex,
     source: &SourceFile,
     facts: &CallableFacts,
@@ -308,7 +339,7 @@ fn getter_is_admitted(
     let Some(property) = &facts.source_property else {
         return false;
     };
-    let Some(entry) = getter_property(index, source, facts) else {
+    let Some(entry) = source_property_entry(index, source, facts) else {
         return false;
     };
     if !crate::members::member_accessible_at(index, receiver, entry, ctx, position) {
@@ -325,24 +356,15 @@ fn getter_is_admitted(
     if owner.path.as_ref() != source.file {
         return false;
     }
-    if getter_return_descriptor(
-        index,
-        facts,
-        &FileCtx::new(source.facts.package.clone(), Vec::new()),
-    )
-    .is_none()
-    {
-        return false;
-    }
-    let Some(class) = index.java_class_inventory(owner) else {
-        return !property.requires_binary_witness;
-    };
     let Some(identity) = (CallableCandidate::Jvm {
         owner: JvmOwner::Source(source),
         facts,
     })
     .identity(index) else {
         return false;
+    };
+    let Some(class) = index.java_class_inventory(owner) else {
+        return !property.requires_binary_witness;
     };
     if class.identity.internal_name != identity.class.internal_name {
         return false;
@@ -388,13 +410,26 @@ fn getter_is_admitted(
     }) else {
         return false;
     };
+    let same_type = |left: &TypeRef, right: &TypeRef| {
+        left.name == right.name
+            && left.qualification == right.qualification
+            && left.args == right.args
+    };
     projected.type_parameters.is_empty()
-        && projected.parameters.is_empty()
-        && projected.returns.as_ref().is_some_and(|ty| {
-            ty.name == facts.return_type.name
-                && ty.qualification == facts.return_type.qualification
-                && ty.args == facts.return_type.args
-        })
+        && projected.parameters.len() == facts.params.len()
+        && projected
+            .parameters
+            .iter()
+            .zip(&facts.params)
+            .all(|(left, right)| same_type(left, right))
+        && if property_setter(facts) {
+            projected.returns.is_none()
+        } else {
+            projected
+                .returns
+                .as_ref()
+                .is_some_and(|ty| same_type(ty, &facts.return_type))
+        }
 }
 
 /// Never invent Object erasure for unresolved source types. Suspend lowering inserts its verified
@@ -665,7 +700,9 @@ pub(crate) fn member_candidates_from<'a>(
                                 definition.start_byte == entry.sym.start_byte
                                     && definition.end_byte == entry.sym.end_byte
                             })
-                            && getter_is_admitted(index, source, facts, receiver, ctx, position)
+                            && property_accessor_is_admitted(
+                                index, source, facts, receiver, ctx, position,
+                            )
                     })
                     .map(|facts| CallableCandidate::Jvm {
                         owner: JvmOwner::Source(source),
@@ -1220,6 +1257,17 @@ pub fn select_call<'a>(
                             let Some(ty) = facts.params.get(position) else {
                                 return Type::Unknown;
                             };
+                            if let JvmOwner::Source(source) = owner {
+                                if let Some(entry) = source_property_entry(index, source, facts) {
+                                    return infer::declared_member_type(
+                                        index,
+                                        receiver,
+                                        entry,
+                                        ty,
+                                        &declaration_ctx,
+                                    );
+                                }
+                            }
                             if ty.qualification.is_none() && facts.type_params.contains(&ty.name) {
                                 Type::Unknown
                             } else {
@@ -1318,7 +1366,7 @@ pub fn projected_return_type_in_context(
         facts,
     } = candidate
     {
-        if let Some(entry) = getter_property(index, source, facts) {
+        if let Some(entry) = source_property_entry(index, source, facts) {
             let result =
                 infer::declared_member_type(index, receiver, entry, &facts.return_type, ctx);
             return (!matches!(result, Type::Unknown)).then_some(result);
@@ -1619,7 +1667,7 @@ pub fn source_facts(
         let Some(name) = property_getter_name(&symbol.name) else {
             continue;
         };
-        callables.push(CallableFacts {
+        let getter = CallableFacts {
             name,
             params: Vec::new(),
             return_type,
@@ -1638,7 +1686,32 @@ pub fn source_facts(
                 type_params: owner.type_params.clone(),
                 requires_binary_witness,
             }),
+        };
+        let mutable = node
+            .children(&mut node.walk())
+            .any(|child| child.kind() == "var");
+        let public_setter = child_of_kind(node, "setter").is_none_or(|setter| {
+            !setter
+                .children(&mut setter.walk())
+                .filter(|child| child.kind() != "function_body")
+                .any(|child| child.has_error() || child.is_missing())
+                && child_of_kind(setter, "modifiers").is_none_or(|modifiers| {
+                    !modifiers
+                        .named_children(&mut modifiers.walk())
+                        .any(|child| child.kind() == "annotation")
+                        && node_text(modifiers, text)
+                            .split_whitespace()
+                            .all(|word| word == "public")
+                })
         });
+        if mutable && public_setter {
+            let mut setter = getter.clone();
+            setter.name = property_setter_name(&symbol.name).unwrap();
+            setter.params.push(setter.return_type.clone());
+            setter.return_type = scope.type_ref("kotlin.Unit", false, Vec::new());
+            callables.push(setter);
+        }
+        callables.push(getter);
     }
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1667,6 +1740,18 @@ pub(crate) fn property_getter_name(name: &str) -> Option<String> {
             chars.as_str()
         ))
     }
+}
+
+pub(crate) fn property_setter_name(name: &str) -> Option<String> {
+    let getter = property_getter_name(name)?;
+    Some(format!(
+        "set{}",
+        if getter == name {
+            &getter[2..]
+        } else {
+            &getter[3..]
+        }
+    ))
 }
 
 /// Accept only a whole, plain JVM-name annotation; spelling substrings are not semantic names.
@@ -1936,6 +2021,50 @@ mod tests {
             member_candidates(&inventory, &pair, "getFirst").is_empty(),
             "unknown class annotation needs a witness"
         );
+
+        let text = include_str!("../tests/fixtures/classfile/kotlin240/VarProperties.kt");
+        let file = "/setter/Properties.kt";
+        let tree = parser.parse(text);
+        let symbols = indexer::extract_symbols(&tree, text, "settercontrol");
+        let facts = source_facts(file, &tree, text, &symbols).unwrap();
+        inventory.index = Index::new();
+        inventory.index.replace_file(file, symbols, Tier::Durable);
+        inventory
+            .index
+            .replace_jvm_source(file, Some(facts), Tier::Durable);
+        let actual = crate::classfile::decode(
+            "fixture:kotlin-2.4.0",
+            include_bytes!("../tests/fixtures/classfile/kotlin240/VarBox.class"),
+        )
+        .unwrap();
+        inventory.class = Some(Arc::new(actual.clone()));
+        let receiver = Type::class("Box", Some("settercontrol".into()));
+        let candidates = member_candidates(&inventory, &receiver, "setValue");
+        let [setter] = candidates.as_slice() else {
+            panic!("actual generic Box setter witness")
+        };
+        let identity = setter.identity(&inventory).unwrap();
+        assert_eq!(identity.class.internal_name, "settercontrol/Box");
+        assert_eq!(identity.descriptor, "(Ljava/lang/Object;)V");
+        for change in 0..4 {
+            let mut changed = actual.clone();
+            let setter = changed
+                .methods
+                .iter_mut()
+                .find(|method| method.name.as_ref() == "setValue")
+                .unwrap();
+            match change {
+                0 => setter.access_flags |= 0x0008,
+                1 => setter.access_flags = 0x0002,
+                2 => setter.signature = Some("(Ljava/lang/String;)V".into()),
+                _ => setter.descriptor = "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
+            }
+            inventory.class = Some(Arc::new(changed));
+            assert!(
+                member_candidates(&inventory, &receiver, "setValue").is_empty(),
+                "invalid setter witness {change}"
+            );
+        }
     }
 
     #[test]
@@ -1957,6 +2086,7 @@ mod tests {
             "class Box { val String.value: Int get() = 1 }",
             "class Box { val value = 1 }",
             "@JvmInline value class Token(val raw: Int)\nclass Box { val value: Token = Token(1) }",
+            "@JvmInline value class String(val raw: Int)\nclass Box(var value: String)",
         ] {
             let text = format!("package getter\n{declaration}\n");
             let mut parser = crate::parser::KotlinParser::new();

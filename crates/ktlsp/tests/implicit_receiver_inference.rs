@@ -366,6 +366,152 @@ fn java_typed_body_and_overriding_property_getters_share_the_nearest_definition(
 }
 
 #[test]
+fn java_property_setters_share_generic_parameters_unit_return_and_source_definitions() {
+    let mut ws = Workspace::new();
+    // Stdlib 2.4.0 indexes common expect and JVM actual headers for the same intrinsic types.
+    // Their expect marker is not evidence that an ordinary scalar accessor is value-class mangled.
+    for (file, source) in [
+        ("CommonPrimitives.kt", "package kotlin\npublic expect class String : Comparable<String>, CharSequence\npublic expect class Boolean : Comparable<Boolean>\npublic expect class Int : Number, Comparable<Int>\n"),
+        ("JvmPrimitives.kt", "package kotlin\npublic actual class String : Comparable<String>, CharSequence\npublic actual class Boolean private constructor() : Comparable<Boolean>\npublic actual class Int private constructor() : Number(), Comparable<Int>\n"),
+    ] {
+        ws.open(file, source.into());
+    }
+    let source = "package probe\nopen class Box<T>(open var value: T)\nclass TextBox(override var value: String) : Box<String>(value)\nclass Flags(var isReady: Boolean, var is_foo: String, var is0: Int, var isfoo: String)\nclass Body { var text: String = \"body\"\n var hidden: String = \"hidden\"\n  private set\n}\n";
+    ws.open("SetterProperties.kt", source.into());
+    ws.open(
+        "String.java",
+        "package java.lang; public final class String { public int length() { return 1; } }".into(),
+    );
+    ws.open(
+        "Decoy.java",
+        "package probe; class Decoy { public int length() { return 2; } }".into(),
+    );
+    let caller = "package probe; class Use { void update(Box<String> box, TextBox child, Flags flags, Body body) { box.setValue(\"ok\"); child.setValue(\"ok\"); flags.setReady(true); flags.set_foo(\"ok\"); flags.set0(1); flags.setIsfoo(\"ok\"); body.setText(\"ok\"); body.getHidden(); body.setHidden(\"bad\"); box.setValue(1); box.setValue(\"ok\").length(); } }";
+    ws.open("SetterUse.java", caller.into());
+    for (receiver, method, argument, property, owner) in [
+        ("box", "setValue", "\"ok\"", "value", "Box"),
+        ("child", "setValue", "\"ok\"", "value", "TextBox"),
+        ("flags", "setReady", "true", "isReady", "Flags"),
+        ("flags", "set_foo", "\"ok\"", "is_foo", "Flags"),
+        ("flags", "set0", "1", "is0", "Flags"),
+        ("flags", "setIsfoo", "\"ok\"", "isfoo", "Flags"),
+        ("body", "setText", "\"ok\"", "text", "Body"),
+    ] {
+        assert!(
+            labels(&mut ws, "SetterUse.java", &format!("{receiver}.{method}")).contains(method),
+            "{receiver}.{method}"
+        );
+        let entry = ws
+            .index
+            .lookup_by_name(property)
+            .iter()
+            .find(|entry| {
+                entry.sym.container.as_deref() == Some(owner)
+                    && entry.sym.kind == SymbolKind::Property
+            })
+            .unwrap();
+        let definition = Def {
+            file: "SetterProperties.kt".into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        };
+        assert_eq!(
+            goto(
+                &mut ws,
+                "SetterUse.java",
+                &format!("{receiver}.{method}({argument})"),
+                method
+            ),
+            vec![definition]
+        );
+    }
+    assert!(!labels(&mut ws, "SetterUse.java", "body.setHidden").contains("setHidden"));
+    assert!(labels(&mut ws, "SetterUse.java", "body.getHidden").contains("getHidden"));
+    assert!(goto(
+        &mut ws,
+        "SetterUse.java",
+        "body.setHidden(\"bad\")",
+        "setHidden"
+    )
+    .is_empty());
+    assert!(goto(
+        &mut ws,
+        "SetterUse.java",
+        "box.setValue(\"ok\").length()",
+        "length"
+    )
+    .is_empty());
+    {
+        use ktcore::{jvm, members};
+        let index = ws.index.scoped_for_file("SetterUse.java");
+        let mut receiver = Type::class("Box", Some("probe".into()));
+        if let Type::Class { args, .. } = &mut receiver {
+            args.push(Type::class("String", Some("java.lang".into())));
+        }
+        let ctx = FileCtx::new("probe".into(), Vec::new());
+        for (argument, applicability) in [
+            (
+                Type::class("String", Some("java.lang".into())),
+                members::Applicability::Applicable,
+            ),
+            (
+                Type::class("Int", Some("kotlin".into())),
+                members::Applicability::Rejected,
+            ),
+        ] {
+            let selected = jvm::select_call(
+                &index,
+                &receiver,
+                jvm::member_candidates(&index, &receiver, "setValue"),
+                "setValue",
+                &members::CallArguments {
+                    count: Some(1),
+                    types: vec![argument],
+                    names: None,
+                    has_spread: false,
+                    trailing_lambda: false,
+                },
+                &ctx,
+            );
+            assert_eq!(selected.applicability, applicability);
+            if applicability == members::Applicability::Applicable {
+                let [candidate] = selected.consumable_candidates() else {
+                    panic!("one applicable setter")
+                };
+                assert_eq!(
+                    jvm::projected_return_type_in_context(&index, &receiver, *candidate, &ctx),
+                    Some(Type::class("Unit", Some("kotlin".into())))
+                );
+                assert_eq!(
+                    candidate.identity(&index).unwrap().descriptor,
+                    "(Ljava/lang/Object;)V"
+                );
+            }
+        }
+    }
+    // Existing Java navigation retains one known declaration for an invalid call; applicability
+    // above is still Rejected, and no property-valued result is inferred for this void method.
+    assert_eq!(
+        goto(&mut ws, "SetterUse.java", "box.setValue(1)", "setValue").len(),
+        1
+    );
+    ws.change(
+        "SetterProperties.kt",
+        source.replace("var value", "val value"),
+    );
+    assert!(!labels(&mut ws, "SetterUse.java", "box.setValue").contains("setValue"));
+    assert!(goto(
+        &mut ws,
+        "SetterUse.java",
+        "box.setValue(\"ok\")",
+        "setValue"
+    )
+    .is_empty());
+    ws.change("SetterProperties.kt", source.into());
+    assert!(labels(&mut ws, "SetterUse.java", "box.setValue").contains("setValue"));
+}
+
+#[test]
 fn java_constructor_string_getter_resolves_java_string_members() {
     let mut ws = Workspace::new();
     ws.open(

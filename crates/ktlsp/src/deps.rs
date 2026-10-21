@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v36-source-getters-lazy-binary";
+const SYMCACHE_VERSION: &[u8] = b"v37-property-setters-lazy-binary";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 const BINARY_JAR_MARKER: &str = ".ktlsp-binary-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
@@ -4372,7 +4372,22 @@ public class ParameterUse<Iterable> {
             resolve_local_jar_stubs(&binary, &root.join("extracted"), &mut kotlin, &mut java)
                 .unwrap();
         assert_eq!(initial.len(), 2);
+        assert!(initial.iter().all(|batch| !Path::new(&batch.file).exists()));
+        for batch in &initial {
+            assert!(materialize_source_file(Path::new(&batch.file)));
+        }
+        let dest = Path::new(&initial[0].file)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let fingerprint = dest.file_name().unwrap().to_str().unwrap();
+        // Legacy eager caches have no marker that can regenerate absent files. Recreate that
+        // format before deleting one file, so this still exercises partial-extraction rejection.
+        fs::remove_file(dest.join(BINARY_JAR_MARKER)).unwrap();
+        assert!(symcache_load(fingerprint, dest).is_some());
         fs::remove_file(&initial[1].file).unwrap();
+        assert!(symcache_load(fingerprint, dest).is_none());
         let repaired =
             resolve_local_jar_stubs(&binary, &root.join("extracted"), &mut kotlin, &mut java)
                 .unwrap();
@@ -4381,6 +4396,17 @@ public class ParameterUse<Iterable> {
             2,
             "a cache miss cannot accept a partial extraction directory"
         );
+        assert!(repaired
+            .iter()
+            .all(|batch| !Path::new(&batch.file).exists()));
+        assert_eq!(
+            symcache_load(fingerprint, dest).unwrap().len(),
+            2,
+            "a current lazy marker permits unmaterialized files without losing either declaration"
+        );
+        for batch in &repaired {
+            assert!(materialize_source_file(Path::new(&batch.file)));
+        }
         assert!(repaired
             .iter()
             .all(|batch| Path::new(&batch.file).is_file()));

@@ -293,5 +293,10 @@
     "file": "kotlin240/Pair.class",
     "sha256": "197a524bc398868de9b81332da07474ca7fe476990736e612d566e729c911a62",
     "bytes": 3012
+  },
+  {
+    "file": "kotlin240/VarBox.class",
+    "sha256": "cb9c1a8201c1f98bd95762df8759fbc9a8ec8a39a3314d90753abb46514206b5",
+    "bytes": 932
   }
 ]
