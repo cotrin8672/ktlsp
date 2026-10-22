@@ -8645,6 +8645,24 @@ impl KotlinDiagnosticState {
     }
 }
 
+fn cached_kotlin_diagnostic_environment(
+    state: &Mutex<KotlinDiagnosticState>,
+    request: &crate::compile::KotlinDiagnosticRequest,
+    fallback: impl FnOnce() -> Option<Arc<crate::compile::KotlinDiagnosticEnvironment>>,
+) -> Option<Arc<crate::compile::KotlinDiagnosticEnvironment>> {
+    let cached = {
+        let state = state.lock();
+        state
+            .environments
+            .get(&request.scope)
+            .filter(|environment| environment.matches(request))
+            .cloned()
+    };
+    // Invalidation callbacks lock Workspace before state; release state before the fallback
+    // accesses Workspace so a cache miss cannot invert that order.
+    cached.or_else(fallback)
+}
+
 fn schedule_selected_kotlin_diagnostics(
     ws: &Arc<Mutex<Workspace>>,
     client: &Client,
@@ -8759,9 +8777,8 @@ fn schedule_selected_kotlin_diagnostics(
                 let _permit = permit;
                 let start = Instant::now();
                 let scope = worker_request.scope.clone();
-                let cached = worker_state.lock().environments.get(&scope)
-                    .filter(|environment| environment.matches(&worker_request)).cloned()
-                    .or_else(|| worker_ws.lock().compiler_api_environment(&worker_request));
+                let cached = cached_kotlin_diagnostic_environment(&worker_state, &worker_request,
+                    || worker_ws.lock().compiler_api_environment(&worker_request));
                 let environment = match cached {
                     Some(environment) => { drop(wake); Ok((environment, false)) }
                     None => {
@@ -8880,6 +8897,30 @@ impl Backend {
 mod kotlin_diagnostic_queue_tests {
     use super::*;
     use crate::project_model::ProjectScope;
+
+    #[test]
+    fn environment_cache_miss_releases_state_before_workspace_fallback() {
+        let state = Arc::new(Mutex::new(KotlinDiagnosticState::default()));
+        let workspace = Arc::new(Mutex::new(Workspace::new()));
+        let request = crate::compile::kotlin_test_request(Path::new("/diagnostic-lock-order"));
+        // The invalidation callback holds Workspace before locking diagnostic state. Gate the
+        // worker at the cache fallback while that callback's Workspace lock remains held.
+        let workspace_guard = workspace.lock();
+        let (entered, waiting) = std::sync::mpsc::sync_channel(0);
+        let worker_state = state.clone();
+        let worker_workspace = workspace.clone();
+        let worker = std::thread::spawn(move || {
+            cached_kotlin_diagnostic_environment(&worker_state, &request, || {
+                entered.send(()).unwrap();
+                worker_workspace.lock().compiler_api_environment(&request)
+            })
+        });
+        waiting.recv().unwrap();
+        let callback_can_lock_state = state.try_lock().is_some();
+        drop(workspace_guard);
+        assert!(worker.join().unwrap().is_none());
+        assert!(callback_can_lock_state, "cache fallback holds diagnostic state while waiting for Workspace, blocking its invalidation callback");
+    }
 
     #[test]
     fn busy_scope_keeps_latest_buffer_and_preserves_other_scope_progress() {
