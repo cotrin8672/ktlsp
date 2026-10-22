@@ -1999,6 +1999,18 @@ fn parameters_applicability(
     mode: CallMode,
     mut uncertain: bool,
 ) -> Applicability {
+    let platform =
+        infer::java_platform_null_arguments(entry, &bound.params, &bound.arguments.types).map(
+            |types| CallArguments {
+                types,
+                ..bound.arguments.as_ref().clone()
+            },
+        );
+    let platform_bound = platform.as_ref().map(|arguments| BoundArguments {
+        arguments: Cow::Borrowed(arguments),
+        params: Cow::Borrowed(&bound.params),
+    });
+    let bound = platform_bound.as_ref().unwrap_or(bound);
     let args = bound.arguments.as_ref();
     let params = bound.params.as_ref();
     uncertain |= params.len() != entry.sym.params.len()
@@ -2143,13 +2155,14 @@ fn java_conversion_unmodeled(actual: &Type, formal: &Type) -> bool {
 /// Custom callable classes and unmodeled signatures remain possible, never definitely absent.
 pub fn function_type_signature(ty: &TypeRef) -> Option<(&[TypeRef], &TypeRef)> {
     let arity = ty.name.strip_prefix("Function")?.parse::<usize>().ok()?;
-    if ty
+    let package = ty
         .qualification
         .as_deref()
-        .is_some_and(|qualification| qualification != "kotlin")
-        || (ty.qualification.as_deref() != Some("kotlin")
-            && (ty.package_candidates.len() != 1 || ty.package_candidates[0] != "kotlin"))
-        || ty.args.len() != arity + 1
+        .or_else(|| (ty.package_candidates.len() == 1).then(|| ty.package_candidates[0].as_str()));
+    if ty.name != format!("Function{arity}")
+        || !matches!(package, Some("kotlin" | "kotlin.jvm.functions"))
+        || arity.checked_add(1)? != ty.args.len()
+        || ty.owner.is_some()
     {
         return None;
     }

@@ -311,7 +311,7 @@ pub struct IndexScopeCandidateConfig {
 }
 
 /// Build cross-file scope candidates from the shared symbol index. Language adapters supply only
-/// visibility rules; this owns the common policy of project/library tiering, arity/detail facts,
+/// eligibility and visibility rules; this owns project/library tiering, arity/detail facts,
 /// and whether a candidate needs an auto-import edit.
 pub fn index_scope_candidates<F>(
     index: &dyn InferenceIndex,
@@ -321,7 +321,7 @@ pub fn index_scope_candidates<F>(
     mut is_visible: F,
 ) -> Vec<ScopeCompletion>
 where
-    F: FnMut(&Entry) -> bool,
+    F: FnMut(&Entry) -> Option<bool>,
 {
     let mut out = Vec::new();
     for entry in index.entries_with_prefix(prefix, true) {
@@ -334,7 +334,9 @@ where
         if !config.include_default_package && entry.sym.package.is_empty() {
             continue;
         }
-        let already_visible = is_visible(entry);
+        let Some(already_visible) = is_visible(entry) else {
+            continue;
+        };
         let mut candidate = ScopeCompletion::new(entry.sym.name.clone(), entry.sym.kind);
         candidate.tier = entry.tier;
         candidate.arity = entry.sym.arity;

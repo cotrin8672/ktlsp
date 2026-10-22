@@ -219,6 +219,9 @@ pub struct IndexedSymbol {
     pub unavailable_members: Option<Box<Vec<(String, SymbolKind, Option<u8>)>>>,
     #[serde(default)]
     pub is_annotation: bool,
+    /// A Kotlin type declared as, or nested within, an expect type has no own JVM class.
+    #[serde(default)]
+    pub is_expect: bool,
     #[serde(default)]
     pub ext_receiver: Option<String>,
     /// The declaration-scoped receiver template; keep absent facts out of line.
@@ -285,6 +288,7 @@ impl IndexedSymbol {
             supertype_refs: Vec::new(),
             unavailable_members: None,
             is_annotation: false,
+            is_expect: false,
             ext_receiver: None,
             extension_receiver: None,
             arity: None,

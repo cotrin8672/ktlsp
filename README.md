@@ -347,6 +347,10 @@ It checks imported superclass identity despite same-name types, exact inherited-
 valid and invalid call diagnostics, and first responses after unsaved superclass import changes.
 It also checks same-name Java fields/methods, callable Kotlin properties, nullable function results,
 qualified nested types, signatures, and whole-buffer rename edits through the same LSP connection.
+The same `java` member probe checks inferred generic property getters/setters and expression-body
+method results across Java/Kotlin, Kotlin typed lambda calls, and Java reads of inferred Kotlin arrays.
+It withdraws an inferred setter after an unsaved `var` to `val` edit, keeps useful getter controls,
+and checks restoration; first responses are retained in `member-selection.json`.
 Its override rename probe applies all related interface/implementation and Java/Kotlin call edits,
 compares five complete buffers, preserves unrelated methods and overloads, and checks fresh goto.
 `artifacts/override-rename-snapshots.json` retains original, expected and actually applied source;

@@ -1225,14 +1225,10 @@ impl Workspace {
                 .filter(|query| query.context == complete::CompletionContext::AfterDot);
         }
         let text = self.doc_text(key)?;
-        semantic_query::after_dot_query(
-            &self.index,
-            self.parsers.kotlin_mut(),
-            key,
-            &text,
-            offset,
-            MAX_COMPLETIONS,
-        )
+        let mut parser = crate::parser::KotlinParser::new();
+        self.with_java_member_proofs(key, |index| {
+            semantic_query::after_dot_query(index, &mut parser, key, &text, offset, MAX_COMPLETIONS)
+        })
     }
 
     pub fn completion_query(
@@ -1276,14 +1272,17 @@ impl Workspace {
             }
         }
         let text = self.doc_text(key)?;
-        semantic_query::completion_query(
-            &self.index,
-            self.parsers.kotlin_mut(),
-            key,
-            &text,
-            offset,
-            MAX_COMPLETIONS,
-        )
+        let mut parser = crate::parser::KotlinParser::new();
+        self.with_java_member_proofs(key, |index| {
+            semantic_query::completion_query(
+                index,
+                &mut parser,
+                key,
+                &text,
+                offset,
+                MAX_COMPLETIONS,
+            )
+        })
     }
 
     fn closed_completion_query(
@@ -1308,16 +1307,41 @@ impl Workspace {
             self.salsa
                 .get_mut()
                 .parsed_tree(&synthetic_key, &synthetic, Durability::LOW);
+        if synthetic_tree.root_node().has_error() {
+            return None;
+        }
         let receiver = complete::navigation_receiver_at(&synthetic_tree, syn_offset)?;
-        let receiver_type = self.salsa.get_mut().expr_type_in_file(
-            &synthetic_key,
-            key,
-            &synthetic,
-            Durability::LOW,
-            &self.index,
-            self.index_revision,
-            ExprKey::from_node(receiver),
-        );
+        let mut prepared = HashSet::new();
+        let receiver_type = loop {
+            let result = self.salsa.get_mut().expr_query_in_file(
+                &synthetic_key,
+                key,
+                &synthetic,
+                Durability::LOW,
+                &self.index,
+                self.index_revision,
+                ExprKey::from_node(receiver),
+            );
+            let missing = result
+                .missing_sources
+                .iter()
+                .filter(|file| prepared.insert((*file).clone()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                break result.value;
+            }
+            for file in missing {
+                if let Some(text) = self.doc_text(&file) {
+                    self.salsa.get_mut().prepare_declaration(
+                        &file,
+                        &text,
+                        &self.index,
+                        self.index_revision,
+                    );
+                }
+            }
+        };
         let receiver_type = infer::member_receiver_type(receiver, receiver_type);
         let ctx = infer::FileCtx::from_tree_in_file(&synthetic_tree, &synthetic, key);
         semantic_query::member_completion_query_for_type_with_ctx(
@@ -2287,10 +2311,13 @@ impl Workspace {
                 fixed.definition.start_byte <= offset && offset <= fixed.definition.end_byte
             })
         })?;
-        self.with_java_member_proofs(key, |index| ktcore::jvm::CallableCandidate::Jvm {
-            owner: ktcore::jvm::JvmOwner::Source(source),
-            facts,
-        }.resolved(index))
+        self.with_java_member_proofs(key, |index| {
+            ktcore::jvm::CallableCandidate::Jvm {
+                owner: ktcore::jvm::JvmOwner::Source(source),
+                facts,
+            }
+            .resolved(index)
+        })
     }
 
     fn rename_jvm_alias(
@@ -7323,6 +7350,37 @@ mod tests {
             .iter()
             .any(|candidate| candidate.label == "onlyFirst"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closed_completion_hydrates_current_inferred_function_return_sources() {
+        let root = unique_tmp("closed-inferred-function-source");
+        std::fs::create_dir_all(&root).unwrap();
+        let model_file = root.join("Model.kt");
+        let use_file = root.join("Use.kt");
+        let model_key = model_file.to_string_lossy().to_string();
+        let use_key = use_file.to_string_lossy().to_string();
+        let model = "class Item { fun ping() {} }\nclass Other { fun pong() {} }\nclass Model { private fun helper(): Item = Item()\n fun make() = helper() }\n";
+        let source = "fun use(model: Model) { model.make().ping() }\n";
+        std::fs::write(&model_file, model).unwrap();
+        std::fs::write(&use_file, source).unwrap();
+        let mut ws = Workspace::new();
+        ws.reindex(&model_key, model);
+        ws.reindex(&use_key, source);
+        let offset = source.find("make().").unwrap() + "make().".len();
+        let first = ws.completion_query(&use_key, offset).unwrap();
+        assert!(first.candidates.iter().any(|item| item.label == "ping"));
+        let defs = ws.goto_definition(&use_key, offset);
+        assert_eq!(defs.len(), 1, "{defs:?}");
+        assert_eq!(defs[0].file, model_key);
+        ws.open(
+            &model_key,
+            model.replace("helper(): Item = Item()", "helper(): Other = Other()"),
+        );
+        let second = ws.completion_query(&use_key, offset).unwrap();
+        assert!(second.candidates.iter().any(|item| item.label == "pong"));
+        assert!(!second.candidates.iter().any(|item| item.label == "ping"));
         let _ = std::fs::remove_dir_all(root);
     }
 

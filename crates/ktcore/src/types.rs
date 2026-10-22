@@ -120,8 +120,8 @@ impl TypeRef {
 }
 
 /// Lexical declaration facts supplied by a syntax adapter, nearest scope first.
-/// These facts describe the current source and are never serialized into the symbol cache.
-#[derive(Clone, Debug)]
+/// Source-property caches may persist this declaration proof; inferred runtime types stay separate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeParameterBounds {
     pub name: String,
     pub start_byte: usize,
@@ -130,6 +130,14 @@ pub struct TypeParameterBounds {
     pub scope_end: usize,
     pub upper_bounds: Vec<TypeRef>,
     pub complete: bool,
+}
+
+/// Keep `T` distinct from `T?` even when an implicit `Any?` bound makes both nullable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParameterNullability {
+    Inherit,
+    Nullable,
+    NonNull,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -151,6 +159,7 @@ pub enum Type {
         definition: crate::symbol::Def,
         name: String,
         nullable: bool,
+        nullability: ParameterNullability,
         upper_bounds: Vec<Type>,
     },
     /// Only projected arguments allocate a bound; ordinary Class values keep their layout.
@@ -253,9 +262,19 @@ impl Type {
 
     pub fn with_nullability(mut self, value: bool) -> Self {
         match &mut self {
-            Type::Class { nullable, .. }
-            | Type::Parameter { nullable, .. }
-            | Type::Array { nullable, .. } => *nullable = value,
+            Type::Parameter {
+                nullable,
+                nullability,
+                ..
+            } => {
+                *nullable = value;
+                *nullability = if value {
+                    ParameterNullability::Nullable
+                } else {
+                    ParameterNullability::NonNull
+                };
+            }
+            Type::Class { nullable, .. } | Type::Array { nullable, .. } => *nullable = value,
             _ => {}
         }
         self

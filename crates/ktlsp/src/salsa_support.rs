@@ -185,10 +185,7 @@ fn expr_type_at_depth(
     let Some(node) = find_expr_node(tree.root_node(), key) else {
         return InferredType::unknown();
     };
-    let facts = file_ctx_facts(db, file);
-    let mut ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone())
-        .with_file(file.scope_key(db));
-    ctx.local_extensions = facts.local_extensions.clone();
+    let ctx = infer::FileCtx::from_tree_in_file(tree, file.text(db), file.scope_key(db));
     let missing = std::cell::RefCell::new(Default::default());
     let declaration = |entry: &crate::index::Entry| {
         let value = source_declaration(db, index, entry, depth + 1).consume(&missing);
@@ -287,10 +284,8 @@ fn declaration_type_at_depth(
     let Some(node) = find_expr_node(parsed_tree(db, file).root_node(), key) else {
         return InferredType::unknown();
     };
-    let facts = file_ctx_facts(db, file);
-    let mut ctx = infer::FileCtx::new(facts.package.clone(), facts.imports.clone())
-        .with_file(file.scope_key(db));
-    ctx.local_extensions = facts.local_extensions.clone();
+    let ctx =
+        infer::FileCtx::from_tree_in_file(parsed_tree(db, file), file.text(db), file.scope_key(db));
     let missing = std::cell::RefCell::new(Default::default());
     let declaration = |entry: &crate::index::Entry| {
         let value = source_declaration(db, index, entry, depth + 1).consume(&missing);
@@ -472,6 +467,29 @@ impl SalsaState {
         index_revision: u64,
         expr: ExprKey,
     ) -> Type {
+        self.expr_query_in_file(
+            key,
+            scope_key,
+            text,
+            durability,
+            index,
+            index_revision,
+            expr,
+        )
+        .value
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn expr_query_in_file(
+        &mut self,
+        key: &str,
+        scope_key: &str,
+        text: &str,
+        durability: Durability,
+        index: &Index,
+        index_revision: u64,
+        expr: ExprKey,
+    ) -> InferredType {
         self.sync_index(index, index_revision);
         let file = self.upsert_file(key, text, durability);
         if file.scope_key(&self.db) != scope_key {
@@ -479,7 +497,7 @@ impl SalsaState {
                 .with_durability(durability)
                 .to(scope_key.to_string());
         }
-        expr_type(&self.db, file, self.index, expr).value
+        expr_type(&self.db, file, self.index, expr)
     }
 
     fn sync_index(&mut self, index: &Index, revision: u64) {

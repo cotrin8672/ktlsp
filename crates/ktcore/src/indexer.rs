@@ -891,6 +891,28 @@ fn push_type_alias(
     });
 }
 
+fn is_expect_type(name: Node, src: &str) -> bool {
+    let mut current = name.parent();
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "object_declaration" | "interface_declaration"
+        ) {
+            if let Some(modifiers) = child_of_kind(node, "modifiers") {
+                let mut cursor = modifiers.walk();
+                if modifiers
+                    .children(&mut cursor)
+                    .any(|modifier| node_text(modifier, src) == "expect")
+                {
+                    return true;
+                }
+            }
+        }
+        current = node.parent();
+    }
+    false
+}
+
 /// Push a type declaration's name with its `supertypes` and formal `type_params`.
 fn push_type(
     out: &mut Vec<IndexedSymbol>,
@@ -905,6 +927,7 @@ fn push_type(
 ) {
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
+        is_expect: is_expect_type(name_node, src),
         is_annotation: name_node
             .parent()
             .and_then(|decl| child_of_kind(decl, "modifiers"))
@@ -1625,6 +1648,7 @@ fn push_synthetic_member(
         supertype_refs: Vec::new(),
         unavailable_members: None,
         is_annotation: false,
+        is_expect: false,
         ext_receiver: None,
         extension_receiver: None,
         arity,
@@ -2518,5 +2542,40 @@ internal constructor(private val rawValue: Long) :
             .unwrap()
             .params
             .is_empty());
+    }
+
+    #[test]
+    fn expect_types_include_enclosing_expect_without_restricting_jvm_classes() {
+        let syms = index(
+            "expect class Common { class Nested { class Deep } }\n\
+             expect object CommonObject\n\
+             expect interface CommonInterface\n\
+             class Ordinary\n\
+             internal class Internal\n\
+             @JvmInline value class Value(val value: Int)\n\
+             actual class Actual\n",
+        );
+        for name in [
+            "Common",
+            "Nested",
+            "Deep",
+            "CommonObject",
+            "CommonInterface",
+        ] {
+            let sym = syms.iter().find(|sym| sym.name == name).unwrap();
+            assert!(sym.is_expect, "{name}: {sym:?}");
+        }
+        for name in ["Ordinary", "Internal", "Value", "Actual"] {
+            let sym = syms.iter().find(|sym| sym.name == name).unwrap();
+            assert!(!sym.is_expect, "{name}: {sym:?}");
+        }
+        for name in ["Internal", "Value"] {
+            assert!(syms
+                .iter()
+                .find(|sym| sym.name == name)
+                .unwrap()
+                .source_member
+                .jvm_restricted());
+        }
     }
 }

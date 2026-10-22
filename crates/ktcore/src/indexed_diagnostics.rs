@@ -571,15 +571,10 @@ fn argument_type_mismatch_query(
     for ty in &arg_types {
         labels.push(type_label(ty)?);
     }
-    if entries.iter().any(|entry| {
-        infer::argument_types_consistent(
-            index,
-            &entry.sym.params,
-            &entry.sym.type_params,
-            &arg_types,
-            &ctx,
-        )
-    }) {
+    if entries
+        .iter()
+        .any(|entry| infer::argument_types_consistent(index, entry, &arg_types, &ctx))
+    {
         return None;
     }
     Some(CallShapeQuery {

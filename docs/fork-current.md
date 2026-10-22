@@ -7,6 +7,45 @@ BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20
 Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
+## Active Unknown coverage
+
+Joint120-17 passes1776 Rust tests,0 fail,9 ignored (42 targets), and release;
+575 input guards stay unchanged and all processes close normally. Its release SHA
+is 53f09f28324356e5f7c5ec84fe71d2f4e16a17942bd01c2134aeec7cd0e2bcef.
+The unchanged durable `java` scenario passes403/403 on this release, including
+all28 new inferred-type assertions. The actual Java auto-import edit matches
+the complete expected source; nullable function safe-call completion is useful.
+The46 member probes each use one RPC. Inputs stay unchanged and shutdown is
+normal. Evidence: native-integrated120-17/{workspace-summary.json,receipt.json}
+and java-unknown121-release17/{summary.json,receipt.json}.
+
+The original array12 also passes on release17, all on first responses with
+unchanged original expectations and normal shutdown. The harness's approved
+fixture-only revision is recorded separately from unchanged project/manifest
+guards. Evidence: array-property120/gradle-release17/receipt.json.
+CEM26 and the five-project50 are being replayed on this same binary; do not
+substitute earlier release15 successes for those pending final receipts.
+
+The shared type facts now distinguish Kotlin expect declarations, including
+enclosing expect types, from JVM-nameable ordinary/internal/value classes.
+Java scope completion excludes expect declarations and typealiases before
+visibility conversion and name deduplication; Kotlin completion retains them.
+Cache v40 invalidates every persisted symbol payload path; project files are
+reparsed. The independent inline-versus-boxed serialization test includes the
+new field and retains exact JSON, length and bincode comparisons. The earlier
+release15 wrong-import snapshot and full16 obsolete-reference failure remain
+recorded, not counted as successes.
+
+Null literals use Nothing?. Source-Java and decoded-callable reference nullness
+is still unproven, so only call-bound arguments retain the former uncertainty;
+Kotlin nonnull and Java primitive negatives stay rejected. Independent Kotlin
+and Javac controls validate both sides. Ordinary invalid calls can retain a
+declared return for editing recovery while still producing the required error;
+no null-only recovery policy was added. Evidence: java-autoimport121-expect-green3,
+function-null121-recovery-green1 and its recovery-policy-review.json.
+Java nullability annotations, contextual lambda inference and other unproved
+type shapes remain gaps. Warm optimization remains paused per user priority.
+
 ## Integrated checkpoint120-9
 
 Checkpoint source through2167820 passes1755 Rust tests,0 fail,9 ignored (40 targets), and a
@@ -111,12 +150,41 @@ oracle120/typetools-selection-readonly1/audit.json.
 
 ## Pending Unknown coverage integration
 
-Joint120-11 compiles and runs all41 test targets:1761 pass,5 fail,9 ignored.
-The failures are the new method-return and function-property probes; existing
-tests and the new generic/array cases pass. No release is emitted. Keep the
-five failures while repairing provider registration and completion-query source
-hydration; do not treat source-ready code as verified behavior. Evidence:
-native-integrated120-11/{workspace-summary.json,receipt.json}.
+Joint120-11 found5 new failures; joint120-12 then found27 existing regressions
+from bypassing recovery and special super semantics. Restoring the original
+completion route and allowing only exact unchanged recovered declarations to
+use the current-source provider repairs all92 focused cases. The provider still
+validates source identity; recovery does not gain property-access or ABI proofs.
+A separate regression rejects invented zero-argument types for contextual lambdas.
+
+Joint120-13 passes1770 tests,0 fail,9 ignored (41 targets), and builds release.
+Both stages close normally with574 guarded inputs unchanged and zero owned
+residuals. Immutable release SHA256:
+ad26e929e4d1d784bb946903e7ef8b859530ff6cc6a15b1973a10dd5b9b6b26b.
+Evidence: native-integrated120-13/{workspace-summary.json,receipt.json,main-ready.json}.
+Real-Neovim original RED replays on this binary now pass method-return4/4,
+function-property10/10 and generic-property6/6. Generic unsaved-edit, withdrawal
+and restoration controls add15 semantic checks; all18 generic RPCs match on
+their first response. These runs preserve inputs and close normally. Evidence:
+function-return121-release13, function-property121-release13, and
+cem-startup120/coverage/native-generic-inferred-release13/receipt.json.
+
+The unchanged array replay initially passes10/12 on release13. Its2 Java
+reference-array element failures expose an obsolete compiled-owner-only filter
+discarding the already-correct source projection. Removing that filter repairs
+the actual Workspace regression and all12 original editor assertions on immutable
+dev14 (SHAa237d9bfe265ecd1e2299b62567d51eaff8158b306b7d4109ce52f2e4629863e).
+All12 first requests match, inputs stay unchanged and shutdown is normal.
+Evidence: array-property120/{gradle-release13,focus-source-array-red,
+focus-source-array-green,gradle-dev14}. Final release replay waits for the
+subsequent Java scenario fixes above rather than rerunning every intermediate build.
+
+Original CEM26 also passes on release13, including all11 single-attempt responses,
+the compiler-validated Float inlay and exact pinned goto locations. Both stages
+close normally with441 guarded inputs unchanged. Source coverage now reports
+zero failed and two missing dependency sources, compared with the earlier one
+failed and three missing. This is a selected functional sweep, not new timing
+evidence. Evidence: cem-startup120/editor-original26-release13/{summary.json,goto-audit.json}.
 
 ## Earlier integrated checkpoint120-6
 

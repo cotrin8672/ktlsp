@@ -4435,6 +4435,22 @@ fn java_method_invocation_return_type(
         return None;
     }
     let arguments = java_call_arguments(index, file, src, tree, call, initializer_depth);
+    if symbol == "invoke" && call.child_by_field_name("type_arguments").is_none() {
+        if let Some(object) = call.child_by_field_name("object") {
+            if let Some(receiver) =
+                receiver_type(index, file, src, tree, object, initializer_depth + 1)
+            {
+                if let Some(result) = infer::function_value_call_type(
+                    index,
+                    &receiver,
+                    &arguments,
+                    ktcore::members::CallMode::Java,
+                ) {
+                    return (!matches!(result, Type::Unknown)).then_some(result);
+                }
+            }
+        }
+    }
     if symbol == "clone" && call.child_by_field_name("type_arguments").is_none() {
         if let Some(object) = call.child_by_field_name("object") {
             if let Some(receiver) =
@@ -4492,17 +4508,7 @@ fn java_method_invocation_return_type(
                 &receiver,
                 *candidate,
                 &FileCtx::new(package_of(tree, src), inference_imports(tree, src)),
-            )
-            .filter(|ty| {
-                !matches!(ty, Type::Array { .. })
-                    || matches!(
-                        candidate,
-                        ktcore::jvm::CallableCandidate::Jvm {
-                            owner: ktcore::jvm::JvmOwner::Compiled { .. },
-                            ..
-                        }
-                    )
-            });
+            );
         }
         // Return inference must keep the same typed selection used by navigation.
         // Signature help separately retains alternative arities while editing arguments.
@@ -4538,10 +4544,7 @@ fn java_method_invocation_return_type(
         return None;
     }
     if entries.iter().any(|entry| {
-        entry.sym.arity.is_none()
-            || entry.sym.min_arity.is_none()
-            || entry.sym.has_vararg
-            || entry.sym.return_type.is_none()
+        entry.sym.arity.is_none() || entry.sym.min_arity.is_none() || entry.sym.has_vararg
     }) {
         return None;
     }
@@ -4562,9 +4565,9 @@ fn java_method_invocation_return_type(
         if !(min..=max).contains(&arg_count) {
             continue;
         }
-        let declared = entry.sym.return_type.as_ref()?;
+        let declared = infer::function_return_type_ref(index, &entry)?;
         let ty =
-            infer::declared_member_call_type(index, &receiver, &entry, declared, &arguments, &ctx);
+            infer::declared_member_call_type(index, &receiver, &entry, &declared, &arguments, &ctx);
         let ty = ktcore::jvm::string_result_for_call_mode(
             index,
             ty,
@@ -5715,7 +5718,10 @@ fn scope_candidates(
             include_contained: false,
             include_default_package: false,
         },
-        |entry| is_visible(&package, &imports, &entry.sym),
+        |entry| {
+            (entry.sym.kind != SymbolKind::TypeAlias && !entry.sym.is_expect)
+                .then(|| is_visible(&package, &imports, &entry.sym))
+        },
     ) {
         if !seen.insert(candidate.label.clone()) {
             continue;

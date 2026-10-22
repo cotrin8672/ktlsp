@@ -48,8 +48,8 @@ return function(project, client, check)
       result = result, error = response and response.err or err, sent_versions = vim.deepcopy(sent) }
     return result
   end
-  local function definition(name, anchor, token, target, declaration)
-    local _, range = probe.find(lines(target), declaration, token)
+  local function definition(name, anchor, token, target, declaration, target_token)
+    local _, range = probe.find(lines(target), declaration, target_token or token)
     local result = once(name, 'textDocument/definition', anchor, token)
     check(name .. ' ' .. anchor .. ' goes to exact ' .. declaration,
       probe.exact_definition(result, project .. '/' .. files[target], { range }), vim.inspect(result))
@@ -150,6 +150,39 @@ return function(project, client, check)
       end)
       completion(name, 'reader.body()', 'reader.body().us', 'useful', 'propertyOnly')
     end
+    -- Inferred declarations must supply useful current types to both language consumers.
+    definition('java', 'box.getValue()', 'getValue', 'kotlin', 'var value = input', 'value')
+    definition('java', 'box.setValue(', 'setValue', 'kotlin', 'var value = input', 'value')
+    definition('java', 'callables.getCallback()', 'getCallback', 'kotlin', 'val callback =', 'callback')
+    definition('java', 'callables.inferredProduct()', 'inferredProduct', 'kotlin', 'fun inferredProduct()')
+    completion('java', 'box.getValue()', 'box.getV', 'getValue', 'ping')
+    completion('java', 'box.setValue(', 'box.setV', 'setValue', 'setInput')
+    completion('java', 'callables.getCallback()', 'callables.getCall', 'getCallback', 'setCallback')
+    for _, case in ipairs({
+      { 'java', 'box.getValue()', 'box.getValue().pr', 'propertyOnly', 'methodOnly' },
+      { 'java', 'callables.inferredProduct()', 'callables.inferredProduct().pr', 'propertyOnly', 'methodOnly' },
+      { 'java', 'arrays.getValues()[0]', 'arrays.getValues()[0].pr', 'propertyOnly', 'methodOnly' },
+      { 'java', 'arrays.getInts().length', 'arrays.getInts().le', 'length', 'propertyOnly' },
+      { 'kotlin', 'box.value.propertyOnly()', 'box.value.pr', 'propertyOnly', 'methodOnly' },
+      { 'kotlin', 'callables.inferredProduct()', 'callables.inferredProduct().pr', 'propertyOnly', 'methodOnly' },
+      { 'kotlin', 'callables.callback(item)', 'callables.callback(item).pi', 'ping', 'propertyOnly' },
+    }) do
+      completion(unpack(case))
+    end
+    local property_edit = lines('kotlin')
+    for i, line in ipairs(property_edit) do
+      property_edit[i] = line:gsub('var value = input', 'val value = input')
+    end
+    vim.api.nvim_buf_set_lines(buffers.kotlin, 0, -1, false, property_edit)
+    flush('kotlin', 'unsaved inferred property mutability')
+    partial('java', 'box.setValue(', 'box.', function(result)
+      check('unsaved val withdraws inferred setter while keeping useful typed and inferred getters',
+        probe.completion_has(result, 'getInput') and probe.completion_has(result, 'getValue')
+          and not probe.completion_has(result, 'setValue'), vim.inspect(result))
+    end)
+    restore()
+    completion('java', 'box.setValue(', 'box.setV', 'setValue', 'setInput')
+    definition('java', 'box.setValue(', 'setValue', 'kotlin', 'var value = input', 'value')
     definition('kotlin', 'callables.action(1)', 'action', 'kotlin', 'val action:')
     definition('kotlin', 'callables.action("x")', 'action', 'kotlin', 'fun action(value: String)')
     definition('kotlin', 'callables.optional', 'optional', 'kotlin', 'val optional:')

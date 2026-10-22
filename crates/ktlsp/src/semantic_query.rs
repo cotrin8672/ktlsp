@@ -846,7 +846,7 @@ pub fn scope_name_query(
             include_contained: true,
             include_default_package: true,
         },
-        |entry| vis.is_symbol_visible(&entry.sym),
+        |entry| Some(vis.is_symbol_visible(&entry.sym)),
     ) {
         let rank = match candidate.tier {
             crate::index::Tier::Volatile => 0,
@@ -939,7 +939,13 @@ impl<'scope> RecoveredTypeIndex<'scope> {
 
 impl InferenceIndex for RecoveredTypeIndex<'_> {
     fn source_declaration_type(&self, entry: &crate::index::Entry) -> Option<Type> {
-        (self.replaced_file != Some(entry.path.as_ref())
+        // Reuse only an unchanged authored declaration; its provider still validates current source.
+        ((self.replaced_file != Some(entry.path.as_ref())
+            || self
+                .source
+                .entries_for_file(&entry.path)
+                .iter()
+                .any(|recovered| recovered.sym == entry.sym))
             && self
                 .index
                 .entries_for_file(&entry.path)
@@ -1380,15 +1386,10 @@ fn argument_type_mismatch_query(
     for ty in &arg_types {
         labels.push(type_label(ty)?);
     }
-    if entries.iter().any(|entry| {
-        infer::argument_types_consistent(
-            index,
-            &entry.sym.params,
-            &entry.sym.type_params,
-            &arg_types,
-            ctx,
-        )
-    }) {
+    if entries
+        .iter()
+        .any(|entry| infer::argument_types_consistent(index, entry, &arg_types, ctx))
+    {
         return None;
     }
     Some(CallShapeQuery {
@@ -2244,6 +2245,7 @@ mod tests {
                 supertype_refs: Vec::new(),
                 unavailable_members: None,
                 is_annotation: false,
+                is_expect: false,
                 ext_receiver: Some("Dog".into()),
                 extension_receiver: None,
                 arity: Some(1),
@@ -4377,11 +4379,33 @@ mod recovered_property_proof_tests {
         assert!(!replaced.source_value_namespace_complete(owner));
         assert_eq!(replaced.source_property_access(property), None);
         assert_eq!(replaced.source_declaration_type(property), None);
+        let mut unchanged = Index::new();
+        unchanged.replace_file(
+            "Parent.kt",
+            vec![property.sym.as_ref().clone()],
+            crate::index::Tier::Volatile,
+        );
+        let unchanged = RecoveredTypeIndex::replacing_file(&host, &unchanged, "Parent.kt");
+        assert_eq!(
+            unchanged.source_declaration_type(property),
+            Some(Type::class("Int", Some("kotlin".into())))
+        );
+        assert_eq!(unchanged.source_property_access(property), None);
+        assert!(!unchanged.source_value_namespace_complete(owner));
         let mut stale = property.clone();
         let mut symbol = stale.sym.as_ref().clone();
         symbol.start_byte += 1;
         stale.sym = std::sync::Arc::new(symbol);
         assert_eq!(recovered.source_declaration_type(&stale), None);
+        assert_eq!(unchanged.source_declaration_type(&stale), None);
+        let mut changed = Index::new();
+        changed.replace_file(
+            "Parent.kt",
+            vec![stale.sym.as_ref().clone()],
+            crate::index::Tier::Volatile,
+        );
+        let changed = RecoveredTypeIndex::replacing_file(&host, &changed, "Parent.kt");
+        assert_eq!(changed.source_declaration_type(&stale), None);
         assert_eq!(
             recovered.source_property_access(&stale),
             None,

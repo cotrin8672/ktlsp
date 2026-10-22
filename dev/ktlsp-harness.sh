@@ -915,6 +915,14 @@ public class MemberUse {
         int value = reader.body;
         Reader.Factory factory = new Reader.Factory();
     }
+    public void inferred(Callables callables, InferredBox<Product> box, InferredArrays arrays) {
+        box.getValue().propertyOnly();
+        box.setValue(new Product());
+        callables.inferredProduct().propertyOnly();
+        callables.getCallback();
+        arrays.getValues()[0].propertyOnly();
+        int length = arrays.getInts().length;
+    }
 }
 JAVA
   cat > "$project/selection/Callable.kt" <<'KOTLIN'
@@ -928,11 +936,27 @@ class OtherResult {
     fun methodOnly() { }
 }
 
+class SmartItem {
+    fun ping() { }
+}
+
+class InferredBox<T>(val input: T) {
+    var value = input
+}
+
+class InferredArrays(seed: Array<Product>, numbers: IntArray) {
+    val values = seed
+    val ints = numbers
+}
+
 class Callables {
     val action: (Int) -> Product = { Product() }
     fun action(value: String): OtherResult = OtherResult()
     val maybe: (String?) -> Product? = { null }
     val optional: ((Int) -> Product)? = null
+    private fun product(): Product = Product()
+    fun inferredProduct() = product()
+    val callback = { item: SmartItem -> item }
 }
 
 fun useMembers(reader: Reader, callables: Callables) {
@@ -943,6 +967,12 @@ fun useMembers(reader: Reader, callables: Callables) {
     callables.action("x").methodOnly()
     callables.maybe(null)?.propertyOnly()
     val optional = callables.optional
+}
+
+fun useInferred(callables: Callables, box: InferredBox<Product>, item: SmartItem) {
+    box.value.propertyOnly()
+    callables.inferredProduct().propertyOnly()
+    callables.callback(item).ping()
 }
 KOTLIN
   printf '%s\n' "$project"

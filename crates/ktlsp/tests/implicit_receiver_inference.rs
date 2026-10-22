@@ -535,6 +535,173 @@ fn java_property_setters_share_generic_parameters_unit_return_and_source_definit
 }
 
 #[test]
+fn inferred_generic_property_accessors_bind_the_exact_owner_parameter_like_explicit_twins() {
+    let mut ws = Workspace::new();
+    let source =
+        "package probe\nclass Box<T>(val input: T) { val typed: T = input\n var value = input\n}\n";
+    let explicit = source.replace("var value = input", "var value: T = input");
+    ws.open("GenericInferred.kt", explicit.clone());
+    ws.open(
+        "String.java",
+        "package java.lang; public final class String { public int length() { return 0; } }".into(),
+    );
+    let caller = "package probe; class Use { void use(Box<String> box) { box.getTyped().length(); box.getValue().length(); box.setValue(\"ok\"); box.setValue(1); } }";
+    ws.open("GenericInferredUse.java", caller.into());
+    assert!(labels(&mut ws, "GenericInferredUse.java", "box.getTyped").contains("getTyped"));
+    assert!(labels(&mut ws, "GenericInferredUse.java", "box.getValue").contains("getValue"));
+    assert!(labels(&mut ws, "GenericInferredUse.java", "box.setValue").contains("setValue"));
+    ws.change("GenericInferred.kt", source.into());
+    let tree = ktlsp::parser::KotlinParser::new().parse(source);
+    let at = source.rfind("input").unwrap();
+    let init = tree
+        .root_node()
+        .descendant_for_byte_range(at, at + 5)
+        .unwrap();
+    let ctx = FileCtx::from_tree_in_file(&tree, source, "GenericInferred.kt");
+    let declaration = ktcore::infer::infer(
+        &ws.index.scoped_for_file("GenericInferred.kt"),
+        init,
+        source,
+        &ctx,
+    );
+    let Type::Parameter {
+        definition, name, ..
+    } = &declaration
+    else {
+        panic!("class parameter inference: {declaration:?}")
+    };
+    assert_eq!(name, "T");
+    assert_eq!(
+        definition,
+        &Def {
+            file: "GenericInferred.kt".into(),
+            start_byte: source.find("<T>").unwrap() + 1,
+            end_byte: source.find("<T>").unwrap() + 2
+        }
+    );
+    assert!(
+        labels(&mut ws, "GenericInferredUse.java", "box.getValue").contains("getValue"),
+        "inferred twin must retain the explicit twin's generic accessor"
+    );
+    assert!(labels(&mut ws, "GenericInferredUse.java", "box.setValue").contains("setValue"));
+    assert_eq!(
+        goto(
+            &mut ws,
+            "GenericInferredUse.java",
+            "box.getValue().length()",
+            "length"
+        ),
+        vec![target(&ws, "String.java", "length")]
+    );
+    ws.open(
+        "GenericPropertyUse.kt",
+        "package probe\nfun use(box: Box<java.lang.String>) = box.value.length()\n".into(),
+    );
+    assert_eq!(
+        goto(
+            &mut ws,
+            "GenericPropertyUse.kt",
+            "box.value.length()",
+            "length"
+        ),
+        vec![target(&ws, "String.java", "length")]
+    );
+    for nullable_input in [false, true, false] {
+        let changed = if nullable_input {
+            source
+                .replace("input: T", "input: T?")
+                .replace("typed: T =", "typed: T? =")
+        } else {
+            source.into()
+        };
+        ws.change("GenericInferred.kt", changed.clone());
+        assert!(labels(&mut ws, "GenericInferredUse.java", "box.getValue").contains("getValue"));
+        assert!(labels(&mut ws, "GenericInferredUse.java", "box.setValue").contains("setValue"));
+        let tree = KotlinParser::new().parse(&changed);
+        let at = changed.rfind("input").unwrap();
+        let initializer = tree
+            .root_node()
+            .descendant_for_byte_range(at, at + 5)
+            .unwrap();
+        let declaration = infer::infer(
+            &ws.index.scoped_for_file("GenericInferred.kt"),
+            initializer,
+            &changed,
+            &FileCtx::from_tree_in_file(&tree, &changed, "GenericInferred.kt"),
+        );
+        let provide =
+            |entry: &ktcore::index::Entry| (entry.sym.name == "value").then(|| declaration.clone());
+        let index = ws
+            .index
+            .scoped_for_file("GenericInferredUse.java")
+            .with_declaration_types(&provide);
+        let mut receiver = Type::class("Box", Some("probe".into()));
+        let Type::Class { args, .. } = &mut receiver else {
+            unreachable!()
+        };
+        args.push(Type::class("String", Some("java.lang".into())));
+        let ctx = FileCtx::new("probe".into(), Vec::new());
+        let candidates = ktcore::jvm::member_candidates(&index, &receiver, "getValue");
+        let [getter] = candidates.as_slice() else {
+            panic!("one inferred getter")
+        };
+        let actual =
+            ktcore::jvm::projected_return_type_in_context(&index, &receiver, *getter, &ctx)
+                .unwrap();
+        assert_eq!(
+            actual,
+            Type::class("String", Some("java.lang".into())).with_nullability(nullable_input)
+        );
+        let mut nullable_receiver = receiver.clone();
+        let Type::Class { args, .. } = &mut nullable_receiver else {
+            unreachable!()
+        };
+        args[0] = args[0].clone().with_nullability(true);
+        let nullable_result = ktcore::jvm::projected_return_type_in_context(
+            &index,
+            &nullable_receiver,
+            *getter,
+            &ctx,
+        )
+        .unwrap();
+        assert!(nullable_result.is_nullable());
+        for (argument, expected) in [
+            (
+                Type::class("String", Some("java.lang".into())),
+                ktcore::members::Applicability::Applicable,
+            ),
+            (
+                Type::class("Int", Some("kotlin".into())),
+                ktcore::members::Applicability::Rejected,
+            ),
+        ] {
+            let selected = ktcore::jvm::select_call(
+                &index,
+                &receiver,
+                ktcore::jvm::member_candidates(&index, &receiver, "setValue"),
+                "setValue",
+                &ktcore::members::CallArguments {
+                    count: Some(1),
+                    types: vec![argument],
+                    names: None,
+                    has_spread: false,
+                    trailing_lambda: false,
+                },
+                &ctx,
+            );
+            assert_eq!(selected.applicability, expected);
+        }
+    }
+    ws.change(
+        "GenericInferred.kt",
+        source.replace("var value = input", "val value = input"),
+    );
+    assert!(!labels(&mut ws, "GenericInferredUse.java", "box.setValue").contains("setValue"));
+    ws.change("GenericInferred.kt", source.into());
+    assert!(labels(&mut ws, "GenericInferredUse.java", "box.setValue").contains("setValue"));
+}
+
+#[test]
 fn inferred_property_accessors_follow_current_source_and_foreign_return_type_edits() {
     let mut ws = Workspace::new();
     let model = "package probe\nclass Model { val title = \"x\"\n var value = produce()\n}\n";

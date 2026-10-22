@@ -289,7 +289,11 @@ fn infer_depth_with<R: ChildInfer>(
         }
         // Defensive: should the grammar ever expose a boolean_literal kind.
         "boolean_literal" => intrinsic_type(index, "Boolean"),
+        "null_literal" => intrinsic_type(index, "Nothing").with_nullability(true),
         "identifier" => infer_identifier(index, node, src, ctx, depth, child_infer),
+        "lambda_literal" => {
+            infer_lambda(index, node, src, ctx, depth, child_infer).unwrap_or(Type::Unknown)
+        }
         "this_expression" if node_text(node, src) == "this" => {
             implicit_receiver_types(index, node, src, ctx, depth)
                 .into_iter()
@@ -338,6 +342,29 @@ fn infer_depth_with<R: ChildInfer>(
                 child_infer.infer_child(index, node.named_child(0).unwrap(), src, ctx, depth + 1);
             let argument =
                 child_infer.infer_child(index, node.named_child(1).unwrap(), src, ctx, depth + 1);
+            if matches!(&receiver, Type::Class {
+                name, package: Some(package), container: None, nullable: false, args,
+                owner: None,
+            } if package == "kotlin" && (name == "Array" && args.len() == 1
+                || matches!(name.as_str(), "BooleanArray" | "ByteArray" | "CharArray"
+                    | "ShortArray" | "IntArray" | "LongArray" | "FloatArray" | "DoubleArray")
+                    && args.is_empty()))
+            {
+                return member_type(
+                    index,
+                    &receiver,
+                    members::candidates_at(index, &receiver, "get", ctx, node.start_byte()),
+                    "get",
+                    true,
+                    Some(1),
+                    Some(&[argument]),
+                    None,
+                    src,
+                    ctx,
+                    depth,
+                    child_infer,
+                );
+            }
             members::kotlin_java_array_member_type(
                 &receiver,
                 "get",
@@ -1250,6 +1277,26 @@ fn lambda_param_type(
         if n.kind() == "lambda_literal" {
             let is_this_lambdas_param = implicit || lambda_declares_param(n, name, src);
             if is_this_lambdas_param {
+                if let Some(parameters) = child_of_kind(n, "lambda_parameters") {
+                    let mut cursor = parameters.walk();
+                    for parameter in parameters.named_children(&mut cursor) {
+                        if first_ident(parameter).is_some_and(|id| node_text(id, src) == name) {
+                            if let Some(reference) =
+                                crate::indexer::value_type_of_scoped(parameter, src, None)
+                            {
+                                let bounds = crate::indexer::type_parameters_in_scope(
+                                    parameter,
+                                    src,
+                                    &ctx.package,
+                                    &ctx.imports,
+                                );
+                                return Some(declared_type_in_scope(
+                                    index, &reference, ctx, &bounds,
+                                ));
+                            }
+                        }
+                    }
+                }
                 return lambda_receiver_or_element(index, n, src, ctx, depth, child_infer);
             }
             if implicit {
@@ -1649,6 +1696,9 @@ fn infer_identifier(
     if name == "true" || name == "false" {
         return intrinsic_type(index, "Boolean");
     }
+    if name == "null" {
+        return intrinsic_type(index, "Nothing").with_nullability(true);
+    }
     // A lambda parameter (implicit `it` OR a named param) of a scope/collection call takes the
     // receiver's (or element's) type.
     if let Some(t) = lambda_param_type(index, ident, name, src, ctx, depth, child_infer) {
@@ -1707,8 +1757,7 @@ fn infer_identifier(
     Type::Unknown
 }
 
-/// The type a declaration's name node binds: an explicit annotation, or (recursively) the inferred
-/// type of its initializer (`val x = foo()` -> foo's return type).
+/// The type a declaration's name node binds, including inferred initializer/function results.
 pub fn decl_type(
     index: &dyn InferenceIndex,
     decl: Node,
@@ -1720,6 +1769,51 @@ pub fn decl_type(
     let Some(parent) = decl.parent() else {
         return Type::Unknown;
     };
+    if parent.kind() == "function_declaration" {
+        let parameters =
+            crate::indexer::type_parameters_in_scope(parent, src, &ctx.package, &ctx.imports);
+        let scope = crate::indexer::TypeScope::with_default_imports(
+            &ctx.package,
+            ctx.imports.clone(),
+            crate::defaults::DEFAULT_IMPORT_PACKAGES,
+        );
+        let names = parameters
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>();
+        let scope = scope.without_shadowed_imports(&names).unwrap_or(scope);
+        let mut after_params = false;
+        let mut cursor = parent.walk();
+        for child in parent.named_children(&mut cursor) {
+            if child.kind() == "function_value_parameters" {
+                after_params = true;
+            } else if after_params {
+                match child.kind() {
+                    "user_type" | "nullable_type" | "function_type" | "parenthesized_type" => {
+                        return crate::indexer::type_ref_from(child, src, Some(&scope))
+                            .map(|tr| declared_type_in_scope(index, &tr, ctx, &parameters))
+                            .unwrap_or(Type::Unknown);
+                    }
+                    "function_body" => {
+                        if parent.has_error() {
+                            return Type::Unknown;
+                        }
+                        let Some(body) = child.named_child(0) else {
+                            return Type::Unknown;
+                        };
+                        // Kotlin block bodies without an annotation return Unit, not their last value.
+                        return if body.kind() == "block" {
+                            Type::class("Unit", Some("kotlin".into()))
+                        } else {
+                            child_infer.infer_child(index, body, src, ctx, depth + 1)
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Type::Unknown;
+    }
     if parent.kind() == "variable_declaration" {
         if let Some(t) = destructured_decl_type(index, decl, src, ctx, depth, child_infer) {
             return t;
@@ -1833,7 +1927,22 @@ fn infer_call(
             let cname = node_text(callee, src);
             // Locals/parameters are lexically stronger than every implicit receiver. Their
             // unmodeled callable signatures must not accidentally select a same-named extension.
-            if let Some((binder, _)) = resolve::local_decl(callee, cname, UseKind::Call, src) {
+            if let Some((binder, kind)) = resolve::local_decl(callee, cname, UseKind::Call, src) {
+                if matches!(kind, SymbolKind::LocalVariable | SymbolKind::Parameter) {
+                    let callable = decl_type(index, binder, src, ctx, depth + 1, child_infer);
+                    let arguments = normalized_call_arguments(
+                        node,
+                        src,
+                        synth_arg_types(index, node, src, ctx, depth, child_infer),
+                    );
+                    return function_value_call_type(
+                        index,
+                        &callable,
+                        &arguments,
+                        members::CallMode::Kotlin,
+                    )
+                    .unwrap_or(Type::Unknown);
+                }
                 let owner = binder.parent().and_then(|decl| {
                     if decl.kind() == "variable_declaration" {
                         decl.parent().and_then(|property| property.parent())
@@ -1866,6 +1975,22 @@ fn infer_call(
                 ctx,
                 callee.start_byte(),
             ) {
+                if selection.entries.len() == 1
+                    && selection.entries[0].sym.kind == SymbolKind::Property
+                    && selection.applicability != members::Applicability::Rejected
+                {
+                    let callable = child_infer.infer_child(index, callee, src, ctx, depth + 1);
+                    if let MemberUse::Call(arguments) = &usage {
+                        if let Some(result) = function_value_call_type(
+                            index,
+                            &callable,
+                            arguments,
+                            members::CallMode::Kotlin,
+                        ) {
+                            return result;
+                        }
+                    }
+                }
                 return selected_member_type(
                     index,
                     &receiver,
@@ -1885,6 +2010,19 @@ fn infer_call(
             }
             // An ordinary visible free function is considered after implicit receivers.
             let entries = visible_top_level_entries(index, cname, ctx, SymbolKind::Function);
+            if entries.is_empty() {
+                let callable = child_infer.infer_child(index, callee, src, ctx, depth + 1);
+                if let MemberUse::Call(arguments) = &usage {
+                    if let Some(result) = function_value_call_type(
+                        index,
+                        &callable,
+                        arguments,
+                        members::CallMode::Kotlin,
+                    ) {
+                        return result;
+                    }
+                }
+            }
             free_function_call_type(
                 index,
                 entries,
@@ -1903,6 +2041,22 @@ fn infer_call(
             let (Some(recv), Some(sel)) = (callee.named_child(0), callee.named_child(1)) else {
                 return Type::Unknown;
             };
+            if node_text(sel, src) == "invoke" {
+                let callable = child_infer.infer_child(index, recv, src, ctx, depth + 1);
+                let arguments = normalized_call_arguments(
+                    node,
+                    src,
+                    synth_arg_types(index, node, src, ctx, depth, child_infer),
+                );
+                if let Some(result) = function_value_call_type(
+                    index,
+                    &callable,
+                    &arguments,
+                    members::CallMode::Kotlin,
+                ) {
+                    return navigation_result_type(result, has_child_token(callee, "?."));
+                }
+            }
             let Some((recv_ty, candidates, nullable_result)) = navigation_member_candidates(
                 index,
                 recv,
@@ -1916,6 +2070,23 @@ fn infer_call(
                 return Type::Unknown;
             };
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
+            let arguments = normalized_call_arguments(node, src, arg_types.clone());
+            let selection =
+                candidates.select(index, &recv_ty, &MemberUse::Call(arguments.clone()), ctx);
+            if selection.entries.len() == 1
+                && selection.entries[0].sym.kind == SymbolKind::Property
+                && selection.applicability != members::Applicability::Rejected
+            {
+                let callable = child_infer.infer_child(index, callee, src, ctx, depth + 1);
+                if let Some(result) = function_value_call_type(
+                    index,
+                    &callable,
+                    &arguments,
+                    members::CallMode::Kotlin,
+                ) {
+                    return navigation_result_type(result, nullable_result);
+                }
+            }
             if recv_ty == Type::Unknown {
                 if let Some(entries) =
                     resolve::qualified_top_level_function_entries(index, callee, src, ctx)
@@ -1954,6 +2125,49 @@ fn infer_call(
         }
         _ => Type::Unknown,
     }
+}
+
+/// Invoke a normalized Kotlin function value using the same argument checks as ordinary members.
+pub fn function_value_call_type(
+    index: &dyn InferenceIndex,
+    callable: &Type,
+    arguments: &CallArguments,
+    mode: members::CallMode,
+) -> Option<Type> {
+    let Type::Class {
+        name,
+        package: Some(package),
+        container: None,
+        nullable,
+        args,
+        owner: None,
+    } = callable
+    else {
+        return None;
+    };
+    if !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions") {
+        return None;
+    }
+    let arity = name.strip_prefix("Function")?.parse::<usize>().ok()?;
+    if name != &format!("Function{arity}") || arity.checked_add(1)? != args.len() {
+        return None;
+    }
+    if *nullable
+        || arguments.count != Some(arity)
+        || arguments.names.is_some()
+        || arguments.has_spread
+        || arguments.trailing_lambda
+        || members::arguments_applicability(
+            index,
+            arguments,
+            |position| args.get(position).cloned().unwrap_or(Type::Unknown),
+            mode,
+            false,
+        ) != members::Applicability::Applicable
+    {
+        return Some(Type::Unknown);
+    }
+    Some(args[arity].clone())
 }
 
 /// Both visible and package-qualified free calls use the same selected signature and bindings.
@@ -2102,7 +2316,7 @@ fn free_function_sig(
                 return None;
             }
             return Some((
-                entry.sym.return_type.clone()?,
+                function_return_type_ref(index, entry)?,
                 entry.sym.type_params.clone(),
                 bound.params.into_owned(),
                 entry.sym.type_parameter_facts,
@@ -2110,10 +2324,7 @@ fn free_function_sig(
             ));
         }
     }
-    let mut group: Vec<&Entry> = entries
-        .into_iter()
-        .filter(|e| e.sym.return_type.is_some())
-        .collect();
+    let mut group = entries;
     if group.is_empty() {
         return None;
     }
@@ -2145,8 +2356,10 @@ fn free_function_sig(
     let first = group.first()?;
     if group.len() > 1
         && !group.iter().all(|e| {
-            opt_type_ref_same_shape(e.sym.return_type.as_ref(), first.sym.return_type.as_ref())
-                && e.sym.type_params == first.sym.type_params
+            opt_type_ref_same_shape(
+                function_return_type_ref(index, e).as_ref(),
+                function_return_type_ref(index, first).as_ref(),
+            ) && e.sym.type_params == first.sym.type_params
                 && e.sym.type_parameter_facts == first.sym.type_parameter_facts
                 && type_ref_list_same_shape(&e.sym.params, &first.sym.params)
         })
@@ -2154,12 +2367,21 @@ fn free_function_sig(
         return None;
     }
     Some((
-        first.sym.return_type.clone().unwrap(),
+        function_return_type_ref(index, first)?,
         first.sym.type_params.clone(),
         first.sym.params.clone(),
         first.sym.type_parameter_facts,
         None,
     ))
+}
+
+/// Read an inferred source return through the same current-declaration query as property types.
+pub fn function_return_type_ref(index: &dyn InferenceIndex, entry: &Entry) -> Option<TypeRef> {
+    entry
+        .sym
+        .return_type
+        .clone()
+        .or_else(|| crate::jvm::inferred_type_ref(&index.source_declaration_type(entry)?))
 }
 
 fn top_level_property_type(
@@ -2979,11 +3201,13 @@ fn selected_member_type(
         let inferred;
         let tr = match member_type_ref(index, recv_ty, e, want_function) {
             Some(tr) => tr,
-            None if !want_function && e.sym.kind == SymbolKind::Property => {
+            None if (!want_function && e.sym.kind == SymbolKind::Property)
+                || (want_function && e.sym.kind == SymbolKind::Function) =>
+            {
                 inferred = index
                     .source_declaration_type(e)
                     .as_ref()
-                    .and_then(crate::jvm::inferred_type_ref);
+                    .and_then(|ty| crate::jvm::inferred_member_type_ref(index, e, ty));
                 let Some(tr) = inferred.as_ref() else {
                     return Type::Unknown;
                 };
@@ -3558,18 +3782,85 @@ fn args_consistent(
 
 pub fn argument_types_consistent(
     index: &dyn InferenceIndex,
-    params: &[TypeRef],
-    type_params: &[String],
+    entry: &Entry,
     args: &[Type],
     ctx: &FileCtx,
 ) -> bool {
-    args_consistent(index, params, type_params, args, ctx, 0)
+    let platform = java_platform_null_arguments(entry, &entry.sym.params, args);
+    args_consistent(
+        index,
+        &entry.sym.params,
+        &entry.sym.type_params,
+        platform.as_deref().unwrap_or(args),
+        ctx,
+        0,
+    )
+}
+
+pub(crate) fn java_platform_null_arguments(
+    entry: &Entry,
+    params: &[TypeRef],
+    args: &[Type],
+) -> Option<Vec<Type>> {
+    if !entry.path.ends_with(".java") || entry.sym.kind != SymbolKind::Function {
+        return None;
+    }
+    unproven_reference_null_arguments(params, args, entry.sym.has_vararg)
+}
+
+pub(crate) fn unproven_reference_null_arguments(
+    params: &[TypeRef],
+    args: &[Type],
+    has_vararg: bool,
+) -> Option<Vec<Type>> {
+    let mut platform = None;
+    for (position, actual) in args.iter().enumerate() {
+        let Some(formal) = params
+            .get(position)
+            .or_else(|| has_vararg.then(|| params.last()).flatten())
+        else {
+            continue;
+        };
+        if is_kotlin_null_type(actual)
+            && !formal.name.is_empty()
+            && !matches!(
+                formal.name.as_str(),
+                "boolean"
+                    | "byte"
+                    | "char"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
+                    | "void"
+            )
+        {
+            // shortcut: Java parameter nullability annotations need normalized facts before proof.
+            platform.get_or_insert_with(|| args.to_vec())[position] = Type::Unknown;
+        }
+    }
+    platform
+}
+
+fn is_kotlin_null_type(ty: &Type) -> bool {
+    matches!(ty, Type::Class {
+        name, package: Some(package), container: None, nullable: true, args, owner: None,
+    } if name == "Nothing" && package == "kotlin" && args.is_empty())
 }
 
 /// Gradual consistency of an actual argument type with a formal parameter type: an `Unknown` on either
 /// side or an unindexed symbolic head stays possible; an exact head match or a known subtype is
 /// consistent; otherwise inconsistent.
 pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal: &Type) -> bool {
+    if is_kotlin_null_type(actual) {
+        return match formal {
+            Type::Class { .. } | Type::Array { .. } | Type::Parameter { .. } => {
+                formal.is_nullable()
+            }
+            _ => true,
+        };
+    }
     let (Some(an), Some(fname)) = (actual.name(), formal.name()) else {
         return true; // Unknown on either side -> compatible (don't eliminate)
     };
@@ -4212,6 +4503,35 @@ pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
     if let Type::Parameter { upper_bounds, .. } = ty {
         return upper_bounds.clone();
     }
+    if let Type::Class {
+        name,
+        package: Some(package),
+        container: None,
+        args,
+        owner: None,
+        ..
+    } = ty
+    {
+        if package == "kotlin" && type_declaration(index, ty).is_none() {
+            if let Some(arity) = name
+                .strip_prefix("Function")
+                .and_then(|arity| arity.parse::<usize>().ok())
+            {
+                if arity <= 22 && name == &format!("Function{arity}") && args.len() == arity + 1 {
+                    let mut runtime = ty.clone();
+                    if let Type::Class { package, .. } = &mut runtime {
+                        *package = Some("kotlin.jvm.functions".into());
+                    }
+                    if type_declaration(index, &runtime).is_some_and(|declaration| {
+                        declaration.sym.kind == SymbolKind::Interface
+                            && declaration.sym.type_params.len() == args.len()
+                    }) {
+                        return vec![runtime];
+                    }
+                }
+            }
+        }
+    }
     if ty.package().is_none()
         && ty.container().is_none()
         && ty
@@ -4329,6 +4649,73 @@ fn lambda_tail_expr(lambda: Node) -> Option<Node> {
     } else {
         Some(tail)
     }
+}
+
+fn infer_lambda(
+    index: &dyn InferenceIndex,
+    lambda: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Option<Type> {
+    if lambda.has_error() {
+        return None;
+    }
+    let parameters = child_of_kind(lambda, "lambda_parameters");
+    if parameters.is_none() {
+        let mut expression = lambda;
+        while let Some(parent) = expression
+            .parent()
+            .filter(|parent| parent.kind() == "parenthesized_expression")
+        {
+            expression = parent;
+        }
+        let initializer = expression
+            .parent()
+            .filter(|parent| parent.kind() == "property_declaration")?;
+        let declaration = child_of_kind(initializer, "variable_declaration")?;
+        // shortcut: contextual arity stays Unknown until expected-type parameter/receiver binding.
+        if crate::indexer::value_type_of_scoped(declaration, src, None).is_some() {
+            return None;
+        }
+    }
+    let mut args = Vec::new();
+    if let Some(parameters) = parameters {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            // shortcut: contextual/destructured parameters stay Unknown until expected-type binding.
+            let reference = crate::indexer::value_type_of_scoped(parameter, src, None)?;
+            let bounds = crate::indexer::type_parameters_in_scope(
+                parameter,
+                src,
+                &ctx.package,
+                &ctx.imports,
+            );
+            let ty = declared_type_in_scope(index, &reference, ctx, &bounds);
+            if ty == Type::Unknown {
+                return None;
+            }
+            args.push(ty);
+        }
+    }
+    let arity = args.len();
+    let result = match lambda_tail_expr(lambda) {
+        Some(tail) => child_infer.infer_child(index, tail, src, ctx, depth + 1),
+        None => intrinsic_type(index, "Unit"),
+    };
+    if result == Type::Unknown {
+        return None;
+    }
+    args.push(result);
+    Some(Type::Class {
+        name: format!("Function{arity}"),
+        package: Some("kotlin".into()),
+        container: None,
+        nullable: false,
+        args,
+        owner: None,
+    })
 }
 
 fn named_type_params(
@@ -4503,6 +4890,41 @@ mod tests {
             assert!(super::direct_supertypes(&index, &primitive).is_empty());
             assert!(crate::jvm::member_candidates(&index, &primitive, "poisoned").is_empty());
             assert_eq!(index.lookup_type(name).len(), 1);
+        }
+    }
+
+    #[test]
+    fn kotlin_nominal_array_index_uses_shared_get_selection() {
+        use crate::types::Type;
+        let mut index = Index::new();
+        let declarations = "package kotlin\nclass Array<T> { operator fun get(index: Int): T = throw Exception() }\nclass IntArray { operator fun get(index: Int): Int = throw Exception() }\n";
+        let mut parser = crate::parser::KotlinParser::new();
+        let declarations_tree = parser.parse(declarations);
+        index.replace_file(
+            "/stdlib/Arrays.kt",
+            crate::indexer::extract_symbols(&declarations_tree, declarations, "kotlin"),
+            Tier::Durable,
+        );
+        let src = "package consumer\nfun read(values: Array<String>, nullable: Array<String>?, ints: IntArray) {\n values[0]\n values[true]\n nullable[0]\n ints[0]\n}\n";
+        let tree = parser.parse(src);
+        let ctx = super::FileCtx::from_tree_in_file(&tree, src, "Use.kt");
+        for (expression, expected) in [
+            ("values[0]", Type::class("String", Some("kotlin".into()))),
+            ("values[true]", Type::Unknown),
+            ("nullable[0]", Type::Unknown),
+            ("ints[0]", Type::class("Int", Some("kotlin".into()))),
+        ] {
+            let start = src.find(expression).unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(&src[node.byte_range()], expression);
+            assert_eq!(
+                super::infer(&index, node, src, &ctx),
+                expected,
+                "{expression}"
+            );
         }
     }
 
@@ -5457,6 +5879,11 @@ pub fn declared_type_in_scope(
                 },
                 name: parameter.name.clone(),
                 nullable,
+                nullability: if tr.nullable {
+                    crate::types::ParameterNullability::Nullable
+                } else {
+                    crate::types::ParameterNullability::Inherit
+                },
                 upper_bounds,
             }
         } else {
@@ -5529,6 +5956,13 @@ fn type_ref_identity(
     tr: &TypeRef,
     ctx: &FileCtx,
 ) -> Option<(Option<String>, Option<String>)> {
+    if members::function_type_signature(tr).is_some() {
+        let package = tr
+            .qualification
+            .as_deref()
+            .unwrap_or_else(|| &tr.package_candidates[0]);
+        return Some((Some(package.to_string()), None));
+    }
     if is_intrinsic_type_ref(index, tr, ctx) {
         return Some((Some(intrinsic_package(index, &tr.name).to_string()), None));
     }

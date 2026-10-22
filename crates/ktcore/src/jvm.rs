@@ -1,13 +1,14 @@
 //! JVM-visible callable facts. Authored declarations keep their source names and signatures.
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::index::{Entry, InferenceIndex, Tier};
 use crate::indexer::{self, TypeScope};
 use crate::infer::{self, FileCtx};
 use crate::parser::{child_of_kind, imports_of, name_field, node_text};
 use crate::symbol::{Def, IndexedSymbol, SymbolKind};
-use crate::types::{Type, TypeRef};
+use crate::types::{ParameterNullability, Type, TypeParameterBounds, TypeRef};
 use tree_sitter::{Node, Tree};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +56,7 @@ pub struct SourceProperty {
     pub owner: String,
     pub name: String,
     pub type_params: Vec<String>,
+    pub type_parameter_bounds: Vec<TypeParameterBounds>,
     pub requires_binary_witness: bool,
     pub deferred: Option<PropertyAccessor>,
 }
@@ -313,6 +315,7 @@ fn source_value_descriptor(
             )
             .is_some();
         if !scalar_abi
+            && !is_kotlin_array_type(&resolved)
             && index.lookup_type(resolved.name()?).iter().any(|entry| {
                 Some(entry.sym.package.as_str()) == resolved.package()
                     && entry.sym.container.as_deref() == resolved.container()
@@ -350,11 +353,86 @@ fn inferred_property_ref(
     facts: &CallableFacts,
 ) -> Option<TypeRef> {
     let entry = source_property_entry(index, source, facts)?;
-    inferred_type_ref(&index.source_declaration_type(entry)?)
+    inferred_property_type_ref(source, facts, entry, &index.source_declaration_type(entry)?)
+}
+
+fn inferred_property_type_ref(
+    source: &SourceFile,
+    facts: &CallableFacts,
+    entry: &Entry,
+    ty: &Type,
+) -> Option<TypeRef> {
+    let property = facts.source_property.as_ref()?;
+    reify_inferred_type(ty, &|definition, name, nullability| {
+        let parameter = property.type_parameter_bounds.iter().find(|parameter| {
+            definition.file == source.file
+                && definition.file == entry.path.as_ref()
+                && definition.start_byte == parameter.start_byte
+                && definition.end_byte == parameter.end_byte
+                && name == parameter.name
+                && parameter.complete
+                && parameter.scope_start <= entry.sym.start_byte
+                && entry.sym.end_byte <= parameter.scope_end
+                && property.type_params.contains(&parameter.name)
+        })?;
+        // `T & Any` needs intersection facts; never silently reify it as plain `T`.
+        if nullability == ParameterNullability::NonNull {
+            return None;
+        }
+        Some(TypeRef {
+            name: parameter.name.clone(),
+            nullable: nullability == ParameterNullability::Nullable,
+            ..TypeRef::default()
+        })
+    })
+}
+
+/// Reify an inferred member only with the current source owner's exact binder proof.
+pub fn inferred_member_type_ref(
+    index: &dyn InferenceIndex,
+    entry: &Entry,
+    ty: &Type,
+) -> Option<TypeRef> {
+    if let Some(reference) = inferred_type_ref(ty) {
+        return Some(reference);
+    }
+    let owner = entry.sym.container.as_deref()?;
+    for source in index.jvm_sources(owner) {
+        if source.file != entry.path.as_ref() {
+            continue;
+        }
+        for facts in &source.facts.callables {
+            if facts.source_property.is_some()
+                && facts.definition.as_ref().is_some_and(|definition| {
+                    definition.start_byte == entry.sym.start_byte
+                        && definition.end_byte == entry.sym.end_byte
+                })
+            {
+                return inferred_property_type_ref(source, facts, entry, ty);
+            }
+        }
+    }
+    None
 }
 
 /// Reify only resolved nominal identities; unresolved/foreign type parameters never acquire an ABI.
 pub fn inferred_type_ref(ty: &Type) -> Option<TypeRef> {
+    reify_inferred_type(ty, &|_, _, _| None)
+}
+
+fn reify_inferred_type(
+    ty: &Type,
+    parameter: &impl Fn(&Def, &str, ParameterNullability) -> Option<TypeRef>,
+) -> Option<TypeRef> {
+    if let Type::Parameter {
+        definition,
+        name,
+        nullability,
+        ..
+    } = ty
+    {
+        return parameter(definition, name, *nullability);
+    }
     let Type::Class {
         name,
         package: Some(package),
@@ -380,9 +458,12 @@ pub fn inferred_type_ref(ty: &Type) -> Option<TypeRef> {
         name: name.clone(),
         qualification: Some(qualification),
         nullable: *nullable,
-        args: args.iter().map(inferred_type_ref).collect::<Option<_>>()?,
+        args: args
+            .iter()
+            .map(|arg| reify_inferred_type(arg, parameter))
+            .collect::<Option<_>>()?,
         owner: match owner {
-            Some(owner) => Some(Box::new(inferred_type_ref(owner)?)),
+            Some(owner) => Some(Box::new(reify_inferred_type(owner, parameter)?)),
             None => None,
         },
         ..TypeRef::default()
@@ -394,12 +475,30 @@ fn resolved_params<'a>(
     source: &SourceFile,
     facts: &'a CallableFacts,
 ) -> Option<Cow<'a, [TypeRef]>> {
-    if deferred_setter(facts) {
-        Some(Cow::Owned(vec![inferred_property_ref(
-            index, source, facts,
-        )?]))
+    let parameters = if deferred_setter(facts) {
+        Cow::Owned(vec![inferred_property_ref(index, source, facts)?])
     } else {
-        Some(Cow::Borrowed(&facts.params))
+        Cow::Borrowed(facts.params.as_slice())
+    };
+    if parameters
+        .iter()
+        .any(|ty| crate::members::function_type_signature(ty).is_some())
+    {
+        let ctx = FileCtx::new(source.facts.package.clone(), Vec::new());
+        Some(Cow::Owned(
+            parameters
+                .iter()
+                .map(|ty| {
+                    if crate::members::function_type_signature(ty).is_some() {
+                        jvm_function_type_ref(index, ty, &ctx)
+                    } else {
+                        Some(ty.clone())
+                    }
+                })
+                .collect::<Option<_>>()?,
+        ))
+    } else {
+        Some(parameters)
     }
 }
 
@@ -408,10 +507,71 @@ fn resolved_return<'a>(
     source: &SourceFile,
     facts: &'a CallableFacts,
 ) -> Option<Cow<'a, TypeRef>> {
-    match facts.return_type.as_ref() {
+    let result = match facts.return_type.as_ref() {
         Some(ty) => Some(Cow::Borrowed(ty)),
         None => inferred_property_ref(index, source, facts).map(Cow::Owned),
+    }?;
+    if crate::members::function_type_signature(&result).is_some() {
+        Some(Cow::Owned(jvm_function_type_ref(
+            index,
+            &result,
+            &FileCtx::new(source.facts.package.clone(), Vec::new()),
+        )?))
+    } else {
+        Some(result)
     }
+}
+
+fn jvm_function_type_ref(
+    index: &dyn InferenceIndex,
+    ty: &TypeRef,
+    ctx: &FileCtx,
+) -> Option<TypeRef> {
+    fn argument(index: &dyn InferenceIndex, ty: &TypeRef, ctx: &FileCtx) -> Option<TypeRef> {
+        if crate::members::function_type_signature(ty).is_some() {
+            return jvm_function_type_ref(index, ty, ctx);
+        }
+        let mut result = ty.clone();
+        let resolved = infer::declared_type(index, ty, ctx);
+        if resolved.container().is_none() && resolved.package() == Some("kotlin") {
+            let wrapper = match resolved.name()? {
+                "Boolean" => Some("Boolean"),
+                "Byte" => Some("Byte"),
+                "Char" => Some("Character"),
+                "Short" => Some("Short"),
+                "Int" => Some("Integer"),
+                "Long" => Some("Long"),
+                "Float" => Some("Float"),
+                "Double" => Some("Double"),
+                "String" => Some("String"),
+                _ => None,
+            };
+            if let Some(wrapper) = wrapper {
+                result.name = wrapper.into();
+                result.qualification = Some("java.lang".into());
+                result.package_candidates = Arc::new(Vec::new());
+            }
+        }
+        result.args = ty
+            .args
+            .iter()
+            .map(|ty| argument(index, ty, ctx))
+            .collect::<Option<_>>()?;
+        Some(result)
+    }
+    let (parameters, _) = crate::members::function_type_signature(ty)?;
+    if parameters.len() > 22 {
+        return None;
+    }
+    let mut result = ty.clone();
+    result.qualification = Some("kotlin.jvm.functions".into());
+    result.package_candidates = Arc::new(Vec::new());
+    result.args = ty
+        .args
+        .iter()
+        .map(|ty| argument(index, ty, ctx))
+        .collect::<Option<_>>()?;
+    Some(result)
 }
 
 pub fn resolved_signature_types(
@@ -551,6 +711,11 @@ fn erased_descriptor(
     ctx: &FileCtx,
     type_parameters: &[String],
 ) -> Option<String> {
+    if let Some((parameters, _)) = crate::members::function_type_signature(ty) {
+        // shortcut: arities above 22 stay Unknown until alternate FunctionN lowering is modeled.
+        return (parameters.len() <= 22)
+            .then(|| format!("Lkotlin/jvm/functions/Function{};", parameters.len()));
+    }
     if ty.qualification.is_none() && type_parameters.contains(&ty.name) {
         return None;
     }
@@ -570,9 +735,32 @@ fn erased_descriptor(
         return None;
     };
     if container.is_none() && package == "kotlin" {
-        // shortcut: generic array erasure remains Unknown until its element/boxing rules are covered.
         if name == "Array" {
-            return None;
+            let [component] = ty.args.as_slice() else {
+                return None;
+            };
+            if !matches!(
+                component.projection,
+                crate::types::Projection::Invariant | crate::types::Projection::Out
+            ) {
+                return None;
+            }
+            let descriptor = erased_descriptor(index, component, ctx, type_parameters)?;
+            let boxed = match descriptor.as_str() {
+                "Z" => "Ljava/lang/Boolean;",
+                "B" => "Ljava/lang/Byte;",
+                "C" => "Ljava/lang/Character;",
+                "S" => "Ljava/lang/Short;",
+                "I" => "Ljava/lang/Integer;",
+                "J" => "Ljava/lang/Long;",
+                "F" => "Ljava/lang/Float;",
+                "D" => "Ljava/lang/Double;",
+                _ => &descriptor,
+            };
+            return Some(format!("[{boxed}"));
+        }
+        if let Some((descriptor, _)) = kotlin_primitive_array_component(&name) {
+            return ty.args.is_empty().then(|| format!("[{descriptor}"));
         }
         if crate::defaults::is_builtin_type(&name) {
             let mut non_nullable = ty.clone();
@@ -625,6 +813,72 @@ fn erased_descriptor(
             format!("{}/", package.replace('.', "/"))
         }
     ))
+}
+
+fn kotlin_primitive_array_component(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        "BooleanArray" => ("Z", "boolean"),
+        "ByteArray" => ("B", "byte"),
+        "CharArray" => ("C", "char"),
+        "ShortArray" => ("S", "short"),
+        "IntArray" => ("I", "int"),
+        "LongArray" => ("J", "long"),
+        "FloatArray" => ("F", "float"),
+        "DoubleArray" => ("D", "double"),
+        _ => return None,
+    })
+}
+
+fn is_kotlin_array_type(ty: &Type) -> bool {
+    matches!(ty, Type::Class { name, package: Some(package), container: None,
+        args, owner: None, .. } if package == "kotlin"
+            && (name == "Array" && args.len() == 1
+                || kotlin_primitive_array_component(name).is_some() && args.is_empty()))
+}
+
+fn kotlin_array_jvm_type(ty: Type) -> Type {
+    if !is_kotlin_array_type(&ty) {
+        return ty;
+    }
+    let Type::Class {
+        name,
+        mut args,
+        nullable,
+        ..
+    } = ty
+    else {
+        unreachable!()
+    };
+    if let Some((_, primitive)) = kotlin_primitive_array_component(&name) {
+        return Type::array(Type::class(primitive, None), nullable);
+    }
+    let component = args.pop().unwrap();
+    let component = match &component {
+        Type::Class {
+            name,
+            package: Some(package),
+            container: None,
+            args,
+            owner: None,
+            ..
+        } if package == "kotlin" && args.is_empty() => {
+            let wrapper = match name.as_str() {
+                "Boolean" => "Boolean",
+                "Byte" => "Byte",
+                "Char" => "Character",
+                "Short" => "Short",
+                "Int" => "Integer",
+                "Long" => "Long",
+                "Float" => "Float",
+                "Double" => "Double",
+                "String" => "String",
+                _ => return Type::array(kotlin_array_jvm_type(component), nullable),
+            };
+            Type::class(wrapper, Some("java.lang".into())).with_nullability(component.is_nullable())
+        }
+        _ => kotlin_array_jvm_type(component),
+    };
+    Type::array(component, nullable)
 }
 
 /// JVM owners are language projections, never authored type declarations.
@@ -1361,9 +1615,22 @@ pub fn select_call<'a>(
                             .unwrap_or_default(),
                     };
                     let declaration_ctx = FileCtx::new(package, Vec::new());
+                    let platform = matches!(owner, JvmOwner::Compiled { .. })
+                        .then(|| {
+                            infer::unproven_reference_null_arguments(
+                                &facts.params,
+                                &args.types,
+                                false,
+                            )
+                        })
+                        .flatten()
+                        .map(|types| members::CallArguments {
+                            types,
+                            ..args.clone()
+                        });
                     members::arguments_applicability(
                         index,
-                        args,
+                        platform.as_ref().unwrap_or(args),
                         |position| {
                             let params = match owner {
                                 JvmOwner::Source(source) => resolved_params(index, source, facts),
@@ -1485,7 +1752,7 @@ pub fn projected_return_type_in_context(
         if let Some(entry) = source_property_entry(index, source, facts) {
             let returns = resolved_return(index, source, facts)?;
             let result = infer::declared_member_type(index, receiver, entry, &returns, ctx);
-            return (!matches!(result, Type::Unknown)).then_some(result);
+            return (!matches!(result, Type::Unknown)).then(|| kotlin_array_jvm_type(result));
         }
     }
     if let CallableCandidate::Jvm {
@@ -1549,9 +1816,10 @@ pub fn source_facts(
         return None;
     }
     let package = crate::parser::package_of(tree, text);
+    let imports = imports_of(tree, text);
     let scope = TypeScope::with_default_imports(
         &package,
-        imports_of(tree, text),
+        imports.clone(),
         crate::defaults::DEFAULT_IMPORT_PACKAGES,
     );
     let mut owner = std::path::Path::new(file)
@@ -1800,6 +2068,9 @@ pub fn source_facts(
                 owner: owner.name.clone(),
                 name: symbol.name.clone(),
                 type_params: owner.type_params.clone(),
+                type_parameter_bounds: indexer::type_parameters_in_scope(
+                    node, text, &package, &imports,
+                ),
                 requires_binary_witness,
                 deferred,
             }),
@@ -1958,6 +2229,70 @@ fn annotation_known(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inferred_property_reification_requires_the_exact_owner_binder() {
+        let file = "/getter/Box.kt";
+        let text =
+            "package getter\nclass Box<T>(val input: T) { var value = input }\nclass Other<T>\n";
+        let tree = crate::parser::KotlinParser::new().parse(text);
+        let symbols = indexer::extract_symbols(&tree, text, "getter");
+        let facts = source_facts(file, &tree, text, &symbols).unwrap();
+        let mut index = crate::index::Index::new();
+        index.replace_file(file, symbols, Tier::Volatile);
+        index.replace_jvm_source(file, Some(facts), Tier::Volatile);
+        let entry = &index.lookup_by_name("value")[0];
+        let at = text.find("<T>").unwrap() + 1;
+        let parameter = Type::Parameter {
+            definition: Def {
+                file: file.into(),
+                start_byte: at,
+                end_byte: at + 1,
+            },
+            name: "T".into(),
+            nullable: true,
+            nullability: ParameterNullability::Inherit,
+            upper_bounds: vec![Type::class("Any", Some("kotlin".into())).with_nullability(true)],
+        };
+        assert!(inferred_type_ref(&parameter).is_none());
+        assert_eq!(
+            inferred_member_type_ref(&index, entry, &parameter),
+            Some(TypeRef::simple("T"))
+        );
+        assert!(
+            inferred_member_type_ref(&index, entry, &parameter.clone().with_nullability(true))
+                .unwrap()
+                .nullable
+        );
+        assert!(
+            inferred_member_type_ref(&index, entry, &parameter.clone().into_non_null()).is_none()
+        );
+        for foreign_file in [false, true] {
+            let mut foreign = parameter.clone();
+            let Type::Parameter { definition, .. } = &mut foreign else {
+                unreachable!()
+            };
+            if foreign_file {
+                definition.file = "/getter/Other.kt".into();
+            } else {
+                definition.start_byte = text.rfind("<T>").unwrap() + 1;
+                definition.end_byte = definition.start_byte + 1;
+            }
+            assert!(inferred_member_type_ref(&index, entry, &foreign).is_none());
+        }
+        let mut incomplete = index.jvm_source_for_file(file).unwrap().facts.clone();
+        for facts in &mut incomplete.callables {
+            facts
+                .source_property
+                .as_mut()
+                .unwrap()
+                .type_parameter_bounds[0]
+                .complete = false;
+        }
+        let entry = entry.clone();
+        index.replace_jvm_source(file, Some(incomplete), Tier::Volatile);
+        assert!(inferred_member_type_ref(&index, &entry, &parameter).is_none());
+    }
 
     #[test]
     fn constructor_property_getters_share_candidates_and_source_definitions() {
@@ -2352,6 +2687,90 @@ mod tests {
         );
         assert!(index.lookup_by_name("getName").is_empty());
         assert!(index.lookup_type("Person").is_empty());
+    }
+
+    #[test]
+    fn decoded_reference_nullness_stays_unproven_but_primitive_null_is_rejected() {
+        let mut index = crate::index::Index::new();
+        index.replace_file(
+            "jdk/String.java",
+            vec![IndexedSymbol::new(
+                "String",
+                SymbolKind::Class,
+                "java.lang",
+                None,
+                0,
+                6,
+            )],
+            Tier::Durable,
+        );
+        for (bytes, name, expected) in [
+            (
+                include_bytes!("../tests/fixtures/classfile/pluginfixture/Person.class").as_slice(),
+                "<init>",
+                crate::members::Applicability::Unknown,
+            ),
+            (
+                include_bytes!(
+                    "../tests/fixtures/classfile/gradle8142/JavaCompilerArgumentsBuilder.class"
+                )
+                .as_slice(),
+                "includeLauncherOptions",
+                crate::members::Applicability::Rejected,
+            ),
+        ] {
+            let class = crate::classfile::decode("selected:existing-fixture", bytes).unwrap();
+            let member = class
+                .methods
+                .iter()
+                .find(|member| member.name.as_ref() == name)
+                .unwrap();
+            let signature = crate::classfile::signature::method_signature(
+                member.signature.as_deref().unwrap_or(&member.descriptor),
+                &member.descriptor,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(signature.parameters.len(), 1);
+            let facts = CallableFacts {
+                name: name.into(),
+                params: signature.parameters,
+                return_type: signature.returns,
+                type_params: Vec::new(),
+                definition: None,
+                fixed_name: None,
+                jvm_name_annotation: None,
+                is_static: false,
+                source_property: None,
+            };
+            let candidate = CallableCandidate::Jvm {
+                owner: JvmOwner::Compiled {
+                    class: &class.identity,
+                    descriptor: &member.descriptor,
+                    tier: Tier::Durable,
+                },
+                facts: &facts,
+            };
+            let arguments = crate::members::CallArguments {
+                count: Some(1),
+                types: vec![Type::class("Nothing", Some("kotlin".into())).with_nullability(true)],
+                names: None,
+                has_spread: false,
+                trailing_lambda: false,
+            };
+            let selected = select_call(
+                &index,
+                &Type::Unknown,
+                vec![candidate],
+                name,
+                &arguments,
+                &FileCtx::new(String::new(), Vec::new()),
+            );
+            assert_eq!(selected.applicability, expected, "{name}");
+            if expected == crate::members::Applicability::Unknown {
+                assert_eq!(selected.consumable_candidates().len(), 1);
+            }
+        }
     }
 
     #[test]
@@ -2777,11 +3196,18 @@ mod tests {
                 facts,
             }
             .identity(&index);
-            assert!(
-                identity.is_none(),
-                "{} must remain unsupported: {identity:?}",
-                facts.name
-            );
+            if facts.name == "concreteArray" {
+                assert_eq!(
+                    identity.unwrap().descriptor,
+                    "([Ljava/lang/Long;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"
+                );
+            } else {
+                assert!(
+                    identity.is_none(),
+                    "{} must remain unsupported: {identity:?}",
+                    facts.name
+                );
+            }
         }
     }
 
@@ -2812,6 +3238,76 @@ mod tests {
                 format!("({parameter}Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn kotlin_array_source_getters_use_jvm_arrays_and_box_reference_components() {
+        let text = "package scalar\nclass Box {\nval strings: Array<String> = arrayOf(\"x\")\nval boxed: Array<Int?>? = null\nval matrix: Array<IntArray> = arrayOf(intArrayOf(1))\nval ints: IntArray = intArrayOf(1)\n}\n";
+        let (mut index, source) = suspend_source_fixture(text);
+        for name in ["Array", "IntArray"] {
+            let mut symbol =
+                IndexedSymbol::new(name, SymbolKind::Class, "kotlin", None, 0, name.len());
+            symbol.source_member = symbol.source_member.with_jvm_restricted(true);
+            index.replace_file(&format!("/stdlib/{name}.kt"), vec![symbol], Tier::Durable);
+        }
+        for (name, descriptor) in [
+            ("getStrings", "()[Ljava/lang/String;"),
+            ("getBoxed", "()[Ljava/lang/Integer;"),
+            ("getMatrix", "()[[I"),
+            ("getInts", "()[I"),
+        ] {
+            let facts = source
+                .facts
+                .callables
+                .iter()
+                .find(|facts| facts.name == name)
+                .unwrap();
+            let candidate = CallableCandidate::Jvm {
+                owner: JvmOwner::Source(&source),
+                facts,
+            };
+            assert_eq!(
+                candidate.identity(&index).unwrap().descriptor,
+                descriptor,
+                "{name}"
+            );
+        }
+        let array = |name: &str, package: &str, args: Vec<Type>| {
+            let mut ty = Type::class(name, Some(package.into()));
+            if let Type::Class { args: target, .. } = &mut ty {
+                *target = args;
+            }
+            ty
+        };
+        let integer = Type::class("Integer", Some("java.lang".into())).with_nullability(true);
+        assert_eq!(
+            kotlin_array_jvm_type(
+                array(
+                    "Array",
+                    "kotlin",
+                    vec![Type::class("Int", Some("kotlin".into())).with_nullability(true)]
+                )
+                .with_nullability(true)
+            ),
+            Type::array(integer, true)
+        );
+        assert_eq!(
+            kotlin_array_jvm_type(array(
+                "Array",
+                "kotlin",
+                vec![Type::class("IntArray", Some("kotlin".into()))]
+            )),
+            Type::array(Type::array(Type::class("int", None), false), false)
+        );
+        for name in ["Array", "IntArray"] {
+            let decoy = array(
+                name,
+                "foreign",
+                vec![Type::class("String", Some("kotlin".into()))],
+            );
+            assert_eq!(kotlin_array_jvm_type(decoy.clone()), decoy);
+            assert!(!is_kotlin_array_type(&decoy));
         }
     }
 }

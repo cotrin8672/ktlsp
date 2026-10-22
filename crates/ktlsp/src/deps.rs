@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v38-deferred-property-accessors-lazy-binary";
+const SYMCACHE_VERSION: &[u8] = b"v40-expect-type-jvm-eligibility";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 const BINARY_JAR_MARKER: &str = ".ktlsp-binary-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
@@ -4148,7 +4148,7 @@ public class ParameterUse<Iterable> {
         fs::create_dir_all(&tmp).unwrap();
         let source = tmp.join("Library.kt");
         let text =
-            "package lib\nclass Payload\nsuspend fun first(value: Payload): Payload = TODO()\n";
+            "package lib\nclass Payload\nexpect class Common\nsuspend fun first(value: Payload): Payload = TODO()\n";
         fs::write(&source, text).unwrap();
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -4172,6 +4172,22 @@ public class ParameterUse<Iterable> {
         );
         let loaded = symcache_load_file(&cache, &tmp).unwrap();
         assert_eq!(loaded[0].symbols, data[0].symbols);
+        assert!(
+            loaded[0]
+                .symbols
+                .iter()
+                .find(|sym| sym.name == "Common")
+                .unwrap()
+                .is_expect
+        );
+        assert!(
+            !loaded[0]
+                .symbols
+                .iter()
+                .find(|sym| sym.name == "Payload")
+                .unwrap()
+                .is_expect
+        );
         assert_eq!(loaded[0].jvm, data[0].jvm);
         assert!(
             loaded[0].origin.is_none(),

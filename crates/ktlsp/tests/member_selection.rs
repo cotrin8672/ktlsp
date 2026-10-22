@@ -2029,7 +2029,8 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
-    // Current cache schema: boxed receivers encode like inline options, followed by source flags.
+    // v40 intentionally adds is_expect to both layouts. Boxed receivers must still encode like
+    // inline options, followed by source flags; the schema tag invalidates older positional bytes.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct InlineSymbol {
         name: String,
@@ -2043,6 +2044,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         supertype_refs: Vec<TypeRef>,
         unavailable_members: Option<Vec<(String, SymbolKind, Option<u8>)>>,
         is_annotation: bool,
+        is_expect: bool,
         ext_receiver: Option<String>,
         extension_receiver: Option<ExtensionReceiverFacts>,
         arity: Option<u8>,
@@ -2080,6 +2082,7 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     rich.supertype_refs = vec![receiver.clone()];
     rich.unavailable_members = Some(Box::new(vec![("f".into(), SymbolKind::Function, Some(0))]));
     rich.is_annotation = true;
+    rich.is_expect = true;
     rich.ext_receiver = Some("Owner".into());
     rich.extension_receiver = Some(Box::new(ExtensionReceiverFacts {
         ty: receiver.clone(),
@@ -2131,6 +2134,13 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         assert_eq!(
             bincode::deserialize::<IndexedSymbol>(&current_bytes).unwrap(),
             symbol
+        );
+        let mut absent_expect = value.clone();
+        absent_expect.as_object_mut().unwrap().remove("is_expect");
+        assert!(
+            !serde_json::from_value::<IndexedSymbol>(absent_expect)
+                .unwrap()
+                .is_expect
         );
         let mut absent_names = value.clone();
         absent_names
