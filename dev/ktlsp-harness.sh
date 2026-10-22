@@ -923,6 +923,15 @@ public class MemberUse {
         arrays.getValues()[0].propertyOnly();
         int length = arrays.getInts().length;
     }
+    public <T> void classLiterals() {
+        String directName = Runnable.class.getName();
+        var literalClass = Runnable.class;
+        String literalName = literalClass.getName();
+        var primitiveClass = int.class;
+        String primitiveName = primitiveClass.getName();
+        var arrayClass = Runnable[].class;
+        String arrayName = arrayClass.getName();
+    }
 }
 JAVA
   cat > "$project/selection/Callable.kt" <<'KOTLIN'

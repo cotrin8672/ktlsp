@@ -3582,6 +3582,67 @@ fn receiver_type(
         return None;
     }
     match object.kind() {
+        "class_literal" => {
+            if object.has_error() {
+                return None;
+            }
+            let node = object.named_child(0)?;
+            let target = if let Some(wrapper) = java_boxed_type(node_text(node, src)) {
+                Type::class(wrapper, Some("java.lang".into()))
+            } else if node.kind() == "void_type" {
+                Type::class("Void", Some("java.lang".into()))
+            } else {
+                let target = receiver_type_from_type_node(index, file, src, tree, node)?;
+                let mut element = &target;
+                let mut array = false;
+                while let Type::Array { component, .. } = element {
+                    array = true;
+                    element = component;
+                }
+                let Type::Class {
+                    name,
+                    package,
+                    container,
+                    args,
+                    owner,
+                    ..
+                } = element
+                else {
+                    return None;
+                };
+                if !args.is_empty() || owner.is_some() {
+                    return None;
+                }
+                let primitive_array = array
+                    && package.is_none()
+                    && container.is_none()
+                    && java_boxed_type(name).is_some();
+                if !primitive_array
+                    && !index.lookup_type(name).iter().any(|entry| {
+                        matches!(
+                            entry.sym.kind,
+                            SymbolKind::Class
+                                | SymbolKind::Interface
+                                | SymbolKind::Object
+                                | SymbolKind::EnumClass
+                        ) && !entry.sym.is_expect
+                            && Some(entry.sym.package.as_str()) == package.as_deref()
+                            && entry.sym.container.as_ref() == container.as_ref()
+                    })
+                {
+                    return None;
+                }
+                target
+            };
+            Some(Type::Class {
+                name: "Class".into(),
+                package: Some("java.lang".into()),
+                container: None,
+                nullable: false,
+                args: vec![target],
+                owner: None,
+            })
+        }
         "this" | "super" => {
             let mut ctx = FileCtx::from_tree_in_file(tree, src, file);
             ctx.package = package_of(tree, src);
@@ -3937,7 +3998,7 @@ fn java_member_receiver(
             receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
-        "object_creation_expression" | "method_invocation" => {
+        "object_creation_expression" | "method_invocation" | "class_literal" => {
             receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
@@ -5799,6 +5860,253 @@ mod tests {
     fn usages(src: &str) -> Vec<Usage> {
         let tree = JavaParser::new().parse(src);
         extract_usages(&tree, src)
+    }
+
+    fn java_class_literal_types(expression: &str, imports: &str) -> [Option<Type>; 3] {
+        let file = "/literal/Use.java";
+        let source = format!(
+            "package literal; {imports} class Class {{}} class Integer {{}} \
+             class Use<T extends Foo> {{ static class OwnNested {{}} \
+             void sample() {{ var literal = {expression}; consume(literal); }} }}"
+        );
+        let tree = JavaParser::new().parse(&source);
+        let mut index = Index::new();
+        index.replace_file(
+            file,
+            extract_symbols(&tree, &source),
+            crate::index::Tier::Volatile,
+        );
+        let targets =
+            "package literal; class Foo {} class Box<E> {} class Outer { static class Nested {} }";
+        let targets_tree = JavaParser::new().parse(targets);
+        index.replace_file(
+            "/literal/Targets.java",
+            extract_symbols(&targets_tree, targets),
+            crate::index::Tier::Volatile,
+        );
+        for (path, package, source) in [
+            ("/literal/Types.kt", "literal", "package literal\ntypealias Alias = Foo\nexpect class Expected { class Nested }\nclass KotlinOrdinary\ninternal class KotlinInternal\n@JvmInline value class KotlinValue(val value: Int)"),
+            ("/aliases/Alias.kt", "aliases", "package aliases\ntypealias Foo = literal.Foo"),
+        ] {
+            let tree = crate::parser::KotlinParser::new().parse(source);
+            let symbols = crate::indexer::extract_symbols(&tree, source, package);
+            assert!(!symbols.is_empty(), "Kotlin class-literal fixture must be indexed");
+            index.replace_file(path, symbols, crate::index::Tier::Volatile);
+        }
+        assert!(index
+            .lookup_type("Alias")
+            .iter()
+            .any(|entry| entry.sym.kind == SymbolKind::TypeAlias));
+        assert!(index
+            .lookup_type("Expected")
+            .iter()
+            .any(|entry| entry.sym.is_expect));
+        let runnable = "package java.lang; public interface Runnable {}";
+        let runnable_tree = JavaParser::new().parse(runnable);
+        index.replace_file(
+            "/java/lang/Runnable.java",
+            extract_symbols(&runnable_tree, runnable),
+            crate::index::Tier::Durable,
+        );
+        let start = source.find(expression).unwrap();
+        let literal = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + expression.len())
+            .unwrap();
+        let alias = identifier_at(
+            &tree,
+            source.find("consume(literal)").unwrap() + "consume(".len(),
+        )
+        .unwrap();
+        [
+            receiver_type(&index, file, &source, &tree, literal, 0),
+            java_argument_type(&index, file, &source, &tree, literal, 0),
+            java_argument_type(&index, file, &source, &tree, alias, 0),
+        ]
+    }
+
+    fn java_class_literal_expected(target: Type) -> Type {
+        Type::Class {
+            name: "Class".into(),
+            package: Some("java.lang".into()),
+            container: None,
+            nullable: false,
+            args: vec![target],
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn java_class_literal_preserves_reference_raw_and_array_types() {
+        let foo = Type::class("Foo", Some("literal".into()));
+        let nested = Type::Class {
+            name: "Nested".into(),
+            package: Some("literal".into()),
+            container: Some("Outer".into()),
+            nullable: false,
+            args: Vec::new(),
+            owner: None,
+        };
+        for (expression, target) in [
+            (
+                "Runnable.class",
+                Type::class("Runnable", Some("java.lang".into())),
+            ),
+            (
+                "java.lang.Runnable.class",
+                Type::class("Runnable", Some("java.lang".into())),
+            ),
+            ("Foo.class", foo.clone()),
+            ("Foo /* target */ .class", foo.clone()),
+            ("Outer.Nested.class", nested),
+            ("Box.class", Type::class("Box", Some("literal".into()))),
+            ("Foo[].class", Type::array(foo.clone(), false)),
+            ("Foo[][].class", Type::array(Type::array(foo, false), false)),
+        ] {
+            let expected = java_class_literal_expected(target);
+            assert_eq!(
+                java_class_literal_types(expression, ""),
+                [
+                    Some(expected.clone()),
+                    Some(expected.clone()),
+                    Some(expected)
+                ],
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_class_literal_boxes_scalars_without_boxing_array_elements() {
+        for (primitive, wrapper) in [
+            ("boolean", "Boolean"),
+            ("byte", "Byte"),
+            ("char", "Character"),
+            ("short", "Short"),
+            ("int", "Integer"),
+            ("long", "Long"),
+            ("float", "Float"),
+            ("double", "Double"),
+            ("void", "Void"),
+        ] {
+            let expected =
+                java_class_literal_expected(Type::class(wrapper, Some("java.lang".into())));
+            assert_eq!(
+                java_class_literal_types(&format!("{primitive}.class"), ""),
+                [
+                    Some(expected.clone()),
+                    Some(expected.clone()),
+                    Some(expected)
+                ],
+                "{primitive}"
+            );
+        }
+        let expected = java_class_literal_expected(Type::array(Type::class("int", None), false));
+        assert_eq!(
+            java_class_literal_types("int[].class", ""),
+            [
+                Some(expected.clone()),
+                Some(expected.clone()),
+                Some(expected)
+            ]
+        );
+        let expected = java_class_literal_expected(Type::array(
+            Type::array(Type::class("boolean", None), false),
+            false,
+        ));
+        assert_eq!(
+            java_class_literal_types("boolean[][].class", ""),
+            [
+                Some(expected.clone()),
+                Some(expected.clone()),
+                Some(expected)
+            ]
+        );
+    }
+
+    #[test]
+    fn java_class_literal_rejects_invalid_or_unknown_targets() {
+        for expression in [
+            "T.class",
+            "T[].class",
+            "Box<Foo>.class",
+            "Box<Foo>[].class",
+            "Missing.class",
+            "missing.Foo.class",
+            "Foo.clas",
+            "void[].class",
+        ] {
+            assert_eq!(
+                java_class_literal_types(expression, ""),
+                [None, None, None],
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_class_literal_requires_a_direct_jvm_nominal_declaration() {
+        for (expression, imports) in [
+            ("Alias.class", ""),
+            ("Alias[].class", ""),
+            ("aliases.Foo.class", ""),
+            ("aliases.Foo[].class", ""),
+            ("Foo.class", "import aliases.Foo;"),
+            ("Foo[].class", "import aliases.Foo;"),
+            ("Expected.class", ""),
+            ("Expected[].class", ""),
+            ("Expected.Nested.class", ""),
+        ] {
+            assert_eq!(
+                java_class_literal_types(expression, imports),
+                [None, None, None],
+                "{imports} {expression}"
+            );
+        }
+        for name in ["KotlinOrdinary", "KotlinInternal", "KotlinValue"] {
+            let expected = java_class_literal_expected(Type::class(name, Some("literal".into())));
+            assert_eq!(
+                java_class_literal_types(&format!("{name}.class"), ""),
+                [
+                    Some(expected.clone()),
+                    Some(expected.clone()),
+                    Some(expected)
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_class_literal_direct_receiver_is_a_value() {
+        let file = "/literal/Direct.java";
+        let source = "package literal; interface Target {} class Use<T> { void sample() { Target.class.getName(); T.class.getName(); } }";
+        let tree = JavaParser::new().parse(source);
+        let mut index = Index::new();
+        index.replace_file(
+            file,
+            extract_symbols(&tree, source),
+            crate::index::Tier::Volatile,
+        );
+        let valid = identifier_at(&tree, source.find("getName").unwrap())
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert_eq!(
+            java_member_receiver(&index, file, source, &tree, valid, 0),
+            Some((
+                java_class_literal_expected(Type::class("Target", Some("literal".into()))),
+                ktcore::jvm::ReceiverKind::Value,
+            ))
+        );
+        let invalid = identifier_at(&tree, source.rfind("getName").unwrap())
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert_eq!(
+            java_member_receiver(&index, file, source, &tree, invalid, 0),
+            None
+        );
     }
 
     #[test]

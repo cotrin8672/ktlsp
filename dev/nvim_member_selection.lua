@@ -169,6 +169,31 @@ return function(project, client, check)
     }) do
       completion(unpack(case))
     end
+    completion('java', 'String directName = Runnable.class.getName();', 'Runnable.class.getN', 'getName', 'run')
+    for _, receiver in ipairs({ 'literalClass', 'primitiveClass', 'arrayClass' }) do
+      completion('java', receiver .. '.getName()', receiver .. '.getN', 'getName', 'run')
+    end
+    local class_definition = once('java', 'textDocument/definition', 'literalClass.getName()', 'getName')
+    local class_locations = probe.locations(class_definition)
+    local exact_class_method = false
+    if #class_locations == 1 then
+      local target = vim.fs.normalize(vim.uri_to_fname(class_locations[1].uri or class_locations[1].targetUri))
+      if target:match('/java/lang/Class%.java$') and vim.fn.filereadable(target) == 1 then
+        local _, range = probe.find(vim.fn.readfile(target), 'public String getName()', 'getName')
+        exact_class_method = probe.exact_definition(class_definition, target, { range })
+      end
+    end
+    check('Java class literal local goes to the exact SDK Class.getName declaration',
+      exact_class_method, vim.inspect(class_definition))
+    partial('java', 'String arrayName = arrayClass.getName();', 'T.class.getN', function(result)
+      local position = probe.find(lines('java'), 'String literalName = literalClass.getName();', 'getName')
+      position.character = position.character + #'getN'
+      local control = once('java', 'textDocument/completion', nil, nil, nil, position)
+      check('Java invalid type-parameter class literal keeps a useful same-phase Class control',
+        probe.completion_has(control, 'getName'), vim.inspect(control))
+      check('Java invalid type-parameter class literal invents no Class method',
+        not probe.completion_has(result, 'getName') and not probe.completion_has(result, 'run'), vim.inspect(result))
+    end)
     local property_edit = lines('kotlin')
     for i, line in ipairs(property_edit) do
       property_edit[i] = line:gsub('var value = input', 'val value = input')
