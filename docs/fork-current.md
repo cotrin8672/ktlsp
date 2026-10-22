@@ -9,6 +9,38 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
+Checkpoint120-18 passes1786 Rust tests,0 fail,9 ignored, and release with575
+stable input guards. Its SHA is
+7a40252548fc6ebce13cb30c77828100b0ab66888242b87b18de59079fef6927.
+Both Cargo stages exit0 with closed output and zero owned live processes;
+each stage's retained MSVC vctip helper requires owned-job cleanup. Real LSP
+runs close normally: Java415/415 (53 first member RPCs), controlled serial
+CEM26/26, and five-project50/50 all pass on this same binary. Evidence:
+native-integrated120-18, java-classliteral121-release18,
+cem-startup120/editor-original26-release18-serial1 and
+final-corpus120-18/summary50.json. No new performance claim is made.
+
+Delivered commits759bc25,9ab41b9 and3fb5afe fix diagnostic lock order, Java
+class literals and same-method generic bounds respectively. Class-literal
+tests verify scalar boxing, void, array rank, direct receivers, comments and
+invalid/expect targets; existing alias rejection is reused. Bound tests cover
+equal types, a distinct valid subtype, incompatible arguments and unsupported
+scope/cycle shapes. Cache v41 refreshes the changed parsed bound facts.
+
+The new shared specificity code remains uncommitted pending a correctness fix.
+Independent javac and current-engine controls show that instantiating generic
+formals before ranking wrongly selects a unique method for both
+`<T>pick(List<T>,T)` versus `pick(Collection<String>,Object)` and
+`<T>pick(List<T>,List<T>)` versus `pick(Collection<String>,Collection<String>)`,
+with String arguments. Javac reports ambiguity. Evidence:
+oracle120/specificity-review-counterexample1 and
+oracle120/specificity-review-nested-counterexample1. Finite editor successes
+above do not cover this failure. Next: prove dominance from declaration shapes,
+retain these ambiguity regressions, then replay strict TypeTools unique goto
+on a fresh binary. Kotlin's behavior for these two reductions is unverified.
+
+### Previous integrated checkpoint120-17
+
 Joint120-17 passes1776 Rust tests,0 fail,9 ignored (42 targets), and release;
 575 input guards stay unchanged and all processes close normally. Its release SHA
 is 53f09f28324356e5f7c5ec84fe71d2f4e16a17942bd01c2134aeec7cd0e2bcef.
