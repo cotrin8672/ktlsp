@@ -19,12 +19,32 @@ The46 member probes each use one RPC. Inputs stay unchanged and shutdown is
 normal. Evidence: native-integrated120-17/{workspace-summary.json,receipt.json}
 and java-unknown121-release17/{summary.json,receipt.json}.
 
-The original array12 also passes on release17, all on first responses with
+Source commit0d27151 also passes the original generic21, function-property10,
+inferred-method4 and array12 checks on release17, all on first responses with
 unchanged original expectations and normal shutdown. The harness's approved
 fixture-only revision is recorded separately from unchanged project/manifest
-guards. Evidence: array-property120/gradle-release17/receipt.json.
-CEM26 and the five-project50 are being replayed on this same binary; do not
-substitute earlier release15 successes for those pending final receipts.
+guards. Evidence: cem-startup120/coverage/native-generic-inferred-release17,
+function-property121-release17, function-return121-release17 and
+array-property120/gradle-release17/receipt.json.
+
+The same release now passes CEM26 in a controlled serial replay and all50
+five-project requests: Gradle9, Moshi9, OkHttp10, Retrofit12 and Spring10.
+All ten corpus stages and both CEM stages close normally with stable input
+guards, no forced cleanup and zero owned residuals. Each useful RPC is a first
+response; CEM's actual Float inlay response and exact goto token ranges are
+audited separately. Corpus normal stages seed only the original project model;
+each incomplete stage reuses its own cache. Evidence:
+cem-startup120/editor-original26-release17-serial1/{summary.json,goto-audit.json,
+replay-policy.json,receipt.json} and final-corpus120-17/summary50.json.
+
+An earlier parallel CEM run on this same binary remains a failure:6 matched,
+3 unmeasured and the incomplete stage unrun. Its K2 Java diagnostic producer
+expired and its Float inlay request was unanswered. The trace records
+compiler.java.editor-unavailable with stale-kotlin-source; no panic or process
+leak occurred. The serial replay changes no expectations or request deadlines,
+but its success does not establish the cause or fix this availability risk.
+Evidence: cem-startup120/editor-original26-release17. These functional runs
+make no new timing claim and do not establish general IDEA parity.
 
 The shared type facts now distinguish Kotlin expect declarations, including
 enclosing expect types, from JVM-nameable ordinary/internal/value classes.
