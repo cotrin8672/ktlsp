@@ -7264,3 +7264,84 @@ fn projected_passthrough_keeps_unresolved_and_incompatible_inputs_unknown() {
         "projection is not equality in an invariant slot"
     );
 }
+
+#[test]
+fn kotlin_runnable_class_java_arguments_keep_exact_types_before_overload_selection() {
+    let source = "package ktlsp.typetools120\nimport net.jodah.typetools.TypeResolver\nclass TypeToolsProbe { fun sample(): Class<*> = TypeResolver.resolveRawArgument(Runnable::class.java, Runnable::class.java) }\n";
+    let mut ws = reflection_workspace(source);
+    ws.open(
+        "Runnable.java",
+        "package java.lang; public interface Runnable { void run(); }".into(),
+    );
+    ws.open(
+        "Type.java",
+        "package java.lang.reflect; public interface Type {}".into(),
+    );
+    ws.open("TypeResolver.java", "package net.jodah.typetools; import java.lang.reflect.Type; public class TypeResolver { public static <T,S extends T> Class<?> resolveRawArgument(Class<T> type,Class<S> subType) { return null; } public static Class<?> resolveRawArgument(Type genericType,Class<?> subType) { return null; } }".into());
+    let runnable = Type::class("Runnable", Some("java.lang".into()));
+    let literal = infer_expression(&ws, "Use.kt", "Runnable::class");
+    assert_eq!(literal.name(), Some("KClass"));
+    assert_eq!(literal.package(), Some("kotlin.reflect"));
+    assert_eq!(literal.args(), [runnable.clone()]);
+    let class = infer_expression(&ws, "Use.kt", "Runnable::class.java");
+    assert_eq!(class.name(), Some("Class"));
+    assert_eq!(class.package(), Some("java.lang"));
+    assert_eq!(class.args(), [runnable]);
+    let expression = "TypeResolver.resolveRawArgument(Runnable::class.java, Runnable::class.java)";
+    let mut parser = KotlinParser::new();
+    let tree = parser.parse(source);
+    let start = source.find(expression).unwrap();
+    let call = tree
+        .root_node()
+        .descendant_for_byte_range(start, start + expression.len())
+        .unwrap();
+    assert_eq!(call.kind(), "call_expression");
+    let arguments = infer::call_arguments(
+        &ws.index,
+        call,
+        source,
+        &FileCtx::from_tree_in_file(&tree, source, "Use.kt"),
+    );
+    assert_eq!(arguments.count, Some(2));
+    assert_eq!(arguments.types, vec![class.clone(), class]);
+}
+
+#[test]
+fn direct_own_method_bounds_validate_substituted_class_arguments() {
+    for (file, declaration) in [
+        ("BoundApi.java", "package probe; public class BoundApi { public <T,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }"),
+        ("BoundApi.kt", "package probe\nclass BoundApi { fun <T,S:T> choose(type:Class<T>,subType:Class<S>):T = TODO() }\n"),
+    ] {
+        let mut ws = reflection_workspace("package probe\nfun use(api:BoundApi) { api.choose(Runnable::class.java,Runnable::class.java); api.choose(Runnable::class.java,SubRunnable::class.java); api.choose(Runnable::class.java,String::class.java) }\n");
+        ws.open("Runnable.java", "package java.lang; public interface Runnable { void run(); }".into());
+        ws.open("SubRunnable.java", "package java.lang; public interface SubRunnable extends Runnable {}".into());
+        ws.open("String.java", "package java.lang; public final class String {}".into());
+        ws.open("T.java", "package probe; public class T {}".into());
+        ws.open(file, declaration.into());
+        let entry = ws.index.lookup_by_name("choose").iter().find(|entry| entry.path.as_ref() == file).unwrap();
+        let bounds = entry.sym.method_type_bounds.as_deref().expect("same-method direct bound has scope proof");
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].0, "S");
+        assert_eq!(bounds[0].1.name, "T");
+        assert!(bounds[0].1.qualification.is_none());
+        let positive = infer_expression(&ws, "Use.kt", "api.choose(Runnable::class.java,Runnable::class.java)");
+        assert_eq!(positive, Type::class("Runnable", Some("java.lang".into())), "{file}: {positive:?}");
+        let subtype = infer_expression(&ws, "Use.kt", "api.choose(Runnable::class.java,SubRunnable::class.java)");
+        assert_eq!(subtype, Type::class("Runnable", Some("java.lang".into())), "{file}: {subtype:?}");
+        assert_eq!(infer_expression(&ws, "Use.kt", "api.choose(Runnable::class.java,String::class.java)"), Type::Unknown, "{file}");
+    }
+}
+
+#[test]
+fn method_bound_relations_keep_cycles_foreign_scopes_and_shadow_collisions_unknown() {
+    for declaration in [
+        "package probe; public class BoundApi { public <T extends S,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }",
+        "package probe; public class BoundApi<T> { public <S extends T> S choose(Class<S> type) { return null; } }",
+        "package probe; public class BoundApi<T> { public <T,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }",
+        "package probe; public class BoundApi { public <T,S extends java.util.List<T>> S choose(Class<T> type,Class<S> subType) { return null; } }",
+    ] {
+        let ws = workspace(&[("BoundApi.java", declaration)]);
+        let entry = &ws.index.lookup_by_name("choose")[0];
+        assert!(entry.sym.method_type_bounds.is_none(), "{declaration}: {:?}", entry.sym.method_type_bounds);
+    }
+}

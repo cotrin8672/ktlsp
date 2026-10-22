@@ -1131,7 +1131,7 @@ pub fn type_parameters_in_scope(
     out
 }
 
-/// Keep only proven nominal callable bounds; variable relationships require declaration identities.
+/// Keep nominal bounds and direct, acyclic relations between unambiguous own-method parameters.
 pub fn method_type_bounds(
     parameters: &[TypeParameterBounds],
     start: usize,
@@ -1155,15 +1155,37 @@ pub fn method_type_bounds(
         .iter()
         .filter(|parameter| parameter.scope_start == start && parameter.scope_end == end)
         .collect();
-    if own.is_empty() || own.iter().any(|parameter| !parameter.complete) {
+    if own.is_empty()
+        || own.iter().any(|parameter| !parameter.complete)
+        || own.iter().enumerate().any(|(position, parameter)| {
+            own[..position]
+                .iter()
+                .any(|earlier| earlier.name == parameter.name)
+        })
+    {
         return None;
     }
     let mut bounds = Vec::new();
-    for parameter in own {
+    let mut relations = Vec::new();
+    for parameter in &own {
         for bound in &parameter.upper_bounds {
-            // A class parameter referenced here must never rebind to a same-spelled method parameter.
             if mentions_parameter(bound, parameters) {
-                return None;
+                // shortcut: nested variable bounds and collisions with enclosing scopes need richer identities.
+                if bound.qualification.is_some()
+                    || !bound.args.is_empty()
+                    || bound.owner.is_some()
+                    || bound.nullable
+                    || bound.projection != crate::types::Projection::Invariant
+                    || parameter.upper_bounds.len() != 1
+                    || !own.iter().any(|target| target.name == bound.name)
+                    || parameters.iter().any(|target| {
+                        (target.name == bound.name || target.name == parameter.name)
+                            && (target.scope_start != start || target.scope_end != end)
+                    })
+                {
+                    return None;
+                }
+                relations.push((parameter.name.as_str(), bound.name.as_str()));
             }
             if bound.name == "Object"
                 && bound.qualification.as_deref() == Some("java.lang")
@@ -1173,6 +1195,17 @@ pub fn method_type_bounds(
                 continue;
             }
             bounds.push((parameter.name.clone(), bound.clone()));
+        }
+    }
+    for parameter in &own {
+        let mut visited = Vec::new();
+        let mut current = parameter.name.as_str();
+        while let Some((_, next)) = relations.iter().find(|(name, _)| *name == current) {
+            if visited.contains(&current) {
+                return None;
+            }
+            visited.push(current);
+            current = next;
         }
     }
     Some(Box::new(bounds))

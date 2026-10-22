@@ -3573,6 +3573,7 @@ pub(crate) fn projected_member_application(
         &initial,
     );
     if application.status == solve::ConstraintStatus::Matched {
+        let method_parameters: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
         for (parameter, bound) in entry
             .sym
             .method_type_bounds
@@ -3580,13 +3581,30 @@ pub(crate) fn projected_member_application(
             .into_iter()
             .flatten()
         {
-            let bound = resolve_type_ref(index, bound, &ctx, 0);
-            let satisfies = application
-                .bindings
-                .get(parameter)
-                .is_some_and(|actual| receiver_satisfies_upper_bound(index, actual, &bound));
+            let own_relation = bound.qualification.is_none()
+                && method_parameters.contains(&bound.name)
+                && bound.args.is_empty()
+                && bound.owner.is_none();
+            let bound = resolve_with_subst_unprojected(
+                index,
+                bound,
+                &ctx,
+                &method_parameters,
+                &application.bindings,
+                0,
+            );
+            let actual = application.bindings.get(parameter);
+            let satisfies =
+                actual.is_some_and(|actual| receiver_satisfies_upper_bound(index, actual, &bound));
             if !satisfies {
-                application.status = solve::ConstraintStatus::Unknown;
+                application.status = if own_relation
+                    && actual
+                        .is_some_and(|actual| nominal_heads_incompatible(index, actual, &bound))
+                {
+                    solve::ConstraintStatus::Rejected
+                } else {
+                    solve::ConstraintStatus::Unknown
+                };
                 break;
             }
         }
