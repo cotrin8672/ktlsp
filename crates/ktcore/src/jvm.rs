@@ -1668,6 +1668,21 @@ pub fn select_call<'a>(
             uncertain |= applicability == Applicability::Unknown;
         }
     }
+    if !conflicting && (accepted.len() > 1 || uncertain) && !accepted.is_empty() {
+        let authored = accepted
+            .iter()
+            .map(|candidate| match candidate {
+                CallableCandidate::Authored(entry) => Some(*entry),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(selected) = authored.as_ref().and_then(|entries| {
+            members::most_specific_reference_call(index, receiver, entries, args, CallMode::Java)
+        }) {
+            accepted = vec![accepted[selected]];
+            uncertain = false;
+        }
+    }
     let applicability = if accepted.is_empty() {
         // Keep rejected signatures for diagnostics; navigation requires a unique declaration.
         accepted = named;
@@ -2229,6 +2244,203 @@ fn annotation_known(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_overload_specificity_requires_all_parameters_and_known_arguments() {
+        // The TypeTools compiler oracle selects Class/Class over Type/Class<?> in both languages.
+        let text = r#"package specificity
+interface MetaType
+class MetaClass<T> : MetaType
+interface Task : MetaType
+interface MetaCollection<T>
+class MetaList<T> : MetaCollection<T>
+class Wrong
+interface Left
+interface Right
+class Both : Left, Right
+class Selected
+class Broad
+class Resolver {
+    fun <T, S : T> resolveRawArgument(type: MetaClass<T>, subType: MetaClass<S>): Selected = Selected()
+    fun resolveRawArgument(type: MetaType, subType: MetaClass<*>): Broad = Broad()
+    fun trade(first: MetaClass<Task>, second: MetaType): Selected = Selected()
+    fun trade(first: MetaType, second: MetaClass<Task>): Broad = Broad()
+    fun clash(value: Left): Selected = Selected()
+    fun clash(value: Right): Broad = Broad()
+    fun numeric(value: Int): Selected = Selected()
+    fun numeric(value: Long): Broad = Broad()
+    fun cycle(value: MetaType): Selected = Selected()
+    fun cycle(value: CycleA): Broad = Broad()
+    fun <T> genericTop(values: MetaList<T>, value: T): Selected = Selected()
+    fun genericTop(values: MetaCollection<Task>, value: MetaType): Broad = Broad()
+    fun <T> genericNested(first: MetaList<T>, second: MetaList<T>): Selected = Selected()
+    fun genericNested(first: MetaCollection<Task>, second: MetaCollection<Task>): Broad = Broad()
+}
+"#;
+        let tree = crate::parser::KotlinParser::new().parse(text);
+        let mut index = crate::index::Index::new();
+        index.replace_file(
+            "Overloads.kt",
+            indexer::extract_symbols(&tree, text, "specificity"),
+            Tier::Volatile,
+        );
+        let cycle = "package specificity\nclass CycleA : CycleB(), MetaType\nopen class CycleB : CycleA()\n";
+        let cycle_tree = crate::parser::KotlinParser::new().parse(cycle);
+        index.replace_file(
+            "Cycles.kt",
+            indexer::extract_symbols(&cycle_tree, cycle, "specificity"),
+            Tier::Volatile,
+        );
+        let receiver = Type::class("Resolver", Some("specificity".into()));
+        let class_of = |argument: Type| {
+            let mut ty = Type::class("MetaClass", Some("specificity".into()));
+            let Type::Class { args, .. } = &mut ty else {
+                unreachable!()
+            };
+            args.push(argument);
+            ty
+        };
+        let task = class_of(Type::class("Task", Some("specificity".into())));
+        let mut list = Type::class("MetaList", Some("specificity".into()));
+        let Type::Class { args, .. } = &mut list else {
+            unreachable!()
+        };
+        args.push(Type::class("Task", Some("specificity".into())));
+        let unknown = class_of(Type::Unknown);
+        let ctx = FileCtx::new("specificity".into(), Vec::new());
+        for (name, types, expected) in [
+            (
+                "resolveRawArgument",
+                vec![task.clone(), task.clone()],
+                Some("Selected"),
+            ),
+            (
+                "resolveRawArgument",
+                vec![
+                    task.clone(),
+                    class_of(Type::class("Wrong", Some("specificity".into()))),
+                ],
+                Some("Broad"),
+            ),
+            (
+                "resolveRawArgument",
+                vec![Type::Unknown, task.clone()],
+                None,
+            ),
+            ("resolveRawArgument", vec![unknown, task.clone()], None),
+            ("trade", vec![task.clone(), task.clone()], None),
+            (
+                "genericTop",
+                vec![
+                    list.clone(),
+                    Type::class("Task", Some("specificity".into())),
+                ],
+                None,
+            ),
+            ("genericNested", vec![list.clone(), list], None),
+            (
+                "clash",
+                vec![Type::class("Both", Some("specificity".into()))],
+                None,
+            ),
+            (
+                "cycle",
+                vec![Type::class("CycleA", Some("specificity".into()))],
+                None,
+            ),
+        ] {
+            let arguments = crate::members::CallArguments {
+                count: Some(types.len()),
+                types,
+                names: None,
+                has_spread: false,
+                trailing_lambda: false,
+            };
+            let java = select_call(
+                &index,
+                &receiver,
+                member_candidates(&index, &receiver, name),
+                name,
+                &arguments,
+                &ctx,
+            );
+            let group = crate::members::candidates(&index, &receiver, name, &ctx);
+            let kotlin = group.select(
+                &index,
+                &receiver,
+                &crate::members::MemberUse::Call(arguments.clone()),
+                &ctx,
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    java.navigation_candidates().len(),
+                    1,
+                    "Java {name}: a unique most-specific declaration"
+                );
+                let [CallableCandidate::Authored(entry)] = java.consumable_candidates() else {
+                    panic!("one authored overload")
+                };
+                assert_eq!(
+                    kotlin.entries.len(),
+                    1,
+                    "Kotlin {name}: same most-specific declaration"
+                );
+                assert!(std::ptr::eq(*entry, kotlin.entries[0]));
+                assert_eq!(
+                    java.applicability,
+                    crate::members::Applicability::Applicable
+                );
+                assert_eq!(
+                    kotlin.applicability,
+                    crate::members::Applicability::Applicable
+                );
+                let result = infer::declared_member_call_type(
+                    &index,
+                    &receiver,
+                    entry,
+                    entry.sym.return_type.as_ref().unwrap(),
+                    &arguments,
+                    &ctx,
+                );
+                assert_eq!(result, Type::class(expected, Some("specificity".into())));
+            } else {
+                assert_eq!(
+                    java.candidates.len(),
+                    2,
+                    "Java {name}: preserve ambiguity/uncertainty"
+                );
+                // K2 selects the nongeneric Java declaration in these two cases; that tie-break is a coverage gap.
+                if !matches!(name, "genericTop" | "genericNested") {
+                    assert_eq!(
+                        kotlin.entries.len(),
+                        2,
+                        "Kotlin {name}: preserve ambiguity/uncertainty"
+                    );
+                }
+            }
+        }
+        let arguments = crate::members::CallArguments {
+            count: Some(1),
+            types: vec![Type::class("Int", Some("kotlin".into()))],
+            names: None,
+            has_spread: false,
+            trailing_lambda: false,
+        };
+        let java = select_call(
+            &index,
+            &receiver,
+            member_candidates(&index, &receiver, "numeric"),
+            "numeric",
+            &arguments,
+            &ctx,
+        );
+        assert_eq!(
+            java.candidates.len(),
+            2,
+            "Java conversion phases are outside reference specificity"
+        );
+        assert_eq!(java.applicability, crate::members::Applicability::Unknown);
+    }
 
     #[test]
     fn inferred_property_reification_requires_the_exact_owner_binder() {

@@ -1793,6 +1793,24 @@ impl<'a> Candidates<'a> {
                             }
                         }
                         if !viable.is_empty() {
+                            if possible.is_empty()
+                                && functions
+                                && (viable.len() > 1 || uncertain)
+                                && viable.iter().all(|entry| self.receiver_is_known(entry))
+                            {
+                                if let Some(selected) = most_specific_reference_call(
+                                    index,
+                                    receiver,
+                                    &viable,
+                                    args,
+                                    CallMode::Kotlin,
+                                ) {
+                                    return self.selection(
+                                        vec![viable[selected]],
+                                        Applicability::Applicable,
+                                    );
+                                }
+                            }
                             if possible.is_empty() && !uncertain {
                                 return self.selection(viable, Applicability::Applicable);
                             }
@@ -1953,6 +1971,237 @@ pub fn function_accepts(
 ) -> bool {
     function_applicability(index, receiver, entry, args, ctx, CallMode::Kotlin)
         != Applicability::Rejected
+}
+
+// shortcut: exact positional reference overloads only; add conversion/variance phases with compiler controls.
+pub(crate) fn most_specific_reference_call(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entries: &[&Entry],
+    args: &CallArguments,
+    mode: CallMode,
+) -> Option<usize> {
+    if entries.is_empty()
+        || args.count != Some(args.types.len())
+        || args.names.is_some()
+        || args.has_spread
+        || args.trailing_lambda
+        || !infer::type_head_is_known(index, receiver)
+        || !args
+            .types
+            .iter()
+            .all(|ty| reference_shape_known(index, ty, false, 0))
+    {
+        return None;
+    }
+    let formals = entries
+        .iter()
+        .map(|entry| {
+            if entry.sym.kind != crate::symbol::SymbolKind::Function
+                || entry.sym.has_vararg
+                || entry.sym.ext_receiver.is_some()
+                || entry.sym.extension_receiver.is_some()
+                || entry.sym.arity.map(usize::from) != args.count
+                || entry.sym.min_arity.map(usize::from) != args.count
+                || entry.sym.params.len() != args.types.len()
+            {
+                return None;
+            }
+            let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+            let generic = !entry.sym.type_params.is_empty();
+            if generic {
+                let bound = bind_arguments(entry, args, mode).ok()?;
+                if infer::projected_member_application(index, receiver, entry, &bound)?.status
+                    != crate::solve::ConstraintStatus::Matched
+                {
+                    return None;
+                }
+            }
+            entry
+                .sym
+                .params
+                .iter()
+                .zip(&args.types)
+                .map(|(formal, actual)| {
+                    let formal = if generic {
+                        infer::declared_member_call_type(index, receiver, entry, formal, args, &ctx)
+                    } else {
+                        infer::declared_member_type(index, receiver, entry, formal, &ctx)
+                    };
+                    reference_subtype(index, actual, &formal, false).then_some(formal)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let declarations: Vec<_> = entries
+        .iter()
+        .map(|entry| generic_declaration_formals(index, receiver, entry))
+        .collect();
+    let more_specific = |left: usize, right: usize| {
+        // A generic competitor needs declaration inference, not an invocation's inferred arguments.
+        if !entries[right].sym.type_params.is_empty() {
+            return false;
+        }
+        let generic = !entries[left].sym.type_params.is_empty();
+        let left_formals = if generic {
+            let Some(declared) = declarations[left].as_ref() else {
+                return false;
+            };
+            declared
+        } else {
+            &formals[left]
+        };
+        left_formals
+            .iter()
+            .zip(&formals[right])
+            .all(|(a, b)| reference_subtype(index, a, b, generic))
+            && left_formals
+                .iter()
+                .zip(&formals[right])
+                .any(|(a, b)| !reference_subtype(index, b, a, generic))
+    };
+    let mut winner = None;
+    for candidate in 0..entries.len() {
+        if (0..entries.len()).all(|other| candidate == other || more_specific(candidate, other)) {
+            if winner.replace(candidate).is_some() {
+                return None;
+            }
+        }
+    }
+    winner
+}
+
+fn generic_declaration_formals(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+) -> Option<Vec<Type>> {
+    fn contains_parameter(ty: &TypeRef, parameters: &[String]) -> bool {
+        ty.qualification.is_none() && parameters.contains(&ty.name)
+            || ty
+                .owner
+                .as_deref()
+                .is_some_and(|owner| contains_parameter(owner, parameters))
+            || ty
+                .args
+                .iter()
+                .any(|argument| contains_parameter(argument, parameters))
+    }
+    if entry.sym.type_params.is_empty() {
+        return None;
+    }
+    let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+    entry
+        .sym
+        .params
+        .iter()
+        .map(|parameter| {
+            if parameter.owner.is_some()
+                || parameter.qualification.is_none()
+                    && entry.sym.type_params.contains(&parameter.name)
+            {
+                return None;
+            }
+            let mut declared = parameter.clone();
+            for argument in &mut declared.args {
+                if argument.qualification.is_none()
+                    && entry.sym.type_params.contains(&argument.name)
+                    && argument.projection == crate::types::Projection::Invariant
+                    && argument.args.is_empty()
+                    && argument.owner.is_none()
+                    && !argument.nullable
+                {
+                    // Universal binder slots can fit an explicit wildcard, never a concrete argument.
+                    argument.projection = crate::types::Projection::Star;
+                } else if contains_parameter(argument, &entry.sym.type_params) {
+                    return None;
+                }
+            }
+            let declared = infer::declared_member_type(index, receiver, entry, &declared, &ctx);
+            reference_shape_known(index, &declared, true, 0).then_some(declared)
+        })
+        .collect()
+}
+
+fn reference_shape_known(index: &dyn InferenceIndex, ty: &Type, star: bool, depth: usize) -> bool {
+    if depth > infer::MAX_DEPTH {
+        return false;
+    }
+    if star && matches!(ty, Type::Star) {
+        return true;
+    }
+    let Type::Class {
+        name,
+        package: Some(package),
+        container,
+        args,
+        owner: None,
+        ..
+    } = ty
+    else {
+        return false;
+    };
+    let declarations = index.lookup_type(name);
+    let mut matching = declarations
+        .iter()
+        .filter(|entry| entry.sym.package == *package && entry.sym.container == *container);
+    let Some(first) = matching.next() else {
+        return false;
+    };
+    let valid = |entry: &Entry| {
+        matches!(
+            entry.sym.kind,
+            crate::symbol::SymbolKind::Class
+                | crate::symbol::SymbolKind::Interface
+                | crate::symbol::SymbolKind::EnumClass
+        ) && entry.sym.type_params.len() == args.len()
+            && entry.sym.type_parameter_facts.known_invariant()
+            && entry.sym.type_parameter_facts.known_unbounded()
+            && entry.sym.kind == first.sym.kind
+            && entry.sym.type_params == first.sym.type_params
+    };
+    valid(first)
+        && matching.all(|entry| valid(entry))
+        && args
+            .iter()
+            .all(|argument| reference_shape_known(index, argument, star, depth + 1))
+}
+
+fn reference_subtype(
+    index: &dyn InferenceIndex,
+    actual: &Type,
+    formal: &Type,
+    universal: bool,
+) -> bool {
+    if !reference_shape_known(index, actual, universal, 0)
+        || !reference_shape_known(index, formal, true, 0)
+        || actual.is_nullable() && !formal.is_nullable()
+    {
+        return false;
+    }
+    let mut witnessed = false;
+    let mut conflicting = false;
+    let mut incomplete = false;
+    let _ = infer::walk_supertypes(index, actual, infer::MAX_DEPTH, |current| {
+        incomplete |= matches!(current, Type::Unknown);
+        if current.name() == formal.name()
+            && current.package() == formal.package()
+            && current.container() == formal.container()
+        {
+            let compatible = reference_shape_known(index, current, universal, 0)
+                && current.owner() == formal.owner()
+                && current.args().len() == formal.args().len()
+                && current
+                    .args()
+                    .iter()
+                    .zip(formal.args())
+                    .all(|(a, b)| matches!(b, Type::Star) || a == b);
+            witnessed |= compatible;
+            conflicting |= !compatible;
+        }
+        ControlFlow::Continue(())
+    });
+    witnessed && !conflicting && !incomplete
 }
 
 pub(crate) fn function_applicability(
