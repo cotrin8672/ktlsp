@@ -9,16 +9,24 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
-Checkpoint120-18 passes1786 Rust tests,0 fail,9 ignored, and release with575
-stable input guards. Its SHA is
-7a40252548fc6ebce13cb30c77828100b0ab66888242b87b18de59079fef6927.
+Source through8f65812, checkpoint120-19 passes1786 Rust tests,0 fail,9 ignored
+(42 targets), and release with575 stable input guards. Its SHA is
+8100bcb57a4ee753c0a25d624425fbc53936d2de31a847d34e5a3851efb8853b.
 Both Cargo stages exit0 with closed output and zero owned live processes;
 each stage's retained MSVC vctip helper requires owned-job cleanup. Real LSP
 runs close normally: Java415/415 (53 first member RPCs), controlled serial
 CEM26/26, and five-project50/50 all pass on this same binary. Evidence:
-native-integrated120-18, java-classliteral121-release18,
-cem-startup120/editor-original26-release18-serial1 and
-final-corpus120-18/summary50.json. No new performance claim is made.
+native-integrated120-19, java-classliteral121-release19,
+cem-startup120/editor-original26-release19-serial1 and
+final-corpus120-19/summary50.json. No new performance claim is made.
+
+The original TypeTools consumers now pass4/4 first requests: Java and Kotlin
+completion and unique goto. Each goto resolves only to the compiler-selected
+Class/Class overload at zero-based197:42..60 in byte-exact0.6.3 sources. The
+original broader oracle is preserved; the new oracle explicitly strengthens
+the expectation to this single compiler-certified range. All guards remain
+stable and the LSP closes normally. Evidence:
+oracle120/typetools-editor-release19-strict1/{strict-audit.json,receipt.json}.
 
 Delivered commits759bc25,9ab41b9 and3fb5afe fix diagnostic lock order, Java
 class literals and same-method generic bounds respectively. Class-literal
@@ -27,17 +35,31 @@ invalid/expect targets; existing alias rejection is reused. Bound tests cover
 equal types, a distinct valid subtype, incompatible arguments and unsupported
 scope/cycle shapes. Cache v41 refreshes the changed parsed bound facts.
 
-The new shared specificity code remains uncommitted pending a correctness fix.
-Independent javac and current-engine controls show that instantiating generic
-formals before ranking wrongly selects a unique method for both
+Commit8f65812 shares bounded reference-overload selection between Java and
+Kotlin. Actual argument substitutions prove applicability; declaration-level
+shapes prove dominance. Unknown arguments, cyclic/incomplete hierarchy proofs,
+unsupported conversion phases and generic competitors retain uncertainty.
+Known applicable singletons keep their fast path. This does not establish
+full overload fidelity or binary-only library selection coverage.
+
+Independent review caught and repaired an intermediate checkpoint18 error:
+instantiating generic formals before ranking wrongly selected one method for
 `<T>pick(List<T>,T)` versus `pick(Collection<String>,Object)` and
 `<T>pick(List<T>,List<T>)` versus `pick(Collection<String>,Collection<String>)`,
-with String arguments. Javac reports ambiguity. Evidence:
+using (List<String>,String) and (List<String>,List<String>) respectively.
+Javac reports ambiguity. Evidence:
 oracle120/specificity-review-counterexample1 and
-oracle120/specificity-review-nested-counterexample1. Finite editor successes
-above do not cover this failure. Next: prove dominance from declaration shapes,
-retain these ambiguity regressions, then replay strict TypeTools unique goto
-on a fresh binary. Kotlin's behavior for these two reductions is unverified.
+oracle120/specificity-review-nested-counterexample1. Both Java ambiguity cases
+are retained in the shared regression and pass on19. Kotlin2.4 independently
+selects the nongeneric overload in both reductions
+(oracle120/kotlin-specificity-counterexamples1/receipt.json).
+Reproducing that Kotlin choice is a separate unmet case; retaining multiple
+candidates there must remain a coverage gap rather than a passing result.
+Next: distinguish proven/disproven declaration forwarding from insufficient
+proof before applying Kotlin's nongeneric tie-break. See the official
+[MSC algorithm](https://kotlinlang.org/spec/overload-resolution.html#algorithm-of-msc-selection).
+Contextual/trailing lambda inference, other unsupported type shapes and Java
+nullability annotations also remain gaps. Warm optimization stays paused.
 
 ### Previous integrated checkpoint120-17
 
