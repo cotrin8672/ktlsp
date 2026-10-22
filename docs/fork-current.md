@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-10-21 (Asia/Tokyo). Goal active; IDEA parity and speed acceptance remain unproved.
+Updated 2026-10-22 (Asia/Tokyo). Goal active; IDEA parity and complete valid-code type coverage remain unproved.
 History: docs/fork-acceptance.md, docs/fork-corpus.md and Git.
 Prospective speed targets and comparison rules: [performance budgets](fork-performance-budgets.md).
 BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
@@ -9,7 +9,7 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Integrated checkpoint120-9
 
-The current source passes1755 Rust tests,0 fail,9 ignored (40 targets), and a
+Checkpoint source through2167820 passes1755 Rust tests,0 fail,9 ignored (40 targets), and a
 release build. Both stages close normally with573 guarded inputs unchanged and
 zero owned residuals. Evidence: native-integrated120-9/{workspace-summary.json,
 receipt.json,main-ready.json}. The immutable release SHA256 is
@@ -26,7 +26,28 @@ that unknown/cyclic types withdraw getValue while a same-phase getTitle control
 remains useful. All23 inputs stay unchanged; shutdown is normal with no forced
 cleanup or owned residuals. Evidence: cem-startup120/inferred-summary.json.
 The earlier availability-only negative assertions are retained but are not used
-to prove candidate absence. Original CEM26 is still in progress.
+to prove candidate absence.
+
+The same release also passes original CEM26 (11 actual first responses, including
+the Float inlay hint) and the original five-project50: Gradle9, Moshi9, OkHttp10,
+Retrofit12 and Spring10. All ten corpus stages and both CEM stages shut down
+normally, with unchanged guarded inputs and zero owned residuals. CEM goto
+locations are checked against real, pinned source contents and token ranges.
+The five-project normal stages start with genuinely cached project models but
+no derived symbol caches; each incomplete stage reuses its own run's cache. No
+timing claim is drawn from these concurrent functional runs. Evidence:
+cem-startup120/editor-original26-release9/{summary.json,goto-audit.json} and
+final-corpus120/summary50.json.
+
+The matching IDEA oracle is now complete for those50 selected requests by
+combining41 non-Gradle observations with the latest9 Gradle observations. Case
+identities, manifests and the ILS263.6379.0/plugin9cfad180 pins match; overlapping
+older Gradle results are replaced rather than double-counted. All observations
+are first-response matches. This is not a single operationally successful IDEA
+run: its shutdown failures remain recorded. CEM's property-form auxiliary and
+the earlier method-form failures are separate. Evidence:
+processor120/idea50-composed-audit.json. Selected-case agreement does not establish
+general IDEA parity.
 
 Mixed property/accessor rename passes14/14 checks in real Neovim on the joint
 dev9 binary (SHA7d84c1dbcf87fcfa3b6cd088df0e5a6c81739032bc21047149f4425dc13e4c6e).
@@ -49,10 +70,53 @@ This is external-extension evidence, not production Mixin support in ktlsp.
 JDK cache planning now runs within the bounded dependency worker pool rather than
 blocking all useful module work. A gated regression verifies useful navigation
 while planning is pending and rejects results from an obsolete generation;
-scoped workers join before their owner returns. The new release's warm-startup
-timing and same-release CEM/five-project sweep are pending. The previous1.700s
-warm observation below is not a measurement of this change. Warm startup under1s
-is the current priority; cold30s is a lower-priority aspiration.
+scoped workers join before their owner returns. Quiet release120-9 records warm
+first use at593.061..1177.902ms across five starts (p50=601.994ms,
+p95=1062.820ms,500ms polling). Four of five are under1s; consistent subsecond
+startup is not established. Thirty useful RPCs have p95=18.577ms, and menu handoff
+p95=52.326ms. All31 actual insertions and all original8 checks pass with unchanged
+inputs and normal shutdown. Evidence: cem-speed120-9/{performance-summary.json,
+warm-startup-n5.json,budget-guard-audit.json}.
+
+The latest user priority accepts this warm speed and moves valid-code Unknown
+coverage ahead of further warm optimization. Current investigations separate
+inferred generic properties, inferred method returns, function-valued properties
+and arrays; expected types must be verified independently before claiming gaps or
+fixes. Never replace honest unknowns with invented types. TypeTools also has a
+reproduced POM/source-policy coverage gap while its binary API remains indexed;
+the encoding-policy fix is verified separately below. These pending type changes are not
+covered by the checkpoint's1755-test result until the next joint verification.
+
+## TypeTools source policy and next overload gap
+
+The real TypeTools0.6.3 POM's numeric compilerArguments source/target properties
+now use the existing bounded expansion and encoding-closure guards. The reduced
+real parent/child POM goes RED to GREEN and all15 existing encoding-policy tests
+pass. Unknown compiler identities, argument files, injected options, ambiguous or
+conditional properties and merge attributes remain rejected. Evidence:
+oracle120/typetools-policy-{red1,regression1}/receipt.json.
+
+Immutable dev10 (SHA16832674ec6b0096128e4270fafbf17d143de91c05110995b937b8d7b33003b2)
+resolves both actual TypeTools source files without the former policy failure.
+Java/Kotlin completion both pass. Every returned definition file matches the
+selected source-jar entry byte-for-byte, but strict unique goto fails because both
+overloads are returned. Preserve that failure: it is not a fully passing editor
+run. Both exact consumers independently compile and javap selects only
+`resolveRawArgument:(Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/Class;`.
+Java class-literal typing and shared overload specificity are the next reproduced
+semantic gap. All compiler/editor processes close normally with unchanged guards.
+Evidence: oracle120/typetools-editor-dev10-1/audit.json,
+oracle120/typetools-consumer-oracle1/receipt.json and
+oracle120/typetools-selection-readonly1/audit.json.
+
+## Pending Unknown coverage integration
+
+Joint120-11 compiles and runs all41 test targets:1761 pass,5 fail,9 ignored.
+The failures are the new method-return and function-property probes; existing
+tests and the new generic/array cases pass. No release is emitted. Keep the
+five failures while repairing provider registration and completion-query source
+hydration; do not treat source-ready code as verified behavior. Evidence:
+native-integrated120-11/{workspace-summary.json,receipt.json}.
 
 ## Earlier integrated checkpoint120-6
 

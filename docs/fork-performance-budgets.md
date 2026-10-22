@@ -1,7 +1,9 @@
 # Performance targets for the next release comparison
 
-User priority update: cold startup is lower priority; warm first useful startup
-under1s is the requested improvement. The former3s warm target below is superseded.
+Latest user priority: warm startup is sufficiently fast; prioritize resolving
+valid-code Unknown results and missing useful completion. Further warm optimization
+is paused. Under1s remains a preference, not a blocker for that semantic work.
+Cold startup is lower priority. The former3s warm target below is superseded.
 These are prospective editing targets on the originating Windows machine, not
 semantic correctness deadlines or universal hardware requirements. Record results
 even when a target is missed; a slow useful answer is not a semantic failure and
@@ -18,7 +20,7 @@ and the recovered-index file-lookup fix.
 | Measured behavior | Next-release target | Required interpretation |
 | --- | --- | --- |
 | CEM cold first useful completion | <=30s, lower-priority aspiration | Fresh LSP cache, existing Gradle artifact home; also report full-index time separately |
-| CEM warm first useful completion | <1s | Reuse the exact cache from the cold run; previously <=3s |
+| CEM warm first useful completion | <1s preference; optimization paused | Reuse the exact cache from the cold run; previously <=3s |
 | CEM warm useful RPCs, n=30 | p95 <=50ms | Keep every observation and report p50/p95/max |
 | CEM input-to-menu handoff, n=30 | p95 <=100ms | Inspect actual accepted text and restore the whole buffer; this is not pixel-display timing |
 | Original five-project completion cases | Each <=100ms after readiness | First response only, unchanged semantic expectations; report startup/producer waiting separately |
@@ -45,4 +47,16 @@ finite observations establish neither a startup distribution nor the entire
 five-project row. The changed observed-result paragraph was captured before the
 actual run, and the target table and conditions match the preparation bytes.
 Evidence: cem-speed120-6/{performance-summary.json,budget-guard-audit.json}.
+Release120-9 observes30.194s cold (n=1) and warm first-use samples of598.058,
+593.061,601.994,1177.902 and602.495ms using the unchanged500ms polling and cache.
+The finite warm n=5 has p50/p95/max of601.994/1062.820/1177.902ms; four samples
+are under1s. This does not establish consistent subsecond startup or a population
+percentile. The original30 RPCs have p50/p95/max10.298/18.577/23.163ms, and menu
+handoff44.253/52.326/57.886ms. All31 actual insertions restore the whole buffer;
+all original8 content checks pass in each startup run. All owned servers close
+normally with unchanged439 input guards and zero forced cleanup. The four extra
+warm runs omit only the later, separate UI server and preserve the original UI
+evidence. Evidence: cem-speed120-9/{performance-summary.json,warm-startup-n5.json,
+budget-guard-audit.json}.
+
 Memory reductions must preserve useful results and latency.

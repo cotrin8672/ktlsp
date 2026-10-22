@@ -230,6 +230,7 @@ struct Pom {
     profile_properties: BTreeSet<String>,
     active_encoding: Option<String>,
     managed_encoding: Option<String>,
+    compiler_levels: Vec<String>,
     unsupported_compiler_encoding: bool,
 }
 
@@ -286,6 +287,7 @@ struct Plugin {
     encoding: Option<String>,
     profile: bool,
     managed: bool,
+    compiler_levels: Vec<String>,
     unsupported: bool,
 }
 struct Frame {
@@ -575,6 +577,7 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
             .chain(std::iter::once(frame.name.clone()))
             .collect();
         let relative: Vec<&str> = names.iter().map(String::as_str).collect();
+        let argument_ancestor_attributes = stack[index + 1..].iter().any(|frame| frame.attributes);
         let plugin = stack[index].plugin.as_mut().unwrap();
         match relative.as_slice() {
             ["groupId"] => set(&mut plugin.group, text.clone())?,
@@ -605,6 +608,17 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
                             || text.contains("${"));
             }
             ["configuration", "compilerArgs", ..] => plugin.unsupported = true,
+            ["configuration", "compilerArguments", "source" | "target"]
+            | ["executions", "execution", "configuration", "compilerArguments", "source" | "target"] =>
+            {
+                plugin.unsupported |=
+                    argument_ancestor_attributes || frame.attributes || frame.children;
+                ensure!(
+                    plugin.compiler_levels.len() < MAX_PROPERTIES,
+                    "compiler level argument limit"
+                );
+                plugin.compiler_levels.push(text.clone());
+            }
             _ if relative.contains(&"encoding") => plugin.unsupported = true,
             _ if relative.iter().any(|p| {
                 matches!(
@@ -623,7 +637,9 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
     }
     if let Some(plugin) = frame.plugin {
         ensure!(
-            !(plugin.encoding.is_some() || plugin.unsupported)
+            !(plugin.encoding.is_some()
+                || plugin.unsupported
+                || !plugin.compiler_levels.is_empty())
                 || !plugin
                     .artifact
                     .as_deref()
@@ -640,6 +656,7 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
                 .as_deref()
                 .is_none_or(|g| g == "org.apache.maven.plugins")
         {
+            pom.compiler_levels.extend(plugin.compiler_levels);
             pom.unsupported_compiler_encoding |=
                 plugin.unsupported || plugin.profile && plugin.encoding.is_some();
             if !plugin.profile {
@@ -705,6 +722,16 @@ fn encoding(chain: &[Pom]) -> anyhow::Result<JavaSourceEncoding> {
     } else {
         JavaSourceEncoding::Utf8
     };
+    // A fixed map key selects -source/-target, but its value could still be an
+    // argument file or injected options. Certify only bounded, numeric levels.
+    for raw in chain.iter().flat_map(|pom| &pom.compiler_levels) {
+        let level = expand(raw, &properties, &mut used, &mut BTreeSet::new())?;
+        let digits = level.strip_prefix("1.").unwrap_or(&level);
+        ensure!(
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+            "unsupported compiler source/target level"
+        );
+    }
     ensure!(
         ambiguous.is_disjoint(&used),
         "ambiguous property in source encoding closure"
@@ -1211,6 +1238,58 @@ mod tests {
 
     #[test]
     fn compiler_argument_boundaries_preserve_encoding_closure() {
+        let level_arguments = |value: &str| {
+            format!("<compilerArguments><source>{value}</source><target>{value}</target></compilerArguments>")
+        };
+        // Reduced from TypeTools 0.6.3: the release execution changes Java levels,
+        // while source text encoding is inherited from oss-parent 7.
+        let tmp = Temp::new();
+        let selected = Coordinate::parse("net.jodah:typetools:0.6.3").unwrap();
+        let parent = Coordinate::parse("org.sonatype.oss:oss-parent:7").unwrap();
+        let child_pom = tmp.write("typetools.pom", &format!(
+            "<project><parent><groupId>org.sonatype.oss</groupId><artifactId>oss-parent</artifactId><version>7</version></parent><groupId>net.jodah</groupId><artifactId>typetools</artifactId><version>0.6.3</version><properties><releaseCompileVersion>1.6</releaseCompileVersion></properties><profiles><profile><id>release</id><build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><executions><execution><id>default-compile</id><configuration>{}</configuration></execution></executions></plugin></plugins></build></profile></profiles></project>",
+            level_arguments("${releaseCompileVersion}"),
+        ));
+        let parent_pom = tmp.write("oss-parent.pom", "<project><groupId>org.sonatype.oss</groupId><artifactId>oss-parent</artifactId><version>7</version><properties><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties></project>");
+        let policy = SourceTextPolicy::resolve_certified(&selected, |coordinate| {
+            Ok(if coordinate == &selected {
+                vec![child_pom.clone()]
+            } else if coordinate == &parent {
+                vec![parent_pom.clone()]
+            } else {
+                Vec::new()
+            })
+        })
+        .unwrap();
+        assert_eq!(policy.java, JavaSourceEncoding::Utf8);
+        assert_eq!(policy.poms.len(), 2);
+        policy.validate().unwrap();
+        for value in ["1.6", "17", "${level}"] {
+            assert_eq!(
+                declared(
+                    &("<properties><level>1.6</level></properties>".to_owned()
+                        + &plugin(&level_arguments(value)))
+                )
+                .unwrap(),
+                JavaSourceEncoding::Utf8
+            );
+        }
+        for (name, body) in [
+            ("missing level", plugin(&level_arguments("${missing}"))),
+            ("cyclic level", "<properties><level>${other}</level><other>${level}</other></properties>".to_owned() + &plugin(&level_arguments("${level}"))),
+            ("ambiguous level", "<properties><level>1.6</level><level>17</level></properties>".to_owned() + &plugin(&level_arguments("${level}"))),
+            ("conditional level", "<properties><level>1.6</level></properties><profiles><profile><properties><level>17</level></properties></profile></profiles>".to_owned() + &plugin(&level_arguments("${level}"))),
+            ("compound level", "<properties><level>1.6</level></properties>".to_owned() + &plugin(&level_arguments("${level}-encoding"))),
+            ("argument file value", "<properties><level>@args.txt</level></properties>".to_owned() + &plugin(&level_arguments("${level}"))),
+            ("injected option value", "<properties><level>1.6 -encoding ISO-8859-1</level></properties>".to_owned() + &plugin(&level_arguments("${level}"))),
+            ("level leaf merge", plugin("<compilerArguments><source combine.self=\"override\">${level}</source></compilerArguments>")),
+            ("level map merge", "<properties><level>1.6</level></properties>".to_owned() + &plugin("<compilerArguments combine.children=\"append\"><source>${level}</source></compilerArguments>")),
+            ("nested level", plugin("<compilerArguments><source><value>1.6</value></source></compilerArguments>")),
+            ("dynamic sibling", "<properties><level>1.6</level></properties>".to_owned() + &plugin(&(level_arguments("${level}") + "<compilerArgument>${opts}</compilerArgument>"))),
+            ("dynamic compiler identity", "<properties><level>1.6</level></properties><build><plugins><plugin><artifactId>${compiler}</artifactId><configuration><compilerArguments><source>${level}</source></compilerArguments></configuration></plugin></plugins></build>".to_owned()),
+        ] {
+            assert!(declared(&body).is_err(), "{name}");
+        }
         let fixed = "-J-Xbootclasspath/p:${settings.localRepository}/compiler/${version}/javac-${version}.jar";
         for configuration in [
             format!("<encoding>UTF8</encoding><compilerArgs><arg>{fixed}</arg></compilerArgs>"),
