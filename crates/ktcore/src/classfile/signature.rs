@@ -68,6 +68,13 @@ mod tests {
                 "get" => assert_eq!(actual.returns.unwrap().name, "T"),
                 "array" => assert_eq!(actual.returns.unwrap().name, "T[]"),
                 "same" => assert_eq!(actual.type_parameters[0].bounds[0].name, "Item"),
+                "related" => {
+                    let bound = &actual.type_parameters[0].bounds[0];
+                    assert_eq!(actual.type_parameters[0].name, "U");
+                    assert_eq!(bound.name, "T");
+                    assert!(bound.qualification.is_none());
+                    assert_eq!(actual.returns.unwrap().name, "U");
+                }
                 "bounded" => {
                     let bound = &actual.type_parameters[0].bounds[0];
                     assert_eq!(actual.type_parameters[0].name, "V");

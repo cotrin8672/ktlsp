@@ -3830,7 +3830,7 @@ pub(crate) fn projected_member_application(
         &initial,
     );
     if application.status == solve::ConstraintStatus::Matched {
-        let method_parameters: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
+        let declared_parameters = member_type_parameters(index, entry);
         for (parameter, bound) in entry
             .sym
             .method_type_bounds
@@ -3838,15 +3838,15 @@ pub(crate) fn projected_member_application(
             .into_iter()
             .flatten()
         {
-            let own_relation = bound.qualification.is_none()
-                && method_parameters.contains(&bound.name)
+            let scoped_relation = bound.qualification.is_none()
+                && declared_parameters.contains(&bound.name)
                 && bound.args.is_empty()
                 && bound.owner.is_none();
             let bound = resolve_with_subst_unprojected(
                 index,
                 bound,
                 &ctx,
-                &method_parameters,
+                &declared_parameters,
                 &application.bindings,
                 0,
             );
@@ -3854,7 +3854,7 @@ pub(crate) fn projected_member_application(
             let satisfies =
                 actual.is_some_and(|actual| receiver_satisfies_upper_bound(index, actual, &bound));
             if !satisfies {
-                application.status = if own_relation
+                application.status = if scoped_relation
                     && actual
                         .is_some_and(|actual| nominal_heads_incompatible(index, actual, &bound))
                 {

@@ -545,7 +545,7 @@ impl DependencyResult {
                     matches!(
                         symbol.kind,
                         ktcore::symbol::SymbolKind::Function | ktcore::symbol::SymbolKind::Property
-                    )
+                    ) || symbol.kind.is_type_like() && symbol.unavailable_members.is_some()
                 })
             })
     }
@@ -6551,6 +6551,12 @@ mod tests {
                     "arrayfixture/Item.class",
                     include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class"),
                 ),
+                (
+                    "shadowfixture/Marker.class",
+                    include_bytes!(
+                        "../../ktcore/tests/fixtures/classfile/shadowfixture/Marker.class"
+                    ),
+                ),
                 ("broken/Only.class", b"not a classfile"),
             ],
         );
@@ -6587,7 +6593,7 @@ mod tests {
         for _ in 0..2 {
             let result = resolve(true, vec![(selected.clone(), origin.clone())]);
             assert!(!result.failed && !result.skipped && result.missing_source);
-            assert_eq!(result.batches.len(), 2);
+            assert_eq!(result.batches.len(), 3);
             assert!(result.batches.iter().all(|batch| {
                 let origin = batch.origin.as_ref().unwrap();
                 origin.origin_id == classpath::maven_origin_id(&coord)
@@ -6598,6 +6604,21 @@ mod tests {
                 .iter()
                 .flat_map(|batch| &batch.symbols)
                 .any(|symbol| symbol.name == "rows"));
+            let marker = result
+                .batches
+                .iter()
+                .find(|batch| batch.symbols.iter().any(|symbol| symbol.name == "Marker"))
+                .unwrap();
+            assert!(marker.symbols.iter().any(|symbol| symbol.kind
+                == ktcore::symbol::SymbolKind::Interface
+                && symbol
+                    .unavailable_members
+                    .as_deref()
+                    .is_some_and(|members| members.is_empty())));
+            assert!(!marker.symbols.iter().any(|symbol| matches!(
+                symbol.kind,
+                ktcore::symbol::SymbolKind::Function | ktcore::symbol::SymbolKind::Property
+            )));
             assert!(!result
                 .batches
                 .iter()
@@ -6687,8 +6708,18 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                         && invalid_source.missing_source
                         && !invalid_source.skipped
                 );
-                assert_eq!(invalid_source.batches.len(), 2);
+                assert_eq!(invalid_source.batches.len(), 3);
                 assert!(invalid_source.source_error_binary_fallback());
+                let mut opaque = resolve(true, vec![(selected.clone(), origin.clone())]);
+                let marker = opaque
+                    .batches
+                    .iter_mut()
+                    .find(|batch| batch.symbols.iter().any(|symbol| symbol.name == "Marker"))
+                    .unwrap();
+                for symbol in &mut marker.symbols {
+                    symbol.unavailable_members = None;
+                }
+                assert!(!opaque.source_error_binary_fallback(), "a header without decoded type facts cannot pass alongside useful member batches");
                 assert!(invalid_source.batches.iter().all(|batch| batch
                     .origin
                     .as_ref()

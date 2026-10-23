@@ -18,6 +18,7 @@ const KOTLIN_BOX: &str =
 #[test]
 fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
     let mut ws = workspace(&[
+        ("T.java", "package app; public class T { public void poison() {} }"),
         (
             "Item.java",
             "package app; public class Item { public void useful() {} }",
@@ -45,7 +46,8 @@ fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
             "package app; class Use { void use(Box<Item> java, KotlinBox<Item> kotlin, Item item, Other other) { java.same(item).useful(); kotlin.same(item).useful(); java.shadow(other).usefulWrong(); kotlin.shadow(other).usefulWrong(); java.same(other).usefulWrong(); kotlin.same(other).usefulWrong(); java.related(item).useful(); kotlin.related(item).useful(); } }",
         ),
     ] {
-        ws.open(file, source.into());
+        let source = source.replace("kotlin.related(item).useful()", "kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong()");
+        ws.open(file, source.clone());
         for receiver in ["java", "kotlin"] {
             assert_member(
                 &mut ws,
@@ -69,11 +71,48 @@ fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
                 )
                 .contains("usefulWrong")
             );
-            assert!(
-                !labels(&mut ws, file, &format!("{receiver}.related(item).useful"))
-                    .contains("useful"),
-                "inter-variable bounds need declaration identity support"
-            );
+            assert_member(&mut ws, file, &format!("{receiver}.related(item).useful"), "useful", "usefulWrong");
+            let member = ws.index.lookup_by_name("useful").iter().find(|entry| entry.path.as_ref() == "Item.java").unwrap();
+            let expected = ktlsp::symbol::Def { file: "Item.java".into(), start_byte: member.sym.start_byte, end_byte: member.sym.end_byte };
+            let prefix = format!("{receiver}.related(item).useful");
+            assert_eq!(ws.goto_definition(file, source.find(&prefix).unwrap() + prefix.len() - "useful".len()), vec![expected]);
+            assert!(!labels(&mut ws, file, &format!("{receiver}.related(other).usefulWrong")).contains("usefulWrong"));
+        }
+        let java_box = ws.doc_text("Box.java").unwrap().to_string();
+        let kotlin_box = ws.doc_text("KotlinBox.kt").unwrap().to_string();
+        ws.change("Box.java", java_box.replace("<U extends T>", "<U extends Other>"));
+        ws.change("KotlinBox.kt", kotlin_box.replace("<U: T>", "<U: Other>"));
+        for receiver in ["java", "kotlin"] {
+            assert_member(&mut ws, file, &format!("{receiver}.related(other).usefulWrong"), "usefulWrong", "useful");
+            assert!(!labels(&mut ws, file, &format!("{receiver}.related(item).useful")).contains("useful"));
+        }
+        ws.change("Box.java", java_box);
+        ws.change("KotlinBox.kt", kotlin_box);
+        for receiver in ["java", "kotlin"] {
+            assert_member(&mut ws, file, &format!("{receiver}.related(item).useful"), "useful", "usefulWrong");
+        }
+    }
+    for (file, source) in [
+        ("Raw.java", "package app; class Raw { void use(Box java, KotlinBox kotlin, T poison) { java.related(poison).poison(); kotlin.related(poison).poison(); } }"),
+        ("Star.kt", "package app\nfun raw(java: Box<*>, kotlin: KotlinBox<*>, poison: T) { java.related(poison).poison(); kotlin.related(poison).poison() }"),
+    ] {
+        ws.open(file, source.into());
+        for receiver in ["java", "kotlin"] {
+            assert!(!labels(&mut ws, file, &format!("{receiver}.related(poison).poison")).contains("poison"));
+        }
+    }
+    ws.open("JavaCycle.java", "package app; class JavaCycle { public <U extends V, V extends U> U cycle(U value) { return value; } }".into());
+    ws.open(
+        "KotlinCycle.kt",
+        "package app\nclass KotlinCycle { fun <U: V, V: U> cycle(value: U): U = value }".into(),
+    );
+    for (file, source) in [
+        ("Cycles.java", "package app; class Cycles { void use(JavaCycle java, KotlinCycle kotlin, Item item) { java.cycle(item).useful(); kotlin.cycle(item).useful(); } }"),
+        ("Cycles.kt", "package app\nfun cycles(java: JavaCycle, kotlin: KotlinCycle, item: Item) { java.cycle(item).useful(); kotlin.cycle(item).useful() }"),
+    ] {
+        ws.open(file, source.into());
+        for receiver in ["java", "kotlin"] {
+            assert!(!labels(&mut ws, file, &format!("{receiver}.cycle(item).useful")).contains("useful"));
         }
     }
 }
@@ -7336,13 +7375,24 @@ fn direct_own_method_bounds_validate_substituted_class_arguments() {
 fn method_bound_relations_keep_cycles_foreign_scopes_and_shadow_collisions_unknown() {
     for declaration in [
         "package probe; public class BoundApi { public <T extends S,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }",
-        "package probe; public class BoundApi<T> { public <S extends T> S choose(Class<S> type) { return null; } }",
+        "package probe; public class BoundApi<T> { public static <S extends T> S choose(Class<S> type) { return null; } }",
         "package probe; public class BoundApi<T> { public <T,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }",
     ] {
         let ws = workspace(&[("BoundApi.java", declaration)]);
         let entry = &ws.index.lookup_by_name("choose")[0];
         assert!(entry.sym.method_type_bounds.is_none(), "{declaration}: {:?}", entry.sym.method_type_bounds);
     }
+    let ws = workspace(&[("BoundApi.java", "package probe; public class BoundApi<T> { public <S extends T> S choose(Class<S> type) { return null; } }")]);
+    let entry = &ws.index.lookup_by_name("choose")[0];
+    let bounds = entry
+        .sym
+        .method_type_bounds
+        .as_deref()
+        .expect("the receiver owner's parameter is scoped");
+    assert_eq!(bounds.len(), 1);
+    assert_eq!(bounds[0].0, "S");
+    assert_eq!(bounds[0].1.name, "T");
+    assert!(bounds[0].1.qualification.is_none());
 }
 
 #[test]
@@ -7510,13 +7560,13 @@ fn f_bounded_property_arguments_preserve_enum_result_across_languages() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-
 #[test]
-fn nominal_method_f_bounds_retain_only_scoped_own_variables() {
+fn nominal_method_f_bounds_retain_scoped_method_and_receiver_variables() {
     for (file, declaration, parameter, head) in [
         ("BoundApi.java", "package probe; public class BoundApi { public <T extends Comparable<T>> T choose(T value) { return value; } }", "T", "Comparable"),
         ("BoundApi.kt", "package probe\nclass BoundApi { fun <T:Comparable<T>> choose(value:T):T = value }\n", "T", "Comparable"),
         ("BoundApi.java", "package probe; public class BoundApi { public <T,S extends java.util.List<T>> S choose(Class<T> type,Class<S> subType) { return null; } }", "S", "List"),
+        ("BoundApi.java", "package probe; public class BoundApi<T> { public <S extends Comparable<T>> S choose(S value) { return value; } }", "S", "Comparable"),
     ] {
         let ws = workspace(&[(file, declaration)]);
         let entry = &ws.index.lookup_by_name("choose")[0];
@@ -7529,7 +7579,6 @@ fn nominal_method_f_bounds_retain_only_scoped_own_variables() {
         assert!(bounds[0].1.args[0].qualification.is_none());
     }
     for declaration in [
-        "package probe; public class BoundApi<T> { public <S extends Comparable<T>> S choose(S value) { return value; } }",
         "package probe; public class BoundApi<T> { public <T extends Comparable<T>> T choose(T value) { return value; } }",
     ] {
         let ws = workspace(&[("BoundApi.java", declaration)]);

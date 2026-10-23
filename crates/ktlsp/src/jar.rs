@@ -1697,7 +1697,7 @@ mod tests {
         let source = java_class_stub(&class).expect("binary method with an own-variable F-bound");
         let mut workspace = crate::workspace::Workspace::new();
         for (file, text) in [
-            ("Item.java", "package genericfixture; public class Item {}"),
+            ("Item.java", include_str!("../../ktcore/tests/fixtures/classfile/sources/genericfixture/Item.java")),
             ("Other.java", "package genericfixture; public class Other { public void wrongResult() {} }"),
             ("Comparable.java", "package java.lang; public interface Comparable<T> { int compareTo(T other); }"),
             ("Value.java", "package genericfixture; public class Value implements Comparable<Value> { public int compareTo(Value other) { return 0; } public void exactResult() {} }"),
@@ -1715,8 +1715,8 @@ mod tests {
         assert_eq!(bounds[0].1.name, "Comparable");
         assert_eq!(bounds[0].1.args[0].name, "V");
         for (file, text) in [
-            ("Use.java", "package genericfixture; class Use { void use(Box<Item> box, Value value, Other other) { box.bounded(value).exactResult(); box.bounded(other).wrongResult(); } }"),
-            ("Use.kt", "package genericfixture\nfun use(box:Box<Item>,value:Value,other:Other) { box.bounded(value).exactResult(); box.bounded(other).wrongResult() }\n"),
+            ("Use.java", "package genericfixture; class Use { void use(Box<Item> box, Item item, Value value, Other other) { box.bounded(value).exactResult(); box.bounded(other).wrongResult(); box.related(item).ping(); box.related(other).wrongResult(); } }"),
+            ("Use.kt", "package genericfixture\nfun use(box:Box<Item>,item:Item,value:Value,other:Other) { box.bounded(value).exactResult(); box.bounded(other).wrongResult(); box.related(item).ping(); box.related(other).wrongResult() }\n"),
         ] {
             workspace.open(file, text.into());
             let prefix = "box.bounded(value).exactRes";
@@ -1733,6 +1733,19 @@ mod tests {
             let prefix = "box.bounded(other).wrongRes";
             let at = text.find(prefix).unwrap() + prefix.len();
             assert!(!workspace.complete(file, at, true).is_some_and(|completion| completion.items.iter().any(|item| item.label == "wrongResult")), "{file}: incompatible method bound");
+            let prefix = "box.related(item).pi";
+            let at = text.find(prefix).unwrap() + prefix.len();
+            let completion = workspace.complete(file, at, true).expect("owner-dependent binary method completion");
+            assert!(completion.items.iter().any(|item| item.label == "ping"), "{file}");
+            assert!(!completion.items.iter().any(|item| item.label == "wrongResult"), "{file}");
+            let definitions = workspace.goto_definition(file, text.find("box.related(item).ping").unwrap() + "box.related(item).".len());
+            assert_eq!(definitions.len(), 1, "{file}: {definitions:?}");
+            assert_eq!(definitions[0].file, "Item.java");
+            let target = workspace.doc_text("Item.java").unwrap();
+            assert_eq!(&target[definitions[0].start_byte..definitions[0].end_byte], "ping");
+            let prefix = "box.related(other).wrongRes";
+            let at = text.find(prefix).unwrap() + prefix.len();
+            assert!(!workspace.complete(file, at, true).is_some_and(|completion| completion.items.iter().any(|item| item.label == "wrongResult")), "{file}: incompatible receiver-dependent bound");
         }
     }
 

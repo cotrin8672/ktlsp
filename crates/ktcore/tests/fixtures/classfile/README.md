@@ -16,6 +16,8 @@ nested enum parameter. Missing or contradictory InnerClasses records keep that m
 bounds, a method parameter shadowing a class parameter, fields, arrays, and wildcard variance.
 Its `bounded` method preserves `<V extends Comparable<V>> V bounded(V)` through binary Signature,
 stub projection, and Java/Kotlin completion and navigation; a non-Comparable argument stays unknown.
+Its `related` method preserves `<U extends T> U related(U)` using the instantiated receiver's T,
+including Java/Kotlin completion and exact member navigation; an incompatible argument stays unknown.
 Child specializes Box to Item; Holder exposes both a static and an instance generic field.
 Lexical keeps a class parameter's bound in its declaration scope under a same-named method
 parameter. Independent binary-only javac consumers accept the useful chains and reject calls

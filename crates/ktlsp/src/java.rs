@@ -371,8 +371,7 @@ fn walk_declaration_container<'tree>(
                     {
                         sym.method_type_bounds = ktcore::indexer::method_type_bounds(
                             &java_type_parameters_in_scope(child, src, scope),
-                            child.start_byte(),
-                            child.end_byte(),
+                            child,
                         );
                     }
                     sym.arity = Some(sym.params.len().min(u8::MAX as usize) as u8);
@@ -4236,7 +4235,6 @@ fn java_unshadowed_type_receiver(
     }
     found_owner.then_some(receiver)
 }
-
 
 fn implicit_receiver_kind(node: Node<'_>, src: &str) -> ktcore::jvm::ReceiverKind {
     let mut current = node.parent();

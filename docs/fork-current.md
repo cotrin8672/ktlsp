@@ -9,42 +9,101 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
-Checkpoint120-22 passes1801 Rust tests,0 fail,9 ignored across42 targets,
+Checkpoint120-23 passes1801 Rust tests,0 fail,9 ignored across42 targets,
 and builds release with576 stable inputs. Immutable binary SHA256:
-`5f9868838966253fda207ab91aa8315e06014973ffdbb2d8815d1d375179bc27`.
+`c3ed4314c4586b5566ff2f2bc1740dc00999988af0a13f0cd8fdc7651f54f64e`.
 Both Cargo stages exit0/EOF/owned-live0; each exact retained MSVC vctip helper
 requires owned-job cleanup. Actual LSP runs close cleanly with no forced cleanup.
+Goal remains active: new library navigation cases below expose real gaps.
 
 | Same-release editor evidence | Observed |
 | --- | --- |
-| Java/Kotlin editor surface |427/427,61 first member RPCs; no false member-call diagnostic; Kotlin MSC extension completion and sole compiler-selected goto pass |
+| Java/Kotlin editor baseline |427/427,61 first member RPCs |
 | Original CEM normal/incomplete |26/26,11 first RPCs |
-| Actual CEM FQN getValue |8/8,6 first RPCs; Java and Kotlin completion/goto pass |
+| Actual CEM FQN getValue |8/8,6 first RPCs, both languages |
 | Strict TypeTools overload |4/4 first requests, sole compiler-selected Class/Class source range |
 | Five additional projects |50/50 first requests: Gradle9,Moshi9,OkHttp10,Retrofit12,Spring10 |
+| New receiver-owner method bounds |8/8 first RPCs,4 Java/Kotlin owner/consumer pairs; incomplete completion and sole exact goto;16 semantic/delivery assertions |
+| New OpenJSSE public API |6/6 functional first RPCs, both languages; cache-copy isolation fails separately (see below) |
+| New failed-source binary API probes |4/9 strict RPC matches: all3 completions and Persister class goto pass;5 navigation checks fail |
 
-All input guards remain stable, all replies are measured on the first attempt,
-and all runtime stages have closed output and zero owned live processes.
-Evidence: `native-integrated120-22`, `java-kotlin-msc121-release22`
-(including `msc-passed-wire-audit.json`),
-`cem-startup120/editor-original26-release22-serial1`,
-`cem-getvalue122-native-release22/receipt.json`,
-`oracle120/typetools-editor-release22-strict1/strict-audit.json`, and
-`final-corpus120-22/summary50.json`. Expectations remain unchanged.
+Original editor expectations remain unchanged. All runtime processes close normally.
+Evidence: `native-integrated120-23`, `java-kotlin-msc121-release23`,
+`cem-startup120/editor-original26-release23-serial1`,
+`cem-getvalue122-native-release23/receipt.json`,
+`oracle120/typetools-editor-release23-strict1/strict-audit.json`,
+`final-corpus120-23/summary50.json`, and `receiver-bound128-native23/receipt.json`.
+New API evidence: `openjsse127-native-release23-attempt3/metadata/receipt.json`,
+`fallback-api126/r-release23-1/receipt.json` and
+`fallback-api126/s-release23-1/receipt.json`. Two OpenJSSE prelaunch adapter
+failures had zero RPCs; the successful functional run is the first semantic run.
 
-These selected cases do not prove complete project analysis or general IDEA
-parity. Source-index coverage limits remain explicit: OkHttp failed1/missing0,
-Retrofit failed6/missing4, Spring failed11/missing10. Identify the actual failure
-artifacts/reasons before treating these as harmless or claiming complete coverage.
-No new warm timing or memory claim is made; the user prioritizes valid-code
-Unknown elimination over further warm optimization.
+### Delivered Unknown fixes on23
 
-Next known semantic gap: `bounded_method_arguments_share_nominal_bounds_and_method_shadowing`
-still expects no useful completion for compiler-valid class/method inter-variable
-bounds (`Box<T:Item>.related<U:T>(U)`). Confirm with independent compilers and
-upgrade this existing regression rather than count missing results as success.
-Compiler-plugin/reload and broader IDEA comparison evidence below belongs to its
-recorded revisions; it has not all been repeated on22.
+Fixed source-encoding authority for a fixed compilerArguments/bootclasspath value;
+encoding/profile/merge/raw-argument guards remain. Actual OpenJSSE1.1.12 retains
+its explicit UTF-8 policy:202/202 Java sources parse without syntax errors,
+5920 symbols;198 declaration-bearing files publish (four package-info files have
+no symbols). Actual JAR API is independently Javac21-certified. Source encoding
+failure is not a persistent negative cache; current policy is revalidated before
+symbol-cache reuse. Focused evidence: `openjsse127-{red1,green1,actual,final.json}`;
+15 encoding tests pass. Actual OkHttp failed-source count drops1 to0, missing0,
+library files37544 to37742.
+
+Fixed failed-source binary publication: a decoded empty marker interface no
+longer discards other useful classes in its selected artifact. Every batch still
+requires exact selected origin and Stub provenance plus proven decoded type or
+member facts. Opaque headers, partial sources and stale/ambiguous origins remain
+rejected; source completeness is not upgraded. Focused LSP worker test passes
+(`joint-unknown127-green1`); that attempt retains143/145 generic checks and two
+obsolete unsupported expectations as a RED, not a full GREEN.
+
+Receiver-owner method bounds now retain proven `<U:T>` relationships without
+new serialized fields; cache v44 invalidates changed bound facts. Nearest-owner
+and complete lexical facts reject inaccessible static/companion/foreign scopes;
+raw/star missing bindings do not resolve through a global same-named class.
+Independent Javac21/Kotlin2.4 controls certify positives and reject wrong arguments.
+Actual compiled Box.class is major61 and its `<U:TT;>(TU;)TU;` signature is checked.
+All60 fixture hashes match. Final focused147/147 (generic145, Signature1,
+compiled-JAR Java/Kotlin completion/goto1): `joint-unknown127-green2`.
+Compiler/fixture evidence: `receiver-bound127-{oracle1,legacy-oracle1,fixture1}`.
+Actual8 first Neovim requests also pass (`receiver-bound128-native23`).
+
+### Remaining navigation and source coverage
+
+New binary API probes use model-only seeds, fresh symbol/extraction caches and
+strict baseline file-set/byte guards, which remain stable. Retrofit Persister.read
+completion and class goto pass; method goto returns20 locations from both Persister
+and Serializer, rejected by the new owner predicate. Check the exact callsite and
+compiler-selected descriptor before generalizing that navigation expectation.
+Spring ContextFactory completion passes in Java/Kotlin, but Java class/method and
+Kotlin method goto return private .java paths which do not exist; Kotlin class
+goto is null. Fix binary fallback source registration/materialization and verify
+these unchanged first-response REDs on a new binary.
+
+Source text limitations remain separate from available API facts. Retrofit still
+has6 failed-source artifacts and missing-source reporting9 (was4), while published
+library files grow67339 to70600 (+3261). Spring retains11 failures and missing19
+(was10), while library files grow153792 to157308 (+3516). The extra missing-source
+counts arise when previously skipped failed-source artifacts now publish selected
+binary facts; source text did not become available. Two stale local Spring artifacts
+remain excluded. Exact causes: `final-corpus120-22/other-source-coverage-causes.json`;
+phase counts: `final-corpus120-23/ors-pairs-summary.json`.
+
+OpenJSSE functional6/6 is NOT a passing isolation proof: a full symbol-cache copy
+keeps its old absolute source URI, and goto adds one SSLParameters.java to the
+original private test cache. Its114 existing files remain byte-identical, with no
+removal or change; the additional file is preserved. See the fileset delta and
+`openjsse127-native-release23-attempt3/final-summary.json`. Cache relocation support
+is unestablished, so do not label this a product bug without auditing the contract.
+Subsequent new API probes use model-only seeds and pass the strict isolation guard.
+
+Captured outer/parameterized-owner method bounds still return Unknown; do not
+count them as supported. No new warm or memory measurement is claimed. Broader
+IDEA/compiler-plugin/reload evidence below belongs to its recorded revisions and
+has not all been repeated on23. Previous selected22 results remain valid at
+SHA5f9868838966253fda207ab91aa8315e06014973ffdbb2d8815d1d375179bc27
+and commit c51cde6, already pushed.
 
 ### Previous editor-accepted checkpoint120-19
 

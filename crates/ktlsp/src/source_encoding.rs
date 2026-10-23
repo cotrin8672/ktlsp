@@ -608,6 +608,12 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
                             || text.contains("${"));
             }
             ["configuration", "compilerArgs", ..] => plugin.unsupported = true,
+            ["configuration", "compilerArguments", "bootclasspath"] => {
+                // Maven's fixed map key becomes -bootclasspath and its value remains one
+                // separate argv entry; interpolating that path cannot add -encoding.
+                plugin.unsupported |=
+                    argument_ancestor_attributes || frame.attributes || frame.children;
+            }
             ["configuration", "compilerArguments", "source" | "target"]
             | ["executions", "execution", "configuration", "compilerArguments", "source" | "target"] =>
             {
@@ -1294,6 +1300,8 @@ mod tests {
         for configuration in [
             format!("<encoding>UTF8</encoding><compilerArgs><arg>{fixed}</arg></compilerArgs>"),
             "<encoding>UTF8</encoding><compilerArgs><arg>-J-Xbootclasspath/p:${path}/has-encoding-in-name.jar</arg></compilerArgs>".to_owned(),
+            // OpenJSSE 1.1.12 supplies a fixed option key and a separate path value.
+            "<encoding>UTF-8</encoding><compilerArguments><bootclasspath>${build.bootclasspath}</bootclasspath></compilerArguments>".to_owned(),
         ] {
             assert_eq!(declared(&plugin(&configuration)).unwrap(), JavaSourceEncoding::Utf8);
         }
@@ -1317,6 +1325,11 @@ mod tests {
             ("unmodeled argument-list merge", "<compilerArgs combine.self=\"override\"><arg>-J-Xbootclasspath/p:${path}</arg></compilerArgs>"),
             ("different argument transport", "<compilerArgument>-J-Xbootclasspath/p:${path}</compilerArgument>"),
             ("JVM file-encoding setting", "<compilerArgs><arg>-J-Dfile.encoding=${charset}</arg></compilerArgs>"),
+            ("bootclasspath leaf merge", "<compilerArguments><bootclasspath combine.self=\"override\">${path}</bootclasspath></compilerArguments>"),
+            ("bootclasspath map merge", "<compilerArguments combine.children=\"append\"><bootclasspath>${path}</bootclasspath></compilerArguments>"),
+            ("bootclasspath nested value", "<compilerArguments><bootclasspath><value>${path}</value></bootclasspath></compilerArguments>"),
+            ("bootclasspath encoding sibling", "<compilerArguments><bootclasspath>${path}</bootclasspath><encoding>${charset}</encoding></compilerArguments>"),
+            ("bootclasspath dynamic sibling", "<compilerArguments><bootclasspath>${path}</bootclasspath></compilerArguments><compilerArgument>${opts}</compilerArgument>"),
         ] {
             assert!(declared(&plugin(&("<encoding>UTF8</encoding>".to_owned() + configuration))).is_err(), "{name}");
         }

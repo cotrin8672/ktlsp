@@ -694,8 +694,7 @@ fn function_symbol(
     {
         method_type_bounds(
             &type_parameters_in_scope(decl, src, package, &scope.imports),
-            decl.start_byte(),
-            decl.end_byte(),
+            decl,
         )
     } else {
         None
@@ -1138,14 +1137,31 @@ pub fn type_parameters_in_scope(
 /// Keep nominal bounds with scoped method variables, rejecting cyclic direct variable relations.
 pub fn method_type_bounds(
     parameters: &[TypeParameterBounds],
-    start: usize,
-    end: usize,
+    declaration: Node,
 ) -> Option<Box<Vec<(String, TypeRef)>>> {
+    let start = declaration.start_byte();
+    let end = declaration.end_byte();
+    let mut parent = declaration.parent();
+    let mut owner_scope = None;
+    while let Some(node) = parent {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
+            owner_scope = Some((node.start_byte(), node.end_byte()));
+            break;
+        }
+        parent = node.parent();
+    }
     fn scoped_parameter_refs(
         ty: &TypeRef,
         parameters: &[TypeParameterBounds],
         start: usize,
         end: usize,
+        owner_scope: Option<(usize, usize)>,
     ) -> bool {
         if ty.qualification.is_none()
             && parameters
@@ -1163,17 +1179,17 @@ pub fn method_type_bounds(
                     == 1
                 && parameters.iter().any(|parameter| {
                     parameter.name == ty.name
-                        && parameter.scope_start == start
-                        && parameter.scope_end == end
+                        && parameter.complete
+                        && ((parameter.scope_start == start && parameter.scope_end == end)
+                            || owner_scope == Some((parameter.scope_start, parameter.scope_end)))
                 });
         }
         ty.owner
             .as_deref()
-            .is_none_or(|owner| scoped_parameter_refs(owner, parameters, start, end))
-            && ty
-                .args
-                .iter()
-                .all(|argument| scoped_parameter_refs(argument, parameters, start, end))
+            .is_none_or(|owner| scoped_parameter_refs(owner, parameters, start, end, owner_scope))
+            && ty.args.iter().all(|argument| {
+                scoped_parameter_refs(argument, parameters, start, end, owner_scope)
+            })
     }
     let own: Vec<_> = parameters
         .iter()
@@ -1193,7 +1209,7 @@ pub fn method_type_bounds(
     let mut relations = Vec::new();
     for parameter in &own {
         for bound in &parameter.upper_bounds {
-            if !scoped_parameter_refs(bound, parameters, start, end) {
+            if !scoped_parameter_refs(bound, parameters, start, end, owner_scope) {
                 return None;
             }
             if bound.qualification.is_none() && own.iter().any(|target| target.name == bound.name) {
