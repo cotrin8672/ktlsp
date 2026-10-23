@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "project_id": "semantic-ipc-child",
+  "scope": "Real stock Backend loader and a disposable child; ordinary local completion remains available while its semantic response is paused.",
+  "probes": [{
+    "id": "ipc-local-baseline",
+    "source": "fixture/IpcUse.java",
+    "anchor": "return target.twice(2)",
+    "token": "twice",
+    "completion_prefix": "tw",
+    "target_file": "fixture/Target.java",
+    "target_anchor": "public int twice",
+    "target_token": "twice"
+  }]
+}

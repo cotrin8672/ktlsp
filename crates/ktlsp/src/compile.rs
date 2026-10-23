@@ -585,7 +585,7 @@ fn wait_with_timeout_cancelled(
 }
 
 #[cfg(windows)]
-mod process_tree {
+pub(crate) mod process_tree {
     use super::*;
     use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -606,7 +606,7 @@ mod process_tree {
         CREATE_SUSPENDED, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
     };
 
-    pub(super) struct ProcessTree {
+    pub(crate) struct ProcessTree {
         child: Child,
         job: OwnedHandle,
         status: Option<ExitStatus>,
@@ -615,7 +615,7 @@ mod process_tree {
     }
 
     impl ProcessTree {
-        pub(super) fn spawn(command: &mut Command) -> io::Result<Self> {
+        pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
             Self::spawn_before_resume(command, |_| Ok(()))
         }
 
@@ -664,7 +664,7 @@ mod process_tree {
             Ok(owned)
         }
 
-        pub(super) fn child_mut(&mut self) -> &mut Child {
+        pub(crate) fn child_mut(&mut self) -> &mut Child {
             &mut self.child
         }
 
@@ -715,7 +715,7 @@ mod process_tree {
             Ok(info.ActiveProcesses)
         }
 
-        pub(super) fn cleanup(&mut self, natural_deadline: Option<Instant>) -> (ExitStatus, bool) {
+        pub(crate) fn cleanup(&mut self, natural_deadline: Option<Instant>) -> (ExitStatus, bool) {
             if self.terminal {
                 return (self.status.expect("terminal root status"), self.forced);
             }

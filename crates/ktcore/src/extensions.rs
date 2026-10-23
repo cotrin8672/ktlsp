@@ -634,8 +634,16 @@ pub struct PendingContributions {
     owner: String,
     provider_generation: u64,
     evaluation: u64,
+    session: u64,
     reads: ReadSet,
     set: ContributionSet,
+}
+
+impl PendingContributions {
+    /// Source producers requested by staged reads, without publishing their semantic results.
+    pub fn requested_source_files(&self) -> &BTreeSet<String> {
+        &self.reads.missing_sources
+    }
 }
 
 /// This store owns input stamps and atomic provider/file sets. It does not clone the semantic
@@ -1232,6 +1240,30 @@ impl ExtensionStore {
         Ok(())
     }
 
+    /// Reborrow a detached evaluation only while all previously consumed inputs are current.
+    pub fn resume<'a>(
+        &'a self,
+        index: &'a dyn InferenceIndex,
+        owner: &'a str,
+        pending: PendingContributions,
+    ) -> Result<ReadSession<'a>, ContractError> {
+        self.validate_pending(&pending)?;
+        if pending.owner != owner {
+            return Err(ContractError::ForeignFile);
+        }
+        Ok(ReadSession {
+            store: self,
+            index: ScopedIndex::new(index, owner),
+            owner,
+            provider: pending.provider,
+            provider_generation: pending.provider_generation,
+            evaluation: pending.evaluation,
+            session: pending.session,
+            reads: pending.reads,
+            set: pending.set,
+        })
+    }
+
     pub fn contributions(&self, provider: &str, owner: &str) -> Option<&ContributionSet> {
         self.sets
             .get(&(provider.into(), owner.into()))
@@ -1261,7 +1293,7 @@ impl ExtensionStore {
             })
     }
 
-    fn validate_pending(&self, pending: &PendingContributions) -> Result<(), ContractError> {
+    pub fn validate_pending(&self, pending: &PendingContributions) -> Result<(), ContractError> {
         if pending.host != self.host {
             return Err(ContractError::ForeignIdentity);
         }
@@ -2249,6 +2281,7 @@ impl ReadSession<'_> {
             owner: self.owner.into(),
             provider_generation: self.provider_generation,
             evaluation: self.evaluation,
+            session: self.session,
             reads: self.reads,
             set: self.set,
         }

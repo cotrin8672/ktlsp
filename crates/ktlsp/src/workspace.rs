@@ -676,6 +676,70 @@ impl Workspace {
         registered
     }
 
+    pub fn register_ipc_provider(
+        &mut self,
+        provider: &str,
+        command: Vec<String>,
+    ) -> Result<bool, String> {
+        let changed = self
+            .analysis_extensions
+            .register_ipc(&self.index, provider, command)?;
+        if changed {
+            let sources = self
+                .open_docs
+                .iter()
+                .map(|(key, doc)| (key.clone(), Arc::from(doc.text.as_str()), doc.tree.clone()))
+                .collect();
+            self.analysis_extensions
+                .replace_sources(&self.index, sources);
+            self.bump_index_revision();
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn take_ipc_work(&mut self) -> Vec<crate::extension_ipc::Work> {
+        let revision = self.analysis_extensions.revision();
+        let work = self.analysis_extensions.take_ipc_work(&self.index);
+        if self.analysis_extensions.revision() != revision {
+            self.bump_index_revision();
+        }
+        work
+    }
+
+    pub(crate) fn ipc_evaluation_current(&self, evaluation: u64) -> bool {
+        self.analysis_extensions.ipc_current(evaluation)
+    }
+
+    pub(crate) fn ipc_batch(
+        &mut self,
+        evaluation: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let revision = self.analysis_extensions.revision();
+        let result = self
+            .analysis_extensions
+            .ipc_batch(&self.index, evaluation, method, params);
+        if self.analysis_extensions.revision() != revision {
+            self.bump_index_revision();
+        }
+        result
+    }
+
+    pub(crate) fn finish_ipc_work(
+        &mut self,
+        evaluation: u64,
+        result: Result<(), String>,
+    ) -> Vec<String> {
+        self.analysis_extensions.finish_ipc_work(evaluation, result);
+        self.bump_index_revision();
+        self.take_extension_diagnostic_changes()
+    }
+
+    pub(crate) fn stop_ipc_workers(&mut self) -> Vec<Arc<crate::extension_ipc::Worker>> {
+        self.analysis_extensions.stop_ipc()
+    }
+
     pub(crate) fn extension_source_input_identity(&self, owner: &str) -> Option<Arc<str>> {
         self.analysis_extensions.source_input_identity(owner)
     }
@@ -9143,6 +9207,19 @@ impl Workspace {
         outcome: crate::compile::KotlinDiagnosticOutcome,
         environment_invalid: Arc<std::sync::atomic::AtomicBool>,
     ) -> Vec<String> {
+        let started = std::time::Instant::now();
+        let trace = |stage: &str, reason: &str, detail: serde_json::Value| {
+            crate::trace::span("kotlin_diagnostics_finish", "compiler", started,
+                serde_json::json!({"stage": stage, "reason": reason,
+                    "module": request.scope.module, "source_set": request.scope.source_set,
+                    "source_generation": request.generation, "detail": detail}));
+        };
+        trace("entry", "", match &outcome {
+            crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean } =>
+                serde_json::json!({"verified": true, "clean": clean, "count": diagnostics.len()}),
+            crate::compile::KotlinDiagnosticOutcome::Unverified(_) =>
+                serde_json::json!({"verified": false}),
+        });
         let current = self
             .kotlin_diagnostic_tickets
             .get(&request.scope)
@@ -9160,11 +9237,31 @@ impl Workspace {
                             .get(&request.scope)
                             .unwrap_or(&0)
             });
-        if !current
-            || request.check_live().is_err()
-            || environment_invalid.load(std::sync::atomic::Ordering::Acquire)
-            || !self.kotlin_overlay_matches(request)
-        {
+        if !current {
+            let ticket = self.kotlin_diagnostic_tickets.get(&request.scope);
+            trace("rejected", "current-ticket", serde_json::json!({
+                "ticket_present": ticket.is_some(),
+                "request_matches": ticket.is_some_and(|ticket| Arc::ptr_eq(&ticket.request, request)),
+                "analysis_generation": self.analysis_generation,
+                "ticket_analysis_generation": ticket.map(|ticket| ticket.analysis_generation),
+                "model_matches": ticket.is_some_and(|ticket| self.project_model.as_ref()
+                    .is_some_and(|model| Arc::ptr_eq(model, &ticket.model))),
+                "refresh_pending": self.project_refresh_pending,
+                "current_source_generation": self.kotlin_source_generations.get(&request.scope),
+            }));
+            return Vec::new();
+        }
+        let rejection = if request.check_live().is_err() {
+            Some("source-invalid")
+        } else if environment_invalid.load(std::sync::atomic::Ordering::Acquire) {
+            Some("environment-invalid")
+        } else if !self.kotlin_overlay_matches(request) {
+            Some("overlay-mismatch")
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            trace("rejected", reason, serde_json::Value::Null);
             return Vec::new();
         }
         let ticket = self
@@ -9174,6 +9271,7 @@ impl Workspace {
         let crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean } = outcome
         else {
             // A failure is not an empty successful compilation and cannot replace accepted reports.
+            trace("rejected", "unverified-outcome", serde_json::Value::Null);
             return Vec::new();
         };
         // A Kotlin clean result never gives Java clean authority, or auxiliary producer closure.
@@ -9192,13 +9290,19 @@ impl Workspace {
             };
             let index = crate::text::LineIndex::new(&source.text);
             let Some(line) = diagnostic.line.checked_sub(1) else {
+                trace("rejected", "line-zero", serde_json::json!({"path": diagnostic.path}));
                 return Vec::new();
             };
             let Some(column) = diagnostic.col.checked_sub(1) else {
+                trace("rejected", "column-zero", serde_json::json!({"path": diagnostic.path}));
                 return Vec::new();
             };
             let start = index.offset(&source.text, line, column);
             if index.position(&source.text, start) != (line, column) {
+                trace("rejected", "position-roundtrip", serde_json::json!({
+                    "path": diagnostic.path, "line": line, "column": column,
+                    "actual": index.position(&source.text, start),
+                }));
                 return Vec::new();
             }
             let tail = &source.text[start..];
@@ -9245,6 +9349,8 @@ impl Workspace {
                 },
             );
         }
+        trace("stored", "", serde_json::json!({"paths": keys, "clean": clean,
+            "positive_diagnostics_only": request.positive_diagnostics_only}));
         keys
     }
 
@@ -9289,7 +9395,25 @@ impl Workspace {
     }
 
     pub(crate) fn kotlin_diagnostic_trace(&self, key: &str) -> Option<serde_json::Value> {
-        let report = self.current_kotlin_report(key)?;
+        let report = match self.current_kotlin_report(key) {
+            Some(report) => report,
+            None => {
+                if let Some(report) = self.kotlin_diagnostic_reports.get(key) {
+                    crate::trace::span("kotlin_diagnostics_trace_rejected", "compiler",
+                        std::time::Instant::now(), serde_json::json!({
+                            "path": key, "source_generation": report.request.generation,
+                            "store_epoch": report.store_epoch,
+                            "refresh_pending": self.project_refresh_pending,
+                            "source_live": report.request.check_live().is_ok(),
+                            "environment_invalid": report.environment_invalid.load(std::sync::atomic::Ordering::Acquire),
+                            "model_matches": self.project_model.as_ref().is_some_and(|model| Arc::ptr_eq(model, &report.model)),
+                            "source_matches": self.open_docs.get(key).is_some_and(|doc| report.request.overlays.iter()
+                                .any(|source| source.key == key && doc.text == source.text)),
+                        }));
+                }
+                return None;
+            }
+        };
         let source = report
             .request
             .overlays
@@ -9939,6 +10063,17 @@ mod kotlin_diagnostic_lifecycle_tests {
             .is_empty());
         assert_eq!(ws.kotlin_diagnostic_result_id(&editor).unwrap(), accepted);
         assert_eq!(ws.current_kotlin_diagnostics(&editor).len(), 1);
+        for (line, column) in [(0, 1), (1, 0), (1, u32::MAX)] {
+            let invalid = ws.begin_kotlin_diagnostics(&helper).unwrap();
+            let mut outcome = reported(&invalid, &helper, "value");
+            if let KotlinDiagnosticOutcome::Verified { diagnostics, .. } = &mut outcome {
+                diagnostics[0].line = line;
+                diagnostics[0].col = column;
+            }
+            assert!(ws.finish_kotlin_diagnostics(&invalid, outcome,
+                Arc::new(AtomicBool::new(false))).is_empty());
+            assert_eq!(ws.kotlin_diagnostic_result_id(&editor).unwrap(), accepted);
+        }
         let partial = ws.begin_kotlin_diagnostics(&helper).unwrap();
         let outcome = reported(&partial, &helper, "value");
         ws.finish_kotlin_diagnostics(&partial, outcome, Arc::new(AtomicBool::new(false)));

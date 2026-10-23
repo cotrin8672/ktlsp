@@ -528,6 +528,25 @@ The additional enum/record/object and mapped-builtin probe uses the same `corpus
 scenario with `KTLSP_CORPUS_EXTRA_PROBES=dev/external-extension/shape-probes.lua`;
 that group remains under verification. Production Mixin integration is separate.
 
+The [semantic IPC prototype](docs/architecture/extension-ipc.md) can load a separately built
+provider through `analysisProviders.<id>.command` (an executable/argv array) in initialization
+options or configuration changes. It uses the same scoped semantic store; ordinary completion
+does not wait for the child. Its real-Neovim proof covers one Java shadow-style method:
+pause → ordinary completion → unsaved target edit → cancellation/stale rejection, fresh
+descriptor-bearing completion/goto/references, idle-crash withdrawal, explicit restart and
+applied three-buffer rename. Same-input linked/IPC outputs are compared; Kotlin, fields,
+unopened dependencies and full MC policy remain separate acceptance work.
+
+Use the existing `corpus` route with `dev/external-extension/ipc-manifest.json` and
+`KTLSP_CORPUS_EXTRA_PROBES=$PWD/dev/external-extension/ipc-probes.lua`. Build the normal host
+and `cargo build --locked --manifest-path dev/external-extension/Cargo.toml --bins`, then
+copy `dev/external-extension/project/` into a disposable project and add `IpcUse.java` from
+that fixture directory to its `fixture/` directory. Set `KTLSP_IPC_CHILD` to the built
+`ipc-child` executable, `KTLSP_IPC_BARRIER` to a fresh empty directory and pass the normal
+host with `--bin ... --no-build`. For the same-input control set `KTLSP_IPC_MODE=linked`
+and use `ktlsp-external-shadow-fixture` as the host. The exact evidence and remaining limits
+are recorded in the architecture document; these checks do not claim full extension parity.
+
 `dev/jvm_projection_project.lua` generates a disposable four-buffer Kotlin/JVM fixture for
 this route. Its `dev/corpus/jvm-projections.json` manifest checks the Java exported suspend
 alias and Kotlin authored name, including first responses while the declaration file is closed.

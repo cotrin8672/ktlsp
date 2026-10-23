@@ -748,7 +748,8 @@ impl AnalysisExtensions {
             return Vec::new();
         }
         let mut requests = Vec::new();
-        let wanted = self.store.requested_source_files();
+        let mut wanted = self.store.requested_source_files();
+        wanted.extend(self.wanted_ipc_sources());
         let obsolete: Vec<_> = self
             .source_producers
             .keys()
@@ -801,7 +802,8 @@ impl AnalysisExtensions {
     }
 
     pub(crate) fn accept_sources(&mut self, index: &Index, prepared: Vec<PreparedSource>) -> bool {
-        let wanted = self.store.requested_source_files();
+        let mut wanted = self.store.requested_source_files();
+        wanted.extend(self.wanted_ipc_sources());
         let mut accepted = Vec::new();
         for source in prepared {
             let file = &source.request.file;

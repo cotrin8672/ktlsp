@@ -9,6 +9,7 @@ use ktcore::index::{Index, InferenceIndex};
 use ktcore::knowledge::Knowledge;
 use tree_sitter::Tree;
 
+mod ipc;
 mod source_hydration;
 pub(crate) use source_hydration::{prepare_sources, PreparedSource, SourceRequest};
 
@@ -17,6 +18,8 @@ pub use ktcore::extensions::AnalysisProvider;
 #[derive(Default)]
 pub(crate) struct AnalysisExtensions {
     providers: BTreeMap<String, Arc<dyn AnalysisProvider>>,
+    ipc_providers: BTreeMap<String, ipc::Slot>,
+    ipc_evaluations: BTreeMap<u64, crate::extension_ipc::Evaluation>,
     inputs: BTreeMap<String, SourceInput>,
     retain_all_sources: bool,
     compiled_enabled: bool,
@@ -75,9 +78,10 @@ impl AnalysisExtensions {
         enabled: bool,
         config: Arc<str>,
     ) -> bool {
-        if !self.providers.contains_key(id) {
+        if !self.providers.contains_key(id) && !self.ipc_providers.contains_key(id) {
             return false;
         }
+        self.configure_ipc(id, enabled, &config);
         if id == COMPILED_JAVA_PROVIDER {
             self.clear_compiled();
             self.clear_compiler_api(index);
@@ -322,7 +326,14 @@ impl AnalysisExtensions {
         if self.suspended {
             return;
         }
+        self.requeue_stale_ipc();
         for (provider, owner) in self.store.take_dirty() {
+            if let Some(slot) = self.ipc_providers.get_mut(&provider) {
+                if slot.enabled {
+                    slot.queued.insert(owner);
+                }
+                continue;
+            }
             if provider == COMPILED_JAVA_PROVIDER
                 && !self.inputs.get(&owner).is_some_and(|input| {
                     input.compiled.is_some() || !input.compiler_classes.is_empty()

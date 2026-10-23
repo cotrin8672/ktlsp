@@ -17,6 +17,7 @@ pub mod complete;
 pub mod daemon;
 pub mod deps;
 pub mod edit;
+pub mod extension_ipc;
 pub mod format;
 pub mod imports;
 pub mod jar;

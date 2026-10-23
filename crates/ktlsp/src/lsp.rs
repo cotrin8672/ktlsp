@@ -52,12 +52,29 @@ struct WatchState {
     sequence: u64,
     configuration_contents: HashMap<String, [u8; 32]>,
     archive_contents: HashMap<String, [u8; 32]>,
+    archive_inputs: Option<(u64, HashMap<String, [u8; 32]>)>,
+    observed_archives: std::collections::BTreeSet<String>,
     configuration_baselined: bool,
     model_loading: bool,
     pending_model_jar: bool,
 }
 
 impl WatchState {
+    fn archive_content(&self, key: &str, generation: u64) -> Option<&[u8; 32]> {
+        self.archive_inputs
+            .as_ref()
+            .filter(|(input_generation, _)| *input_generation == generation)
+            .and_then(|(_, inputs)| inputs.get(key))
+            .or_else(|| self.archive_contents.get(key))
+    }
+
+    fn finish_model_load(&mut self, current_generation: bool) {
+        self.model_loading = false;
+        if !current_generation {
+            self.pending_model_jar = false;
+        }
+    }
+
     fn unchanged_configuration(&mut self, key: &str, kind: FileChangeType) -> bool {
         if !is_project_configuration(Path::new(key)) {
             return false;
@@ -311,6 +328,15 @@ impl Backend {
                     &root,
                 );
                 let mut state = state.lock();
+                if watches.lock().pending_model_jar && state.requested == generation {
+                    watches.lock().pending_model_jar = false;
+                    state
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    state.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    state.requested = ws.lock().begin_analysis_generation();
+                    state.force = true;
+                }
                 if state.stopped || state.requested == generation {
                     state.running = false;
                     break;
@@ -1765,14 +1791,31 @@ async fn index_workspace(
         let model_start = Instant::now();
         let load_root = root.clone();
         let model_cancelled = cancelled.clone();
+        let input_ws = ws.clone();
+        let input_watches = watches.clone();
+        let prior_model = ws.lock().project_snapshot();
         let result = tokio::task::spawn_blocking(move || {
+            if !stage_archive_inputs(
+                &load_root,
+                prior_model.as_deref(),
+                generation,
+                &input_ws,
+                &input_watches,
+            ) {
+                anyhow::bail!("archive inputs superseded before model load");
+            }
             classpath::load_snapshot_cancellable(&load_root, force, Some(&model_cancelled))
         })
         .await;
         {
+            let guard = ws.lock();
             let mut watches = watches.lock();
-            watches.model_loading = false;
-            watches.pending_model_jar = false;
+            watches.finish_model_load(guard.is_current_generation(generation));
+            if let Ok(Ok(model)) = &result {
+                watches
+                    .observed_archives
+                    .extend(model_archive_origins(model).into_keys());
+            }
         }
         crate::trace::span(
             "workspace.model_load",
@@ -1781,7 +1824,7 @@ async fn index_workspace(
             serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
                 "forcedModel": force, "ok": matches!(&result, Ok(Ok(_)))}),
         );
-        if !ws.lock().is_current_generation(generation) {
+        if !ws.lock().is_current_generation(generation) || watches.lock().pending_model_jar {
             if let Some(p) = ongoing {
                 p.finish_with_message("superseded by project changes").await;
             }
@@ -1804,8 +1847,23 @@ async fn index_workspace(
         let prepare_start = Instant::now();
         let known = ws.lock().source_stamps();
         let prepared_model = model.clone();
+        let input_root = root.clone();
+        let input_ws = ws.clone();
+        let input_watches = watches.clone();
         let update = tokio::task::spawn_blocking(move || {
-            crate::workspace::prepare_model_sources(&prepared_model, &known)
+            if !stage_archive_inputs(
+                &input_root,
+                Some(&prepared_model),
+                generation,
+                &input_ws,
+                &input_watches,
+            ) {
+                return None;
+            }
+            Some(crate::workspace::prepare_model_sources(
+                &prepared_model,
+                &known,
+            ))
         })
         .await;
         crate::trace::span(
@@ -1815,7 +1873,7 @@ async fn index_workspace(
             serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
                 "joined": update.is_ok()}),
         );
-        let Ok(update) = update else {
+        let Ok(Some(update)) = update else {
             if let Some(p) = ongoing {
                 p.finish_with_message("project source refresh failed").await;
             }
@@ -1924,12 +1982,24 @@ async fn index_workspace(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize, String)>();
     let index_ws = ws.clone();
     let index_root = root.clone();
+    let input_watches = watches.clone();
     let deps_start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
         // Fingerprint selected mutable archives and the tracked inventory before indexing.
         // A post-index fingerprint alone could accept a replacement
         // whose new bytes were never read by this generation.
-        let archive_contents = project_archive_contents(&index_root, model.as_deref());
+        let staged_inputs = input_watches
+            .lock()
+            .archive_inputs
+            .as_ref()
+            .filter(|(input_generation, _)| *input_generation == generation)
+            .map(|(_, inputs)| inputs.clone());
+        let archive_contents = staged_inputs
+            .unwrap_or_else(|| project_archive_contents(&index_root, model.as_deref()));
+        let archive_origins = model
+            .as_deref()
+            .map(model_archive_origins)
+            .unwrap_or_default();
         let stats = index_dependencies(
             &index_ws,
             &index_root,
@@ -1939,10 +2009,22 @@ async fn index_workspace(
             Some(&tx),
             &cancelled,
         );
-        let archive_contents = archive_contents
-            .into_iter()
-            .filter(|(key, before)| configuration_content(Path::new(key)).as_ref() == Some(before))
+        let changed: Vec<_> = archive_contents
+            .iter()
+            .filter(|(key, before)| configuration_content(Path::new(key)).as_ref() != Some(*before))
+            .map(|(key, _)| key)
             .collect();
+        if !changed.is_empty() {
+            let mut guard = index_ws.lock();
+            if guard.is_current_generation(generation) {
+                for key in changed {
+                    if let Some(origin) = archive_origins.get(key) {
+                        guard.retire_dependency_origin(origin);
+                    }
+                }
+                input_watches.lock().pending_model_jar = true;
+            }
+        }
         (stats, archive_contents)
     });
     while let Some((done, total, label)) = rx.recv().await {
@@ -1957,6 +2039,9 @@ async fn index_workspace(
         }
     }
     let (stats, archive_contents) = handle.await.unwrap_or_default();
+    if watches.lock().pending_model_jar {
+        return;
+    }
     if !ws.lock().is_current_generation(generation) {
         return;
     }
@@ -2343,6 +2428,56 @@ fn model_archive_origins(model: &classpath::ProjectSnapshot) -> HashMap<String, 
         .collect()
 }
 
+fn stage_archive_inputs(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    generation: u64,
+    ws: &Arc<Mutex<Workspace>>,
+    watches: &Arc<Mutex<WatchState>>,
+) -> bool {
+    // A generation may suppress matching watches before publication, never rebase changed inputs.
+    let (before, observed) = {
+        let state = watches.lock();
+        (
+            state
+                .archive_inputs
+                .as_ref()
+                .filter(|(input_generation, _)| *input_generation == generation)
+                .map(|(_, inputs)| inputs.clone())
+                .unwrap_or_default(),
+            state.observed_archives.clone(),
+        )
+    };
+    let mut inputs = project_archive_contents(root, model);
+    for key in observed {
+        if let Some(content) = configuration_content(Path::new(&key)) {
+            inputs.insert(key, content);
+        }
+    }
+    let mut guard = ws.lock();
+    if !guard.is_current_generation(generation) {
+        return false;
+    }
+    let mut state = watches.lock();
+    if before
+        .iter()
+        .any(|(key, content)| inputs.get(key) != Some(content))
+    {
+        for key in before
+            .keys()
+            .filter(|key| inputs.get(*key) != before.get(*key))
+        {
+            if let Some(origin) = model.and_then(|model| model.artifact_origin(Path::new(key))) {
+                guard.retire_dependency_origin(origin);
+            }
+        }
+        state.pending_model_jar = true;
+        return false;
+    }
+    state.archive_inputs = Some((generation, inputs));
+    true
+}
+
 fn project_archive_contents(
     root: &Path,
     model: Option<&classpath::ProjectSnapshot>,
@@ -2646,6 +2781,15 @@ fn configure_analysis_providers(ws: &mut Workspace, options: &Option<serde_json:
         let Some(settings) = settings.as_object() else {
             continue;
         };
+        if let Some(command) = settings.get("command") {
+            let registered = serde_json::from_value::<Vec<String>>(command.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|command| ws.register_ipc_provider(id, command));
+            if let Err(error) = registered {
+                tracing::warn!(provider = id, error, "extension registration rejected");
+                continue;
+            }
+        }
         let enabled = settings
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
@@ -2860,6 +3004,13 @@ impl LanguageServer for Backend {
     async fn shutdown(&self) -> Result<()> {
         self.close_project_refresh();
         self.close_compiler_jobs();
+        let workers = self.ws.lock().stop_ipc_workers();
+        let _ = tokio::task::spawn_blocking(move || {
+            for worker in workers {
+                worker.close();
+            }
+        })
+        .await;
         Ok(())
     }
 
@@ -2945,7 +3096,17 @@ impl LanguageServer for Backend {
         let model = self.ws.lock().project_snapshot();
         // Archive reads may be large. Hash only selected event paths, outside the
         // workspace/watch locks so completion can proceed while IO is pending.
-        let archives = self.watches.lock().archive_contents.clone();
+        let generation = self.ws.lock().analysis_generation();
+        let archives = {
+            let state = self.watches.lock();
+            let mut archives = state.archive_contents.clone();
+            if let Some((input_generation, inputs)) = &state.archive_inputs {
+                if *input_generation == generation {
+                    archives.extend(inputs.clone());
+                }
+            }
+            archives
+        };
         let archive_keys = params
             .changes
             .iter()
@@ -2977,6 +3138,7 @@ impl LanguageServer for Backend {
         let mut jar_only = true;
         let changes = {
             let mut ws = self.ws.lock();
+            let current_generation = ws.analysis_generation();
             params
                 .changes
                 .iter()
@@ -2986,7 +3148,7 @@ impl LanguageServer for Backend {
                     (!watches.unchanged_configuration(&key, change.typ)
                         && !(change.typ == FileChangeType::CHANGED
                             && unchanged_archives.get(&key).is_some_and(|accepted| {
-                                watches.archive_contents.get(&key) == Some(accepted)
+                                watches.archive_content(&key, current_generation) == Some(accepted)
                             })))
                     .then_some(key)
                 })
@@ -2994,6 +3156,9 @@ impl LanguageServer for Backend {
                 .map(|key| {
                     let change = project_change(&root, model.as_deref(), &key);
                     if change.is_some() {
+                        if key.ends_with(".jar") && !is_project_configuration(Path::new(&key)) {
+                            self.watches.lock().observed_archives.insert(key.clone());
+                        }
                         if let Some(origin) = archive_origins.get(&key) {
                             retired_origins.insert(origin.clone());
                         }
@@ -4888,6 +5053,7 @@ fn schedule_extension_sources(
     client: &Client,
     versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
 ) {
+    schedule_ipc_extensions(workspace, client, versions);
     let mut requests = workspace.lock().begin_extension_source_batch();
     if requests.is_empty() {
         return;
@@ -4912,6 +5078,53 @@ fn schedule_extension_sources(
             }
         }
     });
+}
+
+fn schedule_ipc_extensions(
+    workspace: &Arc<Mutex<Workspace>>,
+    client: &Client,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
+) {
+    let (work, changed) = {
+        let mut workspace = workspace.lock();
+        let work = workspace.take_ipc_work();
+        let changed = workspace.take_extension_diagnostic_changes();
+        (work, changed)
+    };
+    for key in changed {
+        schedule_owned_diagnostic(workspace, client, versions, key);
+    }
+    for job in work {
+        let workspace = workspace.clone();
+        let client = client.clone();
+        let versions = versions.clone();
+        tokio::spawn(async move {
+            let evaluation = job.evaluation;
+            let worker_workspace = workspace.clone();
+            let wake_workspace = Arc::downgrade(&workspace);
+            let wake_client = client.clone();
+            let wake_versions = versions.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if let Some(workspace) = wake_workspace.upgrade() {
+                    let client = wake_client.clone();
+                    let versions = wake_versions.clone();
+                    runtime.spawn(async move {
+                        schedule_extension_sources(&workspace, &client, &versions);
+                    });
+                }
+            });
+            let result =
+                tokio::task::spawn_blocking(move || job.worker.run(&job, &worker_workspace, wake))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+            let changed = workspace.lock().finish_ipc_work(evaluation, result);
+            for key in changed {
+                schedule_owned_diagnostic(&workspace, &client, &versions, key);
+            }
+            schedule_extension_sources(&workspace, &client, &versions);
+        });
+    }
 }
 
 fn lsp_diagnostics_with_result(
@@ -7782,6 +7995,71 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn provisional_archive_inputs_cannot_accept_post_import_replacements() {
+        let root = std::env::temp_dir().join(format!("ktlsp_archive_input_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("dependency.jar");
+        std::fs::write(&binary, b"before import").unwrap();
+        let key = crate::paths::file_key(&binary);
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\tPROJECT\t:build-logic\t:dependency\nEND\t:app\n",
+            crate::paths::file_key(&root)
+        )));
+        let ws = Arc::new(Mutex::new(Workspace::new()));
+        let watches = Arc::new(Mutex::new(WatchState::default()));
+        let generation = ws.lock().analysis_generation();
+        assert!(stage_archive_inputs(
+            &root,
+            Some(&model),
+            generation,
+            &ws,
+            &watches
+        ));
+        let before = watches.lock().archive_inputs.clone().unwrap();
+        std::fs::write(&binary, b"after import!").unwrap();
+        assert!(!stage_archive_inputs(
+            &root,
+            Some(&model),
+            generation,
+            &ws,
+            &watches
+        ));
+        assert_eq!(watches.lock().archive_inputs.as_ref(), Some(&before));
+        assert!(watches.lock().pending_model_jar);
+        assert!(watches.lock().archive_contents.is_empty());
+        watches.lock().model_loading = true;
+        watches.lock().finish_model_load(true);
+        assert!(watches.lock().pending_model_jar);
+        assert!(!watches.lock().model_loading);
+        let next = ws.lock().begin_analysis_generation();
+        watches.lock().finish_model_load(false);
+        assert!(!watches.lock().pending_model_jar);
+        assert!(stage_archive_inputs(
+            &root,
+            Some(&model),
+            next,
+            &ws,
+            &watches
+        ));
+        assert_ne!(watches.lock().archive_inputs.as_ref().unwrap().1, before.1);
+        watches.lock().archive_contents = before.1.clone();
+        assert_ne!(watches.lock().archive_content(&key, next), before.1.get(&key));
+        assert_eq!(
+            watches.lock().archive_content(&key, generation),
+            before.1.get(&key)
+        );
+        assert!(!stage_archive_inputs(
+            &root,
+            Some(&model),
+            generation,
+            &ws,
+            &watches
+        ));
+        assert!(!watches.lock().pending_model_jar);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn unchanged_selected_binary_jar_watch_does_not_force_model_reload() {
         let root = std::env::temp_dir().join(format!(
@@ -7830,11 +8108,15 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             } else {
                 "FILE"
             };
-            let model = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\t{component}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\timmutable\t1\nSOURCESET\ttest\nSCP\ttest\t{key}\nARTIFACT\ttest\t{key}\t{component}\nEND\t:app\n",
-            crate::paths::file_key(&root), crate::paths::file_key(&root.join("src")),
-            crate::paths::file_key(&immutable), crate::paths::file_key(&immutable),
-        ))));
+            let model = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(
+                &format!(
+                    "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\t{component}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\timmutable\t1\nSOURCESET\ttest\nSCP\ttest\t{key}\nARTIFACT\ttest\t{key}\t{component}\nEND\t:app\n",
+                    crate::paths::file_key(&root),
+                    crate::paths::file_key(&root.join("src")),
+                    crate::paths::file_key(&immutable),
+                    crate::paths::file_key(&immutable),
+                ),
+            )));
             assert_eq!(
                 model.local_jars().len(),
                 usize::from(!project),
@@ -7874,7 +8156,19 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                     excluded.display()
                 );
             }
-            backend.watches.lock().archive_contents = contents.clone();
+            let generation = backend.ws.lock().analysis_generation();
+            assert!(stage_archive_inputs(
+                &root,
+                Some(&model),
+                generation,
+                &backend.ws,
+                &backend.watches
+            ));
+            assert!(
+                backend.watches.lock().archive_contents.is_empty(),
+                "no completed semantic generation yet"
+            );
+            backend.watches.lock().model_loading = true;
             let initial = backend.refresh.lock().requested;
             backend
                 .did_change_watched_files(DidChangeWatchedFilesParams {
@@ -7889,6 +8183,11 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 initial,
                 "an unchanged selected JAR must not cancel editing or restart Gradle"
             );
+            assert!(
+                !backend.watches.lock().pending_model_jar,
+                "unchanged early input must not queue a deferred import"
+            );
+            backend.watches.lock().model_loading = false;
             backend
                 .did_change_watched_files(DidChangeWatchedFilesParams {
                     changes: vec![FileEvent::new(
@@ -9982,8 +10281,7 @@ mod first_extension_source_tests {
     static NEXT_FIXTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     const OWNER: &str = "package fixture; import org.spongepowered.asm.mixin.Shadow; public abstract class Consumer { @Shadow public abstract int bound(); }";
-    const PLAIN: &str =
-        "package fixture; class Plain { void ordinary() {} void run(Plain item) { item.ordinary(); } }";
+    const PLAIN: &str = "package fixture; class Plain { void ordinary() {} void run(Plain item) { item.ordinary(); } }";
     const PROVIDER: &str = "test.selected-shadow";
     const BACKLOG_TYPES: &[&str] = &[
         "arrayfixture.Factory",
@@ -10586,8 +10884,13 @@ mod first_extension_source_tests {
             .unwrap();
             {
                 let mut ws = backend.ws.lock();
-                let dump = format!("PROJECT\t:\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nSCP\tmain\t{}\nEND\t:\n",
-                    fixture.root.display(), fixture.root.join("src/main/java").display(), fixture.jar.display(), binary.display());
+                let dump = format!(
+                    "PROJECT\t:\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nSCP\tmain\t{}\nEND\t:\n",
+                    fixture.root.display(),
+                    fixture.root.join("src/main/java").display(),
+                    fixture.jar.display(),
+                    binary.display()
+                );
                 ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(
                     crate::classpath::parse_dump(&dump),
                 )));

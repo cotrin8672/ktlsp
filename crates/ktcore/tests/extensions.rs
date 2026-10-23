@@ -620,6 +620,100 @@ fn apply_edits(source: &str, edits: &[Replacement]) -> String {
 }
 
 #[test]
+fn detached_evaluation_resumes_requirements_and_commits_normally() {
+    let (index, mut store) = fixture();
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let req = requirement(
+        &mut read,
+        "twice",
+        Knowledge::Found(method(&[JvmType::Int], &JvmType::Int)),
+        Dispatch::Instance,
+    );
+    let id = read.require(req).unwrap();
+    let pending = read.finish();
+    let mut read = store.resume(&index, MIXIN_FILE, pending).unwrap();
+    assert!(read.resolution(id).unwrap().binding.is_found());
+    let name = occurrence(MIXIN, "twice(I)I", 0);
+    read.bind_site(
+        id,
+        name.clone(),
+        name.start..name.start + 5,
+        RenameSubject::Target,
+    )
+    .unwrap();
+    store.commit(read.finish()).unwrap();
+    let set = store.contributions("mixin-consumer", MIXIN_FILE).unwrap();
+    assert_eq!(set.sites().len(), 1);
+    assert!(set.binding_at(name.start).is_some());
+}
+
+#[test]
+fn detached_evaluation_rejects_prior_read_changes_before_another_batch() {
+    for change in [
+        "source",
+        "owner",
+        "config",
+        "model",
+        "namespace",
+        "newer-evaluation",
+        "foreign-owner",
+    ] {
+        let (mut index, mut store) = fixture();
+        let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+        assert!(read.resolve_type("oracle.Target").is_found());
+        let pending = read.finish();
+        match change {
+            "source" => {
+                let text = TARGET.replace("41", "42");
+                let symbols = index_source(&mut index, TARGET_FILE, &text, "oracle");
+                store
+                    .replace_source(
+                        &index,
+                        TARGET_FILE,
+                        Arc::from(text),
+                        Knowledge::Found(()),
+                        facts(TARGET_FILE, &symbols),
+                    )
+                    .unwrap();
+            }
+            "owner" => {
+                store
+                    .replace_source(
+                        &index,
+                        MIXIN_FILE,
+                        Arc::from(MIXIN),
+                        Knowledge::Found(()),
+                        Vec::new(),
+                    )
+                    .unwrap();
+            }
+            "config" => store.configure_provider("mixin-consumer", true, Arc::from("changed")),
+            "model" => store.invalidate_model(),
+            "namespace" => store.set_namespace_coverage(Knowledge::Unknown(vec![
+                IncompleteReason::IncompleteScope,
+            ])),
+            "newer-evaluation" => {
+                drop(
+                    store
+                        .begin(&index, "mixin-consumer", MIXIN_FILE)
+                        .unwrap()
+                        .finish(),
+                );
+            }
+            "foreign-owner" => {}
+            _ => unreachable!(),
+        }
+        let owner = if change == "foreign-owner" {
+            TARGET_FILE
+        } else {
+            MIXIN_FILE
+        };
+        assert!(store.resume(&index, owner, pending).is_err(), "{change}");
+        assert!(store.contributions("mixin-consumer", MIXIN_FILE).is_none());
+    }
+}
+
+#[test]
 fn prefix_and_selector_rename_share_binding_and_edit_only_the_name_bytes() {
     let (index, mut store) = fixture();
     let pending = prefixed_pending(&index, &mut store, "mixin-consumer");
