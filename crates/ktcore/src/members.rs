@@ -19,6 +19,8 @@ pub struct CallArguments {
     pub names: Option<Vec<Option<String>>>,
     pub has_spread: bool,
     pub trailing_lambda: bool,
+    /// Syntax omits the parameter list or explicitly writes an empty list; not a global arity.
+    pub trailing_lambda_omits_or_has_zero_parameters: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1987,9 +1989,12 @@ pub(crate) struct BoundArguments<'a> {
 
 /// Rebind one candidate, never a name-wide overload group. Unsupported shapes remain possible.
 pub(crate) fn bind_arguments<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
     entry: &'a Entry,
     args: &'a CallArguments,
     mode: CallMode,
+    ctx: &FileCtx,
 ) -> Result<BoundArguments<'a>, Applicability> {
     let Some(names) = &args.names else {
         return Ok(BoundArguments {
@@ -1999,14 +2004,37 @@ pub(crate) fn bind_arguments<'a>(
         });
     };
     if mode != CallMode::Kotlin
-        || args.count != Some(args.types.len())
+        || args.count != Some(args.types.len() + usize::from(args.trailing_lambda))
         || names.len() != args.types.len()
-        || args.trailing_lambda
         || args.has_spread
         || entry.sym.has_vararg
     {
         return Err(Applicability::Unknown);
     }
+    let contextual_unit_lambda = if args.trailing_lambda {
+        let Some(parameter) = entry.sym.params.last() else {
+            return Err(Applicability::Unknown);
+        };
+        if !args.trailing_lambda_omits_or_has_zero_parameters
+            || !function_type_signature(parameter).is_some_and(|(parameters, _)| parameters.is_empty())
+        {
+            return Err(Applicability::Unknown);
+        }
+        let ty = infer::declared_member_type(index, receiver, entry, parameter, mode, ctx);
+        let Type::Class { name, package: Some(package), container: None, args, owner: None, .. } = &ty else {
+            return Err(Applicability::Unknown);
+        };
+        if name != "Function0"
+            || !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
+            || args.as_slice() != [Type::class("Unit", Some("kotlin".into()))]
+        {
+            return Err(Applicability::Unknown);
+        }
+        // Unit coercion discards the body result only in this candidate's proven () -> Unit slot.
+        true
+    } else {
+        false
+    };
     let Some(formals) = entry.sym.kotlin_parameters.as_deref() else {
         return Err(Applicability::Unknown);
     };
@@ -2021,7 +2049,8 @@ pub(crate) fn bind_arguments<'a>(
     {
         return Err(Applicability::Unknown);
     }
-    if args.types.len() > formals.len() {
+    let supplied = args.types.len() + usize::from(contextual_unit_lambda);
+    if supplied > formals.len() {
         return Err(Applicability::Rejected);
     }
     let mut positions = vec![None; formals.len()];
@@ -2043,10 +2072,17 @@ pub(crate) fn bind_arguments<'a>(
             return Err(Applicability::Rejected);
         }
     }
+    if contextual_unit_lambda && positions.last().is_some_and(Option::is_some) {
+        return Err(Applicability::Rejected);
+    }
     if positions
         .iter()
         .zip(formals.iter())
-        .any(|(position, formal)| position.is_none() && !formal.has_default)
+        .enumerate()
+        .any(|(slot, (position, formal))| {
+            position.is_none() && !formal.has_default
+                && !(contextual_unit_lambda && slot + 1 == formals.len())
+        })
     {
         // shortcut: missing defaults stay unknown until inherited/actual defaults are modeled.
         return Err(Applicability::Unknown);
@@ -2073,11 +2109,12 @@ pub(crate) fn bind_arguments<'a>(
     Ok(BoundArguments {
         mode,
         arguments: Cow::Owned(CallArguments {
-            count: args.count,
+            count: Some(args.types.len()),
             types,
             names: None,
             has_spread: false,
             trailing_lambda: false,
+            trailing_lambda_omits_or_has_zero_parameters: false,
         }),
         params,
     })
@@ -2136,7 +2173,7 @@ pub(crate) fn most_specific_reference_call(
             let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
             let generic = !entry.sym.type_params.is_empty();
             if generic {
-                let bound = bind_arguments(entry, args, mode).ok()?;
+                let bound = bind_arguments(index, receiver, entry, args, mode, &ctx).ok()?;
                 if infer::projected_member_application(index, receiver, entry, &bound)?.status
                     != crate::solve::ConstraintStatus::Matched
                 {
@@ -2260,7 +2297,7 @@ fn root_generic_specificity(
                 && entry.sym.arity.map(usize::from) == args.count
                 && entry.sym.min_arity.map(usize::from) == args.count
                 && entry.sym.params.len() == args.types.len()
-                && bind_arguments(entry, args, CallMode::Java)
+                && bind_arguments(index, receiver, entry, args, CallMode::Java, &FileCtx::new(entry.sym.package.clone(), Vec::new()))
                     .ok()
                     .and_then(|bound| {
                         infer::projected_member_application(index, receiver, entry, &bound)
@@ -2576,7 +2613,7 @@ pub(crate) fn function_applicability(
     ctx: &FileCtx,
     mode: CallMode,
 ) -> Applicability {
-    let bound = match bind_arguments(entry, args, mode) {
+    let bound = match bind_arguments(index, receiver, entry, args, mode, ctx) {
         Ok(bound) => bound,
         Err(status) => return status,
     };

@@ -10,7 +10,59 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
-### Slice130/131: shared Unknown fixes; release editor replay in progress
+### Slice132: named arguments with trailing Unit lambdas
+
+The shared candidate binder now consumes a trailing lambda only after proving
+the candidate's final parameter is an ordinary, receiver-free `() -> Unit` and
+the lambda has no explicit parameters (or explicitly writes zero). Kotlin Unit
+coercion permits a body result to be discarded; no context-free lambda type is
+invented. Other parameters retain named/default/type-constraint checks. Runtime
+call facts carry the syntax proof; cached declaration facts and cache v47 do not
+change. Java and synthetic call sites default that proof to false.
+
+Independent Kotlin2.4 consumers accept the original empty, body-containing and
+explicit-zero forms and reject mismatched parameter/result controls. The original
+release25-2 run retains its2 useful controls and2 null-result failures. Focused
+checks now pass13/13. `native-integrated120-26` passes1804 Rust tests,0 failures,
+9 ignored across42 targets and builds release, with576 stable guarded inputs.
+Its immutable binary SHA256 is
+`617a6523a9f97dbfa78bfe8e89cb8dc3fc4eb791952f9c55c0ac27bed3c150cb`.
+`named-tail132-editor-green26/receipt.json` passes8/8 first RPCs with all4 sole
+exact source goto targets,0 mismatch/unmeasured/not-run and clean shutdown/EOF/
+owned-live0. The earlier failures and unchanged original expectations are kept.
+Evidence index: `named-tail132-final-green.json`.
+`external-public134-26/cargo-receipt.json` also passes the actual external
+extension's4 tests and normal build offline/locked with its own unchanged lock.
+This checks the updated Rust call API; the unchanged90 editor probes were not
+repeated after their passing25-2 run. Native build cleanup only terminates
+verified owned MSVC vctip helpers; editor shutdown needs no forced cleanup.
+
+This closes the reproduced Function0/Unit slice. Named projected calls involving
+other lambda arities, receiver lambdas or non-Unit results still need proof; an
+honest Unknown there does not establish complete valid-code coverage.
+
+### Current completion audit and newly exercised editing coverage
+
+`goal-closeout132-audit.md` separates requirement coverage from historical test
+counts. The five-project50 route has no diagnostic expectations and some probes
+use only one consumer language; its success is not proof of both-language valid/
+invalid diagnostic behavior. The existing real-root shared-edit probes are now
+being exercised with unchanged expectations and guarded compiler inputs.
+
+`shared-edit135-release25-2/m-shared` reproduces a Moshi counter-result completion
+failure and an unmeasured diagnostic observation; the earlier typed member/goto,
+references and applied-rename checks succeed. Keep this first failure while
+separating receiver substitution from JDK member availability. OkHttp's selected
+shared edits pass, but its versioned empty diagnostic observation alone does not
+prove an actual compiler ran. Gradle's previously UNRUN shared-edit compiler
+oracle now compiles complete Java/Kotlin snapshots using the official8.14.3
+distribution whose embedded commit exactly matches the pinned checkout; the
+retracted producer gives the sole expected missing-member error. This is an
+independent compiler baseline, not the original captured classpath: some local
+project build JARs are absent. Runtime shared-edit and processor acceptance is
+still in progress; do not count unavailable observations as successful diagnosis.
+
+### Slice130/131: editor-accepted shared Unknown fixes
 
 Implementation5d1de80 is committed and pushed. It passes the full workspace suite and release build in
 `native-integrated120-25-2`:1804 PASS/0 FAIL/9 ignored across42 targets.

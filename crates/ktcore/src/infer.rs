@@ -374,6 +374,7 @@ fn infer_depth_with<R: ChildInfer>(
                     names: None,
                     has_spread: false,
                     trailing_lambda: false,
+                    trailing_lambda_omits_or_has_zero_parameters: false,
                 }),
             )
             .unwrap_or(Type::Unknown)
@@ -2083,9 +2084,19 @@ fn infer_call(
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Type {
-    let Some(callee) = node.named_child(0) else {
+    let Some(mut callee) = node.named_child(0) else {
         return Type::Unknown;
     };
+    if has_trailing_lambda(node)
+        && child_of_kind(node, "value_arguments").is_none()
+        && callee.kind() == "call_expression"
+        && child_of_kind(callee, "value_arguments").is_some()
+    {
+        let Some(inner) = callee.named_child(0).filter(|inner| inner.kind() != "call_expression") else {
+            return Type::Unknown;
+        };
+        callee = inner;
+    }
     match callee.kind() {
         "identifier" => {
             let cname = node_text(callee, src);
@@ -2456,7 +2467,7 @@ fn free_function_sig(
             }
             let entry = selection.entries[0];
             let bound =
-                members::bind_arguments(entry, arguments, members::CallMode::Kotlin).ok()?;
+                members::bind_arguments(index, &Type::Unknown, entry, arguments, members::CallMode::Kotlin, ctx).ok()?;
             if (selection.applicability == members::Applicability::Unknown
                 && entry
                     .sym
@@ -2809,6 +2820,13 @@ fn normalized_call_arguments(call: Node, src: &str, types: Vec<Type>) -> CallArg
         names,
         has_spread,
         trailing_lambda: has_trailing_lambda(call),
+        trailing_lambda_omits_or_has_zero_parameters: child_of_kind(call, "annotated_lambda")
+            .and_then(|annotated| child_of_kind(annotated, "lambda_literal"))
+            .or_else(|| child_of_kind(call, "lambda_literal"))
+            .is_some_and(|lambda| {
+                child_of_kind(lambda, "lambda_parameters")
+                    .is_none_or(|parameters| parameters.named_child_count() == 0)
+            }),
     }
 }
 
@@ -2902,7 +2920,7 @@ fn resolve_trailing_lambda_receiver_candidate(
     depth: usize,
 ) -> Option<Type> {
     let tset: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
-    let arguments = members::bind_arguments(entry, arguments, members::CallMode::Kotlin).ok()?;
+    let arguments = members::bind_arguments(index, recv_ty.unwrap_or(&Type::Unknown), entry, arguments, members::CallMode::Kotlin, ctx).ok()?;
     let arg_types = arguments.arguments.types.as_slice();
     let params = arguments.params.as_ref();
     let mut subst = match recv_ty {
@@ -3319,6 +3337,7 @@ fn member_type(
                 names: None,
                 has_spread: false,
                 trailing_lambda: false,
+                trailing_lambda_omits_or_has_zero_parameters: false,
             },
         })
     } else {
@@ -3438,7 +3457,7 @@ fn selected_member_type(
         };
         let t = if semantic_entry.is_some() {
             if let Some(arguments) = arguments.filter(|arguments| arguments.names.is_some()) {
-                if members::bind_arguments(e, arguments, members::CallMode::Kotlin).is_err() {
+                if members::bind_arguments(index, recv_ty, e, arguments, members::CallMode::Kotlin, ctx).is_err() {
                     return Type::Unknown;
                 }
             }
@@ -3485,7 +3504,7 @@ fn resolve_member_type_with_subst(
     let projected = entry.sym.params.iter().any(solve::has_projection);
     let bound = match arguments {
         Some(arguments) => {
-            match members::bind_arguments(entry, arguments, members::CallMode::Kotlin) {
+            match members::bind_arguments(index, recv_ty, entry, arguments, members::CallMode::Kotlin, ctx) {
                 Ok(bound) => Some(bound),
                 Err(_) => return Type::Unknown,
             }
@@ -3789,6 +3808,10 @@ pub(crate) fn call_parameter_templates_known(index: &dyn InferenceIndex, entry: 
         if formal.qualification.is_none() && parameters.contains(&formal.name) {
             return formal.args.is_empty();
         }
+        if let Some((arguments, result)) = members::function_type_signature(formal) {
+            return arguments.iter().chain(std::iter::once(result))
+                .all(|argument| known(index, argument, ctx, parameters, depth + 1));
+        }
         let resolved =
             resolve_with_subst_unprojected(index, formal, ctx, parameters, &HashMap::new(), depth);
         if !type_head_is_known(index, &resolved) || !receiver_shape_is_known(index, &resolved) {
@@ -3990,7 +4013,7 @@ pub fn declared_member_call_type(
     mode: members::CallMode,
     ctx: &FileCtx,
 ) -> Type {
-    let bound = match members::bind_arguments(entry, arguments, mode) {
+    let bound = match members::bind_arguments(index, receiver, entry, arguments, mode, ctx) {
         Ok(bound) => bound,
         Err(_) => return Type::Unknown,
     };
@@ -6224,6 +6247,7 @@ mod tests {
             names: None,
             has_spread: false,
             trailing_lambda: false,
+            trailing_lambda_omits_or_has_zero_parameters: false,
         };
         assert_eq!(
             java_array_member_type(&expected, "length", &MemberUse::Value),
@@ -6605,6 +6629,7 @@ mod tests {
                 names: None,
                 has_spread: false,
                 trailing_lambda: false,
+                trailing_lambda_omits_or_has_zero_parameters: false,
             };
             assert_eq!(
                 super::declared_member_call_type(

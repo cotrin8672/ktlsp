@@ -638,6 +638,7 @@ mod tests {
                         names: None,
                         has_spread: false,
                         trailing_lambda: false,
+                        trailing_lambda_omits_or_has_zero_parameters: false,
                     },
                     &ctx,
                 );
