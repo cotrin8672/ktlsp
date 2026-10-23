@@ -74,12 +74,17 @@ Actual8 first Neovim requests also pass (`receiver-bound128-native23`).
 New binary API probes use model-only seeds, fresh symbol/extraction caches and
 strict baseline file-set/byte guards, which remain stable. Retrofit Persister.read
 completion and class goto pass; method goto returns20 locations from both Persister
-and Serializer, rejected by the new owner predicate. Check the exact callsite and
-compiler-selected descriptor before generalizing that navigation expectation.
-Spring ContextFactory completion passes in Java/Kotlin, but Java class/method and
-Kotlin method goto return private .java paths which do not exist; Kotlin class
-goto is null. Fix binary fallback source registration/materialization and verify
-these unchanged first-response REDs on a new binary.
+and Serializer. Independent Javac21 compilation of the unchanged complete call
+`p.read(type,text)` selects `(Class,String)Object`, confirming unresolved navigation
+ambiguity. Spring ContextFactory completion passes in Java/Kotlin, but Kotlin
+class goto is null. Three other goto responses have valid materialized stubs and
+correct ranges: their271-character Windows paths fail both Neovim readfile and
+libuv open. The earlier missing-file classification was incorrect; extended-path
+reads prove the files existed during the original run. This is a real editor
+access problem, separate from semantic resolution or lazy source publication.
+Keep the original strict REDs and fix the independent causes before new runs.
+Audit: `fallback-api126/release23-phase-audit.json` and
+`fallback-api126/persister-call-oracle23/receipt.json`.
 
 Source text limitations remain separate from available API facts. Retrofit still
 has6 failed-source artifacts and missing-source reporting9 (was4), while published
