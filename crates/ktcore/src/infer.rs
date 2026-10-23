@@ -555,7 +555,7 @@ fn early_return_narrowing(
         }
     }
     let (narrowed, guard_start) = best?;
-    if !is_stable_for_narrowing(ident, name, guard_start, src) {
+    if !is_stable_for_narrowing(index, ident, name, guard_start, src, ctx) {
         return None;
     }
     Some(narrowed)
@@ -672,7 +672,7 @@ fn if_narrowing(
     if ident.start_byte() < then_branch.start_byte() || ident.end_byte() > then_branch.end_byte() {
         return None;
     }
-    if !is_stable_for_narrowing(ident, name, cond.start_byte(), src) {
+    if !is_stable_for_narrowing(index, ident, name, cond.start_byte(), src, ctx) {
         return None;
     }
     Some(narrowed)
@@ -733,7 +733,7 @@ fn and_short_circuit_narrowing(
         return None;
     }
     let narrowed = guard_type(index, left, name, src, ctx)?;
-    if !is_stable_for_narrowing(ident, name, be.start_byte(), src) {
+    if !is_stable_for_narrowing(index, ident, name, be.start_byte(), src, ctx) {
         return None;
     }
     Some(narrowed)
@@ -770,14 +770,14 @@ fn when_entry_narrowing(
             return None;
         }
         let ut = child_of_kind(cond, "user_type")?;
-        if !is_stable_for_narrowing(ident, name, cond.start_byte(), src) {
+        if !is_stable_for_narrowing(index, ident, name, cond.start_byte(), src, ctx) {
             return None;
         }
         return resolve_narrowed_type(index, ut, src, ctx);
     }
 
     let narrowed = guard_type(index, cond, name, src, ctx)?;
-    if !is_stable_for_narrowing(ident, name, cond.start_byte(), src) {
+    if !is_stable_for_narrowing(index, ident, name, cond.start_byte(), src, ctx) {
         return None;
     }
     Some(narrowed)
@@ -790,10 +790,35 @@ fn when_entry_narrowing(
 /// and the use; anything we can't resolve to a local/param (a member/property that might have a custom
 /// getter) is treated as not stable. Conservative by design — refusing to narrow falls back to the
 /// declared type, never a wrong one.
-fn is_stable_for_narrowing(ident: Node, name: &str, check_start: usize, src: &str) -> bool {
+fn is_stable_for_narrowing(
+    index: &dyn InferenceIndex,
+    ident: Node,
+    name: &str,
+    check_start: usize,
+    src: &str,
+    ctx: &FileCtx,
+) -> bool {
+    if name == "it" {
+        let mut scope = ident.parent();
+        while let Some(lambda) = scope {
+            if lambda.kind() == "lambda_literal" {
+                if child_of_kind(lambda, "lambda_parameters").is_none()
+                    && property_lambda_parameter_type(index, lambda, ident, name, src, ctx).is_some()
+                {
+                    // An implicit parameter shadows outer `it` binders and their guards.
+                    return lambda.start_byte() < check_start;
+                }
+                break;
+            }
+            scope = lambda.parent();
+        }
+    }
     let Some((decl, kind)) = resolve::local_decl(ident, name, UseKind::Value, src) else {
         return false;
     };
+    if decl.start_byte() > check_start {
+        return false;
+    }
     match kind {
         SymbolKind::Parameter => true,
         SymbolKind::LocalVariable => {
@@ -1275,7 +1300,9 @@ fn lambda_param_type(
     let mut cur = ident.parent();
     while let Some(n) = cur {
         if n.kind() == "lambda_literal" {
-            let is_this_lambdas_param = implicit || lambda_declares_param(n, name, src);
+            let is_this_lambdas_param = (implicit
+                && child_of_kind(n, "lambda_parameters").is_none())
+                || lambda_declares_param(n, name, src);
             if is_this_lambdas_param {
                 if let Some(parameters) = child_of_kind(n, "lambda_parameters") {
                     let mut cursor = parameters.walk();
@@ -1297,16 +1324,107 @@ fn lambda_param_type(
                         }
                     }
                 }
+                if let Some(ty) = property_lambda_parameter_type(index, n, ident, name, src, ctx) {
+                    return Some(narrowed_type(index, ident, name, src, ctx).unwrap_or(ty));
+                }
                 return lambda_receiver_or_element(index, n, src, ctx, depth, child_infer);
-            }
-            if implicit {
-                return None; // `it` belongs to the innermost lambda; if it's not the op, no type
             }
             // a named parameter not declared here — keep walking outward to its declaring lambda
         }
         cur = n.parent();
     }
     None
+}
+
+/// A direct property initializer has an authored expected type without overload or call inference.
+fn property_lambda_parameter_type(
+    index: &dyn InferenceIndex,
+    lambda: Node,
+    usage: Node,
+    name: &str,
+    src: &str,
+    ctx: &FileCtx,
+) -> Option<Type> {
+    let mut expression = lambda;
+    while let Some(parent) = expression
+        .parent()
+        .filter(|parent| parent.kind() == "parenthesized_expression")
+    {
+        expression = parent;
+    }
+    let property = expression
+        .parent()
+        .filter(|parent| parent.kind() == "property_declaration")?;
+    let declaration = child_of_kind(property, "variable_declaration")?;
+    let reference = crate::indexer::value_type_of_scoped(declaration, src, None)?;
+    let (formals, _) = members::function_type_signature(&reference)?;
+    let mut annotation = declaration;
+    let function_type = loop {
+        let mut cursor = annotation.walk();
+        annotation = annotation.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "function_type" | "parenthesized_type" | "nullable_type"
+            )
+        })?;
+        if annotation.kind() == "function_type" {
+            break annotation;
+        }
+    };
+    fn contains_suspend(node: Node) -> bool {
+        let mut cursor = node.walk();
+        node.kind() == "suspend" || node.children(&mut cursor).any(contains_suspend)
+    }
+    let source_parameters = child_of_kind(function_type, "function_type_parameters")?;
+    let mut cursor = function_type.walk();
+    if contains_suspend(declaration)
+        || function_type.named_children(&mut cursor).any(|child| {
+            child.end_byte() <= source_parameters.start_byte()
+                && matches!(
+                    child.kind(),
+                    "user_type" | "nullable_type" | "parenthesized_type" | "function_type"
+                )
+        })
+    {
+        // Receiver/suspend function types need their source parameter roles, not flattened ABI slots.
+        return None;
+    }
+    let parameters = child_of_kind(lambda, "lambda_parameters");
+    if let Some((binder, _)) = resolve::local_decl(usage, name, UseKind::Value, src) {
+        if binder.start_byte() > lambda.start_byte()
+            && binder.end_byte() < lambda.end_byte()
+            && !parameters.is_some_and(|parameters| {
+                binder.start_byte() >= parameters.start_byte()
+                    && binder.end_byte() <= parameters.end_byte()
+            })
+        {
+            return None;
+        }
+    }
+    let position = if let Some(parameters) = parameters {
+        let mut cursor = parameters.walk();
+        let parameters: Vec<_> = parameters.named_children(&mut cursor).collect();
+        if parameters.len() != formals.len()
+            || parameters
+                .iter()
+                .any(|parameter| !matches!(parameter.kind(), "identifier" | "variable_declaration"))
+        {
+            return None;
+        }
+        parameters.iter().position(|parameter| {
+            first_ident(*parameter).is_some_and(|identifier| node_text(identifier, src) == name)
+        })?
+    } else {
+        (name == "it" && formals.len() == 1).then_some(0)?
+    };
+    let bounds =
+        crate::indexer::type_parameters_in_scope(declaration, src, &ctx.package, &ctx.imports);
+    Some(declared_type_in_scope(
+        index,
+        &formals[position],
+        ctx,
+        &bounds,
+    ))
 }
 
 /// Whether `lambda` declares a value parameter named `name` (in its `lambda_parameters`).
@@ -2930,7 +3048,10 @@ fn resolve_with_subst_unprojected(
     }
     if tr.qualification.is_none() {
         if let Some(bound) = subst.get(&tr.name) {
-            if !type_head_is_known(index, bound) && !unbounded_scoped_parameter(bound) {
+            if !matches!(bound, Type::Star)
+                && !type_head_is_known(index, bound)
+                && !unbounded_scoped_parameter(bound)
+            {
                 return Type::Unknown;
             }
             return bound
@@ -3377,7 +3498,7 @@ fn unbounded_scoped_parameter(ty: &Type) -> bool {
                 if name == "Any" && package.as_deref() == Some("kotlin") && args.is_empty()))
 }
 
-// Closed type values used in projected constraints must not smuggle unmodeled aliases or bounds.
+// Closed type values retain declaration shape; call bounds are validated after substitution.
 fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize) -> bool {
     if depth > MAX_DEPTH {
         return false;
@@ -3400,7 +3521,10 @@ fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize)
                     entry.sym.package == ty.package().unwrap_or_default()
                         && entry.sym.container.as_deref() == ty.container()
                 })
-                .all(|entry| entry.sym.type_parameter_facts.known_unbounded())
+                .all(|entry| {
+                    entry.sym.type_parameter_facts.known_unbounded()
+                        || entry.sym.type_parameter_facts.known_invariant()
+                })
         {
             return false;
         }
@@ -3415,6 +3539,8 @@ fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize)
 
 // Equality can reject distinct ordinary nominal identities; JVM mapped types and aliases need
 // their own identity normalization. Gradual compatibility is never used as an absence proof.
+
+
 fn constraint_types_distinct(index: &dyn InferenceIndex, a: &Type, b: &Type, depth: usize) -> bool {
     if depth > MAX_DEPTH
         || a == b
@@ -3475,10 +3601,7 @@ fn projected_application(
                         entry.sym.package == actual.package().unwrap_or_default()
                             && entry.sym.container.as_deref() == actual.container()
                     })
-                    .all(|entry| {
-                        entry.sym.type_parameter_facts.known_invariant()
-                            && entry.sym.type_parameter_facts.known_unbounded()
-                    })
+                    .all(|entry| entry.sym.type_parameter_facts.known_invariant())
         },
         |actual, bound| receiver_satisfies_upper_bound(index, actual, bound),
         |actual, other| constraint_types_distinct(index, actual, other, 0),
@@ -3542,6 +3665,50 @@ pub(crate) fn call_parameter_templates_known(index: &dyn InferenceIndex, entry: 
         .all(|formal| known(index, formal, &ctx, &parameters, 0))
 }
 
+/// Project only through a complete hierarchy with one instantiated formal head.
+fn argument_at_formal_head(
+    index: &dyn InferenceIndex,
+    actual: &Type,
+    formal: &TypeRef,
+    ctx: &FileCtx,
+    parameters: &HashSet<String>,
+    initial: &HashMap<String, Type>,
+) -> Type {
+    if formal.args.is_empty() || actual.is_nullable() && !formal.nullable {
+        return actual.clone();
+    }
+    let resolved = resolve_with_subst_unprojected(index, formal, ctx, parameters, initial, 0);
+    let same_head = |current: &Type| {
+        current.name() == resolved.name()
+            && current.package() == resolved.package()
+            && current.container() == resolved.container()
+    };
+    if resolved.name().is_none() || same_head(actual) {
+        return actual.clone();
+    }
+    let mut projected = None;
+    let mut complete = true;
+    let _ = walk_supertypes(index, actual, SUPERTYPE_CAP, |current| {
+        complete &= receiver_arguments_known(index, current, 0);
+        if same_head(current) {
+            let current = current.clone().with_nullability(actual.is_nullable());
+            if projected
+                .as_ref()
+                .is_some_and(|previous| previous != &current)
+            {
+                complete = false;
+            }
+            projected = Some(current);
+        }
+        ControlFlow::Continue(())
+    });
+    if complete {
+        projected.unwrap_or_else(|| actual.clone())
+    } else {
+        actual.clone()
+    }
+}
+
 /// Both call selection and return substitution consume the same bound formal/actual pairs.
 pub(crate) fn projected_member_application(
     index: &dyn InferenceIndex,
@@ -3563,10 +3730,24 @@ pub(crate) fn projected_member_application(
     let receiver_bindings = receiver_type_bindings(index, receiver, entry);
     let missing_receiver = entry.sym.extension_receiver.is_some() && receiver_bindings.is_none();
     let initial = receiver_bindings.unwrap_or_default();
+    let parameters: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
+    let actuals: Vec<Type> = arguments
+        .types
+        .iter()
+        .enumerate()
+        .map(|(position, actual)| {
+            bound.params.get(position).map_or_else(
+                || actual.clone(),
+                |formal| {
+                    argument_at_formal_head(index, actual, formal, &ctx, &parameters, &initial)
+                },
+            )
+        })
+        .collect();
     let mut application = projected_application(
         index,
         &bound.params,
-        &arguments.types,
+        &actuals,
         &entry.sym.type_params,
         callable_bounds_known(entry),
         &ctx,
@@ -3620,6 +3801,7 @@ pub(crate) fn projected_member_application(
     }
     Some(application)
 }
+
 
 fn callable_bounds_known(entry: &Entry) -> bool {
     entry.sym.type_parameter_facts.known_unbounded()

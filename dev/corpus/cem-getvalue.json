@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "project_id": "cem-getvalue-actual",
+  "build_tool": "gradle",
+  "compiler_baseline": "Javac21 and Kotlin2.4 compiled ordinary Java/Kotlin getValue(AXIS) consumers against selected NeoForge21.1.248 artifacts; bytecode returns Direction.Axis. See docs/fork-current.md for retained evidence.",
+  "probes": [
+    {
+      "id": "cem-getvalue-java",
+      "source": "src/main/java/io/github/cotrin8672/cem/mixin/DrillBlockMixin.java",
+      "source_sha256": "4a67b36396441557dfa92e46ae5fed3370dbc8e1a3fdda81f6c0349f817fd23e",
+      "anchor": "state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).isVertical()",
+      "token": "isVertical",
+      "completion_token": "isVertical",
+      "target_file": "Direction.java",
+      "target_anchor": "public boolean isVertical()",
+      "target_token": "isVertical",
+      "target_uri_suffix": "net/minecraft/core/Direction.java",
+      "target_sha256": "13d22e1ceec0190cf3eb57eaf582d317a46f3f712c962ead2955dfbbce084962",
+      "expected": "Real selected Minecraft F-bounded getValue(AXIS) returns Direction.Axis; useful isVertical completion and exact goto.",
+      "known_control": {
+        "anchor": "state.getBlock()",
+        "token": "getBlock",
+        "completion_token": "getBlock"
+      },
+      "buffer_edits": [
+        {
+          "source": "src/main/java/io/github/cotrin8672/cem/mixin/DrillBlockMixin.java",
+          "source_sha256": "4a67b36396441557dfa92e46ae5fed3370dbc8e1a3fdda81f6c0349f817fd23e",
+          "anchor": "package io.github.cotrin8672.cem.mixin;\n\nimport com.simibubi.create.content.kinetics.base.DirectionalKineticBlock;\nimport com.simibubi.create.content.kinetics.drill.DrillBlock;\n\nimport io.github.cotrin8672.cem.registry.BlockRegistration;\n\nimport net.minecraft.core.BlockPos;\nimport net.minecraft.core.Direction.Axis;\nimport net.minecraft.world.InteractionHand;\nimport net.minecraft.world.ItemInteractionResult;\nimport net.minecraft.world.entity.player.Player;\nimport net.minecraft.world.item.BlockItem;\nimport net.minecraft.world.item.ItemStack;\nimport net.minecraft.world.level.Level;\nimport net.minecraft.world.level.block.state.BlockState;\nimport net.minecraft.world.phys.BlockHitResult;\n\nimport org.spongepowered.asm.mixin.Mixin;\nimport org.spongepowered.asm.mixin.injection.At;\nimport org.spongepowered.asm.mixin.injection.Inject;\nimport org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;\n\n@Mixin(value = DrillBlock.class, remap = false)\npublic class DrillBlockMixin extends DirectionalKineticBlock {\n    protected DrillBlockMixin(Properties properties) {\n        super(properties);\n    }\n\n    @Inject(method = \"useItemOn\", at = @At(\"HEAD\"), cancellable = true)\n    private void createenchantablemachinery$use(\n            ItemStack stack,\n            BlockState state,\n            Level level,\n            BlockPos pos,\n            Player player,\n            InteractionHand hand,\n            BlockHitResult hitResult,\n            CallbackInfoReturnable<ItemInteractionResult> cir) {\n        ItemStack heldItem = player.getItemInHand(hand);\n        if (heldItem.isEnchanted()\n                && heldItem.getItem() instanceof BlockItem blockItem\n                && blockItem.getBlock() == state.getBlock()) {\n            ItemInteractionResult result =\n                    BlockRegistration.getENCHANTABLE_MECHANICAL_DRILL()\n                            .get()\n                            .useItemOn(stack, state, level, pos, player, hand, hitResult);\n            cir.setReturnValue(result);\n        }\n    }\n\n    @Override\n    public Axis getRotationAxis(BlockState state) {\n        throw new UnsupportedOperationException(\"Unimplemented method 'getRotationAxis'\");\n    }\n}",
+          "replacement": "package cemfbound;\nimport net.minecraft.core.Direction;\nimport net.minecraft.world.level.block.state.BlockState;\nclass Probe {\n Direction.Axis axis(BlockState state) { return state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS); }\n boolean vertical(BlockState state) { Object known = state.getBlock(); return state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).isVertical(); }\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "cem-getvalue-kotlin",
+      "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+      "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+      "anchor": "state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).isVertical()",
+      "token": "isVertical",
+      "completion_token": "isVertical",
+      "target_file": "Direction.java",
+      "target_anchor": "public boolean isVertical()",
+      "target_token": "isVertical",
+      "target_uri_suffix": "net/minecraft/core/Direction.java",
+      "target_sha256": "13d22e1ceec0190cf3eb57eaf582d317a46f3f712c962ead2955dfbbce084962",
+      "expected": "Real selected Minecraft F-bounded getValue(AXIS) returns Direction.Axis; useful isVertical completion and exact goto.",
+      "known_control": {
+        "anchor": "state.getBlock()",
+        "token": "getBlock",
+        "completion_token": "getBlock"
+      },
+      "buffer_edits": [
+        {
+          "source": "src/main/kotlin/io/github/cotrin8672/cem/content/block/drill/EnchantableDrillBlockEntity.kt",
+          "source_sha256": "3ef6ba4809e344c17d2c9275005b6c0acdfea496dfbc286160f3bd74a2c53289",
+          "anchor": "package io.github.cotrin8672.cem.content.block.drill\n\nimport com.simibubi.create.content.kinetics.drill.DrillBlockEntity\nimport com.simibubi.create.foundation.utility.BlockHelper\nimport com.simibubi.create.foundation.utility.CreateLang\nimport io.github.cotrin8672.cem.content.block.EnchantableBlockEntity\nimport io.github.cotrin8672.cem.content.block.EnchantableBlockEntityDelegate\nimport io.github.cotrin8672.cem.util.EnchantedItemFactory\nimport io.github.cotrin8672.cem.util.holderLookup\nimport joptsimple.internal.Strings\nimport net.createmod.catnip.math.VecHelper\nimport net.minecraft.core.BlockPos\nimport net.minecraft.core.HolderLookup\nimport net.minecraft.core.registries.Registries\nimport net.minecraft.nbt.CompoundTag\nimport net.minecraft.network.chat.Component\nimport net.minecraft.world.entity.item.ItemEntity\nimport net.minecraft.world.item.ItemStack\nimport net.minecraft.world.item.enchantment.Enchantment.getFullname\nimport net.minecraft.world.item.enchantment.Enchantments\nimport net.minecraft.world.level.GameRules\nimport net.minecraft.world.level.block.entity.BlockEntityType\nimport net.minecraft.world.level.block.state.BlockState\nimport net.minecraft.world.phys.Vec3\n\nclass EnchantableDrillBlockEntity(\n    type: BlockEntityType<*>,\n    pos: BlockPos,\n    state: BlockState,\n) : DrillBlockEntity(type, pos, state), EnchantableBlockEntity by EnchantableBlockEntityDelegate() {\n    override fun getBreakSpeed(): Float {\n        val efficiency = holderLookup(Registries.ENCHANTMENT).getOrThrow(Enchantments.EFFICIENCY)\n        val efficiencyLevel = getEnchantmentLevel(efficiency)\n        return super.getBreakSpeed() * (efficiencyLevel + 1)\n    }\n\n    override fun canBreak(stateToBreak: BlockState, blockHardness: Float): Boolean {\n        return isBreakable(stateToBreak, blockHardness)\n    }\n\n    override fun onBlockBroken(stateToBreak: BlockState?) {\n        if (!optimiseCobbleGen(stateToBreak)) {\n            val nonNullLevel = checkNotNull(level)\n            val vec = VecHelper.offsetRandomly(VecHelper.getCenterOf(breakingPos), nonNullLevel.random, .125f)\n            BlockHelper.destroyBlockAs(\n                nonNullLevel,\n                breakingPos,\n                null,\n                EnchantedItemFactory.getPickaxeItemStack(getEnchantments()),\n                1f\n            ) { stack: ItemStack ->\n                if (stack.isEmpty) return@destroyBlockAs\n                if (!nonNullLevel.gameRules.getBoolean(GameRules.RULE_DOBLOCKDROPS)) return@destroyBlockAs\n                if (nonNullLevel.restoringBlockSnapshots) return@destroyBlockAs\n\n                val entity = ItemEntity(nonNullLevel, vec.x, vec.y, vec.z, stack)\n                entity.setDefaultPickUpDelay()\n                entity.deltaMovement = Vec3.ZERO\n                nonNullLevel.addFreshEntity(entity)\n            }\n        }\n    }\n\n    override fun addToGoggleTooltip(tooltip: MutableList<Component>, isPlayerSneaking: Boolean): Boolean {\n        super.addToGoggleTooltip(tooltip, isPlayerSneaking)\n\n        if (getEnchantments().entrySet().isEmpty()) return false\n        for (instance in getEnchantments().entrySet()) {\n            CreateLang.text(Strings.repeat(' ', 0))\n                .add(getFullname(instance.key, instance.intValue))\n                .forGoggles(tooltip)\n        }\n        return true\n    }\n\n    override fun read(compound: CompoundTag, registries: HolderLookup.Provider, clientPacket: Boolean) {\n        readEnchantments(compound, registries)\n        super.read(compound, registries, clientPacket)\n    }\n\n    override fun write(compound: CompoundTag, registries: HolderLookup.Provider, clientPacket: Boolean) {\n        writeEnchantments(compound, registries)\n        super.write(compound, registries, clientPacket)\n    }\n}",
+          "replacement": "package cemfbound\nimport net.minecraft.world.level.block.state.BlockState\nfun axis(state: BlockState) = state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS)\nfun vertical(state: BlockState): Boolean { val known = state.getBlock(); return state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).isVertical() }\n"
+        }
+      ]
+    }
+  ],
+  "scope": "Ordinary Java/Kotlin buffers against actual CEM dependencies; no Mixin semantics; disk inputs stay unchanged. Target file is an oracle-only runtime extraction from selected neoforge21.1.248 source jar; the existing replay runner rebinds its path and validates the pinned content hash."
+}

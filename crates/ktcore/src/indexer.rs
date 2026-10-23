@@ -1131,25 +1131,45 @@ pub fn type_parameters_in_scope(
     out
 }
 
-/// Keep nominal bounds and direct, acyclic relations between unambiguous own-method parameters.
+/// Keep nominal bounds with scoped method variables, rejecting cyclic direct variable relations.
 pub fn method_type_bounds(
     parameters: &[TypeParameterBounds],
     start: usize,
     end: usize,
 ) -> Option<Box<Vec<(String, TypeRef)>>> {
-    fn mentions_parameter(ty: &TypeRef, parameters: &[TypeParameterBounds]) -> bool {
-        ty.qualification.is_none()
+    fn scoped_parameter_refs(
+        ty: &TypeRef,
+        parameters: &[TypeParameterBounds],
+        start: usize,
+        end: usize,
+    ) -> bool {
+        if ty.qualification.is_none()
             && parameters
                 .iter()
                 .any(|parameter| parameter.name == ty.name.trim_end_matches("[]"))
-            || ty
-                .owner
-                .as_deref()
-                .is_some_and(|owner| mentions_parameter(owner, parameters))
-            || ty
+        {
+            return ty.args.is_empty()
+                && ty.owner.is_none()
+                && !ty.nullable
+                && ty.projection == crate::types::Projection::Invariant
+                && parameters
+                    .iter()
+                    .filter(|parameter| parameter.name == ty.name)
+                    .count()
+                    == 1
+                && parameters.iter().any(|parameter| {
+                    parameter.name == ty.name
+                        && parameter.scope_start == start
+                        && parameter.scope_end == end
+                });
+        }
+        ty.owner
+            .as_deref()
+            .is_none_or(|owner| scoped_parameter_refs(owner, parameters, start, end))
+            && ty
                 .args
                 .iter()
-                .any(|argument| mentions_parameter(argument, parameters))
+                .all(|argument| scoped_parameter_refs(argument, parameters, start, end))
     }
     let own: Vec<_> = parameters
         .iter()
@@ -1169,20 +1189,11 @@ pub fn method_type_bounds(
     let mut relations = Vec::new();
     for parameter in &own {
         for bound in &parameter.upper_bounds {
-            if mentions_parameter(bound, parameters) {
-                // shortcut: nested variable bounds and collisions with enclosing scopes need richer identities.
-                if bound.qualification.is_some()
-                    || !bound.args.is_empty()
-                    || bound.owner.is_some()
-                    || bound.nullable
-                    || bound.projection != crate::types::Projection::Invariant
-                    || parameter.upper_bounds.len() != 1
-                    || !own.iter().any(|target| target.name == bound.name)
-                    || parameters.iter().any(|target| {
-                        (target.name == bound.name || target.name == parameter.name)
-                            && (target.scope_start != start || target.scope_end != end)
-                    })
-                {
+            if !scoped_parameter_refs(bound, parameters, start, end) {
+                return None;
+            }
+            if bound.qualification.is_none() && own.iter().any(|target| target.name == bound.name) {
+                if parameter.upper_bounds.len() != 1 {
                     return None;
                 }
                 relations.push((parameter.name.as_str(), bound.name.as_str()));

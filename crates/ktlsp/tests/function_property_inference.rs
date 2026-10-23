@@ -369,3 +369,235 @@ fn kotlin_null_argument_to_unannotated_java_reference_keeps_platform_result() {
     // An invalid ordinary call keeps its declared result for editing; diagnostics reject it.
     assert_eq!(expression_type(&ws, "strict(null)").name(), Some("Product"));
 }
+
+#[test]
+fn expected_property_lambda_body_members_and_goto_use_authored_parameter_types() {
+    let mut ws = workspace();
+    for (annotation, body, prefix) in [
+        ("(String) -> Int", "{ it.length }", "it.len"),
+        ("(String) -> Int", "{ text -> text.length }", "text.len"),
+        ("((String) -> Int)?", "{ it.length }", "it.len"),
+    ] {
+        let mut source = format!("package callbacks\nval handler: {annotation} = {body}\n");
+        if !annotation.ends_with('?') {
+            source.push_str("fun use() { handler(\"text\").resultMarker() }\n");
+        }
+        ws.change(FILE, source.clone());
+        if !annotation.ends_with('?') {
+            assert_eq!(
+                expression_type(&ws, "handler(\"text\")").name(),
+                Some("Int")
+            );
+        }
+        let offset = source.find(prefix).unwrap() + prefix.len();
+        let labels: Vec<_> = ws
+            .complete(FILE, offset, true)
+            .map(|completion| {
+                completion
+                    .items
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            labels.iter().any(|label| label == "length"),
+            "{annotation} {body}: {labels:?}"
+        );
+        let selector = source.find(".length").unwrap() + 1;
+        let definitions = ws.goto_definition(FILE, selector);
+        assert_eq!(definitions.len(), 1, "{body}: {definitions:?}");
+        assert_eq!(definitions[0].file, "/functions/Builtins.kt");
+        let builtin = ws.doc_text("/functions/Builtins.kt").unwrap();
+        assert_eq!(
+            &builtin[definitions[0].start_byte..definitions[0].end_byte],
+            "length"
+        );
+    }
+}
+
+#[test]
+fn expected_property_lambda_unsaved_annotation_edits_and_restore_change_body_members() {
+    let mut ws = workspace();
+    ws.open(
+        "/functions/Other.kt",
+        "package callbacks\nclass Other { fun otherOnly(): Int = 1 }\n".into(),
+    );
+    for (parameter, member, excluded) in [
+        ("String", "length", "otherOnly"),
+        ("Other", "otherOnly", "length"),
+        ("String", "length", "otherOnly"),
+    ] {
+        let expression = if member == "length" {
+            "it.length"
+        } else {
+            "it.otherOnly()"
+        };
+        let source =
+            format!("package callbacks\nval handler: ({parameter}) -> Int = {{ {expression} }}\n");
+        ws.change(FILE, source.clone());
+        let offset = source.find("it.").unwrap() + 3;
+        let labels: Vec<_> = ws
+            .complete(FILE, offset, true)
+            .map(|completion| {
+                completion
+                    .items
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            labels.iter().any(|label| label == member),
+            "{parameter}: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == excluded),
+            "{parameter}: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn expected_property_lambda_shape_and_lexical_shadowing_guards_keep_useful_controls() {
+    let mut ws = workspace();
+    for (declaration, expression) in [
+        (
+            "val wrong: (String, Int) -> Int = { it.length }",
+            "it.length",
+        ),
+        (
+            "val wrong: (String) -> Int = { first, second -> first.length }",
+            "first.length",
+        ),
+        (
+            "val receiver: String.() -> Int = { it.length }",
+            "it.length",
+        ),
+        (
+            "class Function1<P,R>\nval foreign: Function1<String,Int> = { it.length }",
+            "it.length",
+        ),
+    ] {
+        let source = format!(
+            "package callbacks\nval control = {{ typed: String -> typed.length }}\n{declaration}\n"
+        );
+        ws.change(FILE, source.clone());
+        assert_eq!(expression_type(&ws, "typed.length").name(), Some("Int"));
+        assert_eq!(
+            expression_type(&ws, expression),
+            Type::Unknown,
+            "{declaration}"
+        );
+    }
+    ws.open(
+        "/functions/Other.kt",
+        "package callbacks\nclass Other { fun otherOnly(): Int = 1 }\n".into(),
+    );
+    let source = "package callbacks\nval shadowed: (String) -> Int = { text -> val text = Other(); text.otherOnly() }\nval nested: (String) -> Int = { val inner: (Other) -> Int = { it.otherOnly() }; it.length }\n";
+    ws.change(FILE, source.into());
+    for (prefix, expected, excluded) in [
+        ("text.other", "otherOnly", "length"),
+        ("it.other", "otherOnly", "length"),
+        ("it.len", "length", "otherOnly"),
+    ] {
+        let offset = source.find(prefix).unwrap() + prefix.len();
+        let labels: Vec<_> = ws
+            .complete(FILE, offset, true)
+            .map(|completion| {
+                completion
+                    .items
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            labels.iter().any(|label| label == expected),
+            "{prefix}: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == excluded),
+            "{prefix}: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn expected_property_lambda_smartcasts_keep_narrowed_body_members_and_goto() {
+    let mut ws = workspace();
+    let other_file = "/functions/Other.kt";
+    let other = "package callbacks\nclass Other { fun otherOnly(): Int = 1 }\n";
+    ws.open(other_file, other.into());
+    for (binder, parameters) in [("it", ""), ("value", "value ->")] {
+        for source in [
+            format!("package callbacks\nval handler: (Any) -> Int = {{ {parameters} if ({binder} is Other) {binder}.otherOnly() else 0 }}\n"),
+            format!("package callbacks\nfun f({binder}: Any) {{ if ({binder} is Other) run {{ {binder}.otherOnly() }} }}\n"),
+            format!("package callbacks\nfun f({binder}: Any) {{ if ({binder} is Other) {{ val noArg: () -> Int = {{ {binder}.otherOnly() }} }} }}\n"),
+            format!("package callbacks\nfun f({binder}: Any) {{ if ({binder} is Other) \"text\".let {{ unused -> {binder}.otherOnly() }} }}\n"),
+        ] {
+        ws.change(FILE, source.clone());
+        let prefix = format!("{binder}.other");
+        let offset = source.find(&prefix).unwrap() + prefix.len();
+        let labels: Vec<_> = ws
+            .complete(FILE, offset, true)
+            .map(|completion| {
+                completion
+                    .items
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            labels.iter().any(|label| label == "otherOnly"),
+            "{source}: {labels:?}"
+        );
+        let definitions = ws.goto_definition(FILE, source.find(".otherOnly").unwrap() + 1);
+        assert_eq!(definitions.len(), 1, "{binder}: {definitions:?}");
+        assert_eq!(definitions[0].file, other_file);
+        assert_eq!(
+            &other[definitions[0].start_byte..definitions[0].end_byte],
+            "otherOnly"
+        );
+        }
+    }
+    for body in [
+        "fun f(value: Any) { if (value is Other) { val handler: (String) -> Int = { value -> value.length } } }",
+        "fun f(it: Any) { if (it is Other) { val handler: (String) -> Int = { it.length } } }",
+        "fun f(it: Any) { if (it is Other) \"text\".let { it.length } }",
+        "fun f(it: Any) { if (it is Other) \"text\".let { it -> it.length } }",
+        "val handler: (Any) -> Int = { if (it is Other) \"text\".let { it.length } else 0 }",
+        "val handler: (Any) -> Int = { value -> if (value is Other) { val value = \"\"; value.length } else 0 }",
+    ] {
+        let source = format!("package callbacks\n{body}\n");
+        ws.change(FILE, source.clone());
+        let offset = source.find(".length").unwrap() + ".len".len();
+        let labels: Vec<_> = ws
+            .complete(FILE, offset, true)
+            .map(|completion| {
+                completion
+                    .items
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            labels.iter().any(|label| label == "length"),
+            "{body}: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "otherOnly"),
+            "{body}: {labels:?}"
+        );
+        let definitions = ws.goto_definition(FILE, source.find(".length").unwrap() + 1);
+        assert_eq!(definitions.len(), 1, "{body}: {definitions:?}");
+        assert_eq!(definitions[0].file, "/functions/Builtins.kt");
+        let builtin = ws.doc_text("/functions/Builtins.kt").unwrap();
+        assert_eq!(
+            &builtin[definitions[0].start_byte..definitions[0].end_byte],
+            "length"
+        );
+    }
+}

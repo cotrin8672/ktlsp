@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-10-22 (Asia/Tokyo). Goal active; IDEA parity and complete valid-code type coverage remain unproved.
+Updated 2026-10-23 (Asia/Tokyo). Goal active; IDEA parity and complete valid-code type coverage remain unproved.
 History: docs/fork-acceptance.md, docs/fork-corpus.md and Git.
 Prospective speed targets and comparison rules: [performance budgets](fork-performance-budgets.md).
 BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
@@ -8,6 +8,25 @@ Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
+
+Latest integration attempt120-20 passes1793 Rust tests,0 fail,9 ignored across42
+targets, and builds release with576 stable inputs. Immutable binary SHA256:
+`a1c8fd7b7288233fdf39aa8cf17866df5c48d7d6bc6e8e6217384e97d1a12db4`.
+Both Cargo stages exit0/EOF/owned-live0; each exact owned MSVC vctip helper
+requires cleanup. This attempt is **not editor-accepted**: Java423/427 retains
+the four new Kotlin overload failures with actual JDK List/Collection, and actual
+CEM getValue remains4/8 (four target null replies; controls/delivery pass).
+All61 Java member RPCs and all6 CEM RPCs return on their first attempt; no case
+is unmeasured. Both LSP runs preserve inputs and shut down normally with no forced
+cleanup. Evidence: `native-integrated120-20`, `java-kotlin-msc121-release20`
+(including `msc-failed-wire-audit.json`) and
+`cem-getvalue122-native-release20/receipt.json`. The original415 Java checks and
+all new expected-lambda checks pass. Five-project replays are held until the new
+real-dependency failures are understood, avoiding another full matrix on a known
+incomplete binary. Next: inspect the actual JDK/Minecraft facts and normalization
+which differ from the focused fixtures; preserve both real REDs and their oracles.
+
+### Previous editor-accepted checkpoint120-19
 
 Source through8f65812, checkpoint120-19 passes1786 Rust tests,0 fail,9 ignored
 (42 targets), and release with575 stable input guards. Its SHA is
@@ -60,6 +79,57 @@ proof before applying Kotlin's nongeneric tie-break. See the official
 [MSC algorithm](https://kotlinlang.org/spec/overload-resolution.html#algorithm-of-msc-selection).
 Contextual/trailing lambda inference, other unsupported type shapes and Java
 nullability annotations also remain gaps. Warm optimization stays paused.
+
+### In progress: compiler-valid Unknown cases
+
+The user prioritizes valid-code Unknown elimination over further warm timing.
+The property-initializer lambda change now passes four focused tests, including
+body completion/goto, unsaved-edit/restoration, smartcasts and lexical shadowing
+(`contextual-lambda-let-shadow-scoped-green2`: 282 stable inputs). Earlier REDs
+preserve the missing expected-type smartcast and an intermediate inner-`let`
+shadowing error. The final change keeps the original global inference order and
+applies flow narrowing to a proven expected-property parameter. Explicit lambda
+parameters also no longer invent an inner `it` binding. Independent Kotlin2.4
+accepts the smartcast controls and all new shadow/capture bodies
+(`oracle120/contextual-lambda-{smartcast-control1,lexical-boundaries1}`).
+
+The new Kotlin overload editor cases fail on immutable19: the original415
+checks pass, while two chained completions and two unique-definition checks
+fail (`java-kotlin-msc121-red19`, 417/421). Compiler-certified nongeneric
+selection remains the expectation. These are actual first replies, not timeouts.
+The shared substitution repair now preserves an existing star argument during
+superclass projection. Its focused RED directly observes `List<*>` becoming
+`Collection<Unknown>`; GREEN retains `Collection<*>` and passes Kotlin selection,
+Java ambiguity and conservative proof controls
+(`kotlin-msc-star-{red1,green1}`). Neither focused GREEN is counted as integrated
+or real-editor acceptance yet.
+
+CEM exposes a separate real dependency gap: Java and Kotlin compilers infer
+`Direction.Axis` from `state.getValue(BlockStateProperties.AXIS)` and accept
+the `isVertical()` chain (`cem-getvalue122-compiler1`). On19 both languages'
+completion and goto return null, while both known `getBlock` controls work
+(`cem-getvalue122-native-red2`: four target mismatches, no unmeasured requests,
+normal shutdown). That RED has one recorded harness-input deviation: only the
+disposable Java fixture changed during the run; the CEM scenario did not.
+It is retained as such, not reported as a fully stable-guard acceptance run.
+An external19 reduction isolates failures both for a generic subtype argument
+and, independently, for the self-referential method bound
+`<T extends Comparable<T>>` (`cem-getvalue122-reduction1/attempt3`). The same-head
+unbounded control returns useful members and exact goto in both languages.
+
+The pending shared fix now passes all145 generic interop tests
+(`cem-fbound123-green6`), including direct `Property<Axis>` and the actual static
+`AXIS` argument through `EnumProperty<Axis>`, both languages' completion/goto,
+nullable rejection, unresolved/cyclic ancestry rejection and valid restoration.
+The fixture uses absolute source keys and a real disposable standalone scan;
+merely setting the general test index-complete flag does not establish Java's
+source-value namespace proof. The formerly Unknown bounded-owner case is also
+independently compiler-valid (`oracle120/bounded-owner-positive1`). Binary
+metadata coverage, cache invalidation and the combined release remain pending.
+
+Next: finish the focused shared-layer fixes, then run one combined workspace
+suite/release and editor replays. No pending source change is counted as an
+integrated acceptance result. CEM source files remain untouched.
 
 ### Previous integrated checkpoint120-17
 

@@ -68,6 +68,14 @@ mod tests {
                 "get" => assert_eq!(actual.returns.unwrap().name, "T"),
                 "array" => assert_eq!(actual.returns.unwrap().name, "T[]"),
                 "same" => assert_eq!(actual.type_parameters[0].bounds[0].name, "Item"),
+                "bounded" => {
+                    let bound = &actual.type_parameters[0].bounds[0];
+                    assert_eq!(actual.type_parameters[0].name, "V");
+                    assert_eq!(bound.name, "Comparable");
+                    assert_eq!(bound.qualification.as_deref(), Some("java.lang"));
+                    assert_eq!(bound.args[0].name, "V");
+                    assert_eq!(actual.returns.unwrap().name, "V");
+                }
                 "shadow" => {
                     assert_eq!(actual.type_parameters[0].name, "T");
                     assert_eq!(actual.type_parameters[0].bounds[0].name, "Other");

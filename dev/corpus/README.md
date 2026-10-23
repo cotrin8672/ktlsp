@@ -153,6 +153,46 @@ joined with `\n`, rather than archive bytes or platform line endings. The harnes
 rejects a changed source or declaration instead of moving an expected range to
 make a result pass. No third-party source archive is stored in this directory.
 
+### CEM F-bounded return types
+
+`cem-getvalue.json` checks `BlockState.getValue(BlockStateProperties.AXIS)` in
+ordinary Java and Kotlin buffers against CEM's actual dependencies. Both compilers
+resolve its return to `Direction.Axis`; each language must offer `isVertical` and
+navigate to its exact declaration. The existing corpus client replaces only unsaved
+buffers, without Mixin annotations or superclass behavior. It requests two known
+`getBlock` controls and four target results once each, plus two delivery checks:
+eight assertions total. A missing target result fails even if the controls pass.
+
+Use the same source snapshot and JDK 21 prerequisites above. `Direction.java` is a
+runtime oracle placeholder, not a source file to commit. Extract the pinned entry
+from CEM's generated `build/moddev/artifacts/neoforge-21.1.248-sources.jar` and
+rebind only `target_file` in a disposable manifest. From the repository root in
+Bash, with a new output directory:
+
+```sh
+rtk proxy python - /path/to/neoforge-21.1.248-sources.jar /new/temp/cem-getvalue <<'PY'
+from pathlib import Path
+import hashlib, json, sys, zipfile
+out = Path(sys.argv[2]).resolve()
+out.mkdir(parents=True, exist_ok=False)
+manifest = json.loads(Path('dev/corpus/cem-getvalue.json').read_text(encoding='utf-8'))
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    target = out / 'Direction.java'
+    target.write_bytes(archive.read('net/minecraft/core/Direction.java'))
+digest = hashlib.sha256('\n'.join(target.read_text(encoding='utf-8').splitlines()).encode('utf-8')).hexdigest()
+for probe in manifest['probes']:
+    assert probe['target_file'] == 'Direction.java' and digest == probe['target_sha256']
+    probe['target_file'] = str(target)
+(out / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+PY
+rtk proxy env KTLSP_CORPUS_WAIT_INDEX=1 bash dev/ktlsp-harness.sh corpus --root /path/to/disposable/cem-working-copy --file /new/temp/cem-getvalue/manifest.json --bin /path/to/immutable/ktlsp --no-build --run-dir /new/temp/cem-getvalue/run
+```
+
+On Windows use Git Bash with `-o igncr`, as in the examples above. Keep the source
+and target hashes, anchors and exact-range checks unchanged. Record semantic
+results separately from indexing availability, shutdown and input stability; this
+focused case does not establish all CEM analysis or production Mixin support.
+
 ## Unsaved incomplete-code fixture
 
 `mixed-incomplete.json` is a separate fixture control. Generate the golden with

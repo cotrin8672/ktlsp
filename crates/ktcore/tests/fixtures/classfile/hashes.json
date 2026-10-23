@@ -161,8 +161,8 @@
   },
   {
     "file": "sources/genericfixture/Box.java",
-    "sha256": "428e65758aa87726d2366d97073281207f99a5d07ee6d5a693c7938a3649d21c",
-    "bytes": 469
+    "sha256": "925961a8a8d5c97d35ef9bd3097f06cb52a3dacb029f41db606e85ee03171d3e",
+    "bytes": 543
   },
   {
     "file": "sources/genericfixture/Child.java",
@@ -181,8 +181,8 @@
   },
   {
     "file": "genericfixture/Box.class",
-    "sha256": "19d7f78007dbe6efb5260c6d1a92c91b872a06ed34f9be1165ef7d35004801ca",
-    "bytes": 1138
+    "sha256": "772037280915b5dbfd2133fd769811fcded6ba00e8acc662843d620d756fb0f8",
+    "bytes": 1288
   },
   {
     "file": "genericfixture/Child.class",

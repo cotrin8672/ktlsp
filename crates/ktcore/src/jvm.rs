@@ -2244,6 +2244,7 @@ fn annotation_known(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::members::CallMode;
 
     #[test]
     fn reference_overload_specificity_requires_all_parameters_and_known_arguments() {
@@ -2306,6 +2307,28 @@ class Resolver {
             unreachable!()
         };
         args.push(Type::class("Task", Some("specificity".into())));
+        let mut universal_list = list.clone();
+        let Type::Class { args, .. } = &mut universal_list else {
+            unreachable!()
+        };
+        args[0] = Type::Star;
+        let mut universal_collection = Type::class("MetaCollection", Some("specificity".into()));
+        let Type::Class { args, .. } = &mut universal_collection else {
+            unreachable!()
+        };
+        args.push(Type::Star);
+        assert_eq!(
+            infer::direct_supertypes(&index, &universal_list),
+            vec![universal_collection],
+            "declaration forwarding must preserve its universal binder through inheritance"
+        );
+        let Type::Class { args, .. } = &mut universal_list else {
+            unreachable!()
+        };
+        args[0] = Type::Unknown;
+        assert!(infer::direct_supertypes(&index, &universal_list)[0]
+            .args()
+            .contains(&Type::Unknown));
         let unknown = class_of(Type::Unknown);
         let ctx = FileCtx::new("specificity".into(), Vec::new());
         for (name, types, expected) in [
@@ -2337,7 +2360,7 @@ class Resolver {
                 ],
                 None,
             ),
-            ("genericNested", vec![list.clone(), list], None),
+            ("genericNested", vec![list.clone(), list.clone()], None),
             (
                 "clash",
                 vec![Type::class("Both", Some("specificity".into()))],
@@ -2409,8 +2432,24 @@ class Resolver {
                     2,
                     "Java {name}: preserve ambiguity/uncertainty"
                 );
-                // K2 selects the nongeneric Java declaration in these two cases; that tie-break is a coverage gap.
-                if !matches!(name, "genericTop" | "genericNested") {
+                if matches!(name, "genericTop" | "genericNested") {
+                    // The retained K2 oracle selects the nongeneric declaration; javac is ambiguous.
+                    assert_eq!(kotlin.entries.len(), 1, "Kotlin {name}: nongeneric MSC");
+                    assert!(kotlin.entries[0].sym.type_params.is_empty());
+                    assert_eq!(
+                        kotlin.applicability,
+                        crate::members::Applicability::Applicable
+                    );
+                    let result = infer::declared_member_call_type(
+                        &index,
+                        &receiver,
+                        kotlin.entries[0],
+                        kotlin.entries[0].sym.return_type.as_ref().unwrap(),
+                        &arguments,
+                        &ctx,
+                    );
+                    assert_eq!(result, Type::class("Broad", Some("specificity".into())));
+                } else {
                     assert_eq!(
                         kotlin.entries.len(),
                         2,
@@ -2418,6 +2457,100 @@ class Resolver {
                     );
                 }
             }
+        }
+        let arguments = crate::members::CallArguments {
+            count: Some(2),
+            types: vec![list, Type::class("Task", Some("specificity".into()))],
+            names: None,
+            has_spread: false,
+            trailing_lambda: false,
+        };
+        // These incomplete facts test proof refusal, not successful compiler-equivalent resolution.
+        for uncertain in [
+            "missing head",
+            "cycle",
+            "unknown bounds",
+            "conflicting head",
+            "third candidate",
+        ] {
+            let mut symbols = indexer::extract_symbols(&tree, text, "specificity");
+            match uncertain {
+                "missing head" => symbols.retain(|symbol| symbol.name != "MetaCollection"),
+                "cycle" => {
+                    let collection = symbols
+                        .iter_mut()
+                        .find(|symbol| symbol.name == "MetaCollection")
+                        .unwrap();
+                    let mut parent = TypeRef::simple("MetaCollection");
+                    parent.args.push(TypeRef::simple("T"));
+                    collection.supertype_refs.push(parent);
+                }
+                "unknown bounds" => {
+                    let generic = symbols
+                        .iter_mut()
+                        .find(|symbol| {
+                            symbol.name == "genericTop" && !symbol.type_params.is_empty()
+                        })
+                        .unwrap();
+                    generic.type_parameter_facts = crate::symbol::TypeParameterFacts::default();
+                    generic.method_type_bounds = None;
+                }
+                _ => {}
+            }
+            let mut uncertain_index = crate::index::Index::new();
+            uncertain_index.replace_file("Overloads.kt", symbols, Tier::Volatile);
+            let extra = match uncertain {
+                "conflicting head" => "package specificity\ninterface MetaCollection<T> : Left\n",
+                // A third applicable generic candidate is outside this two-candidate proof.
+                "third candidate" => {
+                    "package specificity\nclass Resolver { fun <U : Task> genericTop(values: MetaList<Task>, value: U): Task = value }\n"
+                }
+                _ => "",
+            };
+            if !extra.is_empty() {
+                let extra_tree = crate::parser::KotlinParser::new().parse(extra);
+                uncertain_index.replace_file(
+                    "Extra.kt",
+                    indexer::extract_symbols(&extra_tree, extra, "specificity"),
+                    Tier::Volatile,
+                );
+            }
+            let entries: Vec<_> = uncertain_index
+                .lookup_by_name("genericTop")
+                .iter()
+                .collect();
+            if uncertain == "third candidate" {
+                assert_eq!(entries.len(), 3);
+                for entry in entries
+                    .iter()
+                    .filter(|entry| !entry.sym.type_params.is_empty())
+                {
+                    let bound = crate::members::bind_arguments(entry, &arguments, CallMode::Kotlin)
+                        .ok()
+                        .unwrap();
+                    assert!(
+                        infer::projected_member_application(
+                            &uncertain_index,
+                            &receiver,
+                            entry,
+                            &bound
+                        )
+                        .is_some_and(|application| application.status
+                            == crate::solve::ConstraintStatus::Matched)
+                    );
+                }
+            }
+            assert!(
+                crate::members::most_specific_reference_call(
+                    &uncertain_index,
+                    &receiver,
+                    &entries,
+                    &arguments,
+                    CallMode::Kotlin
+                )
+                .is_none(),
+                "{uncertain} must block a nongeneric tie-break"
+            );
         }
         let arguments = crate::members::CallArguments {
             count: Some(1),

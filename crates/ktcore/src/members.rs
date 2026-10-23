@@ -2035,7 +2035,14 @@ pub(crate) fn most_specific_reference_call(
         .collect::<Option<Vec<_>>>()?;
     let declarations: Vec<_> = entries
         .iter()
-        .map(|entry| generic_declaration_formals(index, receiver, entry))
+        .zip(&formals)
+        .map(|(entry, formals)| {
+            if entry.sym.type_params.is_empty() {
+                formals.iter().cloned().map(Some).collect()
+            } else {
+                generic_declaration_formals(index, receiver, entry)
+            }
+        })
         .collect();
     let more_specific = |left: usize, right: usize| {
         // A generic competitor needs declaration inference, not an invocation's inferred arguments.
@@ -2043,22 +2050,14 @@ pub(crate) fn most_specific_reference_call(
             return false;
         }
         let generic = !entries[left].sym.type_params.is_empty();
-        let left_formals = if generic {
-            let Some(declared) = declarations[left].as_ref() else {
-                return false;
-            };
-            declared
-        } else {
-            &formals[left]
-        };
-        left_formals
-            .iter()
-            .zip(&formals[right])
-            .all(|(a, b)| reference_subtype(index, a, b, generic))
-            && left_formals
-                .iter()
-                .zip(&formals[right])
-                .any(|(a, b)| !reference_subtype(index, b, a, generic))
+        let left_formals = &declarations[left];
+        left_formals.iter().zip(&formals[right]).all(|(a, b)| {
+            a.as_ref()
+                .is_some_and(|a| reference_subtype(index, a, b, generic))
+        }) && left_formals.iter().zip(&formals[right]).any(|(a, b)| {
+            a.as_ref()
+                .is_some_and(|a| !reference_subtype(index, b, a, generic))
+        })
     };
     let mut winner = None;
     for candidate in 0..entries.len() {
@@ -2068,28 +2067,72 @@ pub(crate) fn most_specific_reference_call(
             }
         }
     }
-    winner
+    if winner.is_some() || mode != CallMode::Kotlin || entries.len() != 2 {
+        return winner;
+    }
+    let generic = !entries[0].sym.type_params.is_empty();
+    if generic == !entries[1].sym.type_params.is_empty() {
+        return None;
+    }
+    let forward = |left: usize, right: usize| {
+        let mut proof = DeclarationForward::Proven;
+        for (position, (a, b)) in declarations[left]
+            .iter()
+            .zip(&declarations[right])
+            .enumerate()
+        {
+            let (Some(a), Some(b)) = (a, b) else {
+                proof = DeclarationForward::Unknown;
+                continue;
+            };
+            let rigid = entries[left].sym.type_params.is_empty()
+                || entries[left].sym.type_parameter_facts.known_unbounded();
+            match reference_forward(index, a, b, true, rigid) {
+                DeclarationForward::Disproven => return DeclarationForward::Disproven,
+                DeclarationForward::Proven
+                    if !contains_method_parameter(
+                        &entries[right].sym.params[position],
+                        &entries[right].sym.type_params,
+                    ) => {}
+                _ => proof = DeclarationForward::Unknown,
+            }
+        }
+        proof
+    };
+    // Kotlin's nongeneric tie-break follows declaration forwarding, never call-site substitutions.
+    match (forward(0, 1), forward(1, 0)) {
+        (DeclarationForward::Proven, DeclarationForward::Proven)
+        | (DeclarationForward::Disproven, DeclarationForward::Disproven) => {
+            Some(usize::from(generic))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarationForward {
+    Proven,
+    Disproven,
+    Unknown,
+}
+
+fn contains_method_parameter(ty: &TypeRef, parameters: &[String]) -> bool {
+    ty.qualification.is_none() && parameters.contains(&ty.name)
+        || ty
+            .owner
+            .as_deref()
+            .is_some_and(|owner| contains_method_parameter(owner, parameters))
+        || ty
+            .args
+            .iter()
+            .any(|argument| contains_method_parameter(argument, parameters))
 }
 
 fn generic_declaration_formals(
     index: &dyn InferenceIndex,
     receiver: &Type,
     entry: &Entry,
-) -> Option<Vec<Type>> {
-    fn contains_parameter(ty: &TypeRef, parameters: &[String]) -> bool {
-        ty.qualification.is_none() && parameters.contains(&ty.name)
-            || ty
-                .owner
-                .as_deref()
-                .is_some_and(|owner| contains_parameter(owner, parameters))
-            || ty
-                .args
-                .iter()
-                .any(|argument| contains_parameter(argument, parameters))
-    }
-    if entry.sym.type_params.is_empty() {
-        return None;
-    }
+) -> Vec<Option<Type>> {
     let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
     entry
         .sym
@@ -2113,7 +2156,7 @@ fn generic_declaration_formals(
                 {
                     // Universal binder slots can fit an explicit wildcard, never a concrete argument.
                     argument.projection = crate::types::Projection::Star;
-                } else if contains_parameter(argument, &entry.sym.type_params) {
+                } else if contains_method_parameter(argument, &entry.sym.type_params) {
                     return None;
                 }
             }
@@ -2173,21 +2216,43 @@ fn reference_subtype(
     formal: &Type,
     universal: bool,
 ) -> bool {
+    reference_forward(index, actual, formal, universal, false) == DeclarationForward::Proven
+}
+
+fn reference_forward(
+    index: &dyn InferenceIndex,
+    actual: &Type,
+    formal: &Type,
+    universal: bool,
+    rigid_arguments: bool,
+) -> DeclarationForward {
     if !reference_shape_known(index, actual, universal, 0)
         || !reference_shape_known(index, formal, true, 0)
-        || actual.is_nullable() && !formal.is_nullable()
     {
-        return false;
+        return DeclarationForward::Unknown;
+    }
+    if actual.is_nullable() && !formal.is_nullable() {
+        return DeclarationForward::Disproven;
     }
     let mut witnessed = false;
     let mut conflicting = false;
     let mut incomplete = false;
+    let mut unsupported = false;
+    let mut matching = None;
     let _ = infer::walk_supertypes(index, actual, infer::MAX_DEPTH, |current| {
         incomplete |= matches!(current, Type::Unknown);
+        unsupported |= !reference_shape_known(index, current, universal, 0);
         if current.name() == formal.name()
             && current.package() == formal.package()
             && current.container() == formal.container()
         {
+            if matching
+                .as_ref()
+                .is_some_and(|previous| previous != current)
+            {
+                incomplete = true;
+            }
+            matching = Some(current.clone());
             let compatible = reference_shape_known(index, current, universal, 0)
                 && current.owner() == formal.owner()
                 && current.args().len() == formal.args().len()
@@ -2201,7 +2266,15 @@ fn reference_subtype(
         }
         ControlFlow::Continue(())
     });
-    witnessed && !conflicting && !incomplete
+    if incomplete || witnessed && conflicting {
+        DeclarationForward::Unknown
+    } else if witnessed {
+        DeclarationForward::Proven
+    } else if unsupported || conflicting && !rigid_arguments {
+        DeclarationForward::Unknown
+    } else {
+        DeclarationForward::Disproven
+    }
 }
 
 pub(crate) fn function_applicability(

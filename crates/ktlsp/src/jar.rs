@@ -1688,6 +1688,55 @@ mod tests {
     }
 
     #[test]
+    fn binary_java_f_bounded_methods_preserve_result_members_in_both_languages() {
+        let class = ktcore::classfile::decode(
+            "javac:genericfixture",
+            include_bytes!("../../ktcore/tests/fixtures/classfile/genericfixture/Box.class"),
+        )
+        .unwrap();
+        let source = java_class_stub(&class).expect("binary method with an own-variable F-bound");
+        let mut workspace = crate::workspace::Workspace::new();
+        for (file, text) in [
+            ("Item.java", "package genericfixture; public class Item {}"),
+            ("Other.java", "package genericfixture; public class Other { public void wrongResult() {} }"),
+            ("Comparable.java", "package java.lang; public interface Comparable<T> { int compareTo(T other); }"),
+            ("Value.java", "package genericfixture; public class Value implements Comparable<Value> { public int compareTo(Value other) { return 0; } public void exactResult() {} }"),
+        ] {
+            workspace.open(file, text.into());
+        }
+        workspace.open("Box.java", source);
+        let method = &workspace.index.lookup_by_name("bounded")[0];
+        let bounds = method
+            .sym
+            .method_type_bounds
+            .as_deref()
+            .expect("binary F-bound must survive source projection");
+        assert_eq!(bounds[0].0, "V");
+        assert_eq!(bounds[0].1.name, "Comparable");
+        assert_eq!(bounds[0].1.args[0].name, "V");
+        for (file, text) in [
+            ("Use.java", "package genericfixture; class Use { void use(Box<Item> box, Value value, Other other) { box.bounded(value).exactResult(); box.bounded(other).wrongResult(); } }"),
+            ("Use.kt", "package genericfixture\nfun use(box:Box<Item>,value:Value,other:Other) { box.bounded(value).exactResult(); box.bounded(other).wrongResult() }\n"),
+        ] {
+            workspace.open(file, text.into());
+            let prefix = "box.bounded(value).exactRes";
+            let at = text.find(prefix).unwrap() + prefix.len();
+            let completion = workspace.complete(file, at, true).expect("completion response");
+            assert!(completion.items.iter().any(|item| item.label == "exactResult"), "{file}");
+            assert!(!completion.items.iter().any(|item| item.label == "wrongResult"), "{file}");
+            let at = text.find("exactResult").unwrap();
+            let definitions = workspace.goto_definition(file, at);
+            assert_eq!(definitions.len(), 1, "{file}: {definitions:?}");
+            assert_eq!(definitions[0].file, "Value.java");
+            let target = workspace.doc_text("Value.java").unwrap();
+            assert_eq!(&target[definitions[0].start_byte..definitions[0].end_byte], "exactResult");
+            let prefix = "box.bounded(other).wrongRes";
+            let at = text.find(prefix).unwrap() + prefix.len();
+            assert!(!workspace.complete(file, at, true).is_some_and(|completion| completion.items.iter().any(|item| item.label == "wrongResult")), "{file}: incompatible method bound");
+        }
+    }
+
+    #[test]
     fn binary_java_generic_signatures_feed_shared_java_and_kotlin_queries() {
         let mut workspace = crate::workspace::Workspace::new();
         let root = std::env::temp_dir().join(format!(

@@ -2927,7 +2927,7 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
  request.bounded(other)
  kotlin.bounded(other)
  request.variant(variant)
- request.boundedOwner(bounded)
+ request.boundedOwner(bounded)!!.service()
  variant.body()
  bounded.body()
  known.body()
@@ -2941,6 +2941,7 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
         "receiver.from(type)",
         "request.bounded(type)!!",
         "kotlin.bounded(type)!!",
+        "request.boundedOwner(bounded)!!",
     ] {
         assert_member(
             &mut ws,
@@ -2970,7 +2971,6 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
         "request.bounded(other)",
         "kotlin.bounded(other)",
         "request.variant(variant)",
-        "request.boundedOwner(bounded)",
         "request.invariantNested(pair)",
         "receiver.from(other)",
     ] {
@@ -7338,10 +7338,154 @@ fn method_bound_relations_keep_cycles_foreign_scopes_and_shadow_collisions_unkno
         "package probe; public class BoundApi { public <T extends S,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }",
         "package probe; public class BoundApi<T> { public <S extends T> S choose(Class<S> type) { return null; } }",
         "package probe; public class BoundApi<T> { public <T,S extends T> T choose(Class<T> type,Class<S> subType) { return null; } }",
-        "package probe; public class BoundApi { public <T,S extends java.util.List<T>> S choose(Class<T> type,Class<S> subType) { return null; } }",
     ] {
         let ws = workspace(&[("BoundApi.java", declaration)]);
         let entry = &ws.index.lookup_by_name("choose")[0];
         assert!(entry.sym.method_type_bounds.is_none(), "{declaration}: {:?}", entry.sym.method_type_bounds);
+    }
+}
+
+#[test]
+fn f_bounded_property_arguments_preserve_enum_result_across_languages() {
+    let source = workspace(&[
+        ("Object.java", "package java.lang; public class Object {}"),
+        ("Comparable.java", "package java.lang; public interface Comparable<T> { int compareTo(T other); }"),
+        ("Enum.java", "package java.lang; public abstract class Enum<E extends Enum<E>> implements Comparable<E> { public int compareTo(E other) { return 0; } }"),
+        ("Named.java", "package probe; public interface Named {}"),
+        ("Direction.java", "package probe; public class Direction { public enum Axis implements Named { X,Y,Z; public boolean isVertical() { return this==Y; } } }"),
+        ("Property.java", "package probe; public class Property<T extends Comparable<T>> {}"),
+        ("EnumProperty.java", "package probe; public class EnumProperty<T extends Enum<T> & Named> extends Property<T> {}"),
+        ("BlockStateProperties.java", "package probe; public class BlockStateProperties { public static final EnumProperty<Direction.Axis> AXIS = null; }"),
+        ("StateHolder.java", "package probe; public class StateHolder { public <T extends Comparable<T>> T getValue(Property<T> property) { return null; } }"),
+        ("BlockState.java", "package probe; public class BlockState extends StateHolder {}"),
+    ]);
+    let root = std::env::temp_dir().join(format!(
+        "ktlsp-f-bounds-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let key = |name: &str| ktlsp::paths::file_key(&root.join(name));
+    let mut ws = Workspace::new();
+    assert_eq!(ws.scan(&root), 0);
+    ws.set_library_index_complete(true);
+    ws.set_jdk_index_complete(true);
+    for file in source.open_doc_keys() {
+        ws.open(key(&file), source.doc_text(&file).unwrap());
+    }
+    for (file, source) in [
+        ("Use.java", "package probe; class Use { void use(BlockState state,Property<Direction.Axis> property) { state.getValue(property).isVertical(); state.getValue(BlockStateProperties.AXIS).isVertical(); } }"),
+        ("Use.kt", "package probe\nfun use(state:BlockState,property:Property<Direction.Axis>) { state.getValue(property).isVertical(); state.getValue(BlockStateProperties.AXIS).isVertical() }\n"),
+    ] {
+        let file = key(file);
+        ws.open(&file, source.into());
+            if file.ends_with(".kt") {
+            let actual = infer_expression(&ws, &file, "BlockStateProperties.AXIS");
+            assert_eq!(actual.name(), Some("EnumProperty"));
+            assert_eq!(actual.package(), Some("probe"));
+            assert_eq!(actual.args()[0].name(), Some("Axis"));
+            assert_eq!(actual.args()[0].container(), Some("Direction"));
+            let supertypes = infer::direct_supertypes(&ws.index, &actual);
+            assert_eq!(supertypes.len(), 1);
+            assert_eq!(supertypes[0].name(), Some("Property"));
+            assert_eq!(supertypes[0].args(), actual.args());
+        }
+        for expression in ["state.getValue(property)", "state.getValue(BlockStateProperties.AXIS)"] {
+            assert_member(&mut ws, &file, &format!("{expression}.isVert"), "isVertical", "missingAxisMethod");
+            let start = source.find(&format!("{expression}.isVertical")).unwrap() + expression.len() + 1;
+            let defs = ws.goto_definition(&file, start);
+            assert_eq!(defs.len(), 1, "{file}: {expression}: {defs:?}");
+            assert_eq!(defs[0].file, key("Direction.java"));
+            let target = ws.doc_text(&key("Direction.java")).unwrap();
+            assert_eq!(&target[defs[0].start_byte..defs[0].end_byte], "isVertical");
+            if file.ends_with(".kt") {
+                let result = infer_expression(&ws, &file, expression);
+                assert_eq!(result.name(), Some("Axis"), "{expression}: {result:?}");
+                assert_eq!(result.package(), Some("probe"));
+                assert_eq!(result.container(), Some("Direction"));
+            }
+        }
+    }
+    ws.open(key("KotlinStateHolder.kt"), "package probe\nclass KotlinStateHolder { fun <T:Comparable<T>> getValue(property:Property<T>):T = TODO() }\n".into());
+    ws.open(key("Nullable.kt"), "package probe\nfun invalid(state:KotlinStateHolder,property:EnumProperty<Direction.Axis>?) { state.getValue(property).isVertical() }\n".into());
+    assert_eq!(
+        infer_expression(&ws, &key("Nullable.kt"), "state.getValue(property)"),
+        Type::Unknown
+    );
+    assert!(!labels(
+        &mut ws,
+        &key("Nullable.kt"),
+        "state.getValue(property).isVert"
+    )
+    .contains("isVertical"));
+
+    // A visible matching path cannot conceal an unresolved or cyclic second path.
+    ws.open(
+        key("Loop.java"),
+        "package probe; public interface Loop<T> extends Loop<T> {}".into(),
+    );
+    for parents in ["Missing", "Loop<T>"] {
+        ws.open(key("EnumProperty.java"), format!("package probe; public class EnumProperty<T extends Enum<T> & Named> extends Property<T> implements {parents} {{}}"));
+        assert_eq!(
+            infer_expression(
+                &ws,
+                &key("Use.kt"),
+                "state.getValue(BlockStateProperties.AXIS)"
+            ),
+            Type::Unknown,
+            "{parents}"
+        );
+        for file in [key("Use.kt"), key("Use.java")] {
+            assert!(
+                !labels(
+                    &mut ws,
+                    &file,
+                    "state.getValue(BlockStateProperties.AXIS).isVert"
+                )
+                .contains("isVertical"),
+                "{file}: {parents}"
+            );
+        }
+    }
+    ws.open(key("EnumProperty.java"), "package probe; public class EnumProperty<T extends Enum<T> & Named> extends Property<T> {}".into());
+    for file in [key("Use.kt"), key("Use.java")] {
+        assert_member(
+            &mut ws,
+            &file,
+            "state.getValue(BlockStateProperties.AXIS).isVert",
+            "isVertical",
+            "missingAxisMethod",
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn nominal_method_f_bounds_retain_only_scoped_own_variables() {
+    for (file, declaration, parameter, head) in [
+        ("BoundApi.java", "package probe; public class BoundApi { public <T extends Comparable<T>> T choose(T value) { return value; } }", "T", "Comparable"),
+        ("BoundApi.kt", "package probe\nclass BoundApi { fun <T:Comparable<T>> choose(value:T):T = value }\n", "T", "Comparable"),
+        ("BoundApi.java", "package probe; public class BoundApi { public <T,S extends java.util.List<T>> S choose(Class<T> type,Class<S> subType) { return null; } }", "S", "List"),
+    ] {
+        let ws = workspace(&[(file, declaration)]);
+        let entry = &ws.index.lookup_by_name("choose")[0];
+        let bounds = entry.sym.method_type_bounds.as_deref().expect("scope-proven nominal F-bound");
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].0, parameter);
+        assert_eq!(bounds[0].1.name, head);
+        assert_eq!(bounds[0].1.args.len(), 1);
+        assert_eq!(bounds[0].1.args[0].name, "T");
+        assert!(bounds[0].1.args[0].qualification.is_none());
+    }
+    for declaration in [
+        "package probe; public class BoundApi<T> { public <S extends Comparable<T>> S choose(S value) { return value; } }",
+        "package probe; public class BoundApi<T> { public <T extends Comparable<T>> T choose(T value) { return value; } }",
+    ] {
+        let ws = workspace(&[("BoundApi.java", declaration)]);
+        assert!(ws.index.lookup_by_name("choose")[0].sym.method_type_bounds.is_none());
     }
 }

@@ -14,6 +14,8 @@ nested enum parameter. Missing or contradictory InnerClasses records keep that m
 `javac --release 17 -encoding UTF-8 -proc:none -sourcepath ""`, with the paired sources under
 `sources/genericfixture/` and a fresh external output directory. Box exercises class and method
 bounds, a method parameter shadowing a class parameter, fields, arrays, and wildcard variance.
+Its `bounded` method preserves `<V extends Comparable<V>> V bounded(V)` through binary Signature,
+stub projection, and Java/Kotlin completion and navigation; a non-Comparable argument stays unknown.
 Child specializes Box to Item; Holder exposes both a static and an instance generic field.
 Lexical keeps a class parameter's bound in its declaration scope under a same-named method
 parameter. Independent binary-only javac consumers accept the useful chains and reject calls
@@ -31,8 +33,8 @@ same compiler/options, together with `sources/shadowfixture/Base.java`. The vali
 nested return remains unavailable until nested binary names have source identity proof; its
 descriptor still proves zero parameters and blocks borrowing an ancestor's method. No test
 flattens `$` names or treats this missing useful return as successful coverage. Parameterized
-outer owners, method bounds referring to type variables (including F-bounds), and constructor
-implicit parameters remain separate gaps.
+outer owners and constructor implicit parameters remain separate cases from this bounded-method
+control. The F-bound control does not prove completeness of arbitrary recursive constraint systems.
 
 ## Compiler plugins and source callability
 
