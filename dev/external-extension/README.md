@@ -91,9 +91,16 @@ signatures. Use the same `corpus` command above with
 `KTLSP_CORPUS_EXTRA_PROBES` pointing to `dev/external-extension/shape-probes.lua`.
 Compile the Kotlin fixtures with the selected Kotlin compiler against the same
 Mixin artifact and Java fixture outputs; retain compiler/artifact identities.
-The additional group records `external-shape-proof.json` separately and remains
-under verification. Existing manifests/probe bytes and their denominators stay
-unchanged. Nominal identities do not establish generated enum/record members or
+The additional group records `external-shape-proof.json` separately. The combined
+original50 and additional40 requests passed on the25-2 checkpoint:90 first
+responses and144 semantic checks,0 mismatch/unmeasured/not-run, clean shutdown
+and stable input guards. Evidence is `external-public132-25/editor-receipt.json`
+under the run directory linked from [the current acceptance record](../../docs/fork-current.md).
+The independent crate's4 tests and normal build also passed against checkpoint26
+with its own unchanged lock (`external-public134-26/cargo-receipt.json`). These
+are recorded checkpoints, not a claim that later in-progress API changes have
+already been rebuilt or that the public API is frozen. Existing manifests/probe
+bytes and their denominators stay unchanged. Nominal identities do not establish generated enum/record members or
 object-owned callable lowering. Nullable, generic and value-class ABI shapes
 remain unsupported. Production Mixin integration, runtime/remapping, MixinExtras,
 Lapis and IDEA parity remain unproved.
