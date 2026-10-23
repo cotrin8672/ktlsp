@@ -35,16 +35,15 @@ impl AnalysisProvider for ShadowProvider {
             else {
                 continue;
             };
-            let spelling = &read.source()[owner.definition.start_byte..owner.definition.end_byte];
-            let owner_type = read.resolve_type(&format!("{package}.{spelling}"));
-            if !matches!(owner_type, Knowledge::Found(ref ty) if ty.definition() == &owner.definition)
-            {
+            let declaration =
+                read.declaration(owner.definition.start_byte..owner.definition.end_byte)?;
+            let Knowledge::Found(owner_type) = read.declaration_type(&declaration)? else {
+                continue;
+            };
+            if owner_type.package() != package {
                 continue;
             }
-            let own_members = match &owner_type {
-                Knowledge::Found(owner) => read.declared_members(owner)?.0,
-                _ => continue,
-            };
+            let own_members = read.declared_members(&owner_type)?.0;
             let Some(value) = mixin.arguments.iter().find(|argument| {
                 argument.name.is_none() || argument.name.as_deref() == Some("value")
             }) else {
@@ -148,6 +147,16 @@ mod tests {
 
     #[test]
     fn real_source_annotations_bind_and_target_edits_retract() {
+        let source = include_str!("../project/fixture/CaseMixin.java")
+            .replace(
+                "@Mixin(Target.class)",
+                "class Outer {\n@Mixin(Target.class)",
+            )
+            .replace(
+                "public abstract class CaseMixin",
+                "public abstract static class CaseMixin",
+            )
+            + "\n}\n";
         let mut workspace =
             ktlsp::workspace::Workspace::with_analysis_providers(vec![Arc::new(ShadowProvider)]);
         for (file, source) in [
@@ -163,18 +172,28 @@ mod tests {
                 "Target.java",
                 include_str!("../project/fixture/Target.java"),
             ),
-            (
-                "CaseMixin.java",
-                include_str!("../project/fixture/CaseMixin.java"),
-            ),
+            ("CaseMixin.java", source.as_str()),
         ] {
             workspace.open(file, source.into());
         }
-        let source = include_str!("../project/fixture/CaseMixin.java");
         let offset = source.find("shadow$twice").unwrap() + "shadow$".len();
         let targets = workspace.goto_definition("CaseMixin.java", offset);
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].file, "Target.java");
+        assert!(workspace.configure_analysis_provider(
+            PROVIDER,
+            true,
+            Arc::from(r#"{"mixinPackage":"fixture.Outer"}"#),
+        ));
+        assert!(workspace
+            .goto_definition("CaseMixin.java", offset)
+            .iter()
+            .all(|target| target.file != "Target.java"));
+        assert!(workspace.configure_analysis_provider(PROVIDER, true, Arc::from("{}")));
+        assert!(workspace
+            .goto_definition("CaseMixin.java", offset)
+            .iter()
+            .any(|target| target.file == "Target.java"));
         workspace.change(
             "Target.java",
             include_str!("../project/fixture/Target.java").replace("twice", "changed"),

@@ -285,6 +285,10 @@ impl TypeId {
     pub fn qualified_name(&self) -> &str {
         &self.qualified_name
     }
+
+    pub fn package(&self) -> &str {
+        &self.package
+    }
 }
 
 /// A target identity is distinct from the authored declaration that requests a binding.

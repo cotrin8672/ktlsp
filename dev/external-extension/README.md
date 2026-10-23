@@ -12,6 +12,10 @@ index, and binds `@Shadow(prefix = "shadow$")` using the exact authored JVM
 signature and dispatch. It supplies no target identities, invented signatures,
 feature-specific completion results, or diagnostic suppression.
 
+Authored owners use `declaration(range)` followed by `declaration_type(&id)`;
+the provider does not reconstruct a qualified type name from source spelling.
+`TypeId::package()` preserves the configured exact package filter for nested owners.
+
 The committed Java annotation declarations are a reduced API subset. They are
 only a convenient unit-test input and implement no bytecode transformation.
 The native integration control must instead use an actual Mixin artifact:
@@ -98,9 +102,15 @@ and stable input guards. Evidence is `external-public132-25/editor-receipt.json`
 under the run directory linked from [the current acceptance record](../../docs/fork-current.md).
 The independent crate's4 tests and normal build also passed against checkpoint26
 with its own unchanged lock (`external-public134-26/cargo-receipt.json`). These
-are recorded checkpoints, not a claim that later in-progress API changes have
-already been rebuilt or that the public API is frozen. Existing manifests/probe
-bytes and their denominators stay unchanged. Nominal identities do not establish generated enum/record members or
+are recorded checkpoints, not a stable API promise. The later exact-declaration
+consumer was rebuilt with its original own lock:4 tests and normal build pass,
+including a nested owner and exact package-filter withdrawal/restoration. Its
+independent executable also passes the unchanged90 first-response requests and
+144 semantic checks with clean shutdown, stable guards, EOF and zero live/forced
+owned processes. Evidence: `external-public140-30/cargo-receipt.json` and
+`external-public140-30/editor-receipt.json` under the same run directory.
+Existing manifests/probe bytes and their denominators stay unchanged.
+Nominal identities do not establish generated enum/record members or
 object-owned callable lowering. Nullable, generic and value-class ABI shapes
 remain unsupported. Production Mixin integration, runtime/remapping, MixinExtras,
 Lapis and IDEA parity remain unproved.
