@@ -1409,8 +1409,147 @@ fn constructor_initializers_do_not_borrow_their_own_local_binder() {
             "{source}"
         );
     }
-}
+    ws.open(
+        "Built.java",
+        "package external; public class Built { public Built() {} public void useful() {} }".into(),
+    );
+    ws.open(
+        "Generic.java",
+        "package external; public class Generic<T> { public Generic() {} public void useful() {} }"
+            .into(),
+    );
+    ws.open(
+        "Contract.java",
+        "package external; public interface Contract { void useful(); }".into(),
+    );
+    ws.open(
+        "Singleton.kt",
+        "package external\nobject Singleton { fun useful() {} }".into(),
+    );
+    ws.open(
+        "Choice.java",
+        "package external; public enum Choice { VALUE; public void useful() {} }".into(),
+    );
+    let source = "package app\nfun run() { val built = external.Built(); built.useful() }";
+    ws.change("Use.kt", source.into());
+    assert_member(&mut ws, "Use.kt", "built.", "useful", "poisoned");
+    assert_exact_definition(&mut ws, "Use.kt", "built.useful()", "Built.java", "useful");
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "external.Built()"),
+        Type::class("Built", Some("external".into()))
+    );
+    for source in [
+        "package app\nfun run(external: Item) { val built = external.Built(); built.useful() }",
+        "package app\nfun run() { val external = missing; val built = external.Built(); built.useful() }",
+        "package app\nval external = missing\nfun run() { val built = external.Built(); built.useful() }",
+        "package app\nimport app.Other as external\nfun run() { val built = external.Built(); built.useful() }",
+        "package app\nfun Missing.run() { val built = external.Built(); built.useful() }",
+        "package app\nfun run() { val built = external.Generic(); built.useful() }",
+        "package app\nfun run() { val built = external.Contract(); built.useful() }",
+        "package app\nfun run() { val built = external.Singleton(); built.useful() }",
+        "package app\nfun run() { val built = external.Choice(); built.useful() }",
+        "package app\nfun run() { val built = external.Built(unknown); built.useful() }",
+    ] {
+        ws.change("Use.kt", source.into());
+        assert!(
+            !labels(&mut ws, "Use.kt", "built.").contains("useful"),
+            "{source}"
+        );
+    }
+    let bare = "package app\nfun run() { val bare = external.Built }";
+    ws.change("Use.kt", bare.into());
+    let position = bare.find("external.Built").unwrap() + "external.".len();
+    assert!(ws.goto_definition("Use.kt", position).is_empty());
+    ws.open(
+        "Duplicate.java",
+        "package external; public class Built { public Built() {} public void useful() {} }".into(),
+    );
+    ws.change(
+        "Use.kt",
+        "package app\nfun run() { val built = external.Built(); built.useful() }".into(),
+    );
+    assert!(labels(&mut ws, "Use.kt", "built.").is_empty());
 
+    let mut overloaded = workspace(&[
+        (
+            "Built.java",
+            "package p; public class Built { public <T> Built(T value) {} }",
+        ),
+        (
+            "Use.kt",
+            "package p\nclass Other { fun otherOnly() {} }\nfun Built(): Other = Other()\nfun use() { p.Built().otherOnly() }",
+        ),
+    ]);
+    assert_member(
+        &mut overloaded,
+        "Use.kt",
+        "p.Built().",
+        "otherOnly",
+        "poisoned",
+    );
+    let mut visibility = workspace(&[
+        (
+            "Built.java",
+            "package p; public class Built { public Built() {} public void useful() {} }",
+        ),
+        (
+            "Hidden.kt",
+            "package p\nclass Other { fun otherOnly() {} }\nprivate fun Built(): Other = Other()",
+        ),
+        (
+            "HiddenOuter.java",
+            "package p; class HiddenOuter { public static class Built { public Built() {} public void useful() {} } }",
+        ),
+        (
+            "PublicOuter.java",
+            "package p; public class PublicOuter { public static class Built { public Built() {} public void useful() {} } }",
+        ),
+        (
+            "Use.kt",
+            "package app\nfun use() { p.Built().useful() }",
+        ),
+    ]);
+    assert_member(
+        &mut visibility,
+        "Use.kt",
+        "p.Built().",
+        "useful",
+        "otherOnly",
+    );
+    visibility.change(
+        "Use.kt",
+        "package app\nfun use() { p.PublicOuter.Built().useful() }".into(),
+    );
+    assert_member(
+        &mut visibility,
+        "Use.kt",
+        "p.PublicOuter.Built().",
+        "useful",
+        "poisoned",
+    );
+    visibility.change(
+        "Use.kt",
+        "package app\nfun use() { p.HiddenOuter.Built().useful() }".into(),
+    );
+    assert!(labels(&mut visibility, "Use.kt", "p.HiddenOuter.Built().").is_empty());
+    visibility.change(
+        "Hidden.kt",
+        "package p\nclass Other { fun otherOnly() {} }\nprivate fun Built(): Other = Other()\nfun use() { p.Built().otherOnly() }".into(),
+    );
+    assert!(labels(&mut visibility, "Hidden.kt", "p.Built().").is_empty());
+    visibility.change(
+        "Built.java",
+        "package p; public class Built { public <T> Built(T value) {} public void useful() {} }"
+            .into(),
+    );
+    assert_member(
+        &mut visibility,
+        "Hidden.kt",
+        "p.Built().",
+        "otherOnly",
+        "useful",
+    );
+}
 #[test]
 fn java_declarations_keep_type_parameters_and_structured_type_arguments() {
     let src = "package app; import model.Item; public class Box<T> { public <U> U pick(U value) { return value; } public Box<Item> make() { return null; } public Box<model.Outer.Inner> nested; }";

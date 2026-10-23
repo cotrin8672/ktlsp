@@ -2213,6 +2213,11 @@ fn infer_call(
         }
         // Method call `recv.method(...)`: infer recv, then method's return type on that type.
         "navigation_expression" => {
+            if let Some(constructed) =
+                qualified_constructor_call_type(index, node, callee, src, ctx, depth, child_infer)
+            {
+                return constructed;
+            }
             let (Some(recv), Some(sel)) = (callee.named_child(0), callee.named_child(1)) else {
                 return Type::Unknown;
             };
@@ -2345,6 +2350,133 @@ pub fn function_value_call_type(
     Some(args[arity].clone())
 }
 
+/// A qualified classifier needs the same root-absence proof as static navigation, plus an
+/// accessible, applicable constructor. Unsupported generic construction stays unknown.
+fn qualified_constructor_call_type(
+    index: &dyn InferenceIndex,
+    call: Node,
+    callee: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Option<Type> {
+    let receiver = resolve::qualified_type_receiver(index, callee, src, ctx)?;
+    let declaration = type_declaration(index, &receiver)?;
+    if declaration.sym.kind != SymbolKind::Class
+        || !type_declaration_parameters(index, &receiver)?.is_empty()
+        || declaration.sym.container.is_some()
+            && declaration.sym.source_member.dispatch() != Some(crate::extensions::Dispatch::Static)
+    {
+        return None;
+    }
+    if !qualified_constructor_path_accessible(index, &receiver, ctx, callee.start_byte()) {
+        return Some(Type::Unknown);
+    }
+    let owner = receiver_root_key(index, &receiver)?;
+    let mut entries: Vec<_> = index
+        .members_of(&owner)
+        .iter()
+        .filter(|entry| {
+            entry.sym.package == declaration.sym.package
+                && entry.sym.container.as_deref() == Some(owner.as_str())
+                && entry.sym.source_member.implementation()
+                    == Some(crate::symbol::MemberImplementation::Constructor)
+                && !entry.sym.source_member.jvm_restricted()
+                && members::member_accessible_at(index, &receiver, entry, ctx, callee.start_byte())
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    entries.extend(
+        index
+            .lookup_by_name(&declaration.sym.name)
+            .iter()
+            .filter(|entry| {
+                entry.sym.kind == SymbolKind::Function
+                    && entry.sym.package == declaration.sym.package
+                    && entry.sym.container.is_none()
+                    && entry.sym.ext_receiver.is_none()
+                    && qualified_declaration_accessible_at(
+                        index,
+                        &receiver,
+                        entry,
+                        ctx,
+                        callee.start_byte(),
+                    )
+            }),
+    );
+    let arguments = normalized_call_arguments(
+        call,
+        src,
+        synth_arg_types(index, call, src, ctx, depth, child_infer),
+    );
+    let selection = members::select_functions(index, entries, &MemberUse::Call(arguments), ctx);
+    if selection.applicability != members::Applicability::Applicable || selection.entries.len() != 1
+    {
+        return Some(Type::Unknown);
+    }
+    let selected = selection.entries[0];
+    if selected.sym.source_member.implementation()
+        != Some(crate::symbol::MemberImplementation::Constructor)
+    {
+        return None;
+    }
+    Some(if selected.sym.type_params.is_empty() {
+        receiver
+    } else {
+        Type::Unknown
+    })
+}
+
+fn qualified_declaration_accessible_at(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    ctx: &FileCtx,
+    position: usize,
+) -> bool {
+    if entry.sym.container.is_none()
+        && entry.sym.source_member.visibility() == Some(crate::extensions::Visibility::Private)
+    {
+        return ctx.file() == Some(entry.path.as_ref());
+    }
+    members::member_accessible_at(index, receiver, entry, ctx, position)
+}
+
+fn qualified_constructor_path_accessible(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    ctx: &FileCtx,
+    position: usize,
+) -> bool {
+    let mut current = receiver.clone();
+    loop {
+        let Some(declaration) = type_declaration(index, &current) else {
+            return false;
+        };
+        if !qualified_declaration_accessible_at(index, &current, declaration, ctx, position) {
+            return false;
+        }
+        let Some(container) = current.container() else {
+            return true;
+        };
+        let (container, name) = container
+            .rsplit_once('.')
+            .map_or((None, container), |(container, name)| {
+                (Some(container), name)
+            });
+        current = Type::Class {
+            name: name.into(),
+            package: current.package().map(Into::into),
+            container: container.map(Into::into),
+            nullable: false,
+            args: Vec::new(),
+            owner: None,
+        };
+    }
+}
 /// Both visible and package-qualified free calls use the same selected signature and bindings.
 fn free_function_call_type(
     index: &dyn InferenceIndex,

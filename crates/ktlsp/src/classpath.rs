@@ -1265,7 +1265,7 @@ impl ProjectSnapshot {
     }
 }
 
-fn sdk_feature_version(release: &str) -> Option<u16> {
+pub(crate) fn sdk_feature_version(release: &str) -> Option<u16> {
     let mut versions = release
         .lines()
         .filter_map(|line| line.trim().strip_prefix("JAVA_VERSION="));
@@ -1305,7 +1305,7 @@ fn sdk_feature_version(release: &str) -> Option<u16> {
 }
 
 // Kotlin's selected compiler accepts the legacy spelling only for Java 8.
-fn kotlin_jdk_release_feature(value: &str) -> Option<u16> {
+pub(crate) fn kotlin_jdk_release_feature(value: &str) -> Option<u16> {
     if value == "1.8" {
         Some(8)
     } else {

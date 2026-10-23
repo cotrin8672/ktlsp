@@ -3918,6 +3918,10 @@ impl KotlinDiagnosticEnvironment {
         if let Some(home) = &key.java_home {
             anyhow::ensure!(home.is_absolute(), "compiler-target-jdk-relative");
             inputs.insert(home.join("release"));
+            if key.arguments.iter().any(|a| a.starts_with("-Xjdk-release=")) {
+                // Unlike bytecode target alone, release reads this selected SDK's API signatures.
+                inputs.insert(home.join("lib/ct.sym"));
+            }
             if home.join("lib/modules").is_file() {
                 inputs.extend([home.join("lib/modules"), home.join("lib/jrt-fs.jar")]);
             } else {
@@ -4094,6 +4098,7 @@ fn kotlin_editor_arguments(
     let mut sdk = false;
     let mut explicit_classpath = false;
     let mut jvm_abi_output = false;
+    let mut jdk_release = None;
     let path_separator = if cfg!(windows) { ';' } else { ':' };
     for path in &request.task.classpath {
         anyhow::ensure!(path.is_absolute(), "kotlin-relative-target-classpath");
@@ -4234,10 +4239,37 @@ fn kotlin_editor_arguments(
             | "-Xjvm-default=compatibility"
             | "-Xallow-no-source-files"
             | "-java-parameters"
+            | "-Xsam-conversions=class"
             | "-Xsuppress-version-warnings"
             | "-Xjsr305=strict"
             | "-opt-in=kotlin.RequiresOptIn"
             | "-Xexplicit-api=strict" => result.push(argument.clone()),
+            _ if argument.starts_with("-Xjdk-release=") => {
+                let value = argument.strip_prefix("-Xjdk-release=").unwrap();
+                let feature = crate::classpath::kotlin_jdk_release_feature(value)
+                    .ok_or_else(|| anyhow::anyhow!("kotlin-jdk-release-unhandled"))?;
+                let home = request
+                    .task
+                    .java_home
+                    .as_ref()
+                    .filter(|home| home.is_absolute())
+                    .ok_or_else(|| anyhow::anyhow!("kotlin-jdk-release-sdk-unknown"))?;
+                let bytes = std::fs::read(home.join("release"))?;
+                anyhow::ensure!(bytes.len() <= 64 * 1024, "kotlin-jdk-release-sdk-unhandled");
+                let sdk_feature =
+                    crate::classpath::sdk_feature_version(std::str::from_utf8(&bytes)?)
+                        .ok_or_else(|| anyhow::anyhow!("kotlin-jdk-release-sdk-unhandled"))?;
+                anyhow::ensure!(
+                    jdk_release.is_none()
+                        && (value == "1.8" || value == feature.to_string())
+                        && feature >= 8
+                        && feature <= sdk_feature
+                        && home.join("lib/ct.sym").is_file(),
+                    "kotlin-jdk-release-unhandled"
+                );
+                jdk_release = Some(feature);
+                result.push(argument.clone());
+            }
             _ if argument.starts_with("-Xplugin=") => {
                 kotlin_plugin_paths(std::slice::from_ref(argument))?;
                 result.push(argument.clone());
@@ -4256,6 +4288,19 @@ fn kotlin_editor_arguments(
     );
     let no_jdk = request.task.arguments.iter().any(|a| a == "-no-jdk");
     anyhow::ensure!(!(sdk && no_jdk), "kotlin-conflicting-sdk-arguments");
+    if let Some(release) = jdk_release {
+        let targets: Vec<_> = request
+            .task
+            .arguments
+            .windows(2)
+            .filter(|a| a[0] == "-jvm-target")
+            .map(|a| crate::classpath::kotlin_jdk_release_feature(&a[1]))
+            .collect();
+        anyhow::ensure!(
+            !no_jdk && targets == [Some(release)],
+            "kotlin-jdk-release-target-conflict"
+        );
+    }
     if !sdk && !no_jdk {
         let home = request
             .task
@@ -5281,7 +5326,7 @@ mod kotlin_editor_compile_tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(
             &source,
-            "package fixture\nclass Sample { fun value(): String = \"current\" }\n",
+            "package fixture\npublic class Sample {\n public fun value(): String = java.util.Base64.getEncoder().encodeToString(byteArrayOf(1))\n public fun task(): Runnable = Runnable { value() }\n}\n",
         )
         .unwrap();
         let mut request = kotlin_test_request(&root);
@@ -5293,10 +5338,17 @@ mod kotlin_editor_compile_tests {
         recipe.default_classpath = runtime;
         recipe.gradle_java_home = sdk.clone();
         recipe.toolchain_java_home = sdk.clone();
-        request
+        request.task.arguments =
+            serde_json::from_str(&std::env::var("KTLSP_JVM_ABI_TEST_ARGUMENTS").unwrap()).unwrap();
+        let destination = request
             .task
             .arguments
-            .retain(|a| !a.starts_with("-Xplugin="));
+            .iter()
+            .position(|a| a == "-d")
+            .unwrap()
+            + 1;
+        request.task.arguments[destination] =
+            request.task.output_roots[0].to_string_lossy().into_owned();
         let original_abi = root.join("build/generated/kotlin-abi");
         std::fs::create_dir_all(&original_abi).unwrap();
         let sentinel = original_abi.join("keep.bin");
@@ -5305,11 +5357,14 @@ mod kotlin_editor_compile_tests {
             "plugin:org.jetbrains.kotlin.jvm.abi:outputDir={}",
             original_abi.display()
         );
-        request.task.arguments.extend([
-            format!("-Xplugin={}", plugin.display()),
-            "-P".into(),
-            option.clone(),
-        ]);
+        let option_index = request
+            .task
+            .arguments
+            .iter()
+            .position(|a| a == "-P")
+            .unwrap()
+            + 1;
+        request.task.arguments[option_index] = option.clone();
         let selected = request.task.arguments.clone();
         let arguments =
             kotlin_editor_arguments(&request, &private, std::slice::from_ref(&source)).unwrap();
@@ -5327,31 +5382,51 @@ mod kotlin_editor_compile_tests {
             .iter()
             .any(|a| a.contains(original_abi.to_str().unwrap())));
         assert!(!abi_output.starts_with(&root));
-        let args_file = directory.0.join("compiler.args");
-        std::fs::write(&args_file, kotlin_argument_file(&arguments).unwrap()).unwrap();
-        let mut command = Command::new(sdk.join(if cfg!(windows) {
-            "bin/java.exe"
-        } else {
-            "bin/java"
-        }));
-        command
-            .arg("-cp")
-            .arg(compiler_cp)
-            .arg("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
-            .arg(format!("@{}", args_file.display()));
-        #[cfg(windows)]
-        {
-            let (status, interrupted, out, out_complete, err, err_complete) =
-                OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)
-                    .unwrap()
-                    .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
-            assert!(!interrupted && out_complete && err_complete, "{out}\n{err}");
-            assert_eq!(status.code(), Some(0), "{out}\n{err}");
+        for flag in ["-Xjdk-release=1.8", "-Xsam-conversions=class", "-Werror"] {
+            assert_eq!(arguments.iter().filter(|a| a.as_str() == flag).count(), 1);
         }
-        #[cfg(not(windows))]
-        assert!(command.status().unwrap().success());
+        let run = |arguments: &[String], name: &str, expected: i32| {
+            let args_file = directory.0.join(format!("{name}.args"));
+            std::fs::write(&args_file, kotlin_argument_file(arguments).unwrap()).unwrap();
+            let mut command = Command::new(sdk.join(if cfg!(windows) {
+                "bin/java.exe"
+            } else {
+                "bin/java"
+            }));
+            command
+                .arg("-cp")
+                .arg(&compiler_cp)
+                .arg("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
+                .arg(format!("@{}", args_file.display()));
+            #[cfg(windows)]
+            {
+                let (status, interrupted, out, out_complete, err, err_complete) =
+                    OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)
+                        .unwrap()
+                        .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
+                assert!(!interrupted && out_complete && err_complete, "{out}\n{err}");
+                assert_eq!(status.code(), Some(expected), "{out}\n{err}");
+                format!("{out}\n{err}")
+            }
+            #[cfg(not(windows))]
+            {
+                let output = command.output().unwrap();
+                assert_eq!(output.status.code(), Some(expected));
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            }
+        };
+        run(&arguments, "release8", 0);
         for output in [&private, &abi_output] {
             let bytes = std::fs::read(output.join("fixture/Sample.class")).unwrap();
+            assert_eq!(
+                &bytes[6..8],
+                &[0, 52],
+                "normal and ABI retain Java 8 bytecode"
+            );
             assert_eq!(
                 ktcore::classfile::decode("actual-jvm-abi", &bytes)
                     .unwrap()
@@ -5360,6 +5435,74 @@ mod kotlin_editor_compile_tests {
                 "fixture/Sample"
             );
         }
+        assert!(
+            private.join("fixture/Sample$task$1.class").is_file(),
+            "selected SAM class mode is executed"
+        );
+        let modern = root.join("src/Modern.kt");
+        std::fs::write(&modern, "package fixture\npublic class Modern { public fun value(): String = java.util.HexFormat.of().formatHex(byteArrayOf(1)) }\n").unwrap();
+        let restricted = kotlin_editor_arguments(
+            &request,
+            &directory.0.join("request/restricted"),
+            std::slice::from_ref(&modern),
+        )
+        .unwrap();
+        assert!(run(&restricted, "release8-rejects-jdk17", 1).contains("HexFormat"));
+        let mut unrestricted = request.clone();
+        unrestricted
+            .task
+            .arguments
+            .retain(|a| !a.starts_with("-Xjdk-release="));
+        let unrestricted_output = directory.0.join("request/unrestricted");
+        let unrestricted_args =
+            kotlin_editor_arguments(&unrestricted, &unrestricted_output, &[modern]).unwrap();
+        run(&unrestricted_args, "target8-still-sees-selected-jdk17", 0);
+        assert!(unrestricted_output.join("fixture/Modern.class").is_file());
+        // Observe an actual selected ct.sym replacement without modifying the installed SDK.
+        let copied_sdk = directory.0.join("selected-sdk");
+        std::fs::create_dir_all(copied_sdk.join("lib")).unwrap();
+        std::fs::copy(sdk.join("release"), copied_sdk.join("release")).unwrap();
+        for name in ["modules", "jrt-fs.jar"] {
+            std::fs::copy(
+                sdk.join("lib").join(name),
+                copied_sdk.join("lib").join(name),
+            )
+            .unwrap();
+        }
+        let signatures = copied_sdk.join("lib/ct.sym");
+        std::fs::copy(sdk.join("lib/ct.sym"), &signatures).unwrap();
+        let mut watched = request.clone();
+        watched.task.java_home = Some(copied_sdk.clone());
+        watched
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .toolchain_java_home = copied_sdk;
+        let (wake, _receiver) = tokio::sync::mpsc::channel(1);
+        let environment = KotlinDiagnosticEnvironment::prepare(&watched, wake).unwrap();
+        assert!(environment
+            .stamps
+            .iter()
+            .any(|(path, _)| path == &signatures));
+        environment.check_live().unwrap();
+        std::fs::write(&signatures, b"replaced selected SDK signatures").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !environment
+            .invalid
+            .load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            environment
+                .invalid
+                .load(std::sync::atomic::Ordering::Acquire),
+            "retained signature input watch must retire authority"
+        );
+        assert!(environment.check_live().is_err());
+        environment.close();
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"original-build-output");
         assert_eq!(std::fs::read_dir(&original_abi).unwrap().count(), 1);
         assert!(!request.task.output_roots[0].exists());
@@ -5374,8 +5517,33 @@ mod kotlin_editor_compile_tests {
             format!("{option}\n"),
         ] {
             let mut changed = request.clone();
-            *changed.task.arguments.last_mut().unwrap() = bad;
+            changed.task.arguments[option_index] = bad;
             assert!(kotlin_editor_arguments(&changed, &private, &[]).is_err());
+        }
+        for bad in [
+            "-Xjdk-release=999",
+            "-Xjdk-release=1.9",
+            "-Xjdk-release=17",
+            "-Xjdk-release=1.8\n",
+            "-Xsam-conversions=indy",
+            "-Xsam-conversions=unknown",
+        ] {
+            let mut changed = request.clone();
+            let prefix = if bad.starts_with("-Xjdk") {
+                "-Xjdk-release="
+            } else {
+                "-Xsam-conversions="
+            };
+            *changed
+                .task
+                .arguments
+                .iter_mut()
+                .find(|a| a.starts_with(prefix))
+                .unwrap() = bad.into();
+            assert!(
+                kotlin_editor_arguments(&changed, &private, &[]).is_err(),
+                "{bad}"
+            );
         }
         let mut changed = request.clone();
         changed.task.arguments.extend(["-P".into(), option.clone()]);

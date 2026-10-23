@@ -10,6 +10,43 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
+### Slice137/138: qualified construction and selected Java API release
+
+Joint28 passes1804 Rust tests,0 failed,10 ignored across42 targets and the
+release build;577 guarded inputs remain stable. Immutable binary SHA256:
+`ca2d75b86ab04773742bd7bda1ecad9bece50df569c3ec3eb7f84c659254961d`.
+
+Qualified construction now uses the existing unshadowed classifier proof and
+shared overload selection. It checks constructor access, file-private competing
+functions and every enclosing classifier's access. Unsupported generic/inner
+construction remains Unknown. `fqn-ctor137-green3/receipt.json` covers the useful
+result plus namespace, ambiguity and visibility controls in the existing interop
+test. Independent Javac/K2 oracles retain the generic-constructor/free-function
+and hidden-outer-class counterexamples, including the genuinely ambiguous case.
+
+The selected Kotlin compiler's `-Xjdk-release=1.8` and `-Xsam-conversions=class`
+are preserved. Release/target/selected-SDK consistency is validated and `ct.sym`
+becomes a retained diagnostic input. `jvm-abi138-green2/receipt.json` passes the
+actual native compile plus5 existing argument tests: Java8 API and SAM-class
+output succeed, Java17-only API fails with release8 but succeeds without that
+restriction, ABI output stays private, and replacing selected SDK signatures
+invalidates authority. The earlier Windows hard-link setup failure is retained;
+the successful test copies actual SDK files into its private directory.
+
+The original Moshi6 control now closes6/6 first responses on joint28,0 mismatch
+or unmeasured result, stable source guards and clean shutdown/EOF/live0, without
+generating the missing original producer JAR
+(`shared-edit137-release28/m-atomic-distinct1/receipt.json`). The generated probe
+manifest is byte-identical to the previous27 control. Gradle17 remains in progress.
+Gradle27 closed with14 matched first responses and3
+unmeasured canonical diagnostics,0 semantic mismatch, clean shutdown/EOF and
+stable guards (`gradle-shared134-native27/receipt.json`). The unsupported release
+flag prevented those3 diagnostic requests from starting. Spring's analogous
+unmeasured check is an incomplete compiler model caused by missing genuine
+repackaged dependency outputs. Its focused private-source Gradle build now passes
+(`spring-prereq138-build1/receipt.json`), with10861 tracked files unchanged and
+clean EOF/live0. Fresh model capture and editor diagnostics remain pending.
+
 ### Slice134/136: ABI output isolation and SDK facts with incomplete dependencies
 
 Two reproduced real-project gaps now have focused fixes. Joint27 passes1804 Rust
