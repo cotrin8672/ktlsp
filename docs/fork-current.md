@@ -26,7 +26,8 @@ cleanup. Runtime editor processes close normally without forced termination.
 | Failed-source binary APIs |9/9 original checks; stronger Persister singleton/range audit also passes without additional RPC |
 | Actual CEM FQN getValue |8/8 checks;6 first RPCs |
 | TypeTools overload |4/4 first responses; sole compiler-selected Class/Class declaration |
-| Original CEM scenario |Normal phase has7 semantic matches,0 mismatches,2 unmeasured compiler checks; incomplete phase not run |
+| Original CEM, first parallel observation |Normal phase has7 semantic matches,0 mismatches,2 unmeasured compiler checks; incomplete phase not run |
+| Original CEM, isolated model control |26/26 assertions;11 first responses, same binary/expectations/observation budget |
 
 Captured outer class type variables now reach method bounds through exact lexical
 ancestor scopes. Existing owner-instance substitution proves actual type arguments;
@@ -58,19 +59,28 @@ the new rejection guard accidentally blocked an existing unbounded Class<T> nomi
 head proof. Its restoration passes all five focused controls and the full24-2 suite.
 No old Spring expectation was weakened.
 
-Current CEM gap is explicit: its canonical Java diagnostic receipt was not accepted,
-so manual pull count is0 and two diagnostic checks are unmeasured, not semantic
-mismatches or a passing timeout result. Read-only investigation sees
-`stale-kotlin-source` then `kotlin-project-model-pending`; whether refresh completion
-reenqueues the compiler work is under investigation. The original failed run is
-preserved and was not retried. CEM's separate completion/navigation checks above pass.
+CEM's first parallel observation remains explicit: its canonical Java diagnostic
+receipt was not accepted, so manual pull count is0 and two checks are unmeasured,
+not semantic mismatches or a passing timeout result. A NeoForge jar change
+notification invalidates compiler inputs, followed by `stale-kotlin-source` and
+`kotlin-project-model-pending`. Generation2 indexing is not observed to finish
+within that observation; permanent queue loss is not established.
+After every other editor process closes, a separate isolated control passes the
+unchanged normal/incomplete26 assertions and11 first responses, including canonical
+Java diagnostics. Its jar bytes, SHA and mtime remain unchanged before/after.
+The original unmeasured run is preserved, and the control is not presented as that
+run's first-pass success. No product change or extended observation budget was used
+to obtain the control result. The effect of overlapping model refresh remains a
+separate investigation rather than a proven compiler correctness regression.
 
 Evidence: `native-integrated120-24-2`, `java-kotlin-msc121-release24`,
 `final-corpus120-24/summary50.json`, `captured-owner128-native24/receipt.json`,
 `fallback-api128/release24-2-summary.json` and its Persister singleton post-audit,
 `cem-getvalue122-native-release24/receipt.json`,
 `oracle120/typetools-editor-release24-strict1/strict-audit.json`,
-`cem-startup120/editor-original26-release24-serial1`, and
+`cem-startup120/editor-original26-release24-serial1`,
+`cem-startup120/editor-original26-release24-stable-model1`,
+`cem-startup120/stable-model24-control-audit.json`, and
 `captured-owner128-final.json`. Nullable override and independent-argument compiler
 oracles: `generic-nullability128-oracle1`, `persister129-independent-oracle1`.
 
@@ -81,6 +91,9 @@ path. The original23 REDs and both baseline cache inventories remain unchanged.
 Retrofit/Spring source-text failures remain6/11 respectively; usable binary API
 facts do not make those source texts available. No new warm, memory, general
 compiler-plugin or IDEA-parity claim is made. Valid-code Unknown gaps remain.
+Next: independently classify remaining projected/expected-type generic Unknown
+guards with Javac/Kotlin, then fix the highest-impact valid call without weakening
+the unsupported-input controls.
 
 ### Previous checkpoint120-23
 
