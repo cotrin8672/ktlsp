@@ -48,6 +48,18 @@ return function(env)
   for stage, files in pairs(snapshots) do
     for _, key in ipairs(order) do assert(hash(files[key]) == spec.stages[stage][key].sha256, 'whole-buffer oracle changed') end
   end
+  local diagnostic_snapshots
+  if spec.diagnostic_cycle then
+    assert(canonical, 'diagnostic cycle requires the canonical Kotlin diagnostic route')
+    diagnostic_snapshots = {
+      invalid = { producer = original.producer, consumer = split(table.concat(original.consumer, '\n') .. '\n\n' .. spec.diagnostic_cycle.consumer) },
+      fixed = original,
+    }
+    for phase, files in pairs(diagnostic_snapshots) do
+      assert(hash(files.consumer) == spec.diagnostic_cycle.source_sha256[phase], 'diagnostic whole-buffer oracle changed')
+    end
+    assert(not vim.deep_equal(diagnostic_snapshots.invalid.consumer, original.consumer), 'invalid diagnostic snapshot must change the consumer')
+  end
   local notify, rpc_request, raw_rename = client.rpc.notify, client.rpc.request
   client.rpc.notify = function(method, params)
     local sent = notify(method, params)
@@ -93,6 +105,14 @@ return function(env)
     local row = { case = 'shared-edit:' .. item[1], method = 'textDocument/' .. item[2], attempts = 0, outcome = 'not-run' }
     planned[item[1]] = row
     table.insert(env.request_outcomes, row)
+  end
+  if diagnostic_snapshots then
+    for _, phase in ipairs({ 'invalid', 'fixed' }) do
+      local name = phase .. '-diagnostics'
+      local row = { case = 'shared-edit:' .. name, method = 'textDocument/diagnostic', attempts = 0, outcome = 'not-run' }
+      planned[name] = row
+      table.insert(env.request_outcomes, row)
+    end
   end
   local function selection(key, name)
     local anchor = key == 'consumer' and ('provider.' .. name .. '()') or (name .. '()')
@@ -268,6 +288,41 @@ return function(env)
     -- An unavailable trace must not leave later requests on the previous snapshot.
     set(snapshots.counter)
   end
+  local function diagnostic_cycle()
+    -- Restore the actual baseline first: a producer-only retraction need not change its consumer.
+    set(original)
+    deliver('diagnostic baseline restoration')
+    for _, phase in ipairs({ 'invalid', 'fixed' }) do
+      local name = phase .. '-diagnostics'
+      local _, row = probe.canonical_kotlin_diagnostics(client, buffers.consumer, {
+        edit_label = name, require_complete = phase == 'fixed',
+        observation_timeout_ms = 300000, request_timeout_ms = 5000,
+        mutate = function() set(diagnostic_snapshots[phase]) end,
+        flush = function() deliver(name) end,
+      })
+      local record = planned[name]
+      record.attempts, record.response_received = row.attempted and 1 or 0, row.response ~= nil
+      local certified = row.attempted and row.canonical_certified and (phase ~= 'fixed' or row.absence_certified)
+      record.outcome = certified and probe.request_outcome(row.response, row.error, function(value)
+        if type(value.items) ~= 'table' then return false end
+        local errors = {}
+        for _, item in ipairs(value.items) do
+          if item.severity == nil or item.severity == 1 then errors[#errors + 1] = item end
+        end
+        if phase == 'fixed' then return #errors == 0 end
+        if #errors ~= 1 then return false end
+        local token = spec.diagnostic_cycle.missing_member
+        local _, expected = probe.find(diagnostic_snapshots.invalid.consumer, 'provider.' .. token .. '()', token)
+        local item = errors[1]
+        return item.message:find(token, 1, true) ~= nil
+          and vim.deep_equal(item.range, expected)
+      end, true) or 'unmeasured'
+      record.first_outcome, record.error = record.outcome, row.error
+      requests[#requests + 1] = { case = record.case, method = record.method, observation = row,
+        independent_compiler_oracle = spec.oracle_status, outcome = record.outcome, response_received = record.response_received }
+      env.check(record.case, record.outcome == 'matched', record.outcome, 'semantic', record.outcome)
+    end
+  end
   local ok, err = xpcall(function()
     for _, stage in ipairs({ 'text', 'counter' }) do
       if stage == 'counter' then counter_diagnostics() else set(snapshots[stage]) end
@@ -307,6 +362,7 @@ return function(env)
     set(snapshots.retracted)
     member_completion('retracted-member', 'ktlspSliceCounter', spec.control, 'ktlspSliceCounter')
     request('retracted-goto', selection('consumer', 'ktlspSliceCounter'), function(value) return #probe.locations(value) == 0 end)
+    if diagnostic_snapshots then diagnostic_cycle() end
   end, debug.traceback)
   local restored, restore_error = pcall(function()
     set(original)

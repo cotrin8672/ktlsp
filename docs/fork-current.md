@@ -48,13 +48,30 @@ Immutable binary SHA256:
   `jvm-abi134-red1` retains the original unsupported-option failure; provenance
   is bound in `jvm-abi134-provenance.json`.
 
-Gradle's private source checkout is also running the focused original
-`:problems:compileKotlin` task to restore missing local dependency outputs. This
-does not run the repository-wide build/test task or rewrite tracked sources.
+Gradle's private source checkout completed the focused original
+`:problems:compileKotlin` task successfully (`gradle-focused134-online1/receipt.json`).
+All58 missing captured local dependency outputs are now present;25569 tracked
+files, configuration and automatic init scripts remain unchanged. This did not
+run the repository-wide build/test task or rewrite tracked sources.
 Published same-commit Gradle JARs used by the independent compiler oracle remain
 separate from genuine focused-build outputs and captured task inputs.
 
-The new Retrofit shared-edit case closes22/22 first responses on accepted26:
+The genuine Gradle model on accepted27 now passes ABI-plugin admission but exposes
+two remaining scalar options: `-Xjdk-release=1.8` and `-Xsam-conversions=class`.
+The existing shared-edit completion/navigation/rename observations match, while
+canonical diagnostics remain unmeasured. These flags must retain their semantics;
+discarding them would not establish correct diagnostics.
+
+The fully qualified constructor fix is focused-GREEN in
+`fqn-ctor137-green2/receipt.json`; its existing interop case covers useful
+completion/exact navigation, namespace shadows and invalid classifier calls.
+The same-name free-function/generic-constructor counterexample independently
+passes Javac/K2 (`fqn-ctor137-oracle1/receipt.json`). Integration/release and the
+original six-request Moshi control remain pending; no runtime pass is claimed.
+
+The new Retrofit shared-edit case closes22/22 first responses on accepted26,
+and its committed-manifest route also closes22/22 on accepted27
+(`retrofit-shared137-portable27/final-summary.json`):
 base6, shared14 (including applied whole-buffer rename/reference/retraction),
 and2 diagnostic checks. Valid code has certified empty diagnostics, a missing
 member gives the sole exact error, and fixing the source clears it. Evidence:

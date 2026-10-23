@@ -461,7 +461,7 @@ Use JDK 8 sources for `KTLSP_JDK_SRC` (or JDK 8 as `IJLS_JDK` for IntelliJ) and 
 for Gradle, matching the project's selected main toolchain. This includes completion inside
 braced Kotlin string templates across unsaved Java return-type changes. The focused
 checks pass; broader coverage is tracked in [the acceptance record](docs/fork-acceptance.md).
-For pinned OkHttp, Moshi, Spring and Gradle, pair each `*-shared-edit.json` manifest
+For pinned Retrofit, OkHttp, Moshi, Spring and Gradle, pair each `*-shared-edit.json` manifest
 with `KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_corpus_shared_edit_probes.lua"` through
 the same `corpus` route. These separate cases change a concrete producer member
 from `String` to `AtomicInteger` in memory, check the opposite language's completion
@@ -469,6 +469,21 @@ and exact navigation, apply a two-file rename, and check member retraction after
 restoring the producer. They also record diagnostics for the valid edited consumer;
 Kotlin absence requires an accepted complete compiler result. Compiler-oracle status
 and snapshot hashes are retained separately from the original fifty requests.
+Retrofit adds two canonical diagnostic observations: an exact missing-member error and
+its disappearance after restoring the consumer. Manifests without the optional `diagnostic_cycle`
+keep their fourteen-request behavior. Unavailable diagnostics remain unmeasured.
+
+```sh
+KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_corpus_shared_edit_probes.lua" \
+  dev/ktlsp-harness.sh corpus --root /path/to/retrofit-2.11.0 \
+  --file "$PWD/dev/corpus/retrofit-2.11.0-shared-edit.json"
+```
+
+The Retrofit whole-file oracle used official same-version artifacts for missing recovered jars
+and checked both source files against the official source archive. One recovered scripting-jar
+cache hash omitted its leading zero. Kotlin 1.9.23 scripting options and ErrorProne 2.10 checks
+were retained; standalone Javac 17 targeting Java 8 proves source compatibility, not the original
+Gradle Java 8 compiler recipe or identical captured classpath contents.
 The original CEM and Spring corpus manifests also cover projected factory returns
 and exact overload navigation. Standalone compiler reductions are preserved in
 [the overload controls](dev/corpus/fixtures/spring-overload-controls/README.md).

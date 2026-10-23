@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "project_id": "retrofit-2.11.0",
+  "revision": "cc76c22a68e090f3dd898cbcb0bac30414f59c31",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "awaitResponse",
+      "target": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "target_anchor": "suspend fun <T> Call<T>.awaitResponse()",
+      "target_token": "awaitResponse",
+      "expected": "Java generated facade call navigates to Kotlin suspend extension; completion exposes awaitResponse from @file:JvmName KotlinExtensions.",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "target_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "compiler_status": "focused main compilation passed",
+      "module": ":retrofit",
+      "id": "retrofit-java-kotlin-facade",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "anchor": "KotlinExtensions.awaitResponse(call, continuation)"
+    },
+    {
+      "token": "awaitNullable",
+      "target": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "target_anchor": "suspend fun <T : Any> Call<T?>.await(): T?",
+      "target_token": "await",
+      "expected": "@JvmName awaitNullable maps specifically to nullable receiver/return Kotlin await overload, preserving alias identity for navigation/refactoring.",
+      "source_sha256": "dbe7b55737f043ee754b6d3e3781d3bc01b4628c3c65dee717761b4cbf8d45b8",
+      "target_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "compiler_status": "focused main compilation passed",
+      "module": ":retrofit",
+      "id": "retrofit-jvm-name-alias",
+      "source": "retrofit/src/main/java/retrofit2/HttpServiceMethod.java",
+      "anchor": "KotlinExtensions.awaitNullable(call, continuation)"
+    },
+    {
+      "token": "body",
+      "target": "retrofit/src/main/java/retrofit2/Response.java",
+      "target_anchor": "public @Nullable T body()",
+      "target_token": "body",
+      "expected": "Kotlin Response<T>.body navigates to Java nullable T return; valid null check refines nonnull branch T.",
+      "source_sha256": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26",
+      "target_sha256": "3f710e3a614647f54f8376f20043b3207676912cd738af8a9cd0a476b39047e9",
+      "compiler_status": "focused main compilation passed",
+      "module": ":retrofit",
+      "id": "retrofit-kotlin-java-generic",
+      "source": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+      "anchor": "= response.body()"
+    }
+  ],
+  "shared_edit": {
+    "producer": "retrofit/src/main/java/retrofit2/Call.java",
+    "consumer": "retrofit/src/main/java/retrofit2/KotlinExtensions.kt",
+    "control": "cancel",
+    "consumer_insertion": "file",
+    "additional_request_count": 16,
+    "source_sha256": {
+      "producer": "aefa79780b4541c26499fa9398b69b897b346303d2086a0974f74c73d188e2b3",
+      "consumer": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26"
+    },
+    "recipes": {
+      "text": {
+        "producer": "  default String ktlspSliceText() { return \"slice\"; }",
+        "consumer": "private fun ktlspConsumerSlice(provider: Call<*>): String {\n  return provider.ktlspSliceText().substring(0)\n}"
+      },
+      "counter": {
+        "producer": "  default java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() { return new java.util.concurrent.atomic.AtomicInteger(); }",
+        "consumer": "private fun ktlspConsumerSlice(provider: Call<*>): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}"
+      }
+    },
+    "stages": {
+      "text": {
+        "producer": {
+          "sha256": "c0d6694c7af978533e6df50fe5033b918ad7abe82de5eabe9cb6200e6acafa0c"
+        },
+        "consumer": {
+          "sha256": "8595efa80f1aa9be880f271eb59faaf77d6de32b161404cdd2466f393c3a046d"
+        }
+      },
+      "counter": {
+        "producer": {
+          "sha256": "5f673156d066498caa5a0bf1990fdcb18f7c023db453618cdd62b0b61fd4e6fd"
+        },
+        "consumer": {
+          "sha256": "8cebb21f1638fec24dfbbce486ce98cc4c51b08811ae0d07500ed8886c94ec71"
+        }
+      },
+      "renamed": {
+        "producer": {
+          "sha256": "b51a3b39eef23d23e7baac3dcf3dcb14ae09d8fe82dcc612fd13fbc77f5c1b5c"
+        },
+        "consumer": {
+          "sha256": "89be0aaa0084c9b78a1d4113d51689e9572e295e954e6e5eb551a3f5c9acac94"
+        }
+      },
+      "retracted": {
+        "producer": {
+          "sha256": "aefa79780b4541c26499fa9398b69b897b346303d2086a0974f74c73d188e2b3"
+        },
+        "consumer": {
+          "sha256": "8cebb21f1638fec24dfbbce486ce98cc4c51b08811ae0d07500ed8886c94ec71"
+        }
+      }
+    },
+    "oracle_status": "VERIFIED independent whole-file overlays: official Retrofit 2.11.0 source pair matches the pinned checkout; Kotlin 1.9.23 scripting options and ErrorProne 2.10 checks retained. Text, counter, rename and fix compile; retraction and missing member are rejected. Missing jars use official same-version artifacts; one recovered scripting cache hash omitted its leading zero. Javac 17 --release 8 is an independent source-compatibility baseline, not certification of the original Gradle Java 8 recipe or identity of the full captured classpath.",
+    "compiler_oracle_receipt_sha256": "5f7f09f7396366ef14d05b5f1711ded4c41ee37558124c798134b4a7f2f83ea6",
+    "diagnostic_cycle": {
+      "consumer": "private fun ktlspMissingSlice(provider: Call<*>) {\n  provider.ktlspMissingMember()\n}",
+      "missing_member": "ktlspMissingMember",
+      "source_sha256": {
+        "invalid": "d9324d78ed29cd29b761d2063c3f6e1cc87ad6a2ddf142001bf9389f62af7f98",
+        "fixed": "1e58c64c2a4a5ff4037293844a3a5acccd6a8034aa1c41d466612c4247323f26"
+      }
+    }
+  }
+}
