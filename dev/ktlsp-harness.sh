@@ -890,6 +890,10 @@ public class Reader {
     public int body;
     public Payload body() { return new Payload(); }
     public static class Factory { }
+    public static <T> String pickTop(java.util.List<T> values, T value) { return "generic"; }
+    public static String pickTop(java.util.Collection<String> values, Object value) { return "collection"; }
+    public static <T> String pickNested(java.util.List<T> first, java.util.List<T> second) { return "generic"; }
+    public static String pickNested(java.util.Collection<String> first, java.util.Collection<String> second) { return "collection"; }
 }
 JAVA
   cat > "$project/selection/Payload.java" <<'JAVA'
@@ -960,6 +964,8 @@ class InferredArrays(seed: Array<Product>, numbers: IntArray) {
 
 class Callables {
     val action: (Int) -> Product = { Product() }
+    val contextual: (SmartItem) -> Unit = { it.ping() }
+    val namedContextual: (SmartItem) -> Unit = { item -> item.ping() }
     fun action(value: String): OtherResult = OtherResult()
     val maybe: (String?) -> Product? = { null }
     val optional: ((Int) -> Product)? = null
@@ -982,6 +988,14 @@ fun useInferred(callables: Callables, box: InferredBox<Product>, item: SmartItem
     box.value.propertyOnly()
     callables.inferredProduct().propertyOnly()
     callables.callback(item).ping()
+}
+
+fun useTopSelection(values: java.util.List<String>, text: String) {
+    Reader.pickTop(values, text).isEmpty()
+}
+
+fun useNestedSelection(values: java.util.List<String>, other: java.util.List<String>) {
+    Reader.pickNested(values, other).isEmpty()
 }
 KOTLIN
   printf '%s\n' "$project"

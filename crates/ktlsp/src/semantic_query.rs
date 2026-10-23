@@ -412,11 +412,28 @@ pub fn after_dot_query(
     });
     let mut source = Index::new();
     source.replace_file(file, symbols, Tier::Volatile);
+    let mut original_symbols = index.entries_for_file(file);
+    let mut recovered_symbols = source.entries_for_file(file);
+    let by_position = |a: &Entry, b: &Entry| {
+        (a.sym.start_byte, a.sym.end_byte, a.sym.name.as_str()).cmp(&(
+            b.sym.start_byte,
+            b.sym.end_byte,
+            b.sym.name.as_str(),
+        ))
+    };
+    original_symbols.sort_by(by_position);
+    recovered_symbols.sort_by(by_position);
+    // Placeholder recovery can retain namespace authority only when every authored fact agrees.
+    let source_member_proofs = original_symbols.len() == recovered_symbols.len()
+        && original_symbols
+            .iter()
+            .zip(&recovered_symbols)
+            .all(|(a, b)| a.path == b.path && a.tier == b.tier && a.sym == b.sym);
     let recovered = RecoveredTypeIndex {
         index,
         source: &source,
         replaced_file: Some(file),
-        source_member_proofs: false,
+        source_member_proofs,
     };
     let ctx = infer::FileCtx::from_tree_in_file(&tree, &synthetic, file);
     member_completion_query_with_ctx(
@@ -429,6 +446,7 @@ pub fn after_dot_query(
         &ctx,
     )
 }
+
 
 pub fn member_completion_query(
     index: &dyn InferenceIndex,
@@ -4323,6 +4341,60 @@ mod recovered_property_proof_tests {
             0,
             "file lookup must not enumerate unrelated workspace symbols"
         );
+    }
+
+    #[test]
+    fn kotlin_dot_recovery_retains_only_current_namespace_facts_and_tier() {
+        for (tier, shadow, host_proof, expected) in [
+            (Tier::Volatile, false, true, true),
+            (Tier::Durable, false, true, false),
+            (Tier::Volatile, true, true, false),
+            (Tier::Volatile, false, false, false),
+        ] {
+            let mut index = Index::new();
+            let tail = if shadow {
+                " val probe:Missing = TODO()"
+            } else {
+                ""
+            };
+            let source = format!("package consumer\nclass Caller {{ fun use() {{ probe.Owner.VALUE.useful() }}{tail} }}\n");
+            for (file, text, tier) in [
+                (
+                    "Item.kt",
+                    "package probe\nclass Item { fun useful() {} }\n",
+                    Tier::Volatile,
+                ),
+                (
+                    "Owner.kt",
+                    "package probe\nobject Owner { val VALUE:Item = Item() }\n",
+                    Tier::Volatile,
+                ),
+                ("Use.kt", source.as_str(), tier),
+            ] {
+                let mut parser = KotlinParser::new();
+                let tree = parser.parse(text);
+                let facts = language::symbol_facts(SourceLanguage::Kotlin, &tree, text);
+                index.replace_file(file, facts.symbols, tier);
+            }
+            let host = crate::binary_diagnostics::BinaryDiagnostics {
+                index: &index,
+                inventory: &|_| None,
+                source_members: &|entry| host_proof && entry.tier == Tier::Volatile,
+                value_namespace: &|entry| host_proof && entry.tier == Tier::Volatile,
+                property_access: &|_| None,
+            };
+            let at = source.find("VALUE.use").unwrap() + "VALUE.use".len();
+            let query =
+                after_dot_query(&host, &mut KotlinParser::new(), "Use.kt", &source, at, 100).unwrap();
+            assert_eq!(
+                query
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.label == "useful"),
+                expected,
+                "tier={tier:?}, shadow={shadow}, host_proof={host_proof}"
+            );
+        }
     }
 
     #[test]

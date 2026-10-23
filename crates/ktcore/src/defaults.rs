@@ -37,5 +37,10 @@ pub(crate) fn is_builtin_type(name: &str) -> bool {
             | "Boolean"
             | "Char"
             | "String"
+            | "CharSequence"
     )
+}
+
+pub(crate) fn is_jvm_reference_builtin(name: &str) -> bool {
+    matches!(name, "String" | "CharSequence")
 }

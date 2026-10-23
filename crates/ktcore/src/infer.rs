@@ -803,7 +803,8 @@ fn is_stable_for_narrowing(
         while let Some(lambda) = scope {
             if lambda.kind() == "lambda_literal" {
                 if child_of_kind(lambda, "lambda_parameters").is_none()
-                    && property_lambda_parameter_type(index, lambda, ident, name, src, ctx).is_some()
+                    && property_lambda_parameter_type(index, lambda, ident, name, src, ctx)
+                        .is_some()
                 {
                     // An implicit parameter shadows outer `it` binders and their guards.
                     return lambda.start_byte() < check_start;
@@ -1093,6 +1094,7 @@ pub(crate) fn implicit_receiver_types_with_ancestors(
             "class_declaration" | "object_declaration" => {
                 cached_class_receiver_contribution(index, *n, src, ctx)
             }
+            "object_literal" => Some(Type::Unknown),
             _ => None,
         };
         if let Some(ty) = ty {
@@ -1174,18 +1176,14 @@ fn cached_class_receiver_contribution(
     if let Some(hit) = receiver_cache_lookup(ctx, declaration, 0) {
         return hit;
     }
-    let ty = name_field(declaration).and_then(|name_node| {
+    let ty = Some(name_field(declaration).map_or(Type::Unknown, |name_node| {
         if ctx.file.is_some() {
             ctx.caller_type(index, name_node.start_byte())
+                .unwrap_or(Type::Unknown)
         } else {
-            Some(resolve_type_name(
-                index,
-                node_text(name_node, src),
-                ctx,
-                false,
-            ))
+            resolve_type_name(index, node_text(name_node, src), ctx, false)
         }
-    });
+    }));
     receiver_cache_store(ctx, declaration, 0, ty)
 }
 
@@ -1518,13 +1516,16 @@ fn lambda_receiver_or_element(
 /// type that `this` refers to inside the lambda body.
 fn lambda_receiver_for_this(
     index: &dyn InferenceIndex,
-    _lambda: Node,
+    lambda: Node,
     lambda_ancestors: &[Node],
     src: &str,
     ctx: &FileCtx,
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Option<Type> {
+    if let Some(receiver) = property_lambda_receiver_type(index, lambda, src, ctx) {
+        return Some(receiver);
+    }
     let call = lambda_enclosing_call(lambda_ancestors)?;
     let call_ancestors = &lambda_ancestors[..lambda_ancestors.len() - 2];
     let (call, call_ancestors) = outer_trailing_lambda_call_with_ancestors(call, call_ancestors);
@@ -1558,6 +1559,49 @@ fn lambda_receiver_for_this(
         depth,
         child_infer,
     )
+}
+
+fn property_lambda_receiver_type(
+    index: &dyn InferenceIndex,
+    lambda: Node,
+    src: &str,
+    ctx: &FileCtx,
+) -> Option<Type> {
+    let mut initializer = lambda;
+    while let Some(parent) = initializer
+        .parent()
+        .filter(|parent| parent.kind() == "parenthesized_expression")
+    {
+        initializer = parent;
+    }
+    let property = initializer
+        .parent()
+        .filter(|parent| parent.kind() == "property_declaration")?;
+    let declaration = child_of_kind(property, "variable_declaration")?;
+    let function_type = (|| {
+        let mut annotation = declaration;
+        loop {
+            let mut cursor = annotation.walk();
+            annotation = annotation.named_children(&mut cursor).find(|child| {
+                matches!(
+                    child.kind(),
+                    "function_type" | "parenthesized_type" | "nullable_type"
+                )
+            })?;
+            if annotation.kind() == "function_type" {
+                return Some(annotation);
+            }
+        }
+    })();
+    let reference = if let Some(function_type) = function_type {
+        crate::indexer::receiver_type_of_function_type(function_type, src, None)?
+    } else {
+        let annotation = crate::indexer::value_type_of_scoped(declaration, src, None)?;
+        type_alias_function_receiver_ref(index, &annotation, ctx)?
+    };
+    let bounds =
+        crate::indexer::type_parameters_in_scope(declaration, src, &ctx.package, &ctx.imports);
+    Some(declared_type_in_scope(index, &reference, ctx, &bounds))
 }
 
 fn local_lambda_call_selection<'a>(
@@ -1661,8 +1705,7 @@ fn hardcoded_receiver_lambda_type(
             if !RECEIVER_LAMBDA_OPS.contains(&sel) {
                 return None;
             }
-            let recv_ty = child_infer.infer_child(index, recv, src, ctx, depth + 1);
-            recv_ty.is_member_receiver().then_some(recv_ty)
+            Some(child_infer.infer_child(index, recv, src, ctx, depth + 1))
         }
         _ => None,
     }
@@ -1704,6 +1747,9 @@ fn generic_lambda_receiver_type(
                     depth,
                     child_infer,
                 );
+                if entries.is_empty() && !local_selected {
+                    continue;
+                }
                 let receiver = select_trailing_lambda_receiver_type(
                     index,
                     entries,
@@ -2790,25 +2836,39 @@ fn select_trailing_lambda_receiver_type(
             arg_count, arg_types
         );
     }
-    let mut group: Vec<(&Entry, TypeRef)> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            trailing_lambda_receiver_ref(index, entry, ctx).map(|receiver| (entry, receiver))
-        })
-        .collect();
+    let args = normalized_call_arguments(call, src, arg_types);
+    let mut entries = entries;
+    entries.retain(|entry| {
+        members::function_accepts(index, recv_ty.unwrap_or(&Type::Unknown), entry, &args, ctx)
+    });
+    let mut unknown_role = entries.is_empty();
+    let mut group = Vec::new();
+    for entry in entries {
+        if let Some(receiver) = trailing_lambda_receiver_ref(index, entry, ctx) {
+            group.push((entry, receiver));
+        } else if entry.sym.trailing_lambda_min_arity.is_none()
+            || entry
+                .sym
+                .params
+                .last()
+                .and_then(members::function_type_signature)
+                .is_none()
+        {
+            unknown_role = true;
+        }
+    }
+    if unknown_role {
+        return Some(Type::Unknown);
+    }
     if std::env::var("KTDBG").is_ok() {
         eprintln!("DBG group: {}", group.len());
     }
     if group.is_empty() {
         return None;
     }
-    let args = normalized_call_arguments(call, src, arg_types.clone());
-    group.retain(|(entry, _)| {
-        members::function_accepts(index, recv_ty.unwrap_or(&Type::Unknown), entry, &args, ctx)
-    });
     let mut resolved = Vec::with_capacity(group.len());
     for (entry, receiver_ref) in group {
-        resolved.push(resolve_trailing_lambda_receiver_candidate(
+        let Some(receiver) = resolve_trailing_lambda_receiver_candidate(
             index,
             entry,
             &receiver_ref,
@@ -2816,13 +2876,19 @@ fn select_trailing_lambda_receiver_type(
             &args,
             ctx,
             depth,
-        )?);
+        ) else {
+            return Some(Type::Unknown);
+        };
+        resolved.push(receiver);
     }
-    let first = resolved.first()?.clone();
-    resolved
-        .iter()
-        .all(|receiver| *receiver == first)
-        .then_some(first)
+    let Some(first) = resolved.first().cloned() else {
+        return Some(Type::Unknown);
+    };
+    Some(if resolved.iter().all(|receiver| *receiver == first) {
+        first
+    } else {
+        Type::Unknown
+    })
 }
 
 fn resolve_trailing_lambda_receiver_candidate(
@@ -2912,6 +2978,14 @@ pub fn trailing_lambda_receiver_ref(
         return Some(receiver.clone());
     }
     let parameter_type = entry.sym.params.last()?;
+    type_alias_function_receiver_ref(index, parameter_type, ctx)
+}
+
+fn type_alias_function_receiver_ref(
+    index: &dyn InferenceIndex,
+    parameter_type: &TypeRef,
+    ctx: &FileCtx,
+) -> Option<TypeRef> {
     if parameter_type.name.is_empty() {
         return None;
     }
@@ -3127,6 +3201,9 @@ fn infer_navigation(
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Type {
+    if let Some(receiver) = resolve::qualified_type_receiver(index, node, src, ctx) {
+        return receiver;
+    }
     let (Some(recv), Some(sel)) = (node.named_child(0), node.named_child(1)) else {
         return Type::Unknown;
     };
@@ -3540,7 +3617,6 @@ fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize)
 // Equality can reject distinct ordinary nominal identities; JVM mapped types and aliases need
 // their own identity normalization. Gradual compatibility is never used as an absence proof.
 
-
 fn constraint_types_distinct(index: &dyn InferenceIndex, a: &Type, b: &Type, depth: usize) -> bool {
     if depth > MAX_DEPTH
         || a == b
@@ -3801,7 +3877,6 @@ pub(crate) fn projected_member_application(
     }
     Some(application)
 }
-
 
 fn callable_bounds_known(entry: &Entry) -> bool {
     entry.sym.type_parameter_facts.known_unbounded()
@@ -4094,7 +4169,32 @@ pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal
     if !type_head_is_known(index, actual) || !type_head_is_known(index, formal) {
         return true;
     }
+    if is_reference_root(formal)
+        && matches!(actual, Type::Class { .. })
+        && (!actual.is_nullable() || formal.is_nullable())
+        && !(formal.package() == Some("java.lang")
+            && actual.container().is_none()
+            && actual
+                .package()
+                .is_none_or(|package| matches!(package, "kotlin" | "java.lang"))
+            && matches!(
+                primitive_type_name(an),
+                "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean" | "Char"
+            ))
+    {
+        return true;
+    }
     is_subtype(index, an, actual.package(), fname)
+}
+
+pub(crate) fn is_reference_root(ty: &Type) -> bool {
+    ty.container().is_none()
+        && ty.owner().is_none()
+        && ty.args().is_empty()
+        && matches!(
+            (ty.package(), ty.name()),
+            (Some("kotlin"), Some("Any")) | (Some("java.lang"), Some("Object"))
+        )
 }
 
 /// A closed nominal hierarchy can exclude a head without solving its type arguments.
@@ -4106,14 +4206,7 @@ pub(crate) fn nominal_heads_incompatible(
     if !matches!((actual, formal), (Type::Class { .. }, Type::Class { .. })) {
         return false;
     }
-    let universal = |ty: &Type| {
-        ty.container().is_none()
-            && matches!(
-                (ty.package(), ty.name()),
-                (Some("kotlin"), Some("Any")) | (Some("java.lang"), Some("Object"))
-            )
-    };
-    if universal(formal) || actual.name() == formal.name() {
+    if is_reference_root(formal) || actual.name() == formal.name() {
         return false;
     }
     let modeled = |ty: &Type| {
@@ -5010,6 +5103,122 @@ mod tests {
     use crate::symbol::{IndexedSymbol, SymbolKind};
 
     #[test]
+    fn receiver_lambda_roles_preserve_unknown_and_ordinary_lambda_absence() {
+        use crate::types::Type;
+        let declarations = "package consumer\nclass Known\nfun unknownScope(block: Missing.() -> Unit) {}\nfun <T> genericScope(block: T.() -> Unit) {}\nfun parenthesizedScope(block: (Missing).() -> Unit) {}\nfun plain(block: () -> Unit) {}\nfun run(block: () -> Unit) {}\nfun Known.let(block: (Known) -> Unit) {}\ntypealias UnknownHandler = Missing.() -> Unit\ntypealias KnownHandler = Known.() -> Unit\ntypealias PlainHandler = () -> Unit\nfun choose(a: Int, b: Int) {}\nfun choose(block: Known.() -> Unit) {}\n";
+        let mut parser = crate::parser::KotlinParser::new();
+        let mut index = Index::new();
+        index.replace_file(
+            "Declarations.kt",
+            crate::indexer::extract_symbols(&parser.parse(declarations), declarations, "consumer"),
+            Tier::Volatile,
+        );
+        let target = "package probe\nclass Owner\n";
+        index.replace_file(
+            "Owner.kt",
+            crate::indexer::extract_symbols(&parser.parse(target), target, "probe"),
+            Tier::Volatile,
+        );
+        for (body, expected) in [
+            (
+                "fun use() { missing.apply { probe.Owner.AXIS } }",
+                vec![Type::Unknown],
+            ),
+            (
+                "fun use() { missing.run { probe.Owner.AXIS } }",
+                vec![Type::Unknown],
+            ),
+            (
+                "fun use() { unknownScope { probe.Owner.AXIS } }",
+                vec![Type::class("Missing", None)],
+            ),
+            (
+                "fun use() { genericScope { probe.Owner.AXIS } }",
+                vec![Type::Unknown],
+            ),
+            (
+                "fun use() { parenthesizedScope { probe.Owner.AXIS } }",
+                vec![Type::class("Missing", None)],
+            ),
+            ("fun use() { plain { probe.Owner.AXIS } }", vec![]),
+            ("fun use() { run { probe.Owner.AXIS } }", vec![]),
+            ("fun use() { Known().let { probe.Owner.AXIS } }", vec![]),
+            (
+                "val handler: Missing.() -> Unit = { probe.Owner.AXIS }",
+                vec![Type::class("Missing", None)],
+            ),
+            (
+                "val handler: Known.() -> Unit = { probe.Owner.AXIS }",
+                vec![Type::class("Known", Some("consumer".into()))],
+            ),
+            ("val handler: () -> Unit = { probe.Owner.AXIS }", vec![]),
+            ("val handler: (() -> Unit)? = { probe.Owner.AXIS }", vec![]),
+            (
+                "val handler: UnknownHandler = { probe.Owner.AXIS }",
+                vec![Type::class("Missing", None)],
+            ),
+            (
+                "val handler: KnownHandler = { probe.Owner.AXIS }",
+                vec![Type::class("Known", Some("consumer".into()))],
+            ),
+            ("val handler: PlainHandler = { probe.Owner.AXIS }", vec![]),
+            (
+                "fun use() { choose { probe.Owner.AXIS } }",
+                vec![Type::class("Known", Some("consumer".into()))],
+            ),
+        ] {
+            let source = format!("package consumer\n{body}\n");
+            let tree = parser.parse(&source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let start = source.find("probe.Owner.AXIS").unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + "probe.Owner.AXIS".len())
+                .unwrap();
+            let ctx = super::FileCtx::from_tree_in_file(&tree, &source, "Use.kt");
+            assert_eq!(
+                super::implicit_receiver_types(&index, node, &source, &ctx, 0),
+                expected,
+                "{source}"
+            );
+            if expected.is_empty()
+                || expected.iter().any(|receiver| {
+                    receiver == &Type::Unknown || receiver.name() == Some("Missing")
+                })
+            {
+                let qualifier = tree
+                    .root_node()
+                    .descendant_for_byte_range(start, start + "probe.Owner".len())
+                    .unwrap();
+                assert_eq!(&source[qualifier.byte_range()], "probe.Owner");
+                assert_eq!(
+                    crate::resolve::qualified_type_receiver(&index, qualifier, &source, &ctx)
+                        .is_some(),
+                    expected.is_empty(),
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unmodeled_implicit_receivers_remain_unknown_in_the_receiver_stack() {
+        for source in [
+            "package consumer\nclass MissingOwner { fun use() { probe.Owner.AXIS } }\n",
+            "package consumer\nfun use() { missing.apply { probe.Owner.AXIS } }\n",
+            "package consumer\nfun use() { val owner = object:Missing() { fun use() { probe.Owner.AXIS } } }\n",
+        ] {
+            let mut parser = crate::parser::KotlinParser::new();
+            let tree = parser.parse(source);
+            let start = source.find("probe.Owner.AXIS").unwrap();
+            let node = tree.root_node().descendant_for_byte_range(start, start + "probe.Owner.AXIS".len()).unwrap();
+            let ctx = super::FileCtx::from_tree_in_file(&tree, source, "Use.kt");
+            let receivers = super::implicit_receiver_types(&Index::new(), node, source, &ctx, 0);
+            assert_eq!(receivers, vec![crate::types::Type::Unknown], "{source}");
+        }
+    }
+
+    #[test]
     fn java_primitive_arrays_never_bind_kotlin_keyword_homonyms_or_their_ancestors() {
         use crate::types::{Type, TypeParameterBounds, TypeRef};
         use std::collections::{HashMap, HashSet};
@@ -5565,6 +5774,60 @@ mod tests {
                 "legacy context without stamped candidates"
             );
         }
+    }
+
+    #[test]
+    fn implicit_reference_root_consistency_preserves_nullability_and_primitive_phases() {
+        use crate::types::Type;
+        let ty = |name: &str, package: &str| Type::class(name, Some(package.into()));
+        let mut index = Index::new();
+        index.replace_file(
+            "Roots.kt",
+            [
+                ("Actual", "probe"),
+                ("Object", "probe"),
+                ("Object", "java.lang"),
+            ]
+            .into_iter()
+            .map(|(name, package)| {
+                IndexedSymbol::new(name, SymbolKind::Class, package, None, 0, name.len())
+            })
+            .collect(),
+            Tier::Volatile,
+        );
+        let actual = ty("Actual", "probe");
+        let object = ty("Object", "java.lang");
+        assert!(super::types_consistent(&index, &actual, &object));
+        assert!(!super::types_consistent(
+            &index,
+            &actual.clone().with_nullability(true),
+            &object
+        ));
+        assert!(super::types_consistent(
+            &index,
+            &actual.clone().with_nullability(true),
+            &object.with_nullability(true)
+        ));
+        assert!(!super::types_consistent(
+            &index,
+            &actual,
+            &ty("Object", "probe")
+        ));
+        assert!(!super::types_consistent(
+            &index,
+            &ty("Int", "kotlin"),
+            &ty("Object", "java.lang")
+        ));
+        assert!(!super::types_consistent(
+            &index,
+            &Type::class("int", None),
+            &ty("Object", "java.lang")
+        ));
+        assert!(super::types_consistent(
+            &index,
+            &ty("Int", "kotlin"),
+            &ty("Any", "kotlin")
+        ));
     }
 
     #[test]
@@ -6197,9 +6460,8 @@ fn intrinsic_type(index: &dyn InferenceIndex, name: &str) -> Type {
 }
 
 fn intrinsic_package(index: &dyn InferenceIndex, name: &str) -> &'static str {
-    // Kotlin's JVM String is java.lang.String. Keep its actual source members usable when only
-    // JDK sources are available, while never binding literals to a user class named String.
-    if name == "String" {
+    // Mapped references use JDK source members when Kotlin builtin declarations are unavailable.
+    if crate::defaults::is_jvm_reference_builtin(name) {
         let candidates = index.lookup_type(name);
         let has_top_level = |package: &str| {
             candidates
@@ -6248,7 +6510,7 @@ pub(crate) fn is_intrinsic_type_ref(
             // already expanded into qualification, above. Prefer declaration context to use-site ctx.
             && !(entry.sym.package == "java.lang"
                 && entry.sym.container.is_none()
-                && (tr.name == "String"
+                && (crate::defaults::is_jvm_reference_builtin(&tr.name)
                     || matches!(tr.name.as_str(), "Byte" | "Short" | "Long" | "Float" | "Double" | "Boolean")
                         && tr.package_candidates.first().map_or(ctx.package.as_str(), String::as_str)
                             != "java.lang"))

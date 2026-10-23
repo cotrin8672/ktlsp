@@ -1562,7 +1562,8 @@ fn parameter_identity(index: &dyn InferenceIndex, ty: Type) -> Option<Type> {
     };
     let builtin = container.is_none()
         && package.as_deref().is_none_or(|package| {
-            package == "kotlin" || package == "java.lang" && name == "String"
+            package == "kotlin"
+                || package == "java.lang" && crate::defaults::is_jvm_reference_builtin(&name)
         })
         && crate::defaults::is_builtin_type(infer::primitive_type_name(&name));
     Some(Type::Class {
@@ -2219,6 +2220,20 @@ fn reference_subtype(
     reference_forward(index, actual, formal, universal, false) == DeclarationForward::Proven
 }
 
+fn reference_identity_equal(index: &dyn InferenceIndex, actual: &Type, formal: &Type) -> bool {
+    actual == formal
+        || actual.is_nullable() == formal.is_nullable()
+            && actual.args().len() == formal.args().len()
+            && actual
+                .args()
+                .iter()
+                .zip(formal.args())
+                .all(|(a, b)| reference_identity_equal(index, a, b))
+            && parameter_identity(index, actual.clone())
+                .zip(parameter_identity(index, formal.clone()))
+                .is_some_and(|(a, b)| a == b)
+}
+
 fn reference_forward(
     index: &dyn InferenceIndex,
     actual: &Type,
@@ -2233,6 +2248,10 @@ fn reference_forward(
     }
     if actual.is_nullable() && !formal.is_nullable() {
         return DeclarationForward::Disproven;
+    }
+    // Identity and the language root do not depend on unrelated inherited interfaces.
+    if reference_identity_equal(index, actual, formal) || infer::is_reference_root(formal) {
+        return DeclarationForward::Proven;
     }
     let mut witnessed = false;
     let mut conflicting = false;
@@ -2253,14 +2272,13 @@ fn reference_forward(
                 incomplete = true;
             }
             matching = Some(current.clone());
-            let compatible = reference_shape_known(index, current, universal, 0)
-                && current.owner() == formal.owner()
-                && current.args().len() == formal.args().len()
-                && current
-                    .args()
-                    .iter()
-                    .zip(formal.args())
-                    .all(|(a, b)| matches!(b, Type::Star) || a == b);
+            let compatible =
+                reference_shape_known(index, current, universal, 0)
+                    && current.owner() == formal.owner()
+                    && current.args().len() == formal.args().len()
+                    && current.args().iter().zip(formal.args()).all(|(a, b)| {
+                        matches!(b, Type::Star) || reference_identity_equal(index, a, b)
+                    });
             witnessed |= compatible;
             conflicting |= !compatible;
         }
@@ -2275,6 +2293,62 @@ fn reference_forward(
     } else {
         DeclarationForward::Disproven
     }
+}
+
+#[cfg(test)]
+#[test]
+fn reference_forward_preserves_mapped_argument_nullability_and_foreign_identity() {
+    let text = "package proof\nclass List<T>\nclass String\n";
+    let tree = crate::parser::KotlinParser::new().parse(text);
+    let mut index = crate::index::Index::new();
+    index.replace_file(
+        "Proof.kt",
+        crate::indexer::extract_symbols(&tree, text, "proof"),
+        crate::index::Tier::Volatile,
+    );
+    for (file, package) in [("Kotlin.kt", "kotlin"), ("Java.kt", "java.lang")] {
+        let source = format!("package {package}\nclass String\n");
+        let tree = crate::parser::KotlinParser::new().parse(&source);
+        index.replace_file(
+            file,
+            crate::indexer::extract_symbols(&tree, &source, package),
+            crate::index::Tier::Volatile,
+        );
+    }
+    let list = |argument| {
+        let mut list = Type::class("List", Some("proof".into()));
+        let Type::Class { args, .. } = &mut list else {
+            unreachable!()
+        };
+        args.push(argument);
+        list
+    };
+    let kotlin = Type::class("String", Some("kotlin".into()));
+    let java = Type::class("String", Some("java.lang".into()));
+    assert!(reference_subtype(
+        &index,
+        &list(kotlin.clone()),
+        &list(java.clone()),
+        false
+    ));
+    assert!(!reference_subtype(
+        &index,
+        &list(kotlin.with_nullability(true)),
+        &list(java.clone()),
+        false
+    ));
+    assert!(!reference_subtype(
+        &index,
+        &Type::class("String", Some("proof".into())),
+        &java,
+        false
+    ));
+    assert!(!reference_subtype(
+        &index,
+        &Type::Unknown,
+        &Type::Unknown,
+        false
+    ));
 }
 
 pub(crate) fn function_applicability(

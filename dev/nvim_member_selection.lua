@@ -169,6 +169,28 @@ return function(project, client, check)
     }) do
       completion(unpack(case))
     end
+    for _, case in ipairs({ { 'val contextual:', 'it.pi' }, { 'val namedContextual:', 'item.pi' } }) do
+      local position = probe.find(lines('kotlin'), case[1], 'ping')
+      local before = vim.api.nvim_buf_get_lines(buffers.kotlin, position.line, position.line + 1, false)
+      local edited = before[1]:gsub('%.ping%(%)', '.pi')
+      vim.api.nvim_buf_set_lines(buffers.kotlin, position.line, position.line + 1, false, { edited })
+      flush('kotlin', case[1] .. ' unfinished balanced lambda body')
+      position = probe.find(lines('kotlin'), case[1], case[2])
+      position.character = position.character + #case[2]
+      local result = once('kotlin', 'textDocument/completion', nil, nil, nil, position)
+      check(case[1] .. ' unfinished lambda body offers ping and excludes methodOnly',
+        probe.completion_has(result, 'ping') and not probe.completion_has(result, 'methodOnly'), vim.inspect(result))
+      vim.api.nvim_buf_set_lines(buffers.kotlin, position.line, position.line + 1, false, before)
+      flush('kotlin')
+      definition('kotlin', case[1], 'ping', 'kotlin', 'fun ping()')
+    end
+    for _, case in ipairs({
+      { 'Reader.pickTop(values, text)', 'pickTop', 'public static String pickTop(java.util.Collection<String> values, Object value)' },
+      { 'Reader.pickNested(values, other)', 'pickNested', 'public static String pickNested(java.util.Collection<String> first, java.util.Collection<String> second)' },
+    }) do
+      completion('kotlin', case[1], case[1] .. '.isEm', 'isEmpty', 'propertyOnly')
+      definition('kotlin', case[1], case[2], 'reader', case[3])
+    end
     completion('java', 'String directName = Runnable.class.getName();', 'Runnable.class.getN', 'getName', 'run')
     for _, receiver in ipairs({ 'literalClass', 'primitiveClass', 'arrayClass' }) do
       completion('java', receiver .. '.getName()', receiver .. '.getN', 'getName', 'run')

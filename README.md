@@ -292,6 +292,7 @@ cloned element members, File array members, and exact Object/File source definit
 These are recorded separately in `java-array-sdk.json`. Whole compiler controls
 cover valid uses and reject protected methods, wrong arity and scalar calls on arrays.
 Its member-selection probe also checks Class methods on reference, primitive and array class literals, exact SDK navigation, and a rejected type-parameter literal with a useful same-phase control in `member-selection.json`.
+It also requires useful chained String completion and exact non-generic Java overload navigation for Kotlin calls with top-level and nested-only type parameters, plus completion and exact navigation inside typed lambda properties with implicit and named parameters.
 Five separate first responses check Kotlin reads of Java arrays: matrix/row `size`,
 `get` and `clone`, indexed/cloned element members, and exact Kotlin member navigation.
 Both new buffers retain their current outbound source/version and restore exactly;

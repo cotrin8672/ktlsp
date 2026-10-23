@@ -849,19 +849,23 @@ fn receiver_type_of_function_parameter(
     scope: &TypeScope,
 ) -> Option<TypeRef> {
     let fun_ty = find_descendant(parameter, "function_type")?;
-    receiver_type_of_function_type(fun_ty, src, scope)
+    receiver_type_of_function_type(fun_ty, src, Some(scope))
 }
 
-fn receiver_type_of_function_type(fun_ty: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
+pub(crate) fn receiver_type_of_function_type(
+    fun_ty: Node,
+    src: &str,
+    scope: Option<&TypeScope>,
+) -> Option<TypeRef> {
     let mut cursor = fun_ty.walk();
     for child in fun_ty.named_children(&mut cursor) {
-        match child.kind() {
-            "function_type_parameters" => return None,
-            "user_type" | "nullable_type" => return type_ref_from(child, src, Some(scope)),
-            _ => {}
+        if child.kind() == "function_type_parameters" {
+            return None;
         }
+        // A syntactic receiver remains present even when its type cannot be decoded.
+        return Some(type_ref_from(child, src, scope).unwrap_or_default());
     }
-    None
+    Some(TypeRef::default())
 }
 
 fn push_type_alias(
@@ -874,7 +878,7 @@ fn push_type_alias(
     scope: &TypeScope,
 ) {
     let function_type_receiver = child_of_kind(decl, "function_type")
-        .and_then(|fun_ty| receiver_type_of_function_type(fun_ty, src, scope));
+        .and_then(|fun_ty| receiver_type_of_function_type(fun_ty, src, Some(scope)));
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
         type_params: type_params_of(decl, src),
@@ -2286,6 +2290,26 @@ object Reg { fun add() {} }
 
         let plain = syms.iter().find(|s| s.name == "plain").unwrap();
         assert_eq!(plain.trailing_lambda_receiver_type, None);
+    }
+
+    #[test]
+    fn parenthesized_and_callable_receiver_function_types_keep_receiver_roles() {
+        let syms = index("class Context\nfun wrapped(block: (Context).() -> Unit) {}\nfun callable(block: (() -> Unit).() -> Unit) {}\nfun plain(block: () -> Unit) {}\n");
+        for (name, receiver) in [
+            ("wrapped", Some("Context")),
+            ("callable", Some("Function0")),
+            ("plain", None),
+        ] {
+            let symbol = syms.iter().find(|symbol| symbol.name == name).unwrap();
+            assert_eq!(
+                symbol
+                    .trailing_lambda_receiver_type
+                    .as_ref()
+                    .map(|receiver| receiver.name.as_str()),
+                receiver,
+                "{name}"
+            );
+        }
     }
 
     #[test]

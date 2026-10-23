@@ -132,6 +132,50 @@ pub struct CompilerTask {
     pub problem: Option<String>,
 }
 
+pub(crate) struct JavaApiOptionSlots {
+    pub destination: usize,
+    pub headers: usize,
+    pub generated: usize,
+    pub classpath: usize,
+    pub explicit_processor_argument: bool,
+}
+
+pub(crate) fn same_java_api_path(a: &Path, b: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let key = crate::paths::file_key(path);
+        if cfg!(windows) {
+            key.to_lowercase()
+        } else {
+            key
+        }
+    };
+    normalize(a) == normalize(b)
+}
+
+pub(crate) fn java_api_path_text(path: &Path) -> anyhow::Result<String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("java-path-encoding"))?;
+    anyhow::ensure!(
+        path.is_absolute() && !text.chars().any(|c| matches!(c, '\0' | '\r' | '\n' | '\t')),
+        "java-path-unhandled"
+    );
+    Ok(text.to_owned())
+}
+
+pub(crate) fn joined_java_api_classpath(paths: &[PathBuf]) -> anyhow::Result<String> {
+    for path in paths {
+        let text = java_api_path_text(path)?;
+        anyhow::ensure!(
+            !text.contains(if cfg!(windows) { ';' } else { ':' }),
+            "java-classpath-separator-in-path"
+        );
+    }
+    std::env::join_paths(paths)?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("java-classpath-encoding"))
+}
+
 impl CompilerTask {
     /// A separate optional surface in options avoids duplicating the task's existing input fields.
     /// A worker must still validate argument/input roles and current runtime bytes before launch.
@@ -178,9 +222,119 @@ impl CompilerTask {
         .then_some(recipe)
     }
 
-    pub(crate) fn annotation_processing_disabled(&self) -> bool {
-        self.arguments.len() == 1 && self.arguments[0] == "-proc:none"
+    /// Validate the captured Gradle arguments once for replay and source namespace authority.
+    pub(crate) fn java_api_option_slots(
+        &self,
+        recipe: &JavaCompilerRecipe,
+    ) -> anyhow::Result<JavaApiOptionSlots> {
+        let task = self;
+        let options = &recipe.api_options;
+        let (levels, decoration, raw_proc): (&[&str], &[&str], bool) = match recipe.adapter.as_str() {
+            "gradle-7.4.2-current-jdk17-javac-api-v1" => {
+                (&["-source", "17", "-target", "17"], &[], true)
+            }
+            "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1" => {
+                (&["--release", "8"], &[], false)
+            }
+            "gradle-7.5-current-jdk17-utf8-javac-api-v1" => (
+                &["-source", "1.8", "-target", "1.8"],
+                &["-nowarn", "-encoding", "UTF-8"],
+                true,
+            ),
+            "gradle-9.6.1-current-jdk17-javac-api-v1"
+            | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1" => {
+                (&["-source", "17", "-target", "17"], &[], false)
+            }
+            "gradle-9.6.1-current-jdk21-utf8-javac-api-v1" => (
+                &["-source", "21", "-target", "21"],
+                &["-encoding", "UTF-8"],
+                false,
+            ),
+            _ => anyhow::bail!("java-api-options-adapter-unhandled"),
+        };
+        let destination = levels.len() + 1;
+        let header = levels.len() + 2 + decoration.len();
+        let classpath = header + 10;
+        anyhow::ensure!(
+            options.len() == header + 11 + usize::from(raw_proc),
+            "java-api-options-shape-unhandled"
+        );
+        for (index, expected) in levels.iter().enumerate() {
+            anyhow::ensure!(
+                options[index] == *expected,
+                "java-api-options-unhandled-at-{index}"
+            );
+        }
+        anyhow::ensure!(
+            options[levels.len()] == "-d",
+            "java-api-destination-option-differs"
+        );
+        for (index, expected) in decoration.iter().enumerate() {
+            anyhow::ensure!(
+                options[levels.len() + 2 + index] == *expected,
+                "java-api-encoding-warning-options-differ"
+            );
+        }
+        for (offset, expected) in [
+            (0, "-h"),
+            (2, "-g"),
+            (3, "-sourcepath"),
+            (4, ""),
+            (5, "-proc:none"),
+            (6, "-s"),
+            (8, "-XDuseUnsharedTable=true"),
+            (9, "-classpath"),
+        ] {
+            anyhow::ensure!(
+                options[header + offset] == expected,
+                "java-api-options-unhandled-at-{}",
+                header + offset
+            );
+        }
+        anyhow::ensure!(
+            !raw_proc || options[classpath + 1] == "-proc:none",
+            "java-api-raw-processor-argument-differs"
+        );
+        anyhow::ensure!(
+            task.output_roots.len() == 1
+                && same_java_api_path(Path::new(&options[destination]), &task.output_roots[0]),
+            "java-output-role-unknown"
+        );
+        for position in [header + 1, header + 7] {
+            anyhow::ensure!(
+                task.declared_output_roots
+                    .iter()
+                    .any(|root| same_java_api_path(root, Path::new(&options[position]))),
+                "java-secondary-output-role-unknown"
+            );
+        }
+        anyhow::ensure!(
+            options[classpath] == joined_java_api_classpath(&task.classpath)?,
+            "java-captured-classpath-differs"
+        );
+        Ok(JavaApiOptionSlots {
+            destination,
+            headers: header + 1,
+            generated: header + 7,
+            classpath,
+            explicit_processor_argument: raw_proc,
+        })
     }
+
+    pub(crate) fn annotation_processing_disabled(&self) -> bool {
+        if self.arguments.len() == 1 && self.arguments[0] == "-proc:none" {
+            return true;
+        }
+        if !self.arguments.is_empty() || !self.annotation_processor_path.is_empty() {
+            return false;
+        }
+        self.java_compiler_recipe().is_some_and(|recipe| {
+            self.java_api_option_slots(&recipe)
+                .is_ok_and(|slots| !slots.explicit_processor_argument)
+        })
+    }
+
+
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

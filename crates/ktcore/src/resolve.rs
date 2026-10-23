@@ -2272,6 +2272,42 @@ pub(crate) fn qualified_top_level_function_entries<'a>(
     (!entries.is_empty()).then_some(entries)
 }
 
+/// A qualified classifier is a receiver only after ruling out a value at its root.
+pub(crate) fn qualified_type_receiver(
+    index: &dyn InferenceIndex,
+    node: Node,
+    src: &str,
+    ctx: &infer::FileCtx,
+) -> Option<Type> {
+    let parts = navigation_parts(node, src)?;
+    let names = part_names(&parts);
+    let entries = absolute_path_entries(index, &names, |kind| {
+        matches!(
+            kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Object | SymbolKind::EnumClass
+        )
+    });
+    let [entry] = entries.as_slice() else {
+        return None;
+    };
+    if !absolute_path_entries(index, &names, |kind| {
+        matches!(kind, SymbolKind::Property | SymbolKind::EnumEntry)
+    })
+    .is_empty()
+    {
+        return None;
+    }
+    unshadowed_navigation_parts(index, node, src, ctx)?;
+    Some(Type::Class {
+        name: entry.sym.name.clone(),
+        package: Some(entry.sym.package.clone()),
+        container: entry.sym.container.clone(),
+        nullable: false,
+        args: Vec::new(),
+        owner: None,
+    })
+}
+
 fn unshadowed_navigation_parts<'t>(
     index: &dyn InferenceIndex,
     node: Node<'t>,
@@ -2283,10 +2319,44 @@ fn unshadowed_navigation_parts<'t>(
         return None;
     }
     let (first_node, first_name) = &parts[0];
-    if local_decl(*first_node, first_name, UseKind::Value, src).is_some()
+    if !index.scope_is_complete()
+        || local_decl(*first_node, first_name, UseKind::Value, src).is_some()
         || qualified_root_has_binding(index, first_name, ctx)
     {
         return None;
+    }
+    for receiver in infer::implicit_receiver_types(index, node, src, ctx, 0) {
+        let mut complete = true;
+        let _ = infer::walk_supertypes(index, &receiver, infer::MAX_DEPTH, |current| {
+            let Some(root) = infer::receiver_root_key(index, current) else {
+                complete = false;
+                return ControlFlow::Break(());
+            };
+            let owners: Vec<_> = index
+                .lookup_type(current.name().unwrap_or_default())
+                .into_iter()
+                .filter(|owner| {
+                    Some(owner.sym.package.as_str()) == current.package()
+                        && owner.sym.container.as_deref() == current.container()
+                })
+                .collect();
+            if owners.len() != 1
+                || !index.source_value_namespace_complete(owners[0])
+                || index.members_of(&root).iter().any(|entry| {
+                    entry.sym.name == *first_name
+                        && (entry.sym.kind.is_value_like() || entry.sym.kind.is_type_like())
+                        && Some(entry.sym.package.as_str()) == current.package()
+                        && entry.sym.container.as_deref() == Some(root.as_str())
+                })
+            {
+                complete = false;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        if !complete {
+            return None;
+        }
     }
     Some(parts)
 }
@@ -2302,25 +2372,64 @@ fn qualified_root_has_binding(
             && (entry.sym.kind.is_value_like() || entry.sym.kind.is_type_like())
     };
     if ctx.imports.iter().any(|import| {
-        !import.wildcard
-            && import.local_name() == Some(name)
-            && index
-                .lookup_by_name(import.simple_name())
+        if import.wildcard || import.local_name() != Some(name) {
+            return false;
+        }
+        let entries: Vec<_> = index
+            .lookup_by_name(import.simple_name())
+            .into_iter()
+            .filter(|entry| import_path_matches_entry(import, entry))
+            .collect();
+        entries.is_empty()
+            || entries
                 .iter()
-                .any(|entry| is_root_binding(entry) && import_path_matches_entry(import, entry))
+                .any(|entry| entry.sym.kind.is_value_like() || entry.sym.kind.is_type_like())
     }) {
         return true;
     }
+    if ctx
+        .imports
+        .iter()
+        .filter(|import| import.wildcard)
+        .any(|import| {
+            absolute_path_entries(
+                index,
+                &import
+                    .path
+                    .split('.')
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                SymbolKind::is_type_like,
+            )
+            .iter()
+            .any(|owner| !index.source_value_namespace_complete(owner))
+        })
+    {
+        return true;
+    }
     index.lookup_by_name(name).iter().any(|entry| {
-        is_root_binding(entry)
+        (is_root_binding(entry)
             && (entry.sym.package == ctx.package
                 || DEFAULT_IMPORT_PACKAGES.contains(&entry.sym.package.as_str())
                 || ctx
                     .imports
                     .iter()
-                    .any(|import| import.wildcard && import.package() == entry.sym.package))
+                    .any(|import| import.wildcard && import.package() == entry.sym.package)))
+            || (entry.sym.kind.is_value_like() || entry.sym.kind.is_type_like())
+                && ctx.imports.iter().any(|import| {
+                    import.wildcard
+                        && absolute_path_matches(
+                            entry,
+                            &import
+                                .path
+                                .split('.')
+                                .map(str::to_string)
+                                .collect::<Vec<_>>(),
+                        )
+                })
     })
 }
+
 
 fn ancestor_of_kind_a<'t>(ancestors: &[Node<'t>], kind: &str) -> Option<Node<'t>> {
     ancestors.iter().rev().find(|n| n.kind() == kind).copied()

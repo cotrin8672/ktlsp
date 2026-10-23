@@ -16,6 +16,98 @@ const OVERLOAD_JAVA: &str = "/selection/typed/JavaUse.java";
 const OVERLOAD_KOTLIN: &str = "/selection/typed/KotlinUse.kt";
 const OVERLOAD_USE: &str = "package typed; class JavaUse { void run(Target target, Decoy decoy, int number, String text) { target.twice(1); target.twice(\"x\"); target.twice(number); target.twice(text); decoy.twice(\"x\"); } }";
 
+#[test]
+fn kotlin_java_reference_specificity_maps_jvm_string_arguments() {
+    // Selected JDK 21 and stdlib 2.1.20 headers, including the contravariant Comparable parent.
+    for kotlin_builtins in [false, true] {
+        let mut ws = Workspace::new();
+        for (file, source) in [
+            ("Object.java", "package java.lang; public class Object {}"),
+            ("String.java", "package java.lang; public final class String { public boolean isEmpty() { return false; } }"),
+            ("CharSequence.java", "package java.lang; public interface CharSequence {}"),
+            ("Iterable.java", "package java.lang; public interface Iterable<T> {}"),
+            ("Collection.java", "package java.util; public interface Collection<E> extends java.lang.Iterable<E> {}"),
+            ("SequencedCollection.java", "package java.util; public interface SequencedCollection<E> extends Collection<E> {}"),
+            ("List.java", "package java.util; public interface List<E> extends SequencedCollection<E> {}"),
+            ("Reader.java", "package specificity; public class Reader { public static <T> String pickTop(java.util.List<T> values, T value) { return null; } public static String pickTop(java.util.Collection<String> values, Object value) { return null; } public static <T> String pickNested(java.util.List<T> first, java.util.List<T> second) { return null; } public static String pickNested(java.util.Collection<String> first, java.util.Collection<String> second) { return null; } }"),
+        ] {
+            ws.open(file, source.into());
+        }
+        if kotlin_builtins {
+            ws.open("Builtins.kt", "package kotlin\nopen class Any\ninterface Comparable<in T>\ninterface CharSequence { val length: Int }\nclass String : Comparable<String>, CharSequence { override val length: Int = 0 }\n".into());
+            ws.open(
+                "Strings.kt",
+                "package kotlin.text\nfun CharSequence.isEmpty(): Boolean = length == 0\n".into(),
+            );
+        }
+        let source = "package specificity\nfun use(values: java.util.List<String>, text: String) { Reader.pickTop(values, text).isEmpty(); Reader.pickNested(values, values).isEmpty() }\n";
+        ws.open("Use.kt", source.into());
+        ws.assume_index_complete_for_tests();
+        assert!(
+            ws.diagnostics("Use.kt").is_empty(),
+            "Kotlin builtins={kotlin_builtins}"
+        );
+        for (name, call) in [
+            ("pickTop", "Reader.pickTop(values, text)"),
+            ("pickNested", "Reader.pickNested(values, values)"),
+        ] {
+            let entry = ws
+                .index
+                .lookup_by_name(name)
+                .iter()
+                .find(|entry| entry.sym.type_params.is_empty())
+                .unwrap();
+            let expected = Def {
+                file: "Reader.java".into(),
+                start_byte: entry.sym.start_byte,
+                end_byte: entry.sym.end_byte,
+            };
+            assert_eq!(
+                goto(&mut ws, "Use.kt", call),
+                vec![expected],
+                "{name}; Kotlin builtins={kotlin_builtins}"
+            );
+            assert!(
+                labels(&mut ws, "Use.kt", &format!("{call}.isEm")).contains("isEmpty"),
+                "{name}; Kotlin builtins={kotlin_builtins}"
+            );
+            ws.change(
+                "Use.kt",
+                source.replace(&format!("{call}.isEmpty()"), &format!("{call}.isEm")),
+            );
+            assert!(labels(&mut ws, "Use.kt", &format!("{call}.isEm")).contains("isEmpty"));
+            ws.change("Use.kt", source.into());
+        }
+        ws.change("Use.kt", source.replace("values, text", "values, missing"));
+        assert_eq!(
+            goto(&mut ws, "Use.kt", "Reader.pickTop(values, missing)").len(),
+            2
+        );
+        if kotlin_builtins {
+            ws.change("Use.kt", source.into());
+            ws.open(
+                "OtherSequence.kt",
+                "package other\ninterface CharSequence\n".into(),
+            );
+            ws.change("Strings.kt", "package kotlin.text\nimport other.CharSequence\nfun CharSequence.isEmpty(): Boolean = false\n".into());
+            assert!(
+                !labels(&mut ws, "Use.kt", "Reader.pickTop(values, text).isEm").contains("isEmpty")
+            );
+            ws.change(
+                "Strings.kt",
+                "package kotlin.text\nfun CharSequence.isEmpty(): Boolean = false\n".into(),
+            );
+            ws.open(
+                "LocalSequence.kt",
+                "package kotlin.text\ninterface CharSequence\n".into(),
+            );
+            assert!(
+                !labels(&mut ws, "Use.kt", "Reader.pickTop(values, text).isEm").contains("isEmpty")
+            );
+        }
+    }
+}
+
 fn overload_workspace(java_target: bool) -> (Workspace, &'static str) {
     let mut ws = Workspace::new();
     ws.open("/selection/typed/Results.kt", "package typed\nclass NumberResult { fun numberOnly() {} }\nclass TextResult { fun textOnly() {} }\nclass Decoy { fun twice(value: String): TextResult = TextResult() }\n".into());

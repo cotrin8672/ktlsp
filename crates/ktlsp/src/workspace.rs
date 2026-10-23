@@ -9628,6 +9628,128 @@ mod kotlin_diagnostic_lifecycle_tests {
 mod java_source_authority_tests {
     use super::*;
 
+    #[test]
+    fn gradle_effective_processor_disable_preserves_current_java_namespace() {
+        use std::io::Write;
+        let (mut ws, model, owner, caller) = fixture(false, "java", "package app; public class Current { public static Current FIELD; public int current() { return 2; } }");
+        let root = &model.modules[0].project_dir;
+        std::fs::create_dir_all(root).unwrap();
+        let service = |path: &Path, name: &str| {
+            let mut jar = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            jar.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            jar.write_all(b"test.Provider").unwrap();
+            jar.finish().unwrap();
+        };
+        let processor = root.join("processor.jar");
+        service(
+            &processor,
+            "META-INF/services/javax.annotation.processing.Processor",
+        );
+        let plugin = root.join("plugin.jar");
+        service(&plugin, "META-INF/services/com.sun.source.util.Plugin");
+        let mut modules = model.modules.clone();
+        let task = &mut modules[0].source_sets[0].compiler_tasks[0];
+        task.arguments.clear();
+        task.classpath = vec![processor];
+        task.output_roots = vec![root.join("java-classes")];
+        task.declared_output_roots = vec![
+            root.join("java-classes"),
+            root.join("java-headers"),
+            root.join("java-generated"),
+        ];
+        task.options
+            .insert("encoding".into(), serde_json::json!("UTF-8"));
+        task.options.insert(
+            "javaCompilerRecipe".into(),
+            serde_json::json!({
+                "adapter": "gradle-9.6.1-current-jdk21-utf8-javac-api-v1",
+                "compiler_type": "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler",
+                "java_runtime_version": "21.0.3+9-LTS", "language_version": "21",
+                "gradle_java_version": "21.0.3", "gradle_file_encoding": "UTF-8",
+                "effective_charset": "UTF-8", "locale": "en-US",
+                "api_options": ["-source", "21", "-target", "21", "-d", task.output_roots[0],
+                    "-encoding", "UTF-8", "-h", task.declared_output_roots[1], "-g", "-sourcepath", "",
+                    "-proc:none", "-s", task.declared_output_roots[2], "-XDuseUnsharedTable=true",
+                    "-classpath", std::env::join_paths(&task.classpath).unwrap().into_string().unwrap()]
+            }),
+        );
+        let expected_namespace = |ws: &Workspace, path: &str| {
+            ws.with_java_member_proofs(&caller, |index| {
+                let entries = index.entries_for_file(path);
+                let owner = entries
+                    .iter()
+                    .find(|e| e.sym.kind == SymbolKind::Class)
+                    .unwrap();
+                index.source_value_namespace_complete(owner)
+            })
+        };
+        let apply = |ws: &mut Workspace, modules: Vec<crate::classpath::ModuleClasspath>| {
+            ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+            ws.project_scan_initialized = true;
+            ws.set_library_index_complete(true);
+            ws.set_jdk_index_complete(true);
+        };
+        apply(&mut ws, modules.clone());
+        assert!(
+            expected_namespace(&ws, &owner),
+            "Gradle's captured effective -proc:none disables classpath processors"
+        );
+        let source = "package app; class Use { int run() { return app.Current.FIELD.current(); } }";
+        ws.change(&caller, source.into());
+        let at = source.find(".current").unwrap() + ".curr".len();
+        assert!(ws
+            .complete(&caller, at, true)
+            .unwrap()
+            .items
+            .iter()
+            .any(|i| i.label == "current"));
+        assert!(!ws.goto_definition(&caller, at).is_empty());
+        for gap in [
+            "plugin",
+            "raw-plugin",
+            "raw-argfile",
+            "processor-path",
+            "conflicting-proc",
+            "unknown-adapter",
+            "stale-classpath",
+        ] {
+            let mut changed = modules.clone();
+            let task = &mut changed[0].source_sets[0].compiler_tasks[0];
+            match gap {
+                "plugin" => {
+                    task.classpath.push(plugin.clone());
+                    task.options.get_mut("javaCompilerRecipe").unwrap()["api_options"][18] =
+                        serde_json::json!(std::env::join_paths(&task.classpath)
+                            .unwrap()
+                            .into_string()
+                            .unwrap());
+                }
+                "raw-plugin" => task.arguments.push("-Xplugin:transform".into()),
+                "raw-argfile" => task.arguments.push("@compiler.args".into()),
+                "processor-path" => task
+                    .annotation_processor_path
+                    .push(root.join("processor.jar")),
+                "conflicting-proc" => task.options.get_mut("javaCompilerRecipe").unwrap()
+                    ["api_options"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!("-proc:full")),
+                "unknown-adapter" => {
+                    task.options.get_mut("javaCompilerRecipe").unwrap()["adapter"] =
+                        serde_json::json!("unknown")
+                }
+                "stale-classpath" => task.classpath.push(task.classpath[0].clone()),
+                _ => unreachable!(),
+            }
+            apply(&mut ws, changed);
+            assert!(!expected_namespace(&ws, &owner), "{gap}");
+        }
+        apply(&mut ws, modules);
+        assert!(expected_namespace(&ws, &owner));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn fixture(
         generated: bool,
         extension: &str,

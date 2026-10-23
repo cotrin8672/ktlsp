@@ -2,7 +2,10 @@
 //! shortcut: pinned plain tasks and explicit imports; complete K2 also admits zero-argument
 //! non-generic java.base receiver methods. Expand after same-Javac and editor controls pass.
 use super::*;
-use crate::classpath::{CompilerTask, JavaCompilerRecipe};
+use crate::classpath::{
+    java_api_path_text as path_text, joined_java_api_classpath as joined_classpath,
+    same_java_api_path as same_path, CompilerTask, JavaCompilerRecipe,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,34 +80,6 @@ fn header_key(path: &Path) -> String {
     crate::paths::file_key(path)
         .replace('\\', "/")
         .to_lowercase()
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    kotlin_path_key(&crate::paths::file_key(a)) == kotlin_path_key(&crate::paths::file_key(b))
-}
-
-fn path_text(path: &Path) -> anyhow::Result<String> {
-    let text = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("java-path-encoding"))?;
-    anyhow::ensure!(
-        path.is_absolute() && !text.chars().any(|c| matches!(c, '\0' | '\r' | '\n' | '\t')),
-        "java-path-unhandled"
-    );
-    Ok(text.to_owned())
-}
-
-fn joined_classpath(paths: &[PathBuf]) -> anyhow::Result<String> {
-    for path in paths {
-        let text = path_text(path)?;
-        anyhow::ensure!(
-            !text.contains(if cfg!(windows) { ';' } else { ':' }),
-            "java-classpath-separator-in-path"
-        );
-    }
-    std::env::join_paths(paths)?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("java-classpath-encoding"))
 }
 
 fn k2_normal(request: &KotlinDiagnosticRequest) -> bool {
@@ -817,101 +792,20 @@ fn replay_options(
     kotlin_output: &Path,
     private: &Path,
 ) -> anyhow::Result<Vec<String>> {
+    let slots = task.java_api_option_slots(recipe)?;
+    let (destination, classpath) = (slots.destination, slots.classpath);
     let options = &recipe.api_options;
-    let (levels, decoration, raw_proc): (&[&str], &[&str], bool) = match recipe.adapter.as_str() {
-        "gradle-7.4.2-current-jdk17-javac-api-v1" => {
-            (&["-source", "17", "-target", "17"], &[], true)
-        }
-        "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1" => {
-            (&["--release", "8"], &[], false)
-        }
-        "gradle-7.5-current-jdk17-utf8-javac-api-v1" => (
-            &["-source", "1.8", "-target", "1.8"],
-            &["-nowarn", "-encoding", "UTF-8"],
-            true,
-        ),
-        "gradle-9.6.1-current-jdk17-javac-api-v1"
-        | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1" => {
-            (&["-source", "17", "-target", "17"], &[], false)
-        }
-        "gradle-9.6.1-current-jdk21-utf8-javac-api-v1" => (
-            &["-source", "21", "-target", "21"],
-            &["-encoding", "UTF-8"],
-            false,
-        ),
-        _ => anyhow::bail!("java-api-options-adapter-unhandled"),
-    };
-    let destination = levels.len() + 1;
-    let header = levels.len() + 2 + decoration.len();
-    let classpath = header + 10;
-    anyhow::ensure!(
-        options.len() == header + 11 + usize::from(raw_proc),
-        "java-api-options-shape-unhandled"
-    );
-    for (index, expected) in levels.iter().enumerate() {
-        anyhow::ensure!(
-            options[index] == *expected,
-            "java-api-options-unhandled-at-{index}"
-        );
-    }
-    anyhow::ensure!(
-        options[levels.len()] == "-d",
-        "java-api-destination-option-differs"
-    );
-    for (index, expected) in decoration.iter().enumerate() {
-        anyhow::ensure!(
-            options[levels.len() + 2 + index] == *expected,
-            "java-api-encoding-warning-options-differ"
-        );
-    }
-    for (offset, expected) in [
-        (0, "-h"),
-        (2, "-g"),
-        (3, "-sourcepath"),
-        (4, ""),
-        (5, "-proc:none"),
-        (6, "-s"),
-        (8, "-XDuseUnsharedTable=true"),
-        (9, "-classpath"),
-    ] {
-        anyhow::ensure!(
-            options[header + offset] == expected,
-            "java-api-options-unhandled-at-{}",
-            header + offset
-        );
-    }
-    anyhow::ensure!(
-        !raw_proc || options[classpath + 1] == "-proc:none",
-        "java-api-raw-processor-argument-differs"
-    );
-    anyhow::ensure!(
-        task.output_roots.len() == 1
-            && same_path(Path::new(&options[destination]), &task.output_roots[0]),
-        "java-output-role-unknown"
-    );
-    for position in [header + 1, header + 7] {
-        anyhow::ensure!(
-            task.declared_output_roots
-                .iter()
-                .any(|root| same_path(root, Path::new(&options[position]))),
-            "java-secondary-output-role-unknown"
-        );
-    }
-    anyhow::ensure!(
-        options[classpath] == joined_classpath(&task.classpath)?,
-        "java-captured-classpath-differs"
-    );
-    let slots: Vec<_> = task
+    let kotlin_slots: Vec<_> = task
         .classpath
         .iter()
         .enumerate()
         .filter(|(_, path)| same_path(path, kotlin_output))
         .map(|(index, _)| index)
         .collect();
-    anyhow::ensure!(slots.len() == 1, "java-kotlin-output-slot-unknown");
+    anyhow::ensure!(kotlin_slots.len() == 1, "java-kotlin-output-slot-unknown");
     for (index, path) in task.classpath.iter().enumerate() {
         anyhow::ensure!(
-            index == slots[0]
+            index == kotlin_slots[0]
                 || !paths_overlap(
                     &kotlin_path_key(&crate::paths::file_key(path)),
                     &kotlin_path_key(&crate::paths::file_key(kotlin_output))
@@ -920,12 +814,12 @@ fn replay_options(
         );
     }
     let mut paths = task.classpath.clone();
-    paths[slots[0]] = private.join("lease");
+    paths[kotlin_slots[0]] = private.join("lease");
     let mut result = options.clone();
     for (index, directory) in [
         (destination, "java-classes"),
-        (header + 1, "java-headers"),
-        (header + 7, "java-generated"),
+        (slots.headers, "java-headers"),
+        (slots.generated, "java-generated"),
     ] {
         result[index] = path_text(&private.join(directory))?;
     }

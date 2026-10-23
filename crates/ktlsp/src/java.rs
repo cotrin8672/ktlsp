@@ -3995,6 +3995,9 @@ fn java_member_receiver(
             if let Some(receiver) = java_nested_enum_namespace(index, file, src, tree, object) {
                 return Some((receiver, ReceiverKind::Type));
             }
+            if let Some(receiver) = java_unshadowed_type_receiver(index, file, src, tree, object) {
+                return Some((receiver, ReceiverKind::Type));
+            }
             receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
@@ -4158,6 +4161,13 @@ fn java_unshadowed_type_receiver(
     let mut ancestor = object.parent();
     while let Some(node) = ancestor {
         ancestor = node.parent();
+        if node.kind() == "class_body"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "object_creation_expression")
+        {
+            return None;
+        }
         if !matches!(
             node.kind(),
             "class_declaration"
@@ -4226,6 +4236,7 @@ fn java_unshadowed_type_receiver(
     }
     found_owner.then_some(receiver)
 }
+
 
 fn implicit_receiver_kind(node: Node<'_>, src: &str) -> ktcore::jvm::ReceiverKind {
     let mut current = node.parent();

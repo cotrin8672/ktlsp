@@ -7377,8 +7377,8 @@ fn f_bounded_property_arguments_preserve_enum_result_across_languages() {
         ws.open(key(&file), source.doc_text(&file).unwrap());
     }
     for (file, source) in [
-        ("Use.java", "package probe; class Use { void use(BlockState state,Property<Direction.Axis> property) { state.getValue(property).isVertical(); state.getValue(BlockStateProperties.AXIS).isVertical(); } }"),
-        ("Use.kt", "package probe\nfun use(state:BlockState,property:Property<Direction.Axis>) { state.getValue(property).isVertical(); state.getValue(BlockStateProperties.AXIS).isVertical() }\n"),
+        ("Use.java", "package consumer; import probe.BlockState; import probe.Property; import probe.Direction; import probe.BlockStateProperties; class Use { void use(BlockState state,Property<Direction.Axis> property) { state.getValue(property).isVertical(); state.getValue(BlockStateProperties.AXIS).isVertical(); state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }"),
+        ("Use.kt", "package consumer\nimport probe.BlockState\nimport probe.Property\nimport probe.Direction\nimport probe.BlockStateProperties\nfun use(state:BlockState,property:Property<Direction.Axis>) { state.getValue(property).isVertical(); state.getValue(BlockStateProperties.AXIS).isVertical(); state.getValue(probe.BlockStateProperties.AXIS).isVertical() }\n"),
     ] {
         let file = key(file);
         ws.open(&file, source.into());
@@ -7393,7 +7393,7 @@ fn f_bounded_property_arguments_preserve_enum_result_across_languages() {
             assert_eq!(supertypes[0].name(), Some("Property"));
             assert_eq!(supertypes[0].args(), actual.args());
         }
-        for expression in ["state.getValue(property)", "state.getValue(BlockStateProperties.AXIS)"] {
+        for expression in ["state.getValue(property)", "state.getValue(BlockStateProperties.AXIS)", "state.getValue(probe.BlockStateProperties.AXIS)"] {
             assert_member(&mut ws, &file, &format!("{expression}.isVert"), "isVertical", "missingAxisMethod");
             let start = source.find(&format!("{expression}.isVertical")).unwrap() + expression.len() + 1;
             let defs = ws.goto_definition(&file, start);
@@ -7408,6 +7408,53 @@ fn f_bounded_property_arguments_preserve_enum_result_across_languages() {
                 assert_eq!(result.container(), Some("Direction"));
             }
         }
+    }
+    for (name, source) in [
+        ("KnownOwner.java", "package consumer; import probe.BlockState; class KnownOwner { void valid(BlockState state) { state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }"),
+        ("KnownOwner.kt", "package consumer\nimport probe.BlockState\nclass KnownKotlinOwner { fun valid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } }\n"),
+        ("PlainLambda.kt", "package consumer\nimport probe.BlockState\nfun plain(block:()->Unit) {}\nfun valid(state:BlockState) { plain { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } }\n"),
+    ] {
+        let file = key(name);
+        ws.open(&file, source.into());
+        assert_member(&mut ws, &file, "state.getValue(probe.BlockStateProperties.AXIS).isVert", "isVertical", "missingAxisMethod");
+        let start = source.find("isVertical").unwrap();
+        let definitions = ws.goto_definition(&file, start);
+        assert_eq!(definitions.len(), 1, "{name}: {definitions:?}");
+        assert_eq!(definitions[0].file, key("Direction.java"));
+        if name == "KnownOwner.kt" {
+            ws.change(&file, source.replace("class KnownKotlinOwner", "class KnownKotlinOwner:Missing()"));
+            assert!(!labels(&mut ws, &file, "state.getValue(probe.BlockStateProperties.AXIS).isVert").contains("isVertical"), "a changed header must retract namespace proof");
+            ws.change(&file, source.into());
+            assert_member(&mut ws, &file, "state.getValue(probe.BlockStateProperties.AXIS).isVert", "isVertical", "missingAxisMethod");
+        }
+    }
+    ws.open(
+        key("Root.java"),
+        "package shadow; public class Root { public static Object probe; }".into(),
+    );
+    for (name, source) in [
+        ("Local.java", "package consumer; import probe.BlockState; class Local { void invalid(BlockState state,Object probe) { state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }"),
+        ("Local.kt", "package consumer\nimport probe.BlockState\nfun invalid(state:BlockState,probe:Any) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() }\n"),
+        ("Imported.java", "package consumer; import probe.BlockState; import static shadow.Root.probe; class Imported { void invalid(BlockState state) { state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }"),
+        ("Imported.kt", "package consumer\nimport probe.BlockState\nimport shadow.Root.probe\nfun invalid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() }\n"),
+        ("Wildcard.java", "package consumer; import probe.BlockState; import static shadow.Root.*; class Wildcard { void invalid(BlockState state) { state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }"),
+        ("Wildcard.kt", "package consumer\nimport probe.BlockState\nimport shadow.Root.*\nfun invalid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() }\n"),
+        ("MissingOwner.java", "package consumer; import probe.BlockState; class MissingOwner extends Missing { void invalid(BlockState state) { state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }"),
+        ("MissingOwner.kt", "package consumer\nimport probe.BlockState\nclass MissingKotlinOwner:Missing() { fun invalid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } }\n"),
+        ("UnknownApply.kt", "package consumer\nimport probe.BlockState\nfun invalid(state:BlockState) { missing.apply { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } }\n"),
+        ("UnknownReceiver.kt", "package consumer\nimport probe.BlockState\nfun unknownScope(block:Missing.()->Unit) {}\nfun invalid(state:BlockState) { unknownScope { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } }\n"),
+        ("AnnotatedOwner.kt", "package consumer\nimport probe.BlockState\n@UnknownPlugin class AnnotatedOwner { fun invalid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } }\n"),
+        ("Anonymous.kt", "package consumer\nimport probe.BlockState\nfun invalid(state:BlockState) { val owner = object:Missing() { fun invalid() { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } } }\n"),
+        ("Anonymous.java", "package consumer; import probe.BlockState; class Anonymous { void invalid(BlockState state) { Object owner = new Missing() { void invalid() { state.getValue(probe.BlockStateProperties.AXIS).isVertical(); } }; } }"),
+        ("LaterField.kt", "package consumer\nimport probe.BlockState\nclass LaterField { fun invalid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() } val probe:Missing = TODO() }\n"),
+        ("MissingImport.kt", "package consumer\nimport probe.BlockState\nimport shadow.Missing.probe\nfun invalid(state:BlockState) { state.getValue(probe.BlockStateProperties.AXIS).isVertical() }\n"),
+    ] {
+        let file = key(name);
+        ws.open(&file, source.into());
+        let prefix = "state.getValue(probe.BlockStateProperties.AXIS).isVert";
+        assert!(!labels(&mut ws, &file, prefix).contains("isVertical"), "{name}: a value or unknown ancestor can shadow the package root");
+        let start = source.find(prefix).unwrap() + prefix.len() - "isVert".len();
+        assert!(ws.goto_definition(&file, start).is_empty(), "{name}: root shadow must also block navigation");
     }
     ws.open(key("KotlinStateHolder.kt"), "package probe\nclass KotlinStateHolder { fun <T:Comparable<T>> getValue(property:Property<T>):T = TODO() }\n".into());
     ws.open(key("Nullable.kt"), "package probe\nfun invalid(state:KotlinStateHolder,property:EnumProperty<Direction.Axis>?) { state.getValue(property).isVertical() }\n".into());
