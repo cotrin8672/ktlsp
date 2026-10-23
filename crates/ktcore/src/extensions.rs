@@ -1598,6 +1598,35 @@ impl ReadSession<'_> {
         self.issue_declaration(&entry)
     }
 
+    /// The exact class/interface/object/enum declaration's own type, without name resolution.
+    /// Members do not yield their value/return type or containing owner. Handles retain the
+    /// existing host/source lifetime checks and must remain visible in this session's scope.
+    pub fn declaration_type(
+        &mut self,
+        declaration: &DeclarationId,
+    ) -> Result<Fact<TypeId>, ContractError> {
+        self.check_declaration(declaration)?;
+        self.reads.namespace = Some(self.store.namespace_generation);
+        let entry = self
+            .index
+            .entries_for_file(&declaration.definition.file)
+            .into_iter()
+            .find(|entry| definition(entry) == declaration.definition);
+        if !self.index.scope_is_complete() {
+            return Ok(unknown(IncompleteReason::IncompleteScope));
+        }
+        let entry = entry.ok_or(ContractError::ForeignIdentity)?;
+        if !matches!(
+            entry.sym.kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Object | SymbolKind::EnumClass
+        ) {
+            return Ok(unknown(IncompleteReason::UnsupportedType(
+                entry.sym.name.clone(),
+            )));
+        }
+        self.issue_type(&entry).map(Knowledge::Found)
+    }
+
     pub fn resolve_type(&mut self, qualified_name: &str) -> Fact<TypeId> {
         self.reads.namespace = Some(self.store.namespace_generation);
         let name = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
@@ -1632,25 +1661,14 @@ impl ReadSession<'_> {
         ) {
             return unknown(IncompleteReason::IncompleteTarget);
         }
-        let declaration = match self.issue_declaration(entry) {
-            Ok(declaration) => declaration,
+        match self.issue_type(entry) {
+            Ok(owner) => Knowledge::Found(owner),
             Err(ContractError::MissingSource) => {
                 self.reads.missing_sources.insert(entry.path.to_string());
-                return unknown(IncompleteReason::MissingSource);
+                unknown(IncompleteReason::MissingSource)
             }
-            Err(_) => return unknown(IncompleteReason::MissingSource),
-        };
-        let container = entry.sym.container.as_ref().map_or_else(
-            || unquote(&entry.sym.name).to_string(),
-            |container| format!("{container}.{}", unquote(&entry.sym.name)),
-        );
-        Knowledge::Found(TypeId {
-            declaration,
-            qualified_name: qualified_name.into(),
-            package: entry.sym.package.clone(),
-            container,
-            model_generation: self.store.model_generation,
-        })
+            Err(_) => unknown(IncompleteReason::MissingSource),
+        }
     }
 
     pub fn resolve_type_ref(&mut self, ty: &crate::types::TypeRef) -> Fact<TypeId> {
@@ -2230,6 +2248,19 @@ impl ReadSession<'_> {
             reads: self.reads,
             set: self.set,
         }
+    }
+
+    fn issue_type(&mut self, entry: &Entry) -> Result<TypeId, ContractError> {
+        Ok(TypeId {
+            declaration: self.issue_declaration(entry)?,
+            qualified_name: qualified_type_name(entry),
+            package: entry.sym.package.clone(),
+            container: entry.sym.container.as_ref().map_or_else(
+                || unquote(&entry.sym.name).to_string(),
+                |container| format!("{container}.{}", unquote(&entry.sym.name)),
+            ),
+            model_generation: self.store.model_generation,
+        })
     }
 
     fn issue_declaration(&mut self, entry: &Entry) -> Result<DeclarationId, ContractError> {

@@ -19,8 +19,21 @@ pub struct CallArguments {
     pub names: Option<Vec<Option<String>>>,
     pub has_spread: bool,
     pub trailing_lambda: bool,
-    /// Syntax omits the parameter list or explicitly writes an empty list; not a global arity.
-    pub trailing_lambda_omits_or_has_zero_parameters: bool,
+    pub trailing_lambda_arguments: Option<TrailingLambdaArguments>,
+}
+
+#[derive(Clone, Debug)]
+pub enum LambdaParameters {
+    Implicit,
+    /// Unannotated parameters have a contextual type; annotations must match that context.
+    Explicit(Vec<Option<Type>>),
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrailingLambdaArguments {
+    pub parameters: LambdaParameters,
+    pub result: Type,
 }
 
 #[derive(Clone, Debug)]
@@ -1996,6 +2009,28 @@ pub(crate) fn bind_arguments<'a>(
     mode: CallMode,
     ctx: &FileCtx,
 ) -> Result<BoundArguments<'a>, Applicability> {
+    bind_arguments_with_lambda_context(index, receiver, entry, args, mode, ctx, false)
+}
+
+pub(crate) fn bind_arguments_for_lambda_context<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &'a Entry,
+    args: &'a CallArguments,
+    ctx: &FileCtx,
+) -> Result<BoundArguments<'a>, Applicability> {
+    bind_arguments_with_lambda_context(index, receiver, entry, args, CallMode::Kotlin, ctx, true)
+}
+
+fn bind_arguments_with_lambda_context<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &'a Entry,
+    args: &'a CallArguments,
+    mode: CallMode,
+    ctx: &FileCtx,
+    only_context: bool,
+) -> Result<BoundArguments<'a>, Applicability> {
     let Some(names) = &args.names else {
         return Ok(BoundArguments {
             mode,
@@ -2011,26 +2046,48 @@ pub(crate) fn bind_arguments<'a>(
     {
         return Err(Applicability::Unknown);
     }
-    let contextual_unit_lambda = if args.trailing_lambda {
+    let contextual_lambda = if args.trailing_lambda {
         let Some(parameter) = entry.sym.params.last() else {
             return Err(Applicability::Unknown);
         };
-        if !args.trailing_lambda_omits_or_has_zero_parameters
-            || !function_type_signature(parameter).is_some_and(|(parameters, _)| parameters.is_empty())
+        if infer::trailing_lambda_receiver_ref(index, entry, ctx).is_some()
+            || function_type_signature(parameter).is_none()
         {
             return Err(Applicability::Unknown);
         }
         let ty = infer::declared_member_type(index, receiver, entry, parameter, mode, ctx);
-        let Type::Class { name, package: Some(package), container: None, args, owner: None, .. } = &ty else {
+        let Type::Class { name, package: Some(package), container: None, args: signature, owner: None, nullable: false } = &ty else {
             return Err(Applicability::Unknown);
         };
-        if name != "Function0"
+        let Some((result, parameters)) = signature.split_last() else {
+            return Err(Applicability::Unknown);
+        };
+        if name != &format!("Function{}", parameters.len())
             || !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
-            || args.as_slice() != [Type::class("Unit", Some("kotlin".into()))]
+            || parameters.len() > 1
+            || signature.iter().any(|ty| !infer::constraint_type_is_known(index, ty, 0))
         {
             return Err(Applicability::Unknown);
         }
-        // Unit coercion discards the body result only in this candidate's proven () -> Unit slot.
+        let Some(lambda) = &args.trailing_lambda_arguments else {
+            return Err(Applicability::Unknown);
+        };
+        match &lambda.parameters {
+            LambdaParameters::Implicit if parameters.len() <= 1 => {},
+            LambdaParameters::Explicit(actual) if actual.len() == parameters.len()
+                && actual.iter().zip(parameters).all(|(actual, formal)| actual.as_ref().is_none_or(|actual| {
+                    infer::constraint_type_is_known(index, actual, 0)
+                        && infer::receiver_satisfies_upper_bound(index, formal, actual)
+                })) => {},
+            _ => return Err(Applicability::Unknown),
+        }
+        // Context does not depend on the body. Only proven Unit coercion may discard its result.
+        if !only_context && result != &Type::class("Unit", Some("kotlin".into()))
+            && (!infer::constraint_type_is_known(index, &lambda.result, 0)
+                || !infer::receiver_satisfies_upper_bound(index, &lambda.result, result))
+        {
+            return Err(Applicability::Unknown);
+        }
         true
     } else {
         false
@@ -2049,7 +2106,7 @@ pub(crate) fn bind_arguments<'a>(
     {
         return Err(Applicability::Unknown);
     }
-    let supplied = args.types.len() + usize::from(contextual_unit_lambda);
+    let supplied = args.types.len() + usize::from(contextual_lambda);
     if supplied > formals.len() {
         return Err(Applicability::Rejected);
     }
@@ -2072,7 +2129,7 @@ pub(crate) fn bind_arguments<'a>(
             return Err(Applicability::Rejected);
         }
     }
-    if contextual_unit_lambda && positions.last().is_some_and(Option::is_some) {
+    if contextual_lambda && positions.last().is_some_and(Option::is_some) {
         return Err(Applicability::Rejected);
     }
     if positions
@@ -2081,7 +2138,7 @@ pub(crate) fn bind_arguments<'a>(
         .enumerate()
         .any(|(slot, (position, formal))| {
             position.is_none() && !formal.has_default
-                && !(contextual_unit_lambda && slot + 1 == formals.len())
+                && !(contextual_lambda && slot + 1 == formals.len())
         })
     {
         // shortcut: missing defaults stay unknown until inherited/actual defaults are modeled.
@@ -2114,7 +2171,7 @@ pub(crate) fn bind_arguments<'a>(
             names: None,
             has_spread: false,
             trailing_lambda: false,
-            trailing_lambda_omits_or_has_zero_parameters: false,
+            trailing_lambda_arguments: None,
         }),
         params,
     })

@@ -474,7 +474,7 @@ fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
         names: None,
         has_spread: false,
         trailing_lambda: false,
-        trailing_lambda_omits_or_has_zero_parameters: false,
+        trailing_lambda_arguments: None,
     };
     for name in ["widen", "box", "boxRef"] {
         let selected = ktcore::jvm::select_call(

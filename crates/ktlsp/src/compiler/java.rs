@@ -2342,6 +2342,45 @@ pub(super) fn run(
     clean: bool,
     generated: Option<&processor::GeneratedSources>,
 ) -> anyhow::Result<Vec<CompileDiagnostic>> {
+    run_checked(
+        request,
+        environment,
+        overlay,
+        canonical,
+        clean,
+        generated,
+        false,
+    )
+}
+
+pub(super) fn run_for_producer(
+    request: &KotlinDiagnosticRequest,
+    environment: &KotlinDiagnosticEnvironment,
+    overlay: &KotlinEditorOverlay,
+    canonical: &[CompileDiagnostic],
+    clean: bool,
+    generated: Option<&processor::GeneratedSources>,
+) -> anyhow::Result<Vec<CompileDiagnostic>> {
+    run_checked(
+        request,
+        environment,
+        overlay,
+        canonical,
+        clean,
+        generated,
+        true,
+    )
+}
+
+fn run_checked(
+    request: &KotlinDiagnosticRequest,
+    environment: &KotlinDiagnosticEnvironment,
+    overlay: &KotlinEditorOverlay,
+    canonical: &[CompileDiagnostic],
+    clean: bool,
+    generated: Option<&processor::GeneratedSources>,
+    require_clean: bool,
+) -> anyhow::Result<Vec<CompileDiagnostic>> {
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
     let complete_k2 = k2_normal(request);
@@ -2632,6 +2671,19 @@ pub(super) fn run(
     tools.check_live()?;
     request.check_live()?;
     environment.check_live()?;
+    if require_clean {
+        anyhow::ensure!(
+            exit == 0
+                && clean
+                && canonical
+                    .iter()
+                    .all(|diagnostic| diagnostic.severity != Severity::Error)
+                && value.get("compileCompleted").and_then(Value::as_bool) == Some(true)
+                && value.get("success").and_then(Value::as_bool) == Some(true)
+                && value.get("failure") == Some(&Value::Null),
+            "java-producer-compilation-not-clean"
+        );
+    }
     tracing::debug!(identity = %tools.input_sha256, errors = result.len(), "selected Java positive diagnostics");
     Ok(result)
 }

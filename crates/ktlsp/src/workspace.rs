@@ -7002,8 +7002,11 @@ mod tests {
             2,
             "pending work must preserve source ownership"
         );
-        assert_eq!(proof(&ws), (true, false, false),
-            "scope visibility remains known, but the pending producer cannot certify source closure");
+        assert_eq!(
+            proof(&ws),
+            (true, false, false),
+            "scope visibility remains known, but the pending producer cannot certify source closure"
+        );
         assert!(!ws.completeness.project_scan_complete);
         let offset = overlay.find("Owner.value").unwrap() + "Owner.".len();
         let _ = ws.completion_query(&caller, offset);
@@ -8803,6 +8806,9 @@ impl Workspace {
             }
             None => (None, Vec::new()),
         };
+        let dependency_compilation = compiler_sources_supported
+            .then(|| Self::kotlin_dependency_compilation(&model, task, &dependency_overlays))
+            .flatten();
         let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
         if self
             .kotlin_diagnostic_reports
@@ -8839,6 +8845,7 @@ impl Workspace {
             sources: sources.into_values().collect(),
             overlays,
             dependency_overlays,
+            dependency_compilation,
             visible_origins,
             generation,
             invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -8852,6 +8859,110 @@ impl Workspace {
             },
         );
         Ok(request)
+    }
+
+    fn kotlin_dependency_compilation(
+        model: &crate::classpath::ProjectSnapshot,
+        task: &crate::classpath::CompilerTask,
+        overlays: &[crate::compile::KotlinSourceOverlay],
+    ) -> Option<Box<crate::compile::KotlinDependencyCompilation>> {
+        use crate::classpath::CompilerLanguage;
+        let dirty: Vec<_> = overlays
+            .iter()
+            .filter(|source| {
+                std::fs::read_to_string(&source.key).ok().as_deref() != Some(source.text.as_str())
+            })
+            .collect();
+        let first = *dirty.first()?;
+        if dirty.iter().any(|source| !source.key.ends_with(".java"))
+            || task
+                .source_files
+                .iter()
+                .any(|path| path.extension().and_then(|s| s.to_str()) != Some("kt"))
+        {
+            return None;
+        }
+        let (module, source) = model.owner_for_key(&first.key)?;
+        let source = source?;
+        let scope = model.file_origin(Path::new(&first.key))?.project_scope?;
+        if dirty.iter().any(|overlay| {
+            model
+                .file_origin(Path::new(&overlay.key))
+                .and_then(|origin| origin.project_scope)
+                .as_ref()
+                != Some(&scope)
+        }) || source.compiler_metadata_incomplete
+            || source.classpath_incomplete
+            || !source.unresolved.is_empty()
+            || source.compiler_tasks.len() != 2
+        {
+            return None;
+        }
+        let primary = source.compiler_tasks.iter().find(|candidate| {
+            candidate.language == CompilerLanguage::Kotlin
+                && Some(candidate.task.as_str()) == source.kotlin_compile_task.as_deref()
+        })?;
+        let java = model.plain_java_task(&first.key)?;
+        if !primary.complete
+            || primary.problem.is_some()
+            || !source
+                .compiler_tasks
+                .iter()
+                .any(|candidate| std::ptr::eq(candidate, java))
+            || !java.annotation_processing_disabled()
+            || !java.annotation_processor_path.is_empty()
+            || dirty.iter().any(|overlay| {
+                !java
+                    .source_files
+                    .iter()
+                    .any(|path| crate::paths::file_key(path) == overlay.key)
+            })
+            || java
+                .source_files
+                .iter()
+                .any(|file| !primary.source_files.contains(file))
+        {
+            return None;
+        }
+        let matches: Vec<_> = task
+            .classpath
+            .iter()
+            .filter(|entry| {
+                source.provided_artifacts.iter().any(|artifact| {
+                    crate::paths::file_key(artifact) == crate::paths::file_key(entry)
+                })
+            })
+            .collect();
+        let [artifact] = matches.as_slice() else {
+            return None;
+        };
+        if artifact.extension().and_then(|s| s.to_str()) != Some("jar") {
+            return None;
+        }
+        for other in model.modules.iter().flat_map(|module| &module.source_sets) {
+            if std::ptr::eq(other, source) {
+                continue;
+            }
+            // shortcut: one complete producer, add dependency closures when a second producer is needed.
+            if other.provided_artifacts.iter().any(|output| {
+                crate::paths::file_key(output) == crate::paths::file_key(artifact)
+                    || primary
+                        .classpath
+                        .iter()
+                        .chain(&java.classpath)
+                        .any(|entry| {
+                            crate::paths::file_key(entry) == crate::paths::file_key(output)
+                        })
+            }) {
+                return None;
+            }
+        }
+        Some(Box::new(crate::compile::KotlinDependencyCompilation {
+            project_dir: module.project_dir.clone(),
+            scope,
+            source: source.clone(),
+            artifact: (**artifact).clone(),
+        }))
     }
 
     pub(crate) fn compiler_api_targets(&self) -> Vec<String> {
@@ -9169,6 +9280,202 @@ mod kotlin_diagnostic_lifecycle_tests {
     use super::*;
     use crate::compile::{CompileDiagnostic, KotlinDiagnosticOutcome};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    #[ignore = "requires genuine KTLSP_CROSS_MODULE_TEST_MODEL and SNAPSHOTS with built producer inputs"]
+    fn current_cross_module_java_overlay_reaches_selected_kotlin_compiler() {
+        let model_path = std::env::var_os("KTLSP_CROSS_MODULE_TEST_MODEL").unwrap();
+        let snapshots_path = std::env::var_os("KTLSP_CROSS_MODULE_TEST_SNAPSHOTS").unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model_path).unwrap()).unwrap();
+        let modules = serde_json::from_value(saved["modules"].clone()).unwrap();
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+        let producer = model
+            .modules
+            .iter()
+            .find(|module| module.module == ":moshi")
+            .unwrap();
+        let consumer = model
+            .modules
+            .iter()
+            .find(|module| module.module == ":moshi-kotlin")
+            .unwrap();
+        let producer = crate::paths::file_key(
+            &producer
+                .project_dir
+                .join("src/main/java/com/squareup/moshi/JsonReader.java"),
+        );
+        let consumer = crate::paths::file_key(
+            &consumer
+                .project_dir
+                .join("src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt"),
+        );
+        let snapshots: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snapshots_path).unwrap()).unwrap();
+        let text = |role: &str| {
+            snapshots["snapshots"]["counter"][role]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        let mut ws = Workspace::new();
+        ws.set_project_model(model.clone());
+        ws.open(producer.clone(), text("producer"));
+        ws.open(consumer.clone(), text("consumer"));
+        let request = ws.begin_kotlin_diagnostics(&consumer).unwrap();
+        assert!(request
+            .dependency_overlays
+            .iter()
+            .any(|source| source.key == producer));
+        assert!(
+            request.dependency_compilation.is_some(),
+            "actual selected producer was not captured"
+        );
+        for mutation in [
+            "incomplete",
+            "foreign-owner",
+            "processor",
+            "selected-source",
+            "duplicate-artifact",
+        ] {
+            let mut modules = model.modules.clone();
+            let module = modules
+                .iter_mut()
+                .find(|module| module.module == ":moshi")
+                .unwrap();
+            let source = module
+                .source_sets
+                .iter_mut()
+                .find(|source| source.name == "main")
+                .unwrap();
+            match mutation {
+                "incomplete" => source.compiler_metadata_incomplete = true,
+                "foreign-owner" => source.source_roots = vec![module.project_dir.join("unowned")],
+                "processor" => source
+                    .compiler_tasks
+                    .iter_mut()
+                    .find(|task| task.language == crate::classpath::CompilerLanguage::Java)
+                    .unwrap()
+                    .annotation_processor_path
+                    .push(module.project_dir.join("unknown-processor.jar")),
+                "selected-source" => source
+                    .compiler_tasks
+                    .iter_mut()
+                    .find(|task| task.language == crate::classpath::CompilerLanguage::Kotlin)
+                    .unwrap()
+                    .source_files
+                    .retain(|path| crate::paths::file_key(path) != producer),
+                "duplicate-artifact" => source.provided_artifacts.push(
+                    model
+                        .modules
+                        .iter()
+                        .find(|module| module.module == ":moshi-kotlin")
+                        .unwrap()
+                        .source_sets
+                        .iter()
+                        .find(|source| source.name == "main")
+                        .unwrap()
+                        .compiler_tasks
+                        .iter()
+                        .find(|task| task.language == crate::classpath::CompilerLanguage::Kotlin)
+                        .unwrap()
+                        .classpath[1]
+                        .clone(),
+                ),
+                _ => unreachable!(),
+            }
+            let foreign = crate::classpath::ProjectSnapshot::new(modules);
+            assert!(
+                Workspace::kotlin_dependency_compilation(
+                    &foreign,
+                    &request.task,
+                    &request.dependency_overlays
+                )
+                .is_none(),
+                "{mutation}"
+            );
+        }
+        let mut wrong_sdk = (*request).clone();
+        wrong_sdk
+            .dependency_compilation
+            .as_mut()
+            .unwrap()
+            .source
+            .compiler_tasks
+            .iter_mut()
+            .find(|task| task.language == crate::classpath::CompilerLanguage::Java)
+            .unwrap()
+            .java_home = Some(std::env::temp_dir().join("unverified-producer-sdk"));
+        let (wake, _events) = tokio::sync::mpsc::channel(1);
+        assert!(
+            crate::compile::KotlinDiagnosticEnvironment::prepare(&wrong_sdk, wake.clone()).is_err()
+        );
+        let environment =
+            crate::compile::KotlinDiagnosticEnvironment::prepare(&request, wake).unwrap();
+        let mut changed = (*request).clone();
+        changed
+            .dependency_compilation
+            .as_mut()
+            .unwrap()
+            .source
+            .compiler_tasks[0]
+            .arguments
+            .push("--unverified-producer-option".into());
+        assert!(
+            !environment.matches(&changed),
+            "producer task changes must invalidate retained inputs"
+        );
+        for phase in ["counter", "retracted", "restored"] {
+            if phase != "counter" {
+                let producer_text = if phase == "retracted" {
+                    snapshots["snapshots"]["retracted"]["producer"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|line| line.as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n// Keep this source in the unsaved producer closure.\n"
+                } else {
+                    text("producer")
+                };
+                ws.change(&producer, producer_text);
+            }
+            let current = ws.begin_kotlin_diagnostics(&consumer).unwrap();
+            assert!(current.dependency_compilation.is_some(), "{phase}");
+            assert!(environment.matches(&current), "{phase}");
+            match crate::compile::run_kotlin_editor_compile(&current, &environment) {
+                KotlinDiagnosticOutcome::Verified { clean, diagnostics }
+                    if phase == "retracted" =>
+                {
+                    assert!(
+                        !clean
+                            && diagnostics
+                                .iter()
+                                .any(|diagnostic| diagnostic.message.contains("ktlspSliceCounter")),
+                        "missing current producer API was not diagnosed"
+                    );
+                }
+                KotlinDiagnosticOutcome::Verified { clean, diagnostics } => {
+                    assert!(
+                        clean
+                            && diagnostics.iter().all(|diagnostic| diagnostic.severity
+                                != crate::diagnostics::Severity::Error),
+                        "{phase}: clean={clean}, diagnostics={}",
+                        diagnostics.len()
+                    );
+                }
+                KotlinDiagnosticOutcome::Unverified(reason) => {
+                    panic!("{phase}: current producer was not compiled: {reason}")
+                }
+            }
+        }
+        environment.close();
+    }
 
     fn fixture() -> (Workspace, String, String, String) {
         use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
@@ -9631,7 +9938,11 @@ mod java_source_authority_tests {
     #[test]
     fn gradle_effective_processor_disable_preserves_current_java_namespace() {
         use std::io::Write;
-        let (mut ws, model, owner, caller) = fixture(false, "java", "package app; public class Current { public static Current FIELD; public int current() { return 2; } }");
+        let (mut ws, model, owner, caller) = fixture(
+            false,
+            "java",
+            "package app; public class Current { public static Current FIELD; public int current() { return 2; } }",
+        );
         let root = &model.modules[0].project_dir;
         std::fs::create_dir_all(root).unwrap();
         let service = |path: &Path, name: &str| {

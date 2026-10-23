@@ -2224,6 +2224,202 @@ fn install_nominal_kotlin(
 }
 
 #[test]
+fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
+    struct Probe;
+    impl AnalysisProvider for Probe {
+        fn id(&self) -> &str {
+            "mixin-consumer"
+        }
+        fn analyze(&self, read: &mut ReadSession<'_>) -> Result<(), ContractError> {
+            let methods: Vec<_> = read
+                .declarations()
+                .iter()
+                .filter(|d| d.member.is_some())
+                .cloned()
+                .collect();
+            assert_eq!(methods.len(), 2);
+            for authored in methods {
+                let owner = authored.owner.unwrap();
+                let declaration = read.declaration(owner.start_byte..owner.end_byte)?;
+                assert!(
+                    !matches!(read.resolve_type_ref(&ktcore::types::TypeRef::simple("Axis")), Knowledge::Found(ref ty) if ty.definition() == &owner),
+                    "simple-name resolution cannot identify this nested owner"
+                );
+                let Knowledge::Found(ty) = read.declaration_type(&declaration)? else {
+                    panic!("exact type declaration")
+                };
+                assert_eq!(ty.definition(), &owner);
+                let members = read.declared_members(&ty)?.0;
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].id.definition(), &authored.definition);
+                assert!(
+                    matches!(&members[0].signature, Knowledge::Found(signature) if signature.descriptor() == "()I")
+                );
+                let Knowledge::Found(reference) = read.reference_type(&ty)? else {
+                    panic!("nested JVM reference")
+                };
+                let expected = match ty.qualified_name() {
+                    "oracle.First.Axis" => "(Loracle/First$Axis;)V",
+                    "oracle.Second.Axis" => "(Loracle/Second$Axis;)V",
+                    other => panic!("wrong owner: {other}"),
+                };
+                assert_eq!(method(&[reference], &JvmType::Void).descriptor(), expected);
+                let member =
+                    read.declaration(authored.definition.start_byte..authored.definition.end_byte)?;
+                assert!(
+                    matches!(read.declaration_type(&member)?, Knowledge::Unknown(reasons) if reasons == vec![IncompleteReason::UnsupportedType("value".into())])
+                );
+            }
+            Ok(())
+        }
+    }
+    for java in [false, true] {
+        let (mut index, mut store) = fixture();
+        install_nominal_kotlin(
+            &mut index,
+            &mut store,
+            "/other/Axis.kt",
+            "package other\nclass Axis\n",
+            "other",
+        );
+        let file = if java {
+            "/oracle/Nested.java"
+        } else {
+            "/oracle/Nested.kt"
+        };
+        let text = if java {
+            "package oracle; class First { static class Axis { public int value() { return 1; } } } class Second { static class Axis { public int value() { return 2; } } }"
+        } else {
+            "package oracle\nclass First { class Axis { fun value(): Int = 1 } }\nclass Second { class Axis { fun value(): Int = 2 } }\n"
+        };
+        if java {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_java::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut symbols = Vec::new();
+            for (ordinal, outer) in ["First", "Second"].into_iter().enumerate() {
+                for (name, kind, container) in [
+                    (outer, SymbolKind::Class, None),
+                    ("Axis", SymbolKind::Class, Some(outer.to_string())),
+                    ("value", SymbolKind::Function, Some(format!("{outer}.Axis"))),
+                ] {
+                    let range = occurrence(text, name, if name == outer { 0 } else { ordinal });
+                    let mut symbol =
+                        IndexedSymbol::new(name, kind, "oracle", container, range.start, range.end);
+                    if kind == SymbolKind::Function {
+                        symbol.arity = Some(0);
+                        symbol.return_type = Some(ktcore::types::TypeRef::simple("int"));
+                        let node = tree
+                            .root_node()
+                            .descendant_for_byte_range(range.start, range.end)
+                            .unwrap()
+                            .parent()
+                            .unwrap();
+                        symbol.source_member =
+                            ktcore::indexer::source_member_flags(node, text, true);
+                    }
+                    symbols.push(symbol);
+                }
+            }
+            index.replace_file(file, symbols, Tier::Volatile);
+            let scope = ktcore::indexer::TypeScope::with_default_imports(
+                "oracle",
+                Vec::new(),
+                &["java.lang"],
+            );
+            let declarations = source::extract(&index, file, &tree, text, &scope);
+            store
+                .replace_source_declarations(
+                    &index,
+                    file,
+                    Arc::from(text),
+                    Knowledge::Found(()),
+                    declarations,
+                )
+                .unwrap();
+        } else {
+            install_nominal_kotlin(&mut index, &mut store, file, text, "oracle");
+        }
+        let mut read = store.begin(&index, Probe.id(), file).unwrap();
+        Probe.analyze(&mut read).unwrap();
+        let pending = read.finish();
+        store.commit(pending).unwrap();
+    }
+}
+
+#[test]
+fn declaration_type_validates_identity_scope_and_read_dependencies() {
+    let (mut index, mut store, _) = compiled_host_fixture();
+    let range = occurrence(COMPILED_HOST_SOURCE, "Person", 0);
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert_eq!(
+        read.declaration(0..1),
+        Err(ContractError::NotIndexedDeclaration)
+    );
+    let declaration = read.declaration(range.clone()).unwrap();
+    assert!(read.declaration_type(&declaration).unwrap().is_found());
+    let pending = read.finish();
+    store.invalidate_model();
+    assert_eq!(store.commit(pending), Err(ContractError::Stale));
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert!(
+        read.declaration_type(&declaration).unwrap().is_found(),
+        "unchanged declaration in a current scope remains reusable"
+    );
+    let pending = read.finish();
+    store.set_namespace_coverage(Knowledge::Found(()));
+    assert_eq!(store.commit(pending), Err(ContractError::Stale));
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_B)
+        .unwrap();
+    assert_eq!(
+        read.declaration_type(&declaration),
+        Err(ContractError::ForeignIdentity)
+    );
+    drop(read);
+    let (foreign_index, mut foreign_store, _) = compiled_host_fixture();
+    let mut foreign = foreign_store
+        .begin(&foreign_index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert_eq!(
+        foreign.declaration_type(&declaration),
+        Err(ContractError::ForeignIdentity)
+    );
+    drop(foreign);
+    index.replace_scope_visibilities(Vec::new());
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert!(
+        matches!(read.declaration_type(&declaration).unwrap(), Knowledge::Unknown(reasons) if reasons == vec![IncompleteReason::IncompleteScope])
+    );
+    drop(read);
+    store
+        .replace_source(
+            &index,
+            COMPILED_HOST_A,
+            Arc::from(format!("{COMPILED_HOST_SOURCE}\n")),
+            Knowledge::Found(()),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut read = store
+        .begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A)
+        .unwrap();
+    assert_eq!(
+        read.declaration_type(&declaration),
+        Err(ContractError::Stale)
+    );
+}
+
+#[test]
 fn nominal_enum_and_object_source_signatures_are_useful() {
     let (mut index, mut store) = fixture();
     install_nominal_kotlin(&mut index, &mut store, "/oracle/KotlinKinds.kt", "package oracle\nclass KotlinKinds {\n enum class Axis { X, Y }\n object Marker\n fun axis(value: oracle.KotlinKinds.Axis): oracle.KotlinKinds.Axis = value\n fun marker(value: oracle.KotlinKinds.Marker): oracle.KotlinKinds.Marker = value\n}\n", "oracle");

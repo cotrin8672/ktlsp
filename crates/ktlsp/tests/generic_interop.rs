@@ -664,7 +664,7 @@ fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
                     names: None,
                     has_spread: false,
                     trailing_lambda: false,
-                    trailing_lambda_omits_or_has_zero_parameters: false,
+                    trailing_lambda_arguments: None,
                 },
                 mode,
                 &ctx
@@ -4029,7 +4029,7 @@ fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Ot
             names: None,
             has_spread: false,
             trailing_lambda: false,
-            trailing_lambda_omits_or_has_zero_parameters: false,
+            trailing_lambda_arguments: None,
         }),
         &ctx,
     );
@@ -4213,7 +4213,7 @@ fun use(request:MissingRequest,valid:Request,type:Class<Invocation>,missing:Miss
         names: None,
         has_spread: false,
         trailing_lambda: false,
-        trailing_lambda_omits_or_has_zero_parameters: false,
+        trailing_lambda_arguments: None,
     };
     let ctx = FileCtx::new("probe".into(), Vec::new());
     let candidates = ktcore::members::candidates(&ws.index, &owner, "tag", &ctx);
@@ -4586,13 +4586,16 @@ class NamedShapes {
  fun <T> variable(vararg types:Class<out T>):T=error("fixture")
  fun <A,B> tail(first:Class<out A>,second:Class<out B>,block:()->Unit):A=error("fixture")
  fun <A,B> tailOne(first:Class<out A>,second:Class<out B>,block:(Invocation)->Unit):A=error("fixture")
+ fun <A,B> tailItem(first:Class<out A>,second:Class<out B>,block:(Invocation)->Invocation):A=error("fixture")
+ fun <A,B> tailAny(first:Class<out A>,second:Class<out B>,block:(Any)->Unit):A=error("fixture")
  fun <A,B> tailReceiver(first:Class<out A>,second:Class<out B>,block:Invocation.()->Unit):A=error("fixture")
  fun <A,B> tailUnknown(first:Class<out A>,second:Class<out B>,block:Missing):A=error("fixture")
  fun <A,B> tailOther(first:Class<out A>,second:Class<out B>,block:()->Other):A=error("fixture")
 }
+fun <A,B> freeTail(first:Class<out A>,second:Class<out B>,block:(Invocation)->Invocation):A=error("fixture")
 "#;
     let source = r#"package probe
-fun use(shapes:NamedShapes,left:Class<Invocation>,right:Class<Other>,spread:Array<Class<Invocation>>,known:Other) {
+fun use(shapes:NamedShapes,left:Class<Invocation>,right:Class<Other>,spread:Array<Class<Invocation>>,known:Other,nullable:Invocation?,direct:Invocation) {
  shapes.optional(required=left,ignored=known).service()
  shapes.optional(required=left).service()
  shapes.pick(second=right,left)
@@ -4605,7 +4608,26 @@ fun use(shapes:NamedShapes,left:Class<Invocation>,right:Class<Other>,spread:Arra
  shapes.tail(second=right,first=left) { -> known.body() }.service()
  shapes.tail(second=right,first=left) { unfinishedBody }.service()
  shapes.tail(second=right,first=left) { value -> }
- shapes.tailOne(second=right,first=left) {}
+ shapes.tailOne(second=right,first=left) {}.service()
+ shapes.tailOne(second=right,first=left) { item -> item }.service()
+ shapes.tailOne(second=right,first=left) { it }.service()
+ shapes.tailItem(second=right,first=left) { item -> item }.service()
+ shapes.tailItem(second=right,first=left) { it }.service()
+ shapes.tailItem(second=right,first=left) { item:Invocation -> item }.service()
+ shapes.tailOne(second=right,first=left) { item:Any -> item }.service()
+ shapes.tailItem(second=right,first=left) { item:Any -> direct }.service()
+ shapes.tailOne(second=right,first=left) { item -> item.service() }.service()
+ shapes.tailOne(second=right,first=left) { it.service() }.service()
+ freeTail(second=right,first=left) { item -> item }.service()
+ freeTail(second=right,first=left) { it }.service()
+ shapes.tailAny(second=right,first=left) { if(it is Invocation) it.service() }.service()
+ shapes.tailOne(second=right,first=left) { item:Any -> item.service() }
+ shapes.tailOne(second=right,first=left) { -> }
+ shapes.tailOne(second=right,first=left) { item:Other -> }
+ shapes.tailItem(second=right,first=left) {}
+ shapes.tailItem(second=right,first=left) { known }
+ shapes.tailItem(second=right,first=left) { nullable }
+ shapes.tailItem(second=right,first=left) { first,second -> first }
  shapes.tailReceiver(second=right,first=left) {}
  shapes.tailUnknown(second=right,first=left) {}
  shapes.tailOther(second=right,first=left) {}
@@ -4618,6 +4640,10 @@ fun use(shapes:NamedShapes,left:Class<Invocation>,right:Class<Other>,spread:Arra
 fun shadowed(left:Class<Invocation>,right:Class<Other>,known:Other) {
  val tail:(Class<Invocation>,Class<Other>,()->Unit)->Other = { _,_,_ -> known }
  tail(first=left,second=right) {}
+}
+fun outerGuard(shapes:NamedShapes,left:Class<Invocation>,right:Class<Other>,it:Other?) {
+ if(it!=null) shapes.tailItem(first=left,second=right) { it }.service()
+ shapes.tailOne(first=left,second=right) { val it=Other();it.body() }.service()
 }
 "#;
     let mut ws = projected_workspace(source);
@@ -4667,6 +4693,21 @@ fun shadowed(left:Class<Invocation>,right:Class<Other>,known:Other) {
         "shapes.tail(second=right,first=left) { known.body() }",
         "shapes.tail(second=right,first=left) { -> known.body() }",
         "shapes.tail(second=right,first=left) { unfinishedBody }",
+        "shapes.tailOne(second=right,first=left) {}",
+        "shapes.tailOne(second=right,first=left) { item -> item }",
+        "shapes.tailOne(second=right,first=left) { it }",
+        "shapes.tailItem(second=right,first=left) { item -> item }",
+        "shapes.tailItem(second=right,first=left) { it }",
+        "shapes.tailItem(second=right,first=left) { item:Invocation -> item }",
+        "shapes.tailOne(second=right,first=left) { item:Any -> item }",
+        "shapes.tailItem(second=right,first=left) { item:Any -> direct }",
+        "shapes.tailOne(second=right,first=left) { item -> item.service() }",
+        "shapes.tailOne(second=right,first=left) { it.service() }",
+        "freeTail(second=right,first=left) { item -> item }",
+        "freeTail(second=right,first=left) { it }",
+        "shapes.tailAny(second=right,first=left) { if(it is Invocation) it.service() }",
+        "shapes.tailItem(first=left,second=right) { it }",
+        "shapes.tailOne(first=left,second=right) { val it=Other();it.body() }",
     ] {
         assert_eq!(
             infer_expression(&ws, "Use.kt", expression),
@@ -4683,7 +4724,12 @@ fun shadowed(left:Class<Invocation>,right:Class<Other>,known:Other) {
         "shapes.pick(first=*left,second=right)",
         "shapes.variable(types=*spread)",
         "shapes.tail(second=right,first=left) { value -> }",
-        "shapes.tailOne(second=right,first=left) {}",
+        "shapes.tailOne(second=right,first=left) { -> }",
+        "shapes.tailOne(second=right,first=left) { item:Other -> }",
+        "shapes.tailItem(second=right,first=left) {}",
+        "shapes.tailItem(second=right,first=left) { known }",
+        "shapes.tailItem(second=right,first=left) { nullable }",
+        "shapes.tailItem(second=right,first=left) { first,second -> first }",
         "shapes.tailReceiver(second=right,first=left) {}",
         "shapes.tailUnknown(second=right,first=left) {}",
         "shapes.tailOther(second=right,first=left) {}",
@@ -4703,7 +4749,7 @@ fun shadowed(left:Class<Invocation>,right:Class<Other>,known:Other) {
     for expression in [
         "shapes.pick(second=right,left)",
         "shapes.variable(types=*spread)",
-        "shapes.tailOne(second=right,first=left) {}",
+        "shapes.tailOne(second=right,first=left) { -> }",
     ] {
         let start = source.find(expression).unwrap();
         let call = tree
@@ -4738,6 +4784,11 @@ fun shadowed(left:Class<Invocation>,right:Class<Other>,known:Other) {
             "unsupported call must retain its candidate: {expression}"
         );
     }
+    assert_member(&mut ws, "Use.kt", "{ item -> item.", "service", "body");
+    assert_member(&mut ws, "Use.kt", "{ it.", "service", "body");
+    assert_member(&mut ws, "Use.kt", "if(it is Invocation) it.", "service", "body");
+    assert_member(&mut ws, "Use.kt", "val it=Other();it.", "body", "service");
+    assert!(!labels(&mut ws, "Use.kt", "{ item:Any -> item.").contains("service"));
     assert_member(&mut ws, "Use.kt", "known.", "body", "service");
 }
 
@@ -7471,7 +7522,7 @@ fn projected_mapped_collection_head_remains_possible_without_mapping_proof() {
         names: None,
         has_spread: false,
         trailing_lambda: false,
-        trailing_lambda_omits_or_has_zero_parameters: false,
+        trailing_lambda_arguments: None,
     };
     let candidates = ktcore::members::candidates(&ws.index, &owner, "consume", &ctx);
     let selection = candidates.select(

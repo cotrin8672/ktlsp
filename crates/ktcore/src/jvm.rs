@@ -2422,7 +2422,7 @@ class Resolver {
                 names: None,
                 has_spread: false,
                 trailing_lambda: false,
-                trailing_lambda_omits_or_has_zero_parameters: false,
+                trailing_lambda_arguments: None,
             };
             let java = select_call(
                 &index,
@@ -2511,7 +2511,7 @@ class Resolver {
             names: None,
             has_spread: false,
             trailing_lambda: false,
-            trailing_lambda_omits_or_has_zero_parameters: false,
+            trailing_lambda_arguments: None,
         };
         // These incomplete facts test proof refusal, not successful compiler-equivalent resolution.
         for uncertain in [
@@ -2606,7 +2606,7 @@ class Resolver {
             names: None,
             has_spread: false,
             trailing_lambda: false,
-            trailing_lambda_omits_or_has_zero_parameters: false,
+            trailing_lambda_arguments: None,
         };
         let java = select_call(
             &index,
@@ -3103,7 +3103,7 @@ class Resolver {
                     names: None,
                     has_spread: false,
                     trailing_lambda: false,
-                    trailing_lambda_omits_or_has_zero_parameters: false,
+                    trailing_lambda_arguments: None,
                 },
                 &FileCtx::new(String::new(), Vec::new())
             )
@@ -3183,7 +3183,7 @@ class Resolver {
                 names: None,
                 has_spread: false,
                 trailing_lambda: false,
-                trailing_lambda_omits_or_has_zero_parameters: false,
+                trailing_lambda_arguments: None,
             };
             let selected = select_call(
                 &index,
@@ -3255,7 +3255,7 @@ class Resolver {
                 names: None,
                 has_spread: false,
                 trailing_lambda: false,
-                trailing_lambda_omits_or_has_zero_parameters: false,
+                trailing_lambda_arguments: None,
             },
             &FileCtx::new("oracle".into(), Vec::new()),
         );
@@ -3286,7 +3286,7 @@ class Resolver {
                 names: None,
                 has_spread: false,
                 trailing_lambda: false,
-                trailing_lambda_omits_or_has_zero_parameters: false,
+                trailing_lambda_arguments: None,
             },
             &FileCtx::new("oracle".into(), Vec::new()),
         );
@@ -3343,7 +3343,7 @@ class Resolver {
             names: None,
             has_spread: false,
             trailing_lambda: false,
-            trailing_lambda_omits_or_has_zero_parameters: false,
+            trailing_lambda_arguments: None,
         };
         let ctx = FileCtx::new("oracle".into(), Vec::new());
         for (kind, expected, usable) in [

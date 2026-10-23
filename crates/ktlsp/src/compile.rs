@@ -1296,7 +1296,8 @@ mod native_compile_ownership_tests {
             }
             let script = format!(
                 "@echo off\r\nsetlocal DisableDelayedExpansion\r\nset \"KTLSP_NATIVE_COMPILE_TEST_DIR={}\"\r\nset \"KTLSP_NATIVE_COMPILE_TEST_MODE={mode}\"\r\n\"{}\" --exact compile::native_compile_ownership_tests::native_fixture --ignored --nocapture --test-threads=1\r\nexit /b %errorlevel%\r\n",
-                batch_path(&self.0), batch_path(&std::env::current_exe().unwrap()),
+                batch_path(&self.0),
+                batch_path(&std::env::current_exe().unwrap()),
             );
             std::fs::write(
                 self.0.join("build.gradle.kts"),
@@ -2966,7 +2967,7 @@ fn inventory(path: &Path) -> anyhow::Result<serde_json::Value> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(serde_json::json!({"path":key,"kind":"absent"}))
+            return Ok(serde_json::json!({"path":key,"kind":"absent"}));
         }
         Err(error) => return Err(error.into()),
     };
@@ -3152,8 +3153,10 @@ mod observed_role_tests {
         );
         candidate.task.classpath = candidate.compiler_tasks[1].output_roots.clone();
         sync_selected(candidate);
-        assert!(candidate.validate_roles().is_err(),
-            "legitimate upstream Java classpath remains an OPEN useful-API gap until temporal read proof");
+        assert!(
+            candidate.validate_roles().is_err(),
+            "legitimate upstream Java classpath remains an OPEN useful-API gap until temporal read proof"
+        );
         candidate.task.classpath.clear();
         candidate.task.annotation_processor_path = candidate.compiler_tasks[1].output_roots.clone();
         sync_selected(candidate);
@@ -3609,6 +3612,115 @@ impl KotlinSourceOverlay {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct KotlinDependencyCompilation {
+    pub project_dir: PathBuf,
+    #[serde(serialize_with = "serialize_kotlin_dependency_scope")]
+    pub scope: crate::project_model::ProjectScope,
+    pub source: crate::classpath::SourceSetClasspath,
+    pub artifact: PathBuf,
+}
+
+fn serialize_kotlin_dependency_scope<S: serde::Serializer>(
+    scope: &crate::project_model::ProjectScope,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&(&scope.module, &scope.source_set), serializer)
+}
+
+impl KotlinDependencyCompilation {
+    fn request(
+        &self,
+        consumer: &KotlinDiagnosticRequest,
+    ) -> anyhow::Result<KotlinDiagnosticRequest> {
+        use crate::classpath::CompilerLanguage;
+        anyhow::ensure!(
+            !self.source.compiler_metadata_incomplete
+                && !self.source.classpath_incomplete
+                && self.source.unresolved.is_empty()
+                && self.source.compiler_tasks.len() == 2,
+            "kotlin-dependency-compilation-incomplete"
+        );
+        let primary = self
+            .source
+            .compiler_tasks
+            .iter()
+            .find(|task| {
+                task.language == CompilerLanguage::Kotlin
+                    && Some(task.task.as_str()) == self.source.kotlin_compile_task.as_deref()
+            })
+            .ok_or_else(|| anyhow::anyhow!("kotlin-dependency-primary-unknown"))?;
+        let java = self
+            .source
+            .compiler_tasks
+            .iter()
+            .find(|task| task.language == CompilerLanguage::Java)
+            .ok_or_else(|| anyhow::anyhow!("kotlin-dependency-java-task-unknown"))?;
+        anyhow::ensure!(
+            primary.complete
+                && primary.problem.is_none()
+                && java.complete
+                && java.problem.is_none()
+                && java_diagnostics::selected_tasks_supported(
+                    primary,
+                    java,
+                    &self.source.compiler_tasks
+                )
+                && java.annotation_processing_disabled()
+                && java.annotation_processor_path.is_empty()
+                && java
+                    .source_files
+                    .iter()
+                    .all(|file| primary.source_files.contains(file)),
+            "kotlin-dependency-selected-tasks-unhandled"
+        );
+        let selected: std::collections::BTreeSet<_> = primary
+            .source_files
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
+        anyhow::ensure!(
+            selected.len() == primary.source_files.len()
+                && consumer
+                    .dependency_overlays
+                    .iter()
+                    .filter(|source| {
+                        self.source
+                            .source_roots
+                            .iter()
+                            .any(|root| Path::new(&source.key).starts_with(root))
+                    })
+                    .all(|source| selected.contains(&source.key)),
+            "kotlin-dependency-source-membership-differs"
+        );
+        let (overlays, dependency_overlays) = consumer
+            .dependency_overlays
+            .iter()
+            .cloned()
+            .partition(|source| selected.contains(&source.key));
+        let request = KotlinDiagnosticRequest {
+            project_dir: self.project_dir.clone(),
+            scope: self.scope.clone(),
+            task: primary.clone(),
+            java_task: Some(java.clone()),
+            java_dependencies: Vec::new(),
+            java_editor_sources: Default::default(),
+            processor_plan: None,
+            positive_diagnostics_only: false,
+            source_roots: self.source.source_roots.clone(),
+            sources: primary.source_files.clone(),
+            overlays,
+            dependency_overlays,
+            dependency_compilation: None,
+            visible_origins: consumer.visible_origins.clone(),
+            generation: consumer.generation,
+            invalid: consumer.invalid.clone(),
+        };
+        java_diagnostics::configured_recipe(&request)?;
+        Ok(request)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct KotlinDiagnosticRequest {
     pub project_dir: PathBuf,
@@ -3629,6 +3741,8 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub overlays: Vec<KotlinSourceOverlay>,
     /// Visible other source sets are guards, not extra sources in this task's compilation.
     pub dependency_overlays: Vec<KotlinSourceOverlay>,
+    /// A same-model producer whose complete fresh output can replace one selected binary slot.
+    pub dependency_compilation: Option<Box<KotlinDependencyCompilation>>,
     pub visible_origins: std::collections::BTreeSet<String>,
     pub generation: u64,
     pub invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3762,6 +3876,7 @@ struct KotlinEnvironmentKey {
     java_helper_sha256: Option<String>,
     java_editor_sources: std::collections::BTreeSet<String>,
     processor_plan: Option<ProcessorPlan>,
+    dependency_compilation: Option<Box<KotlinDependencyCompilation>>,
 }
 
 impl KotlinEnvironmentKey {
@@ -3821,6 +3936,7 @@ impl KotlinEnvironmentKey {
                 Default::default()
             },
             processor_plan: request.processor_plan.clone(),
+            dependency_compilation: request.dependency_compilation.clone(),
         })
     }
 
@@ -3862,6 +3978,7 @@ pub(crate) struct KotlinDiagnosticEnvironment {
     processor_artifacts: std::sync::Mutex<Option<java_diagnostics::processor::CachedArtifacts>>,
     positive_tools: std::sync::Mutex<Option<java_diagnostics::positive::Tools>>,
     positive_supported: bool,
+    dependency_environment: Option<std::sync::Arc<KotlinDiagnosticEnvironment>>,
     pub(crate) compiler_api: std::sync::Mutex<Option<java_diagnostics::positive::Snapshot>>,
 }
 
@@ -3875,9 +3992,32 @@ impl KotlinDiagnosticEnvironment {
         request: &KotlinDiagnosticRequest,
         wake: tokio::sync::mpsc::Sender<()>,
     ) -> anyhow::Result<std::sync::Arc<Self>> {
+        Self::prepare_with_invalidation(
+            request,
+            wake,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    fn prepare_with_invalidation(
+        request: &KotlinDiagnosticRequest,
+        wake: tokio::sync::mpsc::Sender<()>,
+        invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<std::sync::Arc<Self>> {
         use sha2::Digest;
         request.check_live()?;
         let key = KotlinEnvironmentKey::new(request)?;
+        let dependency_environment = request
+            .dependency_compilation
+            .as_ref()
+            .map(|plan| {
+                Self::prepare_with_invalidation(
+                    &plan.request(request)?,
+                    wake.clone(),
+                    invalid.clone(),
+                )
+            })
+            .transpose()?;
         // Validate the entire argument boundary before touching any output or starting a JVM.
         kotlin_editor_arguments(request, Path::new("unused-private-output"), &[])?;
         for name in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] {
@@ -3918,7 +4058,11 @@ impl KotlinDiagnosticEnvironment {
         if let Some(home) = &key.java_home {
             anyhow::ensure!(home.is_absolute(), "compiler-target-jdk-relative");
             inputs.insert(home.join("release"));
-            if key.arguments.iter().any(|a| a.starts_with("-Xjdk-release=")) {
+            if key
+                .arguments
+                .iter()
+                .any(|a| a.starts_with("-Xjdk-release="))
+            {
                 // Unlike bytecode target alone, release reads this selected SDK's API signatures.
                 inputs.insert(home.join("lib/ct.sym"));
             }
@@ -3945,10 +4089,16 @@ impl KotlinDiagnosticEnvironment {
             );
         }
         let plan = crate::compiled_watch::WatchPlan::read_inputs(&inputs)?;
-        let invalid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let watch = crate::compiled_watch::NativeInputWatch::new(invalid.clone(), plan, wake)?;
         let environment_sha256 = environment_hash();
         let mut hash = key.input_hasher(&environment_sha256)?;
+        if let Some(dependency) = &dependency_environment {
+            let ktcore::jvm::InputIdentity::Binary { content_sha256 } = &dependency.input_identity
+            else {
+                anyhow::bail!("kotlin-producer-input-identity-unavailable");
+            };
+            hash.update(content_sha256);
+        }
         let mut stamps = Vec::new();
         for input in inputs {
             let before = kotlin_input_stamp(&input)?;
@@ -3973,6 +4123,7 @@ impl KotlinDiagnosticEnvironment {
             processor_artifacts: std::sync::Mutex::new(None),
             positive_tools: std::sync::Mutex::new(None),
             positive_supported,
+            dependency_environment,
             compiler_api: std::sync::Mutex::new(None),
         });
         environment.check_live()?;
@@ -3997,6 +4148,9 @@ impl KotlinDiagnosticEnvironment {
                     "kotlin-input-stamp-changed"
                 );
             }
+            if let Some(dependency) = &self.dependency_environment {
+                dependency.check_live()?;
+            }
             Ok(())
         };
         let result = check();
@@ -4010,6 +4164,9 @@ impl KotlinDiagnosticEnvironment {
     }
 
     pub(crate) fn close(&self) {
+        if let Some(dependency) = &self.dependency_environment {
+            dependency.close();
+        }
         self.watch.close();
     }
 }
@@ -4570,6 +4727,170 @@ pub(crate) fn run_kotlin_editor_compile(
     run_selected_kotlin_editor_compile(request, environment, None)
 }
 
+struct CompiledKotlinDependency {
+    _owner: KotlinEditorOverlay,
+    producer: KotlinDiagnosticRequest,
+    environment: std::sync::Arc<KotlinDiagnosticEnvironment>,
+    artifact: PathBuf,
+    outputs: Vec<PathBuf>,
+    output_inventory: Vec<serde_json::Value>,
+}
+
+impl CompiledKotlinDependency {
+    fn check_live(&self) -> anyhow::Result<()> {
+        self.producer.check_live()?;
+        self.environment.check_live()?;
+        for (output, expected) in self.outputs.iter().zip(&self.output_inventory) {
+            anyhow::ensure!(
+                inventory(output)? == *expected,
+                "kotlin-producer-output-changed"
+            );
+        }
+        Ok(())
+    }
+
+    fn consumer_request(
+        &self,
+        original: &KotlinDiagnosticRequest,
+    ) -> anyhow::Result<KotlinDiagnosticRequest> {
+        self.check_live()?;
+        let mut request = original.clone();
+        kotlin_editor_arguments(&request, Path::new("unused-private-output"), &[])?;
+        let matches: Vec<_> = request
+            .task
+            .classpath
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                crate::paths::file_key(entry) == crate::paths::file_key(&self.artifact)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let [position] = matches.as_slice() else {
+            anyhow::bail!("kotlin-producer-artifact-slot-unknown");
+        };
+        request
+            .task
+            .classpath
+            .splice(*position..=*position, self.outputs.iter().cloned());
+        let mut existing = Vec::new();
+        for path in &request.task.classpath {
+            if kotlin_input_stamp(path)?.is_some() {
+                existing.push(
+                    path.to_str()
+                        .ok_or_else(|| anyhow::anyhow!("kotlin-classpath-encoding-unhandled"))?,
+                );
+            }
+        }
+        let new_cp = existing.join(if cfg!(windows) { ";" } else { ":" });
+        for index in 0..request.task.arguments.len().saturating_sub(1) {
+            if matches!(request.task.arguments[index].as_str(), "-classpath" | "-cp") {
+                request.task.arguments[index + 1] = new_cp.clone();
+            }
+        }
+        request.dependency_overlays.retain(|source| {
+            !self.producer.overlays.iter().any(|compiled| {
+                compiled.key == source.key
+                    && compiled.identity == source.identity
+                    && compiled.text_sha256 == source.text_sha256
+            })
+        });
+        request.dependency_compilation = None;
+        // This route certifies a Kotlin-only consumer. Its Java imports need a separate replay.
+        request.java_task = None;
+        request.java_dependencies.clear();
+        Ok(request)
+    }
+}
+
+fn compile_dependency_overlay(
+    request: &KotlinDiagnosticRequest,
+    environment: &KotlinDiagnosticEnvironment,
+) -> anyhow::Result<Option<CompiledKotlinDependency>> {
+    let Some(plan) = &request.dependency_compilation else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        request.processor_plan.is_none()
+            && !request.positive_diagnostics_only
+            && request
+                .sources
+                .iter()
+                .all(|path| path.extension().and_then(|s| s.to_str()) == Some("kt"))
+            && request
+                .java_task
+                .as_ref()
+                .is_none_or(|task| task.source_files.is_empty()),
+        "kotlin-producer-consumer-role-unhandled"
+    );
+    anyhow::ensure!(
+        plan.source
+            .provided_artifacts
+            .iter()
+            .any(|artifact| crate::paths::file_key(artifact)
+                == crate::paths::file_key(&plan.artifact))
+            && request
+                .task
+                .classpath
+                .iter()
+                .filter(
+                    |entry| crate::paths::file_key(entry) == crate::paths::file_key(&plan.artifact)
+                )
+                .count()
+                == 1,
+        "kotlin-producer-artifact-slot-unknown"
+    );
+    let producer = plan.request(request)?;
+    let producer_environment = environment
+        .dependency_environment
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("kotlin-producer-environment-unknown"))?
+        .clone();
+    anyhow::ensure!(
+        producer_environment.matches(&producer),
+        "kotlin-producer-recipe-changed"
+    );
+    let started = Instant::now();
+    let (outcome, owner) = run_owned_kotlin_overlay(&producer, &producer_environment, None, true)?;
+    anyhow::ensure!(
+        matches!(outcome, KotlinDiagnosticOutcome::Verified { clean: true, ref diagnostics } if diagnostics.iter().all(|diagnostic| diagnostic.severity != Severity::Error)),
+        "kotlin-producer-compilation-not-clean"
+    );
+    let outputs = vec![
+        owner.directory.join("classes"),
+        owner.directory.join("java-classes"),
+    ];
+    anyhow::ensure!(
+        outputs.iter().all(|path| path.is_dir()),
+        "kotlin-producer-outputs-missing"
+    );
+    let output_inventory = outputs
+        .iter()
+        .map(|path| inventory(path))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let compiled = CompiledKotlinDependency {
+        _owner: owner,
+        producer,
+        environment: producer_environment,
+        artifact: plan.artifact.clone(),
+        outputs,
+        output_inventory,
+    };
+    compiled.check_live()?;
+    crate::trace::span(
+        "compiler.kotlin.producer-compiled",
+        "compiler",
+        started,
+        serde_json::json!({
+            "module": plan.scope.module, "source_set": plan.scope.source_set,
+            "artifact": plan.artifact, "source_count": compiled.producer.sources.len(),
+            "overlays": compiled.producer.overlays.iter().map(|source| (&source.key, source.text_sha256)).collect::<Vec<_>>(),
+            "outputs": compiled.output_inventory, "producer_closure": true, "generation": request.generation,
+        }),
+    );
+    Ok(Some(compiled))
+}
+
 fn run_selected_kotlin_editor_compile(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
@@ -4579,109 +4900,143 @@ fn run_selected_kotlin_editor_compile(
         request.check_live()?;
         environment.check_live()?;
         anyhow::ensure!(environment.matches(request), "kotlin-stale-recipe");
-        if environment.positive_supported {
+        if environment.positive_supported && request.dependency_compilation.is_none() {
             return java_diagnostics::positive::run(request, environment);
         }
-        let overlay = KotlinEditorOverlay::create(request)?;
-        let arguments = kotlin_editor_arguments(
-            request,
-            &overlay.directory.join("classes"),
-            &overlay.sources,
+        let dependency = compile_dependency_overlay(request, environment)?;
+        let effective = dependency
+            .as_ref()
+            .map(|compiled| compiled.consumer_request(request))
+            .transpose()?;
+        let (outcome, _overlay) = run_owned_kotlin_overlay(
+            effective.as_ref().unwrap_or(request),
+            environment,
+            generated,
+            false,
         )?;
-        let argument_file = overlay.directory.join("compiler.args");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&argument_file)?;
-        file.write_all(kotlin_argument_file(&arguments)?.as_bytes())?;
-        file.flush()?;
-        drop(file);
-        let recipe = &environment.key.recipe;
-        let runtime: Vec<_> = recipe
-            .default_classpath
-            .iter()
-            .chain(recipe.current_jvm_tools_jar.iter())
-            .collect();
-        anyhow::ensure!(!runtime.is_empty(), "kotlin-compiler-runtime-unknown");
-        let runtime = std::env::join_paths(runtime)?;
-        // The private compiler @file avoids Windows' command-line limit for project libraries/sources.
-        // Oversized JVM runtime classpaths need a separately verified launcher adapter.
-        anyhow::ensure!(
-            runtime.to_string_lossy().encode_utf16().count() < 24_000,
-            "kotlin-runtime-command-line-unhandled"
-        );
-        let mut command = Command::new(recipe.gradle_java_home.join(if cfg!(windows) {
-            "bin/java.exe"
-        } else {
-            "bin/java"
-        }));
-        command
-            .current_dir(&request.project_dir)
-            .arg("-Dfile.encoding=UTF-8")
-            .arg("-Dorg.jetbrains.kotlin.cliMessageRenderer=GradleStyle")
-            .arg("-cp")
-            .arg(runtime)
-            .arg("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
-            .arg(format!("@{}", argument_file.display()));
-        #[cfg(windows)]
-        {
-            let (status, interrupted, mut out, out_complete, err, err_complete) =
-                OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)?
-                    .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
-            out.push('\n');
-            out.push_str(&err);
-            request.check_live()?;
-            environment.check_live()?;
-            let mut outcome = selected_kotlin_output(
-                &out,
-                &recipe.compiler_version,
-                status.code(),
-                interrupted,
-                out_complete && err_complete,
-                &overlay.paths,
-            );
-            if let KotlinDiagnosticOutcome::Verified { diagnostics, clean } = &mut outcome {
-                if request.java_task.is_some() {
-                    let started = Instant::now();
-                    let java = match java_diagnostics::run(
-                        request,
-                        environment,
-                        &overlay,
-                        diagnostics,
-                        *clean,
-                        generated,
-                    ) {
-                        Ok(java) => java,
-                        Err(error) => {
-                            tracing::debug!(%error, "selected Java diagnostics unavailable; retaining Kotlin result");
-                            crate::trace::span(
-                                "compiler.java.editor-unavailable",
-                                "compiler",
-                                started,
-                                serde_json::json!({ "reason": error.to_string(), "generation": request.generation }),
-                            );
-                            Vec::new()
-                        }
-                    };
-                    java_diagnostics::append_positives(diagnostics, java);
-                }
-            }
-            request.check_live()?;
-            environment.check_live()?;
-            Ok(outcome)
+        if let Some(dependency) = &dependency {
+            dependency.check_live()?;
         }
-        #[cfg(not(windows))]
-        {
-            // Preserve the existing Unix lifecycle limitation; do not admit results without tree proof.
-            let _ = command;
-            Ok(KotlinDiagnosticOutcome::Unverified(
-                "native-tree-proof-unavailable".into(),
-            ))
-        }
+        request.check_live()?;
+        environment.check_live()?;
+        Ok(outcome)
     };
     match run() {
         Ok(outcome) => outcome,
         Err(error) => KotlinDiagnosticOutcome::Unverified(error.to_string()),
+    }
+}
+
+fn run_owned_kotlin_overlay(
+    request: &KotlinDiagnosticRequest,
+    environment: &KotlinDiagnosticEnvironment,
+    generated: Option<&java_diagnostics::processor::GeneratedSources>,
+    require_java_clean: bool,
+) -> anyhow::Result<(KotlinDiagnosticOutcome, KotlinEditorOverlay)> {
+    let overlay = KotlinEditorOverlay::create(request)?;
+    let arguments = kotlin_editor_arguments(
+        request,
+        &overlay.directory.join("classes"),
+        &overlay.sources,
+    )?;
+    let argument_file = overlay.directory.join("compiler.args");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&argument_file)?;
+    file.write_all(kotlin_argument_file(&arguments)?.as_bytes())?;
+    file.flush()?;
+    drop(file);
+    let recipe = &environment.key.recipe;
+    let runtime: Vec<_> = recipe
+        .default_classpath
+        .iter()
+        .chain(recipe.current_jvm_tools_jar.iter())
+        .collect();
+    anyhow::ensure!(!runtime.is_empty(), "kotlin-compiler-runtime-unknown");
+    let runtime = std::env::join_paths(runtime)?;
+    // The private compiler @file avoids Windows' command-line limit for project libraries/sources.
+    // Oversized JVM runtime classpaths need a separately verified launcher adapter.
+    anyhow::ensure!(
+        runtime.to_string_lossy().encode_utf16().count() < 24_000,
+        "kotlin-runtime-command-line-unhandled"
+    );
+    let mut command = Command::new(recipe.gradle_java_home.join(if cfg!(windows) {
+        "bin/java.exe"
+    } else {
+        "bin/java"
+    }));
+    command
+        .current_dir(&request.project_dir)
+        .arg("-Dfile.encoding=UTF-8")
+        .arg("-Dorg.jetbrains.kotlin.cliMessageRenderer=GradleStyle")
+        .arg("-cp")
+        .arg(runtime)
+        .arg("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
+        .arg(format!("@{}", argument_file.display()));
+    #[cfg(windows)]
+    {
+        let (status, interrupted, mut out, out_complete, err, err_complete) =
+            OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)?
+                .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
+        out.push('\n');
+        out.push_str(&err);
+        request.check_live()?;
+        environment.check_live()?;
+        let mut outcome = selected_kotlin_output(
+            &out,
+            &recipe.compiler_version,
+            status.code(),
+            interrupted,
+            out_complete && err_complete,
+            &overlay.paths,
+        );
+        if let KotlinDiagnosticOutcome::Verified { diagnostics, clean } = &mut outcome {
+            if request.java_task.is_some() {
+                let started = Instant::now();
+                let run_java = if require_java_clean {
+                    java_diagnostics::run_for_producer
+                } else {
+                    java_diagnostics::run
+                };
+                let java = match run_java(
+                    request,
+                    environment,
+                    &overlay,
+                    diagnostics,
+                    *clean,
+                    generated,
+                ) {
+                    Ok(java) => java,
+                    Err(error) => {
+                        if require_java_clean {
+                            return Err(error);
+                        }
+                        tracing::debug!(%error, "selected Java diagnostics unavailable; retaining Kotlin result");
+                        crate::trace::span(
+                            "compiler.java.editor-unavailable",
+                            "compiler",
+                            started,
+                            serde_json::json!({ "reason": error.to_string(), "generation": request.generation }),
+                        );
+                        Vec::new()
+                    }
+                };
+                java_diagnostics::append_positives(diagnostics, java);
+            }
+        }
+        request.check_live()?;
+        environment.check_live()?;
+        Ok((outcome, overlay))
+    }
+    #[cfg(not(windows))]
+    {
+        // Preserve the existing Unix lifecycle limitation; do not admit results without tree proof.
+        let _ = command;
+        Ok((
+            KotlinDiagnosticOutcome::Unverified("native-tree-proof-unavailable".into()),
+            overlay,
+        ))
     }
 }
 
@@ -4744,6 +5099,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),
         dependency_overlays: Vec::new(),
+        dependency_compilation: None,
         visible_origins: Default::default(),
         generation: 0,
         invalid: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

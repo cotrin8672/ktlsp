@@ -493,7 +493,7 @@ fn java_property_setters_share_generic_parameters_unit_return_and_source_definit
                     names: None,
                     has_spread: false,
                     trailing_lambda: false,
-                    trailing_lambda_omits_or_has_zero_parameters: false,
+                    trailing_lambda_arguments: None,
                 },
                 &ctx,
             );
@@ -687,7 +687,7 @@ fn inferred_generic_property_accessors_bind_the_exact_owner_parameter_like_expli
                     names: None,
                     has_spread: false,
                     trailing_lambda: false,
-                    trailing_lambda_omits_or_has_zero_parameters: false,
+                    trailing_lambda_arguments: None,
                 },
                 &ctx,
             );

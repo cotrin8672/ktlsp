@@ -4405,7 +4405,7 @@ fn java_call_arguments(
         names: None,
         has_spread: false,
         trailing_lambda: false,
-        trailing_lambda_omits_or_has_zero_parameters: false,
+        trailing_lambda_arguments: None,
     }
 }
 
