@@ -50,6 +50,7 @@ struct WatchState {
     registered_options: Option<serde_json::Value>,
     sequence: u64,
     configuration_contents: HashMap<String, [u8; 32]>,
+    archive_contents: HashMap<String, [u8; 32]>,
     configuration_baselined: bool,
     model_loading: bool,
     pending_model_jar: bool,
@@ -1911,7 +1912,14 @@ async fn index_workspace(
     let index_root = root.clone();
     let deps_start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
-        index_dependencies(
+        // Fingerprint only the model's selected local archives, before reading their
+        // semantic inputs. A post-index fingerprint alone could accept a replacement
+        // whose new bytes were never read by this generation.
+        let archive_contents = model
+            .as_deref()
+            .map(model_archive_contents)
+            .unwrap_or_default();
+        let stats = index_dependencies(
             &index_ws,
             &index_root,
             model,
@@ -1919,7 +1927,14 @@ async fn index_workspace(
             generation,
             Some(&tx),
             &cancelled,
-        )
+        );
+        let archive_contents = archive_contents
+            .into_iter()
+            .filter(|(key, before)| {
+                configuration_content(Path::new(key)).as_ref() == Some(before)
+            })
+            .collect();
+        (stats, archive_contents)
     });
     while let Some((done, total, label)) = rx.recv().await {
         if let Some(p) = &ongoing {
@@ -1932,7 +1947,7 @@ async fn index_workspace(
                 .await;
         }
     }
-    let stats = handle.await.unwrap_or_default();
+    let (stats, archive_contents) = handle.await.unwrap_or_default();
     if !ws.lock().is_current_generation(generation) {
         return;
     }
@@ -1990,6 +2005,7 @@ async fn index_workspace(
             stats.jdk_complete,
         );
         if accepted {
+            watches.lock().archive_contents = archive_contents;
             crate::trace::span(
                 "workspace.accepted_finish",
                 "workspace",
@@ -2297,7 +2313,53 @@ fn is_project_configuration(file: &Path) -> bool {
 
 fn configuration_content(path: &Path) -> Option<[u8; 32]> {
     use sha2::Digest;
-    Some(sha2::Sha256::digest(std::fs::read(path).ok()?).into())
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file() {
+        return None;
+    }
+    let modified = before.modified().ok()?;
+    let mut hash = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let len = file.read(&mut buffer).ok()?;
+        if len == 0 {
+            break;
+        }
+        hash.update(&buffer[..len]);
+        bytes += len as u64;
+    }
+    for after in [file.metadata().ok()?, std::fs::metadata(path).ok()?] {
+        if bytes != before.len()
+            || after.len() != before.len()
+            || after.modified().ok()? != modified
+        {
+            return None;
+        }
+    }
+    Some(hash.finalize().into())
+}
+
+fn model_archive_contents(model: &classpath::ProjectSnapshot) -> HashMap<String, [u8; 32]> {
+    model
+        .local_jars()
+        .into_iter()
+        .filter_map(|path| Some((crate::paths::file_key(&path), configuration_content(&path)?)))
+        .collect()
+}
+
+fn unchanged_archive(
+    contents: &HashMap<String, [u8; 32]>,
+    key: &str,
+    kind: FileChangeType,
+) -> bool {
+    kind == FileChangeType::CHANGED
+        && !is_project_configuration(Path::new(key))
+        && contents.get(key).is_some_and(|accepted| {
+            configuration_content(Path::new(key)).as_ref() == Some(accepted)
+        })
 }
 
 fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
@@ -2864,6 +2926,32 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
+        // Archive reads may be large. Hash only selected event paths, outside the
+        // workspace/watch locks so completion can proceed while IO is pending.
+        let archives = self.watches.lock().archive_contents.clone();
+        let archive_keys = params
+            .changes
+            .iter()
+            .filter(|event| event.typ == FileChangeType::CHANGED)
+            .filter_map(|event| uri_to_key(&event.uri))
+            .filter(|key| archives.contains_key(key))
+            .collect::<std::collections::BTreeSet<_>>();
+        let unchanged_archives = if archive_keys.is_empty() {
+            HashMap::new()
+        } else {
+            tokio::task::spawn_blocking(move || {
+                archive_keys
+                    .into_iter()
+                    .filter(|key| unchanged_archive(&archives, key, FileChangeType::CHANGED))
+                    .map(|key| {
+                        let digest = archives[&key];
+                        (key, digest)
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .await
+            .unwrap_or_default()
+        };
         let mut jar_only = true;
         let changes = {
             let mut ws = self.ws.lock();
@@ -2872,7 +2960,13 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter_map(|change| {
                     let key = uri_to_key(&change.uri)?;
-                    (!self.watches.lock().unchanged_configuration(&key, change.typ)).then_some(key)
+                    let mut watches = self.watches.lock();
+                    (!watches.unchanged_configuration(&key, change.typ)
+                        && !(change.typ == FileChangeType::CHANGED
+                            && unchanged_archives.get(&key).is_some_and(|accepted| {
+                                watches.archive_contents.get(&key) == Some(accepted)
+                            })))
+                    .then_some(key)
                 })
                 .filter(|key| !ws.observe_compiled_resource(key))
                 .map(|key| {
@@ -7373,6 +7467,92 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             "provided-only deepest key cannot hide a genuine output ancestor"
         );
         assert!(!model.is_output_key("/provided.jar/Nested.class"));
+    }
+
+    #[tokio::test]
+    async fn unchanged_selected_binary_jar_watch_does_not_force_model_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_unchanged_binary_jar_watch_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("dependency.jar");
+        std::fs::write(&binary, b"accepted binary").unwrap();
+        let key = crate::paths::file_key(&binary);
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSCP\tmain\t{key}\nEND\t:app\n",
+            crate::paths::file_key(&root)
+        )));
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        *backend.gradle_project.lock() = true;
+        let contents = model_archive_contents(&model);
+        assert_eq!(
+            contents.len(),
+            1,
+            "the accepted model seeds the first event"
+        );
+        backend.watches.lock().archive_contents = contents.clone();
+        let initial = backend.refresh.lock().requested;
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent::new(
+                    Uri::from_file_path(&binary).unwrap(),
+                    FileChangeType::CHANGED,
+                )],
+            })
+            .await;
+        assert_eq!(
+            backend.refresh.lock().requested,
+            initial,
+            "an unchanged selected JAR must not cancel editing or restart Gradle"
+        );
+        let modified = std::fs::metadata(&binary).unwrap().modified().unwrap();
+        std::fs::write(&binary, b"replaced binary").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&binary)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&binary).unwrap().len(), 15);
+        assert_eq!(
+            std::fs::metadata(&binary).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(
+            !unchanged_archive(&contents, &key, FileChangeType::CHANGED),
+            "same-size, same-mtime replacement must refresh"
+        );
+        assert_eq!(project_change(&root, Some(&model), &key), Some(true));
+        let replacement = model_archive_contents(&model);
+        assert!(unchanged_archive(
+            &replacement,
+            &key,
+            FileChangeType::CHANGED
+        ));
+        for kind in [FileChangeType::CREATED, FileChangeType::DELETED] {
+            assert!(!unchanged_archive(&replacement, &key, kind));
+        }
+        std::fs::remove_file(&binary).unwrap();
+        assert!(!unchanged_archive(
+            &replacement,
+            &key,
+            FileChangeType::CHANGED
+        ));
+        assert!(!unchanged_archive(
+            &replacement,
+            &key,
+            FileChangeType::DELETED
+        ));
+        std::fs::write(&binary, b"replaced binary").unwrap();
+        assert!(
+            !unchanged_archive(&HashMap::new(), &key, FileChangeType::CHANGED),
+            "a new, unbaselined archive cannot hide its first event"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

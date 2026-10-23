@@ -869,13 +869,22 @@ impl Index {
 
     fn remove_symbols(&mut self, path: &str) {
         if let Some((_, old)) = self.files.remove(path) {
-            for sym in old {
-                Self::drop_from(&mut self.by_name, &sym.name, path);
+            let mut removed_names = HashSet::with_hasher(FxBuildHasher::default());
+            let mut removed_containers = HashSet::with_hasher(FxBuildHasher::default());
+            let mut removed_receivers = HashSet::with_hasher(FxBuildHasher::default());
+            for sym in &old {
+                if removed_names.insert(sym.name.as_str()) {
+                    Self::drop_from(&mut self.by_name, &sym.name, path);
+                }
                 if let Some(container) = &sym.container {
-                    Self::drop_from(&mut self.members_by_container, container, path);
+                    if removed_containers.insert(container.as_str()) {
+                        Self::drop_from(&mut self.members_by_container, container, path);
+                    }
                 }
                 if let Some(recv) = &sym.ext_receiver {
-                    Self::drop_from(&mut self.ext_by_receiver, recv, path);
+                    if removed_receivers.insert(recv.as_str()) {
+                        Self::drop_from(&mut self.ext_by_receiver, recv, path);
+                    }
                 }
             }
         }
@@ -2335,6 +2344,37 @@ mod tests {
 
         idx.remove_file("b.kt");
         assert_eq!(idx.lookup_by_name("foo").len(), 0);
+
+        let members = |name: &str, count| {
+            (0..count)
+                .map(|start_byte| IndexedSymbol {
+                    container: Some("SharedOwner".into()),
+                    ext_receiver: Some("SharedReceiver".into()),
+                    start_byte,
+                    end_byte: start_byte + name.len(),
+                    ..sym(name)
+                })
+                .collect()
+        };
+        idx.replace_file("a.kt", members("overload", 128), Tier::Volatile);
+        idx.replace_file("b.kt", members("overload", 64), Tier::Durable);
+        idx.replace_file("a.kt", members("fresh", 2), Tier::Volatile);
+        assert_eq!(idx.lookup_by_name("overload").len(), 64);
+        assert!(idx
+            .lookup_by_name("overload")
+            .iter()
+            .all(|entry| entry.path.as_ref() == "b.kt"));
+        assert_eq!(idx.lookup_by_name("fresh").len(), 2);
+        assert_eq!(idx.members_by_container["SharedOwner"].len(), 66);
+        assert_eq!(idx.ext_by_receiver["SharedReceiver"].len(), 66);
+        idx.remove_file("b.kt");
+        assert!(idx.lookup_by_name("overload").is_empty());
+        assert_eq!(idx.members_by_container["SharedOwner"].len(), 2);
+        assert_eq!(idx.ext_by_receiver["SharedReceiver"].len(), 2);
+        idx.remove_file("a.kt");
+        assert!(idx.lookup_by_name("fresh").is_empty());
+        assert!(!idx.members_by_container.contains_key("SharedOwner"));
+        assert!(!idx.ext_by_receiver.contains_key("SharedReceiver"));
     }
 
     #[test]

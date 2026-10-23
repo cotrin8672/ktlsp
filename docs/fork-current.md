@@ -10,6 +10,35 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
+### Slice139: unchanged archive watches and duplicate index scans
+
+The actual unchanged-local-JAR event now has a focused handler regression:
+`jar-watch139-red1/receipt.json` reproduces the unwanted refresh and
+`jar-watch139-green1/receipt.json` passes33 watch tests after the fix. Selected
+local archive contents are streamed outside interactive locks, checked before
+and after indexing, and installed only for an accepted generation. A matching
+CHANGED notification does not force Gradle import; unbaselined, unreadable,
+created, deleted or changed content remains conservative. Actual editor replay
+is pending the next immutable release. Same-size/same-mtime replacement is
+detected by this watch policy, but downstream metadata-only local-JAR cache
+identity remains a separate known gap; the unit test does not certify semantic
+reload for that case (`jar-watch139-final.json`).
+
+`Index::remove_symbols` now visits each distinct name/container/receiver bucket
+once, matching the existing reference-removal idiom. The strengthened existing
+replacement test preserves the other file's64 overloads and prunes empty
+buckets. `named-function139-core1/receipt.json` passes that test and the existing
+c18 overload control. `index-bucket139-count1/receipt.json` instruments the actual
+before/after methods: retain predicate visits24960 to576 for the documented
+128/64-member case. This is an operation count, not an end-to-end timing claim
+or proof that it explains Gradle's155s aggregate SDK installation.
+
+Named Function1 trailing-lambda inference and cross-module dirty Java compiler
+inputs are being repaired separately. Their actual editor failures/unmeasured
+diagnostics remain failures/unmeasured until the corresponding immutable editor
+reruns pass; unrelated intermediate Rust compilation errors are not semantic
+test results.
+
 ### Slice137/138: qualified construction and selected Java API release
 
 Joint28 passes1804 Rust tests,0 failed,10 ignored across42 targets and the
