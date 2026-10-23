@@ -45,7 +45,14 @@ flag prevented those3 diagnostic requests from starting. Spring's analogous
 unmeasured check is an incomplete compiler model caused by missing genuine
 repackaged dependency outputs. Its focused private-source Gradle build now passes
 (`spring-prereq138-build1/receipt.json`), with10861 tracked files unchanged and
-clean EOF/live0. Fresh model capture and editor diagnostics remain pending.
+clean EOF/live0. Fresh genuine model capture restores complete beans/core Java
+and Kotlin tasks. The unchanged original Spring shared-edit case now passes16/16
+first responses on joint28,0 mismatch/unmeasured, including a current-version
+complete compiler pass certifying empty diagnostics. Shutdown/EOF are clean,
+owned live/forced cleanup0, and the final10861-file content/inventory/Git audit
+matches (`spring-shared138-final.json`). This certifies the tested document and
+generation, not whole-project absence of diagnostics; the separate producer
+closure completeness flag remains false.
 
 ### Slice134/136: ABI output isolation and SDK facts with incomplete dependencies
 
