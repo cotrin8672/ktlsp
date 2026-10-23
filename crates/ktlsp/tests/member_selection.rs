@@ -17,6 +17,97 @@ const OVERLOAD_KOTLIN: &str = "/selection/typed/KotlinUse.kt";
 const OVERLOAD_USE: &str = "package typed; class JavaUse { void run(Target target, Decoy decoy, int number, String text) { target.twice(1); target.twice(\"x\"); target.twice(number); target.twice(text); decoy.twice(\"x\"); } }";
 
 #[test]
+fn java_generic_overrides_and_projected_overloads_select_declared_class_argument() {
+    // simple-xml 2.7.1 Persister's binary signatures. Javac 21 independently selects
+    // read:(Class,String)Object, rather than the generic read:(Object,String)Object.
+    let mut ws = Workspace::new();
+    for (file, source) in [
+        ("Object.java", "package java.lang; public class Object {}"),
+        (
+            "String.java",
+            "package java.lang; public final class String {}",
+        ),
+        (
+            "Class.java",
+            "package java.lang; public final class Class<T> {}",
+        ),
+        ("File.java", "package java.io; public class File {}"),
+        ("Reader.java", "package java.io; public class Reader {}"),
+        ("InputStream.java", "package java.io; public class InputStream {}"),
+        ("InputNode.java", "package stream; public interface InputNode {}"),
+    ] {
+        ws.open(file, source.into());
+    }
+    let signatures = ["java.lang.Class<? extends T>", "T"].into_iter().flat_map(|first| {
+        ["java.lang.String", "java.io.File", "java.io.Reader", "java.io.InputStream", "stream.InputNode"].into_iter().map(move |second| {
+            format!("public <T extends java.lang.Object> T read({first} p0, {second} p1) {{ throw null; }}\n")
+        })
+    }).collect::<String>();
+    ws.open(
+        "Serializer.java",
+        format!(
+            "package api; public interface Serializer {{ {} }}",
+            signatures.replace(" { throw null; }", ";").replace('T', "U")
+        ),
+    );
+    ws.open(
+        "Persister.java",
+        format!("package api; public class Persister implements Serializer {{ {signatures} }}"),
+    );
+    let source = "package api; class Use { void use(Persister p, Class<String> type, String text) { p.read(type, text); } }";
+    ws.open("Use.java", source.into());
+    ws.assume_index_complete_for_tests();
+    let expected = ws
+        .index
+        .lookup_by_name("read")
+        .iter()
+        .find(|entry| {
+            entry.path.as_ref() == "Persister.java"
+                && entry.sym.params[0].name == "Class"
+                && entry.sym.params[1].name == "String"
+        })
+        .map(|entry| Def {
+            file: "Persister.java".into(),
+            start_byte: entry.sym.start_byte,
+            end_byte: entry.sym.end_byte,
+        })
+        .unwrap();
+    assert_eq!(
+        goto(&mut ws, "Use.java", "p.read(type, text)"),
+        vec![expected.clone()]
+    );
+    // The actual runtime also indexes stdlib: String has unrelated variant ancestors.
+    ws.open("Builtins.kt", "package kotlin\nopen class Any\ninterface Comparable<in T>\ninterface CharSequence\nclass String : Comparable<String>, CharSequence\n".into());
+    assert_eq!(goto(&mut ws, "Use.java", "p.read(type, text)"), vec![expected.clone()]);
+    // Unknown actuals must not let one generic overload win by its declaration shape alone.
+    ws.change(
+        "Use.java",
+        source.replace("p.read(type, text)", "p.read(type, missing)"),
+    );
+    assert!(goto(&mut ws, "Use.java", "p.read(type, missing)").len() > 1);
+    ws.change("Use.java", source.into());
+    assert_eq!(
+        goto(&mut ws, "Use.java", "p.read(type, text)"),
+        vec![expected]
+    );
+
+    // Binder alpha-renaming must preserve nullability and declaration bounds.
+    for (parent, child) in [
+        ("fun <T: Any> f(value: T?)", "fun <U: Any> f(value: U)"),
+        ("fun <T: Any> f(value: T)", "fun <U: String> f(value: U)"),
+    ] {
+        ws.open("Bounds.kt", format!("package api\ninterface Base {{ {parent} }}\nclass Child : Base {{ override {child} {{}} }}\n"));
+        let declarations = ws.index.lookup_by_name("f");
+        let base = declarations.iter().find(|entry| entry.sym.container.as_deref() == Some("Base")).unwrap();
+        let child = declarations.iter().find(|entry| entry.sym.container.as_deref() == Some("Child")).unwrap();
+        assert!(!ktcore::members::inherited_method_relation(
+            &ws.index, &Type::class("Child", Some("api".into())), child, base,
+            &FileCtx::new("api".into(), Vec::new())
+        ).is_found());
+    }
+}
+
+#[test]
 fn kotlin_java_reference_specificity_maps_jvm_string_arguments() {
     // Selected JDK 21 and stdlib 2.1.20 headers, including the contravariant Comparable parent.
     for kotlin_builtins in [false, true] {

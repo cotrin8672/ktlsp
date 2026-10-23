@@ -483,3 +483,96 @@ fn closed_salsa_queries_and_synthetic_completion_follow_scope_and_unsaved_type_c
     assert!(root.starts_with(std::env::temp_dir()));
     std::fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn kotlin_static_receiver_goto_preserves_value_bindings() {
+    const JAVA: &str = "/static-navigation/api/ContextFactory.java";
+    const KOTLIN: &str = "/static-navigation/Use.kt";
+    let mut ws = Workspace::new();
+    ws.open(
+        JAVA,
+        "package api; public class ContextFactory { public static void createContext() {} }"
+            .to_string(),
+    );
+    ws.open(
+        "/static-navigation/api/Payload.java",
+        "package api; public class Payload { public void createContext() {} }".to_string(),
+    );
+    let classifier = target(&ws, JAVA, "ContextFactory", SymbolKind::Class);
+    for (source, usage, declaration) in [
+        (
+            "import api.ContextFactory\nfun use() { ContextFactory.createContext() }",
+            "ContextFactory.createContext",
+            None,
+        ),
+        (
+            "import api.ContextFactory as Factory\nfun use() { Factory.createContext() }",
+            "Factory.createContext",
+            None,
+        ),
+        (
+            "import api.*\nfun use() { ContextFactory.createContext() }",
+            "ContextFactory.createContext",
+            None,
+        ),
+        (
+            "import api.ContextFactory\nimport api.Payload\nfun use(ContextFactory: Payload) { ContextFactory.createContext() }",
+            "ContextFactory.createContext",
+            Some("ContextFactory: Payload"),
+        ),
+        (
+            "import api.ContextFactory\nimport api.Payload\nfun use() { val ContextFactory = Payload(); ContextFactory.createContext() }",
+            "ContextFactory.createContext",
+            Some("ContextFactory = Payload"),
+        ),
+        (
+            "import api.ContextFactory\nval ContextFactory: Missing get() = error(\"missing\")\nfun use() { ContextFactory.createContext() }",
+            "ContextFactory.createContext",
+            Some("ContextFactory: Missing"),
+        ),
+        (
+            "import api.ContextFactory as Factory\nval Factory: Missing get() = error(\"missing\")\nfun use() { Factory.createContext() }",
+            "Factory.createContext",
+            Some("Factory: Missing"),
+        ),
+        (
+            "import api.ContextFactory\nimport api.Payload\nclass Host(val ContextFactory: Payload) { fun use() { ContextFactory.createContext() } }",
+            "ContextFactory.createContext",
+            Some("ContextFactory: Payload"),
+        ),
+    ] {
+        let source = format!("package consumer\n{source}\n");
+        let tree = ktlsp::parser::KotlinParser::new().parse(&source);
+        assert!(!tree.root_node().has_error(), "{source}");
+        ws.open(KOTLIN, source.clone());
+        ws.assume_index_complete_for_tests();
+        let expected = match declaration {
+            None => classifier.clone(),
+            Some(anchor) => {
+                let start_byte = source.find(anchor).unwrap();
+                Def {
+                    file: KOTLIN.to_string(),
+                    start_byte,
+                    end_byte: start_byte + anchor.split([':', ' ']).next().unwrap().len(),
+                }
+            }
+        };
+        assert_eq!(
+            ws.goto_definition(KOTLIN, source.find(usage).unwrap()),
+            vec![expected],
+            "{source}"
+        );
+    }
+    for source in [
+        "package consumer\nimport api.ContextFactory\nval plain = ContextFactory\n",
+        "package consumer\nimport api.ContextFactory\nfun use() { missing.ContextFactory.createContext() }\n",
+    ] {
+        ws.open(KOTLIN, source.to_string());
+        ws.assume_index_complete_for_tests();
+        let offset = if source.contains("missing.") {
+            source.find("missing.").unwrap()
+        } else {
+            source.rfind("ContextFactory").unwrap()
+        };
+        assert!(ws.goto_definition(KOTLIN, offset).is_empty(), "{source}");
+    }
+}

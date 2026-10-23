@@ -115,6 +115,47 @@ fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
             assert!(!labels(&mut ws, file, &format!("{receiver}.cycle(item).useful")).contains("useful"));
         }
     }
+    let mut captured = workspace(&[
+        ("Item.java", "package app; public class Item { public void useful() {} }"),
+        ("Other.java", "package app; public class Other { public void usefulWrong() {} }"),
+        ("T.java", "package app; public class T { public void poison() {} }"),
+        ("Outer.java", "package app; public class Outer<T extends Item> { public class Inner { public <U extends T> U related(U value) { return value; } } }"),
+        ("KotlinOuter.kt", "package app\nclass KotlinOuter<T: Item> { inner class Inner { fun <U: T> related(value: U): U = value } }"),
+    ]);
+    for (file, source) in [
+        ("Captured.java", "package app; class Captured { void use(Outer<Item>.Inner java, KotlinOuter<Item>.Inner kotlin, Item item, Other other) { java.related(item).useful(); kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong(); } }"),
+        ("Captured.kt", "package app\nfun use(java: Outer<Item>.Inner, kotlin: KotlinOuter<Item>.Inner, item: Item, other: Other) { java.related(item).useful(); kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong() }"),
+    ] {
+        captured.open(file, source.into());
+        for receiver in ["java", "kotlin"] {
+            let prefix = format!("{receiver}.related(item).useful");
+            assert_member(&mut captured, file, &prefix, "useful", "usefulWrong");
+            let item = captured.index.lookup_by_name("useful").iter().find(|entry| entry.path.as_ref() == "Item.java").unwrap();
+            let expected = ktlsp::symbol::Def { file: "Item.java".into(), start_byte: item.sym.start_byte, end_byte: item.sym.end_byte };
+            assert_eq!(captured.goto_definition(file, source.find(&prefix).unwrap() + prefix.len() - "useful".len()), vec![expected]);
+            assert!(!labels(&mut captured, file, &format!("{receiver}.related(other).usefulWrong")).contains("usefulWrong"));
+        }
+    }
+    for (file, source) in [
+        ("CapturedRaw.java", "package app; class CapturedRaw { void use(Outer.Inner java, KotlinOuter.Inner kotlin, T poison) { java.related(poison).poison(); kotlin.related(poison).poison(); } }"),
+        ("CapturedStar.kt", "package app\nfun raw(java: Outer<*>.Inner, kotlin: KotlinOuter<*>.Inner, poison: T) { java.related(poison).poison(); kotlin.related(poison).poison() }"),
+    ] {
+        captured.open(file, source.into());
+        for receiver in ["java", "kotlin"] {
+            assert!(!labels(&mut captured, file, &format!("{receiver}.related(poison).poison")).contains("poison"));
+        }
+    }
+    for (file, source) in [
+        ("StaticOuter.java", "package app; public class StaticOuter<T extends Item> { public static class Inner { public <U extends T> U blocked(U value) { return value; } } }"),
+        ("StaticMethod.java", "package app; public class StaticMethod<T extends Item> { public class Inner { public static <U extends T> U blocked(U value) { return value; } } }"),
+        ("NestedOuter.kt", "package app\nclass NestedOuter<T: Item> { class Inner { fun <U: T> blocked(value: U): U = value } }"),
+        ("InterfaceOuter.java", "package app; public interface InterfaceOuter<T extends Item> { class Inner { public <U extends T> U blocked(U value) { return value; } } }"),
+        ("AnnotationOuter.java", "package app; public class AnnotationOuter<T extends Item> { public @interface Nest { class Inner { public <U extends T> U blocked(U value) { return value; } } } }"),
+    ] {
+        captured.open(file, source.into());
+        let entry = captured.index.lookup_by_name("blocked").iter().find(|entry| entry.path.as_ref() == file).unwrap();
+        assert!(entry.sym.method_type_bounds.is_none(), "{file}: inaccessible outer type variable");
+    }
 }
 const IMPORTED_BASE: &str = "package base; public class Base { public void baseOnly() {} public void accept(String value) {} }";
 const WRONG_BASE: &str = "package app; public class Base { public void baseWrong() {} public void accept(int value) {} }";
@@ -3029,6 +3070,7 @@ fn projected_overloads_keep_unknown_candidates_and_reject_exact_invariant_decoys
     let source = r#"package probe
 fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Other) {
  request.pick(type,marker).service()
+ request.independent(type,marker).service()
  request.uncertain(type,marker)
  known.body()
 }
@@ -3042,7 +3084,9 @@ fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Ot
  public <T> T pick(Class<? extends T> type, Invocation marker) { return null; }
  public Other pick(Class<Other> type, Other marker) { return null; }
  public <T> T uncertain(Class<? extends T> type, Invocation marker) { return null; }
- public <T extends Invocation> Other uncertain(other.Class<? extends T> type, Other marker) { return null; }
+ public <T extends Invocation> Other uncertain(other.Class<? extends T> type, Invocation marker) { return null; }
+ public <T> T independent(Class<? extends T> type, Invocation marker) { return null; }
+ public <T extends Invocation> Other independent(other.Class<? extends T> type, Other marker) { return null; }
 }"#.into());
     assert_member(
         &mut ws,
@@ -3058,6 +3102,10 @@ fun use(request: Request, type: Class<Invocation>, marker: Invocation, known: Ot
         "Invocation.java",
         "service",
     );
+    // Javac 21 and K2 both independently select Invocation here. A closed mismatch in
+    // marker rejects the bounded competitor regardless of its unsupported generic head.
+    assert_member(&mut ws, "Use.kt", "request.independent(type,marker).", "service", "serviceWrong");
+    assert_exact_definition(&mut ws, "Use.kt", "request.independent(type,marker).service()", "Invocation.java", "service");
     // A mismatching nominal head without a complete absence proof remains a possible overload.
     assert_eq!(
         infer_expression(&ws, "Use.kt", "request.uncertain(type,marker)"),

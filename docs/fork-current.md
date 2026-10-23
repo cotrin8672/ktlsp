@@ -1,6 +1,7 @@
 # Current fork state
 
 Updated 2026-10-23 (Asia/Tokyo). Goal active; IDEA parity and complete valid-code type coverage remain unproved.
+Current user priority: eliminate valid-code Unknown results before further warm latency or memory tuning. Retain uncertainty for invalid or insufficiently proven cases.
 History: docs/fork-acceptance.md, docs/fork-corpus.md and Git.
 Prospective speed targets and comparison rules: [performance budgets](fork-performance-budgets.md).
 BASE denotes C:/Users/gummy/AppData/Local/Temp/ktlsp-selected-compiler-recipe-20261012-1.
@@ -8,6 +9,80 @@ Other evidence paths below are relative to RUN:
 C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
+
+### Checkpoint120-24-2: three shared analysis gaps fixed
+
+Workspace1803 PASS,0 FAIL,9 ignored across42 targets; release builds successfully.
+All576 guarded inputs remain unchanged. Immutable binary SHA256:
+`264837343aff483ef30ece639c2f4a5aa14dbca7f1daa241df57a821cfaafe48`.
+Both Cargo stages exit0/EOF/owned-live0; only exact owned MSVC vctip helpers need
+cleanup. Runtime editor processes close normally without forced termination.
+
+| Same-release editor evidence | Result |
+| --- | --- |
+| Existing Java/Kotlin surface |427/427;61 first member RPCs |
+| Five additional projects |50/50 first responses; no mismatch or unmeasured result |
+| Captured outer method bounds |8/8 first RPCs;4 owner/consumer pairs, incomplete completion and sole exact goto |
+| Failed-source binary APIs |9/9 original checks; stronger Persister singleton/range audit also passes without additional RPC |
+| Actual CEM FQN getValue |8/8 checks;6 first RPCs |
+| TypeTools overload |4/4 first responses; sole compiler-selected Class/Class declaration |
+| Original CEM scenario |Normal phase has7 semantic matches,0 mismatches,2 unmeasured compiler checks; incomplete phase not run |
+
+Captured outer class type variables now reach method bounds through exact lexical
+ancestor scopes. Existing owner-instance substitution proves actual type arguments;
+raw/star, static, non-inner and unknown scopes retain uncertainty. Java interface/
+annotation member classes additionally enforce their implicit static boundary.
+No inference representation was added. Cache v45 refreshes changed parsed facts.
+Independent Javac21/Kotlin2.4 controls cover all four source combinations; compiled
+Outer.Inner has `<V:TT;>(TV;)TV;`. All61 fixture hashes match the actual compiler
+inputs/outputs; unrelated Outer/Shadow class bytes remain unchanged.
+
+Static Java class receivers in Kotlin navigation now reuse type binding only after
+ordinary value/lexical/implicit receiver resolution. Unknown-typed shadowing values
+remain authoritative; a bare class expression is not globally made a value.
+
+Generic override comparison now checks alpha-renamed declaration binders, bounds
+and nullability. Independent concrete argument mismatches and a narrow declaration
+specificity proof select Persister.read(Class,String), not its Object overload or
+inherited interface candidates. The actual first response contains exactly one
+compiler-certified range. Unknown arguments, unsupported bounds and projection
+proofs retain uncertainty. A previous Unknown guard now legitimately resolves an
+independently Javac/Kotlin-certified call; its original shape and exact navigation
+are retained alongside a separate unsupported-competitor guard.
+
+Intermediate failures remain recorded: `persister129-{green1,green2,focus3}` include
+compile-only failures or the unresolved two-candidate result; `captured-owner128-green1`
+has144/145 generic checks before the independently verified guard upgrade.
+`native-integrated120-24` retains1800 PASS/3 FAIL/9 ignored and no release build:
+the new rejection guard accidentally blocked an existing unbounded Class<T> nominal
+head proof. Its restoration passes all five focused controls and the full24-2 suite.
+No old Spring expectation was weakened.
+
+Current CEM gap is explicit: its canonical Java diagnostic receipt was not accepted,
+so manual pull count is0 and two diagnostic checks are unmeasured, not semantic
+mismatches or a passing timeout result. Read-only investigation sees
+`stale-kotlin-source` then `kotlin-project-model-pending`; whether refresh completion
+reenqueues the compiler work is under investigation. The original failed run is
+preserved and was not retried. CEM's separate completion/navigation checks above pass.
+
+Evidence: `native-integrated120-24-2`, `java-kotlin-msc121-release24`,
+`final-corpus120-24/summary50.json`, `captured-owner128-native24/receipt.json`,
+`fallback-api128/release24-2-summary.json` and its Persister singleton post-audit,
+`cem-getvalue122-native-release24/receipt.json`,
+`oracle120/typetools-editor-release24-strict1/strict-audit.json`,
+`cem-startup120/editor-original26-release24-serial1`, and
+`captured-owner128-final.json`. Nullable override and independent-argument compiler
+oracles: `generic-nullability128-oracle1`, `persister129-independent-oracle1`.
+
+Windows long-path compatibility remains separate: the new binary API tests use
+fresh guarded short private caches (162/168-character targets). They pass actual
+Neovim file/range reads without claiming support for the original271-character
+path. The original23 REDs and both baseline cache inventories remain unchanged.
+Retrofit/Spring source-text failures remain6/11 respectively; usable binary API
+facts do not make those source texts available. No new warm, memory, general
+compiler-plugin or IDEA-parity claim is made. Valid-code Unknown gaps remain.
+
+### Previous checkpoint120-23
 
 Checkpoint120-23 passes1801 Rust tests,0 fail,9 ignored across42 targets,
 and builds release with576 stable inputs. Immutable binary SHA256:
@@ -82,7 +157,11 @@ correct ranges: their271-character Windows paths fail both Neovim readfile and
 libuv open. The earlier missing-file classification was incorrect; extended-path
 reads prove the files existed during the original run. This is a real editor
 access problem, separate from semantic resolution or lazy source publication.
-Keep the original strict REDs and fix the independent causes before new runs.
+The isolated RUN prefix contributes108 characters: the same target under the
+normal default cache is163 characters. Preserve the long-path failure as an
+editor compatibility limit; a shorter guarded private cache can validate the
+unchanged navigation semantics without claiming long-path support.
+Keep the original strict REDs and fix semantic causes before new runs.
 Audit: `fallback-api126/release23-phase-audit.json` and
 `fallback-api126/persister-call-oracle23/receipt.json`.
 

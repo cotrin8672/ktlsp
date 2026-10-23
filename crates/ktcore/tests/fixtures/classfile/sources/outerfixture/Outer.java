@@ -1,7 +1,7 @@
 package outerfixture;
 public class Outer<T extends Item> {
  public class Inner<U extends Other> {
-  public T outer() { return null; }
+  public T outer() { return null; } public <V extends T> V related(V value) { return value; }
   public U inner() { return null; }
   public <T extends Other> T shadow(T value) { return value; }
  }

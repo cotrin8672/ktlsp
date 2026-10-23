@@ -1142,7 +1142,7 @@ pub fn method_type_bounds(
     let start = declaration.start_byte();
     let end = declaration.end_byte();
     let mut parent = declaration.parent();
-    let mut owner_scope = None;
+    let mut owner_scopes = Vec::new();
     while let Some(node) = parent {
         if matches!(
             node.kind(),
@@ -1151,8 +1151,7 @@ pub fn method_type_bounds(
                 | "enum_declaration"
                 | "record_declaration"
         ) {
-            owner_scope = Some((node.start_byte(), node.end_byte()));
-            break;
+            owner_scopes.push((node.start_byte(), node.end_byte()));
         }
         parent = node.parent();
     }
@@ -1161,7 +1160,7 @@ pub fn method_type_bounds(
         parameters: &[TypeParameterBounds],
         start: usize,
         end: usize,
-        owner_scope: Option<(usize, usize)>,
+        owner_scopes: &[(usize, usize)],
     ) -> bool {
         if ty.qualification.is_none()
             && parameters
@@ -1181,14 +1180,14 @@ pub fn method_type_bounds(
                     parameter.name == ty.name
                         && parameter.complete
                         && ((parameter.scope_start == start && parameter.scope_end == end)
-                            || owner_scope == Some((parameter.scope_start, parameter.scope_end)))
+                            || owner_scopes.contains(&(parameter.scope_start, parameter.scope_end)))
                 });
         }
         ty.owner
             .as_deref()
-            .is_none_or(|owner| scoped_parameter_refs(owner, parameters, start, end, owner_scope))
+            .is_none_or(|owner| scoped_parameter_refs(owner, parameters, start, end, owner_scopes))
             && ty.args.iter().all(|argument| {
-                scoped_parameter_refs(argument, parameters, start, end, owner_scope)
+                scoped_parameter_refs(argument, parameters, start, end, owner_scopes)
             })
     }
     let own: Vec<_> = parameters
@@ -1209,7 +1208,7 @@ pub fn method_type_bounds(
     let mut relations = Vec::new();
     for parameter in &own {
         for bound in &parameter.upper_bounds {
-            if !scoped_parameter_refs(bound, parameters, start, end, owner_scope) {
+            if !scoped_parameter_refs(bound, parameters, start, end, &owner_scopes) {
                 return None;
             }
             if bound.qualification.is_none() && own.iter().any(|target| target.name == bound.name) {

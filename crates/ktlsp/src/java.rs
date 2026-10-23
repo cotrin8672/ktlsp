@@ -814,7 +814,12 @@ fn java_type_parameters_in_scope(
                 .any(|modifier| modifier.kind() == "static");
             found
         });
+        let implicitly_static_class = decl.kind() == "class_declaration"
+            && decl.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "interface_body" | "annotation_type_body")
+            });
         accessible &= !is_static
+            && !implicitly_static_class
             && !matches!(
                 decl.kind(),
                 "interface_declaration"

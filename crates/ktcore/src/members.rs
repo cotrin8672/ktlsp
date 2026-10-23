@@ -1167,6 +1167,7 @@ fn remove_overridden_members(
             } else {
                 signature_inheritance_relation(
                     index,
+                    receiver,
                     nearer,
                     inherited,
                     &signatures[other],
@@ -1293,6 +1294,7 @@ pub fn inherited_method_relation(
 ) -> resolve::ResolutionStatus<()> {
     signature_inheritance_relation(
         index,
+        receiver,
         child,
         parent,
         &method_signature(index, receiver, child, ctx),
@@ -1505,6 +1507,7 @@ pub fn required_interface_methods<'a>(
 
 fn signature_inheritance_relation(
     index: &dyn InferenceIndex,
+    receiver: &Type,
     child: &Entry,
     parent: &Entry,
     child_signature: &Option<Vec<Type>>,
@@ -1531,8 +1534,8 @@ fn signature_inheritance_relation(
     }
     if owner.is_found()
         && !owner_inheritance(index, parent, child).is_found()
-        && child_signature.is_some()
-        && parent_signature.is_some()
+        && (child_signature.is_some() && parent_signature.is_some()
+            || generic_override_signature_equal(index, receiver, child, parent))
     {
         return Knowledge::Found(());
     }
@@ -1543,6 +1546,118 @@ fn signature_inheritance_relation(
             end_byte: child.sym.end_byte,
         }),
     ])
+}
+
+// Generic overrides compare declaration binders, not invocation substitutions or erasures.
+// Equal erasures alone would also admit incompatible bounds and nested type arguments.
+fn generic_override_signature_equal(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    left: &Entry,
+    right: &Entry,
+) -> bool {
+    if left.sym.type_params.is_empty()
+        || left.sym.type_params.len() != right.sym.type_params.len()
+        || !left.sym.type_parameter_facts.known_invariant()
+        || !right.sym.type_parameter_facts.known_invariant()
+        || left.sym.arity.map(usize::from) != Some(left.sym.params.len())
+        || right.sym.arity.map(usize::from) != Some(right.sym.params.len())
+        || left.sym.params.len() != right.sym.params.len()
+    {
+        return false;
+    }
+    let same = |a: &TypeRef, b: &TypeRef| {
+        generic_signature_type_equal(index, receiver, left, a, right, b, 0)
+    };
+    let bounds = |entry: &Entry| {
+        entry.sym.method_type_bounds.as_deref().cloned().or_else(|| {
+            entry
+                .sym
+                .type_parameter_facts
+                .known_unbounded()
+                .then(Vec::new)
+        })
+    };
+    let (Some(a), Some(b)) = (bounds(left), bounds(right)) else {
+        return false;
+    };
+    a.len() == b.len()
+        && a.iter().zip(&b).all(|((an, a), (bn, b))| {
+            left.sym.type_params.iter().position(|name| name == an).is_some_and(|slot| {
+                right.sym.type_params.iter().position(|name| name == bn) == Some(slot)
+            })
+                && same(a, b)
+        })
+        && left
+            .sym
+            .params
+            .iter()
+            .zip(&right.sym.params)
+            .all(|(a, b)| same(a, b))
+}
+
+fn generic_signature_type_equal(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    left: &Entry,
+    a: &TypeRef,
+    right: &Entry,
+    b: &TypeRef,
+    depth: usize,
+) -> bool {
+    if depth > infer::MAX_DEPTH
+        || a.nullable != b.nullable
+        || a.projection != b.projection
+        || a.owner.is_some()
+        || b.owner.is_some()
+    {
+        return false;
+    }
+    let variable = |entry: &Entry, ty: &TypeRef| {
+        ty.qualification
+            .is_none()
+            .then(|| {
+                entry
+                    .sym
+                    .type_params
+                    .iter()
+                    .position(|name| name == &ty.name)
+            })
+            .flatten()
+    };
+    match (variable(left, a), variable(right, b)) {
+        (Some(a_slot), Some(b_slot)) => {
+            return a_slot == b_slot && a.args.is_empty() && b.args.is_empty();
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    if a.projection == crate::types::Projection::Star {
+        return true;
+    }
+    let head = |entry: &Entry, ty: &TypeRef| {
+        let mut head = ty.clone();
+        head.args.clear();
+        head.projection = crate::types::Projection::Invariant;
+        parameter_identity(
+            index,
+            infer::declared_member_type(
+                index,
+                receiver,
+                entry,
+                &head,
+                &FileCtx::new(entry.sym.package.clone(), Vec::new()),
+            ),
+        )
+    };
+    let (Some(a_head), Some(b_head)) = (head(left, a), head(right, b)) else {
+        return false;
+    };
+    a_head == b_head
+        && a.args.len() == b.args.len()
+        && a.args.iter().zip(&b.args).all(|(a, b)| {
+            generic_signature_type_equal(index, receiver, left, a, right, b, depth + 1)
+        })
 }
 
 fn parameter_identity(index: &dyn InferenceIndex, ty: Type) -> Option<Type> {
@@ -1995,6 +2110,11 @@ pub(crate) fn most_specific_reference_call(
     {
         return None;
     }
+    if mode == CallMode::Java {
+        if let Some(winner) = root_generic_specificity(index, receiver, entries, args) {
+            return Some(winner);
+        }
+    }
     let formals = entries
         .iter()
         .map(|entry| {
@@ -2108,6 +2228,96 @@ pub(crate) fn most_specific_reference_call(
         }
         _ => None,
     }
+}
+
+/// A declaration-level slice of generic specificity: a nominal reference parameter can
+/// forward to an otherwise unconstrained method variable occurring once. Invocation-inferred
+/// bindings cannot prove this relation (they make both overloads look equally specific).
+fn root_generic_specificity(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entries: &[&Entry],
+    args: &CallArguments,
+) -> Option<usize> {
+    let unbounded = |entry: &Entry| {
+        entry.sym.type_params.len() == 1
+            && entry.sym.type_parameter_facts.known_invariant()
+            && (entry.sym.type_parameter_facts.known_unbounded()
+                // The declaration producer normalizes explicit Java Object bounds away.
+                || entry.sym.method_type_bounds.as_deref().is_some_and(|bounds| bounds.is_empty()))
+    };
+    if entries.len() < 2
+        || !entries.iter().all(|entry| {
+            unbounded(entry)
+                && !entry.sym.has_vararg
+                && entry.sym.extension_receiver.is_none()
+                && entry.sym.ext_receiver.is_none()
+                && entry.sym.arity.map(usize::from) == args.count
+                && entry.sym.min_arity.map(usize::from) == args.count
+                && entry.sym.params.len() == args.types.len()
+                && bind_arguments(entry, args, CallMode::Java)
+                    .ok()
+                    .and_then(|bound| {
+                        infer::projected_member_application(index, receiver, entry, &bound)
+                    })
+                    .is_some_and(|application| {
+                        application.status == crate::solve::ConstraintStatus::Matched
+                    })
+        })
+    {
+        return None;
+    }
+    let forwards = |left: &Entry, right: &Entry| {
+        let slots: Vec<_> = right
+            .sym
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| contains_method_parameter(ty, &right.sym.type_params))
+            .collect();
+        let [(slot, variable)] = slots.as_slice() else {
+            return false;
+        };
+        if variable.qualification.is_some()
+            || variable.name != right.sym.type_params[0]
+            || variable.projection != crate::types::Projection::Invariant
+            || variable.nullable
+            || variable.owner.is_some()
+            || !variable.args.is_empty()
+        {
+            return false;
+        }
+        left.sym
+            .params
+            .iter()
+            .zip(&right.sym.params)
+            .enumerate()
+            .all(|(position, (a, b))| {
+                if position != *slot {
+                    return generic_signature_type_equal(index, receiver, left, a, right, b, 0);
+                }
+                if a.qualification.is_none() && left.sym.type_params.contains(&a.name)
+                    || a.projection != crate::types::Projection::Invariant
+                    || a.nullable
+                    || a.owner.is_some()
+                {
+                    return false;
+                }
+                let ty = infer::declared_member_type(
+                    index,
+                    receiver,
+                    left,
+                    a,
+                    &FileCtx::new(left.sym.package.clone(), Vec::new()),
+                );
+                matches!(ty, Type::Class { .. }) && infer::type_head_is_known(index, &ty)
+            })
+    };
+    let mut winners = (0..entries.len()).filter(|&left| {
+        (0..entries.len()).all(|right| left == right || forwards(entries[left], entries[right]))
+    });
+    let winner = winners.next()?;
+    winners.next().is_none().then_some(winner)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2413,7 +2623,6 @@ fn parameters_applicability(
         && !infer::call_parameter_templates_known(index, entry);
     if let Some(application) = infer::projected_member_application(index, receiver, entry, bound) {
         if application.status == crate::solve::ConstraintStatus::Unknown
-            && entry.sym.type_parameter_facts.known_unbounded()
             && !entry.sym.has_vararg
             && !args.has_spread
             && !args.trailing_lambda
@@ -2421,6 +2630,16 @@ fn parameters_applicability(
             && params.len() == args.types.len()
             && params.len() == entry.sym.params.len()
             && params.iter().zip(&args.types).any(|(parameter, actual)| {
+                // Preserve the existing unbounded nominal-head proof for Class<T> even
+                // when T is unresolved. A variable itself has no independent nominal head;
+                // bounded projected templates still need their application proof.
+                if contains_method_parameter(parameter, &entry.sym.type_params)
+                    && (!entry.sym.type_parameter_facts.known_unbounded()
+                        || parameter.qualification.is_none()
+                            && entry.sym.type_params.contains(&parameter.name))
+                {
+                    return false;
+                }
                 let formal = infer::declared_member_type(index, receiver, entry, parameter, ctx);
                 infer::nominal_heads_incompatible(index, actual, &formal)
             })

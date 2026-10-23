@@ -214,3 +214,10 @@ count, with only the implicit constructor. Native class size272B, major61,
 SHAbfaf22b97a5e004a9bbf6f50033ae27ddac0097249f93c02d11c5f36e319025d.
 It guards Property-only local/Module publication and Java/Kotlin cold/warm
 completion; it does not establish source closure or constant-value semantics.
+
+`outerfixture/Outer$Inner.class` also contains `<V extends T> V related(V)`, where
+`T` is captured from its parameterized outer instance. The existing binary owner queries
+check completion and exact navigation in Java and Kotlin, and reject an unrelated argument.
+Rebuild with `javac --release 17 -encoding UTF-8 -proc:none -sourcepath ""`,
+using this fixture directory as `-classpath`, a fresh `-d` directory, and
+`sources/outerfixture/Outer.java` as input. The other two emitted class files remain byte-identical.

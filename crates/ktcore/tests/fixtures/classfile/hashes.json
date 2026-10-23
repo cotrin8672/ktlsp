@@ -266,8 +266,8 @@
   },
   {
     "file": "outerfixture/Outer$Inner.class",
-    "sha256": "24d25135cf16f85304436a30eaa7cf823fd173fb7b2847e889b083e60acc5faa",
-    "bytes": 775
+    "sha256": "b0fb88ce014539f848303dd6eb6eb554839566e54768d6cd1b34098d996afce1",
+    "bytes": 894
   },
   {
     "file": "outerfixture/Outer$Shadow.class",
@@ -298,5 +298,10 @@
     "file": "kotlin240/VarBox.class",
     "sha256": "cb9c1a8201c1f98bd95762df8759fbc9a8ec8a39a3314d90753abb46514206b5",
     "bytes": 932
+  },
+  {
+    "file": "sources/outerfixture/Outer.java",
+    "sha256": "c531b450a113b8f81d5d77ca6bd627a16e4e90ce2f826b4d769ca263ea82249d",
+    "bytes": 373
   }
 ]

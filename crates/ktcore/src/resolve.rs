@@ -1466,7 +1466,12 @@ fn goto_authored_node_with_ctx(
             return defs;
         }
     }
-    resolve_cross_file(index, name, uk, ctx, named_usage.as_ref())
+    let defs = resolve_cross_file(index, name, uk, ctx, named_usage.as_ref());
+    // A classifier can name a static/companion receiver without being a standalone value.
+    if defs.is_empty() && uk == UseKind::Value && is_navigation_receiver_in(ident, parent) {
+        return resolve_cross_file(index, name, UseKind::Type, ctx, None);
+    }
+    defs
 }
 
 /// If the cursor is on the defining identifier of a declaration, return its own location.

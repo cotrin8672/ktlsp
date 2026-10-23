@@ -3813,8 +3813,8 @@ mod tests {
     fn binary_outer_instantiation_reaches_shared_queries() {
         let (mut workspace, root) = outer97_binary_fixture("complete");
         for (name, source) in [
-            ("Use.java", "package outerfixture; class Use { void use(Factory factory, Other other) { factory.make().outer().special(); factory.make().inner().pong(); factory.value.outer().special(); factory.make().shadow(other).pong(); factory.shadow().own().pong(); } }"),
-            ("Use.kt", "package outerfixture\nfun use(factory: Factory, other: Other) { factory.make().outer().special(); factory.make().inner().pong(); factory.value.outer().special(); factory.make().shadow(other).pong(); factory.shadow().own().pong() }")
+            ("Use.java", "package outerfixture; class Use { void use(Factory factory, SpecialItem item, Other other) { factory.make().outer().special(); factory.make().inner().pong(); factory.value.outer().special(); factory.make().shadow(other).pong(); factory.shadow().own().pong(); factory.make().related(item).special(); factory.make().related(other).pong(); } }"),
+            ("Use.kt", "package outerfixture\nfun use(factory: Factory, item: SpecialItem, other: Other) { factory.make().outer().special(); factory.make().inner().pong(); factory.value.outer().special(); factory.make().shadow(other).pong(); factory.shadow().own().pong(); factory.make().related(item).special(); factory.make().related(other).pong() }")
         ] {
             let key=crate::paths::file_key(&root.join("src").join(name)); workspace.open(&key,source.into()); workspace.scan(&root.join("src"));
             for (chain,useful,wrong) in [
@@ -3822,8 +3822,12 @@ mod tests {
                 ("factory.make().inner().","pong","ping"),
                 ("factory.value.outer().","special","pong"),
                 ("factory.make().shadow(other).","pong","ping"),
-                ("factory.shadow().own().","pong","ping")
+                ("factory.shadow().own().","pong","ping"),
+                ("factory.make().related(item).","special","pong")
             ] { outer97_assert_chain(&mut workspace,&key,source,chain,useful,wrong); }
+            let at=source.find("factory.make().related(other).pong").unwrap()+"factory.make().related(other).".len();
+            assert!(workspace.completion_query(&key,at).is_none_or(|q|q.candidates.iter().all(|c|c.label!="pong")), "{name}: unrelated argument must not satisfy the captured outer bound");
+            assert!(workspace.goto_definition(&key,at).is_empty());
         }
         fs::remove_dir_all(root).unwrap();
     }
