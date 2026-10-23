@@ -4042,6 +4042,46 @@ fn kotlin_scalar_annotation_options(value: &str) -> bool {
     })
 }
 
+fn kotlin_jvm_abi_plugin_supported(request: &KotlinDiagnosticRequest) -> anyhow::Result<bool> {
+    use sha2::{Digest, Sha256};
+    let Some(recipe) = request.task.kotlin_compiler.as_ref() else {
+        return Ok(false);
+    };
+    if recipe.compiler_version != "2.0.21" || recipe.gradle_plugin_version != "2.0.21" {
+        return Ok(false);
+    }
+    let mut found = false;
+    for path in kotlin_plugin_paths(&request.task.arguments)? {
+        let file = std::fs::File::open(&path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        let Ok(mut entry) = archive.by_name("META-INF/MANIFEST.MF") else {
+            continue;
+        };
+        anyhow::ensure!(entry.size() <= 8192, "kotlin-plugin-manifest-too-large");
+        let mut manifest = String::new();
+        entry.read_to_string(&mut manifest)?;
+        if !manifest
+            .lines()
+            .any(|s| s.trim() == "Implementation-Title: jvm-abi-gen-embeddable")
+        {
+            continue;
+        }
+        // The selected public Maven artifact was independently exercised against the captured
+        // compiler. Names or a copied manifest cannot authorize a different plugin's writes.
+        anyhow::ensure!(!found, "kotlin-jvm-abi-plugin-duplicate");
+        if !manifest
+            .lines()
+            .any(|s| s.trim() == "Implementation-Version: 2.0.21-release-482")
+            || format!("{:x}", Sha256::digest(std::fs::read(&path)?))
+                != "6d90e04701a75f4ffbf19adca928d74e4936cdb178034c0b49f54ed51417fba1"
+        {
+            return Ok(false);
+        }
+        found = true;
+    }
+    Ok(found)
+}
+
 fn kotlin_editor_arguments(
     request: &KotlinDiagnosticRequest,
     output: &Path,
@@ -4053,6 +4093,7 @@ fn kotlin_editor_arguments(
     let mut target = false;
     let mut sdk = false;
     let mut explicit_classpath = false;
+    let mut jvm_abi_output = false;
     let path_separator = if cfg!(windows) { ';' } else { ':' };
     for path in &request.task.classpath {
         anyhow::ensure!(path.is_absolute(), "kotlin-relative-target-classpath");
@@ -4074,10 +4115,42 @@ fn kotlin_editor_arguments(
                     .task
                     .arguments
                     .get(i + 1)
-                    .filter(|value| kotlin_scalar_annotation_options(value))
                     .ok_or_else(|| anyhow::anyhow!("kotlin-plugin-option-unhandled-at-{i}"))?;
-                // These options name annotations, not files; preserve their exact selected order.
-                result.extend([argument.clone(), value.clone()]);
+                if kotlin_scalar_annotation_options(value) {
+                    // These name annotations, not files; preserve their exact selected order.
+                    result.extend([argument.clone(), value.clone()]);
+                } else if let Some(original) =
+                    value.strip_prefix("plugin:org.jetbrains.kotlin.jvm.abi:outputDir=")
+                {
+                    let path = Path::new(original);
+                    anyhow::ensure!(
+                        !jvm_abi_output
+                            && path.is_absolute()
+                            && !original.contains(['\0', '\r', '\n', ','])
+                            && !path.components().any(|c| matches!(
+                                c,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )),
+                        "kotlin-jvm-abi-output-unhandled"
+                    );
+                    anyhow::ensure!(
+                        kotlin_jvm_abi_plugin_supported(request)?,
+                        "kotlin-jvm-abi-plugin-unverified"
+                    );
+                    // A sibling keeps ABI stubs out of the normal class inventory. The caller
+                    // supplies this request's private destination, never the task's build output.
+                    let private = output.with_extension("jvm-abi");
+                    let private = private
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("kotlin-jvm-abi-output-encoding"))?;
+                    result.extend([
+                        argument.clone(),
+                        format!("plugin:org.jetbrains.kotlin.jvm.abi:outputDir={private}"),
+                    ]);
+                    jvm_abi_output = true;
+                } else {
+                    anyhow::bail!("kotlin-plugin-option-unhandled-at-{i}");
+                }
                 i += 2;
                 continue;
             }
@@ -5187,6 +5260,146 @@ mod kotlin_editor_compile_tests {
                 "{tail:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires actual KTLSP_JVM_ABI_TEST_JAR, CLASSPATH and JAVA_HOME: selected 2.0.21 plugin"]
+    fn argument_adapter_relocates_selected_jvm_abi_outputs() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("project");
+        let private = directory.0.join("request/classes");
+        let plugin = PathBuf::from(std::env::var_os("KTLSP_JVM_ABI_TEST_JAR").unwrap());
+        let compiler_cp = std::env::var_os("KTLSP_JVM_ABI_TEST_CLASSPATH").unwrap();
+        let sdk = PathBuf::from(std::env::var_os("KTLSP_JVM_ABI_TEST_JAVA_HOME").unwrap());
+        let runtime: Vec<_> = std::env::split_paths(&compiler_cp).collect();
+        let stdlib = runtime
+            .iter()
+            .find(|p| p.file_name().and_then(|s| s.to_str()) == Some("kotlin-stdlib-2.0.21.jar"))
+            .unwrap()
+            .clone();
+        let source = root.join("src/Sample.kt");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            "package fixture\nclass Sample { fun value(): String = \"current\" }\n",
+        )
+        .unwrap();
+        let mut request = kotlin_test_request(&root);
+        request.task.java_home = Some(sdk.clone());
+        request.task.classpath = vec![stdlib];
+        let recipe = request.task.kotlin_compiler.as_mut().unwrap();
+        recipe.compiler_version = "2.0.21".into();
+        recipe.gradle_plugin_version = "2.0.21".into();
+        recipe.default_classpath = runtime;
+        recipe.gradle_java_home = sdk.clone();
+        recipe.toolchain_java_home = sdk.clone();
+        request
+            .task
+            .arguments
+            .retain(|a| !a.starts_with("-Xplugin="));
+        let original_abi = root.join("build/generated/kotlin-abi");
+        std::fs::create_dir_all(&original_abi).unwrap();
+        let sentinel = original_abi.join("keep.bin");
+        std::fs::write(&sentinel, b"original-build-output").unwrap();
+        let option = format!(
+            "plugin:org.jetbrains.kotlin.jvm.abi:outputDir={}",
+            original_abi.display()
+        );
+        request.task.arguments.extend([
+            format!("-Xplugin={}", plugin.display()),
+            "-P".into(),
+            option.clone(),
+        ]);
+        let selected = request.task.arguments.clone();
+        let arguments =
+            kotlin_editor_arguments(&request, &private, std::slice::from_ref(&source)).unwrap();
+        let abi_output = private.with_extension("jvm-abi");
+        let position = arguments.iter().position(|a| a == "-P").unwrap();
+        assert_eq!(
+            arguments[position + 1],
+            format!(
+                "plugin:org.jetbrains.kotlin.jvm.abi:outputDir={}",
+                abi_output.display()
+            )
+        );
+        assert_eq!(request.task.arguments, selected);
+        assert!(!arguments
+            .iter()
+            .any(|a| a.contains(original_abi.to_str().unwrap())));
+        assert!(!abi_output.starts_with(&root));
+        let args_file = directory.0.join("compiler.args");
+        std::fs::write(&args_file, kotlin_argument_file(&arguments).unwrap()).unwrap();
+        let mut command = Command::new(sdk.join(if cfg!(windows) {
+            "bin/java.exe"
+        } else {
+            "bin/java"
+        }));
+        command
+            .arg("-cp")
+            .arg(compiler_cp)
+            .arg("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
+            .arg(format!("@{}", args_file.display()));
+        #[cfg(windows)]
+        {
+            let (status, interrupted, out, out_complete, err, err_complete) =
+                OwnedNativeCompile::spawn(&mut command, MAX_OUTPUT_BYTES)
+                    .unwrap()
+                    .wait(COMPILE_TIMEOUT, Some(request.invalid.as_ref()));
+            assert!(!interrupted && out_complete && err_complete, "{out}\n{err}");
+            assert_eq!(status.code(), Some(0), "{out}\n{err}");
+        }
+        #[cfg(not(windows))]
+        assert!(command.status().unwrap().success());
+        for output in [&private, &abi_output] {
+            let bytes = std::fs::read(output.join("fixture/Sample.class")).unwrap();
+            assert_eq!(
+                ktcore::classfile::decode("actual-jvm-abi", &bytes)
+                    .unwrap()
+                    .identity
+                    .internal_name,
+                "fixture/Sample"
+            );
+        }
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original-build-output");
+        assert_eq!(std::fs::read_dir(&original_abi).unwrap().count(), 1);
+        assert!(!request.task.output_roots[0].exists());
+        for bad in [
+            "plugin:org.jetbrains.kotlin.jvm.abi:unknown=true".to_owned(),
+            "plugin:org.jetbrains.kotlin.jvm.abi:outputDir=../escape".into(),
+            format!(
+                "plugin:org.jetbrains.kotlin.jvm.abi:outputDir={}/../escape",
+                root.display()
+            ),
+            format!("{option},plugin:opaque:value=1"),
+            format!("{option}\n"),
+        ] {
+            let mut changed = request.clone();
+            *changed.task.arguments.last_mut().unwrap() = bad;
+            assert!(kotlin_editor_arguments(&changed, &private, &[]).is_err());
+        }
+        let mut changed = request.clone();
+        changed.task.arguments.extend(["-P".into(), option.clone()]);
+        assert!(kotlin_editor_arguments(&changed, &private, &[]).is_err());
+        let mut changed = request.clone();
+        changed
+            .task
+            .kotlin_compiler
+            .as_mut()
+            .unwrap()
+            .compiler_version = "2.1.20".into();
+        assert!(kotlin_editor_arguments(&changed, &private, &[]).is_err());
+        let altered = directory.0.join("altered.jar");
+        let mut bytes = std::fs::read(&plugin).unwrap();
+        bytes.push(0);
+        std::fs::write(&altered, bytes).unwrap();
+        let mut changed = request.clone();
+        for argument in &mut changed.task.arguments {
+            if argument.starts_with("-Xplugin=") {
+                *argument = format!("-Xplugin={}", altered.display());
+            }
+        }
+        assert!(kotlin_editor_arguments(&changed, &private, &[]).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original-build-output");
     }
 
     #[test]

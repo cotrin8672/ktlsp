@@ -748,8 +748,8 @@ object KtlspCompilerConfiguration {
         val versionHelper = Class.forName("org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapperKt", true, loader)
         val version = versionHelper.getMethod("getKotlinPluginVersion", Project::class.java)
             .invoke(null, task.project) as? String
-        // KGP 1.9.25 fills these SDK options independently of its dependency/plugin classpaths.
-        check(version == "1.9.25")
+        // These verified KGP layouts expose SDK options independently of dependency/plugin classpaths.
+        check(version in setOf("1.8.21", "1.9.25"))
         check(read(task, "getExecutionTimeFreeCompilerArgs\$kotlin_gradle_plugin_common") == null)
         val options = read(task, "getCompilerOptions") ?: error("Kotlin SDK options are unavailable")
         check(Class.forName("org.jetbrains.kotlin.gradle.dsl.KotlinJvmCompilerOptions", false, loader).isInstance(options))
@@ -774,7 +774,7 @@ object KtlspCompilerConfiguration {
         check(explicit.size <= 1)
         val selected = explicit.singleOrNull()?.let { java.io.File(it) } ?: home
         check(selected.isAbsolute)
-        linkedMapOf("adapter" to "kgp-1.9.25-jvm-sdk-options-v1", "task" to task.path,
+        linkedMapOf("adapter" to "kgp-$version-jvm-sdk-options-v1", "task" to task.path,
             "language" to "kotlin", "java_home" to selected.absolutePath, "arguments" to arguments)
     }.getOrNull()
 

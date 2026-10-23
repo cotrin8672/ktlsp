@@ -1504,17 +1504,21 @@ fn sdk_inputs(task: &CompilerTask) -> Option<SdkInputs<'_>> {
     }
     let selection: KotlinSdkSelection =
         serde_json::from_value(task.options.get("sdkSelection")?.clone()).ok()?;
+    let (plugin_version, maximum_target) = match selection.adapter.as_str() {
+        "kgp-1.8.21-jvm-sdk-options-v1" => ("1.8.21", 19),
+        "kgp-1.9.25-jvm-sdk-options-v1" => ("1.9.25", 21),
+        _ => return None,
+    };
     if task.language != CompilerLanguage::Kotlin
-        || selection.adapter != "kgp-1.9.25-jvm-sdk-options-v1"
         || selection.language != task.language
         || selection.task != task.task
         || !selection.java_home.is_absolute()
         || task
             .kotlin_compiler
             .as_ref()
-            .is_some_and(|compiler| compiler.gradle_plugin_version != "1.9.25")
+            .is_some_and(|compiler| compiler.gradle_plugin_version != plugin_version)
         || !matches!(selection.arguments.as_slice(), [flag, target, ..]
-            if flag == "-jvm-target" && kotlin_jdk_release_feature(target).is_some_and(|target| (8..=21).contains(&target)))
+            if flag == "-jvm-target" && kotlin_jdk_release_feature(target).is_some_and(|target| (8..=maximum_target).contains(&target)))
     {
         return None;
     }
@@ -3363,6 +3367,9 @@ pub(crate) mod tests {
         });
         for fault in [
             "valid",
+            "valid-1.8.21",
+            "valid-1.8.21-target19",
+            "1.8.21-target20",
             "missing",
             "adapter",
             "task",
@@ -3386,14 +3393,25 @@ pub(crate) mod tests {
                 .unwrap();
             let mut proof = witness.clone();
             match fault {
+                "valid-1.8.21" | "valid-1.8.21-target19" | "1.8.21-target20" => {
+                    proof["adapter"] = "kgp-1.8.21-jvm-sdk-options-v1".into();
+                    if fault != "valid-1.8.21" {
+                        proof["arguments"] = serde_json::json!([
+                            "-jvm-target",
+                            if fault == "valid-1.8.21-target19" {
+                                "19"
+                            } else {
+                                "20"
+                            }
+                        ]);
+                    }
+                }
                 "adapter" => proof["adapter"] = "unverified".into(),
                 "task" => proof["task"] = ":different:compileKotlin".into(),
                 "language" => proof["language"] = "java".into(),
                 "home" => proof["java_home"] = "relative-sdk".into(),
                 "target" => proof["arguments"] = serde_json::json!(["-jvm-target", "999"]),
-                "no-jdk" => {
-                    proof["arguments"] = serde_json::json!(["-jvm-target", "17", "-no-jdk"])
-                }
+                "no-jdk" => proof["arguments"] = serde_json::json!(["-jvm-target", "17", "-no-jdk"]),
                 "foreign-jdk" => {
                     proof["arguments"] =
                         serde_json::json!(["-jvm-target", "17", "-jdk-home", root.join("jdk21")])
@@ -3402,8 +3420,7 @@ pub(crate) mod tests {
                     proof["arguments"] = serde_json::json!(["-jvm-target", "17", "@opaque.args"])
                 }
                 "release" => {
-                    proof["arguments"] =
-                        serde_json::json!(["-jvm-target", "17", "-Xjdk-release=1.8"])
+                    proof["arguments"] = serde_json::json!(["-jvm-target", "17", "-Xjdk-release=1.8"])
                 }
                 "extra" => proof["unverified_override"] = true.into(),
                 "type" => task.task_type = "custom.KotlinCompiler".into(),
@@ -3422,7 +3439,7 @@ pub(crate) mod tests {
             let model = ProjectSnapshot::new(vec![module]);
             assert_eq!(
                 model.sdk_api_for_file(&caller).is_some(),
-                fault == "valid",
+                fault.starts_with("valid"),
                 "{fault}"
             );
             assert!(

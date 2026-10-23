@@ -10,7 +10,68 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
+### Slice134/136: ABI output isolation and SDK facts with incomplete dependencies
+
+Two reproduced real-project gaps now have focused fixes. Joint27 passes1804 Rust
+tests,0 failed,10 ignored across42 targets and release build, with576 stable
+guarded inputs. The extra ignored case is the real ABI-plugin test already run
+explicitly with its pinned artifacts, not an unexecuted acceptance claim.
+Immutable binary SHA256:
+`c5b21d9650958b3f32aa9cf69e1a9c6da0a9fb9c183ddca7fb6236ed3a008ceb`.
+
+- Moshi's AtomicInteger failure is a missing selected-SDK fact, not evidence of a
+  broken nominal type algorithm. Its local producer JAR is absent, so classpath
+  snapshot resolution leaves the Kotlin task incomplete. The existing independent
+  SDK adapter only covered KGP1.9.25. The same verified API layout now supports
+  KGP1.8.21, with its actual target enum limit and strict version/tag checks.
+  `moshi-sdk136-genuine-capture1/receipt.json` obtains JDK17 SDK facts from actual
+  Gradle while keeping the producer JAR absent and the full compiler recipe
+  incomplete. All153 tracked source files and Git state remain unchanged. No
+  model JSON is patched. The model key already fingerprints the init script,
+  so changing this adapter invalidates old captured models without a schema bump.
+  Actual KGP ABI evidence is `moshi-sdk136-javap2`;11 focused tests pass in
+  `moshi-sdk136-focused2/receipt.json`. The original shared-edit RED and the
+  distinct6-request causal run remain preserved in
+  `shared-edit135-release25-2/shared-summary.json`.
+  `shared-edit136-release27/m-atomic-distinct1` now receives all6 first responses:
+  5 match, including the original producer-return chain and directly typed
+  AtomicInteger parameter;1 still fails for a fully qualified constructor.
+  The producer JAR remains absent. This proves the independent SDK repair while
+  preserving a separate valid-code constructor-inference gap; it is not6/6 GREEN.
+- The JVM ABI outputDir adapter verifies the selected official2.0.21 compiler/
+  plugin and exact plugin JAR digest. It redirects output into the request's
+  private sibling directory and retains original task arguments/build outputs.
+  `jvm-abi134-green1/receipt.json` passes the actual native-plugin compile and5
+  existing argument-adapter tests. The native case verifies both normal and ABI
+  class output, original-output sentinel bytes, and rejection of changed plugin
+  bytes/version, duplicate outputs, unknown options and unsafe original paths.
+  `jvm-abi134-red1` retains the original unsupported-option failure; provenance
+  is bound in `jvm-abi134-provenance.json`.
+
+Gradle's private source checkout is also running the focused original
+`:problems:compileKotlin` task to restore missing local dependency outputs. This
+does not run the repository-wide build/test task or rewrite tracked sources.
+Published same-commit Gradle JARs used by the independent compiler oracle remain
+separate from genuine focused-build outputs and captured task inputs.
+
+The new Retrofit shared-edit case closes22/22 first responses on accepted26:
+base6, shared14 (including applied whole-buffer rename/reference/retraction),
+and2 diagnostic checks. Valid code has certified empty diagnostics, a missing
+member gives the sole exact error, and fixing the source clears it. Evidence:
+`retrofit-shared136/final-summary.json`; whole-file compiler2 has12 stages with
+expected outcomes, actual ErrorProne/AP/Kotlin scripting options retained. Its
+independent Java oracle is JDK17/release8, not certification of the original
+Gradle Java8 recipe. Official source archive bytes match both real files. An
+initial scripting-artifact hash mismatch was only a non-padded39-digit Gradle
+cache-directory SHA1 versus its40-digit official representation, not evidence
+of changed bytes. The absent derived Retrofit JAR is replaced by the official
+release for the independent oracle; it is not claimed as the captured local
+build output. A portable repository probe is being added; no final IDEA-parity
+claim follows from this selected case.
+
 ### Slice132: named arguments with trailing Unit lambdas
+
+Committed and pushed as754b116; same-path reload tests/documentation are f917d5e.
 
 The shared candidate binder now consumes a trailing lambda only after proving
 the candidate's final parameter is an ordinary, receiver-free `() -> Unit` and
@@ -36,6 +97,12 @@ extension's4 tests and normal build offline/locked with its own unchanged lock.
 This checks the updated Rust call API; the unchanged90 editor probes were not
 repeated after their passing25-2 run. Native build cleanup only terminates
 verified owned MSVC vctip helpers; editor shutdown needs no forced cleanup.
+`processor120/acceptance-release26.json` closes the unchanged KAPT/KSP114 checks
+on this same binary,60 error-free RPCs and four actual compile phases
+(valid0, updated0, intentionally disabled1, restored0). The historical54-check
+subset is audited within this one run rather than repeated. Runtime guards stay
+stable and the LSP exits cleanly with EOF/owned-live0/no forced cleanup. These
+counts cover KAPT/KSP, not Lombok, serialization, all-open or noarg.
 
 This closes the reproduced Function0/Unit slice. Named projected calls involving
 other lambda arities, receiver lambdas or non-Unit results still need proof; an
@@ -59,8 +126,15 @@ oracle now compiles complete Java/Kotlin snapshots using the official8.14.3
 distribution whose embedded commit exactly matches the pinned checkout; the
 retracted producer gives the sole expected missing-member error. This is an
 independent compiler baseline, not the original captured classpath: some local
-project build JARs are absent. Runtime shared-edit and processor acceptance is
-still in progress; do not count unavailable observations as successful diagnosis.
+project build JARs are absent. Runtime shared-edit acceptance remains in progress;
+do not count unavailable observations as successful diagnosis.
+The Gradle run identifies a concrete compiler-policy limit:
+`kotlin-plugin-option-unhandled-at-15` rejects the configured official JVM ABI
+plugin's outputDir option. Supporting that plugin must retain artifact/version
+checks and redirect all outputs privately, rather than ignoring the transform or
+writing to the real project. Moshi's counter-result trace is an unknown receiver;
+member/goto of the newly added producer method succeeds. Determine whether
+unsaved new JDK type demands are admitted before changing type inference.
 
 ### Slice130/131: editor-accepted shared Unknown fixes
 
