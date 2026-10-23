@@ -6,6 +6,7 @@ local probe = dofile(dev .. '/nvim_lsp_probe.lua')
 local root, binary, artifacts = assert(arg[1]), assert(arg[2]), assert(arg[3])
 root, artifacts = vim.fs.normalize(root), vim.fs.normalize(artifacts)
 local automatic_watches = (vim.env.KTLSP_GRADLE_RELOAD_AUTOWATCH or '1') == '1'
+local same_path_replacement = vim.env.KTLSP_GRADLE_RELOAD_SAME_PATH == '1'
 local report = { checks = {}, phases = {}, messages = {}, requests = {}, engine = binary,
   watches = { mode = automatic_watches and 'automatic Neovim' or 'explicit notification control',
     registrations = {}, notifications = {} },
@@ -13,6 +14,10 @@ local report = { checks = {}, phases = {}, messages = {}, requests = {}, engine 
   fixture = { gradle = '9.6.1', kotlin = '2.4.0', module = ':app', project_dir = 'modules/editing',
     artifact_semantics = 'compiled Java binary and published source JAR; no member claims from class-name stubs',
     generated_semantics = 'ordinary Gradle task; compiler-plugin generation is a separate acceptance case' } }
+if same_path_replacement then
+  report.same_path_replacement = { coordinate = 'fixture.reload:versioned:1.0',
+    scope = 'same binary/source archive absolute paths and dependency configuration; initial build then update phase 2' }
+end
 local function save()
   vim.fn.writefile({ vim.json.encode(report) }, artifacts .. '/gradle-reload.json')
 end
@@ -69,6 +74,7 @@ local function build(phase)
 end
 
 fixture.write(root, repo)
+if same_path_replacement then fixture.phase(root, 1) end
 if not build(0) then vim.cmd('cquit 1'); return end
 
 local module = root .. '/modules/editing'
@@ -427,11 +433,44 @@ local function clean_current_diagnostics(phase)
   end
 end
 
-for phase = 1, 3 do
+local function same_path_snapshot(label)
+  local snapshot, contents = {}, {}
+  local base = root .. '/home/.m2/repository/fixture/reload/versioned/1.0/versioned-1.0'
+  for name, suffix in pairs({ binary = '.jar', sources = '-sources.jar' }) do
+    local path = base .. suffix
+    local copy = artifacts .. '/same-path-' .. label .. '-' .. name .. '.jar'
+    local file = assert(io.open(path, 'rb'))
+    contents[name] = file:read('*a'); file:close()
+    local stat = assert(vim.uv.fs_stat(path))
+    assert(vim.uv.fs_copyfile(path, copy))
+    snapshot[name] = { path = path, copy = copy, bytes = #contents[name], mtime = stat.mtime }
+  end
+  local configuration = assert(io.open(module .. '/build.gradle', 'rb'))
+  snapshot.dependency_configuration = configuration:read('*a'); configuration:close()
+  return snapshot, contents
+end
+local phases = same_path_replacement and { 2 } or { 1, 2, 3 }
+for _, phase in ipairs(phases) do
   report.current_phase = phase
   local before = read_refresh_state()
+  local previous_contents
+  if same_path_replacement then
+    report.same_path_replacement.before, previous_contents = same_path_snapshot('before')
+    save()
+  end
   fixture.phase(root, phase)
   if not build(phase) then break end
+  if same_path_replacement then
+    local current_contents
+    report.same_path_replacement.after, current_contents = same_path_snapshot('after')
+    check('same path dependency configuration bytes unchanged',
+      report.same_path_replacement.before.dependency_configuration == report.same_path_replacement.after.dependency_configuration)
+    for _, name in ipairs({ 'binary', 'sources' }) do
+      check('same path ' .. name .. ' archive bytes changed after actual build',
+        report.same_path_replacement.before[name].path == report.same_path_replacement.after[name].path
+          and previous_contents[name] ~= current_contents[name], report.same_path_replacement)
+    end
+  end
   watch(phase)
   report.phases[#report.phases].analysis_updated = wait_refresh(before, wait_ms)
   if phase == 1 then
@@ -449,11 +488,18 @@ for phase = 1, 3 do
   elseif phase == 2 then
     for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
       local useful = has(buffer, 'versioned.newApi()', 'newApi')
-      check('updated ' .. label .. ' v2 new member completion', useful)
+      local updated = same_path_replacement and 'same-path rebuilt' or 'v2'
+      check('updated ' .. label .. ' ' .. updated .. ' new member completion', useful)
       check('updated ' .. label .. ' v1 member removed', report.established[label].oldApi.completion
         and not has(buffer, 'versioned.oldApi()', 'oldApi'))
-      local ok, locations = exact_goto(buffer, 'versioned.newApi()', 'newApi', '/fixture.reload/versioned/2.0/vendor/Versioned.java')
-      check('updated ' .. label .. ' goto exact v2 source declaration', ok, locations)
+      local version = same_path_replacement and '1.0' or '2.0'
+      local ok, locations = exact_goto(buffer, 'versioned.newApi()', 'newApi', '/fixture.reload/versioned/' .. version .. '/vendor/Versioned.java')
+      check('updated ' .. label .. ' goto exact ' .. updated .. ' source declaration', ok, locations)
+      if same_path_replacement then
+        local old = go(buffer, 'versioned.oldApi()', 'oldApi')
+        check('updated ' .. label .. ' same-path old member goto removed',
+          report.established[label].oldApi.goto_definition and #old == 0, old)
+      end
       report.established[label].newApi = { completion = useful, goto_definition = ok }
       local diagnostic, observation
       if label == 'Kotlin' then
@@ -479,7 +525,7 @@ for phase = 1, 3 do
       end
       check('updated ' .. label .. ' stale member has a diagnostic', found, diagnostic, observation)
     end
-    check_kotlin_metadata(2, '2.0')
+    check_kotlin_metadata(2, same_path_replacement and '1.0' or '2.0')
   else
     for label, buffer in pairs({ Java = java, Kotlin = kotlin }) do
       for _, item in ipairs({ { 'versioned.oldApi()', 'oldApi' }, { 'versioned.newApi()', 'newApi' },
@@ -522,10 +568,14 @@ public class NativeJavacCertificate {
         /* 日本語😀 */ return known + peer;
     }
 }]]
-local bad = good:gsub('return known %+ peer;', 'return known + peer + new String("x").missingJavacCertificateMethod();', 1)
+local error_receiver, error_member = 'new String("x")', 'missingJavacCertificateMethod'
+local bad = good:gsub('return known %+ peer;',
+  'return known + peer + ' .. error_receiver .. '.' .. error_member .. '();', 1)
 local _, expected = probe.find(vim.split(bad, '\n', { plain = true }),
-  'new String("x").missingJavacCertificateMethod()', 'missingJavacCertificateMethod')
-assert(vim.deep_equal(expected, { start = { line = 6, character = 58 }, ['end'] = { line = 6, character = 87 } }))
+  error_receiver .. '.' .. error_member .. '()', error_member)
+local expected_start = 58
+assert(vim.deep_equal(expected, { start = { line = 6, character = expected_start },
+  ['end'] = { line = 6, character = expected_start + #error_member } }))
 local native_path = module .. '/src/main/java/app/NativeJavacCertificate.java'
 assert(vim.fn.filereadable(native_path) == 0)
 local native = open('src/main/java/app/NativeJavacCertificate.java', 'java', good)
@@ -545,7 +595,7 @@ report.native_java = { expected_range = expected, positive = { result = positive
 local errors = vim.tbl_filter(function(item) return item.severity == 1 end, positive and positive.items or {})
 check('new Java one canonical Javac body error has exact Unicode token range', observed.canonical_certified
   and observed.accepted.count == 1 and #errors == 1 and errors[1].code ~= 'unresolved_reference'
-  and errors[1].message:find('missingJavacCertificateMethod', 1, true) ~= nil
+    and errors[1].message:find(error_member, 1, true) ~= nil
   and vim.deep_equal(errors[1].range, expected), positive, observed)
 local _, finish = probe.observe_diagnostics(client, native)
 vim.api.nvim_buf_set_lines(native, 0, -1, false, vim.split(good, '\n', { plain = true }))

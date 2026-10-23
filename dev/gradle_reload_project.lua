@@ -109,7 +109,12 @@ end
 function M.phase(root, phase)
   assert(phase >= 0 and phase <= 3)
   write(root .. '/phase.txt', tostring(phase))
-  local version = phase < 2 and '1.0' or '2.0'
+  local same_path = vim.env.KTLSP_GRADLE_RELOAD_SAME_PATH == '1'
+  local version = (phase < 2 or same_path) and '1.0' or '2.0'
+  if same_path and phase == 2 then
+    write(root .. '/build/fixture-src/V1/vendor/Versioned.java',
+      'package vendor;\n\npublic class Versioned {\n    public int newApi() { return 7; }\n}\n')
+  end
   local deps = phase == 3 and '' or "    implementation 'fixture.reload:versioned:" .. version .. "'\n"
   if phase == 1 or phase == 2 then deps = deps .. "    implementation 'fixture.reload:added:1.0'\n" end
   write(root .. '/modules/editing/build.gradle', [=[plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0'; id 'java' }

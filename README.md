@@ -591,6 +591,10 @@ The same editor connection checks useful completion, exact definitions, diagnost
 unsaved Kotlin changes. Removal requires a previously useful result. The fixture remaps `:app`
 to `modules/editing`; it requires its generated project, so omit `--root`. Results and build logs
 are recorded in `artifacts/gradle-reload.json` and `artifacts/gradle-phase*-compile.out`.
+Add `KTLSP_GRADLE_RELOAD_SAME_PATH=1` to run two offline builds which replace the
+same dependency binary/source JAR paths without changing the dependency configuration.
+This checks new-member completion and exact navigation, removal of the old API,
+current diagnostics and preservation of unsaved buffers.
 The probe waits for the latest requested analysis generation's accepted finish in the trace,
 then checks each completion and definition once. Readiness failures remain separate from semantic results.
 After the reload checks, valid unsaved Kotlin and a new Java buffer exercise one canonical Javac

@@ -12,13 +12,13 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ### Slice130/131: shared Unknown fixes; release editor replay in progress
 
-Last published implementation remains f7fd11d, with the accepted24-2 binary below.
-The working tree now passes the full workspace suite and release build in
+Implementation5d1de80 is committed and pushed. It passes the full workspace suite and release build in
 `native-integrated120-25-2`:1804 PASS/0 FAIL/9 ignored across42 targets.
 All576 source guards are stable. The immutable release binary SHA256 is
 `0a4ee2c376aeeec66ceaaa3769fddb5d0b94112bfa19bf410bcbeb74413ac4b0`.
-Same-release editor acceptance remains in progress; these Rust results do not
-establish that the28 previously missing editor results are fixed.
+Same-release editor evidence for the repaired28 results, CEM and all five
+additional projects is recorded below. Selected passing cases do not establish
+IDEA parity or complete valid-code coverage.
 `joint-unknown130-focused5` closes with7 passing focused tests (interop4, core2,
 namespace1). Subsequent compiler evidence exposes Kotlin class-first JVM erasure
 for interface-before-class source bounds, so that result is not final acceptance
@@ -33,8 +33,8 @@ pass in the16-check focused regression run and the full25-2 workspace suite.
 The hierarchy change only equates raw-provenance differences for proven nongeneric
 declarations, retaining uncertainty for generic and unproven owners. Java class
 literals are independently Javac-certified as Class<raw Box>, including raw array
-components. The optional field remains unknown when absent. Next replay the
-unchanged controlled32 editor requests and the CEM/five-project acceptance cases.
+components. The optional field remains unknown when absent. The unchanged
+controlled32 editor requests and CEM/five-project acceptance cases now pass.
 
 | Case | Independent expectation / observed / next action |
 | --- | --- |
@@ -85,9 +85,12 @@ Other same25-2 evidence now closed:
   shutdown/EOF/owned-live0. Actual upstream Mixin annotation inputs also compile
   with Javac and Kotlin. This is an independently compiled test extension, not a
   production Mixin implementation or a claim of a stable binary plugin ABI.
-- Five-project replay remains in progress; Gradle/Moshi18 and OkHttp/Retrofit22
-  first responses pass, with Spring still pending. Source-coverage failures remain
-  separate from selected semantic success.
+- `final-corpus120-25-2/summary50.json`:all50 selected normal/incomplete requests
+  across Gradle, Moshi, OkHttp, Retrofit and Spring pass on their first responses;
+  no mismatch, unmeasured or pending result. All servers close normally with
+  stable input guards. Source-coverage failures remain separate: Gradle10 failed
+  source artifacts/38 missing, Moshi0/2, OkHttp0/0, Retrofit6/9 and Spring11/19.
+  These results do not certify every source or binary API in each repository.
 
 Next reproduced valid-code gap: `named-tail132-inputs/compiler-receipt.json`
 certifies `shapes.tail(second=right,first=left) {}.service()` with Kotlin2.4.
@@ -95,6 +98,25 @@ certifies `shapes.tail(second=right,first=left) {}.service()` with Kotlin2.4.
 known receiver completion/exact-goto controls pass, but both trailing-lambda
 result requests return null. Fix shared argument binding after this checkpoint;
 do not treat this valid call as a passing Unknown negative.
+
+### Same-path dependency reload acceptance on25-2
+
+The opt-in `KTLSP_GRADLE_RELOAD_SAME_PATH=1` case now closes47/47 assertions and
+23 first requests in `same-path133-release25-2/{receipt,state-proof}.json`.
+Two actual offline builds replace the same binary/source archive paths while
+dependency configuration bytes remain identical. Both languages expose the new
+API and exact source declaration, withdraw the old completion/goto, diagnose old
+API uses and preserve dirty buffers. The latest model generation is accepted.
+The unchanged ordinary versioned case also passes90/90 assertions,61 first
+requests and four builds in `gradle-reload133-release25-2/{receipt,summary}.json`.
+Both runs close with clean shutdown/EOF/owned-live0 and stable input guards.
+
+The original same-path131 result below remains46 PASS/1 unmeasured: its last
+independent native-Javac certificate had unnecessarily switched the existing
+String control to an external dependency receiver. The corrected probe keeps
+the original String certificate for both modes; all dependency-specific old/new
+API and diagnostic assertions remain required. No product diagnostic-admission
+expansion or relaxed dependency expectation was used to make the run pass.
 
 Additional same24-2 checks now complete:
 
