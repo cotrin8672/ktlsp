@@ -745,6 +745,35 @@ fn jar_fingerprint(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+pub(crate) fn file_content_digest(path: &Path) -> Option<[u8; 32]> {
+    let mut file = fs::File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file() {
+        return None;
+    }
+    let modified = before.modified().ok()?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let len = file.read(&mut buffer).ok()?;
+        if len == 0 {
+            break;
+        }
+        hash.update(&buffer[..len]);
+        bytes += len as u64;
+    }
+    for after in [file.metadata().ok()?, fs::metadata(path).ok()?] {
+        if bytes != before.len()
+            || after.len() != before.len()
+            || after.modified().ok()? != modified
+        {
+            return None;
+        }
+    }
+    Some(hash.finalize().into())
+}
+
 fn symcache_load(fingerprint: &str, source_dir: &Path) -> Option<Vec<FileSymbols>> {
     symcache_load_file(
         &symcache_dir().join(format!("{fingerprint}.zst")),
@@ -1387,11 +1416,13 @@ pub fn resolve_local_jar_stubs_for_origin(
             jar_path.display()
         );
     }
+    let content = file_content_digest(jar_path).context("read stable local artifact content")?;
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    // Binary stubs without hierarchy and shadow facts must miss.
-    hasher.update(b"|local-jar-java-members-v8|");
+    // Mutable local archives may preserve both size and modification time.
+    hasher.update(b"|local-jar-java-members-v9|");
     hasher.update(origin_id.as_bytes());
+    hasher.update(content);
     let fingerprint = format!("{:x}", hasher.finalize());
     let (mut batches, representation) = if let Some(sources) =
         crate::classpath::adjacent_sources_jar(jar_path).filter(|sources| sources.is_file())
@@ -1409,11 +1440,21 @@ pub fn resolve_local_jar_stubs_for_origin(
         )
     } else {
         (
-            resolve_local_jar_stubs_unowned(jar_path, extract_root, &fingerprint, kotlin, java)?,
+            resolve_local_jar_stubs_unowned(
+                jar_path,
+                extract_root,
+                &fingerprint,
+                kotlin,
+                java,
+                &|| file_content_digest(jar_path) == Some(content),
+            )?,
             SourceRepresentation::Stub,
         )
     };
-    if crate::classpath::file_origin_id(jar_path) != origin_id {
+    if crate::classpath::file_origin_id(jar_path) != origin_id
+        || representation == SourceRepresentation::Source
+            && file_content_digest(jar_path) != Some(content)
+    {
         anyhow::bail!(
             "local artifact {} changed while indexing",
             jar_path.display()
@@ -1458,8 +1499,14 @@ pub(crate) fn resolve_module_binary_stubs(
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
-    let mut batches =
-        resolve_local_jar_stubs_unowned(jar_path, extract_root, &fingerprint, kotlin, java)?;
+    let mut batches = resolve_local_jar_stubs_unowned(
+        jar_path,
+        extract_root,
+        &fingerprint,
+        kotlin,
+        java,
+        &|| true,
+    )?;
     anyhow::ensure!(
         crate::classpath::file_origin_id(jar_path) == *expected_origin,
         "selected module artifact changed while indexing: {}",
@@ -1486,6 +1533,7 @@ fn resolve_local_jar_stubs_unowned(
     fingerprint: &str,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<FileSymbols>> {
     if !jar_path.is_file() {
         anyhow::bail!("local artifact {} is missing", jar_path.display());
@@ -1493,6 +1541,10 @@ fn resolve_local_jar_stubs_unowned(
     let dest = extract_root.join("local-jars").join(&fingerprint);
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
+        anyhow::ensure!(
+            current(),
+            "binary artifact changed while loading cached symbols"
+        );
         return Ok(cached);
     }
 
@@ -1519,7 +1571,10 @@ fn resolve_local_jar_stubs_unowned(
         }
         Ok(())
     })?;
-    anyhow::ensure!(marker.current(), "binary artifact changed while indexing");
+    anyhow::ensure!(
+        marker.current() && current(),
+        "binary artifact changed while indexing"
+    );
     symcache_store(&fingerprint, &symbols);
     Ok(symbols)
 }
@@ -4506,7 +4561,7 @@ public class ParameterUse<Iterable> {
             (
                 false,
                 origin.as_str(),
-                b"|local-jar-java-members-v8|".as_slice(),
+                b"|local-jar-java-members-v9|".as_slice(),
             ),
             (
                 true,
@@ -4521,6 +4576,8 @@ public class ParameterUse<Iterable> {
             if is_module {
                 hasher.update(b"|");
                 hasher.update(origin.as_bytes());
+            } else {
+                hasher.update(file_content_digest(&jar).unwrap());
             }
             let fingerprint = format!("{:x}", hasher.finalize());
             let extract = root.join(if is_module { "module" } else { "local" });
@@ -4964,6 +5021,8 @@ public class ParameterUse<Iterable> {
                 if is_module {
                     hash.update(b"|");
                     hash.update(binary_origin.as_bytes());
+                } else if version == 9 {
+                    hash.update(file_content_digest(&jar).unwrap());
                 }
                 format!("{:x}", hash.finalize())
             };
@@ -4973,7 +5032,7 @@ public class ParameterUse<Iterable> {
                 symcache_load(&old_key, &legacy_dir).is_some(),
                 "legacy placeholder cache must exist"
             );
-            let current_key = fingerprint(8);
+            let current_key = fingerprint(if is_module { 8 } else { 9 });
             let dest = extract.join("local-jars").join(&current_key);
             let cache = symcache_dir().join(format!("{current_key}.zst"));
             for warm in [false, true] {
@@ -5131,13 +5190,16 @@ public class ParameterUse<Iterable> {
             hash.update(if module {
                 b"|module-jar-java-members-v8|".as_slice()
             } else {
-                b"|local-jar-java-members-v8|".as_slice()
+                b"|local-jar-java-members-v9|".as_slice()
             });
             if module {
                 hash.update(crate::classpath::maven_origin_id(&coord).as_bytes());
                 hash.update(b"|");
             }
             hash.update(origin.as_bytes());
+            if !module {
+                hash.update(file_content_digest(&jar).unwrap());
+            }
             let fingerprint = format!("{:x}", hash.finalize());
             let cache = symcache_dir().join(format!("{fingerprint}.zst"));
             let destination = extract.join("local-jars").join(&fingerprint);
@@ -5639,12 +5701,14 @@ public class ParameterUse<Iterable> {
             hash.update(if is_module {
                 b"|module-jar-java-members-v8|".as_slice()
             } else {
-                b"|local-jar-java-members-v8|".as_slice()
+                b"|local-jar-java-members-v9|".as_slice()
             });
             hash.update(owner.as_bytes());
             if is_module {
                 hash.update(b"|");
                 hash.update(binary_origin.as_bytes());
+            } else {
+                hash.update(file_content_digest(&jar).unwrap());
             }
             let fingerprint = format!("{:x}", hash.finalize());
             let extract = root.join(if is_module { "module" } else { "local" });

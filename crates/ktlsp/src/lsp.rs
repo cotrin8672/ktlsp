@@ -21,6 +21,7 @@ use tower_lsp_server::{Client, LanguageServer};
 
 use crate::classpath;
 use crate::complete::ShapedItem;
+use crate::deps::file_content_digest as configuration_content;
 use crate::diagnostics::Severity;
 use crate::format::FormatterConfig;
 use crate::hierarchy::HierarchyItem;
@@ -188,10 +189,16 @@ impl Backend {
     }
 
     fn schedule_project_refresh(&self, force: bool, initial_delay: Duration) {
-        self.request_project_refresh(force, initial_delay, false);
+        self.request_project_refresh(force, initial_delay, false, &[]);
     }
 
-    fn request_project_refresh(&self, force: bool, initial_delay: Duration, jar_only: bool) {
+    fn request_project_refresh(
+        &self,
+        force: bool,
+        initial_delay: Duration,
+        jar_only: bool,
+        retired_origins: &[String],
+    ) {
         let Some(root) = self.root.lock().clone() else {
             return;
         };
@@ -199,16 +206,14 @@ impl Backend {
         if state.stopped {
             return;
         }
-        let defer = {
+        let (defer, coalesced) = {
             let mut watches = self.watches.lock();
             if jar_only && watches.model_loading {
-                if watches.pending_model_jar {
-                    return;
-                }
+                let coalesced = watches.pending_model_jar;
                 watches.pending_model_jar = true;
-                true
+                (true, coalesced)
             } else {
-                false
+                (false, false)
             }
         };
         // Gradle may recreate build-logic JARs while importing its own model. Retain
@@ -222,19 +227,28 @@ impl Backend {
         }
         let changed = {
             let mut ws = self.ws.lock();
-            state.requested = ws.begin_analysis_generation();
-            crate::trace::span(
-                "workspace.refresh_requested",
-                "workspace",
-                Instant::now(),
-                serde_json::json!({"root": root.to_string_lossy(), "generation": state.requested,
-                    "deferredJar": defer}),
-            );
-            self.jdk_source_seeds.lock().clear();
+            if !coalesced {
+                state.requested = ws.begin_analysis_generation();
+                crate::trace::span(
+                    "workspace.refresh_requested",
+                    "workspace",
+                    Instant::now(),
+                    serde_json::json!({"root": root.to_string_lossy(), "generation": state.requested,
+                        "deferredJar": defer}),
+                );
+                self.jdk_source_seeds.lock().clear();
+            }
+            // Retire under the generation lock so an old worker cannot restore completion.
+            for origin in retired_origins {
+                ws.retire_dependency_origin(origin);
+            }
             ws.take_extension_diagnostic_changes()
         };
         for key in changed {
             self.schedule_one_diagnostic(key);
+        }
+        if coalesced {
+            return;
         }
         state.force |= force;
         if state.running {
@@ -1912,13 +1926,10 @@ async fn index_workspace(
     let index_root = root.clone();
     let deps_start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
-        // Fingerprint only the model's selected local archives, before reading their
-        // semantic inputs. A post-index fingerprint alone could accept a replacement
+        // Fingerprint selected mutable archives and the tracked inventory before indexing.
+        // A post-index fingerprint alone could accept a replacement
         // whose new bytes were never read by this generation.
-        let archive_contents = model
-            .as_deref()
-            .map(model_archive_contents)
-            .unwrap_or_default();
+        let archive_contents = project_archive_contents(&index_root, model.as_deref());
         let stats = index_dependencies(
             &index_ws,
             &index_root,
@@ -1930,9 +1941,7 @@ async fn index_workspace(
         );
         let archive_contents = archive_contents
             .into_iter()
-            .filter(|(key, before)| {
-                configuration_content(Path::new(key)).as_ref() == Some(before)
-            })
+            .filter(|(key, before)| configuration_content(Path::new(key)).as_ref() == Some(before))
             .collect();
         (stats, archive_contents)
     });
@@ -2311,42 +2320,50 @@ fn is_project_configuration(file: &Path) -> bool {
         || is_gradle_wrapper(file)
 }
 
-fn configuration_content(path: &Path) -> Option<[u8; 32]> {
-    use sha2::Digest;
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let before = file.metadata().ok()?;
-    if !before.is_file() {
-        return None;
-    }
-    let modified = before.modified().ok()?;
-    let mut hash = sha2::Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut bytes = 0_u64;
-    loop {
-        let len = file.read(&mut buffer).ok()?;
-        if len == 0 {
-            break;
-        }
-        hash.update(&buffer[..len]);
-        bytes += len as u64;
-    }
-    for after in [file.metadata().ok()?, std::fs::metadata(path).ok()?] {
-        if bytes != before.len()
-            || after.len() != before.len()
-            || after.modified().ok()? != modified
-        {
-            return None;
-        }
-    }
-    Some(hash.finalize().into())
+fn model_archive_origins(model: &classpath::ProjectSnapshot) -> HashMap<String, String> {
+    let local_jars = model.local_jars();
+    let project_jars = model
+        .modules
+        .iter()
+        .flat_map(|module| &module.source_sets)
+        .flat_map(|source| &source.artifacts)
+        .filter(|artifact| matches!(artifact.component, classpath::ComponentId::Project { .. }))
+        .map(|artifact| &artifact.path);
+    local_jars
+        .iter()
+        .chain(project_jars)
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jar"))
+        .map(|path| crate::paths::file_key(path))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|key| {
+            let origin = model.artifact_origin(Path::new(&key))?.to_string();
+            Some((key, origin))
+        })
+        .collect()
 }
 
-fn model_archive_contents(model: &classpath::ProjectSnapshot) -> HashMap<String, [u8; 32]> {
-    model
-        .local_jars()
-        .into_iter()
-        .filter_map(|path| Some((crate::paths::file_key(&path), configuration_content(&path)?)))
+fn project_archive_contents(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+) -> HashMap<String, [u8; 32]> {
+    let mut keys: std::collections::BTreeSet<_> = model
+        .map(model_archive_origins)
+        .unwrap_or_default()
+        .into_keys()
+        .collect();
+    keys.extend(
+        crate::workspace::git_tracked_project_files(root, &["*.jar"])
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| crate::paths::file_key(&path)),
+    );
+    keys.into_iter()
+        .filter(|key| !is_project_configuration(Path::new(key)))
+        .filter_map(|key| {
+            let content = configuration_content(Path::new(&key))?;
+            Some((key, content))
+        })
         .collect()
 }
 
@@ -2952,6 +2969,11 @@ impl LanguageServer for Backend {
             .await
             .unwrap_or_default()
         };
+        let archive_origins = model
+            .as_deref()
+            .map(model_archive_origins)
+            .unwrap_or_default();
+        let mut retired_origins = std::collections::BTreeSet::new();
         let mut jar_only = true;
         let changes = {
             let mut ws = self.ws.lock();
@@ -2972,6 +2994,9 @@ impl LanguageServer for Backend {
                 .map(|key| {
                     let change = project_change(&root, model.as_deref(), &key);
                     if change.is_some() {
+                        if let Some(origin) = archive_origins.get(&key) {
+                            retired_origins.insert(origin.clone());
+                        }
                         jar_only &= key.ends_with(".jar")
                             && !is_project_configuration(Path::new(&key));
                         tracing::debug!(path = key, force = ?change, "project refresh requested by client watch");
@@ -2986,7 +3011,12 @@ impl LanguageServer for Backend {
         }
         let force = project_changes(changes.into_iter());
         if let Some(force) = force {
-            self.request_project_refresh(force, PROJECT_REFRESH_DEBOUNCE, jar_only);
+            self.request_project_refresh(
+                force,
+                PROJECT_REFRESH_DEBOUNCE,
+                jar_only,
+                &retired_origins.into_iter().collect::<Vec<_>>(),
+            );
         }
     }
 
@@ -7470,32 +7500,227 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
     }
 
     #[tokio::test]
-    async fn unchanged_selected_binary_jar_watch_does_not_force_model_reload() {
+    async fn selected_local_jar_same_metadata_replacement_retires_warm_semantics() {
+        use std::io::Write;
         let root = std::env::temp_dir().join(format!(
-            "ktlsp_unchanged_binary_jar_watch_{}",
-            std::process::id()
+            "ktlsp_same_metadata_local_jar_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
         let binary = root.join("dependency.jar");
-        std::fs::write(&binary, b"accepted binary").unwrap();
-        let key = crate::paths::file_key(&binary);
-        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
-            "PROJECT\t:app\t{}\nSCP\tmain\t{key}\nEND\t:app\n",
-            crate::paths::file_key(&root)
+        let original =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class");
+        let mut replacement = original.to_vec();
+        for (old, new) in [(b"LABEL", b"TITLE"), (b"count", b"total")] {
+            let offset = replacement
+                .windows(old.len())
+                .position(|part| part == old)
+                .unwrap();
+            replacement[offset..offset + old.len()].copy_from_slice(new);
+        }
+        let decoded = ktcore::classfile::decode("replacement", &replacement).unwrap();
+        assert!(decoded
+            .fields
+            .iter()
+            .any(|field| field.name.as_ref() == "TITLE"));
+        assert!(decoded
+            .fields
+            .iter()
+            .any(|field| field.name.as_ref() == "total"));
+        let write = |bytes: &[u8]| {
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+            archive
+                .start_file(
+                    "fieldfixture/FieldOnly.class",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+            archive.finish().unwrap();
+        };
+        write(original);
+        let metadata = std::fs::metadata(&binary).unwrap();
+        let modified = metadata.modified().unwrap();
+        let dump = format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nEND\t:app\n",
+            root.display(),
+            root.display(),
+            binary.display()
+        );
+        let model = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(
+            &dump,
         )));
+        let origin = model.artifact_origin(&binary).unwrap().to_string();
         let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
         drop(socket);
         let backend = service.inner();
         *backend.root.lock() = Some(root.clone());
         *backend.gradle_project.lock() = true;
-        let contents = model_archive_contents(&model);
-        assert_eq!(
-            contents.len(),
-            1,
-            "the accepted model seeds the first event"
+        // Drive the model/index phases explicitly instead of launching Gradle in this fixture.
+        backend.refresh.lock().running = true;
+        backend.watches.lock().archive_contents = project_archive_contents(&root, Some(&model));
+        backend.ws.lock().set_project_model(model.clone());
+        let generation = backend.ws.lock().analysis_generation();
+        let cold = index_dependency_model(
+            &backend.ws,
+            &root,
+            Some(model.clone()),
+            true,
+            generation,
+            None,
+            true,
         );
-        backend.watches.lock().archive_contents = contents.clone();
-        let initial = backend.refresh.lock().requested;
+        assert_eq!(cold.failed, 0);
+        assert_eq!(cold.local_stub_files, 1);
+        assert!(backend.ws.lock().dependency_origin_complete(&origin));
+        let old_files: Vec<_> = backend
+            .ws
+            .lock()
+            .index
+            .file_origins()
+            .filter(|(_, owner)| owner.origin_id == origin)
+            .map(|(key, _)| key.to_string())
+            .collect();
+        assert_eq!(old_files.len(), 1);
+        let extract = crate::deps::extract_root();
+        let fingerprint = Path::new(&old_files[0])
+            .strip_prefix(extract.join("local-jars"))
+            .unwrap()
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_owned();
+        let old_cache = extract
+            .parent()
+            .unwrap()
+            .join("symcache")
+            .join(format!("{}.zst", fingerprint.to_string_lossy()));
+        let cache_bytes =
+            std::fs::read(&old_cache).expect("cold indexing must persist its real symbol cache");
+        let cache_modified = std::fs::metadata(&old_cache).unwrap().modified().unwrap();
+        let mut kotlin = crate::parser::KotlinParser::new();
+        let mut java = crate::java::JavaParser::new();
+        let warm = crate::deps::resolve_local_jar_stubs_for_origin(
+            &binary,
+            &origin,
+            &extract,
+            &mut kotlin,
+            &mut java,
+        )
+        .unwrap();
+        assert!(warm
+            .iter()
+            .flat_map(|batch| &batch.symbols)
+            .any(|symbol| symbol.name == "count"));
+        assert_eq!(
+            std::fs::metadata(&old_cache).unwrap().modified().unwrap(),
+            cache_modified,
+            "warm resolution must load the existing disk cache"
+        );
+        let probes = [
+            (
+                "Value.java",
+                "import fieldfixture.FieldOnly; class Use { void f(FieldOnly value) { value.; } }",
+                "value.",
+                "count",
+                "total",
+            ),
+            (
+                "Value.kt",
+                "import fieldfixture.FieldOnly\nfun use(value: FieldOnly) { value. }",
+                "value.",
+                "count",
+                "total",
+            ),
+            (
+                "Static.java",
+                "import fieldfixture.FieldOnly; class Use { void f() { FieldOnly.; } }",
+                "FieldOnly.",
+                "LABEL",
+                "TITLE",
+            ),
+            (
+                "Static.kt",
+                "import fieldfixture.FieldOnly\nfun use() { FieldOnly. }",
+                "FieldOnly.",
+                "LABEL",
+                "TITLE",
+            ),
+        ];
+        for (file, source, ..) in probes {
+            backend
+                .ws
+                .lock()
+                .open(&crate::paths::file_key(&root.join(file)), source.into());
+        }
+        let check = |updated: bool| {
+            for (file, source, needle, old, new) in probes {
+                let key = crate::paths::file_key(&root.join(file));
+                let query = backend
+                    .ws
+                    .lock()
+                    .completion_query(&key, source.find(needle).unwrap() + needle.len())
+                    .unwrap();
+                let labels: Vec<_> = query
+                    .candidates
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect();
+                let (present, absent) = if updated { (new, old) } else { (old, new) };
+                assert!(
+                    labels.contains(&present),
+                    "{file}: missing {present}: {labels:?}"
+                );
+                assert!(
+                    !labels.contains(&absent),
+                    "{file}: stale {absent}: {labels:?}"
+                );
+                assert_eq!(backend.ws.lock().doc_text(&key).as_deref(), Some(source));
+            }
+        };
+        check(false);
+        write(&replacement);
+        std::fs::File::options()
+            .write(true)
+            .open(&binary)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&binary).unwrap().len(), metadata.len());
+        assert_eq!(
+            std::fs::metadata(&binary).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(classpath::file_origin_id(&binary), origin);
+        for _ in 0..2 {
+            let batches = crate::deps::resolve_local_jar_stubs_for_origin(
+                &binary,
+                &origin,
+                &extract,
+                &mut kotlin,
+                &mut java,
+            )
+            .unwrap();
+            let names: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| &batch.symbols)
+                .map(|symbol| symbol.name.as_str())
+                .collect();
+            assert!(
+                names.contains(&"TITLE") && names.contains(&"total"),
+                "replaced archive reused stale disk facts: {names:?}"
+            );
+            assert!(
+                !names.contains(&"LABEL") && !names.contains(&"count"),
+                "stale disk members: {names:?}"
+            );
+        }
         backend
             .did_change_watched_files(DidChangeWatchedFilesParams {
                 changes: vec![FileEvent::new(
@@ -7504,54 +7729,349 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 )],
             })
             .await;
-        assert_eq!(
-            backend.refresh.lock().requested,
-            initial,
-            "an unchanged selected JAR must not cancel editing or restart Gradle"
-        );
-        let modified = std::fs::metadata(&binary).unwrap().modified().unwrap();
-        std::fs::write(&binary, b"replaced binary").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&binary)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-        assert_eq!(std::fs::metadata(&binary).unwrap().len(), 15);
-        assert_eq!(
-            std::fs::metadata(&binary).unwrap().modified().unwrap(),
-            modified
-        );
         assert!(
-            !unchanged_archive(&contents, &key, FileChangeType::CHANGED),
-            "same-size, same-mtime replacement must refresh"
+            !backend.ws.lock().dependency_origin_complete(&origin),
+            "watch must retire completed memory facts"
         );
-        assert_eq!(project_change(&root, Some(&model), &key), Some(true));
-        let replacement = model_archive_contents(&model);
-        assert!(unchanged_archive(
-            &replacement,
-            &key,
-            FileChangeType::CHANGED
-        ));
-        for kind in [FileChangeType::CREATED, FileChangeType::DELETED] {
-            assert!(!unchanged_archive(&replacement, &key, kind));
+        for file in &old_files {
+            assert!(
+                backend.ws.lock().index.entries_for_file(file).is_empty(),
+                "old archive members survived: {file}"
+            );
+            assert!(backend.ws.lock().index.file_origin(file).is_none());
         }
-        std::fs::remove_file(&binary).unwrap();
-        assert!(!unchanged_archive(
-            &replacement,
-            &key,
-            FileChangeType::CHANGED
-        ));
-        assert!(!unchanged_archive(
-            &replacement,
-            &key,
-            FileChangeType::DELETED
-        ));
-        std::fs::write(&binary, b"replaced binary").unwrap();
-        assert!(
-            !unchanged_archive(&HashMap::new(), &key, FileChangeType::CHANGED),
-            "a new, unbaselined archive cannot hide its first event"
+        let refreshed = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(
+            &dump,
+        )));
+        assert_eq!(refreshed.artifact_origin(&binary), Some(origin.as_str()));
+        backend.ws.lock().set_project_model(refreshed.clone());
+        let generation = backend.ws.lock().analysis_generation();
+        let refreshed_stats = index_dependency_model(
+            &backend.ws,
+            &root,
+            Some(refreshed.clone()),
+            true,
+            generation,
+            None,
+            true,
         );
+        assert_eq!(refreshed_stats.failed, 0);
+        assert_eq!(refreshed_stats.reused_local_jars, 0);
+        assert_eq!(refreshed_stats.local_stub_files, 1);
+        assert!(backend.ws.lock().dependency_origin_complete(&origin));
+        check(true);
+        let warm = index_dependency_model(
+            &backend.ws,
+            &root,
+            Some(refreshed),
+            true,
+            generation,
+            None,
+            true,
+        );
+        assert_eq!(warm.reused_local_jars, 1);
+        assert_eq!(
+            std::fs::read(&old_cache).unwrap(),
+            cache_bytes,
+            "replacement must leave the old cache partition intact"
+        );
+        assert_eq!(
+            std::fs::metadata(&old_cache).unwrap().modified().unwrap(),
+            cache_modified
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchanged_selected_binary_jar_watch_does_not_force_model_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_unchanged_binary_jar_watch_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("dependency.jar");
+        let immutable = root.join("immutable.jar");
+        std::fs::write(&immutable, b"selected Maven artifact").unwrap();
+        let tracked = root.join("docs/tracked.jar");
+        let unknown = root.join("untracked.jar");
+        let wrapper = root.join("gradle/wrapper/gradle-wrapper.jar");
+        std::fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&tracked, b"accepted tracked binary").unwrap();
+        std::fs::write(&unknown, b"unknown existing binary").unwrap();
+        std::fs::write(&wrapper, b"tracked Gradle wrapper").unwrap();
+        std::fs::write(root.join("gradlew"), "wrapper fixture").unwrap();
+        std::fs::write(
+            root.join("settings.gradle"),
+            "rootProject.name = 'watch-fixture'",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "add",
+                "docs/tracked.jar",
+                "gradle/wrapper/gradle-wrapper.jar",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        for project in [false, true] {
+            std::fs::write(&binary, b"accepted binary").unwrap();
+            let key = crate::paths::file_key(&binary);
+            let component = if project {
+                "PROJECT\t:build-logic\t:java-api-extractor"
+            } else {
+                "FILE"
+            };
+            let model = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\t{component}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\timmutable\t1\nSOURCESET\ttest\nSCP\ttest\t{key}\nARTIFACT\ttest\t{key}\t{component}\nEND\t:app\n",
+            crate::paths::file_key(&root), crate::paths::file_key(&root.join("src")),
+            crate::paths::file_key(&immutable), crate::paths::file_key(&immutable),
+        ))));
+            assert_eq!(
+                model.local_jars().len(),
+                usize::from(!project),
+                "Project artifacts keep their own indexing route"
+            );
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            *backend.root.lock() = Some(root.clone());
+            *backend.gradle_project.lock() = true;
+            backend.refresh.lock().running = true;
+            backend.ws.lock().set_project_model(model.clone());
+            let open_key = crate::paths::file_key(&root.join("src/Use.java"));
+            backend
+                .ws
+                .lock()
+                .open(&open_key, "class Use { int unsaved; }".into());
+            let unbaselined = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&tracked).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > unbaselined,
+                "tracked archive without an accepted baseline stays conservative"
+            );
+            let contents = project_archive_contents(&root, Some(&model));
+            assert!(contents.contains_key(&key));
+            for excluded in [&immutable, &unknown, &wrapper] {
+                assert!(
+                    !contents.contains_key(&crate::paths::file_key(excluded)),
+                    "unexpected baseline: {}",
+                    excluded.display()
+                );
+            }
+            backend.watches.lock().archive_contents = contents.clone();
+            let initial = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&binary).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert_eq!(
+                backend.refresh.lock().requested,
+                initial,
+                "an unchanged selected JAR must not cancel editing or restart Gradle"
+            );
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&tracked).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert_eq!(
+                backend.refresh.lock().requested,
+                initial,
+                "unchanged Git-tracked unselected archive must not force import"
+            );
+            assert_eq!(
+                contents.len(),
+                2,
+                "selected paths and tracked inventory must be deduplicated"
+            );
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&unknown).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "untracked existing JAR stays conservative"
+            );
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&wrapper).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "tracked Gradle wrapper stays configuration"
+            );
+            let original_tracked = std::fs::read(&tracked).unwrap();
+            let tracked_modified = std::fs::metadata(&tracked).unwrap().modified().unwrap();
+            std::fs::write(&tracked, b"replaced tracked binary").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&tracked)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(tracked_modified))
+                .unwrap();
+            assert_eq!(
+                original_tracked.len(),
+                std::fs::metadata(&tracked).unwrap().len() as usize
+            );
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&tracked).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "changed tracked bytes must force import"
+            );
+            std::fs::write(&tracked, original_tracked).unwrap();
+            let modified = std::fs::metadata(&binary).unwrap().modified().unwrap();
+            std::fs::write(&binary, b"replaced binary").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&binary)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(std::fs::metadata(&binary).unwrap().len(), 15);
+            assert_eq!(
+                std::fs::metadata(&binary).unwrap().modified().unwrap(),
+                modified
+            );
+            assert!(
+                !unchanged_archive(&contents, &key, FileChangeType::CHANGED),
+                "same-size, same-mtime replacement must refresh"
+            );
+            assert_eq!(project_change(&root, Some(&model), &key), Some(true));
+            let origin = model.artifact_origin(&binary).unwrap().to_string();
+            backend.ws.lock().complete_dependency_origin(origin.clone());
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&binary).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > initial,
+                "changed bytes must refresh File and Project artifacts"
+            );
+            assert!(
+                !backend.ws.lock().dependency_origin_complete(&origin),
+                "changed archive origin must be retired"
+            );
+            let replacement = project_archive_contents(&root, Some(&model));
+            assert!(unchanged_archive(
+                &replacement,
+                &key,
+                FileChangeType::CHANGED
+            ));
+            for kind in [FileChangeType::CREATED, FileChangeType::DELETED] {
+                assert!(!unchanged_archive(&replacement, &key, kind));
+                backend.watches.lock().archive_contents = replacement.clone();
+                let before = backend.refresh.lock().requested;
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![FileEvent::new(Uri::from_file_path(&binary).unwrap(), kind)],
+                    })
+                    .await;
+                assert!(
+                    backend.refresh.lock().requested > before,
+                    "create/delete cannot be suppressed"
+                );
+            }
+            std::fs::remove_file(&binary).unwrap();
+            assert!(!unchanged_archive(
+                &replacement,
+                &key,
+                FileChangeType::CHANGED
+            ));
+            assert!(!unchanged_archive(
+                &replacement,
+                &key,
+                FileChangeType::DELETED
+            ));
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&binary).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "unreadable archive cannot be suppressed"
+            );
+            std::fs::write(&binary, b"replaced binary").unwrap();
+            assert!(
+                !unchanged_archive(&HashMap::new(), &key, FileChangeType::CHANGED),
+                "a new, unbaselined archive cannot hide its first event"
+            );
+            backend.watches.lock().archive_contents.clear();
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(&binary).unwrap(),
+                        FileChangeType::CHANGED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "unknown baseline must remain conservative"
+            );
+            assert_eq!(
+                backend.ws.lock().doc_text(&open_key).as_deref(),
+                Some("class Use { int unsaved; }")
+            );
+            assert_eq!(
+                project_change(
+                    &root,
+                    Some(&model),
+                    &crate::paths::file_key(&root.join("unmodeled-build.jar"))
+                ),
+                Some(true)
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7890,6 +8410,38 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
 
     #[tokio::test]
     async fn watched_file_bursts_coalesce_and_active_refreshes_remain_singleflight() {
+        async fn wait_for_fixture(
+            backend: &Backend,
+            root: &Path,
+            expected_invocations: usize,
+            completed: bool,
+        ) {
+            // Child markers and worker completion prove readiness; the owned harness bounds stalls.
+            loop {
+                let observed = std::fs::read_to_string(root.join("invocations"))
+                    .map(|text| text.lines().count())
+                    .unwrap_or_default();
+                let (running, requested) = {
+                    let state = backend.refresh.lock();
+                    (state.running, state.requested)
+                };
+                let (baselined, model_loading) = {
+                    let watches = backend.watches.lock();
+                    (watches.configuration_baselined, watches.model_loading)
+                };
+                let generation = backend.ws.lock().analysis_generation();
+                assert!(observed <= expected_invocations,
+                    "unexpected fixture invocation: observed={observed}, expected={expected_invocations}, completed={completed}, running={running}, requested={requested}, generation={generation}, baselined={baselined}, model_loading={model_loading}");
+                if observed == expected_invocations && (!completed || !running) {
+                    return;
+                }
+                assert!(running,
+                    "fixture worker terminated before readiness: observed={observed}, expected={expected_invocations}, completed={completed}, requested={requested}, generation={generation}, baselined={baselined}, model_loading={model_loading}, lease={}, overlap={}, root={}",
+                    root.join("running").exists(), root.join("overlap").exists(), root.display());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         let root = gradle_import_request_fixture("refresh-scheduler");
         let nested = root.join("included");
         let configuration_files = [
@@ -7995,10 +8547,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 .map(|text| text.lines().count())
                 .unwrap_or_default()
         };
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while invocations() < 1 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_fixture(backend, &root, 1, false).await;
         assert_eq!(invocations(), 1, "initial import never started");
         let initial = backend.refresh.lock().requested;
         let initial_cancelled = backend.refresh.lock().cancelled.clone();
@@ -8020,10 +8569,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         }
         assert_eq!(backend.refresh.lock().requested, initial);
         assert!(!initial_cancelled.load(std::sync::atomic::Ordering::Acquire));
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while backend.refresh.lock().running && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_fixture(backend, &root, 1, true).await;
         assert!(!backend.refresh.lock().running);
         assert_eq!(
             std::fs::read_to_string(root.join("invocations"))
@@ -8042,10 +8588,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         }
         // The lease file appears before logging. Wait for the durable second startup record;
         // that child then stays active until cancellation, without a 600 ms timing window.
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while invocations() < 2 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_fixture(backend, &root, 2, false).await;
         assert_eq!(invocations(), 2, "second refresh never completed startup");
         assert!(root.join("running").exists());
         let superseded = backend.ws.lock().analysis_generation();
@@ -8096,10 +8639,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             .extend(jar_event(FileChangeType::CHANGED).changes);
         backend.did_change_watched_files(mixed).await;
         assert!(active_cancelled.load(std::sync::atomic::Ordering::Acquire));
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while backend.refresh.lock().running && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_fixture(backend, &root, 3, true).await;
         assert!(!backend.refresh.lock().running);
         assert!(!backend.watches.lock().model_loading);
         assert!(!backend.watches.lock().pending_model_jar);

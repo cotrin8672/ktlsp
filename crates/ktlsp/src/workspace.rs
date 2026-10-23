@@ -331,13 +331,7 @@ impl Workspace {
             .map(|(key, _)| key.to_string())
             .collect();
         for key in removed {
-            // Artifact retirement does not prove an authored type was deleted.
-            self.index.remove_file_origin(&key);
-            self.index.remove_file(&key);
-            self.analysis_extensions.remove_source(&self.index, &key);
-            self.annotated_type_owners.remove(&key);
-            self.salsa.get_mut().forget(&key);
-            self.project_file_meta.remove(&key);
+            self.retire_dependency_file(&key);
         }
         self.completed_dependency_origins.retain(|origin| {
             self.global_origins.contains(origin)
@@ -346,6 +340,37 @@ impl Workspace {
         });
         self.project_model = Some(model);
         self.analysis_extensions.model_changed(&self.index);
+        self.bump_index_revision();
+        self.recompute_project_completeness();
+    }
+
+    fn retire_dependency_file(&mut self, key: &str) {
+        // Artifact retirement does not prove an authored type was deleted.
+        self.index.remove_file_origin(key);
+        self.index.remove_file(key);
+        self.analysis_extensions.remove_source(&self.index, key);
+        self.annotated_type_owners.remove(key);
+        self.salsa.get_mut().forget(key);
+        self.project_file_meta.remove(key);
+    }
+
+    pub(crate) fn retire_dependency_origin(&mut self, origin: &str) {
+        let files: Vec<_> = self
+            .index
+            .file_origins()
+            .filter(|(key, owner)| owner.origin_id == origin && !self.open_docs.contains_key(*key))
+            .map(|(key, _)| key.to_string())
+            .collect();
+        let completed = self.completed_dependency_origins.remove(origin);
+        if files.is_empty() && !completed {
+            return;
+        }
+        self.invalidate_kotlin_diagnostics();
+        self.class_inventory.get_mut().clear();
+        self.invalidate_observed_compile();
+        for file in files {
+            self.retire_dependency_file(&file);
+        }
         self.bump_index_revision();
         self.recompute_project_completeness();
     }
@@ -4331,6 +4356,21 @@ fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
 }
 
 pub(crate) fn git_project_files(root: &Path, patterns: &[&str]) -> Option<Vec<std::path::PathBuf>> {
+    git_project_files_with_untracked(root, patterns, true)
+}
+
+pub(crate) fn git_tracked_project_files(
+    root: &Path,
+    patterns: &[&str],
+) -> Option<Vec<std::path::PathBuf>> {
+    git_project_files_with_untracked(root, patterns, false)
+}
+
+fn git_project_files_with_untracked(
+    root: &Path,
+    patterns: &[&str],
+    include_untracked: bool,
+) -> Option<Vec<std::path::PathBuf>> {
     let top = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4345,15 +4385,9 @@ pub(crate) fn git_project_files(root: &Path, patterns: &[&str]) -> Option<Vec<st
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--full-name",
-            "--",
-        ])
+        .args(["ls-files", "-z", "--cached"])
+        .args(include_untracked.then_some("--others"))
+        .args(["--exclude-standard", "--full-name", "--"])
         .args(patterns)
         .output()
         .ok()?;
