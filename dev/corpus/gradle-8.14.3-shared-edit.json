@@ -40,7 +40,7 @@
         "consumer": "private fun ktlspConsumerSlice(provider: ProblemReportCreator): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}"
       }
     },
-    "additional_request_count": 14,
+    "additional_request_count": 16,
     "consumer_insertion": "file",
     "stages": {
       "text": {
@@ -76,6 +76,14 @@
         }
       }
     },
-    "oracle_status": "UNRUN; source snapshots require actual compiler verification before valid-diagnostic acceptance"
+    "oracle_status": "Whole-file Javac17/Kotlin2.0.21 oracle passed text, counter, renamed and restored snapshots; retracted reports exactly unresolved ktlspSliceCounter. Missing internal JARs used the official Gradle8.14.3 distribution at the identical source revision for this independent oracle, not the original captured classpath. Java processors/ErrorProne are not covered. The subsequent genuine :problems:compileKotlin build passed with unchanged tracked sources/settings and restored the captured classpath. See gradle-shared133-oracle4 and gradle-focused134-online1 evidence in docs/fork-current.md.",
+    "diagnostic_cycle": {
+      "consumer": "private fun ktlspConsumerSlice(provider: ProblemReportCreator): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}",
+      "missing_member": "ktlspSliceCounter",
+      "source_sha256": {
+        "invalid": "7c9d1aff7f2f379c597ba08e5f399c316cad4f542f8c17eb4f0d33139fdb5832",
+        "fixed": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+      }
+    }
   }
 }

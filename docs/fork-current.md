@@ -38,6 +38,23 @@ or unmeasured result, stable source guards and clean shutdown/EOF/live0, without
 generating the missing original producer JAR
 (`shared-edit137-release28/m-atomic-distinct1/receipt.json`). The generated probe
 manifest is byte-identical to the previous27 control. Gradle17 remains in progress.
+The original Moshi shared16 case subsequently closes15 matched first responses,
+0 mismatch and1 unmeasured canonical diagnostic
+(`moshi-focused137-shared28/receipt.json`). A genuine private-copy `:moshi:jar`
+build and fresh normal-server capture establish complete selected Java/Kotlin
+tasks with no missing classpath inputs. The remaining refusal is specifically
+`dirty-visible-dependency-source-unhandled`: the unsaved Java producer belongs
+to another module. Its selected producer compilation must establish private
+current classes for the consumer; skipping the dirty-source guard or using the
+old producer JAR would not certify the edited program.
+
+Gradle28 also receives a CHANGED notification for the byte-identical
+`gradle-java-api-extractor-8.14.3.jar` (same33600 bytes, digest and mtime as the
+genuine focused build). This forces generation2 whole-model import and cancels
+the generation1 diagnostic request; classpath and sources queries take165.5s and
+141s respectively. Both queries finish successfully, but no new canonical
+certificate is claimed. The init-script digest is unchanged from27. Avoiding
+unchanged-artifact refresh must preserve real same-path archive replacement.
 Gradle27 closed with14 matched first responses and3
 unmeasured canonical diagnostics,0 semantic mismatch, clean shutdown/EOF and
 stable guards (`gradle-shared134-native27/receipt.json`). The unsupported release
