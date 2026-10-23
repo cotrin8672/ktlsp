@@ -2379,6 +2379,7 @@ fn free_function_call_type(
             arg_types,
             &type_params,
             parameter_facts.known_unbounded(),
+            members::CallMode::Kotlin,
             ctx,
             &HashMap::new(),
         );
@@ -2918,6 +2919,7 @@ fn resolve_trailing_lambda_receiver_candidate(
             arg_types,
             &entry.sym.type_params,
             entry.sym.type_parameter_facts.known_unbounded(),
+            members::CallMode::Kotlin,
             &declaration_ctx,
             &subst,
         );
@@ -3156,7 +3158,7 @@ fn resolve_with_subst_unprojected(
 
         owner: None,
     };
-    match tr.owner.as_deref() {
+    let ty = match tr.owner.as_deref() {
         Some(owner) if depth < MAX_DEPTH => with_instantiated_owner(
             index,
             ty,
@@ -3164,7 +3166,8 @@ fn resolve_with_subst_unprojected(
         ),
         Some(_) => Type::Unknown,
         None => ty,
-    }
+    };
+    java_omitted_type(index, ty, tr.java_raw_eligible, depth)
 }
 
 /// The number of value arguments of a call: the `value_argument` children of its `value_arguments`
@@ -3343,8 +3346,8 @@ fn member_type(
             let selected =
                 crate::jvm::select_call(index, recv_ty, jvm_candidates, name, arguments, ctx);
             if let [candidate] = selected.consumable_candidates() {
-                return crate::jvm::projected_return_type_in_context(
-                    index, recv_ty, *candidate, ctx,
+                return crate::jvm::projected_return_type_in_call_mode(
+                    index, recv_ty, *candidate, members::CallMode::Kotlin, ctx,
                 )
                 .unwrap_or(Type::Unknown);
             }
@@ -3495,6 +3498,13 @@ fn resolve_member_type_with_subst(
     }) {
         return Type::Unknown;
     }
+    if let Some(signature) = raw_member_signature(index, recv_ty, entry, tr, members::CallMode::Kotlin) {
+        return match &bound {
+            Some(bound) if raw_member_application(index, entry, bound, &signature).status
+                != solve::ConstraintStatus::Matched => Type::Unknown,
+            _ => signature.result,
+        };
+    }
     if projected
         || (entry.sym.extension_receiver.is_none()
             && !entry.sym.type_params.is_empty()
@@ -3515,6 +3525,12 @@ fn resolve_member_type_with_subst(
         return resolve_type_ref(index, tr, ctx, depth + 1);
     }
     let mut subst = receiver_bindings.unwrap_or_default();
+    if tr.qualification.is_none() && tr.args.is_empty() && tr.owner.is_none()
+        && !entry.sym.type_params.contains(&tr.name)
+        && matches!(subst.get(&tr.name), Some(Type::Star))
+    {
+        return declared_member_type(index, recv_ty, entry, tr, members::CallMode::Kotlin, ctx);
+    }
     if let (Some(call), Some(bound)) = (call, bound.as_ref()) {
         // Arguments can bind only method variables; receiver variables retain their equalities.
         let method_params = entry.sym.type_params.iter().cloned().collect();
@@ -3549,8 +3565,12 @@ pub fn declared_member_type(
     recv_ty: &Type,
     entry: &Entry,
     tr: &TypeRef,
+    mode: members::CallMode,
     ctx: &FileCtx,
 ) -> Type {
+    if let Some(signature) = raw_member_signature(index, recv_ty, entry, tr, mode) {
+        return signature.result;
+    }
     let tparams = member_type_parameters(index, entry);
     if tparams.is_empty() && entry.sym.extension_receiver.is_none() {
         return resolve_type_ref(index, tr, ctx, 0);
@@ -3563,6 +3583,35 @@ pub fn declared_member_type(
         return resolve_type_ref(index, tr, ctx, 0);
     }
     let subst = receiver_bindings.unwrap_or_default();
+    if tr.qualification.is_none() && tr.args.is_empty() && tr.owner.is_none()
+        && !entry.sym.type_params.contains(&tr.name)
+        && matches!(subst.get(&tr.name), Some(Type::Star))
+    {
+        let mut read = None;
+        let mut conflict = false;
+        let _ = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
+            if receiver_root_key(index, current).as_deref() != entry.sym.container.as_deref()
+                || current.package() != Some(entry.sym.package.as_str()) { return ControlFlow::Continue(()); }
+            let mut scope = Some(current);
+            while let Some(ty) = scope {
+                if let Some(declaration) = type_declaration_shape(index, ty) {
+                    if let Some(parameters) = type_declaration_parameters(index, ty) {
+                        if parameters.iter().any(|p| p.name == tr.name) {
+                            let ctx = FileCtx::new(declaration.sym.package.clone(), Vec::new()).with_file(&declaration.path);
+                            let candidate = declared_type_in_scope(index, tr, &ctx, parameters);
+                            if read.as_ref().is_some_and(|previous| previous != &candidate) { conflict = true; return ControlFlow::Break(()); }
+                            read = Some(candidate);
+                            break;
+                        }
+                    }
+                }
+                scope = ty.owner();
+            }
+            ControlFlow::Continue(())
+        });
+        if conflict { return Type::Unknown; }
+        if let Some(read) = read { return read; }
+    }
     resolve_with_subst(index, tr, ctx, &tparams, &subst, 0)
 }
 
@@ -3656,6 +3705,7 @@ fn projected_application(
     actuals: &[Type],
     type_params: &[String],
     known_unbounded: bool,
+    mode: members::CallMode,
     ctx: &FileCtx,
     initial: &HashMap<String, Type>,
 ) -> solve::Application {
@@ -3667,17 +3717,53 @@ fn projected_application(
         initial,
         known_unbounded,
         |formal| resolve_with_subst_unprojected(index, formal, ctx, &parameters, initial, 0),
-        |actual| constraint_type_is_known(index, actual, 0),
-        |actual| {
-            type_declaration_shape(index, actual).is_some()
-                && index
-                    .lookup_type(actual.name().unwrap_or_default())
-                    .iter()
-                    .filter(|entry| {
-                        entry.sym.package == actual.package().unwrap_or_default()
-                            && entry.sym.container.as_deref() == actual.container()
+        |actual| match actual {
+            Type::Raw(nominal) => {
+                matches!(nominal.as_ref(), Type::Class { args, .. } if args.is_empty())
+                    && type_head_is_known(index, nominal)
+                    && type_declaration_parameters(index, nominal).is_some()
+            }
+            _ => constraint_type_is_known(index, actual, 0),
+        },
+        |actual, formals| {
+            if type_declaration_shape(index, actual).is_none() {
+                return false;
+            }
+            let declarations = index.lookup_type(actual.name().unwrap_or_default());
+            let mut invariant = true;
+            let mut unbounded = true;
+            for entry in declarations.iter().filter(|entry| {
+                entry.sym.package == actual.package().unwrap_or_default()
+                    && entry.sym.container.as_deref() == actual.container()
+            }) {
+                invariant &= entry.sym.type_parameter_facts.known_invariant();
+                unbounded &= entry.sym.type_parameter_facts.known_unbounded();
+            }
+            if invariant {
+                return true;
+            }
+            if !unbounded {
+                return false;
+            }
+            // The JVM signature exposes declaration-site Kotlin variance as an ordinary class.
+            if mode == members::CallMode::Java {
+                return true;
+            }
+            // Plain equality slots still require an invariant constructor in this local solver.
+            type_declaration_parameters(index, actual).is_some_and(|parameters| {
+                parameters.len() == formals.len()
+                    && parameters.iter().zip(formals).all(|(parameter, formal)| {
+                        matches!(
+                            (parameter.variance, formal.projection),
+                            (Some(Projection::Out), Projection::Out)
+                                | (Some(Projection::In), Projection::In)
+                                | (
+                                    Some(Projection::Invariant),
+                                    Projection::Out | Projection::In
+                                )
+                        )
                     })
-                    .all(|entry| entry.sym.type_parameter_facts.known_invariant())
+            })
         },
         |actual, bound| receiver_satisfies_upper_bound(index, actual, bound),
         |actual, other| constraint_types_distinct(index, actual, other, 0),
@@ -3792,6 +3878,15 @@ pub(crate) fn projected_member_application(
     entry: &Entry,
     bound: &members::BoundArguments<'_>,
 ) -> Option<solve::Application> {
+    if let Some(signature) = raw_member_signature(
+        index,
+        receiver,
+        entry,
+        entry.sym.return_type.as_ref().unwrap_or(&TypeRef::default()),
+        bound.mode,
+    ) {
+        return Some(raw_member_application(index, entry, bound, &signature));
+    }
     if entry.sym.type_params.is_empty()
         && !entry
             .sym
@@ -3826,6 +3921,7 @@ pub(crate) fn projected_member_application(
         &actuals,
         &entry.sym.type_params,
         callable_bounds_known(entry),
+        bound.mode,
         &ctx,
         &initial,
     );
@@ -3891,9 +3987,10 @@ pub fn declared_member_call_type(
     entry: &Entry,
     tr: &TypeRef,
     arguments: &CallArguments,
+    mode: members::CallMode,
     ctx: &FileCtx,
 ) -> Type {
-    let bound = match members::bind_arguments(entry, arguments, members::CallMode::Kotlin) {
+    let bound = match members::bind_arguments(entry, arguments, mode) {
         Ok(bound) => bound,
         Err(_) => return Type::Unknown,
     };
@@ -3908,15 +4005,24 @@ fn declared_member_bound_type(
     bound: &members::BoundArguments<'_>,
     ctx: &FileCtx,
 ) -> Type {
+    if let Some(signature) = raw_member_signature(index, receiver, entry, tr, bound.mode) {
+        return if raw_member_application(index, entry, bound, &signature).status
+            == solve::ConstraintStatus::Matched
+        {
+            signature.result
+        } else {
+            Type::Unknown
+        };
+    }
     if bound.params.len() != entry.sym.params.len() && !call_parameter_templates_known(index, entry)
     {
         return Type::Unknown;
     }
     if entry.sym.type_params.is_empty() && !entry.sym.params.iter().any(solve::has_projection) {
-        return declared_member_type(index, receiver, entry, tr, ctx);
+        return declared_member_type(index, receiver, entry, tr, bound.mode, ctx);
     }
     let Some(application) = projected_member_application(index, receiver, entry, bound) else {
-        return declared_member_type(index, receiver, entry, tr, ctx);
+        return declared_member_type(index, receiver, entry, tr, bound.mode, ctx);
     };
     if application.status == solve::ConstraintStatus::Unknown
         && member_type_parameters(index, entry).is_empty()
@@ -3938,7 +4044,7 @@ fn declared_member_bound_type(
         )
     {
         // An uncertain parameter binding does not change a closed, fixed return type.
-        let declared = declared_member_type(index, receiver, entry, tr, ctx);
+        let declared = declared_member_type(index, receiver, entry, tr, bound.mode, ctx);
         if constraint_type_is_known(index, &declared, 0) {
             return declared;
         }
@@ -4170,7 +4276,7 @@ pub(crate) fn types_consistent(index: &dyn InferenceIndex, actual: &Type, formal
         return true;
     }
     if is_reference_root(formal)
-        && matches!(actual, Type::Class { .. })
+        && matches!(actual, Type::Class { .. } | Type::Raw(_))
         && (!actual.is_nullable() || formal.is_nullable())
         && !(formal.package() == Some("java.lang")
             && actual.container().is_none()
@@ -4301,6 +4407,371 @@ fn is_subtype(index: &dyn InferenceIndex, name: &str, pkg: Option<&str>, target:
     false
 }
 
+// Only the Java adapter can certify omitted type arguments. A missing Kotlin argument list
+// and an explicit Java diamond never acquire raw semantics from their nominal shape.
+fn java_omitted_type(
+    index: &dyn InferenceIndex,
+    mut ty: Type,
+    eligible: bool,
+    depth: usize,
+) -> Type {
+    if !eligible || depth > MAX_DEPTH || !matches!(ty, Type::Class { .. }) {
+        return ty;
+    }
+    let Some(declaration) = type_declaration_shape(index, &ty) else {
+        return ty;
+    };
+    if !ty.args().is_empty() {
+        return ty;
+    }
+    if declaration.sym.source_member.dispatch() == Some(crate::extensions::Dispatch::Instance)
+        && ty.owner().is_none()
+    {
+        if let Some(container) = ty.container() {
+            let (parent, name) = container
+                .rsplit_once('.')
+                .map_or((None, container), |(p, n)| (Some(p.to_string()), n));
+            let owner = java_omitted_type(
+                index,
+                Type::Class {
+                    name: name.to_string(),
+                    package: ty.package().map(str::to_string),
+                    container: parent,
+                    nullable: false,
+                    args: Vec::new(),
+                    owner: None,
+                },
+                true,
+                depth + 1,
+            );
+            if matches!(owner, Type::Raw(_)) {
+                ty = with_instantiated_owner(index, ty, owner);
+            }
+        }
+    }
+    let raw_owner = ty
+        .owner()
+        .is_some_and(|owner| matches!(owner, Type::Raw(_)));
+    if matches!(ty, Type::Raw(_)) {
+        return if type_declaration_parameters(index, &ty).is_some() {
+            ty
+        } else {
+            Type::Unknown
+        };
+    }
+    if !declaration.sym.type_params.is_empty() || raw_owner {
+        if type_declaration_parameters(index, &ty).is_none() {
+            return Type::Unknown;
+        }
+        Type::Raw(Box::new(ty))
+    } else {
+        ty
+    }
+}
+
+struct ErasureScope<'a> {
+    parameters: &'a [TypeParameterBounds],
+    ctx: FileCtx,
+    mode: members::CallMode,
+}
+
+// Method variables shadow class variables; an inherited bound is resolved from its own
+// declaration's layer, so a method cannot change the meaning of a class variable's bound.
+fn raw_erasure_scopes<'a>(
+    index: &'a dyn InferenceIndex,
+    receiver: &Type,
+    method: Option<&'a Entry>,
+    mode: members::CallMode,
+) -> Option<Vec<ErasureScope<'a>>> {
+    let mut scopes = Vec::new();
+    if let Some(method) = method {
+        if !method.sym.type_params.is_empty() {
+            let parameters = method.sym.type_parameter_bounds.as_deref()?;
+            if parameters.len() != method.sym.type_params.len()
+                || !parameters
+                    .iter()
+                    .zip(&method.sym.type_params)
+                    .all(|(p, n)| {
+                        p.name == *n
+                            && p.complete
+                            && p.variance == Some(Projection::Invariant)
+                            && p.erasure.is_some()
+                    })
+            {
+                return None;
+            }
+            scopes.push(ErasureScope {
+                parameters,
+                mode,
+                ctx: FileCtx::new(method.sym.package.clone(), Vec::new()).with_file(&method.path),
+            });
+        }
+    }
+    let mut current = Some(receiver);
+    let mut depth = 0;
+    while let Some(ty) = current {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let parameters = type_declaration_parameters(index, ty)?;
+        if parameters
+            .iter()
+            .any(|parameter| parameter.erasure.is_none())
+        {
+            return None;
+        }
+        let declaration = type_declaration_shape(index, ty)?;
+        scopes.push(ErasureScope {
+            parameters,
+            mode,
+            ctx: FileCtx::new(ty.package().unwrap_or_default().to_string(), Vec::new())
+                .with_file(&declaration.path),
+        });
+        current = ty.owner();
+        depth += 1;
+    }
+    Some(scopes)
+}
+
+fn erase_parameter_bound(
+    index: &dyn InferenceIndex,
+    parameter: &TypeParameterBounds,
+    scopes: &[ErasureScope<'_>],
+    layer: usize,
+    path: &mut Vec<(usize, usize)>,
+    depth: usize,
+) -> Type {
+    use crate::types::ParameterErasure;
+    let Some(policy) = parameter.erasure else {
+        return Type::Unknown;
+    };
+    if parameter.upper_bounds.is_empty() {
+        if policy == ParameterErasure::ClassFirst && scopes[layer].mode == members::CallMode::Kotlin
+        {
+            return Type::class("Any", Some("kotlin".into())).with_nullability(true);
+        }
+        return Type::class("Object", Some("java.lang".into()));
+    }
+    if policy == ParameterErasure::FirstBound {
+        return erase_type_ref(
+            index,
+            &parameter.upper_bounds[0],
+            scopes,
+            layer,
+            path,
+            depth + 1,
+        );
+    }
+    // An intersection involving another type variable has no supported JVM class-order proof.
+    if parameter.upper_bounds.len() > 1
+        && parameter.upper_bounds.iter().any(|bound| {
+            bound.qualification.is_none()
+                && scopes
+                    .iter()
+                    .skip(layer)
+                    .any(|scope| scope.parameters.iter().any(|p| p.name == bound.name))
+        })
+    {
+        return Type::Unknown;
+    }
+    let mut first_interface = None;
+    let mut first_metadata_bound = None;
+    let mut class = None;
+    for bound in &parameter.upper_bounds {
+        let bound = erase_type_ref(index, bound, scopes, layer, path, depth + 1);
+        if first_metadata_bound.is_none() {
+            first_metadata_bound = Some(bound.clone());
+        }
+        if is_reference_root(&bound) {
+            if class.is_some() {
+                return Type::Unknown;
+            }
+            class = Some(Type::class("Object", Some("java.lang".into())));
+            continue;
+        }
+        let Some(declaration) = type_declaration_shape(index, &bound) else {
+            return Type::Unknown;
+        };
+        match declaration.sym.kind {
+            SymbolKind::Interface => {
+                first_interface.get_or_insert(bound);
+            }
+            SymbolKind::Class | SymbolKind::EnumClass | SymbolKind::Object => {
+                if class.is_some() {
+                    return Type::Unknown;
+                }
+                class = Some(bound);
+            }
+            _ => return Type::Unknown,
+        }
+    }
+    if scopes[layer].mode == members::CallMode::Kotlin {
+        first_metadata_bound.unwrap_or(Type::Unknown)
+    } else {
+        class.or(first_interface).unwrap_or(Type::Unknown)
+    }
+}
+
+fn erase_type_ref(
+    index: &dyn InferenceIndex,
+    tr: &TypeRef,
+    scopes: &[ErasureScope<'_>],
+    from: usize,
+    path: &mut Vec<(usize, usize)>,
+    depth: usize,
+) -> Type {
+    if depth > MAX_DEPTH
+        || from >= scopes.len()
+        || tr.name.is_empty()
+        || tr.projection != Projection::Invariant
+    {
+        return Type::Unknown;
+    }
+    if tr.name.ends_with("[]") {
+        return tr.array_component().map_or(Type::Unknown, |component| {
+            Type::array(
+                java_primitive_array_component(&component).unwrap_or_else(|| {
+                    erase_type_ref(index, &component, scopes, from, path, depth + 1)
+                }),
+                tr.nullable,
+            )
+        });
+    }
+    if tr.qualification.is_none() && tr.args.is_empty() && tr.owner.is_none() {
+        for (layer, scope) in scopes.iter().enumerate().skip(from) {
+            if let Some((position, parameter)) = scope
+                .parameters
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.name == tr.name)
+            {
+                if !parameter.complete || path.contains(&(layer, position)) {
+                    return Type::Unknown;
+                }
+                path.push((layer, position));
+                let result =
+                    erase_parameter_bound(index, parameter, scopes, layer, path, depth + 1);
+                path.pop();
+                let nullable = tr.nullable
+                    || (scopes[layer].mode == members::CallMode::Kotlin
+                        && parameter.erasure == Some(crate::types::ParameterErasure::ClassFirst)
+                        && result.is_nullable());
+                return result.with_nullability(nullable);
+            }
+        }
+    }
+    let mut erased = tr.clone();
+    erased.args.clear();
+    erased.owner = None;
+    erased.java_raw_eligible = true;
+    let mut result = resolve_type_ref(index, &erased, &scopes[from].ctx, depth + 1);
+    if let Some(owner) = tr.owner.as_deref() {
+        let owner = erase_type_ref(index, owner, scopes, from, path, depth + 1);
+        let nominal = match result {
+            Type::Raw(inner) => *inner,
+            other => other,
+        };
+        result = with_instantiated_owner(index, nominal, owner);
+        result = java_omitted_type(index, result, true, depth + 1);
+    }
+    result
+}
+
+struct RawMemberSignature {
+    params: Vec<Type>,
+    result: Type,
+}
+
+fn raw_member_signature(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    result: &TypeRef,
+    mode: members::CallMode,
+) -> Option<RawMemberSignature> {
+    if entry.sym.source_member.dispatch() != Some(crate::extensions::Dispatch::Instance)
+        || entry.sym.extension_receiver.is_some()
+    {
+        return None;
+    }
+    let container = entry.sym.container.as_deref()?;
+    let mut declaring = None;
+    let mut conflict = false;
+    let mut raw_path = false;
+    let _ = walk_supertypes(index, receiver, SUPERTYPE_CAP, |current| {
+        if receiver_root_key(index, current).as_deref() == Some(container)
+            && current.package() == Some(entry.sym.package.as_str())
+        {
+            raw_path |= matches!(current, Type::Raw(_));
+            if declaring
+                .as_ref()
+                .is_some_and(|previous| previous != current)
+            {
+                conflict = true;
+            }
+            declaring = Some(current.clone());
+        }
+        ControlFlow::Continue(())
+    });
+    let declaring = declaring?;
+    if !raw_path {
+        return None;
+    }
+    let scopes = (!conflict)
+        .then(|| raw_erasure_scopes(index, &declaring, Some(entry), mode))
+        .flatten();
+    Some(match scopes {
+        Some(scopes) => RawMemberSignature {
+            params: entry
+                .sym
+                .params
+                .iter()
+                .map(|tr| erase_type_ref(index, tr, &scopes, 0, &mut Vec::new(), 0))
+                .collect(),
+            result: erase_type_ref(index, result, &scopes, 0, &mut Vec::new(), 0),
+        },
+        None => RawMemberSignature {
+            params: vec![Type::Unknown; entry.sym.params.len()],
+            result: Type::Unknown,
+        },
+    })
+}
+
+fn raw_member_application(
+    index: &dyn InferenceIndex,
+    entry: &Entry,
+    bound: &members::BoundArguments<'_>,
+    signature: &RawMemberSignature,
+) -> solve::Application {
+    let uncertain = bound.arguments.count != Some(bound.arguments.types.len())
+        || bound.arguments.trailing_lambda
+        || bound.arguments.has_spread
+        || entry.sym.has_vararg
+        || signature.params.len() != bound.arguments.types.len();
+    let applicability = members::arguments_applicability(
+        index,
+        bound.arguments.as_ref(),
+        |position| {
+            signature
+                .params
+                .get(position)
+                .cloned()
+                .unwrap_or(Type::Unknown)
+        },
+        bound.mode,
+        uncertain,
+    );
+    let status = match applicability {
+        members::Applicability::Applicable => solve::ConstraintStatus::Matched,
+        members::Applicability::Rejected => solve::ConstraintStatus::Rejected,
+        members::Applicability::Unknown => solve::ConstraintStatus::Unknown,
+    };
+    solve::Application {
+        status,
+        bindings: HashMap::new(),
+    }
+}
+
 /// A qualified name alone never proves capture of an outer instance or its arguments.
 fn with_instantiated_owner(index: &dyn InferenceIndex, mut ty: Type, owner: Type) -> Type {
     let Some(declaration) = type_declaration_shape(index, &ty) else {
@@ -4322,7 +4793,12 @@ fn with_instantiated_owner(index: &dyn InferenceIndex, mut ty: Type, owner: Type
     } else {
         return Type::Unknown;
     }
-    ty
+    if ty.owner().is_some_and(|owner| matches!(owner, Type::Raw(_))) {
+        if !ty.args().is_empty() { return Type::Unknown; }
+        Type::Raw(Box::new(ty))
+    } else {
+        ty
+    }
 }
 
 fn unique_type_definition(index: &dyn InferenceIndex, ty: &Type) -> bool {
@@ -4663,6 +5139,11 @@ fn receiver_arguments_known(index: &dyn InferenceIndex, actual: &Type, depth: us
 
 // Callers already prove the nominal head; this checks its declaration shape and argument count.
 fn receiver_shape_is_known(index: &dyn InferenceIndex, actual: &Type) -> bool {
+    if let Type::Raw(nominal) = actual {
+        return matches!(nominal.as_ref(), Type::Class { args, .. } if args.is_empty())
+            && type_declaration_parameters(index, nominal).is_some()
+            && nominal.owner().is_none_or(|owner| receiver_shape_is_known(index, owner));
+    }
     if let Some(declaration) = type_declaration_shape(index, actual) {
         return declaration.sym.type_params.len() == actual.args().len()
             && actual
@@ -4699,6 +5180,18 @@ fn type_declaration_shape<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Optio
             if previous.sym.package != entry.sym.package
                 || previous.sym.kind != entry.sym.kind
                 || previous.sym.type_params != entry.sym.type_params
+                || !crate::symbol::type_parameter_bounds_agree(
+                    previous
+                        .sym
+                        .type_parameter_bounds
+                        .as_deref()
+                        .map(Vec::as_slice),
+                    entry
+                        .sym
+                        .type_parameter_bounds
+                        .as_deref()
+                        .map(Vec::as_slice),
+                )
                 || previous.sym.source_member.dispatch() != entry.sym.source_member.dispatch()
             {
                 return None;
@@ -4709,8 +5202,149 @@ fn type_declaration_shape<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Optio
     result
 }
 
+pub(crate) fn type_declaration_parameters<'a>(
+    index: &'a dyn InferenceIndex,
+    ty: &Type,
+) -> Option<&'a [crate::types::TypeParameterBounds]> {
+    let declaration = type_declaration_shape(index, ty)?;
+    if declaration.sym.type_params.is_empty()
+        && declaration.sym.type_parameter_facts.known_invariant()
+    {
+        return Some(&[]);
+    }
+    let parameters = declaration.sym.type_parameter_bounds.as_deref()?;
+    (parameters.len() == declaration.sym.type_params.len()
+        && parameters
+            .iter()
+            .zip(&declaration.sym.type_params)
+            .all(|(parameter, name)| {
+                parameter.name == *name
+                    && parameter.complete
+                    && matches!(
+                        parameter.variance,
+                        Some(
+                            crate::types::Projection::Invariant
+                                | crate::types::Projection::Out
+                                | crate::types::Projection::In
+                        )
+                    )
+            }))
+    .then_some(parameters.as_slice())
+}
+
 /// Parent traversal additionally requires all declarations of the nominal identity to agree on
 /// their instantiated hierarchy; shape agreement alone cannot prove a subtype relationship.
+fn supertype_refs_agree(
+    index: &dyn InferenceIndex,
+    left: &[TypeRef],
+    right: &[TypeRef],
+    package: &str,
+) -> bool {
+    fn nongeneric_view(index: &dyn InferenceIndex, ty: &Type, depth: usize) -> bool {
+        if depth > SUPERTYPE_CAP || !matches!(ty, Type::Class { .. }) || !ty.args().is_empty() {
+            return false;
+        }
+        let Some(declaration) = type_declaration_shape(index, ty) else {
+            return false;
+        };
+        if declaration.sym.kind == SymbolKind::TypeAlias {
+            return false;
+        }
+        if !index
+            .lookup_type(ty.name().unwrap_or_default())
+            .iter()
+            .filter(|entry| {
+                entry.sym.package == declaration.sym.package
+                    && entry.sym.container == declaration.sym.container
+            })
+            .all(|entry| {
+                entry.sym.type_params.is_empty() && entry.sym.type_parameter_facts.known_invariant()
+            })
+        {
+            return false;
+        }
+        if let Some(owner) = ty.owner() {
+            return matches!(owner, Type::Class { .. })
+                && receiver_arguments_known(index, owner, depth + 1);
+        }
+        let Some(container) = ty.container() else {
+            return true;
+        };
+        match declaration.sym.source_member.dispatch() {
+            Some(crate::extensions::Dispatch::Static) => true,
+            Some(crate::extensions::Dispatch::Instance) => {
+                let (outer, name) = container
+                    .rsplit_once('.')
+                    .map_or((None, container), |(outer, name)| {
+                        (Some(outer.to_string()), name)
+                    });
+                nongeneric_view(
+                    index,
+                    &Type::Class {
+                        name: name.to_string(),
+                        package: ty.package().map(str::to_string),
+                        container: outer,
+                        nullable: false,
+                        args: Vec::new(),
+                        owner: None,
+                    },
+                    depth + 1,
+                )
+            }
+            None => false,
+        }
+    }
+    fn same(
+        index: &dyn InferenceIndex,
+        a: &TypeRef,
+        b: &TypeRef,
+        ctx: &FileCtx,
+        depth: usize,
+    ) -> bool {
+        if a == b {
+            return true;
+        }
+        if depth > MAX_DEPTH || a.args.len() != b.args.len() {
+            return false;
+        }
+        let head = |ty: &TypeRef| {
+            let mut head = ty.clone();
+            head.args.clear();
+            head.owner = None;
+            head.java_raw_eligible = false;
+            head
+        };
+        if head(a) != head(b) {
+            return false;
+        }
+        if a.java_raw_eligible != b.java_raw_eligible {
+            let a_type = resolve_type_ref(index, a, ctx, depth);
+            let b_type = resolve_type_ref(index, b, ctx, depth);
+            // Omission provenance is immaterial only when both views retain a proven nongeneric
+            // identity. A nongeneric inner class may still acquire an implicit raw outer owner.
+            if a_type != b_type || !nongeneric_view(index, &a_type, depth) {
+                return false;
+            }
+        }
+        a.args
+            .iter()
+            .zip(&b.args)
+            .all(|(a, b)| same(index, a, b, ctx, depth + 1))
+            && match (&a.owner, &b.owner) {
+                (Some(a), Some(b)) => same(index, a, b, ctx, depth + 1),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+    left == right
+        || left.len() == right.len() && {
+            let ctx = FileCtx::new(package.to_string(), Vec::new());
+            left.iter()
+                .zip(right)
+                .all(|(a, b)| same(index, a, b, &ctx, 0))
+        }
+}
+
 fn type_declaration<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a Entry> {
     let mut result: Option<&Entry> = None;
     for entry in index.lookup_type(ty.name()?) {
@@ -4723,7 +5357,24 @@ fn type_declaration<'a>(index: &'a dyn InferenceIndex, ty: &Type) -> Option<&'a 
             if previous.sym.package != entry.sym.package
                 || previous.sym.kind != entry.sym.kind
                 || previous.sym.type_params != entry.sym.type_params
-                || previous.sym.supertype_refs != entry.sym.supertype_refs
+                || !crate::symbol::type_parameter_bounds_agree(
+                    previous
+                        .sym
+                        .type_parameter_bounds
+                        .as_deref()
+                        .map(Vec::as_slice),
+                    entry
+                        .sym
+                        .type_parameter_bounds
+                        .as_deref()
+                        .map(Vec::as_slice),
+                )
+                || !supertype_refs_agree(
+                    index,
+                    &previous.sym.supertype_refs,
+                    &entry.sym.supertype_refs,
+                    &entry.sym.package,
+                )
                 || previous.sym.supertypes != entry.sym.supertypes
             {
                 return None;
@@ -4793,6 +5444,17 @@ pub fn walk_supertypes(
 
 /// Instantiate a type's direct superclasses/interfaces using its actual type arguments.
 pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
+    if matches!(ty, Type::Raw(_)) {
+        let Some(declaration) = type_declaration(index, ty) else {
+            return vec![Type::Unknown];
+        };
+        let Some(scopes) = raw_erasure_scopes(index, ty, None, members::CallMode::Java) else {
+            return vec![Type::Unknown];
+        };
+        return declaration.sym.supertype_refs.iter().map(|tr| {
+            erase_type_ref(index, tr, &scopes, 0, &mut Vec::new(), 0)
+        }).collect();
+    }
     if let Type::Parameter { upper_bounds, .. } = ty {
         return upper_bounds.clone();
     }
@@ -5282,6 +5944,8 @@ mod tests {
                     expected
                 );
                 let parameters = [TypeParameterBounds {
+                    variance: None,
+                    erasure: None,
                     name: "T".into(),
                     start_byte: 0,
                     end_byte: 1,
@@ -5521,6 +6185,8 @@ mod tests {
             expected
         );
         let parameters = [TypeParameterBounds {
+            variance: None,
+            erasure: None,
             name: "Item".into(),
             start_byte: 10,
             end_byte: 14,
@@ -5947,6 +6613,7 @@ mod tests {
                     entry,
                     entry.sym.return_type.as_ref().unwrap(),
                     &arguments,
+                    crate::members::CallMode::Kotlin,
                     &ctx,
                 ),
                 actual,
@@ -5985,6 +6652,81 @@ mod tests {
                     .map(|name| name.as_deref())
                     .collect::<Vec<_>>(),
                 expected
+            );
+        }
+
+        let receiver = Type::class("Use", Some("demo".into()));
+        let mut parent = IndexedSymbol::new("Parent", SymbolKind::Class, "demo", None, 0, 1);
+        parent.type_parameter_facts = crate::symbol::TypeParameterFacts::new(true, true);
+        index.replace_file("Parent.kt", vec![parent.clone()], Tier::Volatile);
+        let mut java = IndexedSymbol::new("Use", SymbolKind::Class, "demo", None, 0, 1);
+        java.supertype_refs = vec![TypeRef::simple("Parent")];
+        java.supertype_refs[0].java_raw_eligible = true;
+        let mut kotlin = java.clone();
+        kotlin.supertype_refs[0].java_raw_eligible = false;
+        index.replace_file("Use.java", vec![java.clone()], Tier::Volatile);
+        index.replace_file("Use.kt", vec![kotlin.clone()], Tier::Volatile);
+        assert_eq!(
+            super::direct_supertypes(&index, &receiver),
+            vec![Type::class("Parent", Some("demo".into()))]
+        );
+
+        // An actual generic, an unavailable producer, and an unknown header cannot borrow the
+        // nongeneric agreement proof. The two omission views must remain distinguishable.
+        let declarations = "package demo\nopen class Parent<T>";
+        let mut parser = crate::parser::KotlinParser::new();
+        index.replace_file(
+            "Parent.kt",
+            crate::indexer::extract_symbols(&parser.parse(declarations), declarations, "demo"),
+            Tier::Volatile,
+        );
+        let ctx = super::FileCtx::new("demo".into(), Vec::new());
+        assert!(matches!(
+            super::declared_type(&index, &java.supertype_refs[0], &ctx),
+            Type::Raw(_)
+        ));
+        assert!(matches!(
+            super::declared_type(&index, &kotlin.supertype_refs[0], &ctx),
+            Type::Class { .. }
+        ));
+        assert_eq!(
+            super::direct_supertypes(&index, &receiver),
+            vec![Type::Unknown]
+        );
+        index.replace_file("Parent.kt", Vec::new(), Tier::Volatile);
+        assert_eq!(
+            super::direct_supertypes(&index, &receiver),
+            vec![Type::Unknown]
+        );
+        parent.type_params.clear();
+        parent.type_parameter_facts = Default::default();
+        index.replace_file("Parent.kt", vec![parent], Tier::Volatile);
+        assert_eq!(
+            super::direct_supertypes(&index, &receiver),
+            vec![Type::Unknown]
+        );
+
+        for (declarations, accepted) in [
+            ("package demo\nclass Outer<T> { inner class Inner }", false),
+            ("package demo\nclass Outer { inner class Inner }", true),
+        ] {
+            let mut parser = crate::parser::KotlinParser::new();
+            index.replace_file(
+                "Outer.kt",
+                crate::indexer::extract_symbols(&parser.parse(declarations), declarations, "demo"),
+                Tier::Volatile,
+            );
+            for symbol in [&mut java, &mut kotlin] {
+                symbol.supertype_refs[0].name = "Inner".into();
+                symbol.supertype_refs[0].qualification = Some("demo.Outer".into());
+            }
+            index.replace_file("Use.java", vec![java.clone()], Tier::Volatile);
+            index.replace_file("Use.kt", vec![kotlin.clone()], Tier::Volatile);
+            let supers = super::direct_supertypes(&index, &receiver);
+            assert_eq!(
+                supers[0] != Type::Unknown,
+                accepted,
+                "{declarations}: {supers:?}"
             );
         }
     }
@@ -6206,13 +6948,14 @@ fn resolve_type_ref_unprojected(
 
         owner: None,
     };
-    match tr.owner.as_deref() {
+    let ty = match tr.owner.as_deref() {
         Some(owner) if depth < MAX_DEPTH => {
             with_instantiated_owner(index, ty, resolve_type_ref(index, owner, ctx, depth + 1))
         }
         Some(_) => Type::Unknown,
         None => ty,
-    }
+    };
+    java_omitted_type(index, ty, tr.java_raw_eligible, depth)
 }
 
 /// Resolve normalized declaration facts without requiring a particular source grammar.
@@ -6377,7 +7120,7 @@ pub fn declared_type_in_scope(
 
                 owner: None,
             };
-            match tr.owner.as_deref() {
+            let ty = match tr.owner.as_deref() {
                 Some(owner) => with_instantiated_owner(
                     index,
                     ty,
@@ -6393,7 +7136,8 @@ pub fn declared_type_in_scope(
                     ),
                 ),
                 None => ty,
-            }
+            };
+            java_omitted_type(index, ty, tr.java_raw_eligible, depth)
         };
         Type::projected(tr.projection, resolved)
     }

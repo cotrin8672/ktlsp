@@ -2212,8 +2212,8 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
-    // v40 intentionally adds is_expect to both layouts. Boxed receivers must still encode like
-    // inline options, followed by source flags; the schema tag invalidates older positional bytes.
+    // Boxed receivers retain inline encoding; optional declaration facts extend the tail.
+    // Old JSON keeps those facts unknown; the schema tag invalidates older positional bytes.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct InlineSymbol {
         name: String,
@@ -2301,6 +2301,10 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         let mut value = serde_json::to_value(&symbol).unwrap();
         value.as_object_mut().unwrap().remove("source_member");
         value.as_object_mut().unwrap().remove("method_type_bounds");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("type_parameter_bounds");
         let inline: InlineSymbol = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&inline).unwrap(), value);
         let inline_bytes = bincode::serialize(&inline).unwrap();
@@ -2311,6 +2315,9 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
             inline_bytes.len()
                 + 1
                 + bincode::serialize(&symbol.method_type_bounds)
+                    .unwrap()
+                    .len()
+                + bincode::serialize(&symbol.type_parameter_bounds)
                     .unwrap()
                     .len()
         );
@@ -2330,10 +2337,12 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
             .as_object_mut()
             .unwrap()
             .remove("kotlin_parameters");
-        assert!(serde_json::from_value::<IndexedSymbol>(absent_names)
-            .unwrap()
-            .kotlin_parameters
-            .is_none());
+        assert!(
+            serde_json::from_value::<IndexedSymbol>(absent_names)
+                .unwrap()
+                .kotlin_parameters
+                .is_none()
+        );
         let mut absent_facts = value.clone();
         absent_facts
             .as_object_mut()
@@ -2345,12 +2354,20 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         let mut defaulted = symbol.clone();
         defaulted.source_member = Default::default();
         defaulted.method_type_bounds = None;
+        defaulted.type_parameter_bounds = None;
+        assert!(
+            serde_json::from_value::<IndexedSymbol>(value.clone())
+                .unwrap()
+                .type_parameter_bounds
+                .is_none()
+        );
         assert_eq!(
             serde_json::from_value::<IndexedSymbol>(value).unwrap(),
             defaulted
         );
     }
 }
+
 
 fn assert_known_leaf_binary_override(java_caller: bool) {
     use std::io::Write;

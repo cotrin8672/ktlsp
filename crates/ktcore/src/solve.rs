@@ -37,6 +37,10 @@ pub fn unify_into(
             .or_insert_with(|| actual.clone());
         return;
     }
+    // Binding a whole variable above preserves raw identity; structural matching cannot erase it.
+    if matches!(actual, Type::Raw(_)) {
+        return;
+    }
     if Some(formal.name.as_str()) == actual.name() {
         if let (Some(formal), Some(actual)) = (formal.owner.as_deref(), actual.owner()) {
             unify_into(formal, actual, tparams, subst);
@@ -79,9 +83,9 @@ struct Constraint<'a> {
     actual: &'a Type,
 }
 
-/// A bounded local slice, not a global solver: equality plus one identical lower candidate.
-/// All collected constraints are rechecked after choosing a candidate. Upper-only variables,
-/// capture conversion and different lower candidates cannot manufacture an exact type.
+/// A bounded local slice: equality, an identical lower, or a proven most-specific upper.
+/// All collected constraints are rechecked after choosing a candidate. Capture conversion,
+/// incomparable upper bounds and different lower candidates cannot manufacture an exact type.
 pub fn constrain_application(
     formals: &[TypeRef],
     actuals: &[Type],
@@ -90,7 +94,7 @@ pub fn constrain_application(
     known_unbounded: bool,
     mut resolve: impl FnMut(&TypeRef) -> Type,
     mut known: impl FnMut(&Type) -> bool,
-    mut invariant: impl FnMut(&Type) -> bool,
+    mut constructor_supported: impl FnMut(&Type, &[TypeRef]) -> bool,
     mut subtype: impl FnMut(&Type, &Type) -> bool,
     mut distinct: impl FnMut(&Type, &Type) -> bool,
 ) -> Application {
@@ -115,7 +119,7 @@ pub fn constrain_application(
         constraints: &mut Vec<Constraint<'a>>,
         resolve: &mut impl FnMut(&TypeRef) -> Type,
         known: &mut impl FnMut(&Type) -> bool,
-        invariant: &mut impl FnMut(&Type) -> bool,
+        constructor_supported: &mut impl FnMut(&Type, &[TypeRef]) -> bool,
         subtype: &mut impl FnMut(&Type, &Type) -> bool,
         distinct: &mut impl FnMut(&Type, &Type) -> bool,
         depth: usize,
@@ -161,6 +165,10 @@ pub fn constrain_application(
             });
             return ConstraintStatus::Matched;
         }
+        // Raw values may bind a whole variable above, but never expose erased arguments.
+        if matches!(actual, Type::Raw(_)) {
+            return ConstraintStatus::Unknown;
+        }
         let resolved = resolve(formal);
         if resolved.name().is_none() || actual.name().is_none() {
             return ConstraintStatus::Unknown;
@@ -197,7 +205,7 @@ pub fn constrain_application(
                     constraints,
                     resolve,
                     known,
-                    invariant,
+                    constructor_supported,
                     subtype,
                     distinct,
                     depth + 1,
@@ -215,7 +223,7 @@ pub fn constrain_application(
         if formal.args.is_empty() && (!known(&resolved) || !known(actual)) {
             return ConstraintStatus::Unknown;
         }
-        if !formal.args.is_empty() && !invariant(actual) {
+        if !formal.args.is_empty() && !constructor_supported(actual, &formal.args) {
             return ConstraintStatus::Unknown;
         }
         formal
@@ -234,7 +242,7 @@ pub fn constrain_application(
                         constraints,
                         resolve,
                         known,
-                        invariant,
+                        constructor_supported,
                         subtype,
                         distinct,
                         depth + 1,
@@ -279,7 +287,7 @@ pub fn constrain_application(
                 &mut constraints,
                 &mut resolve,
                 &mut known,
-                &mut invariant,
+                &mut constructor_supported,
                 &mut subtype,
                 &mut distinct,
                 0,
@@ -317,7 +325,32 @@ pub fn constrain_application(
                 Relation::Upper => {}
             }
         }
-        let candidate = equal.or_else(|| (!different_lowers).then_some(lower).flatten());
+        let candidate = equal
+            .or_else(|| (!different_lowers).then_some(lower).flatten())
+            .or_else(|| {
+                if lower.is_some() {
+                    return None;
+                }
+                let uppers = || {
+                    constraints.iter().filter(|constraint| {
+                        constraint.parameter == parameter.as_str()
+                            && constraint.relation == Relation::Upper
+                    })
+                };
+                let mut chosen: Option<&Type> = None;
+                for constraint in uppers() {
+                    if uppers().all(|bound| {
+                        constraint.actual == bound.actual
+                            || subtype(constraint.actual, bound.actual)
+                    }) {
+                        if chosen.is_some_and(|previous| previous != constraint.actual) {
+                            return None;
+                        }
+                        chosen = Some(constraint.actual);
+                    }
+                }
+                chosen
+            });
         if let Some(candidate) = candidate {
             for constraint in constraints
                 .iter()
@@ -380,6 +413,7 @@ mod tests {
     fn binds_through_matching_head() {
         // formal List<T> vs actual List<Foo> binds T := Foo.
         let formal = TypeRef {
+            java_raw_eligible: false,
             name: "List".into(),
             projection: Default::default(),
             qualification: None,

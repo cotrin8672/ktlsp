@@ -408,6 +408,14 @@ fn substitute_type_ref(tr: &TypeRef, bindings: &HashMap<String, Type>) -> TypeRe
 
 fn type_to_type_ref(ty: &Type) -> TypeRef {
     match ty {
+        Type::Raw(nominal) => {
+            if !matches!(nominal.as_ref(), Type::Class { args, .. } if args.is_empty()) {
+                return TypeRef::default();
+            }
+            let mut reference = type_to_type_ref(nominal);
+            reference.java_raw_eligible = true;
+            reference
+        }
         Type::Class {
             name,
             package,
@@ -417,6 +425,7 @@ fn type_to_type_ref(ty: &Type) -> TypeRef {
             owner,
             ..
         } => TypeRef {
+            java_raw_eligible: false,
             name: name.clone(),
             projection: Default::default(),
             qualification: None,
@@ -787,6 +796,7 @@ fn synth_arg_types(
 
 fn type_label(ty: &Type) -> Option<String> {
     match ty {
+        Type::Raw(nominal) => type_label(nominal),
         Type::Class {
             name,
             nullable,

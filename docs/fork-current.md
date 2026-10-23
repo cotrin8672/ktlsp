@@ -10,6 +10,126 @@ C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda.
 
 ## Active Unknown coverage
 
+### Slice130/131: shared Unknown fixes; release editor replay in progress
+
+Last published implementation remains f7fd11d, with the accepted24-2 binary below.
+The working tree now passes the full workspace suite and release build in
+`native-integrated120-25-2`:1804 PASS/0 FAIL/9 ignored across42 targets.
+All576 source guards are stable. The immutable release binary SHA256 is
+`0a4ee2c376aeeec66ceaaa3769fddb5d0b94112bfa19bf410bcbeb74413ac4b0`.
+Same-release editor acceptance remains in progress; these Rust results do not
+establish that the28 previously missing editor results are fixed.
+`joint-unknown130-focused5` closes with7 passing focused tests (interop4, core2,
+namespace1). Subsequent compiler evidence exposes Kotlin class-first JVM erasure
+for interface-before-class source bounds, so that result is not final acceptance
+of the expanded raw slice. The normalized erasure-policy correction and its
+focused verification are in progress before the full workspace/release run.
+The completed final focused run is `joint-unknown130-focused8`:8 PASS with stable
+inputs and closed owned jobs. The first broad run, `native-integrated120-25`, is
+preserved as1801 PASS/3 FAIL/9 ignored across42 targets; release is not built.
+Failures were the existing actual-Create binary hierarchy query, Java generic class
+literal representation, and legacy optional-field wire comparison. All three now
+pass in the16-check focused regression run and the full25-2 workspace suite.
+The hierarchy change only equates raw-provenance differences for proven nongeneric
+declarations, retaining uncertainty for generic and unproven owners. Java class
+literals are independently Javac-certified as Class<raw Box>, including raw array
+components. The optional field remains unknown when absent. Next replay the
+unchanged controlled32 editor requests and the CEM/five-project acceptance cases.
+
+| Case | Independent expectation / observed / next action |
+| --- | --- |
+| Lower-projected Class argument (`? super T` / `in T`) |Javac/Kotlin certify4 API/consumer pairs and8 ordered Base/Derived two-upper cases. Candidate selection now uses a uniquely proven candidate satisfying every upper, followed by all constraint checks. Focused, full workspace and unchanged release editor probes pass. |
+| Raw generic Java receiver |Javac/Kotlin certify bound-member reads/calls, with erased Item return even for a SubItem argument. Raw provenance, ordered class bounds and whole instance-signature erasure are now retained in shared facts; cache v47 invalidates older representations. Static generics retain ordinary inference; stars are a different contract. Focused/full checks and release completion/exact goto pass. |
+| Declaration variance |Both compiler-certified Variant cases now pass the unchanged release completion/exact-goto probes. Shared normalized declaration facts carry variance; incomplete and incompatible arguments retain uncertainty. |
+| Raw Kotlin declaration viewed from Java/Kotlin |`raw-bound130-korder-oracle3` proves different views: source `T : KLeft, T : Item` erases to JVM Item for Java, while Kotlin consuming a Java raw factory exposes KLeft and inserts a checkcast after the Item-returning invocation. Java useful/leftOnly and Kotlin leftOnly/useful positive/negative consumers are compiled separately. Share the erasure algorithm with explicit caller mode; never expose Item members in the Kotlin case merely because its JVM descriptor is Item. |
+
+Evidence: `projected-upper130-oracle{1,2}`, `raw-bound129-{oracle1,subitem-oracle1,independent-oracle1}`.
+`joint-unknown130-red1` retains both failures: the upper failure is a real missing
+result, while the initial raw failure is test setup (a Kotlin-only expression helper
+was used for Java). The corrected raw regression uses the existing Java-aware
+completion/navigation queries; no parser framework was added.
+
+`unknown130-editor-baseline24/receipt.json` now proves these missing results in
+actual Neovim using the unchanged accepted24-2 executable: 14 valid source contexts
+(8 raw,4 upper-only,2 variance), each with incomplete completion and exact source
+goto. All28 first RPCs return a semantic mismatch, with no unmeasured/not-run
+request, protocol error, forced cleanup or guard drift. The28 passing assertions
+are exclusion controls, not successful useful completions. Inputs copy the
+compiler-certified original source bytes; `unknown130-editor-inputs/prepared.json`
+pins them and the existing compiler receipts. A separate controlled run,
+`unknown130-editor-controlled-baseline24/positive-audit.json`, prepends4 direct
+Item completion/goto controls in the same Java/Kotlin buffers: all4 succeed,
+including sole exact source goto, while all28 gap requests still mismatch on
+their first responses. This distinguishes missing generic results from an
+unavailable project index. The unchanged controlled32-request manifest now passes
+on release25-2 in `unknown130-editor-controlled-release25/receipt.json`:
+32 first responses,60 semantic assertions,0 mismatched/unmeasured/not-run, and
+all16 goto results point solely to the exact source file/token/range. Both first
+baseline observations remain preserved. The release run exits0 with clean
+shutdown, EOF, owned-live0, no forced cleanup and unchanged guarded inputs.
+
+Other same25-2 evidence now closed:
+
+- `java-kotlin-msc121-release25/summary.json`:427/427 assertions,61 first member
+  requests, no errors, clean shutdown/EOF/owned-live0 and stable guards.
+- `cem-startup120/release25-2-semantic-handoff.json`:38 assertions across the
+  original26, getValue8 and TypeTools4;21 first responses, no retries, no missing
+  result or forced cleanup. All three NeoForge archive snapshots retain bytes,
+  SHA and mtime. Canonical diagnostics are accepted in the original phases;
+  producer closure and whole-API authority are not thereby established.
+- `external-public132-25/cargo-receipt.json`:the actual external manifest and its
+  own unchanged lock compile offline/locked,4 tests pass and the debug build
+  succeeds. External target is outside the checkout. Its `editor-receipt.json`
+  proves the unchanged original50+shape40 requests all pass on their first
+  responses,144 semantic assertions,0 mismatched/unmeasured/not-run and clean
+  shutdown/EOF/owned-live0. Actual upstream Mixin annotation inputs also compile
+  with Javac and Kotlin. This is an independently compiled test extension, not a
+  production Mixin implementation or a claim of a stable binary plugin ABI.
+- Five-project replay remains in progress; Gradle/Moshi18 and OkHttp/Retrofit22
+  first responses pass, with Spring still pending. Source-coverage failures remain
+  separate from selected semantic success.
+
+Next reproduced valid-code gap: `named-tail132-inputs/compiler-receipt.json`
+certifies `shapes.tail(second=right,first=left) {}.service()` with Kotlin2.4.
+`named-tail132-editor-red25-2/receipt.json` receives all4 first responses: the
+known receiver completion/exact-goto controls pass, but both trailing-lambda
+result requests return null. Fix shared argument binding after this checkpoint;
+do not treat this valid call as a passing Unknown negative.
+
+Additional same24-2 checks now complete:
+
+- Gradle reload90/90,61 requests,4 actual offline builds. Latest generations,
+  changed dependency/source JAR SHA values, generated-source addition/removal,
+  dirty Kotlin preservation and current Java canonical diagnostic/withdrawal are
+  recorded in `gradle-reload130-release24/state-proof.json`. This covers versioned
+  dependency path changes; same-path overwrite is outside that case.
+- A separate same-path run now verifies2 actual offline builds with unchanged
+  dependency configuration and archive absolute paths but changed binary/source
+  contents. Java/Kotlin new completion/exact goto, old-member withdrawal,
+  diagnostics and dirty-buffer preservation pass. The original47-check run stays
+ 46 PASS/1 unmeasured canonical certificate, not47 PASS. For that final check the
+  exact-version fast diagnostic is already displayed at the correct Unicode
+  range and agrees with the actual completed Javac error for the same source SHA
+  and new archive. `same-path131-release24/ux-versus-canonical-audit.json` binds
+  archive entries, source identities and both observations. No missing/incorrect
+  user diagnostic is reproduced; no product admission expansion is added merely
+  to satisfy that internal certificate gate. The original receipt is preserved.
+- New IDEA targets2/2 match on their first responses, using pinned ILS263.6379.0 /
+  plugin9cfad180. Persister selects its sole Class/String declaration; the Kotlin
+  qualifier navigates to ContextFactory's class. Actual source/decompiled text is
+  read. Both IDEA client shutdowns fail; native servers eventually exit and exact
+  owned Java residuals need cleanup. These operational failures are not hidden by
+  semantic success. `idea-new130/semantic-comparison-summary.json` records pins,
+  actual process identity, first requests and cleanup; prelaunch adapter failures
+  have zero semantic RPCs and remain separate.
+
+`fallback-api128/consumer-source-set-classpath-proof.json` additionally binds the
+Retrofit consumer to simplexml/main and both Spring consumers to integration-tests/test.
+The exact JARs occur in those source sets' compileClasspath and Java task classpaths.
+Spring's Kotlin task-specific classpath snapshot transform is incomplete; that task
+execution is not claimed. IDEA's successful imported Kotlin class navigation supplies
+an independent editor observation, not a substitute for the unrun compiler task.
+
 ### Checkpoint120-24-2: three shared analysis gaps fixed
 
 Workspace1803 PASS,0 FAIL,9 ignored across42 targets; release builds successfully.
@@ -72,6 +192,11 @@ The original unmeasured run is preserved, and the control is not presented as th
 run's first-pass success. No product change or extended observation budget was used
 to obtain the control result. The effect of overlapping model refresh remains a
 separate investigation rather than a proven compiler correctness regression.
+`cem-startup120/canonical24-control-causality.json` distinguishes the observations:
+the first has one selected-jar notification and generation2 never reaches observed
+completion; each control phase has no selected-jar notification, one completed
+generation and one canonical Java receipt/manual pull. The control therefore does
+not prove content-based notification deduplication or recovery from that refresh.
 
 Evidence: `native-integrated120-24-2`, `java-kotlin-msc121-release24`,
 `final-corpus120-24/summary50.json`, `captured-owner128-native24/receipt.json`,

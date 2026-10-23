@@ -87,6 +87,9 @@ pub struct TypeRef {
     pub package_candidates: Arc<Vec<String>>,
     #[serde(default)]
     pub container_candidates: Vec<String>,
+    /// Java syntax omitted type arguments; resolution must still prove a generic declaration.
+    #[serde(default)]
+    pub java_raw_eligible: bool,
 }
 
 impl TypeRef {
@@ -115,6 +118,7 @@ impl TypeRef {
             container_candidates: Vec::new(),
 
             owner: None,
+            java_raw_eligible: false,
         }
     }
 }
@@ -130,6 +134,61 @@ pub struct TypeParameterBounds {
     pub scope_end: usize,
     pub upper_bounds: Vec<TypeRef>,
     pub complete: bool,
+    /// Declared variance, independently of use-site projections. Legacy facts remain unknown.
+    #[serde(default)]
+    pub variance: Option<Projection>,
+    /// JVM bound selection supplied by the producer; absent legacy facts cannot prove erasure.
+    #[serde(default)]
+    pub erasure: Option<ParameterErasure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParameterErasure {
+    FirstBound,
+    ClassFirst,
+}
+
+/// Keep a declaration's own facts while retaining lexical blockers from static/nested scopes.
+pub fn own_parameter_bounds(
+    parameters: Vec<TypeParameterBounds>,
+    names: &[String],
+    start: usize,
+    end: usize,
+) -> Option<Box<Vec<TypeParameterBounds>>> {
+    fn accessible(reference: &TypeRef, parameters: &[TypeParameterBounds]) -> bool {
+        (reference.qualification.is_some()
+            || parameters
+                .iter()
+                .find(|parameter| parameter.name == reference.name)
+                .is_none_or(|parameter| parameter.complete))
+            && reference
+                .owner
+                .as_deref()
+                .is_none_or(|owner| accessible(owner, parameters))
+            && reference
+                .args
+                .iter()
+                .all(|argument| accessible(argument, parameters))
+    }
+    let own: Vec<_> = parameters
+        .iter()
+        .filter(|parameter| parameter.scope_start == start && parameter.scope_end == end)
+        .map(|parameter| {
+            let mut own = parameter.clone();
+            own.complete &= own
+                .upper_bounds
+                .iter()
+                .all(|bound| accessible(bound, &parameters));
+            own
+        })
+        .collect();
+    (!names.is_empty()
+        && own.len() == names.len()
+        && own
+            .iter()
+            .zip(names)
+            .all(|(parameter, name)| parameter.name == *name))
+    .then(|| Box::new(own))
 }
 
 /// Keep `T` distinct from `T?` even when an implicit `Any?` bound makes both nullable.
@@ -142,6 +201,8 @@ pub enum ParameterNullability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
+    /// Proven Java raw use. Keep it opaque to ordinary generic equality and inference.
+    Raw(Box<Type>),
     /// A Java array has structural rank and a component, without an indexed nominal owner.
     Array {
         component: Box<Type>,
@@ -212,6 +273,7 @@ impl Type {
 
     pub fn name(&self) -> Option<&str> {
         match self {
+            Type::Raw(inner) => inner.name(),
             Type::Class { name, .. } => Some(name),
             Type::Unknown
             | Type::Array { .. }
@@ -223,6 +285,7 @@ impl Type {
 
     pub fn package(&self) -> Option<&str> {
         match self {
+            Type::Raw(inner) => inner.package(),
             Type::Class { package, .. } => package.as_deref(),
             Type::Unknown
             | Type::Array { .. }
@@ -234,6 +297,7 @@ impl Type {
 
     pub fn container(&self) -> Option<&str> {
         match self {
+            Type::Raw(inner) => inner.container(),
             Type::Class { container, .. } => container.as_deref(),
             Type::Unknown
             | Type::Array { .. }
@@ -244,6 +308,9 @@ impl Type {
     }
 
     pub fn is_nullable(&self) -> bool {
+        if let Type::Raw(inner) = self {
+            return inner.is_nullable();
+        }
         matches!(
             self,
             Type::Class { nullable: true, .. }
@@ -256,12 +323,13 @@ impl Type {
     pub fn is_member_receiver(&self) -> bool {
         matches!(
             self,
-            Type::Class { .. } | Type::Parameter { .. } | Type::Array { .. }
+            Type::Class { .. } | Type::Parameter { .. } | Type::Array { .. } | Type::Raw(_)
         )
     }
 
     pub fn with_nullability(mut self, value: bool) -> Self {
         match &mut self {
+            Type::Raw(inner) => **inner = inner.clone().with_nullability(value),
             Type::Parameter {
                 nullable,
                 nullability,
@@ -283,7 +351,7 @@ impl Type {
     pub fn owner(&self) -> Option<&Type> {
         match self {
             Type::Class { owner, .. } => owner.as_deref(),
-            Type::Projected { bound, .. } => bound.owner(),
+            Type::Projected { bound, .. } | Type::Raw(bound) => bound.owner(),
             _ => None,
         }
     }
@@ -291,6 +359,7 @@ impl Type {
     pub fn args(&self) -> &[Type] {
         match self {
             Type::Class { args, .. } => args,
+            Type::Raw(inner) => inner.args(),
             Type::Unknown
             | Type::Array { .. }
             | Type::Parameter { .. }

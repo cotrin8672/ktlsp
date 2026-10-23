@@ -18,7 +18,10 @@ const KOTLIN_BOX: &str =
 #[test]
 fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
     let mut ws = workspace(&[
-        ("T.java", "package app; public class T { public void poison() {} }"),
+        (
+            "T.java",
+            "package app; public class T { public void poison() {} }",
+        ),
         (
             "Item.java",
             "package app; public class Item { public void useful() {} }",
@@ -71,34 +74,89 @@ fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
                 )
                 .contains("usefulWrong")
             );
-            assert_member(&mut ws, file, &format!("{receiver}.related(item).useful"), "useful", "usefulWrong");
-            let member = ws.index.lookup_by_name("useful").iter().find(|entry| entry.path.as_ref() == "Item.java").unwrap();
-            let expected = ktlsp::symbol::Def { file: "Item.java".into(), start_byte: member.sym.start_byte, end_byte: member.sym.end_byte };
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.related(item).useful"),
+                "useful",
+                "usefulWrong",
+            );
+            let member = ws
+                .index
+                .lookup_by_name("useful")
+                .iter()
+                .find(|entry| entry.path.as_ref() == "Item.java")
+                .unwrap();
+            let expected = ktlsp::symbol::Def {
+                file: "Item.java".into(),
+                start_byte: member.sym.start_byte,
+                end_byte: member.sym.end_byte,
+            };
             let prefix = format!("{receiver}.related(item).useful");
-            assert_eq!(ws.goto_definition(file, source.find(&prefix).unwrap() + prefix.len() - "useful".len()), vec![expected]);
-            assert!(!labels(&mut ws, file, &format!("{receiver}.related(other).usefulWrong")).contains("usefulWrong"));
+            assert_eq!(
+                ws.goto_definition(
+                    file,
+                    source.find(&prefix).unwrap() + prefix.len() - "useful".len()
+                ),
+                vec![expected]
+            );
+            assert!(
+                !labels(
+                    &mut ws,
+                    file,
+                    &format!("{receiver}.related(other).usefulWrong")
+                )
+                .contains("usefulWrong")
+            );
         }
         let java_box = ws.doc_text("Box.java").unwrap().to_string();
         let kotlin_box = ws.doc_text("KotlinBox.kt").unwrap().to_string();
-        ws.change("Box.java", java_box.replace("<U extends T>", "<U extends Other>"));
+        ws.change(
+            "Box.java",
+            java_box.replace("<U extends T>", "<U extends Other>"),
+        );
         ws.change("KotlinBox.kt", kotlin_box.replace("<U: T>", "<U: Other>"));
         for receiver in ["java", "kotlin"] {
-            assert_member(&mut ws, file, &format!("{receiver}.related(other).usefulWrong"), "usefulWrong", "useful");
-            assert!(!labels(&mut ws, file, &format!("{receiver}.related(item).useful")).contains("useful"));
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.related(other).usefulWrong"),
+                "usefulWrong",
+                "useful",
+            );
+            assert!(
+                !labels(&mut ws, file, &format!("{receiver}.related(item).useful"))
+                    .contains("useful")
+            );
         }
         ws.change("Box.java", java_box);
         ws.change("KotlinBox.kt", kotlin_box);
         for receiver in ["java", "kotlin"] {
-            assert_member(&mut ws, file, &format!("{receiver}.related(item).useful"), "useful", "usefulWrong");
+            assert_member(
+                &mut ws,
+                file,
+                &format!("{receiver}.related(item).useful"),
+                "useful",
+                "usefulWrong",
+            );
         }
     }
     for (file, source) in [
-        ("Raw.java", "package app; class Raw { void use(Box java, KotlinBox kotlin, T poison) { java.related(poison).poison(); kotlin.related(poison).poison(); } }"),
-        ("Star.kt", "package app\nfun raw(java: Box<*>, kotlin: KotlinBox<*>, poison: T) { java.related(poison).poison(); kotlin.related(poison).poison() }"),
+        (
+            "Raw.java",
+            "package app; class Raw { void use(Box java, KotlinBox kotlin, T poison) { java.related(poison).poison(); kotlin.related(poison).poison(); } }",
+        ),
+        (
+            "Star.kt",
+            "package app\nfun raw(java: Box<*>, kotlin: KotlinBox<*>, poison: T) { java.related(poison).poison(); kotlin.related(poison).poison() }",
+        ),
     ] {
         ws.open(file, source.into());
         for receiver in ["java", "kotlin"] {
-            assert!(!labels(&mut ws, file, &format!("{receiver}.related(poison).poison")).contains("poison"));
+            assert!(
+                !labels(&mut ws, file, &format!("{receiver}.related(poison).poison"))
+                    .contains("poison")
+            );
         }
     }
     ws.open("JavaCycle.java", "package app; class JavaCycle { public <U extends V, V extends U> U cycle(U value) { return value; } }".into());
@@ -107,56 +165,569 @@ fn bounded_method_arguments_share_nominal_bounds_and_method_shadowing() {
         "package app\nclass KotlinCycle { fun <U: V, V: U> cycle(value: U): U = value }".into(),
     );
     for (file, source) in [
-        ("Cycles.java", "package app; class Cycles { void use(JavaCycle java, KotlinCycle kotlin, Item item) { java.cycle(item).useful(); kotlin.cycle(item).useful(); } }"),
-        ("Cycles.kt", "package app\nfun cycles(java: JavaCycle, kotlin: KotlinCycle, item: Item) { java.cycle(item).useful(); kotlin.cycle(item).useful() }"),
+        (
+            "Cycles.java",
+            "package app; class Cycles { void use(JavaCycle java, KotlinCycle kotlin, Item item) { java.cycle(item).useful(); kotlin.cycle(item).useful(); } }",
+        ),
+        (
+            "Cycles.kt",
+            "package app\nfun cycles(java: JavaCycle, kotlin: KotlinCycle, item: Item) { java.cycle(item).useful(); kotlin.cycle(item).useful() }",
+        ),
     ] {
         ws.open(file, source.into());
         for receiver in ["java", "kotlin"] {
-            assert!(!labels(&mut ws, file, &format!("{receiver}.cycle(item).useful")).contains("useful"));
+            assert!(
+                !labels(&mut ws, file, &format!("{receiver}.cycle(item).useful"))
+                    .contains("useful")
+            );
         }
     }
     let mut captured = workspace(&[
-        ("Item.java", "package app; public class Item { public void useful() {} }"),
-        ("Other.java", "package app; public class Other { public void usefulWrong() {} }"),
-        ("T.java", "package app; public class T { public void poison() {} }"),
-        ("Outer.java", "package app; public class Outer<T extends Item> { public class Inner { public <U extends T> U related(U value) { return value; } } }"),
-        ("KotlinOuter.kt", "package app\nclass KotlinOuter<T: Item> { inner class Inner { fun <U: T> related(value: U): U = value } }"),
+        ("Object.java", "package java.lang; public class Object {}"),
+        (
+            "Item.java",
+            "package app; public class Item { public void useful() {} }",
+        ),
+        (
+            "Other.java",
+            "package app; public class Other { public void usefulWrong() {} }",
+        ),
+        (
+            "T.java",
+            "package app; public class T { public void poison() {} }",
+        ),
+        (
+            "Outer.java",
+            "package app; public class Outer<T extends Item> { public class Inner { public <U extends T> U related(U value) { return value; } } }",
+        ),
+        (
+            "KotlinOuter.kt",
+            "package app\nclass KotlinOuter<T: Item> { inner class Inner { fun <U: T> related(value: U): U = value } }",
+        ),
     ]);
     for (file, source) in [
-        ("Captured.java", "package app; class Captured { void use(Outer<Item>.Inner java, KotlinOuter<Item>.Inner kotlin, Item item, Other other) { java.related(item).useful(); kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong(); } }"),
-        ("Captured.kt", "package app\nfun use(java: Outer<Item>.Inner, kotlin: KotlinOuter<Item>.Inner, item: Item, other: Other) { java.related(item).useful(); kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong() }"),
+        (
+            "Captured.java",
+            "package app; class Captured { void use(Outer<Item>.Inner java, KotlinOuter<Item>.Inner kotlin, Item item, Other other) { java.related(item).useful(); kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong(); } }",
+        ),
+        (
+            "Captured.kt",
+            "package app\nfun use(java: Outer<Item>.Inner, kotlin: KotlinOuter<Item>.Inner, item: Item, other: Other) { java.related(item).useful(); kotlin.related(item).useful(); java.related(other).usefulWrong(); kotlin.related(other).usefulWrong() }",
+        ),
     ] {
         captured.open(file, source.into());
         for receiver in ["java", "kotlin"] {
             let prefix = format!("{receiver}.related(item).useful");
             assert_member(&mut captured, file, &prefix, "useful", "usefulWrong");
-            let item = captured.index.lookup_by_name("useful").iter().find(|entry| entry.path.as_ref() == "Item.java").unwrap();
-            let expected = ktlsp::symbol::Def { file: "Item.java".into(), start_byte: item.sym.start_byte, end_byte: item.sym.end_byte };
-            assert_eq!(captured.goto_definition(file, source.find(&prefix).unwrap() + prefix.len() - "useful".len()), vec![expected]);
-            assert!(!labels(&mut captured, file, &format!("{receiver}.related(other).usefulWrong")).contains("usefulWrong"));
+            let item = captured
+                .index
+                .lookup_by_name("useful")
+                .iter()
+                .find(|entry| entry.path.as_ref() == "Item.java")
+                .unwrap();
+            let expected = ktlsp::symbol::Def {
+                file: "Item.java".into(),
+                start_byte: item.sym.start_byte,
+                end_byte: item.sym.end_byte,
+            };
+            assert_eq!(
+                captured.goto_definition(
+                    file,
+                    source.find(&prefix).unwrap() + prefix.len() - "useful".len()
+                ),
+                vec![expected]
+            );
+            assert!(
+                !labels(
+                    &mut captured,
+                    file,
+                    &format!("{receiver}.related(other).usefulWrong")
+                )
+                .contains("usefulWrong")
+            );
         }
     }
     for (file, source) in [
-        ("CapturedRaw.java", "package app; class CapturedRaw { void use(Outer.Inner java, KotlinOuter.Inner kotlin, T poison) { java.related(poison).poison(); kotlin.related(poison).poison(); } }"),
-        ("CapturedStar.kt", "package app\nfun raw(java: Outer<*>.Inner, kotlin: KotlinOuter<*>.Inner, poison: T) { java.related(poison).poison(); kotlin.related(poison).poison() }"),
+        (
+            "CapturedRaw.java",
+            "package app; class CapturedRaw { void use(Outer.Inner java, KotlinOuter.Inner kotlin, T poison) { java.related(poison).poison(); kotlin.related(poison).poison(); } }",
+        ),
+        (
+            "CapturedStar.kt",
+            "package app\nfun raw(java: Outer<*>.Inner, kotlin: KotlinOuter<*>.Inner, poison: T) { java.related(poison).poison(); kotlin.related(poison).poison() }",
+        ),
     ] {
         captured.open(file, source.into());
         for receiver in ["java", "kotlin"] {
-            assert!(!labels(&mut captured, file, &format!("{receiver}.related(poison).poison")).contains("poison"));
+            assert!(
+                !labels(
+                    &mut captured,
+                    file,
+                    &format!("{receiver}.related(poison).poison")
+                )
+                .contains("poison")
+            );
         }
     }
     for (file, source) in [
-        ("StaticOuter.java", "package app; public class StaticOuter<T extends Item> { public static class Inner { public <U extends T> U blocked(U value) { return value; } } }"),
-        ("StaticMethod.java", "package app; public class StaticMethod<T extends Item> { public class Inner { public static <U extends T> U blocked(U value) { return value; } } }"),
-        ("NestedOuter.kt", "package app\nclass NestedOuter<T: Item> { class Inner { fun <U: T> blocked(value: U): U = value } }"),
-        ("InterfaceOuter.java", "package app; public interface InterfaceOuter<T extends Item> { class Inner { public <U extends T> U blocked(U value) { return value; } } }"),
-        ("AnnotationOuter.java", "package app; public class AnnotationOuter<T extends Item> { public @interface Nest { class Inner { public <U extends T> U blocked(U value) { return value; } } } }"),
+        (
+            "StaticOuter.java",
+            "package app; public class StaticOuter<T extends Item> { public static class Inner { public <U extends T> U blocked(U value) { return value; } } }",
+        ),
+        (
+            "StaticMethod.java",
+            "package app; public class StaticMethod<T extends Item> { public class Inner { public static <U extends T> U blocked(U value) { return value; } } }",
+        ),
+        (
+            "NestedOuter.kt",
+            "package app\nclass NestedOuter<T: Item> { class Inner { fun <U: T> blocked(value: U): U = value } }",
+        ),
+        (
+            "InterfaceOuter.java",
+            "package app; public interface InterfaceOuter<T extends Item> { class Inner { public <U extends T> U blocked(U value) { return value; } } }",
+        ),
+        (
+            "AnnotationOuter.java",
+            "package app; public class AnnotationOuter<T extends Item> { public @interface Nest { class Inner { public <U extends T> U blocked(U value) { return value; } } } }",
+        ),
     ] {
         captured.open(file, source.into());
-        let entry = captured.index.lookup_by_name("blocked").iter().find(|entry| entry.path.as_ref() == file).unwrap();
-        assert!(entry.sym.method_type_bounds.is_none(), "{file}: inaccessible outer type variable");
+        let entry = captured
+            .index
+            .lookup_by_name("blocked")
+            .iter()
+            .find(|entry| entry.path.as_ref() == file)
+            .unwrap();
+        assert!(
+            entry.sym.method_type_bounds.is_none(),
+            "{file}: inaccessible outer type variable"
+        );
+        assert!(
+            entry
+                .sym
+                .type_parameter_bounds
+                .as_deref()
+                .unwrap()
+                .iter()
+                .any(|parameter| !parameter.complete),
+            "{file}: raw erasure must retain inaccessible lexical blockers"
+        );
+    }
+
+    // Raw Java receivers erase method variables too; a SubItem argument must not leak subOnly.
+    captured.open("Box.java", "package app; public class Box<T extends Item> { public T get() { return null; } public <U extends T> U related(U value) { return value; } public <U> U independent(U value) { return value; } public static <U> U stat(U value) { return value; } public static Object takeObject(Object value) { return value; } public java.util.List<String> concrete() { return null; } }".into());
+    captured.open(
+        "List.java",
+        "package java.util; public interface List<E> { E get(int i); }".into(),
+    );
+    captured.open("Outer.java", "package app; public class Outer<T extends Item> { public class Inner { public T get() { return null; } public <U extends T> U related(U value) { return value; } } }".into());
+    captured.open(
+        "SubItem.java",
+        "package app; public class SubItem extends Item { public void subOnly() {} }".into(),
+    );
+    captured.open("RawFactory.java", "package app; public class RawFactory { public static Box box() { return null; } public static Outer.Inner inner() { return null; } }".into());
+    for (file, source, receivers) in [
+        (
+            "RawValid.java",
+            "package app; class RawValid { void use(Box box, Outer.Inner inner, Item item, SubItem sub, Other other, T poison) { box.get().useful(); box.related(item).useful(); box.related(sub).useful(); box.related(sub).subOnly(); box.related(other).usefulWrong(); box.related(poison).poison(); inner.get().useful(); inner.related(item).useful(); inner.related(sub).useful(); inner.related(sub).subOnly(); inner.related(other).usefulWrong(); inner.related(poison).poison(); } }",
+            ["box", "inner"],
+        ),
+        (
+            "RawFactoryUse.kt",
+            "package app\nfun raw(item: Item, sub: SubItem, other: Other, poison: T) { RawFactory.box().get().useful(); RawFactory.box().related(item).useful(); RawFactory.box().related(sub).useful(); RawFactory.box().related(sub).subOnly(); RawFactory.box().related(other).usefulWrong(); RawFactory.box().related(poison).poison(); RawFactory.inner().get().useful(); RawFactory.inner().related(item).useful(); RawFactory.inner().related(sub).useful(); RawFactory.inner().related(sub).subOnly(); RawFactory.inner().related(other).usefulWrong(); RawFactory.inner().related(poison).poison() }",
+            ["RawFactory.box()", "RawFactory.inner()"],
+        ),
+    ] {
+        captured.open(file, source.into());
+        for receiver in receivers {
+            for call in ["get()", "related(item)", "related(sub)"] {
+                let expression = format!("{receiver}.{call}");
+                if file.ends_with(".kt") {
+                    assert_eq!(
+                        infer_expression(&captured, file, &expression),
+                        Type::class("Item", Some("app".into())),
+                        "{file}: {expression}: raw receiver retains its erased return",
+                    );
+                }
+                assert_member(
+                    &mut captured,
+                    file,
+                    &format!("{expression}."),
+                    "useful",
+                    "subOnly",
+                );
+                let entry = captured
+                    .index
+                    .lookup_by_name("useful")
+                    .iter()
+                    .find(|entry| entry.path.as_ref() == "Item.java")
+                    .unwrap();
+                let expected = ktlsp::symbol::Def {
+                    file: "Item.java".into(),
+                    start_byte: entry.sym.start_byte,
+                    end_byte: entry.sym.end_byte,
+                };
+                let prefix = format!("{expression}.useful");
+                assert_eq!(
+                    captured.goto_definition(
+                        file,
+                        source.find(&prefix).unwrap() + prefix.len() - "useful".len()
+                    ),
+                    vec![expected]
+                );
+            }
+            for (call, forbidden) in [
+                ("related(sub).", "subOnly"),
+                ("related(other).", "usefulWrong"),
+                ("related(poison).", "poison"),
+            ] {
+                assert!(
+                    !labels(&mut captured, file, &format!("{receiver}.{call}")).contains(forbidden)
+                );
+            }
+        }
+    }
+    captured.open("StarRead.kt", "package app\nfun read(box: Box<*>, inner: Outer<*>.Inner, item: Item) { box.get().useful(); inner.get().useful(); box.related(item).useful(); inner.related(item).useful() }".into());
+    for receiver in ["box", "inner"] {
+        assert_member(
+            &mut captured,
+            "StarRead.kt",
+            &format!("{receiver}.get().useful"),
+            "useful",
+            "subOnly",
+        );
+        assert!(
+            !labels(
+                &mut captured,
+                "StarRead.kt",
+                &format!("{receiver}.related(item).useful")
+            )
+            .contains("useful")
+        );
+    }
+    for (file, source) in [
+        (
+            "RawIndependent.java",
+            "package app; class RawIndependent { void use(Box box, SubItem sub) { box.independent(sub).subOnly(); box.concrete().get(0).length(); Box.stat(sub).subOnly(); Box.stat(box).get().useful(); } }",
+        ),
+        (
+            "RawIndependent.kt",
+            "package app\nfun independent(sub:SubItem) { RawFactory.box().independent(sub).subOnly(); RawFactory.box().concrete().get(0).length(); Box.stat(sub).subOnly(); Box.stat(RawFactory.box()).get().useful(); Box.takeObject(RawFactory.box()) }",
+        ),
+    ] {
+        captured.open(file, source.into());
+        let raw = if file.ends_with(".java") {
+            "box"
+        } else {
+            "RawFactory.box()"
+        };
+        assert!(
+            !labels(&mut captured, file, &format!("{raw}.independent(sub).")).contains("subOnly")
+        );
+        assert!(
+            !labels(&mut captured, file, &format!("{raw}.concrete().get(0).")).contains("length")
+        );
+        assert_member(
+            &mut captured,
+            file,
+            "Box.stat(sub).",
+            "subOnly",
+            "usefulWrong",
+        );
+        let pass_raw = format!("Box.stat({raw}).get().");
+        assert_member(&mut captured, file, &pass_raw, "useful", "subOnly");
+        if file.ends_with(".kt") {
+            assert_eq!(
+                infer_expression(&captured, file, &format!("{raw}.independent(sub)")),
+                Type::class("Object", Some("java.lang".into()))
+            );
+            assert!(matches!(
+                infer_expression(&captured, file, &format!("{raw}.concrete()")),
+                Type::Raw(_)
+            ));
+            assert_eq!(
+                infer_expression(&captured, file, "Box.takeObject(RawFactory.box())"),
+                Type::class("Object", Some("java.lang".into()))
+            );
+        }
+    }
+    for (file, source) in [
+        (
+            "Left.java",
+            "package app; public interface Left { void leftOnly(); }",
+        ),
+        (
+            "Right.java",
+            "package app; public interface Right { void rightOnly(); }",
+        ),
+        (
+            "ObjectFirst.java",
+            "package app; public class ObjectFirst<T extends Object & Left> { public T get() { return null; } }",
+        ),
+        (
+            "InterfaceFirst.java",
+            "package app; public class InterfaceFirst<T extends Left & Right> { public T get() { return null; } }",
+        ),
+        (
+            "Chain.java",
+            "package app; public class Chain<T extends U,U extends Item> { public T get() { return null; } }",
+        ),
+        (
+            "RawCycle.java",
+            "package app; public class RawCycle<T extends T> { public T get() { return null; } }",
+        ),
+        (
+            "RawChild.java",
+            "package app; public class RawChild<T extends Item> extends Box<SubItem> {}",
+        ),
+        (
+            "FixedChild.java",
+            "package app; public class FixedChild extends Box<SubItem> {}",
+        ),
+        (
+            "RawShadow.java",
+            "package app; public class RawShadow<T extends Item,U extends T> { public <T extends Other> U shadow(T value) { return null; } }",
+        ),
+        (
+            "KOrder.kt",
+            "package app\ninterface KLeft { fun leftOnly() }\ninterface KRight { fun rightOnly() }\nclass KOrder<T> where T:KLeft,T:Item { fun get():T = TODO() }\nclass KInterfaces<T> where T:KLeft,T:KRight { fun get():T = TODO() }\nclass KUnknown<T> where T:Missing,T:Item { fun get():T = TODO() }\nclass KConflicting<T> where T:Other,T:Item { fun get():T = TODO() }\nclass KAny<T> where T:Any,T:KLeft { fun get():T = TODO() }\nclass KNullableAny<T> where T:Any?,T:KLeft { fun get():T = TODO() }",
+        ),
+        (
+            "KOrderFactory.java",
+            "package app; public class KOrderFactory { public static KOrder order() { return null; } public static KInterfaces interfaces() { return null; } public static KUnknown unknown() { return null; } public static KConflicting conflicting() { return null; } public static KAny any() { return null; } public static KNullableAny nullableAny() { return null; } }",
+        ),
+        (
+            "OrderedFactory.java",
+            "package app; public class OrderedFactory { public static ObjectFirst objectFirst() { return null; } public static InterfaceFirst interfaceFirst() { return null; } public static Chain chain() { return null; } public static RawChild child() { return null; } public static FixedChild fixed() { return null; } public static RawShadow shadow() { return null; } public static RawCycle cycle() { return null; } }",
+        ),
+    ] {
+        captured.open(file, source.into());
+    }
+    for (file, source, raw, interface, chain, child, fixed, shadow, cycle) in [
+        (
+            "OrderedRaw.java",
+            "package app; class OrderedRaw { void use(ObjectFirst a, InterfaceFirst b, Chain c, RawChild d, FixedChild e, RawShadow f, RawCycle g, Other other) { a.get().leftOnly(); b.get().leftOnly(); b.get().rightOnly(); c.get().useful(); d.get().useful(); d.get().subOnly(); e.get().subOnly(); f.shadow(other).useful(); g.get().poison(); } }",
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+        ),
+        (
+            "OrderedRaw.kt",
+            "package app\nfun ordered(other:Other) { OrderedFactory.objectFirst().get().leftOnly(); OrderedFactory.interfaceFirst().get().leftOnly(); OrderedFactory.interfaceFirst().get().rightOnly(); OrderedFactory.chain().get().useful(); OrderedFactory.child().get().useful(); OrderedFactory.child().get().subOnly(); OrderedFactory.fixed().get().subOnly(); OrderedFactory.shadow().shadow(other).useful(); OrderedFactory.cycle().get().poison() }",
+            "OrderedFactory.objectFirst()",
+            "OrderedFactory.interfaceFirst()",
+            "OrderedFactory.chain()",
+            "OrderedFactory.child()",
+            "OrderedFactory.fixed()",
+            "OrderedFactory.shadow()",
+            "OrderedFactory.cycle()",
+        ),
+    ] {
+        captured.open(file, source.into());
+        assert!(!labels(&mut captured, file, &format!("{raw}.get().")).contains("leftOnly"));
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{interface}.get()."),
+            "leftOnly",
+            "rightOnly",
+        );
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{chain}.get()."),
+            "useful",
+            "subOnly",
+        );
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{child}.get()."),
+            "useful",
+            "subOnly",
+        );
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{fixed}.get()."),
+            "subOnly",
+            "usefulWrong",
+        );
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{shadow}.shadow(other)."),
+            "useful",
+            "usefulWrong",
+        );
+        assert!(!labels(&mut captured, file, &format!("{cycle}.get().")).contains("poison"));
+        if file.ends_with(".kt") {
+            assert_eq!(
+                infer_expression(&captured, file, &format!("{raw}.get()")),
+                Type::class("Object", Some("java.lang".into()))
+            );
+        }
+    }
+    for (file, source) in [
+        (
+            "KOrderUse.java",
+            "package app; class KOrderUse { void use(KOrder order, KInterfaces interfaces, KUnknown unknown, KConflicting conflicting) { order.get().useful(); order.get().leftOnly(); interfaces.get().leftOnly(); interfaces.get().rightOnly(); unknown.get().useful(); conflicting.get().useful(); } }",
+        ),
+        (
+            "KOrderUse.kt",
+            "package app\nfun kotlinOrder() { KOrderFactory.order().get().leftOnly(); KOrderFactory.order().get().useful(); KOrderFactory.interfaces().get().leftOnly(); KOrderFactory.interfaces().get().rightOnly(); KOrderFactory.unknown().get().useful(); KOrderFactory.conflicting().get().useful() }",
+        ),
+    ] {
+        captured.open(file, source.into());
+        let (order, interfaces, unknown, conflicting) = if file.ends_with(".java") {
+            ("order", "interfaces", "unknown", "conflicting")
+        } else {
+            (
+                "KOrderFactory.order()",
+                "KOrderFactory.interfaces()",
+                "KOrderFactory.unknown()",
+                "KOrderFactory.conflicting()",
+            )
+        };
+        let (expected, forbidden) = if file.ends_with(".java") {
+            ("useful", "leftOnly")
+        } else {
+            ("leftOnly", "useful")
+        };
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{order}.get()."),
+            expected,
+            forbidden,
+        );
+        assert_member(
+            &mut captured,
+            file,
+            &format!("{interfaces}.get()."),
+            "leftOnly",
+            "rightOnly",
+        );
+        assert!(!labels(&mut captured, file, &format!("{unknown}.get().")).contains("useful"));
+        assert!(!labels(&mut captured, file, &format!("{conflicting}.get().")).contains("useful"));
+        if file.ends_with(".kt") {
+            assert_eq!(
+                infer_expression(&captured, file, &format!("{order}.get()")),
+                Type::class("KLeft", Some("app".into()))
+            );
+        }
+    }
+    let factory = captured
+        .index
+        .lookup_by_name("order")
+        .iter()
+        .find(|entry| entry.path.as_ref() == "KOrderFactory.java")
+        .unwrap();
+    let receiver = infer::declared_type(
+        &captured.index,
+        factory.sym.return_type.as_ref().unwrap(),
+        &FileCtx::new("app".into(), Vec::new()).with_file("KOrderFactory.java"),
+    );
+    assert!(matches!(receiver, Type::Raw(_)));
+    let get = captured
+        .index
+        .lookup_by_name("get")
+        .iter()
+        .find(|entry| {
+            entry.path.as_ref() == "KOrder.kt" && entry.sym.container.as_deref() == Some("KOrder")
+        })
+        .unwrap();
+    for (mode, expected) in [
+        (ktcore::members::CallMode::Java, "Item"),
+        (ktcore::members::CallMode::Kotlin, "KLeft"),
+    ] {
+        let ctx = FileCtx::new("app".into(), Vec::new());
+        let tr = get.sym.return_type.as_ref().unwrap();
+        let expected = Type::class(expected, Some("app".into()));
+        assert_eq!(
+            infer::declared_member_type(&captured.index, &receiver, get, tr, mode, &ctx),
+            expected
+        );
+        assert_eq!(
+            infer::declared_member_call_type(
+                &captured.index,
+                &receiver,
+                get,
+                tr,
+                &ktcore::members::CallArguments {
+                    count: Some(0),
+                    types: Vec::new(),
+                    names: None,
+                    has_spread: false,
+                    trailing_lambda: false
+                },
+                mode,
+                &ctx
+            ),
+            expected
+        );
+    }
+    captured.open("KDefault.kt", "package app\nclass KUnbounded<T> { fun get():T = TODO() }\nclass KMethod<T:Item> { fun <U> independent(value:U):U = value }".into());
+    captured.open("KDefaultFactory.java", "package app; public class KDefaultFactory { public static KUnbounded unbounded() { return null; } public static KMethod method() { return null; } }".into());
+    let roots = "package app\nfun roots(sub:SubItem) { KOrderFactory.any().get(); KOrderFactory.nullableAny().get(); KDefaultFactory.method().independent(sub); KDefaultFactory.unbounded().get() }";
+    captured.open("KRoots.kt", roots.into());
+    for expression in [
+        "KDefaultFactory.method().independent(sub)",
+        "KDefaultFactory.unbounded().get()",
+    ] {
+        assert_eq!(
+            infer_expression(&captured, "KRoots.kt", expression),
+            Type::class("Any", Some("kotlin".into())).with_nullability(true)
+        );
+    }
+    for (factory, nullable) in [("any", false), ("nullableAny", true)] {
+        assert_eq!(
+            infer_expression(
+                &captured,
+                "KRoots.kt",
+                &format!("KOrderFactory.{factory}().get()")
+            ),
+            Type::class("Any", Some("kotlin".into())).with_nullability(nullable)
+        );
+        let factory = captured
+            .index
+            .lookup_by_name(factory)
+            .iter()
+            .find(|entry| entry.path.as_ref() == "KOrderFactory.java")
+            .unwrap();
+        let ctx = FileCtx::new("app".into(), Vec::new());
+        let receiver = infer::declared_type(
+            &captured.index,
+            factory.sym.return_type.as_ref().unwrap(),
+            &ctx,
+        );
+        let get = captured
+            .index
+            .lookup_by_name("get")
+            .iter()
+            .find(|entry| {
+                entry.path.as_ref() == "KOrder.kt"
+                    && entry.sym.container.as_deref() == receiver.name()
+            })
+            .unwrap();
+        assert_eq!(
+            infer::declared_member_type(
+                &captured.index,
+                &receiver,
+                get,
+                get.sym.return_type.as_ref().unwrap(),
+                ktcore::members::CallMode::Java,
+                &ctx
+            ),
+            Type::class("Object", Some("java.lang".into()))
+        );
     }
 }
+
 const IMPORTED_BASE: &str = "package base; public class Base { public void baseOnly() {} public void accept(String value) {} }";
 const WRONG_BASE: &str = "package app; public class Base { public void baseWrong() {} public void accept(int value) {} }";
 const JAVA_CHILD: &str = "package app; import base.Base; public class Child extends Base {}";
@@ -2847,6 +3418,7 @@ const PROJECTED_REQUEST: &str = r#"package probe;
 public class Request {
  public @javax.annotation.Nullable <T> T tag(Class<? extends T> type) { return null; }
  public <T> T upper(Class<? super T> type) { return null; }
+ public <T> T upperBoth(Class<? super T> left, Class<? super T> right) { return null; }
  public <T> T star(Class<?> type) { return null; }
  public <T> T both(Class<T> exact, Class<? extends T> lower) { return null; }
  public <T> T different(Class<? extends T> left, Class<? extends T> right) { return null; }
@@ -2854,6 +3426,7 @@ public class Request {
  public <T> T nested(Class<? extends Class<T>> type) { return null; }
  public <T> T invariantNested(Pair<Class<? extends T>,Class<T>> pair) { return null; }
  public <T> T variant(Variant<? extends T> type) { return null; }
+ public <T> T variantIn(Variant<? super T> type) { return null; }
  public <T extends Invocation> T boundedOwner(BoundedOwner<? extends T> type) { return null; }
 }
 "#;
@@ -2861,6 +3434,7 @@ const PROJECTED_KOTLIN_REQUEST: &str = r#"package probe
 class KotlinRequest {
  fun <T> tag(type: Class<out T>): T? = null
  fun <T> upper(type: Class<in T>): T? = null
+ fun <T> upperBoth(left: Class<in T>, right: Class<in T>): T? = null
  fun <T> star(type: Class<*>): T? = null
  fun <T> both(exact: Class<T>, lower: Class<out T>): T? = null
  fun <T> bounded(type: Class<out T>): T? where T : Invocation = null
@@ -2987,15 +3561,21 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
 fn projected_constraints_distinguish_equality_lower_and_unsupported_bounds() {
     let source = r#"package probe
 fun <T> Pair<T,Other>.from(type: Class<out T>): T = error("fixture")
-fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other: Class<Other>, star: Class<*>, unknown: Class<Missing>, nested: Class<Class<Invocation>>, pair: Pair<Class<Invocation>,Class<Invocation>>, receiver: Pair<Invocation,Other>, variant: Variant<Invocation>, bounded: BoundedOwner<Invocation>, known: Other) {
+fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, derived: Class<DerivedInvocation>, other: Class<Other>, star: Class<*>, unknown: Class<Missing>, nested: Class<Class<Invocation>>, pair: Pair<Class<Invocation>,Class<Invocation>>, receiver: Pair<Invocation,Other>, variant: Variant<Invocation>, bounded: BoundedOwner<Invocation>, known: Other) {
  request.both(type,type)!!.service()
  kotlin.both(type,type)!!.service()
  request.nested(nested)!!.service()
  receiver.from(type).service()
  receiver.from(other)
  request.invariantNested(pair)
- request.upper(type)
- kotlin.upper(type)
+ request.upper(type)!!.service()
+ kotlin.upper(type)!!.service()
+ request.upperBoth(type,derived)!!.derivedOnly()
+ request.upperBoth(derived,type)!!.derivedOnly()
+ kotlin.upperBoth(type,derived)!!.derivedOnly()
+ kotlin.upperBoth(derived,type)!!.derivedOnly()
+ request.upperBoth(type,other)
+ kotlin.upperBoth(type,other)
  request.star(type)
  kotlin.star(type)
  request.tag(star)
@@ -3006,7 +3586,8 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
  kotlin.bounded(type)!!.service()
  request.bounded(other)
  kotlin.bounded(other)
- request.variant(variant)
+ request.variant(variant)!!.service()
+ request.variantIn(variant)!!.service()
  request.boundedOwner(bounded)!!.service()
  variant.body()
  bounded.body()
@@ -3014,7 +3595,12 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
 }
 "#;
     let mut ws = projected_workspace(source);
+    let derived_source = "package probe; public class DerivedInvocation extends Invocation { public void derivedOnly() {} }";
+    ws.open("DerivedInvocation.java", derived_source.into());
     for expression in [
+        "request.variant(variant)!!",
+        "request.upper(type)!!",
+        "kotlin.upper(type)!!",
         "request.both(type,type)!!",
         "kotlin.both(type,type)!!",
         "request.nested(nested)!!",
@@ -3038,10 +3624,10 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
             "service",
         );
     }
-    // These guards record incomplete coverage, not functional acceptance of valid upper/bounded calls.
+    // Unknown producers, incompatible constraints, and unmodeled captures stay conservative.
     for expression in [
-        "request.upper(type)",
-        "kotlin.upper(type)",
+        "request.upperBoth(type,other)",
+        "kotlin.upperBoth(type,other)",
         "request.star(type)",
         "kotlin.star(type)",
         "request.tag(star)",
@@ -3050,9 +3636,9 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
         "request.different(type,other)",
         "request.bounded(other)",
         "kotlin.bounded(other)",
-        "request.variant(variant)",
         "request.invariantNested(pair)",
         "receiver.from(other)",
+        "request.variantIn(variant)",
     ] {
         assert_eq!(
             infer_expression(&ws, "Use.kt", expression),
@@ -3063,6 +3649,175 @@ fun use(request: Request, kotlin: KotlinRequest, type: Class<Invocation>, other:
     for prefix in ["variant.", "bounded.", "known."] {
         assert_member(&mut ws, "Use.kt", prefix, "body", "service");
     }
+    for expression in [
+        "request.upperBoth(type,derived)!!",
+        "request.upperBoth(derived,type)!!",
+        "kotlin.upperBoth(type,derived)!!",
+        "kotlin.upperBoth(derived,type)!!",
+    ] {
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}."),
+            "derivedOnly",
+            "serviceWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{expression}.derivedOnly()"),
+            "DerivedInvocation.java",
+            "derivedOnly",
+        );
+    }
+    let java_source = "package probe; class UpperUse { void use(Request request, KotlinRequest kotlin, Class<Invocation> type, Class<DerivedInvocation> derived, Variant<Invocation> variant) { request.variant(variant).service(); request.variantIn(variant).service(); request.upper(type).service(); kotlin.upper(type).service(); request.upperBoth(type,derived).derivedOnly(); request.upperBoth(derived,type).derivedOnly(); kotlin.upperBoth(type,derived).derivedOnly(); kotlin.upperBoth(derived,type).derivedOnly(); } }";
+    ws.open("UpperUse.java", java_source.into());
+    assert_member(
+        &mut ws,
+        "UpperUse.java",
+        "request.variant(variant).",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "UpperUse.java",
+        "request.variant(variant).service()",
+        "Invocation.java",
+        "service",
+    );
+    assert_member(
+        &mut ws,
+        "UpperUse.java",
+        "request.variantIn(variant).",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "UpperUse.java",
+        "request.variantIn(variant).service()",
+        "Invocation.java",
+        "service",
+    );
+    for receiver in ["request", "kotlin"] {
+        let call = format!("{receiver}.upper(type)");
+        assert_member(
+            &mut ws,
+            "UpperUse.java",
+            &format!("{call}."),
+            "service",
+            "serviceWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "UpperUse.java",
+            &format!("{call}.service()"),
+            "Invocation.java",
+            "service",
+        );
+        for order in ["type,derived", "derived,type"] {
+            let call = format!("{receiver}.upperBoth({order})");
+            assert_member(
+                &mut ws,
+                "UpperUse.java",
+                &format!("{call}."),
+                "derivedOnly",
+                "serviceWrong",
+            );
+            assert_exact_definition(
+                &mut ws,
+                "UpperUse.java",
+                &format!("{call}.derivedOnly()"),
+                "DerivedInvocation.java",
+                "derivedOnly",
+            );
+        }
+    }
+    // A known matching path cannot hide an unknown sibling hierarchy branch.
+    ws.change(
+        "DerivedInvocation.java",
+        derived_source.replace(
+            "extends Invocation",
+            "extends Invocation implements Missing",
+        ),
+    );
+    for expression in [
+        "request.upperBoth(type,derived)",
+        "kotlin.upperBoth(type,derived)",
+    ] {
+        assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::Unknown);
+        assert!(
+            !labels(&mut ws, "Use.kt", &format!("{expression}!!.derivedOnly"))
+                .contains("derivedOnly")
+        );
+    }
+    ws.change("DerivedInvocation.java", derived_source.into());
+    for receiver in ["request", "kotlin"] {
+        assert_member(
+            &mut ws,
+            "Use.kt",
+            &format!("{receiver}.upperBoth(type,derived)!!."),
+            "derivedOnly",
+            "serviceWrong",
+        );
+    }
+
+    let variant_source = ws.doc_text("Variant.kt").unwrap().to_string();
+    // Java uses the JVM signature; Kotlin additionally rejects opposing declaration/use directions.
+    ws.change("Variant.kt", variant_source.replace("out T>", "in T>"));
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.variant(variant)"),
+        Type::Unknown
+    );
+    assert!(!labels(&mut ws, "Use.kt", "request.variant(variant)!!.service").contains("service"));
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "request.variantIn(variant)!!.",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "request.variantIn(variant)!!.service()",
+        "Invocation.java",
+        "service",
+    );
+    for call in ["request.variant(variant)", "request.variantIn(variant)"] {
+        assert_member(
+            &mut ws,
+            "UpperUse.java",
+            &format!("{call}."),
+            "service",
+            "serviceWrong",
+        );
+        assert_exact_definition(
+            &mut ws,
+            "UpperUse.java",
+            &format!("{call}.service()"),
+            "Invocation.java",
+            "service",
+        );
+    }
+    ws.change(
+        "Variant.kt",
+        variant_source.replace("out T>", "out T: Missing>"),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.variant(variant)"),
+        Type::Unknown
+    );
+    assert!(!labels(&mut ws, "Use.kt", "request.variant(variant)!!.service").contains("service"));
+    ws.change("Variant.kt", variant_source);
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "request.variant(variant)!!.",
+        "service",
+        "serviceWrong",
+    );
 }
 
 #[test]
@@ -3182,6 +3937,7 @@ fn projected_source_facts_survive_cache_and_unsaved_variance_changes() {
         &Type::class("Request", Some("probe".into())),
         entry,
         &entry.sym.params[0],
+        ktcore::members::CallMode::Kotlin,
         &FileCtx::new("probe".into(), Vec::new()),
     );
     assert!(
@@ -3197,6 +3953,14 @@ fn projected_source_facts_survive_cache_and_unsaved_variance_changes() {
     ws.change(
         "Request.java",
         PROJECTED_REQUEST.replace("Class<? extends T> type", "Class<? super T> type"),
+    );
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "request.tag(type)!!"),
+        Type::class("Invocation", Some("probe".into()))
+    );
+    ws.change(
+        "Request.java",
+        PROJECTED_REQUEST.replace("Class<? extends T> type", "Class<?> type"),
     );
     assert_eq!(
         infer_expression(&ws, "Use.kt", "request.tag(type)!!"),
@@ -3892,12 +4656,11 @@ fun use(left:Class<Invocation>,right:Class<Other>,known:Other) { pick(second=rig
 #[test]
 fn named_calls_do_not_treat_java_parameter_spelling_as_kotlin_source_names() {
     let source = "package probe
-fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,wrong:Class<Other>,known:Other) { request.tag(type=type);kotlin.upper(type=type);kotlin.star(type=type);kotlin.bounded(type=type)!!.service();kotlin.bounded(type=wrong);kotlin.both(exact=captured,lower=type);kotlin.tag(type=captured)!!.service();kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
+fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Class<out Invocation>,wrong:Class<Other>,known:Other) { request.tag(type=type);kotlin.upper(type=type)!!.service();kotlin.star(type=type);kotlin.bounded(type=type)!!.service();kotlin.bounded(type=wrong);kotlin.both(exact=captured,lower=type);kotlin.tag(type=captured)!!.service();kotlin.tag(type=type)!!.service();request.tag(type)!!.service();known.body() }
 ";
     let mut ws = projected_workspace(source);
     for expression in [
         "request.tag(type=type)",
-        "kotlin.upper(type=type)",
         "kotlin.star(type=type)",
         "kotlin.bounded(type=wrong)",
         "kotlin.both(exact=captured,lower=type)",
@@ -3958,6 +4721,20 @@ fun use(request:Request,kotlin:KotlinRequest,type:Class<Invocation>,captured:Cla
         "service",
     );
     assert_member(&mut ws, "Use.kt", "known.", "body", "service");
+    assert_member(
+        &mut ws,
+        "Use.kt",
+        "kotlin.upper(type=type)!!.",
+        "service",
+        "serviceWrong",
+    );
+    assert_exact_definition(
+        &mut ws,
+        "Use.kt",
+        "kotlin.upper(type=type)!!.service()",
+        "Invocation.java",
+        "service",
+    );
 }
 
 #[test]

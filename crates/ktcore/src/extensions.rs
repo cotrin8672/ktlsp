@@ -1681,6 +1681,7 @@ impl ReadSession<'_> {
                 self.resolve_type(&qualified)
             }
             crate::types::Type::Unknown
+            | crate::types::Type::Raw(_)
             | crate::types::Type::Array { .. }
             | crate::types::Type::Parameter { .. }
             | crate::types::Type::Projected { .. }

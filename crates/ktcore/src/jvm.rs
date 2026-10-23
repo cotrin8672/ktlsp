@@ -424,6 +424,17 @@ fn reify_inferred_type(
     ty: &Type,
     parameter: &impl Fn(&Def, &str, ParameterNullability) -> Option<TypeRef>,
 ) -> Option<TypeRef> {
+    if let Type::Raw(inner) = ty {
+        let Type::Class { args, .. } = inner.as_ref() else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        let mut reference = reify_inferred_type(inner, parameter)?;
+        reference.java_raw_eligible = true;
+        return Some(reference);
+    }
     if let Type::Parameter {
         definition,
         name,
@@ -725,12 +736,13 @@ fn erased_descriptor(
     if ty.qualification.as_deref() == Some("kotlin.coroutines") && ty.name == "Continuation" {
         return Some("Lkotlin/coroutines/Continuation;".into());
     }
+    let resolved = infer::declared_type(index, ty, ctx);
     let Type::Class {
         name,
         package: Some(package),
         container,
         ..
-    } = infer::declared_type(index, ty, ctx)
+    } = nominal_receiver(&resolved)
     else {
         return None;
     };
@@ -1084,7 +1096,7 @@ pub(crate) fn member_candidates_from<'a>(
             package: Some(package),
             container,
             ..
-        } = receiver
+        } = nominal_receiver(receiver)
         {
             let owners: Vec<_> = index
                 .lookup_type(
@@ -1136,13 +1148,21 @@ pub(crate) fn member_candidates_from<'a>(
     out
 }
 
+// Nominal lookup and JVM erasure may inspect a raw head. Selection still receives the raw type.
+fn nominal_receiver(receiver: &Type) -> &Type {
+    match receiver {
+        Type::Raw(inner) => inner,
+        _ => receiver,
+    }
+}
+
 fn receiver_internal_name(receiver: &Type) -> Option<String> {
     let Type::Class {
         name,
         package: Some(package),
         container,
         ..
-    } = receiver
+    } = nominal_receiver(receiver)
     else {
         return None;
     };
@@ -1178,7 +1198,7 @@ pub fn compiler_object_value(index: &dyn InferenceIndex, receiver: &Type) -> boo
         package: Some(package),
         container: Some(container),
         ..
-    } = receiver
+    } = nominal_receiver(receiver)
     else {
         return false;
     };
@@ -1235,7 +1255,7 @@ fn compiler_object_field_type(
         package: Some(package),
         container,
         ..
-    } = receiver
+    } = nominal_receiver(receiver)
     else {
         return None;
     };
@@ -1381,7 +1401,7 @@ pub fn compiled_overrides_authored(
         package: Some(package),
         container: None,
         ..
-    } = receiver
+    } = nominal_receiver(receiver)
     else {
         return false;
     };
@@ -1647,6 +1667,7 @@ pub fn select_call<'a>(
                                         receiver,
                                         entry,
                                         ty,
+                                        CallMode::Java,
                                         &declaration_ctx,
                                     );
                                 }
@@ -1759,6 +1780,22 @@ pub fn projected_return_type_in_context(
     candidate: CallableCandidate<'_>,
     ctx: &FileCtx,
 ) -> Option<Type> {
+    projected_return_type_in_call_mode(
+        index,
+        receiver,
+        candidate,
+        crate::members::CallMode::Java,
+        ctx,
+    )
+}
+
+pub fn projected_return_type_in_call_mode(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    candidate: CallableCandidate<'_>,
+    mode: crate::members::CallMode,
+    ctx: &FileCtx,
+) -> Option<Type> {
     if let CallableCandidate::Jvm {
         owner: JvmOwner::Source(source),
         facts,
@@ -1766,7 +1803,14 @@ pub fn projected_return_type_in_context(
     {
         if let Some(entry) = source_property_entry(index, source, facts) {
             let returns = resolved_return(index, source, facts)?;
-            let result = infer::declared_member_type(index, receiver, entry, &returns, ctx);
+            let result = infer::declared_member_type(
+                index,
+                receiver,
+                entry,
+                &returns,
+                mode,
+                ctx,
+            );
             return (!matches!(result, Type::Unknown)).then(|| kotlin_array_jvm_type(result));
         }
     }
@@ -2423,6 +2467,7 @@ class Resolver {
                     entry,
                     entry.sym.return_type.as_ref().unwrap(),
                     &arguments,
+                    crate::members::CallMode::Java,
                     &ctx,
                 );
                 assert_eq!(result, Type::class(expected, Some("specificity".into())));
@@ -2446,6 +2491,7 @@ class Resolver {
                         kotlin.entries[0],
                         kotlin.entries[0].sym.return_type.as_ref().unwrap(),
                         &arguments,
+                        crate::members::CallMode::Kotlin,
                         &ctx,
                     );
                     assert_eq!(result, Type::class("Broad", Some("specificity".into())));
@@ -2573,6 +2619,37 @@ class Resolver {
             "Java conversion phases are outside reference specificity"
         );
         assert_eq!(java.applicability, crate::members::Applicability::Unknown);
+    }
+
+    #[test]
+    fn inferred_raw_type_reification_preserves_erased_identity() {
+        let text = "package rawabi\nclass Box<T>\n";
+        let tree = crate::parser::KotlinParser::new().parse(text);
+        let mut index = crate::index::Index::new();
+        index.replace_file(
+            "/rawabi/Box.kt",
+            indexer::extract_symbols(&tree, text, "rawabi"),
+            Tier::Volatile,
+        );
+        let raw = Type::Raw(Box::new(
+            Type::class("Box", Some("rawabi".into())).with_nullability(true),
+        ));
+        let reference = inferred_type_ref(&raw).expect("proven raw nominal type");
+        assert!(reference.java_raw_eligible);
+        assert!(reference.nullable);
+        assert!(reference.args.is_empty());
+        assert_eq!(receiver_internal_name(&raw).as_deref(), Some("rawabi/Box"));
+        assert_eq!(
+            erased_descriptor(
+                &index,
+                &reference,
+                &FileCtx::new("rawabi".into(), Vec::new()),
+                &[],
+            )
+            .as_deref(),
+            Some("Lrawabi/Box;"),
+        );
+        assert!(inferred_type_ref(&Type::Raw(Box::new(Type::Unknown))).is_none());
     }
 
     #[test]

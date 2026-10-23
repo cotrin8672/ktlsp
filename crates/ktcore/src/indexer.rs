@@ -104,6 +104,7 @@ pub struct TypeScope {
     /// for the whole file, so `type_ref` clones the `Arc` instead of rebuilding ~10 owned
     /// strings per unresolved reference (a top allocation source in cold-index profiles).
     package_candidates: std::sync::Arc<Vec<String>>,
+    java_syntax: bool,
 }
 
 impl TypeScope {
@@ -125,7 +126,13 @@ impl TypeScope {
         TypeScope {
             imports,
             package_candidates: std::sync::Arc::new(candidates),
+            java_syntax: false,
         }
+    }
+
+    pub fn with_java_syntax(mut self) -> Self {
+        self.java_syntax = true;
+        self
     }
 
     pub fn type_ref(&self, local_name: &str, nullable: bool, args: Vec<TypeRef>) -> TypeRef {
@@ -134,15 +141,19 @@ impl TypeScope {
         for imp in &self.imports {
             if imp.local_name() == Some(first) {
                 let expanded = format!("{}{}", imp.path, &local_name[first.len()..]);
-                return named_type_ref(&expanded, nullable, args, Arc::new(vec![imp.package()]));
+                let mut ty = named_type_ref(&expanded, nullable, args, Arc::new(vec![imp.package()]));
+                ty.java_raw_eligible = self.java_syntax && ty.args.is_empty();
+                return ty;
             }
         }
-        named_type_ref(
+        let mut ty = named_type_ref(
             local_name,
             nullable,
             args,
             Arc::clone(&self.package_candidates),
-        )
+        );
+        ty.java_raw_eligible = self.java_syntax && ty.args.is_empty();
+        ty
     }
 
     pub fn without_shadowed_imports(&self, type_params: &[String]) -> Option<Self> {
@@ -159,6 +170,7 @@ impl TypeScope {
                 .cloned()
                 .collect(),
             package_candidates: Arc::clone(&self.package_candidates),
+            java_syntax: self.java_syntax,
         })
     }
 }
@@ -174,6 +186,7 @@ fn named_type_ref(
         None => (None, name),
     };
     TypeRef {
+        java_raw_eligible: false,
         name: name.to_string(),
         projection: Default::default(),
         qualification,
@@ -718,6 +731,7 @@ fn function_symbol(
         kotlin_parameters: kotlin_parameters_of(decl, src, &shape.parameters),
         type_parameter_facts,
         method_type_bounds,
+        type_parameter_bounds: own_type_parameter_bounds(decl, src, package, &scope.imports),
         type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -927,6 +941,7 @@ fn push_type(
     supertype_refs: Vec<TypeRef>,
     type_params: Vec<String>,
     documentation: Option<&str>,
+    scope: &TypeScope,
 ) {
     out.push(IndexedSymbol {
         documentation: documentation.map(str::to_string),
@@ -951,6 +966,7 @@ fn push_type(
             .parent()
             .map(|decl| type_parameter_facts_of(decl))
             .unwrap_or_default(),
+        type_parameter_bounds: name_node.parent().and_then(|decl| own_type_parameter_bounds(decl, src, package, &scope.imports)),
         type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -1011,6 +1027,52 @@ fn type_params_of(decl: Node, src: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn declared_parameter_variance(
+    parameter: Node,
+    name: Node,
+    declaration: Node,
+    src: &str,
+) -> Option<crate::types::Projection> {
+    use crate::types::Projection;
+    let mut stack = vec![parameter];
+    let mut variance = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.kind() == "variance_modifier" {
+            variance.push(node_text(node, src));
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(
+            node.named_children(&mut cursor)
+                .filter(|child| child.end_byte() <= name.start_byte()),
+        );
+    }
+    match variance.as_slice() {
+        [] => Some(Projection::Invariant),
+        ["in"] if declaration.kind() == "class_declaration" => Some(Projection::In),
+        ["out"] if declaration.kind() == "class_declaration" => Some(Projection::Out),
+        _ => None,
+    }
+}
+
+fn own_type_parameter_bounds(
+    decl: Node,
+    src: &str,
+    package: &str,
+    imports: &[Import],
+) -> Option<Box<Vec<TypeParameterBounds>>> {
+    let names = type_params_of(decl, src);
+    if names.is_empty() {
+        return None;
+    }
+    crate::types::own_parameter_bounds(
+        type_parameters_in_scope(decl, src, package, imports),
+        &names,
+        decl.start_byte(),
+        decl.end_byte(),
+    )
 }
 
 /// Normalize bounds in lexical order without indexing local parameters as nominal types.
@@ -1091,7 +1153,11 @@ pub fn type_parameters_in_scope(
                     None => complete = false,
                 }
             }
+            let variance = declared_parameter_variance(parameter, name, *decl, src);
+            complete &= variance.is_some();
             own.push(TypeParameterBounds {
+                variance,
+                erasure: Some(crate::types::ParameterErasure::ClassFirst),
                 name: node_text(name, src).to_string(),
                 start_byte: name.start_byte(),
                 end_byte: name.end_byte(),
@@ -1700,6 +1766,7 @@ fn push_synthetic_member(
         return;
     }
     out.push(IndexedSymbol {
+        type_parameter_bounds: None,
         name: name.to_string(),
         kind,
         package: package.to_string(),
@@ -1763,6 +1830,7 @@ fn push_data_class_synthetics(
 
     let (self_name, self_container) = split_qualified_container(container);
     let self_type = TypeRef {
+        java_raw_eligible: false,
         name: self_name.to_string(),
         projection: Default::default(),
         qualification: None,
@@ -1941,6 +2009,7 @@ fn walk(
                         sts,
                         tps,
                         documentation.as_deref(),
+                        scope,
                     );
                     let cname = qualify_container(container, node_text(name, src));
                     // Primary-constructor `val`/`var` parameters ARE properties of the class (this is
@@ -1974,6 +2043,7 @@ fn walk(
                         sts,
                         Vec::new(),
                         documentation.as_deref(),
+                        scope,
                     );
                     let cname = qualify_container(container, node_text(name, src));
                     if let Some(body) = child_of_kind(child, "class_body") {
@@ -2065,6 +2135,7 @@ fn walk(
                         Vec::new(),
                         Vec::new(),
                         documentation.as_deref(),
+                        scope,
                     );
                     out.last_mut().unwrap().source_member =
                         out.last().unwrap().source_member.with_jvm_restricted(true);

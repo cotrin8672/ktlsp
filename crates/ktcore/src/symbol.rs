@@ -265,6 +265,10 @@ pub struct IndexedSymbol {
     /// Proven nominal bounds of this callable's own parameters. None keeps unsupported bounds unknown.
     #[serde(default)]
     pub method_type_bounds: Option<Box<Vec<(String, TypeRef)>>>,
+    /// This declaration's own ordered parameter bounds, before callable-constraint simplification.
+    /// None is legacy, incomplete, or unsupported source metadata; it does not mean unbounded.
+    #[serde(default)]
+    pub type_parameter_bounds: Option<Box<Vec<crate::types::TypeParameterBounds>>>,
 }
 
 impl IndexedSymbol {
@@ -306,7 +310,29 @@ impl IndexedSymbol {
             type_parameter_facts: TypeParameterFacts::default(),
             source_member: SourceMemberFlags::default(),
             method_type_bounds: None,
+            type_parameter_bounds: None,
         }
+    }
+}
+
+/// Compare declaration semantics independently of each source file's byte layout.
+pub fn type_parameter_bounds_agree(
+    left: Option<&[crate::types::TypeParameterBounds]>,
+    right: Option<&[crate::types::TypeParameterBounds]>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(a, b)| {
+                    a.name == b.name
+                        && a.upper_bounds == b.upper_bounds
+                        && a.complete == b.complete
+                        && a.variance == b.variance
+                        && a.erasure == b.erasure
+                })
+        }
+        _ => false,
     }
 }
 
@@ -340,6 +366,18 @@ pub fn reshare_file_type_contexts(
         if let Some(receiver) = symbol.extension_receiver.as_deref_mut() {
             visit(&mut receiver.ty, &mut pool);
             for (_, bound) in &mut receiver.upper_bounds {
+                visit(bound, &mut pool);
+            }
+        }
+        if let Some(parameters) = symbol.type_parameter_bounds.as_deref_mut() {
+            for parameter in parameters {
+                for bound in &mut parameter.upper_bounds {
+                    visit(bound, &mut pool);
+                }
+            }
+        }
+        if let Some(bounds) = symbol.method_type_bounds.as_deref_mut() {
+            for (_, bound) in bounds {
                 visit(bound, &mut pool);
             }
         }

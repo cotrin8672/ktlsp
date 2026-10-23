@@ -227,6 +227,7 @@ fn type_decl<'tree>(
         .collect();
     sym.type_params = type_parameter_names(node, src);
     sym.type_parameter_facts = java_type_parameter_facts(node);
+    sym.type_parameter_bounds = own_java_type_parameter_bounds(node, src, scope);
     out.push(sym);
     let cname = match container {
         Some(parent) => format!("{parent}.{}", node_text(name, src)),
@@ -365,6 +366,7 @@ fn walk_declaration_container<'tree>(
                     sym.params = parameter_types(child, src, scope);
                     sym.type_params = type_parameter_names(child, src);
                     sym.type_parameter_facts = java_type_parameter_facts(child);
+                    sym.type_parameter_bounds = own_java_type_parameter_bounds(child, src, scope);
                     if !sym.type_params.is_empty()
                         && !sym.type_parameter_facts.known_unbounded()
                         && sym.type_parameter_facts.known_invariant()
@@ -570,6 +572,7 @@ fn type_ref_from_node(node: Node<'_>, src: &str, scope: &TypeScope) -> Option<Ty
                 }
             }
             let mut ty = scope.type_ref(&type_path(head, src)?, false, args);
+            ty.java_raw_eligible = false; // An explicit argument list includes diamond syntax.
             ty.owner = parameterized_type_owner(head, src, scope);
             Some(ty)
         }
@@ -746,6 +749,23 @@ fn type_parameters_in_scope(node: Node<'_>, src: &str, tree: &Tree) -> Vec<TypeP
     java_type_parameters_in_scope(node, src, &file_scope)
 }
 
+fn own_java_type_parameter_bounds(
+    decl: Node<'_>,
+    src: &str,
+    scope: &TypeScope,
+) -> Option<Box<Vec<TypeParameterBounds>>> {
+    let names = type_parameter_names(decl, src);
+    if names.is_empty() {
+        return None;
+    }
+    crate::types::own_parameter_bounds(
+        java_type_parameters_in_scope(decl, src, scope),
+        &names,
+        decl.start_byte(),
+        decl.end_byte(),
+    )
+}
+
 fn java_type_parameters_in_scope(
     node: Node<'_>,
     src: &str,
@@ -788,6 +808,8 @@ fn java_type_parameters_in_scope(
                     complete &= !upper_bounds.is_empty();
                 }
                 own.push(TypeParameterBounds {
+                    variance: Some(crate::types::Projection::Invariant),
+                    erasure: Some(crate::types::ParameterErasure::FirstBound),
                     name: node_text(name, src).to_string(),
                     start_byte: name.start_byte(),
                     end_byte: name.end_byte(),
@@ -853,7 +875,7 @@ pub(crate) fn type_scope(tree: &Tree, src: &str) -> TypeScope {
         &package_of(tree, src),
         inference_imports(tree, src),
         &["java.lang"],
-    )
+    ).with_java_syntax()
 }
 
 /// A parsed Java import statement. Static imports are ignored for now.
@@ -3603,6 +3625,10 @@ fn receiver_type(
                     array = true;
                     element = component;
                 }
+                let nominal = match element {
+                    Type::Raw(nominal) => nominal.as_ref(),
+                    element => element,
+                };
                 let Type::Class {
                     name,
                     package,
@@ -3610,7 +3636,7 @@ fn receiver_type(
                     args,
                     owner,
                     ..
-                } = element
+                } = nominal
                 else {
                     return None;
                 };
@@ -3803,6 +3829,7 @@ fn receiver_type(
                 &receiver,
                 field,
                 field.sym.value_type.as_ref()?,
+                ktcore::members::CallMode::Java,
                 &ctx,
             ))
         }
@@ -3887,7 +3914,7 @@ fn java_inherited_field_receiver(
                         && implicit_receiver_kind(object, src) == ReceiverKind::Value)
             {
                 if let Some(value) = &field.sym.value_type {
-                    let ty = infer::declared_member_type(index, &enclosing, field, value, &ctx);
+                    let ty = infer::declared_member_type(index, &enclosing, field, value, ktcore::members::CallMode::Java, &ctx);
                     return Some(ty);
                 }
             }
@@ -4642,7 +4669,7 @@ fn java_method_invocation_return_type(
         }
         let declared = infer::function_return_type_ref(index, &entry)?;
         let ty =
-            infer::declared_member_call_type(index, &receiver, &entry, &declared, &arguments, &ctx);
+            infer::declared_member_call_type(index, &receiver, &entry, &declared, &arguments, ktcore::members::CallMode::Java, &ctx);
         let ty = ktcore::jvm::string_result_for_call_mode(
             index,
             ty,
@@ -5973,7 +6000,27 @@ mod tests {
             ("Foo.class", foo.clone()),
             ("Foo /* target */ .class", foo.clone()),
             ("Outer.Nested.class", nested),
-            ("Box.class", Type::class("Box", Some("literal".into()))),
+            (
+                "Box.class",
+                Type::Raw(Box::new(Type::class("Box", Some("literal".into())))),
+            ),
+            (
+                "Box[].class",
+                Type::array(
+                    Type::Raw(Box::new(Type::class("Box", Some("literal".into())))),
+                    false,
+                ),
+            ),
+            (
+                "Box[][].class",
+                Type::array(
+                    Type::array(
+                        Type::Raw(Box::new(Type::class("Box", Some("literal".into())))),
+                        false,
+                    ),
+                    false,
+                ),
+            ),
             ("Foo[].class", Type::array(foo.clone(), false)),
             ("Foo[][].class", Type::array(Type::array(foo, false), false)),
         ] {
@@ -6094,7 +6141,7 @@ mod tests {
     #[test]
     fn java_class_literal_direct_receiver_is_a_value() {
         let file = "/literal/Direct.java";
-        let source = "package literal; interface Target {} class Use<T> { void sample() { Target.class.getName(); T.class.getName(); } }";
+        let source = "package literal; interface Target {} class Box<E> { public void boxOnly() {} } class Use<T> { void sample() { Target.class.getName(); Box.class.getName(); Box.class.cast(null).boxOnly(); T.class.getName(); } }";
         let tree = JavaParser::new().parse(source);
         let mut index = Index::new();
         index.replace_file(
@@ -6102,16 +6149,78 @@ mod tests {
             extract_symbols(&tree, source),
             crate::index::Tier::Volatile,
         );
-        let valid = identifier_at(&tree, source.find("getName").unwrap())
-            .unwrap()
-            .parent()
+        let reflection = "package java.lang; public final class Class<T> { public String getName() { return null; } public T cast(Object value) { return null; } } class Object {}";
+        let reflection_tree = JavaParser::new().parse(reflection);
+        index.replace_file(
+            "/java/lang/Class.java",
+            extract_symbols(&reflection_tree, reflection),
+            crate::index::Tier::Volatile,
+        );
+        for (prefix, target) in [
+            (
+                "Target.class.",
+                Type::class("Target", Some("literal".into())),
+            ),
+            (
+                "Box.class.",
+                Type::Raw(Box::new(Type::class("Box", Some("literal".into())))),
+            ),
+        ] {
+            let at = source.find(prefix).unwrap() + prefix.len();
+            let valid = identifier_at(&tree, at).unwrap().parent().unwrap();
+            assert_eq!(
+                java_member_receiver(&index, file, source, &tree, valid, 0),
+                Some((
+                    java_class_literal_expected(target),
+                    ktcore::jvm::ReceiverKind::Value
+                ))
+            );
+            let query = completion_query(&index, file, source, &tree, at + "getN".len(), 100).unwrap();
+            assert!(
+                query
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.label == "getName")
+            );
+            let definition = index.lookup_by_name("getName").into_iter().next().unwrap();
+            assert_eq!(
+                goto_definition(&index, file, source, &tree, at),
+                vec![Def {
+                    file: definition.path.to_string(),
+                    start_byte: definition.sym.start_byte,
+                    end_byte: definition.sym.end_byte
+                }]
+            );
+        }
+        let expression = "Box.class.cast(null)";
+        let start = source.find(expression).unwrap();
+        let cast = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + expression.len())
             .unwrap();
         assert_eq!(
-            java_member_receiver(&index, file, source, &tree, valid, 0),
-            Some((
-                java_class_literal_expected(Type::class("Target", Some("literal".into()))),
-                ktcore::jvm::ReceiverKind::Value,
-            ))
+            java_argument_type(&index, file, source, &tree, cast, 0),
+            Some(Type::Raw(Box::new(Type::class(
+                "Box",
+                Some("literal".into())
+            ))))
+        );
+        let at = start + expression.len() + 1;
+        let query = completion_query(&index, file, source, &tree, at + "boxO".len(), 100).unwrap();
+        assert!(
+            query
+                .candidates
+                .iter()
+                .any(|candidate| candidate.label == "boxOnly")
+        );
+        let definition = index.lookup_by_name("boxOnly").into_iter().next().unwrap();
+        assert_eq!(
+            goto_definition(&index, file, source, &tree, at),
+            vec![Def {
+                file: definition.path.to_string(),
+                start_byte: definition.sym.start_byte,
+                end_byte: definition.sym.end_byte
+            }]
         );
         let invalid = identifier_at(&tree, source.rfind("getName").unwrap())
             .unwrap()

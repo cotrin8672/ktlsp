@@ -28,6 +28,8 @@ mod tests {
         let scope = &signature.type_parameters;
         assert_eq!(scope[0].name, "T");
         assert_eq!(scope[0].bounds[0].name, "Item");
+        assert!(scope[0].bounds[0].java_raw_eligible);
+        assert!(crate::classfile::field_type("Lgenericfixture/Box;").unwrap().java_raw_eligible);
         for field in &class.fields {
             let actual = field_signature(
                 field.signature.as_deref().unwrap(),
@@ -40,7 +42,10 @@ mod tests {
             }
             let ty = actual.unwrap();
             match field.name.as_ref() {
-                "value" => assert_eq!(ty.name, "T"),
+                "value" => {
+                    assert_eq!(ty.name, "T");
+                    assert!(!ty.java_raw_eligible, "a scoped parameter is not a raw nominal type");
+                }
                 "producers" => {
                     assert_eq!(ty.args[0].projection, Projection::Out);
                     assert_eq!(ty.args[0].name, "T");
@@ -98,6 +103,7 @@ mod tests {
         let child = class_signature(&child).unwrap();
         assert_eq!(child.superclass.name, "Box");
         assert_eq!(child.superclass.args[0].name, "Item");
+        assert!(!child.superclass.java_raw_eligible, "a parameterized binary signature is not raw");
     }
 
     #[test]
@@ -568,6 +574,7 @@ impl<'a> Parser<'a> {
         let mut ty = TypeRef::simple(name);
         ty.qualification = Some(segments.join("."));
         ty.args = self.arguments(depth)?;
+        ty.java_raw_eligible = ty.args.is_empty();
         let mut owner_depth = depth;
         while self.eat('.') {
             owner_depth += 1;
@@ -586,6 +593,7 @@ impl<'a> Parser<'a> {
             let mut inner = TypeRef::simple(name);
             inner.qualification = Some(qualification);
             inner.args = self.arguments(owner_depth)?;
+            inner.java_raw_eligible = inner.args.is_empty();
             inner.owner = Some(Box::new(ty));
             ty = inner;
         }

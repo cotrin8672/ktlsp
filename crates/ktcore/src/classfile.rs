@@ -177,6 +177,7 @@ fn descriptor_type_ref(ty: TypeDescriptor<'_>) -> Option<crate::types::TypeRef> 
             }
             let (package, simple) = internal.rsplit_once('/').unwrap_or(("", &internal));
             let mut result = crate::types::TypeRef::simple(simple);
+            result.java_raw_eligible = true;
             // Even the default package is explicit; the consumer's package cannot rebind it.
             result.qualification = Some(package.replace('/', "."));
             result

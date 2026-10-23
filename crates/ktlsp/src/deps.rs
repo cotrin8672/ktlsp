@@ -717,7 +717,7 @@ fn symcache_dir() -> PathBuf {
 /// Bumped whenever serialized symbols or their extracted facts change. bincode is positional /
 /// non-self-describing, and an old cache can also omit newly indexed semantic facts (such as Java
 /// inheritance); folding this tag into the fingerprint forces a one-time re-parse.
-const SYMCACHE_VERSION: &[u8] = b"v45-captured-owner-method-bounds";
+const SYMCACHE_VERSION: &[u8] = b"v47-raw-types-own-parameter-erasure";
 const SOURCE_JAR_MARKER: &str = ".ktlsp-source-jar";
 const BINARY_JAR_MARKER: &str = ".ktlsp-binary-jar";
 static LEGACY_SYMCACHE_PRUNED: Once = Once::new();
@@ -4147,8 +4147,7 @@ public class ParameterUse<Iterable> {
         ));
         fs::create_dir_all(&tmp).unwrap();
         let source = tmp.join("Library.kt");
-        let text =
-            "package lib\nclass Payload\nexpect class Common\nsuspend fun first(value: Payload): Payload = TODO()\n";
+        let text = "package lib\nclass Payload\nclass Generic<T>\nexpect class Common\nsuspend fun first(value: Payload): Payload = TODO()\n";
         fs::write(&source, text).unwrap();
         let mut kotlin = KotlinParser::new();
         let mut java = JavaParser::new();
@@ -4172,6 +4171,30 @@ public class ParameterUse<Iterable> {
         );
         let loaded = symcache_load_file(&cache, &tmp).unwrap();
         assert_eq!(loaded[0].symbols, data[0].symbols);
+        let parameter = &loaded[0]
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Generic")
+            .unwrap()
+            .type_parameter_bounds
+            .as_deref()
+            .unwrap()[0];
+        assert_eq!(
+            parameter.erasure,
+            Some(ktcore::types::ParameterErasure::ClassFirst)
+        );
+        assert_eq!(
+            parameter.variance,
+            Some(ktcore::types::Projection::Invariant)
+        );
+        let mut legacy = serde_json::to_value(parameter).unwrap();
+        legacy.as_object_mut().unwrap().remove("erasure");
+        assert!(
+            serde_json::from_value::<ktcore::types::TypeParameterBounds>(legacy)
+                .unwrap()
+                .erasure
+                .is_none()
+        );
         assert!(
             loaded[0]
                 .symbols

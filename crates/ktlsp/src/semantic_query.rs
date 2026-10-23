@@ -400,6 +400,15 @@ pub fn after_dot_query(
     let mut symbols = language::symbol_facts(SourceLanguage::Kotlin, &tree, &synthetic).symbols;
     // Keep provider relations tied to authored declarations, never placeholder-shifted names.
     symbols.retain_mut(|symbol| {
+        if let Some(parameters) = symbol.type_parameter_bounds.as_deref_mut() {
+            for parameter in parameters {
+                for position in [&mut parameter.start_byte, &mut parameter.end_byte, &mut parameter.scope_start, &mut parameter.scope_end] {
+                    if *position >= syn_offset {
+                        *position -= complete::DOT_PLACEHOLDER.len();
+                    }
+                }
+            }
+        }
         if symbol.end_byte <= inserted_at {
             true
         } else if symbol.start_byte >= syn_offset {
@@ -1495,6 +1504,7 @@ fn synth_arg_types(
 
 fn type_label(ty: &Type) -> Option<String> {
     match ty {
+        Type::Raw(nominal) => type_label(nominal),
         Type::Parameter { name, nullable, .. } => {
             Some(format!("{name}{}", if *nullable { "?" } else { "" }))
         }
@@ -2252,6 +2262,7 @@ mod tests {
         ws.index.replace_file(
             "Lib.kt",
             vec![crate::symbol::IndexedSymbol {
+                type_parameter_bounds: None,
                 name: "fetch".into(),
                 kind: SymbolKind::Function,
                 package: "lib".into(),
@@ -4345,11 +4356,12 @@ mod recovered_property_proof_tests {
 
     #[test]
     fn kotlin_dot_recovery_retains_only_current_namespace_facts_and_tier() {
-        for (tier, shadow, host_proof, expected) in [
-            (Tier::Volatile, false, true, true),
-            (Tier::Durable, false, true, false),
-            (Tier::Volatile, true, true, false),
-            (Tier::Volatile, false, false, false),
+        for (tier, shadow, host_proof, generic, expected) in [
+            (Tier::Volatile, false, true, false, true),
+            (Tier::Durable, false, true, false, false),
+            (Tier::Volatile, true, true, false, false),
+            (Tier::Volatile, false, false, false, false),
+            (Tier::Volatile, false, true, true, true),
         ] {
             let mut index = Index::new();
             let tail = if shadow {
@@ -4357,7 +4369,11 @@ mod recovered_property_proof_tests {
             } else {
                 ""
             };
-            let source = format!("package consumer\nclass Caller {{ fun use() {{ probe.Owner.VALUE.useful() }}{tail} }}\n");
+            let source = if generic {
+                format!("package consumer\nclass Host<T> {{ fun <U> use() {{ probe.Owner.VALUE.useful() }}{tail} }}\n")
+            } else {
+                format!("package consumer\nclass Caller {{ fun use() {{ probe.Owner.VALUE.useful() }}{tail} }}\n")
+            };
             for (file, text, tier) in [
                 (
                     "Item.kt",
@@ -4392,7 +4408,7 @@ mod recovered_property_proof_tests {
                     .iter()
                     .any(|candidate| candidate.label == "useful"),
                 expected,
-                "tier={tier:?}, shadow={shadow}, host_proof={host_proof}"
+                "tier={tier:?}, shadow={shadow}, host_proof={host_proof}, generic={generic}"
             );
         }
     }

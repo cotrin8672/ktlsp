@@ -448,18 +448,13 @@ where
         paths.push(qualifier.to_string());
         paths.into_iter().find_map(|path| {
             let reference = scope.type_ref(&path, false, Vec::new());
-            match crate::infer::declared_type(index, &reference, ctx) {
-                crate::types::Type::Class {
-                    name,
-                    package: Some(package),
-                    container,
-                    ..
-                } => Some(fqn(
-                    &package,
-                    &container.map_or(name.clone(), |container| fqn(&container, &name)),
-                )),
-                _ => None,
-            }
+            let ty = crate::infer::declared_type(index, &reference, ctx);
+            let name = ty.name()?;
+            Some(fqn(
+                ty.package()?,
+                &ty.container()
+                    .map_or_else(|| name.to_string(), |container| fqn(container, name)),
+            ))
         })
     });
     let mut candidates = Vec::new();
@@ -507,10 +502,10 @@ where
         }
         if let Some(qualifier) = qualifier {
             let reference = scope.type_ref(&fqn(qualifier, &entry.sym.name), false, Vec::new());
+            let ty = crate::infer::declared_type(index, &reference, ctx);
             if qualified_owner.is_none()
-                && !matches!(crate::infer::declared_type(index, &reference, ctx),
-                crate::types::Type::Class { ref package, ref container, .. }
-                    if package.as_deref() == Some(entry.sym.package.as_str()) && *container == entry.sym.container)
+                && !(ty.package() == Some(entry.sym.package.as_str())
+                    && ty.container() == entry.sym.container.as_deref())
             {
                 continue;
             }

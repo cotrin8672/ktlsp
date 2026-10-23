@@ -1277,7 +1277,8 @@ pub fn method_signature(
         .map(|parameter| {
             parameter_identity(
                 index,
-                infer::declared_member_type(index, receiver, entry, parameter, ctx),
+                // Override identities use the JVM declaration view, independent of caller language.
+                infer::declared_member_type(index, receiver, entry, parameter, CallMode::Java, ctx),
             )
         })
         .collect()
@@ -1646,6 +1647,7 @@ fn generic_signature_type_equal(
                 receiver,
                 entry,
                 &head,
+                CallMode::Java,
                 &FileCtx::new(entry.sym.package.clone(), Vec::new()),
             ),
         )
@@ -1978,6 +1980,7 @@ pub(crate) fn select_functions<'a>(
 /// Supplied actuals and their corresponding formal types always have the same order.
 /// Ordinary positional calls retain their existing borrowed facts and formal slice.
 pub(crate) struct BoundArguments<'a> {
+    pub mode: CallMode,
     pub arguments: Cow<'a, CallArguments>,
     pub params: Cow<'a, [TypeRef]>,
 }
@@ -1990,6 +1993,7 @@ pub(crate) fn bind_arguments<'a>(
 ) -> Result<BoundArguments<'a>, Applicability> {
     let Some(names) = &args.names else {
         return Ok(BoundArguments {
+            mode,
             arguments: Cow::Borrowed(args),
             params: Cow::Borrowed(&entry.sym.params),
         });
@@ -2067,6 +2071,7 @@ pub(crate) fn bind_arguments<'a>(
         .map(|position| args.types[position].clone())
         .collect();
     Ok(BoundArguments {
+        mode,
         arguments: Cow::Owned(CallArguments {
             count: args.count,
             types,
@@ -2145,9 +2150,9 @@ pub(crate) fn most_specific_reference_call(
                 .zip(&args.types)
                 .map(|(formal, actual)| {
                     let formal = if generic {
-                        infer::declared_member_call_type(index, receiver, entry, formal, args, &ctx)
+                        infer::declared_member_call_type(index, receiver, entry, formal, args, mode, &ctx)
                     } else {
-                        infer::declared_member_type(index, receiver, entry, formal, &ctx)
+                        infer::declared_member_type(index, receiver, entry, formal, mode, &ctx)
                     };
                     reference_subtype(index, actual, &formal, false).then_some(formal)
                 })
@@ -2161,7 +2166,7 @@ pub(crate) fn most_specific_reference_call(
             if entry.sym.type_params.is_empty() {
                 formals.iter().cloned().map(Some).collect()
             } else {
-                generic_declaration_formals(index, receiver, entry)
+                generic_declaration_formals(index, receiver, entry, mode)
             }
         })
         .collect();
@@ -2308,6 +2313,7 @@ fn root_generic_specificity(
                     receiver,
                     left,
                     a,
+                    CallMode::Java,
                     &FileCtx::new(left.sym.package.clone(), Vec::new()),
                 );
                 matches!(ty, Type::Class { .. }) && infer::type_head_is_known(index, &ty)
@@ -2343,6 +2349,7 @@ fn generic_declaration_formals(
     index: &dyn InferenceIndex,
     receiver: &Type,
     entry: &Entry,
+    mode: CallMode,
 ) -> Vec<Option<Type>> {
     let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
     entry
@@ -2371,7 +2378,7 @@ fn generic_declaration_formals(
                     return None;
                 }
             }
-            let declared = infer::declared_member_type(index, receiver, entry, &declared, &ctx);
+            let declared = infer::declared_member_type(index, receiver, entry, &declared, mode, &ctx);
             reference_shape_known(index, &declared, true, 0).then_some(declared)
         })
         .collect()
@@ -2613,6 +2620,7 @@ fn parameters_applicability(
             },
         );
     let platform_bound = platform.as_ref().map(|arguments| BoundArguments {
+        mode: bound.mode,
         arguments: Cow::Borrowed(arguments),
         params: Cow::Borrowed(&bound.params),
     });
@@ -2640,7 +2648,7 @@ fn parameters_applicability(
                 {
                     return false;
                 }
-                let formal = infer::declared_member_type(index, receiver, entry, parameter, ctx);
+                let formal = infer::declared_member_type(index, receiver, entry, parameter, mode, ctx);
                 infer::nominal_heads_incompatible(index, actual, &formal)
             })
         {
@@ -2670,7 +2678,7 @@ fn parameters_applicability(
                 // A legacy array reference has not retained a normalized component type.
                 return Type::Unknown;
             }
-            infer::declared_member_type(index, receiver, entry, formal, ctx)
+            infer::declared_member_type(index, receiver, entry, formal, mode, ctx)
         },
         mode,
         uncertain,
@@ -2806,6 +2814,7 @@ fn callable_value_applicability(
             receiver,
             entry,
             &BoundArguments {
+                mode: CallMode::Kotlin,
                 arguments: Cow::Borrowed(args),
                 params: Cow::Borrowed(params),
             },
