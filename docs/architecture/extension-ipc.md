@@ -232,6 +232,14 @@ This is a debug observation at publication time, not persistent readiness, produ
 or a promise that later edits, configuration changes, or child exits cannot retract it.
 Focused host and real-editor verification for this addition is recorded separately.
 
+Completion stays nonblocking while an enabled IPC provider has queued or valid pending
+work for the current owner. The standard `isIncomplete` flag is preserved with ordinary
+items and with an empty list; work for another owner alone does not set it. This flag
+requests recomputation on further input, as defined by the
+[LSP completion specification](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/lsp/3.17/language/completion.md).
+It does not promise an automatic request when publication occurs. Actual editor verification is recorded in
+`pending146-final-green.json` under the fork acceptance RUN.
+
 | File / area | Current implementation |
 | --- | --- |
 | `crates/ktcore/src/extensions.rs` and extension contract tests | Preserve session in pending state; narrow validated resume and missing-source-read accessor; test prior-read invalidation and ordinary final commit. |

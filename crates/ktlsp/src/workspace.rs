@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 
 use salsa::Durability;
+use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Tree};
 use walkdir::{DirEntry, WalkDir};
 
@@ -88,6 +89,7 @@ pub struct Workspace {
     project_model: Option<Arc<crate::classpath::ProjectSnapshot>>,
     global_origins: BTreeSet<String>,
     source_stamps: HashMap<String, SourceStamp>,
+    source_contents: HashMap<String, [u8; 32]>,
     completed_dependency_origins: BTreeSet<String>,
     analysis_generation: u64,
     live_dependency_origins: BTreeSet<String>,
@@ -151,6 +153,7 @@ impl Workspace {
             project_model: None,
             global_origins: BTreeSet::new(),
             source_stamps: HashMap::new(),
+            source_contents: HashMap::new(),
             completed_dependency_origins: BTreeSet::new(),
             analysis_generation: 0,
             live_dependency_origins: BTreeSet::new(),
@@ -243,6 +246,19 @@ impl Workspace {
 
     pub(crate) fn source_stamps(&self) -> HashMap<String, SourceStamp> {
         self.source_stamps.clone()
+    }
+
+    pub(crate) fn source_content(&self, key: &str) -> Option<[u8; 32]> {
+        self.source_contents.get(key).copied()
+    }
+
+    pub(crate) fn observe_disk_source(&mut self, key: &str, unchanged: Option<&[u8; 32]>) -> bool {
+        if unchanged.is_some_and(|content| self.source_contents.get(key) == Some(content)) {
+            return true;
+        }
+        // A real watch/save must reparse even when replacement bytes preserve size and mtime.
+        self.source_stamps.remove(key);
+        false
     }
 
     pub(crate) fn dependency_origin_complete(&self, origin: &str) -> bool {
@@ -390,11 +406,17 @@ impl Workspace {
         self.remove_obsolete_project_files(&update.current);
         self.source_stamps
             .retain(|key, _| update.current.contains(key));
+        self.source_contents
+            .retain(|key, _| update.current.contains(key));
         let mut count = 0;
         let mut extension_sources = Vec::new();
         for batch in update.batches {
             if let Some(stamp) = batch.stamp {
                 self.source_stamps.insert(batch.key.clone(), stamp);
+                self.source_contents.insert(
+                    batch.key.clone(),
+                    Sha256::digest(batch.source.0.as_bytes()).into(),
+                );
             }
             if self.open_docs.contains_key(&batch.key) {
                 continue;
@@ -516,6 +538,7 @@ impl Workspace {
             }
             self.project_file_meta.remove(key);
             self.source_stamps.remove(key);
+            self.source_contents.remove(key);
         }
         if !obsolete.is_empty() {
             self.bump_index_revision();
@@ -752,6 +775,10 @@ impl Workspace {
 
     pub(crate) fn extension_source_input_identity(&self, owner: &str) -> Option<Arc<str>> {
         self.analysis_extensions.source_input_identity(owner)
+    }
+
+    pub(crate) fn extension_completion_pending(&self, owner: &str) -> bool {
+        self.analysis_extensions.ipc_completion_pending(owner)
     }
 
     pub(crate) fn extension_source_wait(
@@ -1086,6 +1113,10 @@ impl Workspace {
         for batch in batches {
             if let Some(stamp) = batch.stamp {
                 self.source_stamps.insert(batch.key.clone(), stamp);
+                self.source_contents.insert(
+                    batch.key.clone(),
+                    Sha256::digest(batch.source.0.as_bytes()).into(),
+                );
             }
             self.project_file_meta.insert(
                 batch.key.clone(),

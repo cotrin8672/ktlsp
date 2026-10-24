@@ -2312,8 +2312,24 @@ fn parse_dump_reader(
     Ok(out)
 }
 
-/// Build files whose mtimes invalidate the cache.
+/// Build configuration and declared Gradle transform mtimes that invalidate the cache.
 fn build_file_mtimes(root: &Path, modules: &[ModuleClasspath]) -> BTreeMap<String, u128> {
+    build_file_mtimes_with_presence(root, modules).0
+}
+
+fn model_inputs_current(
+    root: &Path,
+    modules: &[ModuleClasspath],
+    recorded: &BTreeMap<String, u128>,
+) -> bool {
+    let (current, required_inputs_present) = build_file_mtimes_with_presence(root, modules);
+    required_inputs_present && recorded == &current
+}
+
+fn build_file_mtimes_with_presence(
+    root: &Path,
+    modules: &[ModuleClasspath],
+) -> (BTreeMap<String, u128>, bool) {
     const NAMES: &[&str] = &[
         "settings.gradle.kts",
         "settings.gradle",
@@ -2337,7 +2353,37 @@ fn build_file_mtimes(root: &Path, modules: &[ModuleClasspath]) -> BTreeMap<Strin
             map.insert(path_key(&p), mtime);
         }
     }
-    map
+    // Gradle may retire a declared transform without changing any build file.
+    let inputs: BTreeSet<_> = modules
+        .iter()
+        .flat_map(|module| &module.source_sets)
+        .flat_map(|source| &source.compiler_tasks)
+        .flat_map(|task| &task.declared_input_files)
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-snapshot.bin"))
+                && path.parent().is_some_and(|parent| {
+                    parent.file_name().is_some_and(|name| name == "transformed")
+                        && parent
+                            .parent()
+                            .and_then(Path::parent)
+                            .and_then(Path::file_name)
+                            .is_some_and(|name| name == "transforms")
+                })
+        })
+        .collect();
+    let mut required_inputs_present = true;
+    for path in inputs {
+        let mtime = std::fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok());
+        required_inputs_present &= mtime.is_some();
+        map.insert(path_key(path), mtime.map_or(0, |value| value.as_nanos()));
+    }
+    (map, required_inputs_present)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2467,9 +2513,12 @@ fn source_snapshot(
         Ok::<_, anyhow::Error>(by_identity)
     };
     anyhow::ensure!(
-        without_sources(&modules)? == without_sources(&accepted.modules)?
-            && accepted.mtimes == build_file_mtimes(root, &accepted.modules),
-        "Gradle model changed during source resolution"
+        without_sources(&modules)? == without_sources(&accepted.modules)?,
+        "Gradle binary model changed during source resolution"
+    );
+    anyhow::ensure!(
+        model_inputs_current(root, &accepted.modules, &accepted.mtimes),
+        "Gradle build inputs changed during source resolution"
     );
     let mut enriched = ProjectSnapshot::new(modules);
     enriched.mtimes = accepted.mtimes.clone();
@@ -2524,7 +2573,7 @@ fn load_snapshot_with_cancellable(
         )
     };
     if let Some(model) = snapshot(root).filter(|_| !force) {
-        if model.mtimes == build_file_mtimes(root, &model.modules) {
+        if model_inputs_current(root, &model.modules, &model.mtimes) {
             trace_cache("memory");
             check_cancelled()?;
             return Ok(model);
@@ -2534,7 +2583,7 @@ fn load_snapshot_with_cancellable(
     if !force {
         if let Some(entry) = read_cache_entry(&cache) {
             if entry.model_version == MODEL_VERSION
-                && entry.mtimes == build_file_mtimes(root, &entry.modules)
+                && model_inputs_current(root, &entry.modules, &entry.mtimes)
             {
                 let mut model = ProjectSnapshot::new(entry.modules);
                 model.mtimes = entry.mtimes;
@@ -2574,7 +2623,7 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(model) = snapshot(root) {
-        if model.mtimes == build_file_mtimes(root, &model.modules) {
+        if model_inputs_current(root, &model.modules, &model.mtimes) {
             if let Some(module) = model.modules.iter().find(|m| m.module == module) {
                 return Ok(module.clone());
             }
@@ -2583,7 +2632,7 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
     let cache = module_cache_path(root, module);
     if let Some(entry) = read_cache_entry(&cache) {
         if entry.model_version == MODEL_VERSION
-            && entry.mtimes == build_file_mtimes(root, &entry.modules)
+            && model_inputs_current(root, &entry.modules, &entry.mtimes)
         {
             if let Some(found) = entry.modules.iter().find(|m| m.module == module).cloned() {
                 publish_modules(root, entry.modules);
@@ -6367,6 +6416,127 @@ PROVIDES\tmain\t/repo/lib-custom.jar\nEND\t:lib\n",
             captured
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transform_snapshot_cache_refreshes_missing_inputs_but_reuses_source_saves() {
+        for memory in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "ktlsp-transform-cache-{}-{}-{memory}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let snapshot_file = root.join("cache/transforms/id/transformed/api-snapshot.bin");
+            let source = root.join("Use.java");
+            let kotlin_source = root.join("Use.kt");
+            std::fs::create_dir_all(snapshot_file.parent().unwrap()).unwrap();
+            std::fs::write(root.join("build.gradle"), "plugins { id 'java' }").unwrap();
+            let wrapper = root.join(if cfg!(windows) {
+                "gradlew.bat"
+            } else {
+                "gradlew"
+            });
+            std::fs::write(
+                &wrapper,
+                if cfg!(windows) {
+                    "@echo off\r\necho invoked> \"%~dp0gradle-invoked\"\r\nexit /b 23\r\n"
+                } else {
+                    "#!/bin/sh\n: > \"$(dirname \"$0\")/gradle-invoked\"\nexit 23\n"
+                },
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::write(&source, "class Use {}").unwrap();
+            std::fs::write(&kotlin_source, "class KotlinUse").unwrap();
+            std::fs::write(&snapshot_file, "snapshot").unwrap();
+            let set_snapshot_time = |seconds| {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&snapshot_file)
+                    .unwrap()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+                    .unwrap();
+            };
+            set_snapshot_time(0);
+            let mut compiler = plain_java_configuration();
+            compiler["source_files"] = serde_json::json!([source]);
+            compiler["declared_input_files"] =
+                serde_json::json!([source, kotlin_source, snapshot_file, snapshot_file]);
+            let modules = parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCESET\tmain\nCOMPILER\tmain\t{compiler}\nEND\t:app\n",
+                root.display()
+            ));
+            let dumps = std::cell::Cell::new(0);
+            let load = || {
+                load_snapshot_with(&root, false, || {
+                    dumps.set(dumps.get() + 1);
+                    Ok(modules.clone())
+                })
+                .unwrap()
+            };
+            let retain = |model: &Arc<ProjectSnapshot>| {
+                store_snapshot(&root, model);
+                if memory {
+                    publish_snapshot(&root, model.clone());
+                }
+            };
+            let first = load();
+            retain(&first);
+            let warm = load();
+            assert_eq!(dumps.get(), 1, "an existing epoch-zero input is reusable");
+            if memory {
+                assert!(Arc::ptr_eq(&first, &warm));
+            }
+            std::fs::write(&source, "class Use { int changed; }").unwrap();
+            std::fs::write(&kotlin_source, "class KotlinUse { val changed = 1 }").unwrap();
+            load();
+            assert_eq!(dumps.get(), 1, "ordinary source saves reuse the classpath");
+
+            set_snapshot_time(2);
+            let changed = load();
+            assert_eq!(dumps.get(), 2, "a changed transform invalidates the cache");
+            retain(&changed);
+            load();
+            assert_eq!(dumps.get(), 2, "unchanged transform metadata stays warm");
+
+            std::fs::remove_file(&snapshot_file).unwrap();
+            let missing = load();
+            assert_eq!(dumps.get(), 3, "a deleted transform requires a normal dump");
+            retain(&missing);
+            load();
+            assert_eq!(dumps.get(), 4, "a missing zero baseline is never fresh");
+
+            std::fs::write(&snapshot_file, "restored").unwrap();
+            set_snapshot_time(4);
+            let restored = load();
+            retain(&restored);
+            assert_eq!(dumps.get(), 5);
+            write_cache_entry(
+                &module_cache_path(&root, ":app"),
+                &CacheEntryRef {
+                    model_version: MODEL_VERSION,
+                    mtimes: &restored.mtimes,
+                    modules: &restored.modules,
+                },
+            );
+            assert_eq!(resolve_module(&root, ":app").unwrap().module, ":app");
+            assert!(!root.join("gradle-invoked").exists());
+            std::fs::remove_file(&snapshot_file).unwrap();
+            let failure = resolve_module(&root, ":app")
+                .expect_err("neither memory nor module cache may hide the missing input");
+            assert!(root.join("gradle-invoked").is_file());
+            assert!(format!("{failure:#}").contains("gradle classpath dump failed"));
+            std::fs::remove_file(cache_path(&root)).unwrap();
+            std::fs::remove_file(module_cache_path(&root, ":app")).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -1142,8 +1142,9 @@ fn index_dependencies_with_source_query(
     }
     let enriched = match enriched {
         Ok(enriched) => enriched,
-        Err(_) => {
-            tracing::warn!("Gradle source selection enrichment is unavailable");
+        Err(error) => {
+            let detail: String = format!("{error:#}").chars().take(2048).collect();
+            tracing::warn!(error = %detail, "Gradle source selection enrichment is unavailable");
             return binary;
         }
     };
@@ -2524,7 +2525,7 @@ fn project_archive_contents(
         .collect()
 }
 
-fn unchanged_archive(
+fn unchanged_file_content(
     contents: &HashMap<String, [u8; 32]>,
     key: &str,
     kind: FileChangeType,
@@ -2534,6 +2535,21 @@ fn unchanged_archive(
         && contents.get(key).is_some_and(|accepted| {
             configuration_content(Path::new(key)).as_ref() == Some(accepted)
         })
+}
+
+async fn unchanged_file_contents(contents: HashMap<String, [u8; 32]>) -> HashMap<String, [u8; 32]> {
+    if contents.is_empty() {
+        return contents;
+    }
+    tokio::task::spawn_blocking(move || {
+        contents
+            .keys()
+            .filter(|key| unchanged_file_content(&contents, key, FileChangeType::CHANGED))
+            .map(|key| (key.clone(), contents[key]))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
@@ -3103,7 +3119,21 @@ impl LanguageServer for Backend {
         {
             return;
         }
-        if let Some(force) = project_change(&root, model.as_deref(), &key) {
+        let change = project_change(&root, model.as_deref(), &key);
+        let contents = (change == Some(false))
+            .then(|| self.ws.lock().source_content(&key))
+            .flatten()
+            .map(|content| HashMap::from([(key.clone(), content)]))
+            .unwrap_or_default();
+        let unchanged = unchanged_file_contents(contents).await;
+        if self
+            .ws
+            .lock()
+            .observe_disk_source(&key, unchanged.get(&key))
+        {
+            return;
+        }
+        if let Some(force) = change {
             self.schedule_project_refresh(force, PROJECT_REFRESH_DEBOUNCE);
         }
     }
@@ -3116,10 +3146,10 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
-        // Archive reads may be large. Hash only selected event paths, outside the
+        // Disk reads may be large. Hash only selected event paths, outside the
         // workspace/watch locks so completion can proceed while IO is pending.
         let generation = self.ws.lock().analysis_generation();
-        let archives = {
+        let mut contents = {
             let state = self.watches.lock();
             let mut archives = state.archive_contents.clone();
             if let Some((input_generation, inputs)) = &state.archive_inputs {
@@ -3129,29 +3159,24 @@ impl LanguageServer for Backend {
             }
             archives
         };
-        let archive_keys = params
+        let changed_keys: std::collections::BTreeSet<_> = params
             .changes
             .iter()
             .filter(|event| event.typ == FileChangeType::CHANGED)
             .filter_map(|event| uri_to_key(&event.uri))
-            .filter(|key| archives.contains_key(key))
-            .collect::<std::collections::BTreeSet<_>>();
-        let unchanged_archives = if archive_keys.is_empty() {
-            HashMap::new()
-        } else {
-            tokio::task::spawn_blocking(move || {
-                archive_keys
-                    .into_iter()
-                    .filter(|key| unchanged_archive(&archives, key, FileChangeType::CHANGED))
-                    .map(|key| {
-                        let digest = archives[&key];
-                        (key, digest)
-                    })
-                    .collect::<HashMap<_, _>>()
-            })
-            .await
-            .unwrap_or_default()
+            .collect();
+        {
+            let ws = self.ws.lock();
+            for key in &changed_keys {
+                if let Some(content) = ws.source_content(key) {
+                    if project_change(&root, model.as_deref(), key) == Some(false) {
+                        contents.insert(key.clone(), content);
+                    }
+                }
+            }
         };
+        contents.retain(|key, _| changed_keys.contains(key));
+        let unchanged_contents = unchanged_file_contents(contents).await;
         let archive_origins = model
             .as_deref()
             .map(model_archive_origins)
@@ -3167,14 +3192,19 @@ impl LanguageServer for Backend {
                 .filter_map(|change| {
                     let key = uri_to_key(&change.uri)?;
                     let mut watches = self.watches.lock();
-                    (!watches.unchanged_configuration(&key, change.typ)
-                        && !(change.typ == FileChangeType::CHANGED
-                            && unchanged_archives.get(&key).is_some_and(|accepted| {
-                                watches.archive_content(&key, current_generation) == Some(accepted)
-                            })))
-                    .then_some(key)
+                    let unchanged = (change.typ == FileChangeType::CHANGED)
+                        .then(|| unchanged_contents.get(&key)).flatten();
+                    if watches.unchanged_configuration(&key, change.typ)
+                        || unchanged.is_some_and(|accepted| {
+                            watches.archive_content(&key, current_generation) == Some(accepted)
+                        })
+                        || ws.observe_disk_source(&key, unchanged)
+                    {
+                        return None;
+                    }
+                    drop(watches);
+                    (!ws.observe_compiled_resource(&key)).then_some(key)
                 })
-                .filter(|key| !ws.observe_compiled_resource(key))
                 .map(|key| {
                     let change = project_change(&root, model.as_deref(), &key);
                     if change.is_some() {
@@ -4269,9 +4299,10 @@ impl LanguageServer for Backend {
             let offset = line_index.offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
             let (shaped, semantic) = ws.complete_with_semantic(&key, offset, snippets);
+            let extension_pending = ws.extension_completion_pending(&key);
             let (items, is_incomplete, symbol, semantic) = match shaped {
                 Some(shaped) => {
-                    let incomplete = shaped.is_incomplete;
+                    let incomplete = shaped.is_incomplete || extension_pending;
                     let items = shaped
                         .items
                         .into_iter()
@@ -4279,7 +4310,7 @@ impl LanguageServer for Backend {
                         .collect::<Vec<_>>();
                     (items, incomplete, symbol, semantic)
                 }
-                None => (Vec::new(), false, symbol, semantic),
+                None => (Vec::new(), extension_pending, symbol, semantic),
             };
             Some((items, is_incomplete, symbol, semantic, text))
         };
@@ -4381,7 +4412,7 @@ impl LanguageServer for Backend {
             if count > 0 { "ok" } else { "empty" },
             count,
         );
-        Ok((!items.is_empty()).then(|| {
+        Ok((!items.is_empty() || is_incomplete).then(|| {
             CompletionResponse::List(CompletionList {
                 is_incomplete,
                 items,
@@ -8231,6 +8262,27 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         std::fs::write(&unknown, b"unknown existing binary").unwrap();
         std::fs::write(&wrapper, b"tracked Gradle wrapper").unwrap();
         std::fs::write(root.join("gradlew"), "wrapper fixture").unwrap();
+        let open_file = root.join("src/Use.java");
+        let build_logic = root.join("buildSrc/src/main/kotlin");
+        let sources = [
+            (
+                root.join("src/Closed.java"),
+                "class Closed { int oldName; }\r\n",
+                "class Closed { int newName; }\r\n",
+            ),
+            (
+                root.join("src/ClosedKotlin.kt"),
+                "class ClosedKotlin { val oldName = 1 }\n",
+                "class ClosedKotlin { val newName = 1 }\n",
+            ),
+            (
+                build_logic.join("BuildLogic.kt"),
+                "class BuildLogic { val oldName = 1 }\n",
+                "class BuildLogic { val newName = 1 }\n",
+            ),
+        ];
+        std::fs::create_dir_all(open_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&build_logic).unwrap();
         std::fs::write(
             root.join("settings.gradle"),
             "rootProject.name = 'watch-fixture'",
@@ -8253,6 +8305,10 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 .success());
         }
         for project in [false, true] {
+            std::fs::write(&open_file, "class Use { int onDisk; }").unwrap();
+            for (file, original, _) in &sources {
+                std::fs::write(file, original).unwrap();
+            }
             std::fs::write(&binary, b"accepted binary").unwrap();
             let key = crate::paths::file_key(&binary);
             let component = if project {
@@ -8262,9 +8318,10 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             };
             let model = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(
                 &format!(
-                    "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\t{component}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\timmutable\t1\nSOURCESET\ttest\nSCP\ttest\t{key}\nARTIFACT\ttest\t{key}\t{component}\nEND\t:app\n",
+                    "PROJECT\t:app\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSOURCE\tmain\t{}\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\t{component}\nSCP\tmain\t{}\nARTIFACT\tmain\t{}\tMODULE\tvendor\timmutable\t1\nSOURCESET\ttest\nSCP\ttest\t{key}\nARTIFACT\ttest\t{key}\t{component}\nEND\t:app\n",
                     crate::paths::file_key(&root),
                     crate::paths::file_key(&root.join("src")),
+                    crate::paths::file_key(&build_logic),
                     crate::paths::file_key(&immutable),
                     crate::paths::file_key(&immutable),
                 ),
@@ -8286,6 +8343,156 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 .ws
                 .lock()
                 .open(&open_key, "class Use { int unsaved; }".into());
+            let source_event = |file: &Path, kind| DidChangeWatchedFilesParams {
+                changes: vec![FileEvent::new(Uri::from_file_path(file).unwrap(), kind)],
+            };
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(source_event(&sources[0].0, FileChangeType::CHANGED))
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "source without a disk baseline stays conservative"
+            );
+            backend.ws.lock().scan_model_sources();
+            let before = backend.refresh.lock().requested;
+            let generation = backend.ws.lock().analysis_generation();
+            let cancelled = backend.refresh.lock().cancelled.clone();
+            for file in sources
+                .iter()
+                .map(|(file, _, _)| file)
+                .chain(std::iter::once(&open_file))
+            {
+                backend
+                    .did_change_watched_files(source_event(file, FileChangeType::CHANGED))
+                    .await;
+                backend
+                    .did_save(DidSaveTextDocumentParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: Uri::from_file_path(file).unwrap(),
+                        },
+                        text: None,
+                    })
+                    .await;
+            }
+            assert_eq!(
+                backend.refresh.lock().requested,
+                before,
+                "unchanged source notifications must not restart the root"
+            );
+            assert_eq!(backend.ws.lock().analysis_generation(), generation);
+            assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+            for (file, _, replacement) in &sources {
+                let metadata = std::fs::metadata(file).unwrap();
+                let modified = metadata.modified().unwrap();
+                std::fs::write(file, replacement).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(file)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                assert_eq!(std::fs::metadata(file).unwrap().len(), metadata.len());
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().modified().unwrap(),
+                    modified
+                );
+                let before = backend.refresh.lock().requested;
+                if project {
+                    backend
+                        .did_save(DidSaveTextDocumentParams {
+                            text_document: TextDocumentIdentifier {
+                                uri: Uri::from_file_path(file).unwrap(),
+                            },
+                            text: None,
+                        })
+                        .await;
+                } else {
+                    backend
+                        .did_change_watched_files(source_event(file, FileChangeType::CHANGED))
+                        .await;
+                }
+                assert!(
+                    backend.refresh.lock().requested > before,
+                    "changed source bytes must refresh: {}",
+                    file.display()
+                );
+                backend.ws.lock().scan_model_sources();
+                let entries = backend
+                    .ws
+                    .lock()
+                    .index
+                    .entries_for_file(&crate::paths::file_key(file));
+                assert!(
+                    entries.iter().any(|entry| entry.sym.name == "newName"),
+                    "same-metadata replacement must reach closed facts: {}",
+                    file.display()
+                );
+                assert!(!entries.iter().any(|entry| entry.sym.name == "oldName"));
+            }
+            std::fs::write(&open_file, "class Use { int external; }").unwrap();
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(source_event(&open_file, FileChangeType::CHANGED))
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "an open overlay must not hide a real disk change"
+            );
+            backend.ws.lock().scan_model_sources();
+            assert_eq!(
+                backend.ws.lock().doc_text(&open_key).as_deref(),
+                Some("class Use { int unsaved; }")
+            );
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(source_event(&open_file, FileChangeType::CHANGED))
+                .await;
+            assert_eq!(
+                backend.refresh.lock().requested,
+                before,
+                "accepted disk baseline must update even while an overlay is open"
+            );
+            let file = &sources[0].0;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                let exclusive = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(file)
+                    .unwrap();
+                let before = backend.refresh.lock().requested;
+                backend
+                    .did_change_watched_files(source_event(file, FileChangeType::CHANGED))
+                    .await;
+                assert!(
+                    backend.refresh.lock().requested > before,
+                    "unreadable source stays conservative"
+                );
+                drop(exclusive);
+            }
+            std::fs::remove_file(file).unwrap();
+            for kind in [FileChangeType::CHANGED, FileChangeType::DELETED] {
+                let before = backend.refresh.lock().requested;
+                backend
+                    .did_change_watched_files(source_event(file, kind))
+                    .await;
+                assert!(
+                    backend.refresh.lock().requested > before,
+                    "missing/deleted source stays conservative"
+                );
+            }
+            std::fs::write(file, sources[0].2).unwrap();
+            let before = backend.refresh.lock().requested;
+            backend
+                .did_change_watched_files(source_event(file, FileChangeType::CREATED))
+                .await;
+            assert!(
+                backend.refresh.lock().requested > before,
+                "created source stays conservative"
+            );
+            backend.ws.lock().scan_model_sources();
             let unbaselined = backend.refresh.lock().requested;
             backend
                 .did_change_watched_files(DidChangeWatchedFilesParams {
@@ -8425,7 +8632,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 modified
             );
             assert!(
-                !unchanged_archive(&contents, &key, FileChangeType::CHANGED),
+                !unchanged_file_content(&contents, &key, FileChangeType::CHANGED),
                 "same-size, same-mtime replacement must refresh"
             );
             assert_eq!(project_change(&root, Some(&model), &key), Some(true));
@@ -8448,13 +8655,13 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 "changed archive origin must be retired"
             );
             let replacement = project_archive_contents(&root, Some(&model));
-            assert!(unchanged_archive(
+            assert!(unchanged_file_content(
                 &replacement,
                 &key,
                 FileChangeType::CHANGED
             ));
             for kind in [FileChangeType::CREATED, FileChangeType::DELETED] {
-                assert!(!unchanged_archive(&replacement, &key, kind));
+                assert!(!unchanged_file_content(&replacement, &key, kind));
                 backend.watches.lock().archive_contents = replacement.clone();
                 let before = backend.refresh.lock().requested;
                 backend
@@ -8468,12 +8675,12 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 );
             }
             std::fs::remove_file(&binary).unwrap();
-            assert!(!unchanged_archive(
+            assert!(!unchanged_file_content(
                 &replacement,
                 &key,
                 FileChangeType::CHANGED
             ));
-            assert!(!unchanged_archive(
+            assert!(!unchanged_file_content(
                 &replacement,
                 &key,
                 FileChangeType::DELETED
@@ -8493,7 +8700,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             );
             std::fs::write(&binary, b"replaced binary").unwrap();
             assert!(
-                !unchanged_archive(&HashMap::new(), &key, FileChangeType::CHANGED),
+                !unchanged_file_content(&HashMap::new(), &key, FileChangeType::CHANGED),
                 "a new, unbaselined archive cannot hide its first event"
             );
             backend.watches.lock().archive_contents.clear();
@@ -10241,6 +10448,59 @@ mod first_java_completion_seed_tests {
     }
 
     const USE: &str = "package firstseed; class Use { void run(Iterable<Item> values) { for (var item : values) { item.; } } }";
+
+    #[tokio::test]
+    async fn pending_extension_keeps_normal_items_and_an_empty_incomplete_list() {
+        for prefix in ["", "zzNoMatchingMember"] {
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            backend.ws.lock().open(
+                "Item.kt",
+                "package firstseed\nclass Item { fun useful() {} }".to_string(),
+            );
+            let source = format!(
+                "package firstseed; class Use {{ void run(Item item) {{ item.{prefix}; }} }}"
+            );
+            let key = open_use(backend, "pending-extension-completion", &source);
+            let mut request = params(&key, &source);
+            request.text_document_position.position.character += prefix.len() as u32;
+            let baseline = backend.completion(request.clone()).await.unwrap();
+            if prefix.is_empty() {
+                assert!(labels(baseline.clone())
+                    .iter()
+                    .any(|label| label == "useful"));
+            } else {
+                assert!(baseline.is_none());
+            }
+            backend
+                .ws
+                .lock()
+                .register_ipc_provider("test.pending", vec!["fixture-child".into()])
+                .unwrap();
+            let mut response = Box::pin(backend.completion(request.clone()));
+            let pending = tokio::select! {
+                biased;
+                result = &mut response => result.unwrap(),
+                _ = tokio::task::yield_now() => panic!("completion waited for extension publication"),
+            };
+            let Some(CompletionResponse::List(list)) = pending else {
+                panic!("pending completion must preserve a standard incomplete list");
+            };
+            assert!(list.is_incomplete);
+            let original_items = match &baseline {
+                Some(CompletionResponse::List(list)) => list.items.clone(),
+                Some(CompletionResponse::Array(items)) => items.clone(),
+                None => Vec::new(),
+            };
+            assert_eq!(list.items, original_items);
+            backend
+                .ws
+                .lock()
+                .configure_analysis_provider("test.pending", false, Arc::from("{}"));
+            assert_eq!(backend.completion(request).await.unwrap(), baseline);
+        }
+    }
 
     #[tokio::test]
     async fn first_unknown_java_completion_uses_the_pending_jdk_publication_once() {

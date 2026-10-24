@@ -48,6 +48,46 @@ mod tests {
     }
 
     #[test]
+    fn completion_pending_tracks_queued_and_running_owners_until_commit() {
+        let (index, mut host) = host();
+        assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
+        assert!(host.ipc_completion_pending("/ipc/Target.kt"));
+        assert!(!host.ipc_completion_pending("/ipc/Missing.kt"));
+        let work = host.take_ipc_work(&index).remove(0);
+        assert_eq!(work.params["owner"], "/ipc/Owner.kt");
+        assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
+        host.ipc_batch(
+            &index,
+            work.evaluation,
+            "analysis/finish",
+            json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}}),
+        )
+        .unwrap();
+        assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
+        assert!(host.ipc_completion_pending("/ipc/Target.kt"));
+        host.finish_ipc_work(work.evaluation, Ok(()));
+        let other = host.take_ipc_work(&index).remove(0);
+        assert_eq!(other.params["owner"], "/ipc/Target.kt");
+        assert!(host.ipc_completion_pending("/ipc/Target.kt"));
+        assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
+        host.configure(&index, "test.ipc", false, Arc::from("{}"));
+        assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
+        assert!(!host.ipc_completion_pending("/ipc/Target.kt"));
+    }
+
+    #[test]
+    fn stale_evaluation_is_not_pending_until_fresh_work_is_queued() {
+        let (index, mut host) = host();
+        let work = host.take_ipc_work(&index).remove(0);
+        assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
+        host.store.invalidate_model();
+        assert!(!host.ipc_current(work.evaluation));
+        assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
+        host.requeue_stale_ipc();
+        assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
+    }
+
+    #[test]
     fn publication_requires_current_commit_and_index_publication() {
         let (mut index, mut host) = host();
         let file = "/ipc/Owner.kt";
@@ -175,7 +215,9 @@ mod tests {
     fn foreign_token_poison_prevents_partial_publication() {
         let (index, mut host) = host();
         let work = host.take_ipc_work(&index).remove(0);
+        assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"declaredMembers","target":"foreign:0"}]})).is_err());
+        assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host
             .ipc_batch(
                 &index,
@@ -192,6 +234,7 @@ mod tests {
             .contributions("test.ipc", "/ipc/Owner.kt")
             .is_none());
         assert!(!host.ipc_providers["test.ipc"].enabled);
+        assert!(!host.ipc_completion_pending("/ipc/Target.kt"));
     }
 
     #[test]
@@ -214,6 +257,7 @@ mod tests {
             .requested_source_files_for("/ipc/Owner.kt")
             .is_empty());
         assert!(host.source_wait(&index, "/ipc/Owner.kt").is_none());
+        assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         host.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
         assert!(!host.ipc_current(work.evaluation));
         assert!(host
@@ -383,6 +427,24 @@ impl AnalysisExtensions {
             .get(&id)
             .and_then(|evaluation| evaluation.pending.as_ref())
             .is_some_and(|pending| self.store.validate_pending(pending).is_ok())
+    }
+
+    pub(crate) fn ipc_completion_pending(&self, owner: &str) -> bool {
+        self.inputs.contains_key(owner)
+            && self.ipc_providers.iter().any(|(provider, slot)| {
+                slot.enabled
+                    && (slot.queued.contains(owner)
+                        || (slot.running
+                            && self.ipc_evaluations.values().any(|evaluation| {
+                                evaluation.provider == *provider
+                                    && evaluation.owner == owner
+                                    && evaluation.instance == slot.worker.id
+                                    && evaluation.failure.is_none()
+                                    && evaluation.pending.as_ref().is_some_and(|pending| {
+                                        self.store.validate_pending(pending).is_ok()
+                                    })
+                            })))
+            })
     }
 
     pub(crate) fn ipc_batch(
