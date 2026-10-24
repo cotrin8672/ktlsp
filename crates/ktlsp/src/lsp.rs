@@ -1770,6 +1770,28 @@ async fn index_workspace(
         }
         let registered = watches.lock().registration.is_some();
         if !registered {
+            let input_root = root.clone();
+            let input_ws = ws.clone();
+            let input_watches = watches.clone();
+            let prior_model = ws.lock().project_snapshot();
+            let staged = tokio::task::spawn_blocking(move || {
+                stage_archive_inputs(
+                    &input_root,
+                    prior_model.as_deref(),
+                    generation,
+                    &input_ws,
+                    &input_watches,
+                )
+            })
+            .await
+            .unwrap_or(false);
+            if !staged {
+                if let Some(p) = ongoing {
+                    p.finish_with_message("archive inputs superseded before watch registration")
+                        .await;
+                }
+                return;
+            }
             let watch_start = Instant::now();
             register_project_watches(&client, &root, None, &watches).await;
             crate::trace::span(
@@ -8057,6 +8079,136 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             &watches
         ));
         assert!(!watches.lock().pending_model_jar);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_registration_baselines_tracked_archives_before_client_notifications() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        async fn send(writer: &mut (impl tokio::io::AsyncWrite + Unpin), value: serde_json::Value) {
+            let body = serde_json::to_vec(&value).unwrap();
+            writer
+                .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            writer.write_all(&body).await.unwrap();
+        }
+        async fn receive(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> serde_json::Value {
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_initial_archive_watch_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.gradle"),
+            "rootProject.name = 'initial-watch'",
+        )
+        .unwrap();
+        let binary = root.join("tracked.jar");
+        std::fs::write(&binary, b"original tracked archive").unwrap();
+        for args in [vec!["init", "--quiet"], vec!["add", "tracked.jar"]] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let key = crate::paths::file_key(&binary);
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        let ws = service.inner().ws.clone();
+        let watches = service.inner().watches.clone();
+        let refresh = service.inner().refresh.clone();
+        let (client, server) = tokio::io::duplex(65536);
+        let (input, output) = tokio::io::split(server);
+        let server = tokio::spawn(
+            tower_lsp_server::Server::new(input, output, socket)
+                .concurrency_level(1)
+                .serve(service),
+        );
+        let (input, mut output) = tokio::io::split(client);
+        let mut input = tokio::io::BufReader::new(input);
+        send(&mut output, serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "capabilities":{"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true,"relativePatternSupport":true}}},
+            "workspaceFolders":[{"uri":Uri::from_file_path(&root).unwrap(),"name":"initial-watch"}]
+        }})).await;
+        while receive(&mut input).await["id"] != 1 {}
+        send(
+            &mut output,
+            serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        )
+        .await;
+        let registration = loop {
+            let message = receive(&mut input).await;
+            if message["method"] == "client/registerCapability" {
+                assert_eq!(
+                    message["params"]["registrations"][0]["method"],
+                    "workspace/didChangeWatchedFiles"
+                );
+                break message["id"].clone();
+            }
+        };
+        let generation = ws.lock().analysis_generation();
+        assert!(watches.lock().archive_contents.is_empty());
+        assert_eq!(
+            watches.lock().archive_content(&key, generation),
+            configuration_content(&binary).as_ref()
+        );
+        // Notify before acknowledging registration; the next serial request proves it was handled.
+        for (id, changed) in [(2, false), (3, true)] {
+            if changed {
+                std::fs::write(&binary, b"genuinely changed archive").unwrap();
+            }
+            send(
+                &mut output,
+                serde_json::json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{
+                    "changes":[{"uri":Uri::from_file_path(&binary).unwrap(),"type":2}]
+                }}),
+            )
+            .await;
+            send(&mut output, serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/symbol","params":{"query":"absent"}})).await;
+            while receive(&mut input).await["id"] != id {}
+            assert_eq!(ws.lock().analysis_generation() > generation, changed);
+            assert!(!watches.lock().pending_model_jar);
+        }
+        send(
+            &mut output,
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"shutdown","params":null}),
+        )
+        .await;
+        while receive(&mut input).await["id"] != 4 {}
+        send(
+            &mut output,
+            serde_json::json!({"jsonrpc":"2.0","id":registration,"result":null}),
+        )
+        .await;
+        while refresh.lock().running {
+            tokio::task::yield_now().await;
+        }
+        send(
+            &mut output,
+            serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
+        )
+        .await;
+        server.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
