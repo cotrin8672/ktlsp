@@ -722,6 +722,16 @@ impl Workspace {
             .ipc_batch(&self.index, evaluation, method, params);
         if self.analysis_extensions.revision() != revision {
             self.bump_index_revision();
+            if method == "analysis/finish" && result.is_ok() && crate::trace::enabled() {
+                if let Some(publication) = self.analysis_extensions.ipc_publication(evaluation) {
+                    crate::trace::span(
+                        "extension.ipc.accepted",
+                        "extension",
+                        std::time::Instant::now(),
+                        publication,
+                    );
+                }
+            }
         }
         result
     }

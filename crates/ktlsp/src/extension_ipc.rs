@@ -174,6 +174,7 @@ pub(crate) struct Evaluation {
     pub instance: u64,
     pub pending: Option<PendingContributions>,
     pub failure: Option<String>,
+    pub committed_revision: Option<u64>,
     handles: BTreeMap<String, Handle>,
     batches: usize,
 }
@@ -187,6 +188,7 @@ impl Evaluation {
             instance,
             pending: None,
             failure: None,
+            committed_revision: None,
             handles: BTreeMap::new(),
             batches: 0,
         }

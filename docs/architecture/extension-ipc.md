@@ -215,6 +215,23 @@ or framing test cannot substitute for those editor checks.
 
 ## Implemented change surface and risks
 
+With `KTLSP_TRACE` enabled, `extension.ipc.accepted` records a generic publication
+barrier after a validated `analysis/finish` commit has reached the shared Index,
+inside the same Workspace access. Its arguments are `provider`, `owner`, worker
+`instance`, the opaque `evaluation` token, `publication_revision`, and `source_sha256`.
+The digest covers the UTF-8 source string supplied in `analysis/evaluate.params.source`;
+the source text and full DTO are not logged. Tracing disabled adds no digest or JSON work.
+
+The barrier requires a committed, still-current contribution and enabled running worker
+instance. Pending, failed, stale, replaced, unpublished, and subsequently source-invalidated
+evaluations cannot report acceptance. An unrelated provider publication does not invalidate
+an otherwise current contribution. Editor probes can wait for this generic event tied to
+their provider, owner and source digest, then send a semantic request once, without relying
+on a framework diagnostic marker or retrying until a desired semantic result appears.
+This is a debug observation at publication time, not persistent readiness, producer closure,
+or a promise that later edits, configuration changes, or child exits cannot retract it.
+Focused host and real-editor verification for this addition is recorded separately.
+
 | File / area | Current implementation |
 | --- | --- |
 | `crates/ktcore/src/extensions.rs` and extension contract tests | Preserve session in pending state; narrow validated resume and missing-source-read accessor; test prior-read invalidation and ordinary final commit. |

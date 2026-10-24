@@ -1,6 +1,7 @@
 use super::*;
 use crate::extension_ipc::{Evaluation, Work, Worker};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub(super) struct Slot {
     command: Vec<String>,
@@ -47,8 +48,94 @@ mod tests {
     }
 
     #[test]
+    fn publication_requires_current_commit_and_index_publication() {
+        let (mut index, mut host) = host();
+        let file = "/ipc/Owner.kt";
+        let text = "package ipc\nclass Owner { val text = \"雪☃\" }";
+        let tree = KotlinParser::new().parse(text);
+        index.replace_file(
+            file,
+            ktcore::indexer::extract_symbols(&tree, text, "ipc"),
+            Tier::Volatile,
+        );
+        host.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
+        let work = host.take_ipc_work(&index).remove(0);
+        assert_eq!(work.params["source"], text);
+        host.publish(&mut index);
+        assert!(host.ipc_publication(work.evaluation).is_none());
+        host.ipc_batch(
+            &index,
+            work.evaluation,
+            "analysis/finish",
+            json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}}),
+        )
+        .unwrap();
+        assert!(host.ipc_publication(work.evaluation).is_none());
+        host.publish(&mut index);
+        let publication = host.ipc_publication(work.evaluation).unwrap();
+        assert_eq!(publication.as_object().unwrap().len(), 6);
+        assert_eq!(publication["provider"], "test.ipc");
+        assert_eq!(publication["owner"], file);
+        assert_eq!(publication["instance"], work.worker.id);
+        assert_eq!(publication["evaluation"], work.evaluation.to_string());
+        assert_eq!(publication["publication_revision"], host.published_revision);
+        assert_eq!(
+            publication["source_sha256"],
+            "484c4648a722d52bcb9403cfa2bc0737067163f43c2f49ef4ec9b0a04bf15d0e"
+        );
+
+        host.store
+            .configure_provider("test.other", true, Arc::from("{}"));
+        let read = host
+            .store
+            .begin(&index, "test.other", "/ipc/Target.kt")
+            .unwrap();
+        let pending = read.finish();
+        host.store.commit(pending).unwrap();
+        host.publish(&mut index);
+        let later = host.ipc_publication(work.evaluation).unwrap();
+        assert!(
+            later["publication_revision"].as_u64().unwrap()
+                > publication["publication_revision"].as_u64().unwrap()
+        );
+        assert_eq!(later["source_sha256"], publication["source_sha256"]);
+
+        let changed = "package ipc\nclass Owner { fun changed() = 1 }";
+        let tree = KotlinParser::new().parse(changed);
+        index.replace_file(
+            file,
+            ktcore::indexer::extract_symbols(&tree, changed, "ipc"),
+            Tier::Volatile,
+        );
+        host.replace_sources(&index, vec![(file.into(), Arc::from(changed), tree)]);
+        host.publish(&mut index);
+        assert!(host.ipc_publication(work.evaluation).is_none());
+    }
+
+    #[test]
+    fn replacement_retracts_a_previously_published_evaluation() {
+        let (mut index, mut host) = host();
+        let work = host.take_ipc_work(&index).remove(0);
+        host.ipc_batch(
+            &index,
+            work.evaluation,
+            "analysis/finish",
+            json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}}),
+        )
+        .unwrap();
+        host.publish(&mut index);
+        assert!(host.ipc_publication(work.evaluation).is_some());
+        host.register_ipc(&index, "test.ipc", vec!["replacement-child".into()])
+            .unwrap();
+        host.publish(&mut index);
+        assert!(host.ipc_publication(work.evaluation).is_none());
+        host.finish_ipc_work(work.evaluation, Err("late old failure".into()));
+        assert!(host.ipc_publication(work.evaluation).is_none());
+    }
+
+    #[test]
     fn late_old_failure_cannot_disable_or_clear_replacement_success() {
-        let (index, mut host) = host();
+        let (mut index, mut host) = host();
         let old = host.take_ipc_work(&index).remove(0);
         host.register_ipc(&index, "test.ipc", vec!["replacement-child".into()])
             .unwrap();
@@ -60,12 +147,17 @@ mod tests {
                 json!({"evaluation":old.evaluation.to_string(),"queries":[]})
             )
             .is_err());
+        assert!(host.ipc_publication(old.evaluation).is_none());
         let fresh = host.take_ipc_work(&index).remove(0);
         host.ipc_batch(&index,fresh.evaluation,"analysis/finish",json!({"evaluation":fresh.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})).unwrap();
+        host.publish(&mut index);
+        assert!(host.ipc_publication(fresh.evaluation).is_some());
         host.finish_ipc_work(fresh.evaluation, Ok(()));
         let _next = host.take_ipc_work(&index).remove(0);
         let instance = host.ipc_providers["test.ipc"].worker.id;
         assert!(host.ipc_providers["test.ipc"].running);
+        assert!(host.ipc_publication(old.evaluation).is_none());
+        assert!(host.ipc_publication(fresh.evaluation).is_none());
         host.finish_ipc_work(
             old.evaluation,
             Err("late child crash after consumed pending".into()),
@@ -84,8 +176,17 @@ mod tests {
         let (index, mut host) = host();
         let work = host.take_ipc_work(&index).remove(0);
         assert!(host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"declaredMembers","target":"foreign:0"}]})).is_err());
-        assert!(host.ipc_batch(&index,work.evaluation,"analysis/finish",json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})).is_err());
+        assert!(host
+            .ipc_batch(
+                &index,
+                work.evaluation,
+                "analysis/finish",
+                json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})
+            )
+            .is_err());
+        assert!(host.ipc_publication(work.evaluation).is_none());
         host.finish_ipc_work(work.evaluation, Err("invalid batch".into()));
+        assert!(host.ipc_publication(work.evaluation).is_none());
         assert!(host
             .store
             .contributions("test.ipc", "/ipc/Owner.kt")
@@ -115,6 +216,16 @@ mod tests {
         assert!(host.source_wait(&index, "/ipc/Owner.kt").is_none());
         host.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
         assert!(!host.ipc_current(work.evaluation));
+        assert!(host
+            .ipc_batch(
+                &index,
+                work.evaluation,
+                "analysis/finish",
+                json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})
+            )
+            .is_err());
+        host.publish(&mut index);
+        assert!(host.ipc_publication(work.evaluation).is_none());
         assert!(host.ipc_providers["test.ipc"]
             .queued
             .contains("/ipc/Owner.kt"));
@@ -305,12 +416,40 @@ impl AnalysisExtensions {
                 self.store
                     .commit(evaluation.pending.take().unwrap())
                     .map_err(|error| format!("{error:?}"))?;
+                evaluation.committed_revision = Some(self.store.publication_revision());
                 self.changed.insert(owner.clone());
             }
             result
         })();
         self.ipc_evaluations.insert(id, evaluation);
         result
+    }
+
+    pub(crate) fn ipc_publication(&self, id: u64) -> Option<Value> {
+        let evaluation = self.ipc_evaluations.get(&id)?;
+        let committed = evaluation.committed_revision?;
+        let slot = self.ipc_providers.get(&evaluation.provider)?;
+        if evaluation.pending.is_some()
+            || evaluation.failure.is_some()
+            || !slot.enabled
+            || !slot.running
+            || slot.worker.id != evaluation.instance
+            || self.published_revision != self.store.publication_revision()
+            || committed > self.published_revision
+            || self
+                .store
+                .contributions(&evaluation.provider, &evaluation.owner)
+                .is_none()
+        {
+            return None;
+        }
+        let source = self.inputs.get(&evaluation.owner)?;
+        let source_sha256 = format!("{:x}", Sha256::digest(source.text.as_bytes()));
+        Some(serde_json::json!({
+            "provider": evaluation.provider, "owner": evaluation.owner,
+            "instance": evaluation.instance, "evaluation": id.to_string(),
+            "publication_revision": self.published_revision, "source_sha256": source_sha256,
+        }))
     }
 
     pub(crate) fn finish_ipc_work(&mut self, id: u64, result: Result<(), String>) {
