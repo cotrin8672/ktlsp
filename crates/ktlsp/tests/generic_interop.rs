@@ -4580,19 +4580,37 @@ fun use(router:NamedRouter,left:Class<Invocation>,right:Class<Other>,marker:Invo
 #[test]
 fn named_generic_callbacks_bind_context_without_reentering_the_body() {
     let source = r#"package probe
-class Candidate { fun useful():String = "ok" }
-class Other { fun usefulWrong() {} }
+class Candidate { fun useful():String = "ok"; fun convert():Other = Other() }
+class Other { fun usefulWrong() {}; fun usefulOther():String = "ok" }
 fun <T> accept(value:T, block:(T)->String):String = block(value)
 fun <T> select(value:T, block:(T)->Unit):T = value
 fun <T> checked(value:T, block:(T)->String):T = value
+fun <A,B> transform(value:A, block:(A)->B):B = block(value)
+fun <A,B:Candidate> bounded(value:A, block:(A)->B):B = block(value)
 fun use() {
  accept(value=Candidate()) { it.useful() }
  select(value=Candidate()) {}.useful()
+ transform(value=Candidate()) { it.convert() }.usefulOther()
+ select(value=Candidate()) { it.convert() }.useful()
 }
 "#;
     let mut ws = workspace(&[("Use.kt", source)]);
     // Diagnostics visit implicit receivers before the first editor completion request.
     let _ = ws.diagnostics("Use.kt");
+    let mut parser = KotlinParser::new();
+    let tree = parser.parse(source);
+    let ctx = FileCtx::from_tree_in_file(&tree, source, "Use.kt");
+    let expression = "select(value=Candidate()) {}";
+    let start = source.find(expression).unwrap();
+    let call = tree.root_node().descendant_for_byte_range(start, start + expression.len()).unwrap();
+    let arguments = infer::call_arguments(&ws.index, call, source, &ctx);
+    let entry = &ws.index.lookup_by_name("select")[0];
+    let shared = infer::declared_member_call_type(
+        &ws.index, &Type::Unknown, entry, entry.sym.return_type.as_ref().unwrap(), &arguments,
+        ktcore::members::CallMode::Kotlin, &ctx,
+    );
+    assert_eq!(shared, Type::class("Candidate", Some("probe".into())), "normalized callback binding");
+    assert_eq!(infer_expression(&ws, "Use.kt", expression), shared, "source and normalized calls must agree");
     for prefix in ["it.", "select(value=Candidate()) {}."] {
         assert_member(&mut ws, "Use.kt", prefix, "useful", "usefulWrong");
         assert_exact_definition(
@@ -4607,14 +4625,30 @@ fun use() {
         infer_expression(&ws, "Use.kt", "select(value=Candidate()) {}"),
         Type::class("Candidate", Some("probe".into()))
     );
+    for (prefix, expected, absent) in [
+        ("transform(value=Candidate()) { it.", "convert", "usefulOther"),
+        ("transform(value=Candidate()) { it.convert() }.", "usefulOther", "useful"),
+        ("select(value=Candidate()) { it.convert() }.", "useful", "usefulOther"),
+    ] {
+        assert_member(&mut ws, "Use.kt", prefix, expected, absent);
+        assert_exact_definition(&mut ws, "Use.kt", &format!("{prefix}{expected}()"), "Use.kt", expected);
+    }
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "transform(value=Candidate()) { it.convert() }"),
+        Type::class("Other", Some("probe".into()))
+    );
     for expression in [
         "select(value=Candidate()) { item:Other -> }",
         "checked(value=Candidate()) { 42 }",
         "select(missing=Candidate()) {}",
+        "transform(value=Candidate()) { item:Other -> item }",
+        "bounded(value=Candidate()) { Other() }",
+        "transform(missing=Candidate()) { Other() }",
     ] {
         ws.change("Use.kt", format!("{source}\nfun invalid() {{ {expression}.useful() }}"));
         assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::Unknown, "{expression}");
         assert!(!labels(&mut ws, "Use.kt", &format!("{expression}.")).contains("useful"));
+        assert!(!labels(&mut ws, "Use.kt", &format!("{expression}.")).contains("usefulOther"));
     }
 }
 

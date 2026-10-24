@@ -3911,6 +3911,9 @@ pub(crate) fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, de
     if unbounded_scoped_parameter(ty) {
         return true;
     }
+    if let Some(arguments) = intrinsic_function_arguments(ty) {
+        return arguments.iter().all(|argument| constraint_type_is_known(index, argument, depth + 1));
+    }
     if !type_head_is_known(index, ty) || !receiver_shape_is_known(index, ty) {
         return false;
     }
@@ -3940,6 +3943,15 @@ pub(crate) fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, de
             .args()
             .iter()
             .all(|arg| constraint_type_is_known(index, arg, depth + 1))
+}
+
+fn intrinsic_function_arguments(ty: &Type) -> Option<&[Type]> {
+    match ty {
+        Type::Class { name, package: Some(package), container: None, args, owner: None, .. }
+            if matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
+                && matches!((name.as_str(), args.len()), ("Function0", 1) | ("Function1", 2)) => Some(args),
+        _ => None,
+    }
 }
 
 // Equality can reject distinct ordinary nominal identities; JVM mapped types and aliases need
@@ -4005,6 +4017,9 @@ fn projected_application(
             _ => constraint_type_is_known(index, actual, 0),
         },
         |actual, formals| {
+            if intrinsic_function_arguments(actual).is_some_and(|args| args.len() == formals.len()) {
+                return true;
+            }
             if type_declaration_shape(index, actual).is_none() {
                 return false;
             }

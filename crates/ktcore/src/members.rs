@@ -2118,7 +2118,7 @@ fn bind_arguments_with_lambda_context<'a>(
         .flatten()
         .map(|position| args.types[position].clone())
         .collect();
-    let bound = BoundArguments {
+    let mut bound = BoundArguments {
         mode,
         arguments: Cow::Owned(CallArguments {
             count: Some(args.types.len()),
@@ -2140,7 +2140,7 @@ fn bind_arguments_with_lambda_context<'a>(
             return Err(Applicability::Unknown);
         }
         // Ordinary arguments establish method variables before the callback is checked.
-        let ty = infer::declared_member_bound_type(index, receiver, entry, parameter, &bound, ctx);
+        let mut ty = infer::declared_member_bound_type(index, receiver, entry, parameter, &bound, ctx);
         let Type::Class { name, package: Some(package), container: None, args: signature, owner: None, nullable: false } = &ty else {
             return Err(Applicability::Unknown);
         };
@@ -2150,7 +2150,7 @@ fn bind_arguments_with_lambda_context<'a>(
         if name != &format!("Function{}", parameters.len())
             || !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
             || parameters.len() > 1
-            || signature.iter().any(|ty| !infer::constraint_type_is_known(index, ty, 0))
+            || parameters.iter().any(|ty| !infer::constraint_type_is_known(index, ty, 0))
         {
             return Err(Applicability::Unknown);
         }
@@ -2166,12 +2166,34 @@ fn bind_arguments_with_lambda_context<'a>(
                 })) => {},
             _ => return Err(Applicability::Unknown),
         }
-        // Context does not depend on the body. Only proven Unit coercion may discard its result.
-        if !only_context && result != &Type::class("Unit", Some("kotlin".into()))
-            && (!infer::constraint_type_is_known(index, &lambda.result, 0)
-                || !infer::receiver_satisfies_upper_bound(index, &lambda.result, result))
-        {
-            return Err(Applicability::Unknown);
+        if !only_context {
+            // Unit coercion discards the body value; closed results already constrain subtypes.
+            let actual_result = if result == &Type::class("Unit", Some("kotlin".into())) {
+                result.clone()
+            } else {
+                if !infer::constraint_type_is_known(index, &lambda.result, 0) {
+                    return Err(Applicability::Unknown);
+                }
+                if infer::constraint_type_is_known(index, result, 0) {
+                    if !infer::receiver_satisfies_upper_bound(index, &lambda.result, result) {
+                        return Err(Applicability::Unknown);
+                    }
+                    result.clone()
+                } else {
+                    lambda.result.clone()
+                }
+            };
+            let Type::Class { args, .. } = &mut ty else { unreachable!() };
+            *args.last_mut().unwrap() = actual_result;
+            bound.params.to_mut().push(parameter.clone());
+            let arguments = bound.arguments.to_mut();
+            arguments.types.push(ty);
+            arguments.count = Some(arguments.types.len());
+            if infer::projected_member_application(index, receiver, entry, &bound)
+                .is_none_or(|application| application.status != crate::solve::ConstraintStatus::Matched)
+            {
+                return Err(Applicability::Unknown);
+            }
         }
     }
     Ok(bound)
