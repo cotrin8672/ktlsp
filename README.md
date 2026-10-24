@@ -547,6 +547,11 @@ host with `--bin ... --no-build`. For the same-input control set `KTLSP_IPC_MODE
 and use `ktlsp-external-shadow-fixture` as the host. The exact evidence and remaining limits
 are recorded in the architecture document; these checks do not claim full extension parity.
 
+`analysis/readFacts` also supports `declarationMember` for an exact authored declaration
+token. It returns the host-normalized member and signature without guessing among names
+or overloads. Ambiguous JVM projections and incomplete facts remain Unknown. The same
+query is available to linked providers as `ReadSession::declaration_member`.
+
 `dev/jvm_projection_project.lua` generates a disposable four-buffer Kotlin/JVM fixture for
 this route. Its `dev/corpus/jvm-projections.json` manifest checks the Java exported suspend
 alias and Kotlin authored name, including first responses while the declaration file is closed.

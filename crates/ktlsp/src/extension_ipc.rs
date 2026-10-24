@@ -308,6 +308,10 @@ impl Evaluation {
                             self.type_fact(&read.resolve_type_ref(&reference))
                         }
                         ReadQuery::DeclarationType {declaration} => self.type_fact(&read.declaration_type(&self.declaration(&json!(declaration))?).map_err(contract)?),
+                        ReadQuery::DeclarationMember {declaration} => {
+                            let member = read.declaration_member(&self.declaration(&json!(declaration))?).map_err(contract)?;
+                            fact(&member, |member| self.member(member))
+                        }
                         ReadQuery::DeclaredMembers {target} => {
                             let (members,coverage) = read.declared_members(&self.ty(&json!(target))?).map_err(contract)?;
                             json!({"members":members.iter().map(|member|self.member(member)).collect::<Vec<_>>(),"coverage":fact(&coverage, |_|Value::Null)})
@@ -432,6 +436,7 @@ enum ReadQuery {
     ResolveType { name: String },
     ResolveTypeRef { reference: String },
     DeclarationType { declaration: String },
+    DeclarationMember { declaration: String },
     DeclaredMembers { target: String },
 }
 #[derive(Deserialize)]
@@ -750,6 +755,84 @@ impl Drop for Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn declaration_member_reads_exact_overload_and_rejects_foreign_tokens() {
+        use ktcore::index::{Index, Tier};
+        let file = "/wire/Owner.kt";
+        let text = "package wire\nclass Owner { fun same(arg: Int): Int = arg; fun same(arg: String): String = arg; private var count: Int = 0 }";
+        let tree = ktcore::parser::KotlinParser::new().parse(text);
+        assert!(!tree.root_node().has_error());
+        let mut index = Index::new();
+        index.replace_file(
+            file,
+            ktcore::indexer::extract_symbols(&tree, text, "wire"),
+            Tier::Volatile,
+        );
+        let scope = ktcore::indexer::TypeScope::with_default_imports(
+            "wire",
+            Vec::new(),
+            &["kotlin", "java.lang"],
+        );
+        let declarations = ktcore::extensions::source::extract(&index, file, &tree, text, &scope);
+        let mut store = ExtensionStore::default();
+        store.configure_provider("wire", true, Arc::from("{}"));
+        store
+            .replace_source_declarations(
+                &index,
+                file,
+                Arc::from(text),
+                Knowledge::Found(()),
+                declarations,
+            )
+            .unwrap();
+        let mut read = store.begin(&index, "wire", file).unwrap();
+        let mut evaluation = Evaluation::new("wire".into(), file.into(), 1);
+        let source = evaluation.source(&mut read).unwrap();
+        let declarations = source["declarations"].as_array().unwrap();
+        let queries: Vec<_> = declarations
+            .iter()
+            .map(|declaration| json!({"op":"declarationMember","declaration":declaration["id"]}))
+            .collect();
+        let response = evaluation
+            .batch(
+                &mut read,
+                "analysis/readFacts",
+                json!({"evaluation":evaluation.id.to_string(),"queries":queries}),
+            )
+            .unwrap();
+        let facts = response["facts"].as_array().unwrap();
+        let mut signatures = std::collections::BTreeSet::new();
+        for (declaration, fact) in declarations.iter().zip(facts) {
+            if declaration["name"] == "Owner" {
+                assert_eq!(fact["state"], "unknown");
+                continue;
+            }
+            assert_eq!(fact["state"], "found");
+            let candidate = &fact["value"];
+            assert_eq!(candidate["name"], declaration["name"]);
+            let Handle::Member(member) = &evaluation.handles[candidate["id"].as_str().unwrap()]
+            else {
+                panic!("host member token")
+            };
+            let identity = evaluation.declaration(&declaration["id"]).unwrap();
+            assert_eq!(member.definition(), identity.definition());
+            signatures.insert(
+                candidate["signature"]["value"]["descriptor"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            signatures,
+            ["(I)I", "(Ljava/lang/String;)Ljava/lang/String;", "I"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert!(evaluation.batch(&mut read, "analysis/readFacts", json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"declarationMember","declaration":"foreign:0"}]})).is_err());
+    }
+
     #[test]
     fn framing_rejects_duplicate_lengths_truncation_and_oversize() {
         for bytes in [

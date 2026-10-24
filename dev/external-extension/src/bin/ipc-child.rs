@@ -49,7 +49,6 @@ fn analyze(
     }) else {
         return Ok(json!({"sites":[],"diagnostics":[]}));
     };
-    let owner = shadow["owner"].clone();
     let target = params["configuration"]["target"]
         .as_str()
         .unwrap_or("fixture.Target");
@@ -58,29 +57,17 @@ fn analyze(
         output,
         next,
         "analysis/readFacts",
-        json!({"evaluation":evaluation,"queries":[{"op":"resolveType","name":target},{"op":"declarationType","declaration":owner}]}),
+        json!({"evaluation":evaluation,"queries":[{"op":"resolveType","name":target},{"op":"declarationMember","declaration":shadow["id"]}]}),
     )?;
     let target = read["facts"][0].clone();
     if target["state"] != "found" || read["facts"][1]["state"] != "found" {
         return Ok(json!({"sites":[],"diagnostics":[]}));
     }
-    let members = request(
-        input,
-        output,
-        next,
-        "analysis/readFacts",
-        json!({"evaluation":evaluation,"queries":[{"op":"declaredMembers","target":read["facts"][1]["value"]["id"]},{"op":"declaredMembers","target":target["value"]["id"]}]}),
-    )?;
     let name = shadow["name"]
         .as_str()
         .ok_or("shadow name")?
         .trim_matches('`');
-    let member = members["facts"][0]["members"]
-        .as_array()
-        .ok_or("members")?
-        .iter()
-        .find(|candidate| candidate["name"] == name)
-        .ok_or("shadow member missing")?;
+    let member = &read["facts"][1]["value"];
     if let Some(barrier) = barrier {
         if !barrier.join("released-once").exists() {
             std::fs::create_dir_all(barrier).map_err(|e| e.to_string())?;

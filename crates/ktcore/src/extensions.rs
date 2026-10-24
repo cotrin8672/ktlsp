@@ -1663,6 +1663,81 @@ impl ReadSession<'_> {
         self.issue_type(&entry).map(Knowledge::Found)
     }
 
+    /// The authored declaration's exact member, including its host-normalized signature.
+    /// Same-name overloads and members of other owners never supply a correspondence.
+    pub fn declaration_member(
+        &mut self,
+        declaration: &DeclarationId,
+    ) -> Result<Fact<MemberCandidate>, ContractError> {
+        self.check_declaration(declaration)?;
+        self.reads.namespace = Some(self.store.namespace_generation);
+        if !self.index.scope_is_complete() {
+            return Ok(unknown(IncompleteReason::IncompleteScope));
+        }
+        let entries = self.index.entries_for_file(&declaration.definition.file);
+        let exact: Vec<_> = entries
+            .iter()
+            .filter(|entry| definition(entry) == declaration.definition)
+            .collect();
+        let entry = match exact.as_slice() {
+            [entry] => *entry,
+            [] => return Err(ContractError::ForeignIdentity),
+            _ => return Ok(unknown(IncompleteReason::AmbiguousMember)),
+        };
+        let Some(container) = entry
+            .sym
+            .container
+            .as_deref()
+            .filter(|_| member_kind(entry).is_some())
+        else {
+            return Ok(unknown(IncompleteReason::MissingFacts));
+        };
+        let owners: Vec<_> = entries
+            .iter()
+            .filter(|owner| {
+                matches!(
+                    owner.sym.kind,
+                    SymbolKind::Class
+                        | SymbolKind::Interface
+                        | SymbolKind::Object
+                        | SymbolKind::EnumClass
+                ) && owner.sym.package == entry.sym.package
+                    && owner.sym.container.as_ref().map_or_else(
+                        || unquote(&owner.sym.name).to_string(),
+                        |parent| format!("{parent}.{}", unquote(&owner.sym.name)),
+                    ) == container
+            })
+            .collect();
+        let owner = match owners.as_slice() {
+            [owner] => self.issue_type(owner)?,
+            [] => return Ok(unknown(IncompleteReason::MissingFacts)),
+            _ => return Ok(unknown(IncompleteReason::AmbiguousType)),
+        };
+        let (members, coverage) = self.declared_members(&owner)?;
+        let mut exact = members
+            .into_iter()
+            .filter(|member| member.id.definition() == &declaration.definition);
+        match (exact.next(), exact.next()) {
+            (Some(member), None) => {
+                let mut reasons = Vec::new();
+                add_unknown(&member.signature, &mut reasons);
+                add_unknown(&member.dispatch, &mut reasons);
+                add_unknown(&member.visibility, &mut reasons);
+                add_unknown(&member.synthetic, &mut reasons);
+                if reasons.is_empty() {
+                    Ok(Knowledge::Found(member))
+                } else {
+                    Ok(Knowledge::Unknown(reasons))
+                }
+            }
+            (Some(_), Some(_)) => Ok(unknown(IncompleteReason::AmbiguousMember)),
+            _ => Ok(match coverage {
+                Knowledge::Unknown(reasons) => Knowledge::Unknown(reasons),
+                _ => unknown(IncompleteReason::MissingFacts),
+            }),
+        }
+    }
+
     pub fn resolve_type(&mut self, qualified_name: &str) -> Fact<TypeId> {
         self.reads.namespace = Some(self.store.namespace_generation);
         let name = qualified_name.rsplit('.').next().unwrap_or(qualified_name);

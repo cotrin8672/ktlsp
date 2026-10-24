@@ -60,6 +60,25 @@ serialize private TypeId/DeclarationId fields, accept a child-supplied declarati
 or reconstruct an identity from a qualified name. Names are query input, not authority.
 Reject cross-workspace, foreign-instance, stale or wrongly typed tokens.
 
+`analysis/readFacts` accepts `resolveType`, `resolveTypeRef`, `declarationType`,
+`declarationMember` and `declaredMembers` operations. For example,
+`{"op":"declarationMember","declaration":"<host declaration token>"}` returns a
+Fact containing the exact authored MemberCandidate, with opaque member/signature tokens
+and the existing normalized kind/descriptor/dispatch/visibility/synthetic fields.
+The host matches the exact indexed definition and a unique containing type, then reuses
+`declared_members`; it does not select a same-name overload. Non-member declarations,
+missing facts, incomplete scope and ambiguous owners remain Unknown. Foreign/stale
+identities are rejected using the existing contract checks. Source, model and namespace
+reads participate in the same resume/commit validation as other facts. This additive query
+is newer than snapshot `58ce9c41` and is verified in release34: focused core4/wire2
+checks, the workspace suite, and the independently built child on the actual host.
+The child now requires this query instead of matching a same-name member.
+`member141-final-receipt.json` records clean IPC26/linked14 checks and equal completion,
+goto, references and applied rename outputs.
+An authored Kotlin property with accessor projections, or an unsupported `@JvmOverloads`
+lowering, does not prove a single JVM member; unresolved signature/modifier facts keep the
+whole correspondence Unknown. This query does not enumerate generated JVM projections.
+
 Source facts preserve owner/annotation/declaration ranges, normalized annotation arguments,
 member kind and known signature/dispatch/visibility/synthetic facts for both languages.
 Class-valued annotation/type-reference tokens are resolved by the host in the owner scope.

@@ -2331,7 +2331,14 @@ fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
                 .filter(|d| d.member.is_some())
                 .cloned()
                 .collect();
-            assert_eq!(methods.len(), 2);
+            assert_eq!(
+                methods.len(),
+                if read.source().contains("projected") {
+                    8
+                } else {
+                    6
+                }
+            );
             for authored in methods {
                 let owner = authored.owner.unwrap();
                 let declaration = read.declaration(owner.start_byte..owner.end_byte)?;
@@ -2344,11 +2351,41 @@ fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
                 };
                 assert_eq!(ty.definition(), &owner);
                 let members = read.declared_members(&ty)?.0;
-                assert_eq!(members.len(), 1);
-                assert_eq!(members[0].id.definition(), &authored.definition);
-                assert!(
-                    matches!(&members[0].signature, Knowledge::Found(signature) if signature.descriptor() == "()I")
+                let member =
+                    read.declaration(authored.definition.start_byte..authored.definition.end_byte)?;
+                let result = read.declaration_member(&member)?;
+                let name = read
+                    .source()
+                    .get(authored.definition.start_byte..authored.definition.end_byte)
+                    .unwrap();
+                if matches!(name, "projected" | "publicValue") {
+                    assert!(
+                        matches!(result, Knowledge::Unknown(_)),
+                        "one authored declaration does not prove one JVM member"
+                    );
+                    continue;
+                }
+                let Knowledge::Found(exact) = result else {
+                    panic!("exact authored member: {name}")
+                };
+                assert_eq!(exact.id.definition(), &authored.definition);
+                assert_eq!(exact.id.owner(), &ty);
+                assert_eq!(
+                    members
+                        .iter()
+                        .filter(|candidate| candidate.id.definition() == &authored.definition)
+                        .collect::<Vec<_>>(),
+                    vec![&exact]
                 );
+                let expected = match read.source().get(authored.definition.end_byte..).unwrap() {
+                    tail if tail.starts_with("()") => "()I",
+                    tail if tail.starts_with('(') => "(I)I",
+                    _ => "I",
+                };
+                assert!(
+                    matches!(&exact.signature, Knowledge::Found(signature) if signature.descriptor() == expected)
+                );
+                let expected_type_reason = IncompleteReason::UnsupportedType(name.into());
                 let Knowledge::Found(reference) = read.reference_type(&ty)? else {
                     panic!("nested JVM reference")
                 };
@@ -2358,10 +2395,8 @@ fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
                     other => panic!("wrong owner: {other}"),
                 };
                 assert_eq!(method(&[reference], &JvmType::Void).descriptor(), expected);
-                let member =
-                    read.declaration(authored.definition.start_byte..authored.definition.end_byte)?;
                 assert!(
-                    matches!(read.declaration_type(&member)?, Knowledge::Unknown(reasons) if reasons == vec![IncompleteReason::UnsupportedType("value".into())])
+                    matches!(read.declaration_type(&member)?, Knowledge::Unknown(reasons) if reasons == vec![expected_type_reason])
                 );
             }
             Ok(())
@@ -2382,9 +2417,9 @@ fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
             "/oracle/Nested.kt"
         };
         let text = if java {
-            "package oracle; class First { static class Axis { public int value() { return 1; } } } class Second { static class Axis { public int value() { return 2; } } }"
+            "package oracle; class First { static class Axis { public int value() { return 1; } public int value(int arg) { return arg; } public int count; } } class Second { static class Axis { public int value() { return 2; } public int value(int arg) { return arg; } public int count; } }"
         } else {
-            "package oracle\nclass First { class Axis { fun value(): Int = 1 } }\nclass Second { class Axis { fun value(): Int = 2 } }\n"
+            "package oracle\nclass First { class Axis { fun value(): Int = 1; fun value(arg: Int): Int = arg; private var count: Int = 0; @kotlin.jvm.JvmOverloads fun projected(arg: Int = 0): Int = arg; var publicValue: Int = 0 } }\nclass Second { class Axis { fun value(): Int = 2; fun value(arg: Int): Int = arg; private var count: Int = 0 } }\n"
         };
         if java {
             let mut parser = tree_sitter::Parser::new();
@@ -2395,20 +2430,52 @@ fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
             assert!(!tree.root_node().has_error());
             let mut symbols = Vec::new();
             for (ordinal, outer) in ["First", "Second"].into_iter().enumerate() {
-                for (name, kind, container) in [
-                    (outer, SymbolKind::Class, None),
-                    ("Axis", SymbolKind::Class, Some(outer.to_string())),
-                    ("value", SymbolKind::Function, Some(format!("{outer}.Axis"))),
+                for (name, kind, container, occurrence_index) in [
+                    (outer, SymbolKind::Class, None, 0),
+                    ("Axis", SymbolKind::Class, Some(outer.to_string()), ordinal),
+                    (
+                        "value",
+                        SymbolKind::Function,
+                        Some(format!("{outer}.Axis")),
+                        ordinal * 2,
+                    ),
+                    (
+                        "value",
+                        SymbolKind::Function,
+                        Some(format!("{outer}.Axis")),
+                        ordinal * 2 + 1,
+                    ),
+                    (
+                        "count",
+                        SymbolKind::Property,
+                        Some(format!("{outer}.Axis")),
+                        ordinal,
+                    ),
                 ] {
-                    let range = occurrence(text, name, if name == outer { 0 } else { ordinal });
+                    let range = occurrence(text, name, occurrence_index);
                     let mut symbol =
                         IndexedSymbol::new(name, kind, "oracle", container, range.start, range.end);
                     if kind == SymbolKind::Function {
-                        symbol.arity = Some(0);
+                        symbol.arity = Some((occurrence_index % 2) as u8);
+                        if occurrence_index % 2 == 1 {
+                            symbol.params = vec![ktcore::types::TypeRef::simple("int")];
+                        }
                         symbol.return_type = Some(ktcore::types::TypeRef::simple("int"));
                         let node = tree
                             .root_node()
                             .descendant_for_byte_range(range.start, range.end)
+                            .unwrap()
+                            .parent()
+                            .unwrap();
+                        symbol.source_member =
+                            ktcore::indexer::source_member_flags(node, text, true);
+                    } else if kind == SymbolKind::Property {
+                        symbol.value_type = Some(ktcore::types::TypeRef::simple("int"));
+                        let node = tree
+                            .root_node()
+                            .descendant_for_byte_range(range.start, range.end)
+                            .unwrap()
+                            .parent()
                             .unwrap()
                             .parent()
                             .unwrap();
@@ -2441,6 +2508,85 @@ fn declaration_type_provider_keeps_exact_nested_owners_and_jvm_signatures() {
         Probe.analyze(&mut read).unwrap();
         let pending = read.finish();
         store.commit(pending).unwrap();
+        let range = occurrence(text, "value", 0);
+        let mut read = store.begin(&index, Probe.id(), file).unwrap();
+        let declaration = read.declaration(range).unwrap();
+        drop(read);
+        let mut symbols: Vec<_> = index
+            .entries_for_file(file)
+            .iter()
+            .map(|entry| (*entry.sym).clone())
+            .collect();
+        let mut duplicate = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Axis" && symbol.container.as_deref() == Some("First"))
+            .unwrap()
+            .clone();
+        let other = occurrence(text, "Axis", 1);
+        duplicate.start_byte = other.start;
+        duplicate.end_byte = other.end;
+        symbols.push(duplicate);
+        index.replace_file(file, symbols, Tier::Volatile);
+        let mut read = store.begin(&index, Probe.id(), file).unwrap();
+        assert!(
+            matches!(read.declaration_member(&declaration).unwrap(), Knowledge::Unknown(reasons) if reasons == vec![IncompleteReason::AmbiguousType])
+        );
+    }
+}
+
+#[test]
+fn declaration_member_tracks_its_own_read_dependencies_and_missing_facts() {
+    for changed in ["model", "namespace", "source", "facts"] {
+        let (index, mut store) = fixture();
+        let mut read = store.begin(&index, "mixin-consumer", TARGET_FILE).unwrap();
+        let declaration = read.declaration(occurrence(TARGET, "twice", 0)).unwrap();
+        drop(read);
+        let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+        assert!(read.declaration_member(&declaration).unwrap().is_found());
+        let pending = read.finish();
+        match changed {
+            "model" => store.invalidate_model(),
+            "namespace" => store.set_namespace_coverage(Knowledge::Unknown(vec![
+                IncompleteReason::IncompleteScope,
+            ])),
+            "source" | "facts" => store
+                .replace_source(
+                    &index,
+                    TARGET_FILE,
+                    Arc::from(if changed == "source" {
+                        format!("{TARGET}\n")
+                    } else {
+                        TARGET.into()
+                    }),
+                    Knowledge::Found(()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store.commit(pending),
+            Err(ContractError::Stale),
+            "{changed}"
+        );
+        let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+        if matches!(changed, "source" | "facts") {
+            assert_eq!(
+                read.declaration_member(&declaration),
+                Err(ContractError::Stale)
+            );
+            drop(read);
+            let mut read = store.begin(&index, "mixin-consumer", TARGET_FILE).unwrap();
+            let current = read.declaration(occurrence(TARGET, "twice", 0)).unwrap();
+            assert!(
+                matches!(read.declaration_member(&current).unwrap(), Knowledge::Unknown(reasons) if !reasons.is_empty() && reasons.iter().all(|reason| *reason == IncompleteReason::MissingFacts))
+            );
+        } else {
+            assert!(
+                read.declaration_member(&declaration).unwrap().is_found(),
+                "{changed}"
+            );
+        }
     }
 }
 
@@ -2457,6 +2603,13 @@ fn declaration_type_validates_identity_scope_and_read_dependencies() {
     );
     let declaration = read.declaration(range.clone()).unwrap();
     assert!(read.declaration_type(&declaration).unwrap().is_found());
+    assert!(
+        matches!(
+            read.declaration_member(&declaration).unwrap(),
+            Knowledge::Unknown(_)
+        ),
+        "a class is not a member"
+    );
     let pending = read.finish();
     store.invalidate_model();
     assert_eq!(store.commit(pending), Err(ContractError::Stale));
@@ -2477,6 +2630,10 @@ fn declaration_type_validates_identity_scope_and_read_dependencies() {
         read.declaration_type(&declaration),
         Err(ContractError::ForeignIdentity)
     );
+    assert_eq!(
+        read.declaration_member(&declaration),
+        Err(ContractError::ForeignIdentity)
+    );
     drop(read);
     let (foreign_index, mut foreign_store, _) = compiled_host_fixture();
     let mut foreign = foreign_store
@@ -2486,6 +2643,10 @@ fn declaration_type_validates_identity_scope_and_read_dependencies() {
         foreign.declaration_type(&declaration),
         Err(ContractError::ForeignIdentity)
     );
+    assert_eq!(
+        foreign.declaration_member(&declaration),
+        Err(ContractError::ForeignIdentity)
+    );
     drop(foreign);
     index.replace_scope_visibilities(Vec::new());
     let mut read = store
@@ -2493,6 +2654,9 @@ fn declaration_type_validates_identity_scope_and_read_dependencies() {
         .unwrap();
     assert!(
         matches!(read.declaration_type(&declaration).unwrap(), Knowledge::Unknown(reasons) if reasons == vec![IncompleteReason::IncompleteScope])
+    );
+    assert!(
+        matches!(read.declaration_member(&declaration).unwrap(), Knowledge::Unknown(reasons) if reasons == vec![IncompleteReason::IncompleteScope])
     );
     drop(read);
     store
@@ -2509,6 +2673,10 @@ fn declaration_type_validates_identity_scope_and_read_dependencies() {
         .unwrap();
     assert_eq!(
         read.declaration_type(&declaration),
+        Err(ContractError::Stale)
+    );
+    assert_eq!(
+        read.declaration_member(&declaration),
         Err(ContractError::Stale)
     );
 }
