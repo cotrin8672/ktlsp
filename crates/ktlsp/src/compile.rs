@@ -1203,8 +1203,8 @@ mod native_compile_ownership_tests {
         WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Threading::{
-        GetProcessId, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE,
+        GetExitCodeProcess, GetProcessId, OpenProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
     // Job termination is asynchronous; verify the retained descendant handle actually signals.
@@ -1470,10 +1470,15 @@ mod native_compile_ownership_tests {
             outcome.diagnostics[0].message,
             "fixture retained diagnostic"
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(6),
-            "silent pipe holder delayed public return after {:?}: {outcome:?}",
-            started.elapsed()
+        let mut leaf_exit = 0;
+        assert_ne!(
+            unsafe { GetExitCodeProcess(leaf.as_raw_handle(), &mut leaf_exit) },
+            0,
+            "retained leaf exit code must remain queryable"
+        );
+        assert_ne!(
+            leaf_exit, 0,
+            "fixture leaf exited naturally instead of owned cleanup"
         );
         assert!(
             !outcome.executed,
