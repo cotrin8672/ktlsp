@@ -2046,52 +2046,7 @@ fn bind_arguments_with_lambda_context<'a>(
     {
         return Err(Applicability::Unknown);
     }
-    let contextual_lambda = if args.trailing_lambda {
-        let Some(parameter) = entry.sym.params.last() else {
-            return Err(Applicability::Unknown);
-        };
-        if infer::trailing_lambda_receiver_ref(index, entry, ctx).is_some()
-            || function_type_signature(parameter).is_none()
-        {
-            return Err(Applicability::Unknown);
-        }
-        let ty = infer::declared_member_type(index, receiver, entry, parameter, mode, ctx);
-        let Type::Class { name, package: Some(package), container: None, args: signature, owner: None, nullable: false } = &ty else {
-            return Err(Applicability::Unknown);
-        };
-        let Some((result, parameters)) = signature.split_last() else {
-            return Err(Applicability::Unknown);
-        };
-        if name != &format!("Function{}", parameters.len())
-            || !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
-            || parameters.len() > 1
-            || signature.iter().any(|ty| !infer::constraint_type_is_known(index, ty, 0))
-        {
-            return Err(Applicability::Unknown);
-        }
-        let Some(lambda) = &args.trailing_lambda_arguments else {
-            return Err(Applicability::Unknown);
-        };
-        match &lambda.parameters {
-            LambdaParameters::Implicit if parameters.len() <= 1 => {},
-            LambdaParameters::Explicit(actual) if actual.len() == parameters.len()
-                && actual.iter().zip(parameters).all(|(actual, formal)| actual.as_ref().is_none_or(|actual| {
-                    infer::constraint_type_is_known(index, actual, 0)
-                        && infer::receiver_satisfies_upper_bound(index, formal, actual)
-                })) => {},
-            _ => return Err(Applicability::Unknown),
-        }
-        // Context does not depend on the body. Only proven Unit coercion may discard its result.
-        if !only_context && result != &Type::class("Unit", Some("kotlin".into()))
-            && (!infer::constraint_type_is_known(index, &lambda.result, 0)
-                || !infer::receiver_satisfies_upper_bound(index, &lambda.result, result))
-        {
-            return Err(Applicability::Unknown);
-        }
-        true
-    } else {
-        false
-    };
+    let contextual_lambda = args.trailing_lambda;
     let Some(formals) = entry.sym.kotlin_parameters.as_deref() else {
         return Err(Applicability::Unknown);
     };
@@ -2163,7 +2118,7 @@ fn bind_arguments_with_lambda_context<'a>(
         .flatten()
         .map(|position| args.types[position].clone())
         .collect();
-    Ok(BoundArguments {
+    let bound = BoundArguments {
         mode,
         arguments: Cow::Owned(CallArguments {
             count: Some(args.types.len()),
@@ -2174,7 +2129,52 @@ fn bind_arguments_with_lambda_context<'a>(
             trailing_lambda_arguments: None,
         }),
         params,
-    })
+    };
+    if contextual_lambda {
+        let Some(parameter) = entry.sym.params.last() else {
+            return Err(Applicability::Unknown);
+        };
+        if infer::trailing_lambda_receiver_ref(index, entry, ctx).is_some()
+            || function_type_signature(parameter).is_none()
+        {
+            return Err(Applicability::Unknown);
+        }
+        // Ordinary arguments establish method variables before the callback is checked.
+        let ty = infer::declared_member_bound_type(index, receiver, entry, parameter, &bound, ctx);
+        let Type::Class { name, package: Some(package), container: None, args: signature, owner: None, nullable: false } = &ty else {
+            return Err(Applicability::Unknown);
+        };
+        let Some((result, parameters)) = signature.split_last() else {
+            return Err(Applicability::Unknown);
+        };
+        if name != &format!("Function{}", parameters.len())
+            || !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
+            || parameters.len() > 1
+            || signature.iter().any(|ty| !infer::constraint_type_is_known(index, ty, 0))
+        {
+            return Err(Applicability::Unknown);
+        }
+        let Some(lambda) = &args.trailing_lambda_arguments else {
+            return Err(Applicability::Unknown);
+        };
+        match &lambda.parameters {
+            LambdaParameters::Implicit if parameters.len() <= 1 => {},
+            LambdaParameters::Explicit(actual) if actual.len() == parameters.len()
+                && actual.iter().zip(parameters).all(|(actual, formal)| actual.as_ref().is_none_or(|actual| {
+                    infer::constraint_type_is_known(index, actual, 0)
+                        && infer::receiver_satisfies_upper_bound(index, formal, actual)
+                })) => {},
+            _ => return Err(Applicability::Unknown),
+        }
+        // Context does not depend on the body. Only proven Unit coercion may discard its result.
+        if !only_context && result != &Type::class("Unit", Some("kotlin".into()))
+            && (!infer::constraint_type_is_known(index, &lambda.result, 0)
+                || !infer::receiver_satisfies_upper_bound(index, &lambda.result, result))
+        {
+            return Err(Applicability::Unknown);
+        }
+    }
+    Ok(bound)
 }
 
 pub fn function_accepts(

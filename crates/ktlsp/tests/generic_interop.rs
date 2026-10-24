@@ -4578,6 +4578,47 @@ fun use(router:NamedRouter,left:Class<Invocation>,right:Class<Other>,marker:Invo
 }
 
 #[test]
+fn named_generic_callbacks_bind_context_without_reentering_the_body() {
+    let source = r#"package probe
+class Candidate { fun useful():String = "ok" }
+class Other { fun usefulWrong() {} }
+fun <T> accept(value:T, block:(T)->String):String = block(value)
+fun <T> select(value:T, block:(T)->Unit):T = value
+fun <T> checked(value:T, block:(T)->String):T = value
+fun use() {
+ accept(value=Candidate()) { it.useful() }
+ select(value=Candidate()) {}.useful()
+}
+"#;
+    let mut ws = workspace(&[("Use.kt", source)]);
+    // Diagnostics visit implicit receivers before the first editor completion request.
+    let _ = ws.diagnostics("Use.kt");
+    for prefix in ["it.", "select(value=Candidate()) {}."] {
+        assert_member(&mut ws, "Use.kt", prefix, "useful", "usefulWrong");
+        assert_exact_definition(
+            &mut ws,
+            "Use.kt",
+            &format!("{prefix}useful()"),
+            "Use.kt",
+            "useful",
+        );
+    }
+    assert_eq!(
+        infer_expression(&ws, "Use.kt", "select(value=Candidate()) {}"),
+        Type::class("Candidate", Some("probe".into()))
+    );
+    for expression in [
+        "select(value=Candidate()) { item:Other -> }",
+        "checked(value=Candidate()) { 42 }",
+        "select(missing=Candidate()) {}",
+    ] {
+        ws.change("Use.kt", format!("{source}\nfun invalid() {{ {expression}.useful() }}"));
+        assert_eq!(infer_expression(&ws, "Use.kt", expression), Type::Unknown, "{expression}");
+        assert!(!labels(&mut ws, "Use.kt", &format!("{expression}.")).contains("useful"));
+    }
+}
+
+#[test]
 fn named_projected_calls_preserve_unknown_for_unsupported_argument_shapes() {
     let declarations = r#"package probe
 class NamedShapes {

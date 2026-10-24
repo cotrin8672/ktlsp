@@ -1563,7 +1563,8 @@ fn lambda_receiver_or_element(
     if let Some((receiver, selection)) =
         local_lambda_call_selection(index, call, callee, src, ctx, depth, child_infer)
     {
-        let arguments = normalized_call_arguments(index, call, src, ctx, depth, synth_arg_types(index, call, src, ctx, depth, child_infer), child_infer);
+        let arguments = syntactic_call_arguments(call, src,
+            synth_arg_types(index, call, src, ctx, depth, child_infer));
         let mut result = None;
         for entry in selection.entries {
             if trailing_lambda_receiver_ref(index, entry, ctx).is_some() {
@@ -1718,7 +1719,8 @@ fn local_lambda_call_selection<'a>(
     if !candidates.has_local_extensions() {
         return None;
     }
-    let usage = MemberUse::Call(normalized_call_arguments(index, call, src, ctx, depth, synth_arg_types(index, call, src, ctx, depth, child_infer), child_infer));
+    let usage = MemberUse::Call(syntactic_call_arguments(call, src,
+        synth_arg_types(index, call, src, ctx, depth, child_infer)));
     let selection = candidates.select(index, &receiver, &usage, ctx);
     (selection.applicability != members::Applicability::Rejected).then_some((receiver, selection))
 }
@@ -2886,7 +2888,8 @@ fn callable_member_entries<'a>(
     child_infer: &mut impl ChildInfer,
 ) -> (Vec<&'a Entry>, bool) {
     if candidates.has_local_extensions() {
-        let usage = MemberUse::Call(normalized_call_arguments(index, call, src, ctx, depth, synth_arg_types(index, call, src, ctx, depth, child_infer), child_infer));
+        let usage = MemberUse::Call(syntactic_call_arguments(call, src,
+            synth_arg_types(index, call, src, ctx, depth, child_infer)));
         let selection = candidates.select(index, receiver, &usage, ctx);
         return (
             selection
@@ -3111,7 +3114,8 @@ fn select_trailing_lambda_receiver_type(
             arg_count, arg_types
         );
     }
-    let args = normalized_call_arguments(index, call, src, ctx, depth, arg_types, child_infer);
+    // Expected receiver context must not infer the lambda body that requests it.
+    let args = syntactic_call_arguments(call, src, arg_types);
     let mut entries = entries;
     entries.retain(|entry| {
         members::function_accepts(index, recv_ty.unwrap_or(&Type::Unknown), entry, &args, ctx)
@@ -4276,7 +4280,7 @@ pub fn declared_member_call_type(
     declared_member_bound_type(index, receiver, entry, tr, &bound, ctx)
 }
 
-fn declared_member_bound_type(
+pub(crate) fn declared_member_bound_type(
     index: &dyn InferenceIndex,
     receiver: &Type,
     entry: &Entry,
