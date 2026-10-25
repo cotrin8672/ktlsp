@@ -1410,6 +1410,25 @@ pub fn resolve_local_jar_stubs_for_origin(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    resolve_local_jar_stubs_for_origin_while_current(
+        jar_path,
+        origin_id,
+        extract_root,
+        kotlin,
+        java,
+        &|| true,
+    )
+}
+
+pub(crate) fn resolve_local_jar_stubs_for_origin_while_current(
+    jar_path: &Path,
+    origin_id: &str,
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
+) -> anyhow::Result<Vec<FileSymbols>> {
+    anyhow::ensure!(current(), "binary indexing generation cancelled");
     if !jar_path.is_file() || crate::classpath::file_origin_id(jar_path) != origin_id {
         anyhow::bail!(
             "local artifact {} changed since project discovery",
@@ -1417,6 +1436,7 @@ pub fn resolve_local_jar_stubs_for_origin(
         );
     }
     let content = file_content_digest(jar_path).context("read stable local artifact content")?;
+    anyhow::ensure!(current(), "binary indexing generation cancelled");
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
     // Mutable local archives may preserve both size and modification time.
@@ -1435,7 +1455,7 @@ pub fn resolve_local_jar_stubs_for_origin(
             policy: Ok(SourceTextPolicy::default()),
         };
         (
-            resolve_library_source_unowned(&source, Some(&fingerprint), kotlin, java, &|| true)?,
+            resolve_library_source_unowned(&source, Some(&fingerprint), kotlin, java, current)?,
             SourceRepresentation::Source,
         )
     } else {
@@ -1447,6 +1467,7 @@ pub fn resolve_local_jar_stubs_for_origin(
                 kotlin,
                 java,
                 &|| file_content_digest(jar_path) == Some(content),
+                current,
             )?,
             SourceRepresentation::Stub,
         )
@@ -1460,6 +1481,7 @@ pub fn resolve_local_jar_stubs_for_origin(
             jar_path.display()
         );
     }
+    anyhow::ensure!(current(), "binary indexing generation cancelled");
     tag_batches(&mut batches, origin_id, representation);
     Ok(batches)
 }
@@ -1472,6 +1494,25 @@ pub(crate) fn resolve_module_binary_stubs(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    resolve_module_binary_stubs_while_current(
+        coord,
+        selected_binaries,
+        extract_root,
+        kotlin,
+        java,
+        &|| true,
+    )
+}
+
+pub(crate) fn resolve_module_binary_stubs_while_current(
+    coord: &Coordinate,
+    selected_binaries: &[(PathBuf, String)],
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
+) -> anyhow::Result<Vec<FileSymbols>> {
+    anyhow::ensure!(current(), "binary indexing generation cancelled");
     if Coordinate::parse(&coord.label()).as_ref() != Some(coord) {
         return Ok(Vec::new());
     }
@@ -1506,6 +1547,7 @@ pub(crate) fn resolve_module_binary_stubs(
         kotlin,
         java,
         &|| true,
+        current,
     )?;
     anyhow::ensure!(
         crate::classpath::file_origin_id(jar_path) == *expected_origin,
@@ -1523,6 +1565,7 @@ pub(crate) fn resolve_module_binary_stubs(
             ) || symbol.kind.is_type_like() && symbol.unavailable_members.is_some()
         })
     });
+    anyhow::ensure!(current(), "binary indexing generation cancelled");
     tag_batches(&mut batches, &origin_id, SourceRepresentation::Stub);
     Ok(batches)
 }
@@ -1534,7 +1577,9 @@ fn resolve_local_jar_stubs_unowned(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
     current: &dyn Fn() -> bool,
+    live: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    anyhow::ensure!(live(), "binary indexing generation cancelled");
     if !jar_path.is_file() {
         anyhow::bail!("local artifact {} is missing", jar_path.display());
     }
@@ -1542,7 +1587,7 @@ fn resolve_local_jar_stubs_unowned(
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
         anyhow::ensure!(
-            current(),
+            live() && current(),
             "binary artifact changed while loading cached symbols"
         );
         return Ok(cached);
@@ -1551,6 +1596,7 @@ fn resolve_local_jar_stubs_unowned(
     let marker = prepare_lazy_binary_dir(jar_path, &dest)?;
     let mut symbols = Vec::new();
     jar::visit_class_stub_facts(jar_path, &dest, |path, text, owners| {
+        anyhow::ensure!(live(), "binary indexing generation cancelled");
         if let Some(mut batch) = parse_source_file(path, text, kotlin, java) {
             if let Some(owners) = owners {
                 for owner in batch
@@ -1572,7 +1618,7 @@ fn resolve_local_jar_stubs_unowned(
         Ok(())
     })?;
     anyhow::ensure!(
-        marker.current() && current(),
+        live() && marker.current() && current(),
         "binary artifact changed while indexing"
     );
     symcache_store(&fingerprint, &symbols);
@@ -2162,6 +2208,17 @@ pub struct JdkParsePlan {
 }
 
 pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPlan> {
+    plan_jdk_index_while_current(src_zip, extract_root, &|| true)
+}
+
+pub(crate) fn plan_jdk_index_while_current(
+    src_zip: &Path,
+    extract_root: &Path,
+    current: &dyn Fn() -> bool,
+) -> Option<JdkIndexPlan> {
+    if !current() {
+        return None;
+    }
     if !src_zip.is_file() {
         return None;
     }
@@ -2178,6 +2235,9 @@ pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPla
     }
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
+        if !current() {
+            return None;
+        }
         let mut cached = cached;
         tag_batches(
             &mut cached,
@@ -2190,6 +2250,9 @@ pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPla
     }
 
     let bytes = fs::read(src_zip).ok()?;
+    if !current() {
+        return None;
+    }
     Some(JdkIndexPlan::Parse(JdkParsePlan {
         fingerprint,
         dest,
@@ -2207,19 +2270,34 @@ pub fn parse_jdk_shard(
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> anyhow::Result<Vec<FileSymbols>> {
+    parse_jdk_shard_while_current(plan, shard, shards, kotlin, java, &|| true)
+}
+
+pub(crate) fn parse_jdk_shard_while_current(
+    plan: &JdkParsePlan,
+    shard: usize,
+    shards: usize,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+    current: &dyn Fn() -> bool,
+) -> anyhow::Result<Vec<FileSymbols>> {
+    anyhow::ensure!(current(), "JDK indexing generation cancelled");
     let mut out = Vec::new();
-    jar::visit_sources_shard(
+    jar::visit_sources_shard_with_encoding_while_current(
         plan.bytes.clone(),
         &plan.src_zip,
         &plan.dest,
         shard,
         shards,
+        JavaSourceEncoding::Utf8,
+        current,
         |path, text| {
             if let Some(file) = parse_source_file(path, text, kotlin, java) {
                 out.push(file);
             }
         },
     )?;
+    anyhow::ensure!(current(), "JDK indexing generation cancelled");
     tag_batches(
         &mut out,
         &crate::classpath::jdk_origin_id(&plan.src_zip),
@@ -6426,6 +6504,55 @@ public class ParameterUse<Iterable> {
             );
         }
         fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn cancelled_binary_parse_never_caches_a_partial_library() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-cancel-binary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let jar = root.join("api.jar");
+        write_sources_jar(&jar, &[("api/First.class", ""), ("api/Second.class", "")]);
+        let origin = crate::classpath::file_origin_id(&jar);
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
+        let visits = std::cell::Cell::new(0);
+        let current = || {
+            let n = visits.get();
+            visits.set(n + 1);
+            n < 4
+        };
+        assert!(resolve_local_jar_stubs_for_origin_while_current(
+            &jar,
+            &origin,
+            &root.join("extract"),
+            &mut kotlin,
+            &mut java,
+            &current
+        )
+        .is_err());
+        for _ in 0..2 {
+            let full = resolve_local_jar_stubs_for_origin(
+                &jar,
+                &origin,
+                &root.join("extract"),
+                &mut kotlin,
+                &mut java,
+            )
+            .unwrap();
+            assert_eq!(
+                full.len(),
+                2,
+                "cancelled parsing must not cache a partial archive"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

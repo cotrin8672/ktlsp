@@ -15,12 +15,8 @@ const DOMAIN_SOURCE: &str = include_str!("DomainProof.kt");
 const K2_HEADER_SOURCE: &str = include_str!("K2CompleteHeaders.kt");
 const JAVA_SOURCE: &str = include_str!("JavacDiagnostics.java");
 
-#[path = "method_diagnostics.rs"]
-mod method_diagnostics;
 #[path = "positive.rs"]
 pub(crate) mod positive;
-#[path = "processor.rs"]
-pub(super) mod processor;
 
 pub(super) fn assets_sha256() -> String {
     let mut hash = Sha256::new();
@@ -30,7 +26,6 @@ pub(super) fn assets_sha256() -> String {
         K2_HEADER_SOURCE,
         JAVA_SOURCE,
         include_str!("PositiveHeaders.kt"),
-        processor::OBSERVER,
         include_str!("../../../../scripts/classpath-dump.init.gradle.kts"),
     ] {
         hash.update((source.len() as u64).to_be_bytes());
@@ -468,7 +463,7 @@ fn dependency_domains(
 }
 // Source membership can change without a build-file change or a new Gradle task snapshot.
 // A closed newly saved file must not be omitted from a negative import proof.
-fn owned_membership_inputs(request: &KotlinDiagnosticRequest) -> anyhow::Result<Vec<PathBuf>> {
+pub(super) fn owned_membership_inputs(request: &KotlinDiagnosticRequest) -> anyhow::Result<Vec<PathBuf>> {
     anyhow::ensure!(
         !request.source_roots.is_empty(),
         "java-owned-source-roots-unknown"
@@ -498,7 +493,7 @@ fn owned_membership_inputs(request: &KotlinDiagnosticRequest) -> anyhow::Result<
     Ok(roots)
 }
 
-fn owned_source_membership(
+pub(super) fn owned_source_membership(
     request: &KotlinDiagnosticRequest,
     read_plan: &crate::compiled_watch::WatchPlan,
 ) -> anyhow::Result<Value> {
@@ -576,8 +571,16 @@ pub(super) fn selected_tasks_supported(
     java: &CompilerTask,
     tasks: &[CompilerTask],
 ) -> bool {
+    selected_tasks_supported_reason(primary, java, tasks).is_ok()
+}
+
+pub(super) fn selected_tasks_supported_reason(
+    primary: &CompilerTask,
+    java: &CompilerTask,
+    tasks: &[CompilerTask],
+) -> Result<(), &'static str> {
     let Some(runtime) = primary.kotlin_compiler.as_ref() else {
-        return false;
+        return Err("selected-kotlin-runtime-unknown");
     };
     let legacy = runtime.compiler_version == "1.8.21" && runtime.gradle_plugin_version == "1.8.21";
     let complete_k2 =
@@ -630,21 +633,24 @@ pub(super) fn selected_tasks_supported(
         || !stock_task_action(java, "org.gradle.api.tasks.compile.JavaCompile", "compile")
         || !stock_only_if(java, false)
     {
-        return false;
+        return Err("selected-stock-task-contract-unhandled");
     }
     let auxiliary: Vec<_> = tasks
         .iter()
         .filter(|task| task.task != primary.task && task.task != java.task)
         .collect();
     if auxiliary.is_empty() {
-        return true;
+        return Ok(());
     }
     if complete_k2 {
-        return false;
+        return Err("k2-auxiliary-tasks-unhandled");
     }
     // The only auxiliary path admitted here is KGP 1.8.21's inactive KAPT pair.
     // KaptWithoutKotlincTask.compile returns before submitWork when both fields are empty,
     // even if includeCompileClasspath=true. An empty AP path alone is insufficient.
+    if auxiliary.iter().any(|task| !task.annotation_processor_path.is_empty()) {
+        return Err("active-annotation-processor-path");
+    }
     if auxiliary.len() != 2
         || auxiliary.iter().any(|task| {
             !task.complete
@@ -665,7 +671,7 @@ pub(super) fn selected_tasks_supported(
                 || !task.annotation_processor_path.is_empty()
         })
     {
-        return false;
+        return Err("auxiliary-stock-task-contract-unhandled");
     }
     let Some(apt) = auxiliary.iter().find(|task| {
         matches!(
@@ -674,7 +680,7 @@ pub(super) fn selected_tasks_supported(
                 | "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask_Decorated"
         )
     }) else {
-        return false;
+        return Err("kapt-task-unknown");
     };
     let Some(stubs) = auxiliary.iter().find(|task| {
         matches!(
@@ -683,7 +689,7 @@ pub(super) fn selected_tasks_supported(
                 | "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated"
         )
     }) else {
-        return false;
+        return Err("kapt-stubs-task-unknown");
     };
     let empty_array = |name| {
         apt.options
@@ -714,7 +720,7 @@ pub(super) fn selected_tasks_supported(
         || stubs.kotlin_compiler.as_ref() != Some(runtime)
         || stubs.java_home != primary.java_home
     {
-        return false;
+        return Err("inactive-kapt-contract-unproved");
     }
     let main_sources: BTreeSet<_> = primary
         .source_files
@@ -731,7 +737,7 @@ pub(super) fn selected_tasks_supported(
         || stubs.output_roots.is_empty()
         || stubs.declared_output_roots.is_empty()
     {
-        return false;
+        return Err("kapt-stubs-source-membership-unproved");
     }
     // Stubs are not a Java API lease. Their configured outputs must not supply any read slot;
     // custom/KSP/active AP producers need a separate current-input proof before admission.
@@ -742,7 +748,7 @@ pub(super) fn selected_tasks_supported(
         .chain(primary.classpath.iter())
         .chain(java.classpath.iter());
     let reads: Vec<_> = reads.map(|path| header_key(path)).collect();
-    stubs.output_roots.iter().all(|root| {
+    let outputs_supported = stubs.output_roots.iter().all(|root| {
         stubs
             .declared_output_roots
             .iter()
@@ -752,7 +758,8 @@ pub(super) fn selected_tasks_supported(
             && reads
                 .iter()
                 .all(|read| !paths_overlap(&header_key(root), read))
-    })
+    });
+    if outputs_supported { Ok(()) } else { Err("kapt-stubs-output-read-unhandled") }
 }
 
 fn explicit_utf8_recipe(recipe: &JavaCompilerRecipe) -> bool {
@@ -1096,6 +1103,7 @@ fn kotlin(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
 ) -> anyhow::Result<(i32, String)> {
+    kotlin_analysis_plugins(arguments)?;
     write_new(file, kotlin_argument_file(arguments)?.as_bytes())?;
     let recipe = &environment.key.recipe;
     let runtime = std::env::join_paths(
@@ -2350,7 +2358,6 @@ pub(super) fn run(
     overlay: &KotlinEditorOverlay,
     canonical: &[CompileDiagnostic],
     clean: bool,
-    generated: Option<&processor::GeneratedSources>,
 ) -> anyhow::Result<JavaDiagnostics> {
     run_checked(
         request,
@@ -2358,7 +2365,6 @@ pub(super) fn run(
         overlay,
         canonical,
         clean,
-        generated,
         false,
     )
 }
@@ -2369,7 +2375,6 @@ pub(super) fn run_for_producer(
     overlay: &KotlinEditorOverlay,
     canonical: &[CompileDiagnostic],
     clean: bool,
-    generated: Option<&processor::GeneratedSources>,
 ) -> anyhow::Result<JavaDiagnostics> {
     run_checked(
         request,
@@ -2377,7 +2382,6 @@ pub(super) fn run_for_producer(
         overlay,
         canonical,
         clean,
-        generated,
         true,
     )
 }
@@ -2388,7 +2392,6 @@ fn run_checked(
     overlay: &KotlinEditorOverlay,
     canonical: &[CompileDiagnostic],
     clean: bool,
-    generated: Option<&processor::GeneratedSources>,
     require_clean: bool,
 ) -> anyhow::Result<JavaDiagnostics> {
     let started = Instant::now();
@@ -2637,9 +2640,6 @@ fn run_checked(
         .arg("JavacDiagnostics")
         .arg(&spec)
         .arg(&output);
-    let method_api = generated
-        .map(|g| method_diagnostics::MethodApi::prepare(g, request, overlay, &receipt))
-        .transpose()?;
     let (exit, _) = native(&mut command, request, environment)?;
     anyhow::ensure!(matches!(exit, 0 | 1), "java-helper-failed");
     let value = read_json(&output)?;
@@ -2673,15 +2673,6 @@ fn run_checked(
         exit,
         complete_k2,
     )?;
-    if let Some(api) = &method_api {
-        result.extend(method_diagnostics::admitted(
-            &value,
-            request,
-            overlay,
-            &java_sources,
-            api,
-        )?);
-    }
     if let Some(before) = &canonical_outputs {
         complete_outputs_match(
             &overlay.directory.join("classes"),
@@ -2734,6 +2725,8 @@ fn run_checked(
             sources,
             source_epoch: request.invalid.clone(),
             input_epoch: environment.invalid.clone(),
+            body_environment: None,
+            producer_outputs: None,
         })
     } else {
         None

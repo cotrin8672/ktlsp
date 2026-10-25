@@ -3578,15 +3578,15 @@ mod observed_path_cache_tests {
 
 #[path = "compiler/java.rs"]
 mod java_diagnostics;
-#[path = "compiler/java_producer.rs"]
-mod java_producer;
-pub(crate) use java_producer::Plan as JavaProducerPlan;
+#[path = "compiler/kotlin_producers.rs"]
+pub(crate) mod kotlin_producers;
+#[path = "compiler/sealed_output.rs"]
+mod sealed_output;
 
 pub(crate) use java_diagnostics::positive::{
     candidate as compiler_api_candidate, supported as compiler_api_supported,
     Snapshot as CompilerApiSnapshot,
 };
-pub(crate) use java_diagnostics::processor::Plan as ProcessorPlan;
 
 pub(crate) fn java_import_dependencies(
     primary: &crate::classpath::CompilerTask,
@@ -3637,7 +3637,6 @@ pub(crate) struct KotlinDependencyCompilation {
     pub scope: crate::project_model::ProjectScope,
     pub source: crate::classpath::SourceSetClasspath,
     pub artifact: PathBuf,
-    pub java_replay: Option<JavaProducerPlan>,
 }
 
 fn serialize_kotlin_dependency_scope<S: serde::Serializer>(
@@ -3725,18 +3724,27 @@ impl KotlinDependencyCompilation {
             java_body_eligible: false,
             java_dependencies: Vec::new(),
             java_editor_sources: Default::default(),
-            processor_plan: None,
             positive_diagnostics_only: false,
             source_roots: self.source.source_roots.clone(),
             sources: primary.source_files.clone(),
             overlays,
             dependency_overlays,
             dependency_compilation: None,
+            kotlin_producers: Vec::new(),
             visible_origins: consumer.visible_origins.clone(),
             generation: consumer.generation,
             invalid: consumer.invalid.clone(),
         };
-        java_diagnostics::configured_recipe(&request)?;
+        if java.source_files.is_empty()
+            && primary.source_files.iter().all(|path| path.extension().and_then(|ext| ext.to_str()) == Some("kt"))
+            && crate::classpath::sdk_producer_roots(primary).is_some_and(|(_, complete)| complete)
+            && crate::classpath::sdk_producer_roots(java).is_some_and(|(_, complete)| complete)
+        {
+            // This is no Java body certificate. The producer closure additionally checks
+            // current complete source membership and creates a fresh empty Java slot.
+        } else {
+            java_diagnostics::configured_recipe(&request)?;
+        }
         Ok(request)
     }
 }
@@ -3755,7 +3763,6 @@ pub(crate) struct KotlinDiagnosticRequest {
     /// New owned wire sources admitted by the current stock task source policy.
     pub java_editor_sources: std::collections::BTreeSet<String>,
     /// Configured invocation facts only. Completion/API authority requires owned current execution.
-    pub processor_plan: Option<ProcessorPlan>,
     /// Auxiliary Kotlin tasks may produce semantics this independent invocation cannot certify.
     pub positive_diagnostics_only: bool,
     pub source_roots: Vec<PathBuf>,
@@ -3765,6 +3772,8 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub dependency_overlays: Vec<KotlinSourceOverlay>,
     /// A same-model producer whose complete fresh output can replace one selected binary slot.
     pub dependency_compilation: Option<Box<KotlinDependencyCompilation>>,
+    /// Complete bounded normal-output producer closure, in dependency order.
+    pub kotlin_producers: Vec<KotlinDependencyCompilation>,
     pub visible_origins: std::collections::BTreeSet<String>,
     pub generation: u64,
     pub invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3772,11 +3781,7 @@ pub(crate) struct KotlinDiagnosticRequest {
 
 impl KotlinDiagnosticRequest {
     pub(crate) fn diagnostic_overlays(&self) -> impl Iterator<Item = &KotlinSourceOverlay> {
-        let producer = self.dependency_compilation.as_deref().filter(|plan| plan.java_replay.is_some());
-        self.overlays.iter().chain(self.dependency_overlays.iter().filter(move |source| {
-            producer.is_some_and(|plan| plan.source.compiler_tasks[0].source_files.iter()
-                .any(|path| crate::paths::file_key(path) == source.key))
-        }))
+        self.overlays.iter()
     }
 
     pub(crate) fn check_live(&self) -> anyhow::Result<()> {
@@ -3906,8 +3911,8 @@ struct KotlinEnvironmentKey {
     java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     java_helper_sha256: Option<String>,
     java_editor_sources: std::collections::BTreeSet<String>,
-    processor_plan: Option<ProcessorPlan>,
     dependency_compilation: Option<Box<KotlinDependencyCompilation>>,
+    kotlin_producers: Vec<KotlinDependencyCompilation>,
 }
 
 impl KotlinEnvironmentKey {
@@ -3967,8 +3972,8 @@ impl KotlinEnvironmentKey {
             } else {
                 Default::default()
             },
-            processor_plan: request.processor_plan.clone(),
             dependency_compilation: request.dependency_compilation.clone(),
+            kotlin_producers: request.kotlin_producers.clone(),
         })
     }
 
@@ -4005,11 +4010,10 @@ pub(crate) struct KotlinDiagnosticEnvironment {
     stamps: Vec<(PathBuf, KotlinInputStamp)>,
     environment_sha256: String,
     watch: std::sync::Arc<crate::compiled_watch::NativeInputWatch>,
-    // Each actual compiler recipe retains its own bounded watcher and shares owner invalidation.
-    java_dependency_watch: Option<std::sync::Arc<crate::compiled_watch::NativeInputWatch>>,
+    wake: tokio::sync::mpsc::Sender<()>,
     // Failed helper builds retain their watched assets and cannot erase canonical Kotlin results.
     java_tools: std::sync::Mutex<Option<(java_diagnostics::Tools, Result<(), String>)>>,
-    processor_artifacts: std::sync::Mutex<Option<java_diagnostics::processor::CachedArtifacts>>,
+    kotlin_producer_cache: std::sync::Mutex<Option<std::sync::Arc<kotlin_producers::CompiledProducers>>>,
     positive_tools: std::sync::Mutex<Option<java_diagnostics::positive::Tools>>,
     positive_supported: bool,
     dependency_environment: Option<std::sync::Arc<KotlinDiagnosticEnvironment>>,
@@ -4044,7 +4048,6 @@ impl KotlinDiagnosticEnvironment {
         let dependency_environment = request
             .dependency_compilation
             .as_ref()
-            .filter(|plan| plan.java_replay.is_none())
             .map(|plan| {
                 Self::prepare_with_invalidation(
                     &plan.request(request)?,
@@ -4071,16 +4074,6 @@ impl KotlinDiagnosticEnvironment {
             .cloned()
             .collect();
         inputs.extend(kotlin_plugin_paths(&key.arguments)?);
-        if let Some(plan) = &key.processor_plan {
-            inputs.extend(plan.watch_inputs());
-        }
-        let java_inputs = key
-            .dependency_compilation
-            .as_ref()
-            .and_then(|plan| plan.java_replay.as_ref().map(|replay| (plan, replay)))
-            .map(|(plan, replay)| replay.watch_inputs(&plan.source, &plan.project_dir))
-            .transpose()?
-            .unwrap_or_default();
         let host = &key.recipe.gradle_java_home;
         anyhow::ensure!(host.is_absolute(), "compiler-host-jdk-relative");
         anyhow::ensure!(
@@ -4120,7 +4113,6 @@ impl KotlinDiagnosticEnvironment {
             }
         }
         let consumer_inputs: Vec<_> = inputs.iter().cloned().collect();
-        inputs.extend(java_inputs.iter().cloned());
         let inputs: Vec<_> = inputs.into_iter().collect();
         anyhow::ensure!(
             inputs.len() <= crate::compiled_watch::MAX_INPUT_PATHS,
@@ -4138,16 +4130,6 @@ impl KotlinDiagnosticEnvironment {
         }
         let plan = crate::compiled_watch::WatchPlan::read_inputs(&consumer_inputs)?;
         let watch = crate::compiled_watch::NativeInputWatch::new(invalid.clone(), plan, wake.clone())?;
-        let java_dependency_watch = if java_inputs.is_empty() {
-            None
-        } else {
-            let plan = crate::compiled_watch::WatchPlan::read_inputs(&java_inputs)?;
-            Some(crate::compiled_watch::NativeInputWatch::new(
-                invalid.clone(),
-                plan,
-                wake,
-            )?)
-        };
         let environment_sha256 = environment_hash();
         let mut hash = key.input_hasher(&environment_sha256)?;
         if let Some(dependency) = &dependency_environment {
@@ -4195,9 +4177,9 @@ impl KotlinDiagnosticEnvironment {
             stamps,
             environment_sha256,
             watch,
-            java_dependency_watch,
+            wake,
             java_tools: std::sync::Mutex::new(None),
-            processor_artifacts: std::sync::Mutex::new(None),
+            kotlin_producer_cache: std::sync::Mutex::new(None),
             positive_tools: std::sync::Mutex::new(None),
             positive_supported,
             dependency_environment,
@@ -4236,9 +4218,6 @@ impl KotlinDiagnosticEnvironment {
             self.invalid
                 .store(true, std::sync::atomic::Ordering::Release);
             self.watch.close();
-            if let Some(watch) = &self.java_dependency_watch {
-                watch.close();
-            }
         }
         result
     }
@@ -4248,9 +4227,6 @@ impl KotlinDiagnosticEnvironment {
             dependency.close();
         }
         self.watch.close();
-        if let Some(watch) = &self.java_dependency_watch {
-            watch.close();
-        }
     }
 }
 
@@ -4266,6 +4242,38 @@ fn kotlin_plugin_paths(arguments: &[String]) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(result)
+}
+
+fn kotlin_analysis_plugin_archive<R: std::io::Read + std::io::Seek>(reader: R) -> anyhow::Result<()> {
+    let mut archive = zip::ZipArchive::new(reader)?;
+    for service in ["ComponentRegistrar", "CompilerPluginRegistrar"] {
+        let path = format!("META-INF/services/org.jetbrains.kotlin.compiler.plugin.{service}");
+        let entry = match archive.by_name(&path) {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(entry.size() <= 8192, "kotlin-plugin-service-unhandled");
+        let mut providers = String::new();
+        entry.take(8193).read_to_string(&mut providers)?;
+        anyhow::ensure!(providers.len() <= 8192, "kotlin-plugin-service-unhandled");
+        for provider in providers.lines().map(|line| line.split('#').next().unwrap().trim()) {
+            anyhow::ensure!(
+                !provider.starts_with("org.jetbrains.kotlin.kapt3.")
+                    && !provider.starts_with("org.jetbrains.kotlin.kapt4.")
+                    && !provider.starts_with("com.google.devtools.ksp."),
+                "kotlin-build-time-generator-plugin",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn kotlin_analysis_plugins(arguments: &[String]) -> anyhow::Result<()> {
+    for plugin in kotlin_plugin_paths(arguments)? {
+        kotlin_analysis_plugin_archive(std::fs::File::open(plugin)?)?;
+    }
+    Ok(())
 }
 
 fn kotlin_scalar_annotation_options(value: &str) -> bool {
@@ -4738,6 +4746,10 @@ pub(crate) struct JavaCleanReceipt {
     sources: std::collections::BTreeMap<String, String>,
     source_epoch: std::sync::Arc<std::sync::atomic::AtomicBool>,
     input_epoch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Keep the exact read/output ownership alive through stored clean authority. Drop the
+    // body watcher before the producer output owners it reads.
+    body_environment: Option<std::sync::Arc<KotlinDiagnosticEnvironment>>,
+    producer_outputs: Option<std::sync::Arc<kotlin_producers::CompiledProducers>>,
 }
 
 impl JavaCleanReceipt {
@@ -4755,6 +4767,9 @@ impl JavaCleanReceipt {
             && std::sync::Arc::ptr_eq(&self.input_epoch, inputs)
             && request.check_live().is_ok()
             && !inputs.load(std::sync::atomic::Ordering::Acquire)
+            && self.body_environment.as_ref().is_none_or(|environment|
+                !environment.invalid.load(std::sync::atomic::Ordering::Acquire))
+            && self.producer_outputs.as_ref().is_none_or(|outputs| outputs.epochs_live())
             && self.sources.get(&source.key).is_some_and(|digest|
                 *digest == source.text_sha256.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
     }
@@ -4763,7 +4778,8 @@ impl JavaCleanReceipt {
         serde_json::json!({"basis":"javac-body-normal-kotlin-output", "task":self.task,
             "compiler_version":self.compiler_version,"compiler_inputs_sha256":self.compiler_inputs_sha256,
             "input_spec_sha256":self.input_spec_sha256,"body_receipt_sha256":self.body_receipt_sha256,
-            "source_count":self.sources.len()})
+            "source_count":self.sources.len(),
+            "producer_closure":self.producer_outputs.as_ref().map(|outputs| outputs.trace())})
     }
 
     #[cfg(test)]
@@ -4778,7 +4794,8 @@ impl JavaCleanReceipt {
             sources:request.overlays.iter().filter(|source| source.key.ends_with(".java"))
                 .map(|source| (source.key.clone(), source.text_sha256.iter()
                     .map(|byte| format!("{byte:02x}")).collect())).collect(),
-            source_epoch:request.invalid.clone(),input_epoch:inputs.clone() }
+            source_epoch:request.invalid.clone(),input_epoch:inputs.clone(),
+            body_environment:None,producer_outputs:None }
     }
 }
 
@@ -4860,20 +4877,14 @@ pub(crate) fn run_kotlin_editor_compile(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
 ) -> KotlinDiagnosticOutcome {
-    if let Some(plan) = &request.processor_plan {
-        return match java_diagnostics::processor::run(request, environment, plan) {
-            Ok(outcome) => outcome,
-            Err(error) => KotlinDiagnosticOutcome::Unverified(error.to_string()),
-        };
-    }
-    run_selected_kotlin_editor_compile(request, environment, None)
+    run_selected_kotlin_editor_compile(request, environment)
 }
 
 struct CompiledKotlinDependency {
     _owner: KotlinEditorOverlay,
     producer: KotlinDiagnosticRequest,
     environment: Option<std::sync::Arc<KotlinDiagnosticEnvironment>>,
-    sealed: Vec<java_diagnostics::processor::SealedOutput>,
+    sealed: Vec<sealed_output::SealedOutput>,
     artifact: PathBuf,
     outputs: Vec<PathBuf>,
     output_inventory: Vec<serde_json::Value>,
@@ -4954,12 +4965,8 @@ fn compile_dependency_overlay(
     let Some(plan) = &request.dependency_compilation else {
         return Ok(Ok(None));
     };
-    if let Some(replay) = &plan.java_replay {
-        return java_producer::run(request, environment, plan, replay).map(|result| result.map(Some));
-    }
     anyhow::ensure!(
-        request.processor_plan.is_none()
-            && !request.positive_diagnostics_only
+        !request.positive_diagnostics_only
             && request
                 .sources
                 .iter()
@@ -4998,7 +5005,7 @@ fn compile_dependency_overlay(
         "kotlin-producer-recipe-changed"
     );
     let started = Instant::now();
-    let (outcome, owner) = run_owned_kotlin_overlay(&producer, &producer_environment, None, true)?;
+    let (outcome, owner) = run_owned_kotlin_overlay(&producer, &producer_environment, true)?;
     anyhow::ensure!(
         matches!(outcome, KotlinDiagnosticOutcome::Verified { clean: true, ref diagnostics, .. } if diagnostics.iter().all(|diagnostic| diagnostic.severity != Severity::Error)),
         "kotlin-producer-compilation-not-clean"
@@ -5042,12 +5049,14 @@ fn compile_dependency_overlay(
 fn run_selected_kotlin_editor_compile(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
-    generated: Option<&java_diagnostics::processor::GeneratedSources>,
 ) -> KotlinDiagnosticOutcome {
     let run = || -> anyhow::Result<KotlinDiagnosticOutcome> {
         request.check_live()?;
         environment.check_live()?;
         anyhow::ensure!(environment.matches(request), "kotlin-stale-recipe");
+        if !request.kotlin_producers.is_empty() {
+            return kotlin_producers::run(request, environment);
+        }
         if environment.positive_supported && request.dependency_compilation.is_none() {
             return java_diagnostics::positive::run(request, environment);
         }
@@ -5062,7 +5071,6 @@ fn run_selected_kotlin_editor_compile(
         let (outcome, _overlay) = run_owned_kotlin_overlay(
             effective.as_ref().unwrap_or(request),
             environment,
-            generated,
             false,
         )?;
         if let Some(dependency) = &dependency {
@@ -5081,9 +5089,9 @@ fn run_selected_kotlin_editor_compile(
 fn run_owned_kotlin_overlay(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
-    generated: Option<&java_diagnostics::processor::GeneratedSources>,
     require_java_clean: bool,
 ) -> anyhow::Result<(KotlinDiagnosticOutcome, KotlinEditorOverlay)> {
+    kotlin_analysis_plugins(&request.task.arguments)?;
     let overlay = KotlinEditorOverlay::create(request)?;
     let arguments = kotlin_editor_arguments(
         request,
@@ -5156,8 +5164,7 @@ fn run_owned_kotlin_overlay(
                     &overlay,
                     diagnostics,
                     *clean,
-                    generated,
-                ) {
+                        ) {
                     Ok(java) => java,
                     Err(error) => {
                         if require_java_clean {
@@ -5247,12 +5254,12 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         java_body_eligible: false,
         java_dependencies: Vec::new(),
         java_editor_sources: Default::default(),
-        processor_plan: None,
         positive_diagnostics_only: false,
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),
         dependency_overlays: Vec::new(),
         dependency_compilation: None,
+        kotlin_producers: Vec::new(),
         visible_origins: Default::default(),
         generation: 0,
         invalid: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5619,6 +5626,40 @@ mod kotlin_editor_compile_tests {
                 error.to_string().contains("kotlin-argument-unhandled-at-"),
                 "{argument}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn analysis_plugins_reject_generator_services_before_jvm_launch() {
+        let archive = |service: &str, providers: &str| {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer.start_file(
+                format!("META-INF/services/org.jetbrains.kotlin.compiler.plugin.{service}"),
+                zip::write::SimpleFileOptions::default(),
+            ).unwrap();
+            writer.write_all(providers.as_bytes()).unwrap();
+            writer.finish().unwrap()
+        };
+        for service in ["ComponentRegistrar", "CompilerPluginRegistrar"] {
+            for provider in [
+                "org.jetbrains.kotlin.kapt3.Kapt3ComponentRegistrar",
+                "org.jetbrains.kotlin.kapt4.Kapt4CompilerPluginRegistrar",
+                "com.google.devtools.ksp.KotlinSymbolProcessingComponentRegistrar",
+                "com.google.devtools.ksp.KotlinSymbolProcessingCompilerPluginRegistrar",
+            ] {
+                let error = kotlin_analysis_plugin_archive(archive(service,
+                    &format!("# selected plugin\n  {provider}  # generator\n"))).unwrap_err();
+                assert_eq!(error.to_string(), "kotlin-build-time-generator-plugin");
+            }
+            for provider in [
+                "org.jetbrains.kotlin.allopen.AllOpenComponentRegistrar",
+                "org.jetbrains.kotlin.noarg.NoArgComponentRegistrar",
+                "org.jetbrains.kotlinx.serialization.compiler.extensions.SerializationComponentRegistrar",
+            ] {
+                kotlin_analysis_plugin_archive(archive(service,
+                    &format!("# org.jetbrains.kotlin.kapt3.CommentOnly\n{provider} # ordinary plugin\n"))).unwrap();
+            }
+            assert!(kotlin_analysis_plugin_archive(archive(service, &"x".repeat(8193))).is_err());
         }
     }
 

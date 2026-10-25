@@ -8720,13 +8720,6 @@ impl Workspace {
         {
             return true;
         }
-        if request
-            .processor_plan
-            .as_ref()
-            .is_some_and(|plan| plan.affects_processor_source(Path::new(key)))
-        {
-            return true;
-        }
         // Keep selected external sources and files without a current model origin protected.
         request
             .sources
@@ -8886,18 +8879,6 @@ impl Workspace {
             .collect();
         let source_views = model.compiler_source_views();
         let mut java_editor_sources = BTreeSet::new();
-        let mut processor_plan = if self.analysis_extensions.is_empty() {
-            model.plain_java_task(key).and_then(|java| {
-                crate::compile::ProcessorPlan::capture(module, source, task, java, &model)
-                    .inspect_err(|error| {
-                        tracing::debug!(task = %task.task, %error,
-                            "selected processor execution plan unavailable");
-                    })
-                    .ok()
-            })
-        } else {
-            None
-        };
         let mut overlays = Vec::new();
         let mut dependency_overlays = Vec::new();
         for (open_key, doc) in &self.open_docs {
@@ -8910,12 +8891,7 @@ impl Workspace {
             let dependency = origin
                 .as_ref()
                 .is_some_and(|origin| visible_origins.contains(&origin.origin_id));
-            let processor = processor_plan
-                .as_ref()
-                .is_some_and(|plan| plan.affects_processor_source(Path::new(open_key)));
-            if !own && !dependency && !processor {
-                continue;
-            }
+            if !own && !dependency { continue; }
             let revision = self
                 .index
                 .jvm_source_for_file(open_key)
@@ -8976,21 +8952,21 @@ impl Workspace {
                         &visibilities,
                         &visible_origins,
                     )
-                    .map(|dependencies| (java.clone(), dependencies, true))
-                    .or_else(|| processor_plan.as_ref().map(|_| (java.clone(), Vec::new(), false)))
+                    .map(|dependencies| (java.clone(), dependencies, true, Vec::new()))
+                    .or_else(|| {
+                        crate::compile::kotlin_producers::capture(&model, source, task, java)
+                            .filter(|producers| !producers.is_empty())
+                            .map(|producers| (java.clone(), Vec::new(), true, producers))
+                    })
                 })
         } else {
             None
         };
-        if java_inputs.is_none() {
-            processor_plan = None;
-        }
         // Existing domain-only dependency facts do not prove that project producer ABIs are current.
-        // Processor execution support does not prove ordinary project dependency closure.
-        let java_body_eligible = java_inputs.as_ref().is_some_and(|(_, dependencies, imports_verified)|
+        let java_body_eligible = java_inputs.as_ref().is_some_and(|(_, dependencies, imports_verified, _)|
             *imports_verified && dependencies.is_empty());
-        let (java_task, java_dependencies) = match java_inputs {
-            Some((task, dependencies, _)) => (Some(task), dependencies),
+        let (java_task, java_dependencies, kotlin_producers) = match java_inputs {
+            Some((task, dependencies, _, producers)) => (Some(task), dependencies, producers),
             None if crate::compile::compiler_api_candidate(task) => {
                 let java: Vec<_> = source
                     .compiler_tasks
@@ -9007,11 +8983,12 @@ impl Workspace {
                         _ => None,
                     },
                     Vec::new(),
+                    Vec::new(),
                 )
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), Vec::new()),
         };
-        let dependency_compilation = compiler_sources_supported
+        let dependency_compilation = (compiler_sources_supported && kotlin_producers.is_empty())
             .then(|| Self::kotlin_dependency_compilation(&model, task, &dependency_overlays))
             .flatten();
         let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
@@ -9041,9 +9018,9 @@ impl Workspace {
             task: task.clone(),
             java_task,
             java_body_eligible,
+            kotlin_producers,
             java_dependencies,
             java_editor_sources,
-            processor_plan,
             positive_diagnostics_only: source.compiler_tasks.iter().any(|candidate| {
                 candidate.language == CompilerLanguage::Kotlin && candidate.task != task.task
             }),
@@ -9098,25 +9075,20 @@ impl Workspace {
         {
             return None;
         }
-        let java_replay = crate::compile::JavaProducerPlan::capture(module, source, model);
-        let primary = if java_replay.is_some() { None } else {
-            if source.compiler_tasks.len() != 2 || task.source_files.iter()
-                .any(|path| path.extension().and_then(|s| s.to_str()) != Some("kt")) { return None; }
-            Some(source.compiler_tasks.iter().find(|candidate| {
-                candidate.language == CompilerLanguage::Kotlin
-                    && Some(candidate.task.as_str()) == source.kotlin_compile_task.as_deref()
-            })?)
-        };
-        let java = if java_replay.is_some() { &source.compiler_tasks[0] } else { model.plain_java_task(&first.key)? };
+        if source.compiler_tasks.len() != 2 || task.source_files.iter()
+            .any(|path| path.extension().and_then(|s| s.to_str()) != Some("kt")) { return None; }
+        let primary = source.compiler_tasks.iter().find(|candidate| {
+            candidate.language == CompilerLanguage::Kotlin
+                && Some(candidate.task.as_str()) == source.kotlin_compile_task.as_deref()
+        })?;
+        let java = model.plain_java_task(&first.key)?;
         if dirty.iter().any(|overlay| !java.source_files.iter().any(|path| crate::paths::file_key(path) == overlay.key)) {
             return None;
         }
-        if let Some(primary) = primary {
-            if !primary.complete || primary.problem.is_some()
+        if !primary.complete || primary.problem.is_some()
                 || !source.compiler_tasks.iter().any(|candidate| std::ptr::eq(candidate, java))
                 || !java.annotation_processing_disabled() || !java.annotation_processor_path.is_empty()
                 || java.source_files.iter().any(|file| !primary.source_files.contains(file)) { return None; }
-        }
         let matches: Vec<_> = task
             .classpath
             .iter()
@@ -9132,7 +9104,6 @@ impl Workspace {
         if artifact.extension().and_then(|s| s.to_str()) != Some("jar") {
             return None;
         }
-        if let Some(primary) = primary {
         for other in model.modules.iter().flat_map(|module| &module.source_sets) {
             if std::ptr::eq(other, source) {
                 continue;
@@ -9151,13 +9122,11 @@ impl Workspace {
                 return None;
             }
         }
-        }
         Some(Box::new(crate::compile::KotlinDependencyCompilation {
             project_dir: module.project_dir.clone(),
             scope,
             source: source.clone(),
             artifact: (**artifact).clone(),
-            java_replay,
         }))
     }
 
@@ -9262,10 +9231,6 @@ impl Workspace {
                     .is_some_and(|origin| origin.project_scope.as_ref() == Some(&request.scope)))
                 && (key.ends_with(".kt") || key.ends_with(".java"));
             if !own
-                && !request
-                    .processor_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.affects_processor_source(Path::new(key)))
                 && origin
                     .as_ref()
                     .is_none_or(|origin| !request.visible_origins.contains(&origin.origin_id))
@@ -9541,78 +9506,6 @@ mod kotlin_diagnostic_lifecycle_tests {
     use super::*;
     use crate::compile::{CompileDiagnostic, KotlinDiagnosticOutcome};
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[test]
-    #[ignore = "requires genuine Gradle KTLSP_CROSS_MODULE_TEST_MODEL and valid Java6 SNAPSHOTS"]
-    fn current_java_only_producer_uses_private_gradle_archive_and_reports_source_level_errors() {
-        java_only_producer_source_level_case(true);
-    }
-
-    #[test]
-    #[ignore = "requires genuine Gradle KTLSP_CROSS_MODULE_TEST_MODEL and valid Java6 SNAPSHOTS"]
-    fn current_java_only_producer_reports_source_level_errors_without_prior_success() {
-        java_only_producer_source_level_case(false);
-    }
-
-    fn java_only_producer_source_level_case(check_prior_success: bool) {
-        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            std::env::var_os("KTLSP_CROSS_MODULE_TEST_MODEL").unwrap()).unwrap()).unwrap();
-        let model = Arc::new(crate::classpath::ProjectSnapshot::new(
-            serde_json::from_value(saved["modules"].clone()).unwrap()));
-        let producer_module = model.modules.iter().find(|module| module.module == ":problems-api").unwrap();
-        let consumer_module = model.modules.iter().find(|module| module.module == ":problems").unwrap();
-        let producer = crate::paths::file_key(&producer_module.project_dir.join(
-            "src/main/java/org/gradle/api/problems/internal/ProblemSummaryData.java"));
-        let invalid = crate::paths::file_key(&producer_module.project_dir.join(
-            "src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java"));
-        let consumer = crate::paths::file_key(&consumer_module.project_dir.join(
-            "src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt"));
-        let snapshots: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            std::env::var_os("KTLSP_CROSS_MODULE_TEST_SNAPSHOTS").unwrap()).unwrap()).unwrap();
-        let text = |role: &str| snapshots["snapshots"]["counter"][role].as_array().unwrap().iter()
-            .map(|line| line.as_str().unwrap()).collect::<Vec<_>>().join("\n");
-        let mut ws = Workspace::new();
-        ws.set_project_model(model.clone());
-        ws.open(producer.clone(), text("producer"));
-        ws.open(consumer.clone(), text("consumer"));
-        let request = ws.begin_kotlin_diagnostics(&consumer).unwrap();
-        assert!(request.dependency_compilation.as_ref().unwrap().java_replay.is_some());
-        let (wake, _events) = tokio::sync::mpsc::channel(1);
-        let environment = crate::compile::KotlinDiagnosticEnvironment::prepare(&request, wake).unwrap();
-        if check_prior_success {
-            let outcome = crate::compile::run_kotlin_editor_compile(&request, &environment);
-            match &outcome {
-                KotlinDiagnosticOutcome::Verified { clean, diagnostics, .. } => assert!(*clean
-                    && diagnostics.iter().all(|diagnostic| diagnostic.severity != crate::diagnostics::Severity::Error),
-                    "valid Java6 concrete method must reach the selected Kotlin compiler"),
-                KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
-            }
-            assert!(ws.finish_kotlin_diagnostics(&request, outcome, environment.invalid.clone()).contains(&consumer));
-            assert!(ws.kotlin_diagnostic_result_id(&consumer).is_some());
-            assert!(!environment.invalid.load(Ordering::Acquire), "private output retirement is not an original input edit");
-        }
-        let original = std::fs::read_to_string(&invalid).unwrap();
-        let end = original.rfind("\n}").unwrap();
-        let changed = format!("{}\n  default java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() {{ return new java.util.concurrent.atomic.AtomicInteger(); }}\n{}",
-            &original[..end], &original[end..]);
-        let expected = crate::text::LineIndex::new(&changed).position(&changed, changed.find("default java").unwrap());
-        ws.open(invalid.clone(), changed);
-        assert!(request.invalid.load(Ordering::Acquire), "later producer edits retire the accepted consumer request");
-        let current = ws.begin_kotlin_diagnostics(&consumer).unwrap();
-        assert!(environment.matches(&current));
-        let outcome = crate::compile::run_kotlin_editor_compile(&current, &environment);
-        match &outcome {
-            KotlinDiagnosticOutcome::Verified { clean, diagnostics, .. } => assert!(!clean && diagnostics.iter().any(|diagnostic|
-                diagnostic.path == invalid && (diagnostic.line, diagnostic.col) == (expected.0 + 1, expected.1 + 1)
-                && diagnostic.severity == crate::diagnostics::Severity::Error)),
-            KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
-        }
-        assert!(ws.finish_kotlin_diagnostics(&current, outcome, environment.invalid.clone()).contains(&invalid));
-        assert!(!ws.current_kotlin_diagnostics(&invalid).is_empty());
-        assert!(ws.kotlin_diagnostic_result_id(&invalid).is_some());
-        assert!(ws.kotlin_diagnostic_result_id(&consumer).is_none(), "failed producer cannot certify Kotlin clean");
-        environment.close();
-    }
 
     #[test]
     #[ignore = "requires genuine KTLSP_CROSS_MODULE_TEST_MODEL and SNAPSHOTS with built producer inputs"]

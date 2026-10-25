@@ -94,6 +94,15 @@ pub(crate) struct SdkApiIndex {
 }
 
 pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<SdkApiIndex> {
+    index_while_current(selection, extract_root, &|| true)
+}
+
+pub(crate) fn index_while_current(
+    selection: &SdkApiSelection,
+    extract_root: &Path,
+    current: &dyn Fn() -> bool,
+) -> Result<SdkApiIndex> {
+    ensure!(current(), "SDK indexing generation cancelled");
     ensure!(
         selection.release.is_some(),
         "SDK API projection requires a release inventory"
@@ -118,6 +127,7 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
     let mut complete = true;
     let mut classes = BTreeMap::new();
     for (owner, entry_name) in selection.entries.iter() {
+        ensure!(current(), "SDK indexing generation cancelled");
         let Some(entry_name) = entry_name else {
             complete = false;
             continue;
@@ -144,6 +154,7 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
     }
     let mut projections = BTreeMap::new();
     for (owner, class) in &classes {
+        ensure!(current(), "SDK indexing generation cancelled");
         if owner.contains('$') {
             continue;
         }
@@ -166,6 +177,7 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
         );
     }
     for (owner, class) in &classes {
+        ensure!(current(), "SDK indexing generation cancelled");
         if !owner.contains('$') {
             continue;
         }
@@ -199,6 +211,7 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
         ));
     }
     for (owner, (source, owners)) in projections {
+        ensure!(current(), "SDK indexing generation cancelled");
         let path = dest.join(format!("{owner}.java"));
         ensure!(
             path.starts_with(&dest),
@@ -242,6 +255,7 @@ pub(crate) fn index(selection: &SdkApiSelection, extract_root: &Path) -> Result<
             }),
         });
     }
+    ensure!(current(), "SDK indexing generation cancelled");
     Ok(SdkApiIndex { batches, complete })
 }
 
@@ -396,6 +410,31 @@ mod tests {
             entries: std::sync::Arc::new(release_entries(&bytes, 8).unwrap()),
         };
         (root, selection)
+    }
+
+    #[test]
+    fn cancelled_sdk_projection_returns_no_partial_authority() {
+        let (root, selection) = entry_selection();
+        let visits = std::cell::Cell::new(0);
+        let current = || {
+            let n = visits.get();
+            visits.set(n + 1);
+            n < 3
+        };
+        assert!(index_while_current(&selection, &root.join("extract"), &current).is_err());
+        assert!(
+            visits.get() >= 4,
+            "cancellation must be observed during class decoding"
+        );
+        let fresh = index(&selection, &root.join("extract")).unwrap();
+        assert!(
+            fresh.complete
+                && fresh.batches.iter().any(|batch| batch
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.name == "AtomicInteger"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

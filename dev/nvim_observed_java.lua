@@ -4,6 +4,9 @@ return function(ctx)
   local probe = dofile(ctx.repo .. '/dev/nvim_lsp_probe.lua')
   local client, sources = ctx.client, ctx.sources
   local checks, phases, delivery, sent_versions = {}, {}, {}, {}
+  local external_build = vim.env.KTLSP_JAVA_EXTERNAL_BUILD == '1'
+  local watched_changes, wire_texts = {}, {}
+  local external_watch_snapshot
   local initial_getter_queries, config_serial = 0, 0
   local original_notify = client.rpc.notify
   local person = ctx.project .. '/src/main/java/producerfixture/Person.java'
@@ -20,13 +23,25 @@ return function(ctx)
   end
   for _, value in pairs(sources) do
     sent_versions[vim.uri_from_bufnr(value.buf)] = vim.lsp.util.buf_versions[value.buf]
+    if external_build then wire_texts[vim.uri_from_bufnr(value.buf)] = probe.buffer_full_text(value.buf) end
   end
   client.rpc.notify = function(method, params)
+    local watch_before = external_build and method == 'workspace/didChangeWatchedFiles'
+      and external_watch_snapshot and external_watch_snapshot() or nil
     local sent = original_notify(method, params)
     if sent and (method == 'textDocument/didChange' or method == 'textDocument/didOpen') then
       sent_versions[params.textDocument.uri] = params.textDocument.version
+      if external_build then
+        local uri = params.textDocument.uri
+        if method == 'textDocument/didOpen' then wire_texts[uri] = params.textDocument.text
+        else wire_texts[uri] = probe.apply_content_changes(wire_texts[uri], params.contentChanges, client.offset_encoding or 'utf-16') end
+      end
     end
     if sent and method == 'workspace/didChangeConfiguration' then config_serial = config_serial + 1 end
+    if external_build and sent and method == 'workspace/didChangeWatchedFiles' then
+      watched_changes[#watched_changes + 1] = { params = vim.deepcopy(params), sent_ns = vim.uv.hrtime(), client = client.id,
+        before = watch_before, after = external_watch_snapshot and external_watch_snapshot() or nil }
+    end
     return sent
   end
   local function source(path)
@@ -46,6 +61,7 @@ return function(ctx)
     return value
   end
   local function rpc(name, method, params, path, timeout)
+    assert(not external_build or method ~= 'workspace/executeCommand', 'external build mode must not ask the LSP to generate code')
     local response, err = client:request_sync(method, params, timeout or 10000, source(path or consumer).buf)
     local received = response ~= nil and response.err == nil and err == nil
     check(name .. ': first response received', received, vim.inspect(response and response.err or err))
@@ -129,6 +145,211 @@ return function(ctx)
     end
     phases[#phases + 1] = { name = name, result = result, received = received, expected = expected_status }
     return good
+  end
+  local external_restore
+  local function run_external()
+    local function bytes(path)
+      local file = assert(io.open(path, 'rb'))
+      local value = file:read('*a'); file:close(); return value
+    end
+    local function write(path, value)
+      local file = assert(io.open(path, 'wb')); assert(file:write(value)); file:close()
+    end
+    local config = ctx.project .. '/lombok.config'
+    local original = { [person] = bytes(person), [consumer] = bytes(consumer), [config] = bytes(config) }
+    assert(bytes(ctx.project .. '/settings.gradle.kts'):find('ktlsp-java-lombok-clean-receipt', 1, true),
+      'external builds require the disposable --java-only fixture')
+    assert(vim.fn.sha256(table.concat(vim.fn.readfile(person), '\n')) == ctx.manifest.probes[1].target_sha256)
+    local caller = source(consumer)
+    local old_buffer = { lines = lines(consumer), text = probe.buffer_full_text(caller.buf),
+      modified = vim.bo[caller.buf].modified, eol = vim.bo[caller.buf].eol, fileformat = vim.bo[caller.buf].fileformat }
+    local active_build
+    local function join_build(cancel)
+      if not active_build then return true end
+      -- jobstart/jobstop own a Neovim job, including its process tree; never kill by name/PID.
+      if cancel and vim.fn.jobwait({ active_build.id }, 0)[1] == -1 then
+        active_build.record.stop_requested = true
+        active_build.record.stop_result = vim.fn.jobstop(active_build.id)
+      end
+      local status = vim.fn.jobwait({ active_build.id }, 10000)[1]
+      active_build.record.join_status = status
+      local joined = status >= 0 or status == -3 -- Exited jobs may already have been released.
+      active_build.record.joined = joined
+      if status >= 0 then active_build.record.exit = status end
+      if joined then active_build = nil end
+      return joined
+    end
+    external_restore = function()
+      assert(join_build(true), 'owned external build did not terminate; outer job cleanup must drain it')
+      for path, value in pairs(original) do if bytes(path) ~= value then write(path, value) end end
+      vim.api.nvim_buf_set_lines(caller.buf, 0, -1, false, old_buffer.lines)
+      vim.bo[caller.buf].eol, vim.bo[caller.buf].fileformat, vim.bo[caller.buf].modified = old_buffer.eol, old_buffer.fileformat, old_buffer.modified
+      require('vim.lsp._changetracking').flush(client)
+      for path, value in pairs(original) do check('external build disk restored: ' .. path, bytes(path) == value) end
+      check('external build original consumer buffer restored', probe.buffer_full_text(caller.buf) == old_buffer.text)
+    end
+    local reader = { offset = 0, tail = '' }
+    local function state()
+      local file = assert(io.open(assert(vim.env.KTLSP_TRACE), 'rb'))
+      if file:seek('end') < reader.offset then reader = { offset = 0, tail = '' } end
+      file:seek('set', reader.offset)
+      local chunk = file:read('*a'); reader.offset = file:seek(); file:close()
+      local pending = reader.tail .. chunk
+      local last = 1
+      for line, next_position in pending:gmatch('([^\n]*)\n()') do
+        last = next_position
+        local decoded, event = pcall(vim.json.decode, line)
+        local args = decoded and type(event) == 'table' and event.args
+        if type(args) == 'table' and probe.path_key(args.root or '') == probe.path_key(ctx.project) then
+          reader.events = (reader.events or 0) + 1
+          if event.name == 'workspace.refresh_requested' then reader.requested = args.generation
+          elseif event.name == 'workspace.accepted_finish' then reader.accepted, reader.accepted_at = args, reader.events
+          elseif event.name == 'workspace.source_install_begin' then reader.source_begin, reader.source_begin_at = args, reader.events
+          elseif event.name == 'workspace.source_install' then reader.sources, reader.sources_at = args, reader.events
+          elseif event.name == 'deps.index_workspace' then reader.dependencies, reader.dependencies_at = args, reader.events end
+        end
+      end
+      reader.tail = pending:sub(last)
+      return reader
+    end
+    local function available(name, ok, detail)
+      checks[#checks + 1] = { name = name, ok = not not ok, detail = detail, kind = 'operational' }
+      ctx.check(name, ok, detail, 'operational')
+      return ok
+    end
+    local function edit_caller(api)
+      local value, count = original[consumer]:gsub('getName', api)
+      assert(count == 2)
+      local edited = vim.split(value:gsub('\n$', ''), '\n', { plain = true })
+      edited[#edited + 1] = '// unsaved caller survives external Gradle builds'
+      vim.api.nvim_buf_set_lines(caller.buf, 0, -1, false, edited)
+      require('vim.lsp._changetracking').flush(client)
+      local version = vim.lsp.util.buf_versions[caller.buf]
+      local uri, source_sha256 = vim.uri_from_bufnr(caller.buf), probe.buffer_sha256(caller.buf)
+      local wire_sha256 = type(wire_texts[uri]) == 'string' and vim.fn.sha256(wire_texts[uri]) or nil
+      check('external caller edit delivered: ' .. api, sent_versions[uri] == version and wire_sha256 == source_sha256)
+      delivery[#delivery + 1] = { mode = 'external-build', api = api, version = version,
+        source_sha256 = source_sha256, wire_sha256 = wire_sha256, unsaved = vim.bo[caller.buf].modified }
+    end
+    local function output_identity()
+      local root = ctx.project .. '/build/classes/java/main/producerfixture/'
+      return { Person = vim.fn.sha256(bytes(root .. 'Person.class')), Consumer = vim.fn.sha256(bytes(root .. 'Consumer.class')) }
+    end
+    external_watch_snapshot = function()
+      local ordinal = state().events or 0
+      local found, outputs = pcall(output_identity)
+      return { trace_events = ordinal, outputs = found and outputs or nil }
+    end
+    local function build(name, mutate)
+      local before = state().requested or 0
+      local watch_start = #watched_changes
+      local buffer_before = probe.buffer_full_text(caller.buf)
+      mutate()
+      local inputs = {}
+      for path in pairs(original) do inputs[path] = vim.fn.sha256(bytes(path)) end
+      local command = vim.fn.has('win32') == 1
+        and { vim.env.COMSPEC or 'cmd.exe', '/d', '/s', '/c',
+          'call "' .. ctx.project .. '/gradlew.bat" :classes --rerun-tasks --no-build-cache --offline --no-daemon --console=plain --max-workers=1' }
+        or { 'bash', ctx.project .. '/gradlew', ':classes', '--rerun-tasks', '--no-build-cache', '--offline', '--no-daemon', '--console=plain', '--max-workers=1' }
+      local phase = { name = name, command = command, watch_start = watch_start, before_generation = before, client = client.id,
+        disk_input_sha256 = inputs, unsaved_caller_sha256 = vim.fn.sha256(buffer_before) }
+      phases[#phases + 1] = phase
+      local completed, output = nil, {}
+      local job = vim.fn.jobstart(command, { cwd = ctx.project, detach = false, stdout_buffered = true, stderr_buffered = true,
+        on_stdout = function(_, data) output[#output + 1] = table.concat(data, '\n') end,
+        on_stderr = function(_, data) output[#output + 1] = table.concat(data, '\n') end,
+        on_exit = function(_, code) completed = code end,
+      })
+      assert(job > 0, 'external Gradle launcher failed')
+      phase.job, phase.pid, phase.operational_timeout_ms = job, vim.fn.jobpid(job), 120000
+      phase.process_owner = 'Neovim jobstart/jobstop; detach=false; process-tree stop and bounded join'
+      active_build = { id = job, record = phase }
+      local finished = vim.wait(120000, function() return completed ~= nil end, 20)
+      phase.timed_out = not finished
+      local joined = join_build(not finished)
+      if not joined then joined = join_build(true) end
+      phase.exit, phase.joined = completed, joined
+      write(ctx.artifacts .. '/external-java-' .. name .. '-build.out', table.concat(output, '\n'))
+      if not available('external ' .. name .. ': actual Gradle classes build succeeds and owned job joins',
+        finished and joined and completed == 0, vim.inspect({ exit = completed, timed_out = phase.timed_out, joined = joined })) then return false end
+      phase.outputs = output_identity()
+      local output_root = probe.path_key(ctx.project .. '/build/classes/java/main')
+      local ready = vim.wait(180000, function()
+        local current = state()
+        local output_event = false
+        for index = watch_start + 1, #watched_changes do
+          local watch = watched_changes[index]
+          for _, change in ipairs(watch.params.changes or {}) do
+            local path = probe.path_key(vim.uri_to_fname(change.uri))
+            if (path == output_root or path:sub(1, #output_root + 1) == output_root .. '/') and watch.before and watch.after
+              and vim.deep_equal(watch.before.outputs, phase.outputs) and vim.deep_equal(watch.after.outputs, phase.outputs)
+              and (current.source_begin_at or 0) > watch.before.trace_events
+              and (current.sources_at or 0) > watch.before.trace_events
+              and (current.accepted_at or 0) > watch.before.trace_events
+              and (current.dependencies_at or 0) > watch.before.trace_events then
+              output_event, phase.output_identity_watch = true, index
+            end
+          end
+        end
+        phase.requested, phase.accepted, phase.sources, phase.dependencies = current.requested, current.accepted, current.sources, current.dependencies
+        phase.source_begin, phase.source_begin_at = current.source_begin, current.source_begin_at
+        phase.actual_output_watch = output_event
+        return output_event and current.requested ~= nil and current.requested > before
+          and current.accepted and current.accepted.generation == current.requested
+          and current.source_begin and current.source_begin.generation == current.requested
+          and current.sources and current.sources.generation == current.requested
+          and current.dependencies and current.dependencies.generation == current.requested
+      end, 50)
+      phase.watch_end, phase.ready = #watched_changes, ready
+      if not available('external ' .. name .. ': real output watch and latest accepted model', ready,
+        vim.inspect({ requested = phase.requested, accepted = phase.accepted, actual_output_watch = phase.actual_output_watch })) then return false end
+      check('external ' .. name .. ': unsaved consumer survives build and refresh', vim.bo[caller.buf].modified and probe.buffer_full_text(caller.buf) == buffer_before)
+      check('external ' .. name .. ': actual compiled outputs remain current', vim.deep_equal(output_identity(), phase.outputs))
+      return true
+    end
+    local function useful(name, api, obsolete)
+      phases[#phases].expected_api, phases[#phases].obsolete_api = api, obsolete
+      edit_caller(api)
+      local phase = phases[#phases]
+      local current = state()
+      phase.request_generation = current.requested
+      if not available('external ' .. name .. ': request uses current ingested output generation',
+        current.requested == phase.requested and current.accepted and current.accepted.generation == current.requested
+          and vim.deep_equal(output_identity(), phase.outputs)) then return false end
+      local anchor = getter_anchor:gsub('getName', api)
+      local good
+      if name == 'initial' then good = getter('initial-first-generated-completion', true, anchor)
+      else good = completion('external ' .. name .. ': generated method', anchor, api, api:sub(1, 2), true) end
+      authored('external ' .. name)
+      if not good then return false end
+      if obsolete then completion('external ' .. name .. ': obsolete method absent', anchor, api, '', false, obsolete) end
+      local hover = rpc('external ' .. name .. ': generated signature', 'textDocument/hover', {
+        textDocument = { uri = vim.uri_from_bufnr(caller.buf) }, position = position(consumer, anchor, api),
+      })
+      check('external ' .. name .. ': exact String signature', type(hover) == 'table' and type(hover.contents) == 'table'
+        and hover.contents.value == '```java\n' .. api .. '(): String\n```', vim.inspect(hover))
+      completion('external ' .. name .. ': String result chain', chain_anchor:gsub('getName', api), 'length', 'le', true)
+      local after = state()
+      check('external ' .. name .. ': output identity and generation preserved through first responses',
+        after.requested == phase.request_generation and after.accepted and after.accepted.generation == after.requested
+          and vim.deep_equal(output_identity(), phase.outputs))
+      return true
+    end
+    edit_caller('getName')
+    if not build('initial', function() end) or not useful('initial', 'getName') then return end
+    if not build('config', function()
+      write(config, original[config] .. 'lombok.accessors.fluent = true\n')
+      write(consumer, (original[consumer]:gsub('getName', 'name')))
+    end) or not useful('config', 'name', 'getName') then return end
+    if not build('source', function()
+      write(config, original[config])
+      local changed, fields = original[person]:gsub('String name =', 'String title =')
+      changed = changed:gsub('return name;', 'return title;')
+      assert(fields == 1)
+      write(person, changed); write(consumer, (original[consumer]:gsub('getName', 'getTitle')))
+    end) or not useful('source', 'getTitle', 'name') then return end
+    if not build('restored', function() for path, value in pairs(original) do write(path, value) end end) then return end
+    useful('restored', 'getName', 'getTitle')
   end
   local function run()
     source(consumer); source(person)
@@ -215,7 +436,12 @@ return function(ctx)
     if not compile('fresh-final-clean-receipt') then return end
     getter('fresh-final-first-getter', true); authored('fresh-final')
   end
-  local ok, err = xpcall(run, debug.traceback)
+  local ok, err = xpcall(external_build and run_external or run, debug.traceback)
+  if external_restore then
+    local restored, restore_error = pcall(external_restore)
+    check('external build fixture restoration completed', restored, tostring(restore_error))
+    if not restored then ok, err = false, restore_error end
+  end
   for _, path in ipairs({ person, consumer }) do
     local value = source(path)
     if not vim.deep_equal(lines(path), value.disk) then restore(path, 'failure-cleanup-' .. vim.fs.basename(path)) end
@@ -223,13 +449,27 @@ return function(ctx)
     check('disk golden and clean buffer preserved: ' .. path,
       vim.deep_equal(vim.fn.readfile(path), value.disk) and not vim.bo[value.buf].modified)
   end
-  check('initial getter queried exactly once', initial_getter_queries == 1, tostring(initial_getter_queries))
+  if not external_build or initial_getter_queries > 0 then
+    check('initial getter queried exactly once', initial_getter_queries == 1, tostring(initial_getter_queries))
+  end
   client.rpc.notify = original_notify
+  local not_run = {}
+  if external_build then
+    local ran = {}
+    for _, phase in ipairs(phases) do ran[phase.name] = true end
+    for _, name in ipairs({ 'initial', 'config', 'source', 'restored' }) do if not ran[name] then not_run[#not_run + 1] = name end end
+  end
   vim.fn.writefile({ vim.json.encode({ status = ok and 'completed' or 'probe-error', error = err,
     checks = checks, phases = phases, delivery = delivery, initial_getter_queries = initial_getter_queries,
-    native_compiles_maximum = 4, semantic_retry_attempts = 0,
-    scope = 'clean pure Java only; original mixed/unsaved useful generated completion remains unresolved',
-    configuration_control = 'explicit standard didChangeConfiguration, not a native lombok.config watcher test',
+    mode = external_build and 'external-Gradle-build' or 'explicit-LSP-compile-command',
+    lsp_generation_commands = external_build and 0 or nil,
+    native_compiles_maximum = external_build and 0 or 4, external_builds_planned = external_build and 4 or 0,
+    external_builds_not_run = external_build and not_run or nil,
+    watched_changes = external_build and watched_changes or nil, semantic_retry_attempts = 0,
+    scope = external_build and 'Actual external Java/Lombok classes builds, live output ingestion and preserved unsaved caller; no LSP generation command'
+      or 'clean pure Java only; original mixed/unsaved useful generated completion remains unresolved',
+    configuration_control = external_build and 'actual lombok.config and source changes, external builds and native client watches; no artificial notification'
+      or 'explicit standard didChangeConfiguration, not a native lombok.config watcher test',
     source_less_navigation = 'None expected, never a stand-in owner or fabricated source span',
     performance = 'correctness only; no timing acceptance' }) }, ctx.artifacts .. '/compiled-java-results.json')
   if not ok then error(err) end

@@ -37,6 +37,7 @@ const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
 #[derive(Default)]
 struct RefreshState {
     requested: u64,
+    active_generation: Option<u64>,
     running: bool,
     force: bool,
     stopped: bool,
@@ -224,9 +225,16 @@ impl Backend {
         if state.stopped {
             return;
         }
+        let pending = state.running
+            && state
+                .active_generation
+                .is_some_and(|active| active != state.requested);
         let (defer, coalesced) = {
             let mut watches = self.watches.lock();
-            if build_output_only && watches.model_loading {
+            if build_output_only && pending {
+                // The queued generation has not started reading inputs; it will see this burst too.
+                (true, true)
+            } else if build_output_only && watches.model_loading {
                 let coalesced = watches.pending_model_jar;
                 watches.pending_model_jar = true;
                 (true, coalesced)
@@ -241,7 +249,8 @@ impl Backend {
                 Instant::now(),
                 serde_json::json!({"path": key, "kind": kind, "force": cause_force,
                     "batch_force": force, "build_output_only": build_output_only,
-                    "deferred": defer, "coalesced": coalesced}),
+                    "deferred": defer, "coalesced": coalesced,
+                    "activeGeneration": state.active_generation, "requestedGeneration": state.requested}),
             );
         }
         // Gradle may recreate JARs or output directories while importing its own model. Retain
@@ -275,10 +284,10 @@ impl Backend {
         for key in changed {
             self.schedule_one_diagnostic(key);
         }
+        state.force |= force;
         if coalesced {
             return;
         }
-        state.force |= force;
         if state.running {
             return;
         }
@@ -304,11 +313,13 @@ impl Backend {
                     let mut state = state.lock();
                     if state.stopped {
                         state.running = false;
+                        state.active_generation = None;
                         break;
                     }
                     if state.requested != requested {
                         continue;
                     }
+                    state.active_generation = Some(state.requested);
                     (
                         state.requested,
                         std::mem::take(&mut state.force),
@@ -351,6 +362,7 @@ impl Backend {
                 }
                 if state.stopped || state.requested == generation {
                     state.running = false;
+                    state.active_generation = None;
                     break;
                 }
             }
@@ -623,22 +635,25 @@ fn dependency_index_threads() -> usize {
 /// removes the single-thread tail that previously dominated cold library indexing. Returns the
 /// number of workers actually spawned: a shortfall means entries whose index maps to an
 /// unspawned shard are skipped this run (never cached), rather than hanging the scheduler.
-fn spawn_jdk_shard_workers(
+fn spawn_jdk_shard_workers<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
     plan: crate::deps::JdkParsePlan,
     origin: String,
     shards: usize,
     generation: u64,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) -> usize {
     let mut spawned = 0;
     for shard in 0..shards {
         let plan = plan.clone();
+        let cancelled = cancelled.clone();
         let origin = origin.clone();
         let tx = tx.clone();
         let ok = std::thread::Builder::new()
             .name(format!("ktlsp-jdk-index-{shard}"))
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || {
+            .spawn_scoped(scope, move || {
                 use crate::deps;
                 use crate::java::JavaParser;
                 use crate::parser::KotlinParser;
@@ -647,7 +662,7 @@ fn spawn_jdk_shard_workers(
                 let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
-                    deps::parse_jdk_shard(&plan, shard, shards, &mut kotlin, &mut java)
+                    deps::parse_jdk_shard_while_current(&plan, shard, shards, &mut kotlin, &mut java, &|| !cancelled.load(std::sync::atomic::Ordering::Acquire))
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("JDK index worker panicked")));
                 let result = match resolved {
@@ -697,18 +712,22 @@ fn spawn_jdk_shard_workers(
     spawned
 }
 
-fn spawn_sdk_api_worker(
+fn spawn_sdk_api_worker<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
     selection: classpath::SdkApiSelection,
     extract_root: PathBuf,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) -> bool {
     std::thread::Builder::new()
         .name("ktlsp-sdk-api".into())
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
+        .spawn_scoped(scope, move || {
             let origin = selection.origin();
             let indexed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::sdk_api::index(&selection, &extract_root)
+                crate::sdk_api::index_while_current(&selection, &extract_root, &|| {
+                    !cancelled.load(std::sync::atomic::Ordering::Acquire)
+                })
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("SDK API index worker panicked")));
             let (batches, failed, incomplete) = match indexed {
@@ -744,6 +763,7 @@ fn spawn_jdk_plan_worker<'scope, 'env>(
     extract_root: PathBuf,
     origin: String,
     generation: u64,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     planner: Arc<JdkPlanner>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) -> bool {
@@ -753,7 +773,11 @@ fn spawn_jdk_plan_worker<'scope, 'env>(
         .spawn_scoped(scope, move || {
             let started = crate::trace::enabled().then(Instant::now);
             let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                planner(&source, &extract_root)
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    None
+                } else {
+                    planner(&source, &extract_root)
+                }
             }))
             .unwrap_or_else(|_| {
                 tracing::warn!(%origin, "JDK index planning worker panicked");
@@ -792,11 +816,13 @@ fn spawn_jdk_plan_worker<'scope, 'env>(
         .is_ok()
 }
 
-fn spawn_local_jar_index_worker(
+fn spawn_local_jar_index_worker<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
     jar_path: std::path::PathBuf,
     origin_id: String,
     extract_root: std::path::PathBuf,
     generation: u64,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let label = jar_path
@@ -808,7 +834,7 @@ fn spawn_local_jar_index_worker(
     let _ = std::thread::Builder::new()
         .name(thread_name)
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
+        .spawn_scoped(scope, move || {
             use crate::deps;
             use crate::java::JavaParser;
             use crate::parser::KotlinParser;
@@ -817,12 +843,13 @@ fn spawn_local_jar_index_worker(
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut kotlin = KotlinParser::new();
                 let mut java = JavaParser::new();
-                let batches = deps::resolve_local_jar_stubs_for_origin(
+                let batches = deps::resolve_local_jar_stubs_for_origin_while_current(
                     &jar_path,
                     &origin_id,
                     &extract_root,
                     &mut kotlin,
                     &mut java,
+                    &|| !cancelled.load(std::sync::atomic::Ordering::Acquire),
                 )?;
                 let missing_source = batches.is_empty()
                     && !verified_empty_binaries(&[(jar_path.clone(), origin_id.clone())])?;
@@ -890,7 +917,8 @@ fn verified_empty_binaries(binaries: &[(std::path::PathBuf, String)]) -> anyhow:
     Ok(empty)
 }
 
-fn spawn_coordinate_index_worker(
+fn spawn_coordinate_index_worker<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
     coord: crate::coords::Coordinate,
     repos: crate::artifacts::Repos,
     extract_root: std::path::PathBuf,
@@ -901,12 +929,13 @@ fn spawn_coordinate_index_worker(
     binary_only: bool,
     generation: u64,
     workspace: Arc<Mutex<Workspace>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
         .name(format!("ktlsp-dep-index-{}", coord.artifact))
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
+        .spawn_scoped(scope, move || {
             use crate::artifacts;
             use crate::deps;
             use crate::java::JavaParser;
@@ -915,8 +944,8 @@ fn spawn_coordinate_index_worker(
             let label = coord.label();
             let resolve_started = crate::trace::enabled().then(Instant::now);
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let current = || workspace.lock().is_current_generation(generation);
-                if !current() {
+                let current = || !cancelled.load(std::sync::atomic::Ordering::Acquire);
+                if !current() || !workspace.lock().is_current_generation(generation) {
                     return (Vec::new(), false, Vec::new(), true, false);
                 }
                 let (source, source_failed) = if binary_only {
@@ -967,12 +996,13 @@ fn spawn_coordinate_index_worker(
                             tracing::warn!("index {label} source failed: {error:#}");
                             source_missing = true;
                             let batches = if authoritative {
-                                match deps::resolve_module_binary_stubs(
+                                match deps::resolve_module_binary_stubs_while_current(
                                     &coord,
                                     &selected_binaries,
                                     &extract_root,
                                     &mut kotlin,
                                     &mut java,
+                                    &current,
                                 ) {
                                     Ok(batches) => batches,
                                     Err(binary_error) => {
@@ -991,12 +1021,13 @@ fn spawn_coordinate_index_worker(
                 } else if authoritative && current() {
                     let mut kotlin = KotlinParser::new();
                     let mut java = JavaParser::new();
-                    match deps::resolve_module_binary_stubs(
+                    match deps::resolve_module_binary_stubs_while_current(
                         &coord,
                         &selected_binaries,
                         &extract_root,
                         &mut kotlin,
                         &mut java,
+                        &current,
                     ) {
                         Ok(batches) => (batches, false),
                         Err(error) => {
@@ -1007,6 +1038,7 @@ fn spawn_coordinate_index_worker(
                 } else {
                     (Vec::new(), false)
                 };
+                if !current() { return (Vec::new(), false, Vec::new(), true, false); }
                 failed |= source_failed;
                 let empty_input = source_missing || (!skipped && batches.is_empty());
                 let verified_empty_binary = if empty_input && authoritative && !failed {
@@ -1079,7 +1111,7 @@ fn index_dependencies(
     gradle: bool,
     generation: u64,
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
-    cancelled: &std::sync::atomic::AtomicBool,
+    cancelled: &Arc<std::sync::atomic::AtomicBool>,
 ) -> DepStats {
     index_dependencies_with_source_query(
         ws,
@@ -1100,7 +1132,7 @@ fn index_dependencies_with_source_query(
     gradle: bool,
     generation: u64,
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
-    cancelled: &std::sync::atomic::AtomicBool,
+    cancelled: &Arc<std::sync::atomic::AtomicBool>,
     load_sources: impl FnOnce(
             &std::path::Path,
             &Arc<classpath::ProjectSnapshot>,
@@ -1113,7 +1145,16 @@ fn index_dependencies_with_source_query(
         .filter(|model| gradle && model.source_enrichment_needed())
         .cloned();
     let Some(accepted) = pending else {
-        return index_dependency_model(ws, root, model, gradle, generation, progress, false);
+        return index_dependency_model_cancellable(
+            ws,
+            root,
+            model,
+            gradle,
+            generation,
+            progress,
+            false,
+            cancelled.clone(),
+        );
     };
     // Source selection reads only the immutable accepted model. Keep its worker owned by
     // this blocking index job, overlap repository IO with binary preview, and publish neither
@@ -1124,7 +1165,7 @@ fn index_dependencies_with_source_query(
             .name("ktlsp-source-query".to_string())
             .spawn_scoped(scope, move || load_sources(root, &query_model, cancelled));
         let started = Instant::now();
-        let binary = index_dependency_model(
+        let binary = index_dependency_model_cancellable(
             ws,
             root,
             Some(accepted.clone()),
@@ -1132,6 +1173,7 @@ fn index_dependencies_with_source_query(
             generation,
             progress,
             true,
+            cancelled.clone(),
         );
         crate::trace::span(
             "deps.binary_preview",
@@ -1176,7 +1218,7 @@ fn index_dependencies_with_source_query(
     if ws.lock().is_current_generation(generation) {
         classpath::store_snapshot(root, &enriched);
     }
-    let mut source = index_dependency_model(
+    let mut source = index_dependency_model_cancellable(
         ws,
         root,
         Some(enriched),
@@ -1184,6 +1226,7 @@ fn index_dependencies_with_source_query(
         generation,
         progress,
         false,
+        cancelled.clone(),
     );
     source.files += binary.files;
     source.symbols += binary.symbols;
@@ -1197,6 +1240,7 @@ fn index_dependencies_with_source_query(
     source
 }
 
+#[cfg(test)]
 fn index_dependency_model(
     ws: &Arc<Mutex<Workspace>>,
     root: &std::path::Path,
@@ -1205,6 +1249,28 @@ fn index_dependency_model(
     generation: u64,
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
     binary_only: bool,
+) -> DepStats {
+    index_dependency_model_cancellable(
+        ws,
+        root,
+        model,
+        gradle,
+        generation,
+        progress,
+        binary_only,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+fn index_dependency_model_cancellable(
+    ws: &Arc<Mutex<Workspace>>,
+    root: &std::path::Path,
+    model: Option<Arc<classpath::ProjectSnapshot>>,
+    gradle: bool,
+    generation: u64,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
+    binary_only: bool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 ) -> DepStats {
     std::thread::scope(|scope| {
         index_dependency_model_with_jdk_plan(
@@ -1217,7 +1283,15 @@ fn index_dependency_model(
             progress,
             binary_only,
             dependency_index_threads(),
-            Arc::new(crate::deps::plan_jdk_index),
+            Arc::new({
+                let live = cancelled.clone();
+                move |src, extract| {
+                    crate::deps::plan_jdk_index_while_current(src, extract, &|| {
+                        !live.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                }
+            }),
+            cancelled.clone(),
         )
     })
 }
@@ -1233,6 +1307,7 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
     binary_only: bool,
     max_workers: usize,
     planner: Arc<JdkPlanner>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 ) -> DepStats {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1345,16 +1420,25 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
         || !local_jars.is_empty()
         || !queue.is_empty()
     {
-        if !ws.lock().is_current_generation(generation) {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || !ws.lock().is_current_generation(generation)
+        {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
             queue.clear();
             local_jars.clear();
             jdk_plans.clear();
             jdk_pending.clear();
             sdk_api_pending.clear();
         }
-        while active < max_workers {
+        while active < max_workers && !cancelled.load(std::sync::atomic::Ordering::Acquire) {
             if let Some(selection) = sdk_api_pending.pop_front() {
-                if spawn_sdk_api_worker(selection, extract_root.clone(), tx.clone()) {
+                if spawn_sdk_api_worker(
+                    scope,
+                    selection,
+                    extract_root.clone(),
+                    cancelled.clone(),
+                    tx.clone(),
+                ) {
                     active += 1;
                 } else {
                     stats.failed += 1;
@@ -1368,6 +1452,7 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                     extract_root.clone(),
                     origin,
                     generation,
+                    cancelled.clone(),
                     planner.clone(),
                     tx.clone(),
                 ) {
@@ -1388,10 +1473,12 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                     ));
                 }
                 let spawned = spawn_jdk_shard_workers(
+                    scope,
                     plan.clone(),
                     origin.clone(),
                     jdk_shards,
                     generation,
+                    cancelled.clone(),
                     tx.clone(),
                 );
                 if spawned < jdk_shards {
@@ -1433,10 +1520,12 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                     continue;
                 }
                 spawn_local_jar_index_worker(
+                    scope,
                     jar_path,
                     origin_id,
                     extract_root.clone(),
                     generation,
+                    cancelled.clone(),
                     tx.clone(),
                 );
                 active += 1;
@@ -1491,6 +1580,7 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                 let _ = tx.send((completed + active + 1, progress_total, coord.label()));
             }
             spawn_coordinate_index_worker(
+                scope,
                 coord.clone(),
                 repos.clone(),
                 extract_root.clone(),
@@ -1504,6 +1594,7 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                 binary_only,
                 generation,
                 ws.clone(),
+                cancelled.clone(),
                 tx.clone(),
             );
             active += 1;
@@ -1513,10 +1604,18 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
             continue;
         }
 
-        let Ok(mut result) = rx.recv() else {
-            break;
+        let mut result = match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         active = active.saturating_sub(1);
+        if cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || !ws.lock().is_current_generation(generation)
+        {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            continue; // Drain owned workers, without repeatedly locking for every stale batch.
+        }
         if let Some(plan) = result.jdk_parse_plan.take() {
             if ws.lock().is_current_generation(generation) {
                 jdk_pending.push_back((result.local_origin.unwrap(), plan));
@@ -1560,8 +1659,10 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                 let previous_jdk_files = stats.jdk_files;
                 for batch in state.batches.drain(..) {
                     let mut guard = ws.lock();
-                    if !guard.is_current_generation(generation) {
-                        continue;
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        || !guard.is_current_generation(generation)
+                    {
+                        break;
                     }
                     let symbol_count = batch.symbols.len();
                     stats.symbols += symbol_count;
@@ -1572,7 +1673,9 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                 }
                 {
                     let mut guard = ws.lock();
-                    if guard.is_current_generation(generation) {
+                    if !cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        && guard.is_current_generation(generation)
+                    {
                         guard.bump_index_revision();
                         if !state.failed {
                             guard.complete_dependency_origin(origin.clone());
@@ -1626,8 +1729,10 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
         let mut files_for_coord = Vec::new();
         for batch in result.batches {
             let mut guard = ws.lock();
-            if !guard.is_current_generation(generation) {
-                continue;
+            if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                || !guard.is_current_generation(generation)
+            {
+                break;
             }
             let symbol_count = batch.symbols.len();
             stats.symbols += symbol_count;
@@ -1672,7 +1777,9 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                 .map(classpath::maven_origin_id)
                 .or(result.local_origin);
             let mut guard = ws.lock();
-            if guard.is_current_generation(generation) {
+            if !cancelled.load(std::sync::atomic::Ordering::Acquire)
+                && guard.is_current_generation(generation)
+            {
                 if let Some(origin) = origin {
                     guard.complete_dependency_origin(origin);
                 }
@@ -1687,7 +1794,8 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
             }
         }
     }
-    stats.jdk_complete = !jdk_origins.is_empty()
+    stats.jdk_complete = !cancelled.load(std::sync::atomic::Ordering::Acquire)
+        && !jdk_origins.is_empty()
         && jdk_origins
             .iter()
             .all(|origin| ws.lock().dependency_origin_complete(origin));
@@ -1729,7 +1837,7 @@ async fn prime_selected_compiler_api(
             let accepted = snapshot.map(|snapshot| ws.accept_kotlin_compiler_api(&request, environment.clone(), snapshot));
             ws.finish_kotlin_diagnostics(&request, outcome, environment.invalid.clone());
             crate::trace::span("compiler.api.initialize", "compiler", start,
-                serde_json::json!({"generation": request.generation, "accepted": accepted.as_ref().is_some_and(|result| result.is_ok()), "error": accepted.and_then(|result| result.err()), "compiler_error": compiler_error, "processor_plan": request.processor_plan.is_some()}));
+                serde_json::json!({"generation": request.generation, "accepted": accepted.as_ref().is_some_and(|result| result.is_ok()), "error": accepted.and_then(|result| result.err()), "compiler_error": compiler_error}));
         }).await;
     }
 }
@@ -2076,6 +2184,7 @@ async fn index_workspace(
     let index_ws = ws.clone();
     let index_root = root.clone();
     let input_watches = watches.clone();
+    let index_cancelled = cancelled.clone();
     let deps_start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
         // Fingerprint selected mutable archives and the tracked inventory before indexing.
@@ -2100,27 +2209,34 @@ async fn index_workspace(
             gradle,
             generation,
             Some(&tx),
-            &cancelled,
+            &index_cancelled,
         );
-        let changed: Vec<_> = archive_contents
-            .iter()
-            .filter(|(key, before)| configuration_content(Path::new(key)).as_ref() != Some(*before))
-            .map(|(key, _)| key)
-            .collect();
+        let Some(changed) = changed_archive_inputs_while_current(
+            generation,
+            &archive_contents,
+            || !index_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                && index_ws.lock().is_current_generation(generation),
+            configuration_content,
+        ) else {
+            return (stats, None);
+        };
         if !changed.is_empty() {
             let mut guard = index_ws.lock();
             if guard.is_current_generation(generation) {
                 for key in changed {
-                    if let Some(origin) = archive_origins.get(key) {
+                    if let Some(origin) = archive_origins.get(&key) {
                         guard.retire_dependency_origin(origin);
                     }
                 }
                 input_watches.lock().pending_model_jar = true;
             }
         }
-        (stats, archive_contents)
+        (stats, Some(archive_contents))
     });
+    let drain_start = Instant::now();
+    let mut progress_events = 0_usize;
     while let Some((done, total, label)) = rx.recv().await {
+        progress_events += 1;
         if let Some(p) = &ongoing {
             let pct = if total == 0 {
                 100
@@ -2131,7 +2247,12 @@ async fn index_workspace(
                 .await;
         }
     }
+    crate::trace::span("workspace.dependency_progress_drained", "workspace", drain_start,
+        serde_json::json!({"generation": generation, "events": progress_events}));
     let (stats, archive_contents) = handle.await.unwrap_or_default();
+    if archive_contents.is_none() || cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     if watches.lock().pending_model_jar {
         return;
     }
@@ -2186,13 +2307,15 @@ async fn index_workspace(
     );
     let accepted = {
         let mut guard = ws.lock();
-        let accepted = guard.finish_analysis_generation(
+        let accepted = finish_dependency_index_generation(
+            &mut guard,
+            &mut watches.lock(),
             generation,
-            stats.failed == 0 && stats.missing_sources == 0 && !stats.incomplete_classpath,
-            stats.jdk_complete,
+            &stats,
+            archive_contents,
+            &cancelled,
         );
         if accepted {
-            watches.lock().archive_contents = archive_contents;
             crate::trace::span(
                 "workspace.accepted_finish",
                 "workspace",
@@ -2721,6 +2844,55 @@ async fn unchanged_file_contents(contents: HashMap<String, [u8; 32]>) -> HashMap
     })
     .await
     .unwrap_or_default()
+}
+
+fn finish_dependency_index_generation(
+    workspace: &mut Workspace,
+    watches: &mut WatchState,
+    generation: u64,
+    stats: &DepStats,
+    validated_archives: Option<HashMap<String, [u8; 32]>>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let Some(archives) = validated_archives else { return false; };
+    if cancelled.load(std::sync::atomic::Ordering::Acquire)
+        || watches.pending_model_jar
+        || !workspace.finish_analysis_generation(generation,
+            stats.failed == 0 && stats.missing_sources == 0 && !stats.incomplete_classpath,
+            stats.jdk_complete)
+    {
+        return false;
+    }
+    watches.archive_contents = archives;
+    true
+}
+
+fn changed_archive_inputs_while_current(
+    generation: u64,
+    inputs: &HashMap<String, [u8; 32]>,
+    current: impl Fn() -> bool,
+    mut fingerprint: impl FnMut(&Path) -> Option<[u8; 32]>,
+) -> Option<Vec<String>> {
+    let started = Instant::now();
+    let mut changed = Vec::new();
+    let mut checked = 0_usize;
+    for (key, before) in inputs {
+        if !current() {
+            crate::trace::span("deps.archive_validation", "deps", started,
+                serde_json::json!({"generation": generation, "inputs": inputs.len(),
+                    "checked": checked, "cancelled": true}));
+            return None;
+        }
+        if fingerprint(Path::new(key)).as_ref() != Some(before) {
+            changed.push(key.clone());
+        }
+        checked += 1;
+    }
+    let still_current = current();
+    crate::trace::span("deps.archive_validation", "deps", started,
+        serde_json::json!({"generation": generation, "inputs": inputs.len(),
+            "checked": checked, "changed": changed.len(), "cancelled": !still_current}));
+    still_current.then_some(changed)
 }
 
 fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
@@ -3374,6 +3546,7 @@ impl LanguageServer for Backend {
         let mut retired_origins = std::collections::BTreeSet::new();
         let mut build_output_only = true;
         let mut adopted_cause = None;
+        let mut compiler_inputs_changed = false;
         let changes = {
             let mut ws = self.ws.lock();
             let current_generation = ws.analysis_generation();
@@ -3394,7 +3567,11 @@ impl LanguageServer for Backend {
                         return None;
                     }
                     drop(watches);
-                    (!ws.observe_compiled_resource(&key)).then_some((key, change.typ))
+                    if ws.observe_compiled_resource(&key) {
+                        return None;
+                    }
+                    compiler_inputs_changed = true;
+                    Some((key, change.typ))
                 })
                 .map(|(key, kind)| {
                     let change = project_change(&root, model.as_deref(), &key);
@@ -3430,6 +3607,10 @@ impl LanguageServer for Backend {
                 &retired_origins.into_iter().collect::<Vec<_>>(),
                 adopted_cause,
             );
+        } else if compiler_inputs_changed {
+            // Resource/directory events can invalidate selected compiler inputs without needing
+            // a Gradle model refresh. Retain the latest source epoch after cancelling its worker.
+            self.schedule_kotlin_diagnostics();
         }
     }
 
@@ -6206,7 +6387,7 @@ mod tests {
                 true,
                 generation,
                 None,
-                &std::sync::atomic::AtomicBool::new(false),
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 move |_, _, _| {
                     entered.send(()).unwrap();
                     Ok(query_result)
@@ -6244,8 +6425,10 @@ mod tests {
     fn jdk_cache_planning_overlaps_useful_modules_and_joins_stale_results() {
         use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
-        for superseded in [false, true] {
-            let (root, ws, accepted, _) = source_query_overlap_fixture(if superseded {
+        for (superseded, cooperative) in [(false, false), (true, false), (true, true)] {
+            let (root, ws, accepted, _) = source_query_overlap_fixture(if cooperative {
+                "jdk-plan-active-cancel"
+            } else if superseded {
                 "jdk-plan-stale"
             } else {
                 "jdk-plan-overlap"
@@ -6302,14 +6485,28 @@ mod tests {
             let blocked = Arc::new(Mutex::new(blocked));
             let exited = Arc::new(AtomicBool::new(false));
             let planner_exited = exited.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let planner_cancelled = cancelled.clone();
             let planner: Arc<JdkPlanner> = Arc::new(move |src, extract_root| {
                 entered.send(()).unwrap();
-                blocked.lock().recv().unwrap();
-                let plan = crate::deps::plan_jdk_index(src, extract_root);
+                if cooperative {
+                    while !planner_cancelled.load(Ordering::Acquire)
+                        && blocked.lock().try_recv().is_err()
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                } else {
+                    blocked.lock().recv().unwrap();
+                }
+                let plan = crate::deps::plan_jdk_index_while_current(src, extract_root, &|| {
+                    !planner_cancelled.load(Ordering::Acquire)
+                });
                 planner_exited.store(true, Ordering::Release);
                 plan
             });
             let worker_ws = ws.clone();
+            let worker_cancelled = cancelled.clone();
+            let current_model = model.clone();
             let worker_root = root.clone();
             let worker = std::thread::spawn(move || {
                 std::thread::scope(|scope| {
@@ -6324,6 +6521,7 @@ mod tests {
                         true,
                         2,
                         planner,
+                        worker_cancelled,
                     )
                 })
             });
@@ -6346,6 +6544,15 @@ mod tests {
             if superseded {
                 ws.lock().begin_analysis_generation();
             }
+            let cancellation_seen = if cooperative {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                cancelled.load(Ordering::Acquire)
+            } else {
+                true
+            };
             release.send(()).ok();
             let stats = worker.join().unwrap();
             assert!(
@@ -6357,12 +6564,32 @@ mod tests {
                 "the planner must remain owned and unpublished until released"
             );
             assert!(exited.load(Ordering::Acquire));
+            assert!(
+                cancellation_seen,
+                "superseding a generation must stop an active owned binary worker"
+            );
             assert_eq!(stats.jdk_complete, !superseded);
             assert_eq!(ws.lock().dependency_origin_complete(&origin), !superseded);
             assert_eq!(
                 !ws.lock().index.lookup_by_name("PlannerJdk").is_empty(),
                 !superseded
             );
+            if cooperative {
+                let current = ws.lock().analysis_generation();
+                let fresh = index_dependency_model(
+                    &ws,
+                    &root,
+                    Some(current_model),
+                    true,
+                    current,
+                    None,
+                    true,
+                );
+                assert!(
+                    fresh.jdk_complete && ws.lock().dependency_origin_complete(&origin),
+                    "after the cancelled owner joins, the current generation must advance normally"
+                );
+            }
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -6585,9 +6812,10 @@ mod tests {
         };
         let request_has_current_source = compiler_request.as_ref().is_ok_and(|request| {
             request.task.task == ":compileKotlin"
-                && request.overlays.iter().any(|overlay| {
-                    overlay.key == kotlin_key && overlay.text.contains("value.co")
-                })
+                && request
+                    .overlays
+                    .iter()
+                    .any(|overlay| overlay.key == kotlin_key && overlay.text.contains("value.co"))
         });
         let compiler_preceded_query = !worker.is_finished();
         backend.shutdown().await.unwrap();
@@ -6605,7 +6833,11 @@ mod tests {
             "completion must precede source query termination"
         );
         assert!(observed.iter().all(|(_, useful)| *useful), "{observed:?}");
-        assert!(request_has_current_source, "{:?}", compiler_request.as_ref().err());
+        assert!(
+            request_has_current_source,
+            "{:?}",
+            compiler_request.as_ref().err()
+        );
         assert!(
             compiler_preceded_query,
             "compiler readiness must not wait for source selection"
@@ -6708,14 +6940,18 @@ mod tests {
             archive.finish().unwrap();
             for _ in 0..2 {
                 let (tx, rx) = std::sync::mpsc::channel();
-                spawn_local_jar_index_worker(
-                    binary.clone(),
-                    classpath::file_origin_id(&binary),
-                    root.join("extracted"),
-                    1,
-                    tx,
-                );
-                let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let result = std::thread::scope(|scope| {
+                    spawn_local_jar_index_worker(
+                        scope,
+                        binary.clone(),
+                        classpath::file_origin_id(&binary),
+                        root.join("extracted"),
+                        1,
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        tx,
+                    );
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                });
                 assert!(
                     !result.failed,
                     "{case}: readable input is not an IO failure"
@@ -6777,20 +7013,24 @@ mod tests {
             };
             let resolve = || {
                 let (tx, rx) = std::sync::mpsc::channel();
-                spawn_coordinate_index_worker(
-                    coord.clone(),
-                    repos.clone(),
-                    root.join("extracted"),
-                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-                    true,
-                    vec![(binary.clone(), classpath::file_origin_id(&binary))],
-                    None,
-                    false,
-                    1,
-                    generation_one_workspace(),
-                    tx,
-                );
-                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                std::thread::scope(|scope| {
+                    spawn_coordinate_index_worker(
+                        scope,
+                        coord.clone(),
+                        repos.clone(),
+                        root.join("extracted"),
+                        Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                        true,
+                        vec![(binary.clone(), classpath::file_origin_id(&binary))],
+                        None,
+                        false,
+                        1,
+                        generation_one_workspace(),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        tx,
+                    );
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                })
             };
             write_source();
             let initial = resolve();
@@ -6885,20 +7125,24 @@ mod tests {
         assert!(verified_empty_binaries(&[]).is_ok_and(|empty| !empty));
         let resolve = |binaries| {
             let (tx, rx) = std::sync::mpsc::channel();
-            spawn_coordinate_index_worker(
-                coord.clone(),
-                repos.clone(),
-                root.join("extracted"),
-                Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-                true,
-                binaries,
-                None,
-                false,
-                1,
-                generation_one_workspace(),
-                tx,
-            );
-            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            std::thread::scope(|scope| {
+                spawn_coordinate_index_worker(
+                    scope,
+                    coord.clone(),
+                    repos.clone(),
+                    root.join("extracted"),
+                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                    true,
+                    binaries,
+                    None,
+                    false,
+                    1,
+                    generation_one_workspace(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tx,
+                );
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            })
         };
         for source_present in [false, true] {
             if source_present {
@@ -6965,14 +7209,18 @@ mod tests {
             std::fs::copy(&source, artifact_dir.join("empty-1-sources.jar")).unwrap();
             for _ in 0..2 {
                 let (tx, rx) = std::sync::mpsc::channel();
-                spawn_local_jar_index_worker(
-                    binary.clone(),
-                    classpath::file_origin_id(&binary),
-                    root.join("local-extracted"),
-                    1,
-                    tx,
-                );
-                let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let result = std::thread::scope(|scope| {
+                    spawn_local_jar_index_worker(
+                        scope,
+                        binary.clone(),
+                        classpath::file_origin_id(&binary),
+                        root.join("local-extracted"),
+                        1,
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        tx,
+                    );
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                });
                 assert!(
                     !result.failed,
                     "a readable empty archive is not an IO failure"
@@ -6984,23 +7232,27 @@ mod tests {
                     Some(classpath::file_origin_id(&binary))
                 );
                 let (tx, rx) = std::sync::mpsc::channel();
-                spawn_coordinate_index_worker(
-                    coord.clone(),
-                    repos.clone(),
-                    root.join("maven-extracted"),
-                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-                    true,
-                    vec![(
-                        artifact_dir.join("empty-1.jar"),
-                        classpath::file_origin_id(&artifact_dir.join("empty-1.jar")),
-                    )],
-                    None,
-                    false,
-                    1,
-                    generation_one_workspace(),
-                    tx,
-                );
-                let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let result = std::thread::scope(|scope| {
+                    spawn_coordinate_index_worker(
+                        scope,
+                        coord.clone(),
+                        repos.clone(),
+                        root.join("maven-extracted"),
+                        Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                        true,
+                        vec![(
+                            artifact_dir.join("empty-1.jar"),
+                            classpath::file_origin_id(&artifact_dir.join("empty-1.jar")),
+                        )],
+                        None,
+                        false,
+                        1,
+                        generation_one_workspace(),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        tx,
+                    );
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                });
                 assert!(
                     !result.failed,
                     "an empty coordinate must succeed cold and cached"
@@ -7077,20 +7329,24 @@ mod tests {
                 }
                 for _ in 0..2 {
                     let (tx, rx) = std::sync::mpsc::channel();
-                    spawn_coordinate_index_worker(
-                        coord.clone(),
-                        repos.clone(),
-                        root.join("maven-extracted"),
-                        Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-                        true,
-                        vec![(binary.clone(), classpath::file_origin_id(&binary))],
-                        None,
-                        false,
-                        1,
-                        generation_one_workspace(),
-                        tx,
-                    );
-                    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let result = std::thread::scope(|scope| {
+                        spawn_coordinate_index_worker(
+                            scope,
+                            coord.clone(),
+                            repos.clone(),
+                            root.join("maven-extracted"),
+                            Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                            true,
+                            vec![(binary.clone(), classpath::file_origin_id(&binary))],
+                            None,
+                            false,
+                            1,
+                            generation_one_workspace(),
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            tx,
+                        );
+                        rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                    });
                     assert!(
                         !result.failed
                             && !result.skipped
@@ -7099,14 +7355,18 @@ mod tests {
                         "{name}, sources={with_sources}"
                     );
                     let (tx, rx) = std::sync::mpsc::channel();
-                    spawn_local_jar_index_worker(
-                        binary.clone(),
-                        classpath::file_origin_id(&binary),
-                        root.join("local-extracted"),
-                        1,
-                        tx,
-                    );
-                    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let result = std::thread::scope(|scope| {
+                        spawn_local_jar_index_worker(
+                            scope,
+                            binary.clone(),
+                            classpath::file_origin_id(&binary),
+                            root.join("local-extracted"),
+                            1,
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            tx,
+                        );
+                        rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                    });
                     assert!(
                         !result.failed
                             && !result.skipped
@@ -7186,20 +7446,24 @@ mod tests {
         let origin = classpath::file_origin_id(&selected);
         let resolve = |authoritative, binaries: Vec<(std::path::PathBuf, String)>| {
             let (tx, rx) = std::sync::mpsc::channel();
-            spawn_coordinate_index_worker(
-                coord.clone(),
-                repos.clone(),
-                root.join("extracted"),
-                Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-                authoritative,
-                binaries,
-                None,
-                false,
-                1,
-                generation_one_workspace(),
-                tx,
-            );
-            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            std::thread::scope(|scope| {
+                spawn_coordinate_index_worker(
+                    scope,
+                    coord.clone(),
+                    repos.clone(),
+                    root.join("extracted"),
+                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                    authoritative,
+                    binaries,
+                    None,
+                    false,
+                    1,
+                    generation_one_workspace(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tx,
+                );
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            })
         };
         let mut previous = None;
         for _ in 0..2 {
@@ -7479,24 +7743,28 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 archive.finish().unwrap();
             }
             let (tx, rx) = std::sync::mpsc::channel();
-            spawn_coordinate_index_worker(
-                coord,
-                repos.clone(),
-                root.join("extracted").join(case),
-                Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-                case != "fallback",
-                if case == "absent" {
-                    Vec::new()
-                } else {
-                    vec![(binary.clone(), classpath::file_origin_id(&binary))]
-                },
-                None,
-                false,
-                1,
-                generation_one_workspace(),
-                tx,
-            );
-            let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = std::thread::scope(|scope| {
+                spawn_coordinate_index_worker(
+                    scope,
+                    coord,
+                    repos.clone(),
+                    root.join("extracted").join(case),
+                    Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+                    case != "fallback",
+                    if case == "absent" {
+                        Vec::new()
+                    } else {
+                        vec![(binary.clone(), classpath::file_origin_id(&binary))]
+                    },
+                    None,
+                    false,
+                    1,
+                    generation_one_workspace(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tx,
+                );
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            });
             assert!(
                 result.missing_source,
                 "{case} must not prove complete source coverage"
@@ -7536,7 +7804,15 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         };
         let (tx, rx) = std::sync::mpsc::channel();
         assert_eq!(
-            spawn_jdk_shard_workers(plan, classpath::jdk_origin_id(&jar), 1, 1, tx),
+            std::thread::scope(|scope| spawn_jdk_shard_workers(
+                scope,
+                plan,
+                classpath::jdk_origin_id(&jar),
+                1,
+                1,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                tx
+            )),
             1
         );
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -7582,14 +7858,18 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 std::fs::remove_file(&sources).unwrap();
             }
             let (tx, rx) = std::sync::mpsc::channel();
-            spawn_local_jar_index_worker(
-                jar.clone(),
-                classpath::file_origin_id(&jar),
-                root.join("extracted"),
-                1,
-                tx,
-            );
-            let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = std::thread::scope(|scope| {
+                spawn_local_jar_index_worker(
+                    scope,
+                    jar.clone(),
+                    classpath::file_origin_id(&jar),
+                    root.join("extracted"),
+                    1,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tx,
+                );
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            });
             assert_eq!(
                 result.failed, present,
                 "unreadable sources must keep coverage incomplete"
@@ -8319,7 +8599,10 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         ));
         assert_ne!(watches.lock().archive_inputs.as_ref().unwrap().1, before.1);
         watches.lock().archive_contents = before.1.clone();
-        assert_ne!(watches.lock().archive_content(&key, next), before.1.get(&key));
+        assert_ne!(
+            watches.lock().archive_content(&key, next),
+            before.1.get(&key)
+        );
         assert_eq!(
             watches.lock().archive_content(&key, generation),
             before.1.get(&key)
@@ -9417,6 +9700,189 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             java_entries,
             kotlin_entries
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_current_dependency_validation_cannot_finish_generation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut workspace = Workspace::new();
+        let generation = workspace.analysis_generation();
+        let prior = HashMap::from([("prior.jar".to_string(), [1; 32])]);
+        let mut watches = WatchState { archive_contents: prior.clone(), ..Default::default() };
+        let stats = DepStats { jdk_complete: true, ..Default::default() };
+        let cancelled = AtomicBool::new(true);
+        let validation = changed_archive_inputs_while_current(generation, &prior,
+            || !cancelled.load(Ordering::Acquire),
+            |_| panic!("cancelled receipt cannot perform fingerprint IO"));
+        assert!(validation.is_none());
+        assert!(workspace.is_current_generation(generation), "cancellation need not advance the model");
+        // Exercise the production outer acceptance boundary, not only its fingerprint helper.
+        assert!(!finish_dependency_index_generation(&mut workspace, &mut watches,
+            generation, &stats, validation.map(|_| prior.clone()), &cancelled));
+        assert_eq!(watches.archive_contents, prior);
+        assert!(!finish_dependency_index_generation(&mut workspace, &mut watches,
+            generation, &stats, Some(HashMap::new()), &cancelled));
+        assert_eq!(watches.archive_contents, prior);
+        cancelled.store(false, Ordering::Release);
+        assert!(!finish_dependency_index_generation(&mut workspace, &mut watches,
+            generation, &stats, None, &cancelled), "unvalidated is distinct from validated empty");
+        assert!(finish_dependency_index_generation(&mut workspace, &mut watches,
+            generation, &stats, Some(HashMap::new()), &cancelled));
+        assert!(watches.archive_contents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseded_dependency_validation_joins_without_hashing_remaining_archives() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (root, _, accepted, _) = source_query_overlap_fixture("cancelled-archive-validation");
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        backend.ws.lock().set_project_model(accepted.clone());
+        let generation = backend.ws.lock().analysis_generation();
+        let old_cancelled = {
+            let mut state = backend.refresh.lock();
+            state.running = true;
+            state.requested = generation;
+            state.active_generation = Some(generation);
+            state.cancelled.clone()
+        };
+        let inputs = HashMap::from([("first.jar".to_string(), [1; 32]),
+            ("second.jar".to_string(), [1; 32])]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (entered, pending) = std::sync::mpsc::sync_channel(1);
+        let (release, held) = std::sync::mpsc::sync_channel(0);
+        let worker_reads = reads.clone();
+        let worker_inputs = inputs.clone();
+        let worker_cancelled = old_cancelled.clone();
+        let worker_ws = backend.ws.clone();
+        let worker = std::thread::spawn(move || changed_archive_inputs_while_current(
+            generation, &worker_inputs,
+            || !worker_cancelled.load(Ordering::Acquire)
+                && worker_ws.lock().is_current_generation(generation),
+            |_| {
+                if worker_reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                }
+                Some([2; 32])
+            }));
+        pending.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The model and owned source/API work have completed; only final validation remains.
+        backend.request_project_refresh(true, Duration::ZERO, true, &[], None);
+        let future = backend.refresh.lock().requested;
+        let future_cancelled = backend.refresh.lock().cancelled.clone();
+        backend.request_project_refresh(true, Duration::ZERO, true, &[], None);
+        assert_eq!(backend.refresh.lock().requested, future);
+        assert_eq!(future, generation + 1);
+        assert!(old_cancelled.load(Ordering::Acquire));
+        assert!(!future_cancelled.load(Ordering::Acquire));
+        assert!(!worker.is_finished(), "the in-flight fingerprint remains owned");
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_none(), "cancelled validation cannot publish partial change authority");
+        assert_eq!(reads.load(Ordering::Acquire), 1, "remaining obsolete archive reads must stop");
+        let skipped = changed_archive_inputs_while_current(generation, &inputs, || false,
+            |_| panic!("already-cancelled generation must not start fingerprint IO"));
+        assert!(skipped.is_none());
+        let mut latest_reads = 0;
+        let latest = changed_archive_inputs_while_current(future, &inputs,
+            || !future_cancelled.load(Ordering::Acquire)
+                && backend.ws.lock().is_current_generation(future),
+            |_| { latest_reads += 1; Some([2; 32]) });
+        assert_eq!(latest_reads, 2, "the current generation still validates every archive");
+        assert_eq!(latest.unwrap().len(), 2);
+        assert!(backend.refresh.lock().force, "the current model retry remains mandatory");
+        assert!(!backend.ws.lock().finish_analysis_generation(generation, true, true));
+        backend.refresh.lock().running = false;
+        backend.refresh.lock().active_generation = None;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_model_output_burst_preserves_one_pending_refresh_and_owned_query() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (root, _ws, accepted, enriched) = source_query_overlap_fixture("pending-output-burst");
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        backend.ws.lock().set_project_model(accepted.clone());
+        let generation = backend.ws.lock().analysis_generation();
+        let old_cancelled = {
+            let mut state = backend.refresh.lock();
+            state.running = true;
+            state.requested = generation;
+            state.active_generation = Some(generation);
+            state.cancelled.clone()
+        };
+        let (entered, pending) = std::sync::mpsc::sync_channel(1);
+        let (release, held) = std::sync::mpsc::sync_channel(1);
+        let exited = Arc::new(AtomicBool::new(false));
+        let query_exited = exited.clone();
+        let worker_ws = backend.ws.clone();
+        let worker_root = root.clone();
+        let worker_model = accepted.clone();
+        let worker_cancelled = old_cancelled.clone();
+        let owner = std::thread::spawn(move || {
+            index_dependencies_with_source_query(
+                &worker_ws,
+                &worker_root,
+                Some(worker_model),
+                true,
+                generation,
+                None,
+                &worker_cancelled,
+                move |_, _, _| {
+                    entered.send(()).unwrap();
+                    held.recv().unwrap();
+                    query_exited.store(true, Ordering::Release);
+                    Ok(enriched)
+                },
+            )
+        });
+        pending.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            !backend.watches.lock().model_loading,
+            "the model has already been installed"
+        );
+        backend.request_project_refresh(false, Duration::ZERO, true, &[], None);
+        let future = backend.refresh.lock().requested;
+        let future_cancelled = backend.refresh.lock().cancelled.clone();
+        assert_eq!(future, generation + 1);
+        assert!(old_cancelled.load(Ordering::Acquire));
+        for force in [true, false, true] {
+            backend.request_project_refresh(force, Duration::ZERO, true, &[], None);
+        }
+        assert_eq!(backend.refresh.lock().requested, future);
+        assert_eq!(backend.ws.lock().analysis_generation(), future);
+        assert!(
+            backend.refresh.lock().force,
+            "the settled retry must still force a fresh model"
+        );
+        assert!(Arc::ptr_eq(
+            &backend.refresh.lock().cancelled,
+            &future_cancelled
+        ));
+        assert!(!future_cancelled.load(Ordering::Acquire));
+        assert!(!backend
+            .ws
+            .lock()
+            .finish_analysis_generation(generation, true, true));
+        assert!(
+            !owner.is_finished(),
+            "the held source query must remain owned"
+        );
+        release.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(exited.load(Ordering::Acquire));
+        assert!(
+            Arc::ptr_eq(&backend.ws.lock().project_snapshot().unwrap(), &accepted),
+            "late cancelled source metadata must not publish"
+        );
+        backend.refresh.lock().running = false;
+        backend.refresh.lock().active_generation = None;
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -10747,6 +11213,95 @@ mod kotlin_diagnostic_queue_tests {
         drop(workspace_guard);
         assert!(worker.join().unwrap().is_none());
         assert!(callback_can_lock_state, "cache fallback holds diagnostic state while waiting for Workspace, blocking its invalidation callback");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resource_watch_requeues_latest_source_epoch_after_ordered_java_kotlin_edits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::env::temp_dir().join(format!("ktlsp-resource-requeue-{}", std::process::id()));
+        let producer = root.join("producer");
+        let consumer = root.join("consumer");
+        let java_path = producer.join("src/api/Producer.java");
+        let kotlin_path = consumer.join("src/Use.kt");
+        std::fs::create_dir_all(java_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(kotlin_path.parent().unwrap()).unwrap();
+        let java_key = crate::paths::file_key(&java_path);
+        let kotlin_key = crate::paths::file_key(&kotlin_path);
+        let output = producer.join("build/classes");
+        let mut modules = classpath::parse_dump(&format!(
+            "PROJECT\t:producer\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nEND\t:producer\nPROJECT\t:consumer\t{}\nSOURCESET\tmain\nSOURCE\tmain\t{}\nSCP\tmain\t{}\nEND\t:consumer\n",
+            producer.display(), producer.join("src").display(), output.display(),
+            consumer.display(), consumer.join("src").display(), output.display()));
+        let mut task = crate::compile::kotlin_test_request(&consumer).task;
+        task.source_files = vec![kotlin_path];
+        modules[1].source_sets[0].kotlin_compile_task = Some(task.task.clone());
+        modules[1].source_sets[0].compiler_tasks.push(task);
+        let model = Arc::new(classpath::ProjectSnapshot::new(modules));
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        *backend.gradle_project.lock() = true;
+        // Hold the selected worker at its existing singleflight boundary. No native compiler or
+        // Gradle is needed to exercise real didChange/watch admission and current request capture.
+        backend.kotlin_diagnostics.lock().running = true;
+        {
+            let mut ws = backend.ws.lock();
+            ws.set_project_model(model.clone());
+            ws.open(java_key.clone(), "package api; public class Producer {}".into());
+            ws.open(kotlin_key.clone(), "fun use() = 0".into());
+        }
+        let java_text = "package api; public class Producer { public int count() { return 1; } }";
+        let kotlin_text = "fun use(value: api.Producer) = value.count()";
+        for (key, text) in [(&java_key, java_text), (&kotlin_key, kotlin_text)] {
+            backend.did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri: key_to_uri(key).unwrap(), version: 4 },
+                content_changes: vec![TextDocumentContentChangeEvent { range: None, range_length: None, text: text.into() }],
+            }).await;
+        }
+        let old = backend.ws.lock().begin_kotlin_diagnostics(&kotlin_key).unwrap();
+        {
+            let mut state = backend.kotlin_diagnostics.lock();
+            while state.next().is_some() {}
+        }
+        let (release, held) = std::sync::mpsc::sync_channel(0);
+        let worker_ws = backend.ws.clone();
+        let old_worker = old.clone();
+        let worker = std::thread::spawn(move || {
+            held.recv().unwrap();
+            worker_ws.lock().finish_kotlin_diagnostics(&old_worker,
+                crate::compile::KotlinDiagnosticOutcome::Verified {
+                    diagnostics: Vec::new(), clean: true, java_clean: None,
+                },
+                Arc::new(AtomicBool::new(false)))
+        });
+        let directory = crate::paths::file_key(java_path.parent().unwrap());
+        assert_eq!(project_change(&root, Some(&model), &directory), None);
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent { uri: key_to_uri(&directory).unwrap(), typ: FileChangeType::CHANGED }],
+        }).await;
+        let old_cancelled = old.invalid.load(Ordering::Acquire);
+        let queued = {
+            let mut state = backend.kotlin_diagnostics.lock();
+            let mut keys = Vec::new();
+            while let Some(key) = state.next() { keys.push(key); }
+            keys
+        };
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_empty(), "superseded worker must join without publication");
+        assert!(old_cancelled, "producer directory watch invalidates its active consumer");
+        assert_eq!(queued.iter().filter(|key| **key == kotlin_key).count(), 1,
+            "non-refresh watch must retain one latest consumer job");
+        let latest = backend.ws.lock().begin_kotlin_diagnostics(&kotlin_key).unwrap();
+        assert!(latest.generation > old.generation);
+        assert!(latest.overlays.iter().any(|overlay| overlay.key == kotlin_key && overlay.text == kotlin_text));
+        assert!(latest.dependency_overlays.iter().any(|overlay| overlay.key == java_key && overlay.text == java_text));
+        assert!(Arc::ptr_eq(&backend.ws.lock().project_snapshot().unwrap(), &model));
+        assert_eq!(backend.ws.lock().analysis_generation(), 0);
+        backend.kotlin_diagnostics.lock().running = false;
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

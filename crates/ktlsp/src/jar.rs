@@ -386,12 +386,36 @@ pub(crate) fn visit_sources_shard_with_encoding(
     shard: usize,
     shards: usize,
     java_encoding: JavaSourceEncoding,
+    visit: impl FnMut(&Path, &str),
+) -> anyhow::Result<usize> {
+    visit_sources_shard_with_encoding_while_current(
+        bytes,
+        jar,
+        out_dir,
+        shard,
+        shards,
+        java_encoding,
+        &|| true,
+        visit,
+    )
+}
+
+pub(crate) fn visit_sources_shard_with_encoding_while_current(
+    bytes: std::sync::Arc<[u8]>,
+    jar: &Path,
+    out_dir: &Path,
+    shard: usize,
+    shards: usize,
+    java_encoding: JavaSourceEncoding,
+    current: &dyn Fn() -> bool,
     mut visit: impl FnMut(&Path, &str),
 ) -> anyhow::Result<usize> {
+    anyhow::ensure!(current(), "source archive indexing generation cancelled");
     let mut archive = archive_shared(bytes, jar)?;
 
     let mut visited = 0;
     for i in (shard..archive.len()).step_by(shards) {
+        anyhow::ensure!(current(), "source archive indexing generation cancelled");
         if visited >= MAX_SOURCE_FILES {
             tracing::warn!(
                 "jar {} shard {shard} has more than {MAX_SOURCE_FILES} source files; truncating",
@@ -414,9 +438,11 @@ pub(crate) fn visit_sources_shard_with_encoding(
         if !path.starts_with(out_dir) {
             continue;
         }
+        anyhow::ensure!(current(), "source archive indexing generation cancelled");
         let capacity = entry.size().min(MAX_ENTRY_SIZE_HINT) as usize;
         let text = read_source_text(&mut entry, capacity, &rel, java_encoding)
             .with_context(|| format!("read source {} from {}", rel.display(), jar.display()))?;
+        anyhow::ensure!(current(), "source archive indexing generation cancelled");
         visit(&path, &text);
         visited += 1;
     }
@@ -3528,6 +3554,51 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
     }
+    #[test]
+    fn cancelled_source_shard_stops_before_reading_the_next_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-cancel-source-shard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let archive = root.join("sources.jar");
+        write_binary_jar(
+            &archive,
+            &[("First.java", b"class First {}"), ("Second.java", b"\xff")],
+        );
+        let bytes: std::sync::Arc<[u8]> = fs::read(&archive).unwrap().into();
+        let live = std::cell::Cell::new(true);
+        let visits = std::cell::Cell::new(0);
+        let error = visit_sources_shard_with_encoding_while_current(
+            bytes.clone(),
+            &archive,
+            &root.join("extract"),
+            0,
+            1,
+            JavaSourceEncoding::Utf8,
+            &|| live.get(),
+            |_, _| {
+                visits.set(visits.get() + 1);
+                live.set(false);
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("generation cancelled"),
+            "{error:#}"
+        );
+        assert_eq!(visits.get(), 1);
+        // Reading the second entry would fail decoding before the callback can skip it.
+        assert!(
+            visit_sources_shard(bytes, &archive, &root.join("extract"), 0, 1, |_, _| {}).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn source_encoding_all_transports_share_normalized_utf8() {
         let root =

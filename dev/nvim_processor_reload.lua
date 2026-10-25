@@ -235,8 +235,12 @@ local function run()
           if not ok or type(event) ~= 'table' then row.error = 'invalid-refresh-trace-event'; return false end
           local args = type(event.args) == 'table' and event.args or {}
           if type(args.root) == 'string' and probe.path_key(args.root) == probe.path_key(root) then
-            if event.name == 'workspace.project_scan' and event.cat == 'workspace' and args.forcedModel == true
-              and type(args.generation) == 'number' and (not row.scan or args.generation >= row.scan.generation) then
+            if event.name == 'workspace.refresh_requested' and type(args.generation) == 'number' then
+              row.requested_generation = math.max(row.requested_generation or 0, args.generation)
+              if row.scan and row.scan.generation < row.requested_generation then row.scan, row.deps = nil, nil end
+            elseif event.name == 'workspace.project_scan' and event.cat == 'workspace'
+              and type(args.generation) == 'number' and args.generation >= (row.requested_generation or 0)
+              and (not row.scan or args.generation >= row.scan.generation) then
               row.scan, row.deps = args, nil
             elseif event.name == 'deps.index_workspace' and event.cat == 'deps' and row.scan
               and args.generation == row.scan.generation then row.deps = args end
@@ -320,40 +324,46 @@ local function run()
     end
   end
   local function refresh_after_build(number, version, enabled)
+    -- Start before Gradle: normal file watches may import the new configuration during the build.
+    local before = mode == 'ktlsp' and cache_stamps() or {}
+    local read_trace, trace_row
+    if mode == 'ktlsp' then
+      read_trace, trace_row = observe_refresh_trace()
+      phase_traces[number] = { read = read_trace, row = trace_row }
+    end
     build(number, version, enabled)
-    check('phase ' .. number .. ' native watched-file notification delivered', wait_for(function()
+    local automatic_sent = wait_for(function()
       for _, notification in ipairs(report.notifications) do
         if notification.phase == number and notification.sent and notification.role == 'automatic' then return true end
       end
       return false
-    end, 10000))
+    end, 10000)
+    check('phase ' .. number .. ' native watched-file notification delivered', automatic_sent)
     if mode ~= 'ktlsp' then
       local ready = probe.import_ready(client, 'gradle', 120000, check)
       report.refresh_ordering[tostring(number)] = { mode = mode, ready = ready,
         generation_certified = false, role = 'existing IDEA adapter import observation' }
       return ready
     end
-    -- Deliver a final build batch after native compilation/output checks, so a mid-build import
-    -- cannot be mistaken for the final model. Automatic watch delivery is checked separately above.
-    local before, changes = cache_stamps(), {}
-    local read_trace, trace_row = observe_refresh_trace()
-    phase_traces[number] = { read = read_trace, row = trace_row }
-    for _, path in ipairs({ 'gradle.properties', 'app/build/classes/kotlin/main',
-      'app/build/classes/java/main', 'app/build/generated/ksp/main/classes' }) do
-      changes[#changes + 1] = { uri = vim.uri_from_fname(root .. '/' .. path),
-        type = vim.uv.fs_stat(root .. '/' .. path) and 2 or 3 }
+    local generated_hashes = {}
+    local function generated_hash(path)
+      return vim.fn.filereadable(path) == 1 and vim.fn.sha256(table.concat(vim.fn.readfile(path, 'b'), '\n')) or false
     end
-    notification_role = 'post-build final model control'
-    local sent = client:notify('workspace/didChangeWatchedFiles', { changes = changes })
-    notification_role = 'automatic'
-    local observation = { sent = not not sent, native_build_closed = true,
+    for _, target in ipairs(generated) do generated_hashes[target.path] = generated_hash(root .. '/' .. target.path) end
+    -- Readiness observes real build artifacts and the latest normal watch-driven generation.
+    -- No synthetic notification or expected completion result is used to advance the server.
+    local observation = { sent = automatic_sent, notification_role = 'automatic', synthetic_final_watch = false,
+      native_build_closed = true, generated_hashes = generated_hashes,
       build_exit = report.phases[#report.phases].compile_exit,
       properties_sha256 = vim.fn.sha256(table.concat(vim.fn.readfile(root .. '/gradle.properties'), '\n')) }
-    local observed = sent and wait_for(function()
+    local observed = automatic_sent and wait_for(function()
       local traced = read_trace()
       if trace_row.error then return true end
       local selected = refreshed_model(before)
       if not traced or not selected then return false end
+      for path, hash in pairs(generated_hashes) do
+        if generated_hash(root .. '/' .. path) ~= hash then return false end
+      end
       observation.model = selected
       return true
     end, 120000)

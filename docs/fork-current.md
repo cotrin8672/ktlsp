@@ -1,9 +1,18 @@
 # Current fork state
 
-Updated 2026-10-25 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
+Updated 2026-10-26 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
 correctness coverage are unmeasured; passing selected probes does not establish either.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
 by editing UX. Warm speed is accepted provisionally; cold startup is lower priority.
+KAPT/KSP execution belongs to the external build, not to ktlsp's analysis. The
+user explicitly rejected LSP-owned regeneration. Remove the private generation
+executor and analysis-triggered Gradle replay; do not retain them as optional
+features. Existing generated sources/classes, dependencies and plugin configuration
+must instead be reflected in editing features and refreshed after an external build.
+The [official KSP quickstart](https://kotlinlang.org/docs/ksp-quickstart.html#use-your-processor)
+explicitly says that an undefined generated function in the IDE is expected before
+building/running. This does not waive ordinary unsaved Java/Kotlin semantics or
+virtual-member support supplied by compiler plugins.
 
 Evidence paths below are relative to RUN:
 `C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda`.
@@ -12,7 +21,150 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification on releases42 through45
+## Current verification on releases42 through50
+
+The private-generation results below document a superseded design, not additional
+completion requirements. The source now removes that executor, its cache and
+diagnostic authority, and automatic Gradle archive replay from analysis. Candidate53
+passes six focused controls. Candidate54 passes three further controls, including
+known KAPT/KSP plugin rejection before JVM launch and the restored actual Javac
+generated-API/Unicode-range check. Release54 passes1840 tests,0 failures,13 ignored;
+the full release build succeeds with605 compiled inputs unchanged. Its immutable
+binary is22,526,464 bytes, SHA256
+`8d83259301e36b628ac4ee404fa60cddb740d9b6b86c390e2cc73aa39cd1d617`
+(`native-integrated120-54/main-ready.json`). Both owned stages reach EOF/live0;
+each retires one exact owned MSVC helper, with no JVM/server involved.
+Generated-input analysis and update checks remain required; they use actual external
+builds rather than LSP-triggered generation.
+
+Actual54 external Java/Lombok ingestion reproduces a product gap: the external
+Gradle build succeeds, current class hashes and the latest model/index generation
+are observed, and authored completion works, but the first generated `getName`
+completion is empty. There are17 matched checks and1 mismatch; later configuration,
+source-change and restoration phases are not run. EOF/live0/forced0, stable guards
+and the restored H17 profile are verified (`external-java155-release54/receipt.json`).
+This is generated-output analysis still needing a fix, not a need for LSP generation.
+The separate KSP/KAPT114 run first lacked the offline Kotlin1.8.21 plugin marker;
+genuine external Gradle resolution now succeeds. An overlong Windows service-file
+path is also retained as a setup failure with zero LSP requests. The original114
+checks are running from a shorter disposable path; no source/model cache is fabricated.
+
+The compiler-task observer fix is committed and pushed in
+`8b0f9129fed8f5b24b8e340d8fe7a5a1e85a8cba`. Actual Gradle8.10.2 cold/warm controls
+verify that only exact owned action wrappers are excluded, user actions remain
+visible, and configuration-cache reuse succeeds (`observed-action155-frozen1.json`).
+This does not itself establish generated-code ingestion in an editor.
+
+Release50 passes **1869 passed, 0 failed, 15 ignored** and builds successfully.
+All615 inputs remain unchanged; both stages reach EOF/live0/forced0. The immutable
+binary is23,269,376 bytes, SHA256
+`1b8821fab0f26d33f1c11f5651ddb0f8bfb5d4d727375abff136dae0a7881663`
+(`native-integrated120-50/main-ready.json`). The source guard packet binds32
+selected inputs. These candidates also contain unpublished working-tree analysis
+and processor changes; their binary/source receipts distinguish them from Git HEAD.
+
+The four-task KAPT executor now has focused contract tests and an independent
+review covering current generated outputs, three normal producer modules/six
+output slots, temporal reads, cache validity and retained private-generation
+ownership. This is still not proof that the actual OkHttp KAPT run succeeds.
+The direct51 native run now completes Gradle successfully, but current-result
+acceptance rejects `:okhttp:copyJavaTemplates` reading its authored template outside
+the modeled source closure. This is a real unsupported input role, not a timeout.
+Candidate52 models that precise role and checks the current template, expansion
+configuration and generated contents. Its three focused tests pass. The same
+native control completes Gradle successfully but rejects an external input that
+was not prearmed; the exact offending read is not established. Current native
+receipts are retained before that rejection. No current Java-body success has
+been established for this workflow, and further unsaved-KAPT closure expansion is
+deferred (`diagnostic155-kapt-direct52/receipt.json`,
+`build155-candidate52-native-red-handoff.json`). A separate review found that the
+template cache lacked a current expansion-configuration binding; its safety fix
+is pending, so template-cache reuse is not an accepted workflow.
+
+An unchanged observed-Java plugin probe on release50 also reproduces a missing
+generated getter. Native `:compileJava` succeeds, but configured-task equality
+rejects the result: the only configuration difference is two action wrappers around
+the same stock action. Their exact ownership is under investigation; user actions
+and other configuration changes must remain checked. Authored completion and goto
+pass; the generated getter fails, and later configuration/dirty phases do not run
+(`observed-java155-release50-2/adjudication.json`). Its genuine online Gradle/Lombok
+bootstrap succeeds; the semantic probe itself remains offline and unchanged.
+
+The durable Java-only corpus probe is committed and pushed in
+`b4ef819072e435f63b9394d620e01950f5e2f178`. Actual48 verifies four first-response
+RPCs/eleven semantic checks, v3 error then v4 repair, exact wire/result identities
+and raw Javac input/body-receipt joins, with restored buffers/profiles and
+EOF/live0/forced0 (`java-body155-release48/acceptance.json`). ROOT rehashes all
+eight referenced artifacts and independently recomputes both canonical raw-receipt
+digests. This remains one K2 mixed module; it does not establish KAPT/K1/producer
+closure. The existing corpus route and library generator reproduce it.
+
+Gradle48 still has no currentv4 counter receipt. This run has no model-refresh
+events, but does receive directory-only resource-watch notifications. Resource
+observation invalidates the current ticket, while the directory has no project
+refresh and the old handler returns without requeuing diagnostics. Release50
+reschedules selected diagnostics after accepted nonrefresh observations. Its real
+Backend regression covers ordered Java/Kotlin edits, both current wire snapshots,
+the same analysis generation/model, deduplication, and rejection of an otherwise
+publishable stale result. Actual50 still has no current counter receipt. It does
+exercise coalescing into the already queued generation. Both obsolete workers join
+in about9 seconds; the subsequent retirement gap is not attributed to that preview.
+Candidate51 also makes post-index archive validation cancellable and rejects its
+cancelled result at the outer acceptance boundary. Its focused tests pass; the
+actual Gradle counter still needs verification. No full17 replay is started from
+earlier unmeasured selective results (`gradle-counter155-selective50/tail-retirement-supplement.json`).
+
+Release47 passes **1865 passed, 0 failed, 14 ignored** and builds successfully.
+All613 input guards, including the new producer helper, remain unchanged;
+both stages reach EOF/live0 and each cleans one exact-owned MSVC helper.
+The immutable binary is23,198,208 bytes, SHA256
+`812cdc361fb69ad029ad6e29580a35d1888d428411f1faccef288577532cbad3`
+(`native-integrated120-47/main-ready.json`). It includes the current normal-output
+closure for three Kotlin producers, the exact captured Gradle7.5 Java19-option
+variant, and cooperative cancellation of active SDK/JDK/binary indexing. Focused
+tests cover both Java option variants, six output bindings, stale/cyclic inputs,
+owned-worker cancellation, stopping JDK archive reads, and partial-cache rejection.
+Actual47 OkHttp Java error/repair/cache checks and the Gradle counter still do not
+establish current diagnostic acceptance. Both runs shut down cleanly, restore
+buffers/profiles, and retain their unmeasured cases rather than counting a timeout
+as either semantic correctness or a false diagnostic.
+
+OkHttp47 again matches the original16 operations, but its added Java error control
+has no current compiler receipt; repair/cache/API follow-ups are not run
+(`okhttp-java155-release47/adjudication.json`). A direct captured-model Rust check
+now admits all three regular producers and identifies the consumer boundary:
+guide has an active20-entry Moshi KAPT path and four compiler tasks. It cannot be
+treated as an inactive processor. The existing private processor execution supports
+a fixed five-task KSP/KAPT chain; supporting the actual four-task chain must also
+include the three regular producers and current generated outputs. That work is
+under implementation, with no Java-clean authority granted by merely changing a
+predicate (`diagnostic155-admission48/bounded-admission-result.json`).
+
+Gradle47 reaches the originalv4 counter but still has no accepted current receipt
+within the unchanged observation. The obsolete227-second preview is not observed:
+after a cancellation, the next model/source install and binary preview progress.
+Further build-output notifications then request generations5 through8, and the
+target remains unmeasured. Active cancellation is useful mechanism evidence, not
+proof that the complete counter workflow is fixed. The owned run86867 terminates
+cleanly with stable inputs and the original profile restored; no full17 replay is
+started from this failed selective proof.
+
+Release46 passes1861 tests and builds, but its actual OkHttp run only verifies the
+original16 operations. The added current-Java error check remains unmeasured;
+repair/cache/API follow-ups were not run (`okhttp-java155-release46/adjudication.json`).
+Captured Java19-option producer recipes were rejected by a parser accepting the
+guide's21-option shape. Release47 adds that exact observed variant while retaining
+processor, order, encoding and output-role checks. This still needs runtime proof.
+
+The actual Gradle45 counter also remains unmeasured with its exact originalv4
+wire hash and300-second observation. Two input inventories cancel on build-logic
+JAR updates. Obsolete generation5 binary preview then takes227.611s, including a
+213.631s SDK installation that publishes zero files, blocking generation6 behind
+singleflight. The source-query cancellation had already completed. Full-trace and
+source mapping are retained in
+`gradle-counter155-selective45/causal-scheduling-audit.json`; the SDK subcost is not
+attributed to lock waiting, disposal or computation without evidence. Release47's
+cancellation fix passes focused tests; the actual editing result is still pending.
 
 Release45 passes **1860 passed, 0 failed, 14 ignored** and builds successfully.
 All611 input guards remain unchanged and both build stages reach EOF/live0;
@@ -58,9 +210,9 @@ Release42 also passes1856 tests and builds with zero forced cleanup. Its SHA256 
 | Spring shutdown | Release43: same original4 responses match, clean shutdown3.967s within the unchanged15s observation, no terminate call, stable inputs and EOF/live0/forced0. `spring-shutdown155-release43/acceptance.json`. | Inventory cancellation has deterministic Rust coverage, but this replay emits no source_cancelled event; it does not prove the exact formerly slow phase occurred again. |
 | Declared callback parameter types | Release42: unchanged indexed10, ordinary top-level8 and member10 RPCs all match; portable semantic harness181 PASS/0 FAIL including8 new first-response completion/exact-goto checks. `callback155-42-replay/receipt.json`. | Uses declared parameter positions and generic receiver bindings. Ambiguous/unavailable declarations remain Unknown; this is not language-wide inference coverage. |
 | Shared edits and scoped compiler diagnostics | Release42: Moshi16, Spring16 and Retrofit22 match, including five current-version/source-SHA compiler passes, exact Retrofit invalid range and independently applied rename edits. `shared-diagnostics155-release42/final.json`, `independent-audit.json` in the same directory. | Certificates concern the observed documents; producer_closure_complete remains false. |
-| OkHttp shared edits | Release42: original16/16 match, stable inputs and clean shutdown. `okhttp-shared155-release42/acceptance.json`. | Java version4/wire-SHA delivery and a supported recipe are proven; the empty push does not certify a compiler-complete error absence. |
-| Gradle Java6-valid shared edits | Release42:14 matched, 0 mismatched,3 unmeasured; counter v4, invalid v8 and fixed v9 never reached a certified diagnostic RPC. `gradle-shared155-valid42-summary.json`. | Release44 settles the modeled-output notifications, but the optional source query still delays compiler scheduling. Release45's earlier queue is under actual selective verification, before repeating the full17. The source6-invalid default-method fixture remains separate; observation windows and certificate requirements are unchanged. |
-| Current Java-body clean authority | Release45 focused tests and actual Java-only editor check pass: errorv3 then repairedv4, exact current wire SHA/resultId, actual raw Javac error/success receipts, and matching clean body-receipt SHA. ROOT independently rehashes all eight referenced artifacts. `java-body155-release45/acceptance.json`. | One controlled K2 module with no producer DAG. Port the tiny private probe through the existing corpus route after the concurrent run closes. OkHttp's three Kotlin producers still require verified current output closure; no header or old binary can certify that Java result. |
+| OkHttp shared edits | Release42 and46: original16/16 match with stable inputs and clean shutdown. `okhttp-shared155-release42/acceptance.json`, `okhttp-java155-release46/adjudication.json`. | Release46's new Java check remains unmeasured. The exact Java19-option producer variant is added on47; current body/three-producer/cache proof is being rerun. An empty push or supported recipe is insufficient. |
+| Gradle Java6-valid shared edits | Release42:14 matched, 0 mismatched,3 unmeasured. Actual45 selective counter still has no current receipt; wire/source/prefix preserved and all cleanup succeeds. | Actual45 identifies obsolete active binary indexing blocking the next model generation. Release47 adds cooperative cancellation and archive-read aborts; selective proof is being rerun before full17. The source6-invalid default-method fixture stays separate; observation and certificate requirements are unchanged. |
+| Current Java-body clean authority | Release45 and the durable48 corpus probe pass: four first-response RPCs, current errorv3 then repairedv4, exact wire/result identity, raw Javac error/success receipts and matching body-receipt digest. `java-body155-release48/acceptance.json`; portable probe published inb4ef819. | One controlled K2 module with no producer DAG. Actual OkHttp KAPT plus three normal producers still needs current native generation/body proof; no header, configuration or old binary can certify it. |
 | Java-only producer, native failure route | Actual native44 invalid-only run passes with a located current Java error and clean:false. Earlier native42's valid producer/consumer phase passed, but its full run failed; native43's location failure is retained. | Current full editor canonical workflow above remains unverified. The fixed enum-name and Windows-path boundaries do not alone establish the full workflow. |
 | Source-library coverage | The same Gradle42 traces resolve all six repaired POM origins without failure; aggregate failed1/missingSources29, NeKoHTML binary retention remains explicit. `gradle155-source-coverage42.json`. | Retrofit still reports six failed source origins and9 missing sources; Spring reports six and16. Binary facts do not imply recovered original-source coverage. |
 | External shared-semantic extension | Current42 host and independently rebuilt child pass legacy26 plus optional46: actual model1->2/classpath3->4, stale rejection, fresh publication, crash/restart and applied rename. `project-facts143-42-final.json`; consumer4 tests/build in `external42-ready/ready.json`. | workspaceUri, source-only raw ABI and full-runtime ABI coverage remain Unknown. Full MC policy stays in mc-dev. |

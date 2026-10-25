@@ -236,11 +236,15 @@ impl CompilerTask {
             "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1" => {
                 (&["--release", "8"], &[], false)
             }
-            "gradle-7.5-current-jdk17-utf8-javac-api-v1" => (
-                &["-source", "1.8", "-target", "1.8"],
-                &["-nowarn", "-encoding", "UTF-8"],
-                true,
-            ),
+            "gradle-7.5-current-jdk17-utf8-javac-api-v1" => match task.arguments.as_slice() {
+                // Captured stock producer: warnings enabled and no user compiler arguments.
+                [] => (&["-source", "1.8", "-target", "1.8"], &["-encoding", "UTF-8"], false),
+                [argument] if argument == "-proc:none" => (
+                    &["-source", "1.8", "-target", "1.8"],
+                    &["-nowarn", "-encoding", "UTF-8"], true,
+                ),
+                _ => anyhow::bail!("java-api-raw-arguments-unhandled"),
+            },
             "gradle-9.6.1-current-jdk17-javac-api-v1"
             | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1" => {
                 (&["-source", "17", "-target", "17"], &[], false)

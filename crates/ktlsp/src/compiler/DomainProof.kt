@@ -106,8 +106,6 @@ internal class PackageDomainProof(
         val allowedRegistrars = setOf(
             "org.jetbrains.kotlin.scripting.compiler.plugin.ScriptingCompilerConfigurationComponentRegistrar",
             "org.jetbrains.kotlin.scripting.compiler.plugin.ScriptingK2CompilerPluginRegistrar",
-            "org.jetbrains.kotlin.kapt3.Kapt3ComponentRegistrar",
-            "com.google.devtools.ksp.KotlinSymbolProcessingComponentRegistrar",
         )
         val registrars = (configuration.getList(ComponentRegistrar.PLUGIN_COMPONENT_REGISTRARS).map { it.javaClass } +
             configuration.getList(CompilerPluginRegistrar.COMPILER_PLUGIN_REGISTRARS).map { it.javaClass })

@@ -619,7 +619,11 @@ Set `KTLSP_UI_CASES` to an absolute UI manifest path to run the existing native 
 accepted-text probe after corpus requests; `compiler-plugins-ui.json` checks Kotlin's generated
 getter property. See [the fixture instructions](dev/corpus/README.md) for pins and remaining checks.
 
-The saved Java-only observed-build probe uses the same corpus client and a fresh Gradle
+Code generation belongs to the external build. Editor analysis does not execute KAPT/KSP
+or replay Gradle generation tasks. Build the project to produce generated sources/classes;
+ktlsp reads those outputs and refreshes analysis when they change.
+
+The Java-only external-build ingestion probe uses the same corpus client and a fresh Gradle
 8.10.2/Lombok 1.18.32 fixture. Run from Git Bash with native Windows Neovim on `PATH`,
 JDK 17 selected by `JAVA_HOME`, cached dependencies and an accepted release server:
 
@@ -631,13 +635,20 @@ fixture="$fixture_parent/project"
 rtk proxy nvim -l dev/compiler_plugin_project.lua "$fixture" --java-only
 KTLSP_CORPUS_WAIT_INDEX=1 \
 KTLSP_CORPUS_READY_TIMEOUT_MS=180000 \
+KTLSP_JAVA_EXTERNAL_BUILD=1 \
 KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_observed_java.lua" \
 rtk proxy bash -o igncr dev/ktlsp-harness.sh corpus \
   --root "$fixture" --file "$PWD/dev/corpus/observed-java.json" \
   --release --no-build --bin "$accepted_ktlsp" --run-dir "$fixture_parent/run"
 ```
 
-The saved Java-only regression passes 99 checks in checkpoints 27 and 28, including
+With `KTLSP_JAVA_EXTERNAL_BUILD=1`, the probe invokes Gradle externally and uses actual
+file-watch events to check generated getters, String inference, configuration changes,
+source changes and restoration while preserving an unsaved consumer buffer. It never
+calls an LSP build command. This is distinct from the historical explicit-build-command
+mode below; its current validation status is recorded in `docs/fork-current.md`.
+
+The separate explicit-build-command regression passes 99 checks in checkpoints 27 and 28, including
 the compiler-path preparation change. It requires a real
 selected `:compileJava` execution before the first generated
 `getName` completion, then checks String inference, configuration changes, dirty-buffer
