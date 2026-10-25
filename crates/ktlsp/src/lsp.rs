@@ -1742,15 +1742,28 @@ async fn index_workspace(
     let ongoing = if progress {
         let token = ProgressToken::String("ktlsp/index".to_string());
         // Server-initiated progress requires creating the token first (per the LSP spec).
-        let _ = client.create_work_done_progress(token.clone()).await;
-        Some(
-            client
-                .progress(token, "ktlsp: indexing")
-                .with_message("scanning project")
-                .with_percentage(0)
-                .begin()
-                .await,
-        )
+        let create_start = Instant::now();
+        let created = client.create_work_done_progress(token.clone()).await;
+        crate::trace::span(
+            "workspace.progress_create",
+            "workspace",
+            create_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation, "ok": created.is_ok()}),
+        );
+        let begin_start = Instant::now();
+        let progress = client
+            .progress(token, "ktlsp: indexing")
+            .with_message("scanning project")
+            .with_percentage(0)
+            .begin()
+            .await;
+        crate::trace::span(
+            "workspace.progress_begin",
+            "workspace",
+            begin_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation}),
+        );
+        Some(progress)
     } else {
         None
     };
@@ -1758,11 +1771,18 @@ async fn index_workspace(
     let scan_start = Instant::now();
     if gradle {
         if !watches.lock().configuration_baselined {
+            let baseline_start = Instant::now();
             let configuration_root = root.clone();
             let contents =
                 tokio::task::spawn_blocking(move || configuration_contents(&configuration_root))
                     .await
                     .unwrap_or_default();
+            crate::trace::span(
+                "workspace.configuration_baseline",
+                "workspace",
+                baseline_start,
+                serde_json::json!({"root": root.to_string_lossy(), "generation": generation, "entries": contents.len()}),
+            );
             let mut state = watches.lock();
             for (key, content) in contents {
                 state.configuration_contents.entry(key).or_insert(content);
@@ -1827,18 +1847,30 @@ async fn index_workspace(
             ) {
                 anyhow::bail!("archive inputs superseded before model load");
             }
-            classpath::load_snapshot_cancellable(&load_root, force, Some(&model_cancelled))
+            let result =
+                classpath::load_snapshot_cancellable(&load_root, force, Some(&model_cancelled));
+            if let Ok(model) = &result {
+                input_watches
+                    .lock()
+                    .observed_archives
+                    .extend(model_archive_origins(model).into_keys());
+                // Keep import ownership until newly selected fingerprints are visible.
+                // Unread inputs remain conservative and coalesce with this owned import.
+                stage_archive_inputs(
+                    &load_root,
+                    Some(model),
+                    generation,
+                    &input_ws,
+                    &input_watches,
+                );
+            }
+            result
         })
         .await;
         {
             let guard = ws.lock();
             let mut watches = watches.lock();
             watches.finish_model_load(guard.is_current_generation(generation));
-            if let Ok(Ok(model)) = &result {
-                watches
-                    .observed_archives
-                    .extend(model_archive_origins(model).into_keys());
-            }
         }
         crate::trace::span(
             "workspace.model_load",
@@ -1870,17 +1902,9 @@ async fn index_workspace(
         let prepare_start = Instant::now();
         let known = ws.lock().source_stamps();
         let prepared_model = model.clone();
-        let input_root = root.clone();
         let input_ws = ws.clone();
-        let input_watches = watches.clone();
         let update = tokio::task::spawn_blocking(move || {
-            if !stage_archive_inputs(
-                &input_root,
-                Some(&prepared_model),
-                generation,
-                &input_ws,
-                &input_watches,
-            ) {
+            if !input_ws.lock().is_current_generation(generation) {
                 return None;
             }
             Some(crate::workspace::prepare_model_sources(
@@ -1894,7 +1918,7 @@ async fn index_workspace(
             "workspace",
             prepare_start,
             serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
-                "joined": update.is_ok()}),
+                "joined": update.is_ok(), "prepared": matches!(&update, Ok(Some(_)))}),
         );
         let Ok(Some(update)) = update else {
             if let Some(p) = ongoing {
@@ -1903,8 +1927,21 @@ async fn index_workspace(
             return;
         };
         let install_start = Instant::now();
+        crate::trace::span(
+            "workspace.source_install_begin",
+            "workspace",
+            install_start,
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation}),
+        );
         let count = {
+            let lock_start = Instant::now();
             let mut guard = ws.lock();
+            crate::trace::span(
+                "workspace.source_install_lock",
+                "workspace",
+                lock_start,
+                serde_json::json!({"root": root.to_string_lossy(), "generation": generation}),
+            );
             let count = guard.install_project_update(generation, model.clone(), update);
             if count.is_some() {
                 classpath::publish_snapshot(&root, model.clone());
@@ -2458,6 +2495,18 @@ fn stage_archive_inputs(
     ws: &Arc<Mutex<Workspace>>,
     watches: &Arc<Mutex<WatchState>>,
 ) -> bool {
+    stage_archive_inputs_with(root, model, generation, ws, watches, |_| {})
+}
+
+fn stage_archive_inputs_with(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    generation: u64,
+    ws: &Arc<Mutex<Workspace>>,
+    watches: &Arc<Mutex<WatchState>>,
+    mut fingerprinted: impl FnMut(&str),
+) -> bool {
+    let read_start = Instant::now();
     // A generation may suppress matching watches before publication, never rebase changed inputs.
     let (before, observed) = {
         let state = watches.lock();
@@ -2471,14 +2520,67 @@ fn stage_archive_inputs(
             state.observed_archives.clone(),
         )
     };
-    let mut inputs = project_archive_contents(root, model);
+    let observed_count = observed.len();
+    let mut observed_preexisting = 0_usize;
+    let mut current = true;
+    let mut accept = |key: &str, content: [u8; 32]| {
+        if !current {
+            return;
+        }
+        let mut guard = ws.lock();
+        if !guard.is_current_generation(generation) {
+            current = false;
+            return;
+        }
+        let mut state = watches.lock();
+        let inputs = state
+            .archive_inputs
+            .get_or_insert_with(|| (generation, HashMap::new()));
+        if inputs.0 != generation {
+            *inputs = (generation, HashMap::new());
+        }
+        if inputs.1.get(key).is_some_and(|before| before != &content) {
+            if let Some(origin) = model.and_then(|model| model.artifact_origin(Path::new(key))) {
+                guard.retire_dependency_origin(origin);
+            }
+            state.pending_model_jar = true;
+            current = false;
+        } else {
+            // Publish each first fingerprint before reading the remaining archives.
+            // A matching client notification can now prove its content, while a
+            // concurrent stage can never replace this generation's earlier bytes.
+            inputs.1.entry(key.to_string()).or_insert(content);
+        }
+        drop(state);
+        drop(guard);
+        fingerprinted(key);
+    };
+    let mut inputs = project_archive_contents_with(root, model, &mut accept);
     for key in observed {
+        observed_preexisting += usize::from(inputs.contains_key(&key));
         if let Some(content) = configuration_content(Path::new(&key)) {
+            accept(&key, content);
             inputs.insert(key, content);
         }
     }
+    drop(accept);
+    crate::trace::span(
+        "workspace.archive_stage_read",
+        "workspace",
+        read_start,
+        serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+            "model": model.is_some(), "before": before.len(), "observed": observed_count,
+            "observed_preexisting": observed_preexisting, "accepted": inputs.len()}),
+    );
+    let lock_start = Instant::now();
     let mut guard = ws.lock();
-    if !guard.is_current_generation(generation) {
+    crate::trace::span(
+        "workspace.archive_stage_lock",
+        "workspace",
+        lock_start,
+        serde_json::json!({"root": root.to_string_lossy(), "generation": generation}),
+    );
+    if !current || !guard.is_current_generation(generation) {
         return false;
     }
     let mut state = watches.lock();
@@ -2497,7 +2599,13 @@ fn stage_archive_inputs(
         state.pending_model_jar = true;
         return false;
     }
-    state.archive_inputs = Some((generation, inputs));
+    if state
+        .archive_inputs
+        .as_ref()
+        .is_none_or(|(input_generation, _)| *input_generation != generation)
+    {
+        state.archive_inputs = Some((generation, inputs));
+    }
     true
 }
 
@@ -2505,24 +2613,54 @@ fn project_archive_contents(
     root: &Path,
     model: Option<&classpath::ProjectSnapshot>,
 ) -> HashMap<String, [u8; 32]> {
+    project_archive_contents_with(root, model, |_, _| {})
+}
+
+fn project_archive_contents_with(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    mut fingerprinted: impl FnMut(&str, [u8; 32]),
+) -> HashMap<String, [u8; 32]> {
+    let discovery_start = Instant::now();
     let mut keys: std::collections::BTreeSet<_> = model
         .map(model_archive_origins)
         .unwrap_or_default()
         .into_keys()
         .collect();
+    let model_count = keys.len();
+    let tracked = crate::workspace::git_tracked_project_files(root, &["*.jar"]).unwrap_or_default();
+    let tracked_count = tracked.len();
     keys.extend(
-        crate::workspace::git_tracked_project_files(root, &["*.jar"])
-            .unwrap_or_default()
+        tracked
             .into_iter()
             .map(|path| crate::paths::file_key(&path)),
     );
-    keys.into_iter()
+    crate::trace::span(
+        "workspace.archive_discovery",
+        "workspace",
+        discovery_start,
+        serde_json::json!({"root": root.to_string_lossy(), "model": model_count,
+            "tracked": tracked_count, "unique": keys.len()}),
+    );
+    let hash_start = Instant::now();
+    let mut attempted = 0_usize;
+    let contents: HashMap<_, _> = keys
+        .into_iter()
         .filter(|key| !is_project_configuration(Path::new(key)))
         .filter_map(|key| {
+            attempted += 1;
             let content = configuration_content(Path::new(&key))?;
+            fingerprinted(&key, content);
             Some((key, content))
         })
-        .collect()
+        .collect();
+    crate::trace::span(
+        "workspace.archive_hash",
+        "workspace",
+        hash_start,
+        serde_json::json!({"root": root.to_string_lossy(), "attempted": attempted, "accepted": contents.len()}),
+    );
+    contents
 }
 
 fn unchanged_file_content(
@@ -2553,6 +2691,7 @@ async fn unchanged_file_contents(contents: HashMap<String, [u8; 32]>) -> HashMap
 }
 
 fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
+    let discovery_start = Instant::now();
     let paths = crate::workspace::git_project_files(
         root,
         &[
@@ -2573,11 +2712,29 @@ fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
             .map(|entry| entry.into_path())
             .collect()
     });
-    paths
+    crate::trace::span(
+        "workspace.configuration_discovery",
+        "workspace",
+        discovery_start,
+        serde_json::json!({"root": root.to_string_lossy(), "candidates": paths.len()}),
+    );
+    let hash_start = Instant::now();
+    let mut attempted = 0_usize;
+    let contents: HashMap<_, _> = paths
         .into_iter()
         .filter(|path| is_project_configuration(path))
-        .filter_map(|path| Some((crate::paths::file_key(&path), configuration_content(&path)?)))
-        .collect()
+        .filter_map(|path| {
+            attempted += 1;
+            Some((crate::paths::file_key(&path), configuration_content(&path)?))
+        })
+        .collect();
+    crate::trace::span(
+        "workspace.configuration_hash",
+        "workspace",
+        hash_start,
+        serde_json::json!({"root": root.to_string_lossy(), "attempted": attempted, "accepted": contents.len()}),
+    );
+    contents
 }
 
 /// `Some(force)` for relevant events; source-only saves reuse the published classpath.
@@ -8991,6 +9148,138 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 matches!(watcher.glob_pattern, GlobPattern::Relative(_)) == relative
             }));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn newly_selected_archive_fingerprints_precede_whole_stage_publication() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_archive_publication_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("newly-selected.jar");
+        let second = root.join("concurrently-selected.jar");
+        std::fs::write(&first, b"first bytes").unwrap();
+        std::fs::write(&second, b"other bytes").unwrap();
+        let first_key = crate::paths::file_key(&first);
+        let second_key = crate::paths::file_key(&second);
+        let model = |keys: &[&str]| {
+            classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\n{}END\t:app\n",
+            crate::paths::file_key(&root),
+            keys.iter().map(|key| format!("SCP\tmain\t{key}\nARTIFACT\tmain\t{key}\tPROJECT\t:build-logic\t:dependency\n")).collect::<String>()
+        )))
+        };
+        let initial_model = model(&[&first_key]);
+        let expanded_model = model(&[&first_key, &second_key]);
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        *backend.gradle_project.lock() = true;
+        backend.refresh.lock().running = true;
+        backend.watches.lock().model_loading = true;
+        let generation = backend.ws.lock().analysis_generation();
+        let initial_requested = backend.refresh.lock().requested;
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let stage_root = root.clone();
+        let stage_ws = backend.ws.clone();
+        let stage_watches = backend.watches.clone();
+        let first_stage = tokio::task::spawn_blocking(move || {
+            let mut read_tx = Some(read_tx);
+            stage_archive_inputs_with(
+                &stage_root,
+                Some(&initial_model),
+                generation,
+                &stage_ws,
+                &stage_watches,
+                |_| {
+                    if let Some(tx) = read_tx.take() {
+                        tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
+        });
+        read_rx.await.unwrap();
+        let event = || DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(
+                Uri::from_file_path(&first).unwrap(),
+                FileChangeType::CHANGED,
+            )],
+        };
+        backend.did_change_watched_files(event()).await;
+        // Always release the owned worker before assertions, including a RED run.
+        let unchanged_generation = backend.ws.lock().analysis_generation();
+        let unchanged_requested = backend.refresh.lock().requested;
+        let unchanged_pending = backend.watches.lock().pending_model_jar;
+        let concurrent_stage = stage_archive_inputs(
+            &root,
+            Some(&expanded_model),
+            generation,
+            &backend.ws,
+            &backend.watches,
+        );
+        resume_tx.send(()).unwrap();
+        let first_accepted = first_stage.await.unwrap();
+        assert_eq!(
+            unchanged_generation, generation,
+            "a fingerprinted new selection must not supersede its generation"
+        );
+        assert_eq!(unchanged_requested, initial_requested);
+        assert!(!unchanged_pending);
+        assert!(concurrent_stage && first_accepted);
+        let accepted = backend.watches.lock().archive_inputs.clone().unwrap();
+        assert_eq!(
+            accepted.1.get(&second_key),
+            configuration_content(&second).as_ref(),
+            "a late stage must retain another stage's first fingerprint"
+        );
+        let modified = std::fs::metadata(&first).unwrap().modified().unwrap();
+        std::fs::write(&first, b"newer bytes").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(!stage_archive_inputs(
+            &root,
+            Some(&expanded_model),
+            generation,
+            &backend.ws,
+            &backend.watches
+        ));
+        assert_eq!(
+            backend.watches.lock().archive_inputs.as_ref(),
+            Some(&accepted),
+            "same-generation writers must never rebase a replacement"
+        );
+        backend.watches.lock().pending_model_jar = false;
+        backend.did_change_watched_files(event()).await;
+        let next = backend.ws.lock().analysis_generation();
+        assert_eq!(
+            next,
+            generation + 1,
+            "real same-metadata replacement must still refresh"
+        );
+        assert!(backend.refresh.lock().force);
+        assert!(backend.watches.lock().pending_model_jar);
+        assert!(stage_archive_inputs(
+            &root,
+            Some(&expanded_model),
+            next,
+            &backend.ws,
+            &backend.watches
+        ));
+        assert_eq!(
+            backend.watches.lock().archive_content(&first_key, next),
+            configuration_content(&first).as_ref()
+        );
+        assert_ne!(
+            backend.watches.lock().archive_content(&first_key, next),
+            accepted.1.get(&first_key)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
