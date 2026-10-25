@@ -238,6 +238,25 @@ error ranges, valid Object/generic/varargs calls, delivery identity and restorat
 The selected Java source proof preserves unknown compiler-plugin and hierarchy cases.
 Its first cold diagnostic cost remains recorded as a performance gap in the fork
 acceptance log.
+The `corpus` route also checks the full Java body diagnostic queue with only
+`PlainUse.java` open. Four first-response RPCs cover ordinary completion/goto,
+an unsaved missing-package ERROR, and a separately certified clean repair. The
+diagnostic probes require current v3/v4 wire hashes and result identities, plus
+the matching raw Javac receipt and compiler input digests. Kotlin buffers stay
+closed; an empty push does not prove the repair. Evidence is retained in
+`artifacts/java-body-diagnostics.json` and `java-body-*-javac-receipt.json`.
+
+Prepare a fresh disposable fixture with the existing generator (its first run
+needs the Gradle/Maven prerequisites), then use that generated project as `--root`:
+
+```sh
+rtk proxy bash dev/ktlsp-harness.sh library --release --no-build --bin /path/to/immutable/ktlsp --run-dir /new/temp/java-body-fixture
+KTLSP_CORPUS_WAIT_INDEX=1 KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_corpus_java_body_probes.lua" rtk proxy bash dev/ktlsp-harness.sh corpus --root /new/temp/java-body-fixture/projects/library --file dev/corpus/java-body.json --release --no-build --bin /path/to/immutable/ktlsp --run-dir /new/temp/java-body-check
+```
+
+On Windows use Git Bash with `-o igncr`. The fixture preparation runs in its
+own editor process; the focused corpus command opens only the Java caller.
+
 The `semantic` harness also checks declared multi-parameter callback types: Int
 indices and generic elements retain different members, typed controls agree, and
 first completion responses and exact goto use the same shared inference.

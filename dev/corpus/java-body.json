@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "project_id": "java-body-diagnostics",
+  "build_tool": "gradle",
+  "probes": [
+    {
+      "id": "ordinary-Java-identity-control",
+      "source": "src/main/java/app/PlainUse.java",
+      "source_sha256": "b32c6e8b4d1525a75ee125294a11f221100c687e5c89d347fe7d11753207c310",
+      "anchor": "return value.identity(3);",
+      "token": "identity",
+      "completion_prefix": "iden",
+      "target": "src/main/java/app/PlainOwner.java",
+      "target_sha256": "2f8dbc8761babd3c72c39b3b89f1e2e0368778f28a2fe5b5dcd46a349bb3528e",
+      "target_anchor": "public <T> T identity(T value) { return value; }",
+      "target_token": "identity"
+    }
+  ],
+  "additional_request_count": 2
+}
