@@ -601,6 +601,7 @@ pub(super) fn run(
         return Ok(Err(KotlinDiagnosticOutcome::Verified {
             diagnostics,
             clean: false,
+            java_clean: None,
         }));
     }
     anyhow::ensure!(

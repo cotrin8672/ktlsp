@@ -12,7 +12,23 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification on releases42 through44
+## Current verification on releases42 through45
+
+Release45 passes **1860 passed, 0 failed, 14 ignored** and builds successfully.
+All611 input guards remain unchanged and both build stages reach EOF/live0;
+each records one exact-owned MSVC helper cleanup. The immutable binary is
+23,084,032 bytes, SHA256
+`430c11893e76339eb79182e0e9bb3df2f7139512aaee8c73b4a37bca44a26256`
+(`native-integrated120-45/main-ready.json`). Focused checks cover Java-only
+buffer scheduling, separate current Java-body receipts, rejection of processor
+fallback as dependency-closure authority, and scheduling before an optional
+dependency-source query finishes. The actual Java-only editor check also passes:
+four first-response RPCs/eight semantic checks, located Javac error at wirev3,
+then a separate clean Java-body receipt at wirev4. Its raw body receipt SHA matches
+the accepted certificate exactly, with stable18 guards and EOF/live0/forced0
+(`java-body155-release45/acceptance.json`). This is one controlled K2 mixed module;
+it does not establish K1 or external-producer closure. The actual Gradle counter
+check remains in progress.
 
 Release44 also passes **1857 passed, 0 failed, 14 ignored** and builds successfully.
 Its610 input guards remain unchanged, both build stages reach EOF/live0, and each
@@ -20,8 +36,11 @@ records only one exact-owned MSVC helper cleanup. The immutable binary is
 23,056,896 bytes, SHA256
 `43a959df9bb9a1b3007e8991db192f017b81aaeef2dcc55be3916b65645456b8`
 (`native-integrated120-44/main-ready.json`). Modeled output notifications now use
-the existing owned-import coalescing path. The actual Gradle counter certificate
-must still be verified; unit and build success do not establish that result.
+the existing owned-import coalescing path. The actual selective Gradle counter
+still produces no current certificate within its unchanged300-second observation.
+Output notifications settle, but an optional dependency-source query delays the
+selected compiler queue (`gradle-counter155-selective44/selective-counter-adjudication.json`).
+Release45 moves that queue earlier; its actual result is still unverified.
 
 Release43 passes the workspace suite: **1857 passed, 0 failed, 14 ignored**.
 The release build succeeds with609 unchanged input guards. Its immutable binary is
@@ -40,7 +59,8 @@ Release42 also passes1856 tests and builds with zero forced cleanup. Its SHA256 
 | Declared callback parameter types | Release42: unchanged indexed10, ordinary top-level8 and member10 RPCs all match; portable semantic harness181 PASS/0 FAIL including8 new first-response completion/exact-goto checks. `callback155-42-replay/receipt.json`. | Uses declared parameter positions and generic receiver bindings. Ambiguous/unavailable declarations remain Unknown; this is not language-wide inference coverage. |
 | Shared edits and scoped compiler diagnostics | Release42: Moshi16, Spring16 and Retrofit22 match, including five current-version/source-SHA compiler passes, exact Retrofit invalid range and independently applied rename edits. `shared-diagnostics155-release42/final.json`, `independent-audit.json` in the same directory. | Certificates concern the observed documents; producer_closure_complete remains false. |
 | OkHttp shared edits | Release42: original16/16 match, stable inputs and clean shutdown. `okhttp-shared155-release42/acceptance.json`. | Java version4/wire-SHA delivery and a supported recipe are proven; the empty push does not certify a compiler-complete error absence. |
-| Gradle Java6-valid shared edits | Release42:14 matched, 0 mismatched,3 unmeasured; counter v4, invalid v8 and fixed v9 never reached a certified diagnostic RPC. `gradle-shared155-valid42-summary.json`. | Actual model imports repeatedly cancel amid modeled output-directory notifications. Coalescing during an owned import is being fixed; do not extend observation windows or count missing certificates as success. The original source6-invalid default-method fixture remains separate. |
+| Gradle Java6-valid shared edits | Release42:14 matched, 0 mismatched,3 unmeasured; counter v4, invalid v8 and fixed v9 never reached a certified diagnostic RPC. `gradle-shared155-valid42-summary.json`. | Release44 settles the modeled-output notifications, but the optional source query still delays compiler scheduling. Release45's earlier queue is under actual selective verification, before repeating the full17. The source6-invalid default-method fixture remains separate; observation windows and certificate requirements are unchanged. |
+| Current Java-body clean authority | Release45 focused tests and actual Java-only editor check pass: errorv3 then repairedv4, exact current wire SHA/resultId, actual raw Javac error/success receipts, and matching clean body-receipt SHA. ROOT independently rehashes all eight referenced artifacts. `java-body155-release45/acceptance.json`. | One controlled K2 module with no producer DAG. Port the tiny private probe through the existing corpus route after the concurrent run closes. OkHttp's three Kotlin producers still require verified current output closure; no header or old binary can certify that Java result. |
 | Java-only producer, native failure route | Actual native44 invalid-only run passes with a located current Java error and clean:false. Earlier native42's valid producer/consumer phase passed, but its full run failed; native43's location failure is retained. | Current full editor canonical workflow above remains unverified. The fixed enum-name and Windows-path boundaries do not alone establish the full workflow. |
 | Source-library coverage | The same Gradle42 traces resolve all six repaired POM origins without failure; aggregate failed1/missingSources29, NeKoHTML binary retention remains explicit. `gradle155-source-coverage42.json`. | Retrofit still reports six failed source origins and9 missing sources; Spring reports six and16. Binary facts do not imply recovered original-source coverage. |
 | External shared-semantic extension | Current42 host and independently rebuilt child pass legacy26 plus optional46: actual model1->2/classpath3->4, stale rejection, fresh publication, crash/restart and applied rename. `project-facts143-42-final.json`; consumer4 tests/build in `external42-ready/ready.json`. | workspaceUri, source-only raw ABI and full-runtime ABI coverage remain Unknown. Full MC policy stays in mc-dev. |
@@ -51,6 +71,9 @@ Their completion percentage is not the goal's implementation percentage or a
 grammar/whole-project coverage estimate. Plugin/build lifecycle results below retain
 their actual older versions; they have not all been rerun on43. Warm latency
 distributions also remain the earlier measurements.
+The earlier57/88 (about65%) statement described execution of this representative
+checklist at that moment, not overall goal progress. These are selected operation
+cases, not an exhaustive final validation of either language.
 
 ## Previous integrated baseline39
 

@@ -1585,7 +1585,7 @@ struct SdkProducerClaims {
     complete: bool,
 }
 
-fn sdk_producer_roots(task: &CompilerTask) -> Option<(Vec<String>, bool)> {
+pub(crate) fn sdk_producer_roots(task: &CompilerTask) -> Option<(Vec<String>, bool)> {
     let claims: SdkProducerClaims =
         serde_json::from_value(task.options.get("sdkProducerClaims")?.clone()).ok()?;
     if claims.adapter != "gradle-producing-source-trees-v1"

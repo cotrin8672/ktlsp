@@ -3722,6 +3722,7 @@ impl KotlinDependencyCompilation {
             scope: self.scope.clone(),
             task: primary.clone(),
             java_task: Some(java.clone()),
+            java_body_eligible: false,
             java_dependencies: Vec::new(),
             java_editor_sources: Default::default(),
             processor_plan: None,
@@ -3747,6 +3748,8 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub task: crate::classpath::CompilerTask,
     /// Optional plain Java task on this same model/source-set snapshot; only positive imports are admitted.
     pub java_task: Option<crate::classpath::CompilerTask>,
+    /// Admission only: a clean receipt still requires an actual verified Javac body invocation.
+    pub java_body_eligible: bool,
     /// Existing source-set facts for participating plain Java dependencies; no binary API authority.
     pub java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     /// New owned wire sources admitted by the current stock task source policy.
@@ -3899,6 +3902,7 @@ struct KotlinEnvironmentKey {
     extra_inputs: Vec<PathBuf>,
     gradle_fingerprint_inputs: Vec<PathBuf>,
     java_task: Option<crate::classpath::CompilerTask>,
+    java_body_eligible: bool,
     java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     java_helper_sha256: Option<String>,
     java_editor_sources: std::collections::BTreeSet<String>,
@@ -3951,6 +3955,7 @@ impl KotlinEnvironmentKey {
             extra_inputs,
             gradle_fingerprint_inputs,
             java_task: java_available.then(|| request.java_task.clone()).flatten(),
+            java_body_eligible: request.java_body_eligible,
             java_dependencies: if java_available {
                 request.java_dependencies.clone()
             } else {
@@ -4721,12 +4726,70 @@ fn kotlin_path_key(path: &str) -> String {
     }
 }
 
+/// Successful full Javac bodies against current normal compiler output, never signature headers.
+#[derive(Clone)]
+pub(crate) struct JavaCleanReceipt {
+    scope: crate::project_model::ProjectScope,
+    task: String,
+    compiler_version: String,
+    compiler_inputs_sha256: String,
+    input_spec_sha256: String,
+    body_receipt_sha256: String,
+    sources: std::collections::BTreeMap<String, String>,
+    source_epoch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    input_epoch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl JavaCleanReceipt {
+    pub(crate) fn matches_source(
+        &self,
+        request: &KotlinDiagnosticRequest,
+        inputs: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        source: &KotlinSourceOverlay,
+    ) -> bool {
+        source.key.ends_with(".java")
+            && request.java_body_eligible
+            && self.scope == request.scope
+            && request.java_task.as_ref().is_some_and(|task| task.task == self.task)
+            && std::sync::Arc::ptr_eq(&self.source_epoch, &request.invalid)
+            && std::sync::Arc::ptr_eq(&self.input_epoch, inputs)
+            && request.check_live().is_ok()
+            && !inputs.load(std::sync::atomic::Ordering::Acquire)
+            && self.sources.get(&source.key).is_some_and(|digest|
+                *digest == source.text_sha256.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+    }
+
+    pub(crate) fn trace(&self) -> serde_json::Value {
+        serde_json::json!({"basis":"javac-body-normal-kotlin-output", "task":self.task,
+            "compiler_version":self.compiler_version,"compiler_inputs_sha256":self.compiler_inputs_sha256,
+            "input_spec_sha256":self.input_spec_sha256,"body_receipt_sha256":self.body_receipt_sha256,
+            "source_count":self.sources.len()})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_test_fixture(
+        request: &KotlinDiagnosticRequest,
+        inputs: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        // Storage lifecycle only; no production path can mint a compiler receipt this way.
+        Self { scope:request.scope.clone(),task:request.java_task.as_ref().unwrap().task.clone(),
+            compiler_version:"storage-fixture".into(),compiler_inputs_sha256:"0".repeat(64),
+            input_spec_sha256:"1".repeat(64),body_receipt_sha256:"2".repeat(64),
+            sources:request.overlays.iter().filter(|source| source.key.ends_with(".java"))
+                .map(|source| (source.key.clone(), source.text_sha256.iter()
+                    .map(|byte| format!("{byte:02x}")).collect())).collect(),
+            source_epoch:request.invalid.clone(),input_epoch:inputs.clone() }
+    }
+}
+
 pub(crate) enum KotlinDiagnosticOutcome {
     /// Exit 0 proves this invocation completed; exit 1 admits only the errors it actually reported.
     Verified {
         diagnostics: Vec<CompileDiagnostic>,
         /// The canonical Kotlin invocation only; appended Java positives never grant Java clean authority.
         clean: bool,
+        /// Separately verified full Java compilation; absent for headers, failures or unknown producers.
+        java_clean: Option<JavaCleanReceipt>,
     },
     Unverified(String),
 }
@@ -4789,6 +4852,7 @@ fn selected_kotlin_output(
     KotlinDiagnosticOutcome::Verified {
         diagnostics,
         clean: exit == Some(0),
+        java_clean: None,
     }
 }
 
@@ -4936,7 +5000,7 @@ fn compile_dependency_overlay(
     let started = Instant::now();
     let (outcome, owner) = run_owned_kotlin_overlay(&producer, &producer_environment, None, true)?;
     anyhow::ensure!(
-        matches!(outcome, KotlinDiagnosticOutcome::Verified { clean: true, ref diagnostics } if diagnostics.iter().all(|diagnostic| diagnostic.severity != Severity::Error)),
+        matches!(outcome, KotlinDiagnosticOutcome::Verified { clean: true, ref diagnostics, .. } if diagnostics.iter().all(|diagnostic| diagnostic.severity != Severity::Error)),
         "kotlin-producer-compilation-not-clean"
     );
     let outputs = vec![
@@ -5078,7 +5142,7 @@ fn run_owned_kotlin_overlay(
             out_complete && err_complete,
             &overlay.paths,
         );
-        if let KotlinDiagnosticOutcome::Verified { diagnostics, clean } = &mut outcome {
+        if let KotlinDiagnosticOutcome::Verified { diagnostics, clean, java_clean } = &mut outcome {
             if request.java_task.is_some() {
                 let started = Instant::now();
                 let run_java = if require_java_clean {
@@ -5106,10 +5170,11 @@ fn run_owned_kotlin_overlay(
                             started,
                             serde_json::json!({ "reason": error.to_string(), "generation": request.generation }),
                         );
-                        Vec::new()
+                        java_diagnostics::JavaDiagnostics { positives: Vec::new(), clean: None }
                     }
                 };
-                java_diagnostics::append_positives(diagnostics, java);
+                *java_clean = java.clean;
+                java_diagnostics::append_positives(diagnostics, java.positives);
             }
         }
         request.check_live()?;
@@ -5179,6 +5244,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         sources: task.source_files.clone(),
         task,
         java_task: None,
+        java_body_eligible: false,
         java_dependencies: Vec::new(),
         java_editor_sources: Default::default(),
         processor_plan: None,
@@ -6583,7 +6649,7 @@ mod kotlin_editor_compile_tests {
         let error = "e: file:///C:/private/%E6%97%A5%E6%9C%AC%20space/Editor.kt:2:20 Unresolved reference 'oldApi'.\n";
         let output = format!("{version}{error}");
         match selected_kotlin_output(&output, "2.4.0", Some(1), false, true, &paths) {
-            KotlinDiagnosticOutcome::Verified { diagnostics, clean } => {
+            KotlinDiagnosticOutcome::Verified { diagnostics, clean, .. } => {
                 assert!(!clean);
                 assert_eq!(diagnostics.len(), 1);
                 assert_eq!(

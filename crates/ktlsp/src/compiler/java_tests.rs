@@ -835,6 +835,7 @@ fn workspace(
 
 fn positive(java: &str) -> KotlinDiagnosticOutcome {
     KotlinDiagnosticOutcome::Verified {
+        java_clean: None,
         clean: true,
         diagnostics: vec![CompileDiagnostic {
             path: java.into(),
@@ -877,6 +878,7 @@ fn java_positive_reports_reuse_same_generation_and_never_get_kotlin_clean_author
     let changed = ws.finish_kotlin_diagnostics(
         &newer,
         KotlinDiagnosticOutcome::Verified {
+            java_clean: None,
             clean: true,
             diagnostics: Vec::new(),
         },
@@ -1415,6 +1417,7 @@ fn unavailable_foreign_producer_retains_the_canonical_kotlin_worker_and_no_java_
     let changed = ws.finish_kotlin_diagnostics(
         &pending,
         KotlinDiagnosticOutcome::Verified {
+            java_clean: None,
             clean: false,
             diagnostics: vec![diagnostic],
         },
@@ -3409,6 +3412,49 @@ fn processor_current_plan_captures_unsaved_nonsemantic_processor_and_cancels_on_
             "unproved KAPT worker must remain unavailable: {mutation}"
         );
     }
+}
+
+#[test]
+fn processor_fallback_does_not_certify_unclosed_regular_kotlin_dependency() {
+    let (owner, mut ws, target, _) = processor_workspace_control(false);
+    let initial = ws.begin_kotlin_diagnostics(&target).unwrap();
+    let mut modules = ws.project_snapshot().unwrap().modules.clone();
+    let producer_dir = owner.directory.join("regular-kotlin");
+    let artifact = producer_dir.join("build/classes/kotlin/main");
+    for task in &mut modules[0].source_sets[0].compiler_tasks {
+        if matches!(task.language, crate::classpath::CompilerLanguage::Kotlin | crate::classpath::CompilerLanguage::Java) {
+            task.classpath.push(artifact.clone());
+        }
+    }
+    let mut producer = initial.task.clone();
+    producer.task = ":regular-kotlin:compileKotlin".into();
+    producer.source_files = vec![producer_dir.join("src/main/kotlin/Api.kt")];
+    producer.classpath.clear();
+    producer.output_roots = vec![artifact.clone()];
+    producer.declared_output_roots = vec![artifact.clone()];
+    modules.push(ModuleClasspath {
+        module: ":regular-kotlin".into(),
+        project_dir: producer_dir.clone(),
+        build: modules[0].build.clone(),
+        entries: Vec::new(),
+        unresolved: Vec::new(),
+        source_sets: vec![SourceSetClasspath {
+            name: "main".into(),
+            source_roots: vec![producer_dir.join("src/main/kotlin")],
+            output_roots: vec![artifact.clone()],
+            provided_artifacts: vec![artifact],
+            kotlin_compile_task: Some(producer.task.clone()),
+            compiler_tasks: vec![producer],
+            ..Default::default()
+        }],
+    });
+    ws.set_project_model(Arc::new(ProjectSnapshot::new(modules)));
+    let request = ws.begin_kotlin_diagnostics(&target).unwrap();
+    assert!(request.java_task.is_some(), "keep the existing positive diagnostic execution path");
+    assert!(request.processor_plan.is_some(), "processor execution is still supported");
+    assert!(request.java_dependencies.is_empty(), "this is the processor fallback, not validated closure");
+    assert!(!request.java_body_eligible,
+        "processor bootstrap coverage cannot certify ordinary Kotlin dependency ABIs");
 }
 
 #[test]

@@ -473,7 +473,13 @@ fn owned_membership_inputs(request: &KotlinDiagnosticRequest) -> anyhow::Result<
         !request.source_roots.is_empty(),
         "java-owned-source-roots-unknown"
     );
-    for root in &request.source_roots {
+    let mut roots = request.source_roots.clone();
+    if let Some((producer_roots, true)) = crate::classpath::sdk_producer_roots(&request.task) {
+        roots.extend(producer_roots.into_iter().map(PathBuf::from));
+    }
+    roots.sort();
+    roots.dedup();
+    for root in &roots {
         path_text(root)?;
         anyhow::ensure!(
             !path_under(&header_key(&request.project_dir), &header_key(root)),
@@ -489,7 +495,7 @@ fn owned_membership_inputs(request: &KotlinDiagnosticRequest) -> anyhow::Result<
             "java-owned-source-root-overlaps-classes"
         );
     }
-    Ok(request.source_roots.clone())
+    Ok(roots)
 }
 
 fn owned_source_membership(
@@ -1595,7 +1601,6 @@ fn complete_output_inventory(root: &Path) -> anyhow::Result<BTreeMap<String, (u6
             "java-k2-output-duplicate"
         );
     }
-    anyhow::ensure!(!files.is_empty(), "java-k2-canonical-output-empty");
     Ok(files)
 }
 
@@ -2334,6 +2339,11 @@ fn platform_method_diagnostics(
     Ok(result)
 }
 
+pub(super) struct JavaDiagnostics {
+    pub(super) positives: Vec<CompileDiagnostic>,
+    pub(super) clean: Option<JavaCleanReceipt>,
+}
+
 pub(super) fn run(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
@@ -2341,7 +2351,7 @@ pub(super) fn run(
     canonical: &[CompileDiagnostic],
     clean: bool,
     generated: Option<&processor::GeneratedSources>,
-) -> anyhow::Result<Vec<CompileDiagnostic>> {
+) -> anyhow::Result<JavaDiagnostics> {
     run_checked(
         request,
         environment,
@@ -2360,7 +2370,7 @@ pub(super) fn run_for_producer(
     canonical: &[CompileDiagnostic],
     clean: bool,
     generated: Option<&processor::GeneratedSources>,
-) -> anyhow::Result<Vec<CompileDiagnostic>> {
+) -> anyhow::Result<JavaDiagnostics> {
     run_checked(
         request,
         environment,
@@ -2380,20 +2390,31 @@ fn run_checked(
     clean: bool,
     generated: Option<&processor::GeneratedSources>,
     require_clean: bool,
-) -> anyhow::Result<Vec<CompileDiagnostic>> {
+) -> anyhow::Result<JavaDiagnostics> {
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
     let complete_k2 = k2_normal(request);
+    let kotlin_inventory_known = request.task.complete
+        && crate::classpath::sdk_producer_roots(&request.task).is_some_and(|(_, complete)| complete);
     anyhow::ensure!(
         !complete_k2 || (clean && canonical.iter().all(|d| d.severity != Severity::Error)),
         "java-k2-normal-compilation-required"
     );
     // run_kotlin_editor_compile creates this fresh output and calls us only after owned/EOF
     // selected_kotlin_output; clean=true means exit0 with no reported canonical errors.
-    let canonical_outputs = if complete_k2 {
-        Some(complete_output_inventory(
-            &overlay.directory.join("classes"),
-        )?)
+    let canonical_outputs = if clean
+        && canonical
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Severity::Error)
+    {
+        let outputs = complete_output_inventory(&overlay.directory.join("classes"))?;
+        if !outputs.is_empty()
+                || (kotlin_inventory_known && !overlay.sources.iter().any(|path| path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("kt"))) {
+            Some(outputs)
+        } else { None }
     } else {
         None
     };
@@ -2431,7 +2452,7 @@ fn run_checked(
         )?;
         (
             serde_json::json!({
-                "component": "canonical-k2-complete-output",
+                "component": if complete_k2 { "canonical-k2-complete-output" } else { "canonical-k1-complete-output" },
                 "compilerVersion": environment.key.recipe.compiler_version,
                 "sourceSha256": expected,
                 "outputInventory": before,
@@ -2510,6 +2531,7 @@ fn run_checked(
         let KotlinDiagnosticOutcome::Verified {
             diagnostics,
             clean: header_clean,
+            ..
         } = selected_kotlin_output(
             &text,
             &environment.key.recipe.compiler_version,
@@ -2633,7 +2655,7 @@ fn run_checked(
                 "dependent_source_domains": tools.dependency_domains,
                 "producer_closure": false, "whole_api_authority": false,
                 "k2_normal_output_matches_canonical": complete_k2.then_some(true),
-                "canonical_output_reused": complete_k2,
+                "canonical_output_reused": canonical_outputs.is_some(),
             }),
         );
     }
@@ -2671,21 +2693,56 @@ fn run_checked(
     tools.check_live()?;
     request.check_live()?;
     environment.check_live()?;
+    let body_clean = exit == 0
+        && clean
+        && canonical
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Severity::Error)
+        && value.get("compileCompleted").and_then(Value::as_bool) == Some(true)
+        && value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("failure") == Some(&Value::Null);
     if require_clean {
-        anyhow::ensure!(
-            exit == 0
-                && clean
-                && canonical
-                    .iter()
-                    .all(|diagnostic| diagnostic.severity != Severity::Error)
-                && value.get("compileCompleted").and_then(Value::as_bool) == Some(true)
-                && value.get("success").and_then(Value::as_bool) == Some(true)
-                && value.get("failure") == Some(&Value::Null),
-            "java-producer-compilation-not-clean"
-        );
+        anyhow::ensure!(body_clean, "java-producer-compilation-not-clean");
     }
+    let clean_receipt = if body_clean
+        && canonical_outputs.is_some()
+        && kotlin_inventory_known
+        && request.java_body_eligible
+        && request.java_dependencies.is_empty()
+    {
+        let sources = java_sources
+            .iter()
+            .map(|(private, digest)| {
+                let original = overlay
+                    .paths
+                    .get(&kotlin_path_key(&crate::paths::file_key(private)))
+                    .ok_or_else(|| anyhow::anyhow!("java-body-source-unmapped"))?;
+                Ok((original.clone(), digest.clone()))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        anyhow::ensure!(
+            !sources.is_empty() && sources.len() == java_sources.len(),
+            "java-body-source-coverage-unavailable"
+        );
+        Some(JavaCleanReceipt {
+            scope: request.scope.clone(),
+            task: task.task.clone(),
+            compiler_version: recipe.java_runtime_version.clone(),
+            compiler_inputs_sha256: tools.input_sha256.clone(),
+            input_spec_sha256: value_string(&value, "inputSpecSha256")?.to_owned(),
+            body_receipt_sha256: sha(&serde_json::to_vec(&value)?),
+            sources,
+            source_epoch: request.invalid.clone(),
+            input_epoch: environment.invalid.clone(),
+        })
+    } else {
+        None
+    };
     tracing::debug!(identity = %tools.input_sha256, errors = result.len(), "selected Java positive diagnostics");
-    Ok(result)
+    Ok(JavaDiagnostics {
+        positives: result,
+        clean: clean_receipt,
+    })
 }
 
 #[cfg(test)]

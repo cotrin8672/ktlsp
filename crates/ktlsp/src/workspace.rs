@@ -8685,6 +8685,7 @@ struct KotlinFileDiagnostics {
     diagnostics: Vec<crate::diagnostics::Diagnostic>,
     store_epoch: u64,
     clean: bool,
+    java_clean: Option<crate::compile::JavaCleanReceipt>,
 }
 
 impl Workspace {
@@ -8693,7 +8694,7 @@ impl Workspace {
         let keys: BTreeSet<_> = self
             .open_docs
             .keys()
-            .filter(|key| key.ends_with(".kt"))
+            .filter(|key| key.ends_with(".kt") || key.ends_with(".java"))
             .collect();
         for key in keys {
             if let Some(scope) = self.project_scope_for_file(key) {
@@ -8949,8 +8950,9 @@ impl Workspace {
                 ));
             }
         }
-        if !allow_closed && !overlays.iter().any(|source| source.key.ends_with(".kt")) {
-            return Err("no-open-owned-kotlin-source");
+        if !allow_closed && !overlays.iter().any(|source|
+            source.key.ends_with(".kt") || source.key.ends_with(".java")) {
+            return Err("no-open-owned-jvm-source");
         }
         overlays.sort_by(|a, b| a.key.cmp(&b.key));
         dependency_overlays.sort_by(|a, b| a.key.cmp(&b.key));
@@ -8974,8 +8976,8 @@ impl Workspace {
                         &visibilities,
                         &visible_origins,
                     )
-                    .map(|dependencies| (java.clone(), dependencies))
-                    .or_else(|| processor_plan.as_ref().map(|_| (java.clone(), Vec::new())))
+                    .map(|dependencies| (java.clone(), dependencies, true))
+                    .or_else(|| processor_plan.as_ref().map(|_| (java.clone(), Vec::new(), false)))
                 })
         } else {
             None
@@ -8983,8 +8985,12 @@ impl Workspace {
         if java_inputs.is_none() {
             processor_plan = None;
         }
+        // Existing domain-only dependency facts do not prove that project producer ABIs are current.
+        // Processor execution support does not prove ordinary project dependency closure.
+        let java_body_eligible = java_inputs.as_ref().is_some_and(|(_, dependencies, imports_verified)|
+            *imports_verified && dependencies.is_empty());
         let (java_task, java_dependencies) = match java_inputs {
-            Some((task, dependencies)) => (Some(task), dependencies),
+            Some((task, dependencies, _)) => (Some(task), dependencies),
             None if crate::compile::compiler_api_candidate(task) => {
                 let java: Vec<_> = source
                     .compiler_tasks
@@ -9034,6 +9040,7 @@ impl Workspace {
             scope: scope.clone(),
             task: task.clone(),
             java_task,
+            java_body_eligible,
             java_dependencies,
             java_editor_sources,
             processor_plan,
@@ -9306,7 +9313,7 @@ impl Workspace {
                     "source_generation": request.generation, "detail": detail}));
         };
         trace("entry", "", match &outcome {
-            crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean } =>
+            crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean, .. } =>
                 serde_json::json!({"verified": true, "clean": clean, "count": diagnostics.len()}),
             crate::compile::KotlinDiagnosticOutcome::Unverified(_) =>
                 serde_json::json!({"verified": false}),
@@ -9359,7 +9366,7 @@ impl Workspace {
             .kotlin_diagnostic_tickets
             .remove(&request.scope)
             .unwrap();
-        let crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean } = outcome
+        let crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean, java_clean } = outcome
         else {
             // A failure is not an empty successful compilation and cannot replace accepted reports.
             trace("rejected", "unverified-outcome", serde_json::Value::Null);
@@ -9423,11 +9430,16 @@ impl Workspace {
             .diagnostic_overlays()
             .filter(|source| {
                 by_file.contains_key(&source.key) || (source.key.ends_with(".kt") && kotlin_clean)
+                    || java_clean.as_ref().is_some_and(|proof|
+                        proof.matches_source(request, &environment_invalid, source))
             })
             .map(|source| source.key.clone())
             .collect();
         self.kotlin_diagnostic_store_epoch = self.kotlin_diagnostic_store_epoch.saturating_add(1);
         for key in &keys {
+            let java_proof = java_clean.as_ref().filter(|proof|
+                request.diagnostic_overlays().find(|source| source.key == *key)
+                    .is_some_and(|source| proof.matches_source(request, &environment_invalid, source))).cloned();
             self.kotlin_diagnostic_reports.insert(
                 key.clone(),
                 KotlinFileDiagnostics {
@@ -9436,7 +9448,8 @@ impl Workspace {
                     environment_invalid: environment_invalid.clone(),
                     diagnostics: by_file.remove(key).unwrap_or_default(),
                     store_epoch: self.kotlin_diagnostic_store_epoch,
-                    clean: clean && key.ends_with(".kt"),
+                    clean: (kotlin_clean && key.ends_with(".kt")) || java_proof.is_some(),
+                    java_clean: java_proof,
                 },
             );
         }
@@ -9518,6 +9531,7 @@ impl Workspace {
             "store_epoch": report.store_epoch, "source_generation": report.request.generation,
             "source_sha256": source_hash, "count": report.diagnostics.len(), "clean": report.clean,
             "compiler_version": report.request.task.kotlin_compiler.as_ref().map(|recipe| &recipe.compiler_version),
+            "java_body":report.java_clean.as_ref().map(|receipt| receipt.trace()),
         }))
     }
 }
@@ -9568,7 +9582,7 @@ mod kotlin_diagnostic_lifecycle_tests {
         if check_prior_success {
             let outcome = crate::compile::run_kotlin_editor_compile(&request, &environment);
             match &outcome {
-                KotlinDiagnosticOutcome::Verified { clean, diagnostics } => assert!(*clean
+                KotlinDiagnosticOutcome::Verified { clean, diagnostics, .. } => assert!(*clean
                     && diagnostics.iter().all(|diagnostic| diagnostic.severity != crate::diagnostics::Severity::Error),
                     "valid Java6 concrete method must reach the selected Kotlin compiler"),
                 KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
@@ -9588,7 +9602,7 @@ mod kotlin_diagnostic_lifecycle_tests {
         assert!(environment.matches(&current));
         let outcome = crate::compile::run_kotlin_editor_compile(&current, &environment);
         match &outcome {
-            KotlinDiagnosticOutcome::Verified { clean, diagnostics } => assert!(!clean && diagnostics.iter().any(|diagnostic|
+            KotlinDiagnosticOutcome::Verified { clean, diagnostics, .. } => assert!(!clean && diagnostics.iter().any(|diagnostic|
                 diagnostic.path == invalid && (diagnostic.line, diagnostic.col) == (expected.0 + 1, expected.1 + 1)
                 && diagnostic.severity == crate::diagnostics::Severity::Error)),
             KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
@@ -9768,7 +9782,7 @@ mod kotlin_diagnostic_lifecycle_tests {
             assert!(current.dependency_compilation.is_some(), "{phase}");
             assert!(environment.matches(&current), "{phase}");
             match crate::compile::run_kotlin_editor_compile(&current, &environment) {
-                KotlinDiagnosticOutcome::Verified { clean, diagnostics }
+                KotlinDiagnosticOutcome::Verified { clean, diagnostics, .. }
                     if phase == "retracted" =>
                 {
                     assert!(
@@ -9779,7 +9793,7 @@ mod kotlin_diagnostic_lifecycle_tests {
                         "missing current producer API was not diagnosed"
                     );
                 }
-                KotlinDiagnosticOutcome::Verified { clean, diagnostics } => {
+                KotlinDiagnosticOutcome::Verified { clean, diagnostics, .. } => {
                     assert!(
                         clean
                             && diagnostics.iter().all(|diagnostic| diagnostic.severity
@@ -9852,6 +9866,7 @@ mod kotlin_diagnostic_lifecycle_tests {
         let (line, column) = crate::text::LineIndex::new(&source.text)
             .position(&source.text, source.text.find(token).unwrap());
         KotlinDiagnosticOutcome::Verified {
+            java_clean: None,
             clean: false,
             diagnostics: vec![CompileDiagnostic {
                 path: key.into(),
@@ -9861,6 +9876,66 @@ mod kotlin_diagnostic_lifecycle_tests {
                 message: format!("Unresolved reference '{token}'."),
             }],
         }
+    }
+
+    #[test]
+    fn java_only_open_scope_is_queued_without_an_owned_kotlin_buffer() {
+        let (mut ws, editor, helper, java) = fixture();
+        ws.close(&editor);
+        ws.close(&helper);
+        let targets = ws.kotlin_diagnostic_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1, java);
+        let request = ws.begin_kotlin_diagnostics(&java).unwrap();
+        assert!(request.overlays.iter().all(|source| source.key.ends_with(".java")));
+        assert!(!request.java_body_eligible, "queue membership cannot mint unsupported Java authority");
+    }
+
+    #[test]
+    fn java_error_repair_needs_its_own_current_body_receipt() {
+        let (mut ws, _, _, java) = fixture();
+        // This tests storage identity, not compiler/recipe admission; the fixture proof is cfg(test).
+        let ticket = |ws: &mut Workspace| {
+            let request = ws.begin_kotlin_diagnostics(&java).unwrap();
+            let mut current = (*request).clone();
+            current.java_task = Some(crate::compile::observed_test_request(std::path::Path::new("/fixture-java")).task.clone());
+            current.java_body_eligible = true;
+            let current = Arc::new(current);
+            ws.kotlin_diagnostic_tickets.get_mut(&current.scope).unwrap().request = current.clone();
+            current
+        };
+        ws.change(&java, "class Main { Missing value; }".into());
+        let request = ticket(&mut ws);
+        let inputs = Arc::new(AtomicBool::new(false));
+        let error = reported(&request, &java, "Missing");
+        assert!(ws.finish_kotlin_diagnostics(&request, error, inputs.clone()).contains(&java));
+        assert_eq!(ws.current_kotlin_diagnostics(&java).len(), 1);
+        ws.change(&java, "class Main { String value; }".into());
+        let request = ticket(&mut ws);
+        ws.finish_kotlin_diagnostics(&request, KotlinDiagnosticOutcome::Verified {
+            diagnostics: Vec::new(), clean: true, java_clean: None,
+        }, inputs.clone());
+        assert!(ws.kotlin_diagnostic_result_id(&java).is_none(), "Kotlin success cannot certify repaired Java");
+        let request = ticket(&mut ws);
+        let proof = crate::compile::JavaCleanReceipt::storage_test_fixture(&request, &inputs);
+        assert!(ws.finish_kotlin_diagnostics(&request, KotlinDiagnosticOutcome::Verified {
+            diagnostics: Vec::new(), clean: true, java_clean: Some(proof.clone()),
+        }, inputs.clone()).contains(&java));
+        let receipt = ws.kotlin_diagnostic_trace(&java).unwrap();
+        assert_eq!(receipt["clean"], true);
+        assert_eq!(receipt["java_body"]["basis"], "javac-body-normal-kotlin-output");
+        ws.change(&java, "class Main { String changed; }".into());
+        let current = ticket(&mut ws);
+        ws.finish_kotlin_diagnostics(&current, KotlinDiagnosticOutcome::Verified {
+            diagnostics: Vec::new(), clean: true, java_clean: Some(proof),
+        }, inputs.clone());
+        assert!(ws.kotlin_diagnostic_result_id(&java).is_none(), "stale body receipts cannot certify a new source epoch");
+        let current = ticket(&mut ws);
+        let proof = crate::compile::JavaCleanReceipt::storage_test_fixture(&current, &inputs);
+        ws.finish_kotlin_diagnostics(&current, KotlinDiagnosticOutcome::Verified {
+            diagnostics: Vec::new(), clean: true, java_clean: Some(proof),
+        }, Arc::new(AtomicBool::new(false)));
+        assert!(ws.kotlin_diagnostic_result_id(&java).is_none(), "different compiler inputs cannot reuse a body receipt");
     }
 
     #[test]
@@ -9928,6 +10003,7 @@ mod kotlin_diagnostic_lifecycle_tests {
                 &clean,
                 KotlinDiagnosticOutcome::Verified {
                     diagnostics: Vec::new(),
+                    java_clean: None,
                     clean: true
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -9950,6 +10026,7 @@ mod kotlin_diagnostic_lifecycle_tests {
                 &clean,
                 KotlinDiagnosticOutcome::Verified {
                     diagnostics: Vec::new(),
+                    java_clean: None,
                     clean: true
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -10187,6 +10264,7 @@ mod kotlin_diagnostic_lifecycle_tests {
                     diagnostics: Vec::new(),
                     store_epoch: 1,
                     clean: true,
+                    java_clean: None,
                 },
             );
         }
@@ -10248,6 +10326,7 @@ mod kotlin_diagnostic_lifecycle_tests {
             &clean,
             KotlinDiagnosticOutcome::Verified {
                 diagnostics: Vec::new(),
+                java_clean: None,
                 clean: true,
             },
             Arc::new(AtomicBool::new(false)),

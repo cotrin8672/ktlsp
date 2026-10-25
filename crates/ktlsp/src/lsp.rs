@@ -327,6 +327,7 @@ impl Backend {
                     watches.clone(),
                     cancelled,
                     compiler_workers.clone(),
+                    compiler_state.clone(),
                 )
                 .await;
                 schedule_selected_kotlin_diagnostics(
@@ -1745,6 +1746,7 @@ async fn index_workspace(
     watches: Arc<Mutex<WatchState>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     compiler_workers: Arc<tokio::sync::Semaphore>,
+    compiler_state: Arc<Mutex<KotlinDiagnosticState>>,
 ) {
     // 1. Project sources (fast).
     let scan_ws = ws.clone();
@@ -2022,6 +2024,26 @@ async fn index_workspace(
             p.finish_with_message("superseded by project changes").await;
         }
         return;
+    }
+    // Selected compiler requests own their recipe and input checks. Optional source-JAR
+    // enrichment must not postpone their queue until the complete library index finishes.
+    if gradle && !watches.lock().pending_model_jar {
+        schedule_selected_kotlin_diagnostics(
+            &ws,
+            &client,
+            &versions,
+            &compiler_state,
+            &compiler_workers,
+            &watches,
+            &root,
+        );
+        crate::trace::span(
+            "workspace.selected_compiler_scheduled",
+            "workspace",
+            Instant::now(),
+            serde_json::json!({"root": root.to_string_lossy(), "generation": generation,
+                "stage": "project_sources"}),
+        );
     }
     crate::trace::span(
         "workspace.project_scan",
@@ -6547,6 +6569,27 @@ mod tests {
             &crate::coords::Coordinate::parse("fieldfixture:api:1").unwrap(),
         );
         let falsely_complete = backend.ws.lock().dependency_origin_complete(&source_origin);
+        // Optional source selection does not prevent a current compiler request from
+        // capturing the selected task and unsaved source, without certifying libraries.
+        let kotlin_key = crate::paths::file_key(&root.join("Use.kt"));
+        let compiler_request = {
+            let mut ws = backend.ws.lock();
+            let mut modules = ws.project_snapshot().unwrap().modules.clone();
+            let mut task = crate::compile::kotlin_test_request(&root).task;
+            task.source_files = vec![root.join("Use.kt"), root.join("Use.java")];
+            let source = &mut modules[0].source_sets[0];
+            source.kotlin_compile_task = Some(task.task.clone());
+            source.compiler_tasks.push(task);
+            ws.set_project_model(Arc::new(classpath::ProjectSnapshot::new(modules)));
+            ws.begin_kotlin_diagnostics(&kotlin_key)
+        };
+        let request_has_current_source = compiler_request.as_ref().is_ok_and(|request| {
+            request.task.task == ":compileKotlin"
+                && request.overlays.iter().any(|overlay| {
+                    overlay.key == kotlin_key && overlay.text.contains("value.co")
+                })
+        });
+        let compiler_preceded_query = !worker.is_finished();
         backend.shutdown().await.unwrap();
         let started = Instant::now();
         while !worker.is_finished() && started.elapsed() < Duration::from_secs(5) {
@@ -6562,6 +6605,11 @@ mod tests {
             "completion must precede source query termination"
         );
         assert!(observed.iter().all(|(_, useful)| *useful), "{observed:?}");
+        assert!(request_has_current_source, "{:?}", compiler_request.as_ref().err());
+        assert!(
+            compiler_preceded_query,
+            "compiler readiness must not wait for source selection"
+        );
         assert!(
             !falsely_complete,
             "positive binary facts do not certify source completeness"
