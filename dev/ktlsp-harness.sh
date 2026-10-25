@@ -450,6 +450,36 @@ class CompilerRuntimeMutationProbe(
     }
 }
 
+// Execute the production identity helper on real Gradle action wrappers. User actions
+// deliberately compare equal; delegate/class/equality filtering would lose them.
+run {
+    val probe = tasks.create("ktlspObserverActionIdentityProbe")
+    fun action() = object : Action<Task> {
+        override fun execute(task: Task) {}
+        override fun equals(other: Any?) = true
+        override fun hashCode() = 0
+    }
+    probe.doLast(action())
+    val baseline = probe.actions.toList()
+    val observer = KtlspObserverActions()
+    val start = action()
+    val installed = observer.install(probe, true, start)
+    observer.install(probe, false, action())
+    val visible = observer.visible(probe)
+    check(visible.size == baseline.size && visible.indices.all { visible[it] === baseline[it] })
+    probe.doFirst(action())
+    probe.doLast(start) // Same delegate, distinct user-installed wrapper: must remain visible.
+    val changed = observer.visible(probe)
+    check(changed.size == baseline.size + 2 && changed[1] === baseline[0])
+    check(changed.first() === probe.actions.first() && changed.last() === probe.actions.last())
+    val other = tasks.create("ktlspOtherActionIdentityProbe")
+    other.actions.add(installed)
+    check(observer.visible(other).single() === installed) // Exclusions are task-scoped.
+    probe.actions.removeAt(probe.actions.indices.single { probe.actions[it] === installed })
+    check(runCatching { observer.visible(probe) }.isFailure) // Missing own hook fails closed.
+    println("PASS  observer-owned action identities preserve configured and late user hooks")
+}
+
 val compilerMutationRuntimes = gradle.sharedServices.registerIfAbsent("ktlspCompilerMutationRuntimes", KtlspCompilerRuntimes::class.java) {}
 tasks.register("ktlspCompilerRuntimeMutationProbe") {
     usesService(compilerMutationRuntimes)

@@ -108,6 +108,36 @@ abstract class KtlspCompilerRuntimes : org.gradle.api.services.BuildService<org.
     }
 }
 
+// Per observed invocation: never suppress a user's action by class, equality or delegate.
+class KtlspObserverActions {
+    private val owned = java.util.IdentityHashMap<Task, MutableSet<Any>>()
+
+    fun install(task: Task, first: Boolean, action: Action<Task>): Action<in Task> {
+        val before = task.actions.toList()
+        if (first) task.doFirst(action) else task.doLast(action)
+        val after = task.actions.toList()
+        check(after.size == before.size + 1 && before.indices.all { index ->
+            before[index] === after[index + if (first) 1 else 0]
+        }) { "Observer action installation changed other configured actions" }
+        val inserted = if (first) after.first() else after.last()
+        if (inserted !== action) {
+            val wrapper = Class.forName("org.gradle.api.internal.AbstractTask\$TaskActionWrapper", false, Task::class.java.classLoader)
+            check(inserted.javaClass == wrapper) { "Unsupported observer action wrapper" }
+            val delegate = wrapper.getDeclaredField("action").apply { isAccessible = true }.get(inserted)
+            check(delegate === action) { "Observer action delegate differs" }
+        }
+        owned.getOrPut(task) { java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>()) }.add(inserted)
+        return inserted
+    }
+
+    fun visible(task: Task): List<Action<in Task>> {
+        val actions = task.actions.toList()
+        val exclusions = owned[task] ?: return actions
+        check(exclusions.all { own -> actions.count { it === own } == 1 }) { "Observer action missing or duplicated" }
+        return actions.filterNot { exclusions.contains(it) }
+    }
+}
+
 object KtlspCompilerConfiguration {
     private data class JavaGradleProfile(
         val version: String,
@@ -291,13 +321,13 @@ object KtlspCompilerConfiguration {
     }
 
     // shortcut: pinned private action ABIs; an unknown layout never proves producer inactivity.
-    fun producerActions(task: Task): Map<String, Any?>? = runCatching {
+    fun producerActions(task: Task, observerActions: KtlspObserverActions? = null): Map<String, Any?>? = runCatching {
         val profile = javaGradleProfile(task)
         val loader = Task::class.java.classLoader
         val standard = Class.forName("org.gradle.api.internal.project.taskfactory.StandardTaskAction", false, loader)
         val incremental = Class.forName("org.gradle.api.internal.project.taskfactory.${profile.incrementalAction}", false, loader)
         val methodField = standard.getDeclaredField("method").apply { isAccessible = true }
-        val rows = task.actions.map { action ->
+        val rows = (observerActions?.visible(task) ?: task.actions).map { action ->
             val method = if (action.javaClass == incremental || action.javaClass == standard)
                 methodField.get(action) as? java.lang.reflect.Method else null
             linkedMapOf<String, Any?>(
@@ -778,7 +808,7 @@ object KtlspCompilerConfiguration {
             "language" to "kotlin", "java_home" to selected.absolutePath, "arguments" to arguments)
     }.getOrNull()
 
-    fun dump(task: Task, language: String, runtimes: Provider<KtlspCompilerRuntimes>): String {
+    fun dump(task: Task, language: String, runtimes: Provider<KtlspCompilerRuntimes>, observerActions: KtlspObserverActions? = null): String {
         // Keep producer coverage even when later SDK/recipe capture fails.
         val sdkSources = sdkSourceFacts(task, language)
         val sdkSelection = if (language == "kotlin") kotlinSdkSelection(task) else null
@@ -819,7 +849,7 @@ object KtlspCompilerConfiguration {
                     "release" to options.release.orNull,
                     "encoding" to options.encoding,
                     "bootstrapClasspath" to options.bootstrapClasspath?.files?.map { it.absolutePath },
-                    "taskActionInventory" to producerActions(task),
+                    "taskActionInventory" to producerActions(task, observerActions),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
                     "fork" to options.isFork,
                     "forkJavaHome" to options.forkOptions.javaHome?.absolutePath,
@@ -891,7 +921,7 @@ object KtlspCompilerConfiguration {
                     "sdkSourcePolicy" to sdkSources.second,
                     "sdkSelection" to sdkSelection,
                     "kotlinClasspathSnapshotInputs" to kotlinClasspathSnapshotInputs(task, recipe),
-                    "taskActionInventory" to producerActions(task),
+                    "taskActionInventory" to producerActions(task, observerActions),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
                 )
                 record["options"] = options
@@ -951,7 +981,7 @@ object KtlspCompilerConfiguration {
                     "classpath" to (read(task, "getClasspath") as FileCollection).files.map { it.absolutePath },
                     "providerArguments" to providerArguments,
                     "annotationProcessorOptionProviderCount" to optionProviders.size,
-                    "taskActionInventory" to producerActions(task),
+                    "taskActionInventory" to producerActions(task, observerActions),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
                 )
                 record["output_roots"] = listOf("getClassesDir", "getDestinationDir", "getKotlinSourcesDestinationDir")
@@ -1389,8 +1419,8 @@ object KtlspSelectedTaskObserver {
         it.name == "getSerializedCompilerArguments" && it.parameterCount == 0
     }
 
-    fun configuration(task: Task, runtimes: Provider<KtlspCompilerRuntimes>): Map<*, *> = groovy.json.JsonSlurper().parseText(
-        KtlspCompilerConfiguration.dump(task, if (task is JavaCompile) "java" else "kotlin", runtimes)
+    fun configuration(task: Task, runtimes: Provider<KtlspCompilerRuntimes>, actions: KtlspObserverActions? = null): Map<*, *> = groovy.json.JsonSlurper().parseText(
+        KtlspCompilerConfiguration.dump(task, if (task is JavaCompile) "java" else "kotlin", runtimes, actions)
     ) as Map<*, *>
 
     fun pluginFiles(configurations: List<Map<*, *>>): List<Map<String, Any?>> {
@@ -1404,7 +1434,7 @@ object KtlspSelectedTaskObserver {
 
     fun javaInputs(task: JavaCompile, sourceSet: org.gradle.api.tasks.SourceSet,
                    compilerTasks: List<Task>, buildFiles: List<java.io.File>,
-                   runtimes: Provider<KtlspCompilerRuntimes>): Map<String, Any?> {
+                   runtimes: Provider<KtlspCompilerRuntimes>, actions: KtlspObserverActions): Map<String, Any?> {
         val kotlinExtension = sourceSet.extensions.findByName("kotlin")
         val kotlinDirectories = when (kotlinExtension) {
             is SourceDirectorySet -> kotlinExtension
@@ -1416,7 +1446,7 @@ object KtlspSelectedTaskObserver {
         }
         val sources = (sourceSet.allJava.files + (kotlinDirectories?.files ?: emptySet()) + task.source.files)
             .sortedBy { path(it) }
-        val configurations = compilerTasks.map { configuration(it, runtimes) }
+        val configurations = compilerTasks.map { configuration(it, runtimes, actions) }
         val homes = configurations.mapNotNull { it["java_home"] as? String }.toMutableSet()
         homes.add(System.getProperty("java.home"))
         val runtimeFiles = homes.sorted().flatMap { home ->
@@ -1424,7 +1454,7 @@ object KtlspSelectedTaskObserver {
                 .map { file(java.io.File(home, it)) }
         }
         return linkedMapOf(
-            "configuration" to configuration(task, runtimes),
+            "configuration" to configuration(task, runtimes, actions),
             "compiler_configurations" to configurations,
             "compiler_runtime_files" to runtimeFiles,
             "module_sources" to sources.map { file(it) },
@@ -1491,6 +1521,7 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
             val buildFiles = listOf("build.gradle.kts", "settings.gradle.kts", "gradle.properties", "gradlew",
                 "gradlew.bat", "gradle/wrapper/gradle-wrapper.properties", "gradle/wrapper/gradle-wrapper.jar")
                 .map { java.io.File(selected.project.rootDir, it) }
+            val actions = KtlspObserverActions()
             observer.event("graph", linkedMapOf(
                 "root" to observer.path(gradle.rootProject.rootDir), "project" to selected.project.path,
                 "project_dir" to observer.path(selected.project.projectDir), "source_set" to sourceSet.name,
@@ -1499,18 +1530,18 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                 "gradle_home" to gradle.gradleHomeDir?.let { observer.path(it) },
                 "gradle_user_home" to observer.path(gradle.gradleUserHomeDir),
                 "init_scripts" to gradle.startParameter.initScripts.map { observer.file(it) },
-                "compiler_configurations" to compilerTasks.map { observer.configuration(it, compilerRuntimes) },
+                "compiler_configurations" to compilerTasks.map { observer.configuration(it, compilerRuntimes, actions) },
             ))
             var selectedStarted = false
-            selected.doFirst(object : Action<Task> {
+            actions.install(selected, true, object : Action<Task> {
                 override fun execute(task: Task) {
                     selectedStarted = true
                     observer.event("selected-action-start", linkedMapOf("task" to selected.path,
-                        "inputs" to observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles, compilerRuntimes),
+                        "inputs" to observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles, compilerRuntimes, actions),
                         "outputs_before" to observer.inventory(selected.outputs.files.files.toList())))
                 }
             })
-            selected.doLast(object : Action<Task> {
+            actions.install(selected, false, object : Action<Task> {
                 override fun execute(task: Task) {
                     observer.event("selected-action-end", linkedMapOf("task" to selected.path,
                         "outputs" to observer.inventory(selected.outputs.files.files.toList())))
@@ -1522,7 +1553,7 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                 override fun beforeExecute(task: Task) {
                     val record = linkedMapOf<String, Any?>("task" to task.path, "type" to task.javaClass.name)
                     if (task in compilerTasks) {
-                        record["configuration"] = observer.configuration(task, compilerRuntimes)
+                        record["configuration"] = observer.configuration(task, compilerRuntimes, actions)
                         record["declared_inputs"] = observer.inventory(task.inputs.files.files.sortedBy { observer.path(it) })
                     }
                     observer.event("task-start", record)
@@ -1530,7 +1561,7 @@ if (ktlspObserverDirectory != null && ktlspObserverRoot != null && ktlspObserver
                 override fun afterExecute(task: Task, state: org.gradle.api.tasks.TaskState) {
                     val record = linkedMapOf<String, Any?>("task" to task.path, "state" to observer.state(state))
                     if (task in compilerTasks) record["outputs"] = observer.inventory(task.outputs.files.files.toList())
-                    if (task == selected && selectedStarted) record["inputs_after"] = observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles, compilerRuntimes)
+                    if (task == selected && selectedStarted) record["inputs_after"] = observer.javaInputs(selected, sourceSet, compilerTasks, buildFiles, compilerRuntimes, actions)
                     observer.event("task-end", record)
                 }
             })
