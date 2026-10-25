@@ -36,6 +36,70 @@ pub const MAX_DEPTH: usize = 16;
 /// Cap on the supertype walk when looking up a member's type (mirrors the completion/goto caps).
 const SUPERTYPE_CAP: usize = 32;
 
+/// A null literal is known, unlike an expression whose type could not be resolved.
+pub enum StringConcatenationOperand<'a> {
+    Value(&'a Type),
+    Null,
+}
+
+/// Result of intrinsic String `+`, after the syntax adapter has classified both operands.
+pub fn string_concatenation_type(
+    mode: members::CallMode,
+    left: StringConcatenationOperand<'_>,
+    right: StringConcatenationOperand<'_>,
+) -> Option<Type> {
+    fn value_type(ty: &Type) -> bool {
+        match ty {
+            Type::Class { name, package, .. } => {
+                package.is_some()
+                    || matches!(
+                        name.as_str(),
+                        "boolean" | "byte" | "short" | "int" | "long" | "float" | "double" | "char"
+                    )
+            }
+            Type::Array { component, .. } | Type::Raw(component) => value_type(component),
+            Type::Parameter { .. } => true,
+            Type::Unknown | Type::Projected { .. } | Type::Star => false,
+        }
+    }
+    let value = |operand: &StringConcatenationOperand<'_>| match operand {
+        StringConcatenationOperand::Value(ty) => value_type(ty),
+        StringConcatenationOperand::Null => true,
+    };
+    let string = |operand: &StringConcatenationOperand<'_>| {
+        let StringConcatenationOperand::Value(ty) = operand else {
+            return None;
+        };
+        let Type::Class {
+            name,
+            package,
+            container: None,
+            nullable: false,
+            args,
+            owner: None,
+        } = *ty
+        else {
+            return None;
+        };
+        if !args.is_empty() || name != "String" {
+            return None;
+        }
+        let canonical = match mode {
+            members::CallMode::Java => package.as_deref() == Some("java.lang"),
+            members::CallMode::Kotlin => matches!(package.as_deref(), Some("kotlin" | "java.lang")),
+        };
+        canonical.then(|| Type::clone(ty))
+    };
+    if let Some(string) = string(&left).filter(|_| value(&right)) {
+        return Some(string);
+    }
+    if mode == members::CallMode::Java && value(&left) {
+        string(&right)
+    } else {
+        None
+    }
+}
+
 /// The file-level facts inference needs to resolve a simple type name to a package: the file's own
 /// package and its imports. Built once per request from the (synthetic or real) tree.
 #[derive(Clone, Debug)]
@@ -317,13 +381,24 @@ fn infer_depth_with<R: ChildInfer>(
         },
         // Elvis `a ?: b`: the non-null type of the left operand (best-effort; we don't unify with
         // the right). `?:` is an anonymous operator token, so detect it by scanning all children.
-        // Other binary operators don't yield a useful receiver type — leave them Unknown.
         "binary_expression" if has_child_token(node, "?:") => match node.named_child(0) {
             Some(left) => child_infer
                 .infer_child(index, left, src, ctx, depth + 1)
                 .into_non_null(),
             None => Type::Unknown,
         },
+        "binary_expression" if has_child_token(node, "+") && node.named_child_count() == 2 => {
+            let left =
+                child_infer.infer_child(index, node.named_child(0).unwrap(), src, ctx, depth + 1);
+            let right =
+                child_infer.infer_child(index, node.named_child(1).unwrap(), src, ctx, depth + 1);
+            string_concatenation_type(
+                members::CallMode::Kotlin,
+                StringConcatenationOperand::Value(&left),
+                StringConcatenationOperand::Value(&right),
+            )
+            .unwrap_or(Type::Unknown)
+        }
         // Unary, incl. the non-null assertion `a!!`: the argument's type with nullability stripped.
         // (`-n`/`!b` keep the argument's type too, which is correct for Int/Boolean.)
         "unary_expression" => match node.named_child(0) {
@@ -808,7 +883,15 @@ fn is_stable_for_narrowing(
                     && !lambda_parameter_shadowed(lambda, ident, name, src)
                     && (property_lambda_parameter_type(index, lambda, ident, name, src, ctx)
                         .is_some()
-                        || named_call_lambda_parameter_type(index, lambda, src, ctx, 0, &mut LocalChildInfer).is_some())
+                        || named_call_lambda_parameter_type(
+                            index,
+                            lambda,
+                            src,
+                            ctx,
+                            0,
+                            &mut LocalChildInfer,
+                        )
+                        .is_some())
                 {
                     // An implicit parameter shadows outer `it` binders and their guards.
                     return lambda.start_byte() < check_start;
@@ -1333,7 +1416,9 @@ fn lambda_param_type(
                 if let Some(ty) = property_lambda_parameter_type(index, n, ident, name, src, ctx) {
                     return Some(narrowed_type(index, ident, name, src, ctx).unwrap_or(ty));
                 }
-                if let Some(ty) = named_call_lambda_parameter_type(index, n, src, ctx, depth, child_infer) {
+                if let Some(ty) =
+                    named_call_lambda_parameter_type(index, n, src, ctx, depth, child_infer)
+                {
                     return Some(narrowed_type(index, ident, name, src, ctx).unwrap_or(ty));
                 }
                 return lambda_receiver_or_element(index, n, src, ctx, depth, child_infer);
@@ -1374,16 +1459,21 @@ fn named_call_lambda_parameter_type(
         callee = callee.named_child(0)?;
     }
     // Parameter context uses only the ordinary arguments, avoiding a body -> call -> body cycle.
-    let arguments = syntactic_call_arguments(call, src,
-        synth_arg_types(index, call, src, ctx, depth, child_infer));
+    let arguments = syntactic_call_arguments(
+        call,
+        src,
+        synth_arg_types(index, call, src, ctx, depth, child_infer),
+    );
     arguments.names.as_ref()?;
     let usage = MemberUse::Call(arguments.clone());
     let (receiver, selection) = match callee.kind() {
         "navigation_expression" => {
             let receiver = callee.named_child(0)?;
             let name = node_text(callee.named_child(1)?, src);
-            let ty = member_receiver_type(receiver,
-                child_infer.infer_child(index, receiver, src, ctx, depth + 1));
+            let ty = member_receiver_type(
+                receiver,
+                child_infer.infer_child(index, receiver, src, ctx, depth + 1),
+            );
             let candidates = members::candidates_at(index, &ty, name, ctx, callee.start_byte());
             let selection = candidates.select(index, &ty, &usage, ctx);
             (ty, selection)
@@ -1396,7 +1486,12 @@ fn named_call_lambda_parameter_type(
                 }
                 let owner = binder.parent().and_then(|declaration| declaration.parent());
                 if !ctx.local_extension_at(binder.start_byte(), binder.end_byte())
-                    && !owner.is_some_and(|owner| matches!(owner.kind(), "source_file" | "class_body" | "enum_class_body"))
+                    && !owner.is_some_and(|owner| {
+                        matches!(
+                            owner.kind(),
+                            "source_file" | "class_body" | "enum_class_body"
+                        )
+                    })
                 {
                     return None;
                 }
@@ -1404,14 +1499,21 @@ fn named_call_lambda_parameter_type(
             if !index.lookup_type(name).is_empty() {
                 return None;
             }
-            if let Some(selection) = members::select_implicit_at(index,
+            if let Some(selection) = members::select_implicit_at(
+                index,
                 implicit_receiver_types(index, callee, src, ctx, depth + 1),
-                name, &usage, ctx, callee.start_byte())
-            {
+                name,
+                &usage,
+                ctx,
+                callee.start_byte(),
+            ) {
                 selection
             } else {
                 let entries = visible_top_level_entries(index, name, ctx, SymbolKind::Function);
-                (Type::Unknown, members::select_functions(index, entries, &usage, ctx))
+                (
+                    Type::Unknown,
+                    members::select_functions(index, entries, &usage, ctx),
+                )
             }
         }
         _ => return None,
@@ -1425,9 +1527,18 @@ fn named_call_lambda_parameter_type(
             return None;
         }
         let (parameters, _) = members::function_type_signature(entry.sym.params.last()?)?;
-        let [parameter] = parameters else { return None; };
-        let ty = resolve_trailing_lambda_receiver_candidate(index, entry, parameter,
-            Some(&receiver), &arguments, ctx, depth)?;
+        let [parameter] = parameters else {
+            return None;
+        };
+        let ty = resolve_trailing_lambda_receiver_candidate(
+            index,
+            entry,
+            parameter,
+            Some(&receiver),
+            &arguments,
+            ctx,
+            depth,
+        )?;
         if !constraint_type_is_known(index, &ty, 0)
             || result.as_ref().is_some_and(|previous| previous != &ty)
         {
@@ -1563,8 +1674,11 @@ fn lambda_receiver_or_element(
     if let Some((receiver, selection)) =
         local_lambda_call_selection(index, call, callee, src, ctx, depth, child_infer)
     {
-        let arguments = syntactic_call_arguments(call, src,
-            synth_arg_types(index, call, src, ctx, depth, child_infer));
+        let arguments = syntactic_call_arguments(
+            call,
+            src,
+            synth_arg_types(index, call, src, ctx, depth, child_infer),
+        );
         let mut result = None;
         for entry in selection.entries {
             if trailing_lambda_receiver_ref(index, entry, ctx).is_some() {
@@ -1719,8 +1833,11 @@ fn local_lambda_call_selection<'a>(
     if !candidates.has_local_extensions() {
         return None;
     }
-    let usage = MemberUse::Call(syntactic_call_arguments(call, src,
-        synth_arg_types(index, call, src, ctx, depth, child_infer)));
+    let usage = MemberUse::Call(syntactic_call_arguments(
+        call,
+        src,
+        synth_arg_types(index, call, src, ctx, depth, child_infer),
+    ));
     let selection = candidates.select(index, &receiver, &usage, ctx);
     (selection.applicability != members::Applicability::Rejected).then_some((receiver, selection))
 }
@@ -2181,7 +2298,10 @@ fn infer_call(
         && callee.kind() == "call_expression"
         && child_of_kind(callee, "value_arguments").is_some()
     {
-        let Some(inner) = callee.named_child(0).filter(|inner| inner.kind() != "call_expression") else {
+        let Some(inner) = callee
+            .named_child(0)
+            .filter(|inner| inner.kind() != "call_expression")
+        else {
             return Type::Unknown;
         };
         callee = inner;
@@ -2194,7 +2314,15 @@ fn infer_call(
             if let Some((binder, kind)) = resolve::local_decl(callee, cname, UseKind::Call, src) {
                 if matches!(kind, SymbolKind::LocalVariable | SymbolKind::Parameter) {
                     let callable = decl_type(index, binder, src, ctx, depth + 1, child_infer);
-                    let arguments = normalized_call_arguments(index, node, src, ctx, depth, synth_arg_types(index, node, src, ctx, depth, child_infer), child_infer);
+                    let arguments = normalized_call_arguments(
+                        index,
+                        node,
+                        src,
+                        ctx,
+                        depth,
+                        synth_arg_types(index, node, src, ctx, depth, child_infer),
+                        child_infer,
+                    );
                     return function_value_call_type(
                         index,
                         &callable,
@@ -2226,7 +2354,15 @@ fn infer_call(
                 return resolve_type_name(index, cname, ctx, false);
             }
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
-            let usage = MemberUse::Call(normalized_call_arguments(index, node, src, ctx, depth, arg_types.clone(), child_infer));
+            let usage = MemberUse::Call(normalized_call_arguments(
+                index,
+                node,
+                src,
+                ctx,
+                depth,
+                arg_types.clone(),
+                child_infer,
+            ));
             if let Some((receiver, selection)) = members::select_implicit_at(
                 index,
                 implicit_receiver_types(index, callee, src, ctx, depth + 1),
@@ -2308,7 +2444,15 @@ fn infer_call(
             };
             if node_text(sel, src) == "invoke" {
                 let callable = child_infer.infer_child(index, recv, src, ctx, depth + 1);
-                let arguments = normalized_call_arguments(index, node, src, ctx, depth, synth_arg_types(index, node, src, ctx, depth, child_infer), child_infer);
+                let arguments = normalized_call_arguments(
+                    index,
+                    node,
+                    src,
+                    ctx,
+                    depth,
+                    synth_arg_types(index, node, src, ctx, depth, child_infer),
+                    child_infer,
+                );
                 if let Some(result) = function_value_call_type(
                     index,
                     &callable,
@@ -2331,7 +2475,15 @@ fn infer_call(
                 return Type::Unknown;
             };
             let arg_types = synth_arg_types(index, node, src, ctx, depth, child_infer);
-            let arguments = normalized_call_arguments(index, node, src, ctx, depth, arg_types.clone(), child_infer);
+            let arguments = normalized_call_arguments(
+                index,
+                node,
+                src,
+                ctx,
+                depth,
+                arg_types.clone(),
+                child_infer,
+            );
             let selection =
                 candidates.select(index, &recv_ty, &MemberUse::Call(arguments.clone()), ctx);
             if selection.entries.len() == 1
@@ -2352,8 +2504,15 @@ fn infer_call(
                 if let Some(entries) =
                     resolve::qualified_top_level_function_entries(index, callee, src, ctx)
                 {
-                    let usage =
-                        MemberUse::Call(normalized_call_arguments(index, node, src, ctx, depth, arg_types.clone(), child_infer));
+                    let usage = MemberUse::Call(normalized_call_arguments(
+                        index,
+                        node,
+                        src,
+                        ctx,
+                        depth,
+                        arg_types.clone(),
+                        child_infer,
+                    ));
                     return free_function_call_type(
                         index,
                         entries,
@@ -2488,7 +2647,15 @@ fn qualified_constructor_call_type(
                     )
             }),
     );
-    let arguments = normalized_call_arguments(index, call, src, ctx, depth, synth_arg_types(index, call, src, ctx, depth, child_infer), child_infer);
+    let arguments = normalized_call_arguments(
+        index,
+        call,
+        src,
+        ctx,
+        depth,
+        synth_arg_types(index, call, src, ctx, depth, child_infer),
+        child_infer,
+    );
     let selection = members::select_functions(index, entries, &MemberUse::Call(arguments), ctx);
     if selection.applicability != members::Applicability::Applicable || selection.entries.len() != 1
     {
@@ -2588,7 +2755,8 @@ fn free_function_call_type(
             return Type::Unknown;
         };
         if params.len() != arg_types.len()
-            || (!was_named && (normalized.count != Some(params.len()) || normalized.trailing_lambda))
+            || (!was_named
+                && (normalized.count != Some(params.len()) || normalized.trailing_lambda))
         {
             return Type::Unknown;
         }
@@ -2674,8 +2842,15 @@ fn free_function_sig(
                 return None;
             }
             let entry = selection.entries[0];
-            let bound =
-                members::bind_arguments(index, &Type::Unknown, entry, arguments, members::CallMode::Kotlin, ctx).ok()?;
+            let bound = members::bind_arguments(
+                index,
+                &Type::Unknown,
+                entry,
+                arguments,
+                members::CallMode::Kotlin,
+                ctx,
+            )
+            .ok()?;
             if (selection.applicability == members::Applicability::Unknown
                 && entry
                     .sym
@@ -2888,8 +3063,11 @@ fn callable_member_entries<'a>(
     child_infer: &mut impl ChildInfer,
 ) -> (Vec<&'a Entry>, bool) {
     if candidates.has_local_extensions() {
-        let usage = MemberUse::Call(syntactic_call_arguments(call, src,
-            synth_arg_types(index, call, src, ctx, depth, child_infer)));
+        let usage = MemberUse::Call(syntactic_call_arguments(
+            call,
+            src,
+            synth_arg_types(index, call, src, ctx, depth, child_infer),
+        ));
         let selection = candidates.select(index, receiver, &usage, ctx);
         return (
             selection
@@ -2976,7 +3154,9 @@ pub(crate) fn named_call_arguments(
     src: &str,
     ctx: &FileCtx,
 ) -> Option<CallArguments> {
-    syntactic_call_arguments(call, src, Vec::new()).names.as_ref()?;
+    syntactic_call_arguments(call, src, Vec::new())
+        .names
+        .as_ref()?;
     Some(call_arguments(index, call, src, ctx))
 }
 
@@ -3040,13 +3220,18 @@ fn syntactic_call_arguments(call: Node, src: &str, types: Vec<Type>) -> CallArgu
                             if !matches!(parameter.kind(), "identifier" | "variable_declaration") {
                                 return members::LambdaParameters::Unknown;
                             }
-                            types.push(crate::indexer::value_type_of_scoped(parameter, src, None)
-                                .map(|_| Type::Unknown));
+                            types.push(
+                                crate::indexer::value_type_of_scoped(parameter, src, None)
+                                    .map(|_| Type::Unknown),
+                            );
                         }
                         members::LambdaParameters::Explicit(types)
                     },
                 );
-                members::TrailingLambdaArguments { parameters, result: Type::Unknown }
+                members::TrailingLambdaArguments {
+                    parameters,
+                    result: Type::Unknown,
+                }
             }),
     }
 }
@@ -3068,9 +3253,18 @@ fn normalized_call_arguments(
                     .and_then(|lambda| child_of_kind(lambda, "lambda_parameters"))
                 {
                     let mut cursor = parameters.walk();
-                    for (ty, parameter) in types.iter_mut().zip(parameters.named_children(&mut cursor)) {
-                        if let Some(reference) = crate::indexer::value_type_of_scoped(parameter, src, None) {
-                            let bounds = crate::indexer::type_parameters_in_scope(parameter, src, &ctx.package, &ctx.imports);
+                    for (ty, parameter) in
+                        types.iter_mut().zip(parameters.named_children(&mut cursor))
+                    {
+                        if let Some(reference) =
+                            crate::indexer::value_type_of_scoped(parameter, src, None)
+                        {
+                            let bounds = crate::indexer::type_parameters_in_scope(
+                                parameter,
+                                src,
+                                &ctx.package,
+                                &ctx.imports,
+                            );
                             *ty = Some(declared_type_in_scope(index, &reference, ctx, &bounds));
                         }
                     }
@@ -3180,7 +3374,14 @@ fn resolve_trailing_lambda_receiver_candidate(
     depth: usize,
 ) -> Option<Type> {
     let tset: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
-    let arguments = members::bind_arguments_for_lambda_context(index, recv_ty.unwrap_or(&Type::Unknown), entry, arguments, ctx).ok()?;
+    let arguments = members::bind_arguments_for_lambda_context(
+        index,
+        recv_ty.unwrap_or(&Type::Unknown),
+        entry,
+        arguments,
+        ctx,
+    )
+    .ok()?;
     let arg_types = arguments.arguments.types.as_slice();
     let params = arguments.params.as_ref();
     let mut subst = match recv_ty {
@@ -3590,7 +3791,9 @@ fn member_type(
     let usage = if want_function {
         let types = arg_types.unwrap_or_default().to_vec();
         MemberUse::Call(match call {
-            Some(call) => normalized_call_arguments(index, call, src, ctx, depth, types, child_infer),
+            Some(call) => {
+                normalized_call_arguments(index, call, src, ctx, depth, types, child_infer)
+            }
             None => CallArguments {
                 count: arg_count,
                 types,
@@ -3626,7 +3829,11 @@ fn member_type(
                 crate::jvm::select_call(index, recv_ty, jvm_candidates, name, arguments, ctx);
             if let [candidate] = selected.consumable_candidates() {
                 return crate::jvm::projected_return_type_in_call_mode(
-                    index, recv_ty, *candidate, members::CallMode::Kotlin, ctx,
+                    index,
+                    recv_ty,
+                    *candidate,
+                    members::CallMode::Kotlin,
+                    ctx,
                 )
                 .unwrap_or(Type::Unknown);
             }
@@ -3717,7 +3924,16 @@ fn selected_member_type(
         };
         let t = if semantic_entry.is_some() {
             if let Some(arguments) = arguments.filter(|arguments| arguments.names.is_some()) {
-                if members::bind_arguments(index, recv_ty, e, arguments, members::CallMode::Kotlin, ctx).is_err() {
+                if members::bind_arguments(
+                    index,
+                    recv_ty,
+                    e,
+                    arguments,
+                    members::CallMode::Kotlin,
+                    ctx,
+                )
+                .is_err()
+                {
                     return Type::Unknown;
                 }
             }
@@ -3764,7 +3980,14 @@ fn resolve_member_type_with_subst(
     let projected = entry.sym.params.iter().any(solve::has_projection);
     let bound = match arguments {
         Some(arguments) => {
-            match members::bind_arguments(index, recv_ty, entry, arguments, members::CallMode::Kotlin, ctx) {
+            match members::bind_arguments(
+                index,
+                recv_ty,
+                entry,
+                arguments,
+                members::CallMode::Kotlin,
+                ctx,
+            ) {
                 Ok(bound) => Some(bound),
                 Err(_) => return Type::Unknown,
             }
@@ -3777,10 +4000,16 @@ fn resolve_member_type_with_subst(
     }) {
         return Type::Unknown;
     }
-    if let Some(signature) = raw_member_signature(index, recv_ty, entry, tr, members::CallMode::Kotlin) {
+    if let Some(signature) =
+        raw_member_signature(index, recv_ty, entry, tr, members::CallMode::Kotlin)
+    {
         return match &bound {
-            Some(bound) if raw_member_application(index, entry, bound, &signature).status
-                != solve::ConstraintStatus::Matched => Type::Unknown,
+            Some(bound)
+                if raw_member_application(index, entry, bound, &signature).status
+                    != solve::ConstraintStatus::Matched =>
+            {
+                Type::Unknown
+            }
             _ => signature.result,
         };
     }
@@ -3804,7 +4033,9 @@ fn resolve_member_type_with_subst(
         return resolve_type_ref(index, tr, ctx, depth + 1);
     }
     let mut subst = receiver_bindings.unwrap_or_default();
-    if tr.qualification.is_none() && tr.args.is_empty() && tr.owner.is_none()
+    if tr.qualification.is_none()
+        && tr.args.is_empty()
+        && tr.owner.is_none()
         && !entry.sym.type_params.contains(&tr.name)
         && matches!(subst.get(&tr.name), Some(Type::Star))
     {
@@ -3862,7 +4093,9 @@ pub fn declared_member_type(
         return resolve_type_ref(index, tr, ctx, 0);
     }
     let subst = receiver_bindings.unwrap_or_default();
-    if tr.qualification.is_none() && tr.args.is_empty() && tr.owner.is_none()
+    if tr.qualification.is_none()
+        && tr.args.is_empty()
+        && tr.owner.is_none()
         && !entry.sym.type_params.contains(&tr.name)
         && matches!(subst.get(&tr.name), Some(Type::Star))
     {
@@ -3870,15 +4103,22 @@ pub fn declared_member_type(
         let mut conflict = false;
         let _ = walk_supertypes(index, recv_ty, SUPERTYPE_CAP, |current| {
             if receiver_root_key(index, current).as_deref() != entry.sym.container.as_deref()
-                || current.package() != Some(entry.sym.package.as_str()) { return ControlFlow::Continue(()); }
+                || current.package() != Some(entry.sym.package.as_str())
+            {
+                return ControlFlow::Continue(());
+            }
             let mut scope = Some(current);
             while let Some(ty) = scope {
                 if let Some(declaration) = type_declaration_shape(index, ty) {
                     if let Some(parameters) = type_declaration_parameters(index, ty) {
                         if parameters.iter().any(|p| p.name == tr.name) {
-                            let ctx = FileCtx::new(declaration.sym.package.clone(), Vec::new()).with_file(&declaration.path);
+                            let ctx = FileCtx::new(declaration.sym.package.clone(), Vec::new())
+                                .with_file(&declaration.path);
                             let candidate = declared_type_in_scope(index, tr, &ctx, parameters);
-                            if read.as_ref().is_some_and(|previous| previous != &candidate) { conflict = true; return ControlFlow::Break(()); }
+                            if read.as_ref().is_some_and(|previous| previous != &candidate) {
+                                conflict = true;
+                                return ControlFlow::Break(());
+                            }
                             read = Some(candidate);
                             break;
                         }
@@ -3888,8 +4128,12 @@ pub fn declared_member_type(
             }
             ControlFlow::Continue(())
         });
-        if conflict { return Type::Unknown; }
-        if let Some(read) = read { return read; }
+        if conflict {
+            return Type::Unknown;
+        }
+        if let Some(read) = read {
+            return read;
+        }
     }
     resolve_with_subst(index, tr, ctx, &tparams, &subst, 0)
 }
@@ -3904,7 +4148,11 @@ fn unbounded_scoped_parameter(ty: &Type) -> bool {
 }
 
 // Closed type values retain declaration shape; call bounds are validated after substitution.
-pub(crate) fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, depth: usize) -> bool {
+pub(crate) fn constraint_type_is_known(
+    index: &dyn InferenceIndex,
+    ty: &Type,
+    depth: usize,
+) -> bool {
     if depth > MAX_DEPTH {
         return false;
     }
@@ -3912,7 +4160,9 @@ pub(crate) fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, de
         return true;
     }
     if let Some(arguments) = intrinsic_function_arguments(ty) {
-        return arguments.iter().all(|argument| constraint_type_is_known(index, argument, depth + 1));
+        return arguments
+            .iter()
+            .all(|argument| constraint_type_is_known(index, argument, depth + 1));
     }
     if !type_head_is_known(index, ty) || !receiver_shape_is_known(index, ty) {
         return false;
@@ -3947,9 +4197,21 @@ pub(crate) fn constraint_type_is_known(index: &dyn InferenceIndex, ty: &Type, de
 
 fn intrinsic_function_arguments(ty: &Type) -> Option<&[Type]> {
     match ty {
-        Type::Class { name, package: Some(package), container: None, args, owner: None, .. }
-            if matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
-                && matches!((name.as_str(), args.len()), ("Function0", 1) | ("Function1", 2)) => Some(args),
+        Type::Class {
+            name,
+            package: Some(package),
+            container: None,
+            args,
+            owner: None,
+            ..
+        } if matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
+            && matches!(
+                (name.as_str(), args.len()),
+                ("Function0", 1) | ("Function1", 2)
+            ) =>
+        {
+            Some(args)
+        }
         _ => None,
     }
 }
@@ -4017,7 +4279,8 @@ fn projected_application(
             _ => constraint_type_is_known(index, actual, 0),
         },
         |actual, formals| {
-            if intrinsic_function_arguments(actual).is_some_and(|args| args.len() == formals.len()) {
+            if intrinsic_function_arguments(actual).is_some_and(|args| args.len() == formals.len())
+            {
                 return true;
             }
             if type_declaration_shape(index, actual).is_none() {
@@ -4084,7 +4347,9 @@ pub(crate) fn call_parameter_templates_known(index: &dyn InferenceIndex, entry: 
             return formal.args.is_empty();
         }
         if let Some((arguments, result)) = members::function_type_signature(formal) {
-            return arguments.iter().chain(std::iter::once(result))
+            return arguments
+                .iter()
+                .chain(std::iter::once(result))
                 .all(|argument| known(index, argument, ctx, parameters, depth + 1));
         }
         let resolved =
@@ -4180,7 +4445,11 @@ pub(crate) fn projected_member_application(
         index,
         receiver,
         entry,
-        entry.sym.return_type.as_ref().unwrap_or(&TypeRef::default()),
+        entry
+            .sym
+            .return_type
+            .as_ref()
+            .unwrap_or(&TypeRef::default()),
         bound.mode,
     ) {
         return Some(raw_member_application(index, entry, bound, &signature));
@@ -5091,8 +5360,13 @@ fn with_instantiated_owner(index: &dyn InferenceIndex, mut ty: Type, owner: Type
     } else {
         return Type::Unknown;
     }
-    if ty.owner().is_some_and(|owner| matches!(owner, Type::Raw(_))) {
-        if !ty.args().is_empty() { return Type::Unknown; }
+    if ty
+        .owner()
+        .is_some_and(|owner| matches!(owner, Type::Raw(_)))
+    {
+        if !ty.args().is_empty() {
+            return Type::Unknown;
+        }
         Type::Raw(Box::new(ty))
     } else {
         ty
@@ -5314,7 +5588,11 @@ fn receiver_bound_mentions_parameter(bound: &TypeRef, params: &[String], depth: 
 
 /// Prove a nominal upper bound without gradual compatibility or name-only subtype guesses.
 /// Instantiated arguments remain exact; incomplete or conflicting inheritance paths stay unknown.
-pub(crate) fn receiver_satisfies_upper_bound(index: &dyn InferenceIndex, actual: &Type, bound: &Type) -> bool {
+pub(crate) fn receiver_satisfies_upper_bound(
+    index: &dyn InferenceIndex,
+    actual: &Type,
+    bound: &Type,
+) -> bool {
     if !receiver_arguments_known(index, actual, 0)
         || !receiver_arguments_known(index, bound, 0)
         || (actual.is_nullable() && !bound.is_nullable())
@@ -5440,7 +5718,9 @@ fn receiver_shape_is_known(index: &dyn InferenceIndex, actual: &Type) -> bool {
     if let Type::Raw(nominal) = actual {
         return matches!(nominal.as_ref(), Type::Class { args, .. } if args.is_empty())
             && type_declaration_parameters(index, nominal).is_some()
-            && nominal.owner().is_none_or(|owner| receiver_shape_is_known(index, owner));
+            && nominal
+                .owner()
+                .is_none_or(|owner| receiver_shape_is_known(index, owner));
     }
     if let Some(declaration) = type_declaration_shape(index, actual) {
         return declaration.sym.type_params.len() == actual.args().len()
@@ -5749,9 +6029,12 @@ pub fn direct_supertypes(index: &dyn InferenceIndex, ty: &Type) -> Vec<Type> {
         let Some(scopes) = raw_erasure_scopes(index, ty, None, members::CallMode::Java) else {
             return vec![Type::Unknown];
         };
-        return declaration.sym.supertype_refs.iter().map(|tr| {
-            erase_type_ref(index, tr, &scopes, 0, &mut Vec::new(), 0)
-        }).collect();
+        return declaration
+            .sym
+            .supertype_refs
+            .iter()
+            .map(|tr| erase_type_ref(index, tr, &scopes, 0, &mut Vec::new(), 0))
+            .collect();
     }
     if let Type::Parameter { upper_bounds, .. } = ty {
         return upper_bounds.clone();
@@ -6061,6 +6344,98 @@ mod tests {
     use super::named_type_params;
     use crate::index::{Index, Tier};
     use crate::symbol::{IndexedSymbol, SymbolKind};
+
+    #[test]
+    fn string_concatenation_rule_distinguishes_modes_and_unproven_operands() {
+        use super::{
+            string_concatenation_type as concatenate,
+            StringConcatenationOperand::{Null, Value},
+        };
+        use crate::members::CallMode::{Java, Kotlin};
+        use crate::types::Type;
+        let string_concatenation_type =
+            |mode, left: &Type, right: &Type| concatenate(mode, Value(left), Value(right));
+        let kotlin_string = Type::class("String", Some("kotlin".into()));
+        let java_string = Type::class("String", Some("java.lang".into()));
+        let kotlin_int = Type::class("Int", Some("kotlin".into()));
+        let java_int = Type::class("int", None);
+        assert_eq!(
+            string_concatenation_type(Kotlin, &kotlin_string, &kotlin_int),
+            Some(kotlin_string.clone())
+        );
+        assert_eq!(
+            string_concatenation_type(Kotlin, &java_string, &kotlin_int),
+            Some(java_string.clone())
+        );
+        assert_eq!(
+            string_concatenation_type(Java, &java_string, &java_int),
+            Some(java_string.clone())
+        );
+        assert_eq!(
+            string_concatenation_type(Java, &java_int, &java_string),
+            Some(java_string.clone())
+        );
+        assert!(string_concatenation_type(Kotlin, &kotlin_int, &kotlin_string).is_none());
+        for (mode, string, scalar) in [
+            (Kotlin, kotlin_string, kotlin_int),
+            (Java, java_string, java_int),
+        ] {
+            for unproven in [
+                Type::Unknown,
+                Type::class("void", None),
+                Type::class("Missing", None),
+            ] {
+                assert!(string_concatenation_type(mode, &string, &unproven).is_none());
+                assert!(string_concatenation_type(mode, &unproven, &scalar).is_none());
+            }
+            for value in [
+                Type::class("Object", Some("java.lang".into())),
+                Type::class("Any", Some("kotlin".into())).with_nullability(true),
+                Type::class("Nothing", Some("kotlin".into())).with_nullability(true),
+                Type::class("Unit", Some("kotlin".into())),
+                Type::class("UInt", Some("kotlin".into())),
+                Type::class("String", Some("custom".into())),
+                Type::class("Box", Some("custom".into())),
+                Type::class("Integer", Some("java.lang".into())).with_nullability(true),
+            ] {
+                assert_eq!(
+                    string_concatenation_type(mode, &string, &value),
+                    Some(string.clone())
+                );
+                if mode == Kotlin {
+                    assert!(
+                        string_concatenation_type(mode, &value, &string).is_none(),
+                        "non-String left operands may have a different operator"
+                    );
+                } else {
+                    assert_eq!(
+                        string_concatenation_type(mode, &value, &string),
+                        Some(string.clone())
+                    );
+                }
+                assert!(string_concatenation_type(mode, &value, &scalar).is_none());
+            }
+            assert_eq!(
+                concatenate(mode, Value(&string), Null),
+                Some(string.clone())
+            );
+            assert_eq!(
+                concatenate(mode, Null, Value(&string)),
+                (mode == Java).then(|| string.clone())
+            );
+            assert!(concatenate(mode, Null, Null).is_none());
+            let char_type = Type::class(
+                if mode == Java { "char" } else { "Char" },
+                if mode == Java {
+                    None
+                } else {
+                    Some("kotlin".into())
+                },
+            );
+            assert!(string_concatenation_type(mode, &char_type, &scalar).is_none());
+            assert!(string_concatenation_type(mode, &char_type, &char_type).is_none());
+        }
+    }
 
     #[test]
     fn receiver_lambda_roles_preserve_unknown_and_ordinary_lambda_absence() {

@@ -875,7 +875,8 @@ pub(crate) fn type_scope(tree: &Tree, src: &str) -> TypeScope {
         &package_of(tree, src),
         inference_imports(tree, src),
         &["java.lang"],
-    ).with_java_syntax()
+    )
+    .with_java_syntax()
 }
 
 /// A parsed Java import statement. Static imports are ignored for now.
@@ -3721,6 +3722,35 @@ fn receiver_type(
             object.named_child(0)?,
             initializer_depth + 1,
         ),
+        "binary_expression"
+            if object
+                .child_by_field_name("operator")
+                .map(|node| node_text(node, src))
+                == Some("+") =>
+        {
+            // An AST null is a known operand, distinct from a type we failed to resolve.
+            let operand = |node: Node<'_>| {
+                if node.kind() == "null_literal" {
+                    Some(None)
+                } else {
+                    java_argument_type(index, file, src, tree, node, initializer_depth + 1)
+                        .map(Some)
+                }
+            };
+            let left = operand(object.child_by_field_name("left")?)?;
+            let right = operand(object.child_by_field_name("right")?)?;
+            infer::string_concatenation_type(
+                ktcore::members::CallMode::Java,
+                left.as_ref().map_or(
+                    infer::StringConcatenationOperand::Null,
+                    infer::StringConcatenationOperand::Value,
+                ),
+                right.as_ref().map_or(
+                    infer::StringConcatenationOperand::Null,
+                    infer::StringConcatenationOperand::Value,
+                ),
+            )
+        }
         "array_creation_expression" => {
             if object.has_error() {
                 return None;
@@ -3914,7 +3944,14 @@ fn java_inherited_field_receiver(
                         && implicit_receiver_kind(object, src) == ReceiverKind::Value)
             {
                 if let Some(value) = &field.sym.value_type {
-                    let ty = infer::declared_member_type(index, &enclosing, field, value, ktcore::members::CallMode::Java, &ctx);
+                    let ty = infer::declared_member_type(
+                        index,
+                        &enclosing,
+                        field,
+                        value,
+                        ktcore::members::CallMode::Java,
+                        &ctx,
+                    );
                     return Some(ty);
                 }
             }
@@ -4032,10 +4069,12 @@ fn java_member_receiver(
             receiver_type(index, file, src, tree, object, initializer_depth)
                 .map(|receiver| (receiver, ReceiverKind::Value))
         }
-        "object_creation_expression" | "method_invocation" | "class_literal" => {
-            receiver_type(index, file, src, tree, object, initializer_depth)
-                .map(|receiver| (receiver, ReceiverKind::Value))
-        }
+        "object_creation_expression"
+        | "method_invocation"
+        | "class_literal"
+        | "parenthesized_expression"
+        | "binary_expression" => receiver_type(index, file, src, tree, object, initializer_depth)
+            .map(|receiver| (receiver, ReceiverKind::Value)),
         "this" | "super" => receiver_type(index, file, src, tree, object, initializer_depth)
             .map(|receiver| (receiver, implicit_receiver_kind(call, src))),
         _ => receiver_type(index, file, src, tree, object, initializer_depth)
@@ -4669,8 +4708,15 @@ fn java_method_invocation_return_type(
             continue;
         }
         let declared = infer::function_return_type_ref(index, &entry)?;
-        let ty =
-            infer::declared_member_call_type(index, &receiver, &entry, &declared, &arguments, ktcore::members::CallMode::Java, &ctx);
+        let ty = infer::declared_member_call_type(
+            index,
+            &receiver,
+            &entry,
+            &declared,
+            &arguments,
+            ktcore::members::CallMode::Java,
+            &ctx,
+        );
         let ty = ktcore::jvm::string_result_for_call_mode(
             index,
             ty,
@@ -6176,13 +6222,12 @@ mod tests {
                     ktcore::jvm::ReceiverKind::Value
                 ))
             );
-            let query = completion_query(&index, file, source, &tree, at + "getN".len(), 100).unwrap();
-            assert!(
-                query
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.label == "getName")
-            );
+            let query =
+                completion_query(&index, file, source, &tree, at + "getN".len(), 100).unwrap();
+            assert!(query
+                .candidates
+                .iter()
+                .any(|candidate| candidate.label == "getName"));
             let definition = index.lookup_by_name("getName").into_iter().next().unwrap();
             assert_eq!(
                 goto_definition(&index, file, source, &tree, at),
@@ -6208,12 +6253,10 @@ mod tests {
         );
         let at = start + expression.len() + 1;
         let query = completion_query(&index, file, source, &tree, at + "boxO".len(), 100).unwrap();
-        assert!(
-            query
-                .candidates
-                .iter()
-                .any(|candidate| candidate.label == "boxOnly")
-        );
+        assert!(query
+            .candidates
+            .iter()
+            .any(|candidate| candidate.label == "boxOnly"));
         let definition = index.lookup_by_name("boxOnly").into_iter().next().unwrap();
         assert_eq!(
             goto_definition(&index, file, source, &tree, at),

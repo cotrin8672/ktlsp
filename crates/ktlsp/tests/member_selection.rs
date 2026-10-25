@@ -17,6 +17,51 @@ const OVERLOAD_KOTLIN: &str = "/selection/typed/KotlinUse.kt";
 const OVERLOAD_USE: &str = "package typed; class JavaUse { void run(Target target, Decoy decoy, int number, String text) { target.twice(1); target.twice(\"x\"); target.twice(number); target.twice(text); decoy.twice(\"x\"); } }";
 
 #[test]
+fn string_concatenation_has_typed_java_kotlin_completion_and_goto() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Object.java",
+        "package java.lang; public class Object {}".into(),
+    );
+    ws.open("String.java", "package java.lang; public final class String { public String substring(int start) { return this; } }".into());
+    ws.open(
+        "Builtins.kt",
+        "package kotlin\nopen class Any\nobject Unit\n".into(),
+    );
+    for (file, source, member, call, prefix, target_file) in [
+        ("Concat.java", "package concat; class Concat { String use(int count) { return (\"prefix\" + count).substring(1); } }", "substring", "(\"prefix\" + count).substring(1)", "(\"prefix\" + count).sub", "String.java"),
+        ("Concat.kt", "package concat\nfun String.stringOnly(): Int = 1\nfun use(count: Int): Int = (\"prefix\" + count).stringOnly()\n", "stringOnly", "(\"prefix\" + count).stringOnly()", "(\"prefix\" + count).stringO", "Concat.kt"),
+        ("Reference.java", "package concat; class Reference { String use(Object value) { return (\"prefix\" + value).substring(1); } }", "substring", "(\"prefix\" + value).substring(1)", "(\"prefix\" + value).sub", "String.java"),
+        ("Null.java", "package concat; class Null { String use() { return (\"prefix\" + null).substring(1); } }", "substring", "(\"prefix\" + null).substring(1)", "(\"prefix\" + null).sub", "String.java"),
+        ("Reference.kt", "package concat\nfun useAny(value: Any?): String = (\"prefix\" + value).substring(1)\n", "substring", "(\"prefix\" + value).substring(1)", "(\"prefix\" + value).sub", "String.java"),
+        ("Null.kt", "package concat\nfun useNull(): String = (\"prefix\" + null).substring(1)\n", "substring", "(\"prefix\" + null).substring(1)", "(\"prefix\" + null).sub", "String.java"),
+        ("Unit.kt", "package concat\nfun useUnit(value: Unit): String = (\"prefix\" + value).substring(1)\n", "substring", "(\"prefix\" + value).substring(1)", "(\"prefix\" + value).sub", "String.java"),
+    ] {
+        ws.open(file, source.into());
+        let target = ws
+            .index
+            .lookup_by_name(member)
+            .iter()
+            .find(|entry| entry.path.as_ref() == target_file)
+            .map(|entry| Def {
+                file: target_file.into(),
+                start_byte: entry.sym.start_byte,
+                end_byte: entry.sym.end_byte,
+            })
+            .unwrap();
+        assert!(labels(&mut ws, file, prefix).contains(member));
+        assert_eq!(goto(&mut ws, file, call), vec![target]);
+        let changed = source.replace("\"prefix\"", "1");
+        ws.change(file, changed);
+        assert!(
+            !labels(&mut ws, file, &prefix.replace("\"prefix\"", "1")).contains(member),
+            "numeric operands must not acquire String members"
+        );
+        assert!(goto(&mut ws, file, &call.replace("\"prefix\"", "1")).is_empty());
+    }
+}
+
+#[test]
 fn java_generic_overrides_and_projected_overloads_select_declared_class_argument() {
     // simple-xml 2.7.1 Persister's binary signatures. Javac 21 independently selects
     // read:(Class,String)Object, rather than the generic read:(Object,String)Object.
@@ -33,8 +78,14 @@ fn java_generic_overrides_and_projected_overloads_select_declared_class_argument
         ),
         ("File.java", "package java.io; public class File {}"),
         ("Reader.java", "package java.io; public class Reader {}"),
-        ("InputStream.java", "package java.io; public class InputStream {}"),
-        ("InputNode.java", "package stream; public interface InputNode {}"),
+        (
+            "InputStream.java",
+            "package java.io; public class InputStream {}",
+        ),
+        (
+            "InputNode.java",
+            "package stream; public interface InputNode {}",
+        ),
     ] {
         ws.open(file, source.into());
     }
@@ -47,7 +98,9 @@ fn java_generic_overrides_and_projected_overloads_select_declared_class_argument
         "Serializer.java",
         format!(
             "package api; public interface Serializer {{ {} }}",
-            signatures.replace(" { throw null; }", ";").replace('T', "U")
+            signatures
+                .replace(" { throw null; }", ";")
+                .replace('T', "U")
         ),
     );
     ws.open(
@@ -78,7 +131,10 @@ fn java_generic_overrides_and_projected_overloads_select_declared_class_argument
     );
     // The actual runtime also indexes stdlib: String has unrelated variant ancestors.
     ws.open("Builtins.kt", "package kotlin\nopen class Any\ninterface Comparable<in T>\ninterface CharSequence\nclass String : Comparable<String>, CharSequence\n".into());
-    assert_eq!(goto(&mut ws, "Use.java", "p.read(type, text)"), vec![expected.clone()]);
+    assert_eq!(
+        goto(&mut ws, "Use.java", "p.read(type, text)"),
+        vec![expected.clone()]
+    );
     // Unknown actuals must not let one generic overload win by its declaration shape alone.
     ws.change(
         "Use.java",
@@ -98,12 +154,22 @@ fn java_generic_overrides_and_projected_overloads_select_declared_class_argument
     ] {
         ws.open("Bounds.kt", format!("package api\ninterface Base {{ {parent} }}\nclass Child : Base {{ override {child} {{}} }}\n"));
         let declarations = ws.index.lookup_by_name("f");
-        let base = declarations.iter().find(|entry| entry.sym.container.as_deref() == Some("Base")).unwrap();
-        let child = declarations.iter().find(|entry| entry.sym.container.as_deref() == Some("Child")).unwrap();
+        let base = declarations
+            .iter()
+            .find(|entry| entry.sym.container.as_deref() == Some("Base"))
+            .unwrap();
+        let child = declarations
+            .iter()
+            .find(|entry| entry.sym.container.as_deref() == Some("Child"))
+            .unwrap();
         assert!(!ktcore::members::inherited_method_relation(
-            &ws.index, &Type::class("Child", Some("api".into())), child, base,
+            &ws.index,
+            &Type::class("Child", Some("api".into())),
+            child,
+            base,
             &FileCtx::new("api".into(), Vec::new())
-        ).is_found());
+        )
+        .is_found());
     }
 }
 
@@ -2338,12 +2404,10 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
             .as_object_mut()
             .unwrap()
             .remove("kotlin_parameters");
-        assert!(
-            serde_json::from_value::<IndexedSymbol>(absent_names)
-                .unwrap()
-                .kotlin_parameters
-                .is_none()
-        );
+        assert!(serde_json::from_value::<IndexedSymbol>(absent_names)
+            .unwrap()
+            .kotlin_parameters
+            .is_none());
         let mut absent_facts = value.clone();
         absent_facts
             .as_object_mut()
@@ -2356,19 +2420,16 @@ fn receiver_storage_preserves_inline_symbol_cache_wire() {
         defaulted.source_member = Default::default();
         defaulted.method_type_bounds = None;
         defaulted.type_parameter_bounds = None;
-        assert!(
-            serde_json::from_value::<IndexedSymbol>(value.clone())
-                .unwrap()
-                .type_parameter_bounds
-                .is_none()
-        );
+        assert!(serde_json::from_value::<IndexedSymbol>(value.clone())
+            .unwrap()
+            .type_parameter_bounds
+            .is_none());
         assert_eq!(
             serde_json::from_value::<IndexedSymbol>(value).unwrap(),
             defaulted
         );
     }
 }
-
 
 fn assert_known_leaf_binary_override(java_caller: bool) {
     use std::io::Write;
