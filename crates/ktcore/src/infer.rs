@@ -1002,9 +1002,10 @@ fn is_stable_for_narrowing(
                     && !lambda_parameter_shadowed(lambda, ident, name, src)
                     && (property_lambda_parameter_type(index, lambda, ident, name, src, ctx)
                         .is_some()
-                        || named_call_lambda_parameter_type(
+                        || call_lambda_parameter_type(
                             index,
                             lambda,
+                            name,
                             src,
                             ctx,
                             0,
@@ -1536,9 +1537,12 @@ fn lambda_param_type(
                     return Some(narrowed_type(index, ident, name, src, ctx).unwrap_or(ty));
                 }
                 if let Some(ty) =
-                    named_call_lambda_parameter_type(index, n, src, ctx, depth, child_infer)
+                    call_lambda_parameter_type(index, n, name, src, ctx, depth, child_infer)
                 {
                     return Some(narrowed_type(index, ident, name, src, ctx).unwrap_or(ty));
+                }
+                if lambda_parameter_nodes(n).is_some_and(|parameters| parameters.len() > 1) {
+                    return None;
                 }
                 return lambda_receiver_or_element(index, n, src, ctx, depth, child_infer);
             }
@@ -1561,9 +1565,10 @@ fn lambda_parameter_shadowed(lambda: Node, usage: Node, name: &str, src: &str) -
     })
 }
 
-fn named_call_lambda_parameter_type(
+fn call_lambda_parameter_type(
     index: &dyn InferenceIndex,
     lambda: Node,
+    name: &str,
     src: &str,
     ctx: &FileCtx,
     depth: usize,
@@ -1583,7 +1588,6 @@ fn named_call_lambda_parameter_type(
         src,
         synth_arg_types(index, call, src, ctx, depth, child_infer),
     );
-    arguments.names.as_ref()?;
     let usage = MemberUse::Call(arguments.clone());
     let (receiver, selection) = match callee.kind() {
         "navigation_expression" => {
@@ -1637,35 +1641,73 @@ fn named_call_lambda_parameter_type(
         }
         _ => return None,
     };
-    if selection.applicability == members::Applicability::Rejected || selection.entries.is_empty() {
+    if selection.entries.is_empty() {
         return None;
+    }
+    if selection.applicability == members::Applicability::Rejected {
+        return Some(Type::Unknown);
     }
     let mut result = None;
     for entry in selection.entries {
         if trailing_lambda_receiver_ref(index, entry, ctx).is_some() {
             return None;
         }
-        let (parameters, _) = members::function_type_signature(entry.sym.params.last()?)?;
-        let [parameter] = parameters else {
-            return None;
+        let Some((parameters, _)) = entry
+            .sym
+            .params
+            .last()
+            .and_then(members::function_type_signature)
+        else {
+            return Some(Type::Unknown);
         };
-        let ty = resolve_trailing_lambda_receiver_candidate(
+        let Some(position) = lambda_parameter_position(lambda, name, src, parameters.len()) else {
+            return Some(Type::Unknown);
+        };
+        let Some(ty) = resolve_trailing_lambda_receiver_candidate(
             index,
             entry,
-            parameter,
+            &parameters[position],
             Some(&receiver),
             &arguments,
             ctx,
             depth,
-        )?;
+        ) else {
+            return Some(Type::Unknown);
+        };
         if !constraint_type_is_known(index, &ty, 0)
             || result.as_ref().is_some_and(|previous| previous != &ty)
         {
-            return None;
+            return Some(Type::Unknown);
         }
         result = Some(ty);
     }
     result
+}
+
+fn lambda_parameter_position(lambda: Node, name: &str, src: &str, arity: usize) -> Option<usize> {
+    let Some(parameters) = lambda_parameter_nodes(lambda) else {
+        return (name == "it" && arity == 1).then_some(0);
+    };
+    if parameters.len() != arity
+        || parameters
+            .iter()
+            .any(|parameter| !matches!(parameter.kind(), "identifier" | "variable_declaration"))
+    {
+        return None;
+    }
+    parameters.iter().position(|parameter| {
+        first_ident(*parameter).is_some_and(|identifier| node_text(identifier, src) == name)
+    })
+}
+
+fn lambda_parameter_nodes(lambda: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let parameters = child_of_kind(lambda, "lambda_parameters")?;
+    let mut cursor = parameters.walk();
+    let nodes = parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| !matches!(parameter.kind(), "line_comment" | "block_comment"))
+        .collect();
+    Some(nodes)
 }
 
 /// A direct property initializer has an authored expected type without overload or call inference.
@@ -1721,26 +1763,10 @@ fn property_lambda_parameter_type(
         // Receiver/suspend function types need their source parameter roles, not flattened ABI slots.
         return None;
     }
-    let parameters = child_of_kind(lambda, "lambda_parameters");
     if lambda_parameter_shadowed(lambda, usage, name, src) {
         return None;
     }
-    let position = if let Some(parameters) = parameters {
-        let mut cursor = parameters.walk();
-        let parameters: Vec<_> = parameters.named_children(&mut cursor).collect();
-        if parameters.len() != formals.len()
-            || parameters
-                .iter()
-                .any(|parameter| !matches!(parameter.kind(), "identifier" | "variable_declaration"))
-        {
-            return None;
-        }
-        parameters.iter().position(|parameter| {
-            first_ident(*parameter).is_some_and(|identifier| node_text(identifier, src) == name)
-        })?
-    } else {
-        (name == "it" && formals.len() == 1).then_some(0)?
-    };
+    let position = lambda_parameter_position(lambda, name, src, formals.len())?;
     let bounds =
         crate::indexer::type_parameters_in_scope(declaration, src, &ctx.package, &ctx.imports);
     Some(declared_type_in_scope(
@@ -3326,7 +3352,7 @@ fn syntactic_call_arguments(call: Node, src: &str, types: Vec<Type>) -> CallArgu
             .and_then(|annotated| child_of_kind(annotated, "lambda_literal"))
             .or_else(|| child_of_kind(call, "lambda_literal"))
             .map(|lambda| {
-                let parameters = child_of_kind(lambda, "lambda_parameters").map_or(
+                let parameters = lambda_parameter_nodes(lambda).map_or(
                     if has_child_token(lambda, "->") {
                         members::LambdaParameters::Explicit(Vec::new())
                     } else {
@@ -3334,8 +3360,7 @@ fn syntactic_call_arguments(call: Node, src: &str, types: Vec<Type>) -> CallArgu
                     },
                     |parameters| {
                         let mut types = Vec::new();
-                        let mut cursor = parameters.walk();
-                        for parameter in parameters.named_children(&mut cursor) {
+                        for parameter in parameters {
                             if !matches!(parameter.kind(), "identifier" | "variable_declaration") {
                                 return members::LambdaParameters::Unknown;
                             }
@@ -3368,13 +3393,10 @@ fn normalized_call_arguments(
     if arguments.names.is_some() {
         if let Some(lambda) = &mut arguments.trailing_lambda_arguments {
             if let members::LambdaParameters::Explicit(types) = &mut lambda.parameters {
-                if let Some(parameters) = trailing_lambda_node(call)
-                    .and_then(|lambda| child_of_kind(lambda, "lambda_parameters"))
+                if let Some(parameters) =
+                    trailing_lambda_node(call).and_then(lambda_parameter_nodes)
                 {
-                    let mut cursor = parameters.walk();
-                    for (ty, parameter) in
-                        types.iter_mut().zip(parameters.named_children(&mut cursor))
-                    {
+                    for (ty, parameter) in types.iter_mut().zip(parameters) {
                         if let Some(reference) =
                             crate::indexer::value_type_of_scoped(parameter, src, None)
                         {
@@ -3492,7 +3514,8 @@ fn resolve_trailing_lambda_receiver_candidate(
     ctx: &FileCtx,
     depth: usize,
 ) -> Option<Type> {
-    let tset: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
+    let tset = member_type_parameters(index, entry);
+    let method_parameters: HashSet<_> = entry.sym.type_params.iter().cloned().collect();
     let arguments = members::bind_arguments_for_lambda_context(
         index,
         recv_ty.unwrap_or(&Type::Unknown),
@@ -3504,7 +3527,9 @@ fn resolve_trailing_lambda_receiver_candidate(
     let arg_types = arguments.arguments.types.as_slice();
     let params = arguments.params.as_ref();
     let mut subst = match recv_ty {
-        Some(receiver) if entry.sym.extension_receiver.is_some() => {
+        Some(receiver)
+            if entry.sym.extension_receiver.is_some() || entry.sym.container.is_some() =>
+        {
             receiver_type_bindings(index, receiver, entry)?
         }
         _ => HashMap::new(),
@@ -3529,7 +3554,7 @@ fn resolve_trailing_lambda_receiver_candidate(
         for (i, p) in params.iter().enumerate() {
             if let Some(a) = arg_types.get(i) {
                 let mut argument_bindings = HashMap::new();
-                solve::unify_into(p, a, &tset, &mut argument_bindings);
+                solve::unify_into(p, a, &method_parameters, &mut argument_bindings);
                 merge_type_bindings(&mut subst, argument_bindings);
             }
         }

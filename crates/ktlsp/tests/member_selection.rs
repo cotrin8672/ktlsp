@@ -17,6 +17,100 @@ const OVERLOAD_KOTLIN: &str = "/selection/typed/KotlinUse.kt";
 const OVERLOAD_USE: &str = "package typed; class JavaUse { void run(Target target, Decoy decoy, int number, String text) { target.twice(1); target.twice(\"x\"); target.twice(number); target.twice(text); decoy.twice(\"x\"); } }";
 
 #[test]
+fn callback_parameter_positions_use_declared_generic_types_and_unsaved_changes() {
+    let mut ws = Workspace::new();
+    let file = "CallbackPositions.kt";
+    let source = r#"package callback
+open class Cookie { fun cookieName155(): String = "name" }
+class ChildCookie : Cookie() { fun childOnly155(): String = "child" }
+class Batch<T>(val value: T) {
+fun forEachIndexed(block: (Int, T) -> String): String = block(0, value)
+fun single(block: (T) -> String): String = block(value)
+fun withValue(value: T, block: (T) -> String): String = block(value)
+fun <T> method(seed: T, block: (Int, T) -> String): String = block(0, seed)
+}
+fun Int.indexTag155(): String = "index"
+fun <T> visit(seed: T, block: (Int, T) -> String): String = block(0, seed)
+fun first(seed: Batch<Cookie>): String = seed.forEachIndexed { firstIndex, firstCookie -> firstIndex.indexTag155() }
+fun second(seed: Batch<Cookie>): String = seed.forEachIndexed { secondIndex, secondCookie -> secondCookie.cookieName155() }
+fun one(seed: Batch<Cookie>): String = seed.single { single -> single.cookieName155() }
+fun ordinary(seed: Cookie): String = visit(seed) { topIndex, topCookie -> topCookie.cookieName155() }
+fun named(seed: Cookie): String = visit(seed = seed) { namedIndex, namedCookie -> namedCookie.cookieName155() }
+fun commented(seed: Batch<Cookie>): String = seed.forEachIndexed { commentIndex, /* slot separator */ commentCookie -> commentCookie.cookieName155() }
+fun ignored(seed: Batch<Cookie>): String = seed.forEachIndexed { _, ignoredCookie -> ignoredCookie.cookieName155() }
+fun subtype(seed: Batch<Cookie>, child: ChildCookie): String = seed.withValue(child) { subtypeCookie -> subtypeCookie.cookieName155() }
+fun unknown(seed: Batch<Cookie>): String = seed.withValue(missing) { fixedCookie -> fixedCookie.cookieName155() }
+fun shadow(seed: Batch<Cookie>): String = seed.method(1) { methodIndex, methodValue -> methodValue.indexTag155() }
+"#;
+    ws.open(file, source.into());
+    for (prefix, member) in [
+        ("firstIndex.indexTag155", "indexTag155"),
+        ("secondCookie.cookieName155", "cookieName155"),
+        ("single.cookieName155", "cookieName155"),
+        ("topCookie.cookieName155", "cookieName155"),
+        ("namedCookie.cookieName155", "cookieName155"),
+        ("commentCookie.cookieName155", "cookieName155"),
+        ("ignoredCookie.cookieName155", "cookieName155"),
+        ("subtypeCookie.cookieName155", "cookieName155"),
+        ("fixedCookie.cookieName155", "cookieName155"),
+        ("methodValue.indexTag155", "indexTag155"),
+    ] {
+        assert!(labels(&mut ws, file, prefix).contains(member), "{prefix}");
+        let expected = target(&ws, file, member, SymbolKind::Function);
+        assert_eq!(
+            goto(&mut ws, file, &format!("{prefix}()")),
+            vec![expected],
+            "{prefix}"
+        );
+    }
+    let first = labels(&mut ws, file, "firstIndex.");
+    assert!(first.contains("indexTag155"));
+    assert!(!first.contains("cookieName155"));
+    assert!(!labels(&mut ws, file, "subtypeCookie.").contains("childOnly155"));
+    ws.change(
+        file,
+        source.replace(
+            "(Int, T) -> String): String = block(0, value)",
+            "(T, Int) -> String): String = block(value, 0)",
+        ),
+    );
+    let changed = labels(&mut ws, file, "firstIndex.");
+    assert!(changed.contains("cookieName155"));
+    assert!(!changed.contains("indexTag155"));
+}
+
+#[test]
+fn callback_ambiguous_or_unavailable_context_never_guesses_the_element_for_each_parameter() {
+    let mut ws = Workspace::new();
+    let file = "CallbackUnknown.kt";
+    ws.open(
+        file,
+        r#"package callback
+class Cookie { fun cookieName155(): String = "name" }
+class Batch<T>(val value: T) {
+fun mapIndexed(marker: Int, block: (Int, T) -> String): String = block(0, value)
+fun mapIndexed(marker: String, block: (T, Int) -> String): String = block(value, 0)
+fun indexed(block: (Int, T) -> String): String = block(0, value)
+}
+fun Int.indexTag155(): String = "index"
+fun known(cookie: Cookie): String = cookie.cookieName155()
+fun use(seed: Batch<Cookie>) {
+seed.mapIndexed(missing) { ambiguousFirst, second -> ambiguousFirst.indexTag155() }
+seed.indexed { lone -> lone.cookieName155() }
+seed.forEachIndexed { unavailableFirst, second -> unavailableFirst.cookieName155() }
+}
+"#
+        .into(),
+    );
+    assert!(labels(&mut ws, file, "cookie.cookieName155").contains("cookieName155"));
+    for prefix in ["ambiguousFirst.", "lone.", "unavailableFirst."] {
+        let members = labels(&mut ws, file, prefix);
+        assert!(!members.contains("cookieName155"), "{prefix}");
+        assert!(!members.contains("indexTag155"), "{prefix}");
+    }
+}
+
+#[test]
 fn standard_kotlin_arithmetic_uses_declared_overload_results_for_direct_and_local_receivers() {
     let mut ws = Workspace::new();
     // Selected kotlin-stdlib Primitives.kt/Char.kt signatures, including widening overloads.
@@ -661,11 +755,11 @@ fn java_nested_argument_types_preserve_their_declared_owner() {
 }
 
 #[test]
-fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
+fn java_widening_selects_known_primitive_while_boxing_stays_unknown() {
     use ktcore::members::{Applicability, CallArguments};
     let mut ws = Workspace::new();
     ws.open("/selection/typed/Target.java", "package typed; class Target { void widen(long value) {} void widen(String value) {} void box(Integer value) {} void box(String value) {} void boxRef(java.io.Serializable value) {} void boxRef(String value) {} }".into());
-    // Reduced declarations make the reference identities known without implementing conversions.
+    // Reduced declarations make reference identities known; boxing conversions remain unproven.
     ws.open(
         "/selection/java/lang/Integer.java",
         "package java.lang; class Integer {}".into(),
@@ -684,7 +778,11 @@ fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
         trailing_lambda: false,
         trailing_lambda_arguments: None,
     };
-    for name in ["widen", "box", "boxRef"] {
+    for (name, expected) in [
+        ("widen", Applicability::Applicable),
+        ("box", Applicability::Unknown),
+        ("boxRef", Applicability::Unknown),
+    ] {
         let selected = ktcore::jvm::select_call(
             &ws.index,
             &receiver,
@@ -693,7 +791,7 @@ fn java_widening_and_boxing_candidates_keep_unknown_applicability() {
             &args,
             &ctx,
         );
-        assert_eq!(selected.applicability, Applicability::Unknown, "{name}");
+        assert_eq!(selected.applicability, expected, "{name}");
         assert_eq!(selected.navigation_candidates().len(), 1, "{name}");
         assert_ne!(selected.candidates[0].params()[0].name, "String");
     }

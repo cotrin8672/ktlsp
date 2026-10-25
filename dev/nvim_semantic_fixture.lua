@@ -11,6 +11,7 @@
 -- - Imported extension aliases through unsaved rebind, references, and applied rename
 -- - Function-local extensions through unsaved declaration changes and sibling scope exclusion
 -- - Kotlin where/Java intersection bounds through unsaved swap, removal, and restoration
+-- - Declared callback parameter positions and generic receiver bindings, with typed controls
 
 local script_dir = vim.fs.dirname(debug.getinfo(1, "S").source:sub(2))
 local probe = dofile(script_dir .. "/nvim_lsp_probe.lua")
@@ -31,6 +32,7 @@ local files = {
   cleaner = root .. "/probe/cleaner/CleanerProbe.kt",
   invitations = root .. "/probe/invitations/InvitationsApi.kt",
   kmp = root .. "/feature/src/jvmMain/kotlin/probe/kmp/KmpProbe.kt",
+  callbacks = root .. "/probe/callbacks/CallbackPositions.kt",
 }
 
 local failures = {}
@@ -135,6 +137,38 @@ local ready = vim.wait(10000, function()
   return labels.email == true
 end, 200)
 check("semantic probe warmed", ready)
+
+do
+  local b, path = bufs.callbacks, files.callbacks
+  local lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+  local records = {}
+  for _, case in ipairs({
+    { "index.indexOnlyCallback()", "indexOnlyCallback", "fun Int.indexOnlyCallback()", "cookieOnlyCallback" },
+    { "cookie.cookieOnlyCallback()", "cookieOnlyCallback", "fun cookieOnlyCallback()", "indexOnlyCallback" },
+    { "typedIndex.indexOnlyCallback()", "indexOnlyCallback", "fun Int.indexOnlyCallback()", "cookieOnlyCallback" },
+    { "typedCookie.cookieOnlyCallback()", "cookieOnlyCallback", "fun cookieOnlyCallback()", "indexOnlyCallback" },
+  }) do
+    local position = probe.find(lines, case[1], case[2])
+    local _, expected = probe.find(lines, case[3], case[2])
+    for _, method in ipairs({ "textDocument/completion", "textDocument/definition" }) do
+      local params = { textDocument = { uri = vim.uri_from_bufnr(b) }, position = position }
+      if method == "textDocument/completion" then params.context = { triggerKind = 1 } end
+      local reply, err = client:request_sync(method, params, 5000, b)
+      local result = reply and reply.result
+      local matched = reply ~= nil and reply.err == nil and (method == "textDocument/completion"
+        and probe.completion_has(result, case[2]) and not probe.completion_has(result, case[4])
+        or method == "textDocument/definition" and probe.exact_definition(result, path, { expected }))
+      check("callback first response " .. case[1] .. " " .. method, matched,
+        reply and reply.err and tostring(reply.err) or err)
+      records[#records + 1] = { case = case[1], method = method, params = params, attempts = 1,
+        response_received = reply ~= nil, matched = not not matched, result = result, error = err }
+    end
+  end
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode({ requests = records, buffer_lines_sha256 = vim.fn.sha256(table.concat(lines, "\n")) }) },
+      arg[3] .. "/callback-positions.json")
+  end
+end
 
 do
   local b = open_file(files.invitations)

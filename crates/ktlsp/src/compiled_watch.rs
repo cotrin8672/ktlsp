@@ -11,7 +11,7 @@ use std::sync::{
 use tokio::sync::mpsc;
 
 const MAX_WATCH_DIRS: usize = 512;
-const MAX_INPUT_PATHS: usize = 4096;
+pub(crate) const MAX_INPUT_PATHS: usize = 4096;
 const MAX_DIRECTORY_ENTRIES: usize = 20_000;
 
 fn key(path: &Path) -> String {
@@ -26,6 +26,7 @@ fn key(path: &Path) -> String {
 #[derive(Clone, Default)]
 pub(crate) struct WatchPlan {
     directories: BTreeSet<PathBuf>,
+    recursive: BTreeSet<PathBuf>,
     exact: BTreeSet<String>,
     trees: BTreeSet<String>,
     ancestors: BTreeSet<String>,
@@ -61,7 +62,7 @@ impl WatchPlan {
                 .filter(|p| path_under(p, &project)),
         );
         // The parent guards replacement/deletion of the project root, not its contents.
-        plan.guard_parents(&request.root)?;
+        plan.guard_parents(&request.root, false)?;
         plan.ancestors.insert(project.clone());
         anyhow::ensure!(inputs.len() <= MAX_INPUT_PATHS, "compiler-native-input-cap");
         for input in inputs {
@@ -109,7 +110,7 @@ impl WatchPlan {
             );
             plan.memberships.insert(key(directory));
             plan.add_directory(directory)?;
-            plan.guard_parents(directory)?;
+            plan.guard_parents(directory, true)?;
         }
         Ok(plan)
     }
@@ -118,6 +119,10 @@ impl WatchPlan {
     /// succeeds, a current read traversal may not rely on a directory omitted during planning.
     pub(crate) fn includes_directory_watch(&self, path: &Path) -> bool {
         self.directories.contains(path)
+            || self
+                .recursive
+                .iter()
+                .any(|root| path_under(&key(path), &key(root)))
     }
 
     pub(crate) fn covers_read(&self, path: &str, directory: bool) -> bool {
@@ -161,8 +166,11 @@ impl WatchPlan {
         } else {
             self.exact.insert(key(path));
         }
-        self.guard_parents(path)?;
+        self.guard_parents(path, metadata.as_ref().is_some_and(|m| m.is_dir()))?;
         if metadata.as_ref().is_some_and(|m| m.is_dir()) {
+            // Windows recursion uses one native handle; retain other backends' per-directory bound.
+            #[cfg(windows)]
+            self.add_recursive_directory(path)?;
             let outputs = self.delegated_outputs.clone();
             for (n, entry) in walkdir::WalkDir::new(path)
                 .follow_links(false)
@@ -173,6 +181,7 @@ impl WatchPlan {
                 anyhow::ensure!(n < MAX_DIRECTORY_ENTRIES, "compiler-watch-directory-cap");
                 let entry = entry?;
                 anyhow::ensure!(!entry.file_type().is_symlink(), "compiler-watch-symlink");
+                #[cfg(not(windows))]
                 if entry.file_type().is_dir() {
                     self.add_directory(entry.path())?;
                 }
@@ -181,9 +190,19 @@ impl WatchPlan {
         Ok(())
     }
 
-    fn guard_parents(&mut self, path: &Path) -> anyhow::Result<()> {
-        // Also watch each existing parent nonrecursively: parent removal/rename can otherwise
-        // make a child watch silently disappear. Missing-ancestor arrival invalidates the receipt.
+    fn guard_parents(&mut self, path: &Path, native_at_path: bool) -> anyhow::Result<()> {
+        // Windows cannot rename higher ancestors while a watched child directory is open.
+        // Keep the closest watch and its own rename guard; still validate every logical ancestor.
+        let guard_limit = if cfg!(windows) {
+            if native_at_path {
+                1
+            } else {
+                2
+            }
+        } else {
+            usize::MAX
+        };
+        let mut guarded = 0;
         for parent in path.ancestors().skip(1) {
             self.ancestors.insert(key(parent));
             match std::fs::symlink_metadata(parent) {
@@ -193,7 +212,10 @@ impl WatchPlan {
                         "compiler-watch-parent-symlink"
                     );
                     anyhow::ensure!(metadata.is_dir(), "compiler-watch-parent-not-directory");
-                    self.add_directory(parent)?;
+                    if guarded < guard_limit {
+                        self.add_directory(parent)?;
+                        guarded += 1;
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -203,7 +225,35 @@ impl WatchPlan {
     }
 
     fn add_directory(&mut self, path: &Path) -> anyhow::Result<()> {
+        if self
+            .recursive
+            .iter()
+            .any(|root| path_under(&key(path), &key(root)))
+        {
+            return Ok(());
+        }
         self.directories.insert(path.to_path_buf());
+        anyhow::ensure!(
+            self.directories.len() <= MAX_WATCH_DIRS,
+            "compiler-native-watch-cap"
+        );
+        Ok(())
+    }
+
+    fn add_recursive_directory(&mut self, path: &Path) -> anyhow::Result<()> {
+        if self
+            .recursive
+            .iter()
+            .any(|root| path_under(&key(path), &key(root)))
+        {
+            return Ok(());
+        }
+        self.directories
+            .retain(|directory| !path_under(&key(directory), &key(path)));
+        self.recursive
+            .retain(|directory| !path_under(&key(directory), &key(path)));
+        self.directories.insert(path.to_owned());
+        self.recursive.insert(path.to_owned());
         anyhow::ensure!(
             self.directories.len() <= MAX_WATCH_DIRS,
             "compiler-native-watch-cap"
@@ -218,6 +268,9 @@ impl WatchPlan {
         self.memberships.extend(next.memberships);
         self.delegated_sources.extend(next.delegated_sources);
         self.delegated_outputs.extend(next.delegated_outputs);
+        for directory in &next.recursive {
+            self.add_recursive_directory(directory)?;
+        }
         for directory in next.directories {
             self.add_directory(&directory)?;
         }
@@ -317,6 +370,46 @@ impl Signal {
             .map_or(true, |event| plan.read().affected(event))
         {
             tracing::debug!(?event, "compiler receipt invalidated by native watch");
+            if !self.invalid.load(Ordering::Acquire) {
+                let (kind, rescan, path_count, paths, error) = match &event {
+                    Ok(event) => (
+                        Some(format!("{:?}", event.kind)),
+                        event.need_rescan(),
+                        event.paths.len(),
+                        event
+                            .paths
+                            .iter()
+                            .take(4)
+                            .map(|path| {
+                                path.to_string_lossy().chars().take(512).collect::<String>()
+                            })
+                            .collect::<Vec<_>>(),
+                        None,
+                    ),
+                    Err(error) => (
+                        None,
+                        false,
+                        0,
+                        Vec::new(),
+                        Some(error.to_string().chars().take(512).collect::<String>()),
+                    ),
+                };
+                let read_hint = {
+                    let plan = plan.read();
+                    plan.exact
+                        .iter()
+                        .next()
+                        .or_else(|| plan.trees.iter().next())
+                        .map(|path| path.chars().take(512).collect::<String>())
+                };
+                crate::trace::span(
+                    "compiler.native_watch_invalidated",
+                    "compiler",
+                    std::time::Instant::now(),
+                    serde_json::json!({"read_hint":read_hint,"kind":kind,"rescan":rescan,
+                        "path_count":path_count,"paths":paths,"error":error}),
+                );
+            }
             self.invalidate();
         }
     }
@@ -324,11 +417,22 @@ impl Signal {
 
 pub(crate) struct NativeInputWatch {
     watcher: Mutex<Option<RecommendedWatcher>>,
+    recursive_watcher: Mutex<Option<RecommendedWatcher>>,
     plan: Arc<RwLock<WatchPlan>>,
     signal: Arc<Signal>,
 }
 
 impl NativeInputWatch {
+    fn watcher(
+        signal: &Arc<Signal>,
+        plan: &Arc<RwLock<WatchPlan>>,
+    ) -> anyhow::Result<RecommendedWatcher> {
+        let signal = signal.clone();
+        let plan = plan.clone();
+        Ok(notify::recommended_watcher(move |event| {
+            signal.event(&plan, event)
+        })?)
+    }
     pub(crate) fn new(
         invalid: Arc<AtomicBool>,
         plan: WatchPlan,
@@ -340,45 +444,126 @@ impl NativeInputWatch {
             wake,
         });
         let shared = Arc::new(RwLock::new(plan.clone()));
-        let callback_signal = signal.clone();
-        let callback_plan = shared.clone();
-        let mut watcher = match notify::recommended_watcher(move |event| {
-            callback_signal.event(&callback_plan, event)
-        }) {
+        let mut watcher = match Self::watcher(&signal, &shared) {
             Ok(watcher) => watcher,
             Err(error) => {
                 signal.invalidate();
                 return Err(error.into());
             }
         };
+        let mut recursive_watcher = if plan.recursive.is_empty() {
+            None
+        } else {
+            match Self::watcher(&signal, &shared) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    signal.invalidate();
+                    return Err(error);
+                }
+            }
+        };
         for directory in &plan.directories {
-            if let Err(error) = watcher.watch(directory, RecursiveMode::NonRecursive) {
+            let result = if plan.recursive.contains(directory) {
+                recursive_watcher
+                    .as_mut()
+                    .unwrap()
+                    .watch(directory, RecursiveMode::Recursive)
+            } else {
+                watcher.watch(directory, RecursiveMode::NonRecursive)
+            };
+            if let Err(error) = result {
                 signal.invalidate();
                 return Err(error.into());
             }
         }
+        crate::trace::span(
+            "compiler.native_watch_plan",
+            "compiler",
+            std::time::Instant::now(),
+            serde_json::json!({"directories":plan.directories.len(), "recursive_read_trees":plan.recursive.len(), "limit":MAX_WATCH_DIRS}),
+        );
         Ok(Arc::new(Self {
             watcher: Mutex::new(Some(watcher)),
+            recursive_watcher: Mutex::new(recursive_watcher),
             plan: shared,
             signal,
         }))
     }
 
     pub(crate) fn extend(&self, next: WatchPlan) -> anyhow::Result<()> {
-        let previous = self.plan.read().directories.clone();
+        let previous = self.plan.read().clone();
         let mut merged = self.plan.read().clone();
         merged.merge(next)?;
+        let new_recursive: Vec<_> = merged
+            .recursive
+            .difference(&previous.recursive)
+            .cloned()
+            .collect();
+        let new_shallow: Vec<_> = merged
+            .directories
+            .iter()
+            .filter(|directory| {
+                !merged.recursive.contains(*directory) && !previous.directories.contains(*directory)
+            })
+            .cloned()
+            .collect();
+        // Arm replacement coverage before retiring old handles; never cross the native resource cap.
+        if previous.directories.len() + new_recursive.len() + new_shallow.len() > MAX_WATCH_DIRS {
+            self.signal.invalidate();
+            anyhow::bail!("compiler-native-watch-cap");
+        }
         *self.plan.write() = merged.clone();
         let mut guard = self.watcher.lock();
         let watcher = guard
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("compiler-watch-closed"))?;
-        for directory in merged.directories.difference(&previous) {
+        let mut recursive_guard = self.recursive_watcher.lock();
+        if !new_recursive.is_empty() && recursive_guard.is_none() {
+            match Self::watcher(&self.signal, &self.plan) {
+                Ok(watcher) => *recursive_guard = Some(watcher),
+                Err(error) => {
+                    self.signal.invalidate();
+                    return Err(error);
+                }
+            }
+        }
+        for directory in &new_recursive {
+            if let Err(error) = recursive_guard
+                .as_mut()
+                .unwrap()
+                .watch(directory, RecursiveMode::Recursive)
+            {
+                self.signal.invalidate();
+                return Err(error.into());
+            }
+        }
+        for directory in &new_shallow {
             if let Err(error) = watcher.watch(directory, RecursiveMode::NonRecursive) {
                 self.signal.invalidate();
                 return Err(error.into());
             }
         }
+        for directory in &previous.directories {
+            if !merged.directories.contains(directory)
+                || (!previous.recursive.contains(directory) && merged.recursive.contains(directory))
+            {
+                let result = if previous.recursive.contains(directory) {
+                    recursive_guard.as_mut().unwrap().unwatch(directory)
+                } else {
+                    watcher.unwatch(directory)
+                };
+                if let Err(error) = result {
+                    self.signal.invalidate();
+                    return Err(error.into());
+                }
+            }
+        }
+        crate::trace::span(
+            "compiler.native_watch_plan",
+            "compiler",
+            std::time::Instant::now(),
+            serde_json::json!({"directories":merged.directories.len(), "recursive_read_trees":merged.recursive.len(), "limit":MAX_WATCH_DIRS}),
+        );
         Ok(())
     }
 
@@ -387,8 +572,10 @@ impl NativeInputWatch {
         self.signal.invalidate();
         self.signal.closed.store(true, Ordering::Release);
         let watcher = self.watcher.lock().take();
+        let recursive_watcher = self.recursive_watcher.lock().take();
         // Never join the notify thread from its callback or while holding Workspace's mutex.
         drop(watcher);
+        drop(recursive_watcher);
     }
 }
 
@@ -551,8 +738,108 @@ mod tests {
         assert!(invalid.load(Ordering::Acquire));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn finite_external_directory_plan_has_only_immediate_native_watches() {
+    #[ignore = "requires genuine KTLSP_WATCH_INPUT_SNAPSHOT recipe inputs"]
+    fn selected_compiler_physical_registration_counts() {
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var_os("KTLSP_WATCH_INPUT_SNAPSHOT").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["schema"], 1);
+        for (name, recipe) in snapshot["recipes"].as_object().unwrap() {
+            let inputs: Vec<PathBuf> = serde_json::from_value(recipe["inputs"].clone()).unwrap();
+            let plan = WatchPlan::read_inputs(&inputs).unwrap();
+            let mut previous = plan.clone();
+            for input in &inputs {
+                assert!(plan.covers_read(&crate::paths::file_key(input), input.is_dir()));
+                for parent in input.ancestors().skip(1) {
+                    assert!(plan.ancestors.contains(&key(parent)));
+                    if parent.is_dir() {
+                        previous.add_directory(parent).unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                previous.directories.len() as u64,
+                recipe["old_native_directories"].as_u64().unwrap()
+            );
+            assert!(plan.directories.len() < previous.directories.len());
+            eprintln!(
+                "native_watch_registration_measurement {}",
+                serde_json::json!({
+                "recipe":name,"inputs":inputs.len(),"before":previous.directories.len(),
+                "after":plan.directories.len(),"recursive_read_trees":plan.recursive.len(),
+                "logical_readset_preserved":true})
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_parent_guards_preserve_negative_reads_and_root_replacements() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-parent-guards-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parent = root.join("a");
+        let directory = parent.join("b");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("Input.java");
+        std::fs::write(&file, b"input").unwrap();
+        let missing = directory.join("missing/input.json");
+        for input in [&file, &missing] {
+            let plan = WatchPlan::read_inputs(&[input.clone()]).unwrap();
+            assert_eq!(
+                plan.directories,
+                BTreeSet::from([directory.clone(), parent.clone()])
+            );
+            assert_eq!(plan.ancestors, input.ancestors().skip(1).map(key).collect());
+            let arriving = if input == &missing {
+                directory.join("missing")
+            } else {
+                file.clone()
+            };
+            assert!(
+                plan.affected(&Event::new(EventKind::Create(CreateKind::Any)).add_path(arriving))
+            );
+            assert!(plan.affected(
+                &Event::new(EventKind::Modify(ModifyKind::Name(
+                    notify::event::RenameMode::From
+                )))
+                .add_path(directory.clone())
+            ));
+        }
+        let tree = WatchPlan::read_inputs(&[directory.clone()]).unwrap();
+        assert_eq!(
+            tree.directories,
+            BTreeSet::from([directory.clone(), parent.clone()])
+        );
+        assert!(tree.covers_read(
+            &crate::paths::file_key(&directory.join("new/Child.java")),
+            false
+        ));
+        let request = crate::compile::observed_test_request(&directory);
+        let guard_only = WatchPlan::build(&request, &[]).unwrap();
+        assert_eq!(
+            guard_only.directories,
+            BTreeSet::from([parent, root.clone()])
+        );
+        assert!(guard_only.affected(
+            &Event::new(EventKind::Modify(ModifyKind::Name(
+                notify::event::RenameMode::From
+            )))
+            .add_path(directory)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finite_external_directory_plan_compacts_only_the_declared_read_tree() {
         let root = std::env::temp_dir().join(format!(
             "ktlsp-compiled-watch-{}-{}",
             std::process::id(),
@@ -566,7 +853,14 @@ mod tests {
         std::fs::write(root.join("input/a/b/member.class"), b"class").unwrap();
         let mut plan = WatchPlan::default();
         plan.add_input(&root.join("input"), true).unwrap();
-        assert!(plan.directories.contains(&root.join("input/a/b")));
+        assert_eq!(
+            plan.directories.contains(&root.join("input/a/b")),
+            !cfg!(windows)
+        );
+        assert!(plan.includes_directory_watch(&root.join("input/a/b")));
+        if cfg!(windows) {
+            assert_eq!(plan.recursive, BTreeSet::from([root.join("input")]));
+        }
         assert!(plan.directories.len() <= MAX_WATCH_DIRS);
         assert!(plan.affected(
             &Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.join("input/new"))
@@ -574,6 +868,68 @@ mod tests {
         // Planner never enumerates siblings of a readset root, even when their parent is watched.
         assert!(!plan.directories.contains(&root.join("sibling")));
         assert!(!plan.directories.contains(&root.join("sibling/deep/child")));
+        assert!(!plan.affected(
+            &Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("sibling/deep/child/generated.class"))
+        ));
+        let mut nested = WatchPlan::default();
+        nested.add_input(&root.join("input/a"), true).unwrap();
+        plan.merge(nested).unwrap();
+        if cfg!(windows) {
+            assert_eq!(plan.recursive, BTreeSet::from([root.join("input")]));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_read_tree_upgrade_keeps_nested_edits_read_tree_rename_and_output_filtering() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-recursive-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("original/input/a/b")).unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        let input = root.join("original/input");
+        let file = input.join("a/b/Input.java");
+        std::fs::write(&file, b"A").unwrap();
+        for operation in 0..2 {
+            let invalid = Arc::new(AtomicBool::new(false));
+            let (wake, mut events) = mpsc::channel(1);
+            let watch = NativeInputWatch::new(
+                invalid.clone(),
+                WatchPlan::read_inputs(&[file.clone()]).unwrap(),
+                wake,
+            )
+            .unwrap();
+            watch
+                .extend(WatchPlan::read_inputs(&[input.clone()]).unwrap())
+                .unwrap();
+            assert!(watch.plan.read().recursive.contains(&input));
+            assert!(!watch.plan.read().directories.contains(&input.join("a/b")));
+            std::fs::write(root.join("generated/Output.class"), b"unrelated").unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!invalid.load(Ordering::Acquire));
+            if operation == 0 {
+                std::fs::create_dir_all(input.join("new/nested")).unwrap();
+                std::fs::write(input.join("new/nested/New.java"), b"B").unwrap();
+            } else {
+                // This also proves the old deeper directory handles were retired by extend.
+                std::fs::rename(&input, root.join("original/renamed-input")).unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap(),
+                Some(())
+            );
+            assert!(invalid.load(Ordering::Acquire));
+            watch.close();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -610,6 +966,83 @@ mod tests {
                 .unwrap();
         }
         assert!(capped.add_directory(Path::new("one-too-many")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deep_read_tree_keeps_directory_cap_without_losing_descendant_coverage() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-watch-tree-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let input = root.join("input");
+        for n in 0..MAX_WATCH_DIRS + 1 {
+            std::fs::create_dir_all(input.join(format!("child-{n}"))).unwrap();
+        }
+        let plan = WatchPlan::read_inputs(&[input.clone()]).unwrap();
+        assert_eq!(plan.recursive, BTreeSet::from([input.clone()]));
+        assert!(plan.directories.len() <= MAX_WATCH_DIRS);
+        assert!(plan.includes_directory_watch(&input.join("child-512")));
+        assert!(plan.affected(
+            &Event::new(EventKind::Create(CreateKind::File))
+                .add_path(input.join("child-512/New.java"))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_compiler_recipe_watches_invalidate_one_consumer_and_release_both() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-recipe-watches-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("consumer")).unwrap();
+        std::fs::create_dir_all(root.join("producer")).unwrap();
+        let consumer_input = root.join("consumer/input.jar");
+        let producer_input = root.join("producer/processor.jar");
+        std::fs::write(&consumer_input, b"consumer").unwrap();
+        std::fs::write(&producer_input, b"producer").unwrap();
+        let invalid = Arc::new(AtomicBool::new(false));
+        let (wake, mut events) = mpsc::channel(1);
+        let consumer = NativeInputWatch::new(
+            invalid.clone(),
+            WatchPlan::read_inputs(&[consumer_input]).unwrap(),
+            wake.clone(),
+        )
+        .unwrap();
+        let producer = NativeInputWatch::new(
+            invalid.clone(),
+            WatchPlan::read_inputs(&[producer_input.clone()]).unwrap(),
+            wake,
+        )
+        .unwrap();
+        std::fs::write(root.join("producer/unrelated-output.class"), b"output").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!invalid.load(Ordering::Acquire));
+        std::fs::write(&producer_input, b"changed processor").unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert!(consumer.signal.invalid.load(Ordering::Acquire));
+        consumer.close();
+        producer.close();
+        for watch in [consumer, producer] {
+            assert!(watch.watcher.lock().is_none());
+            assert!(watch.recursive_watcher.lock().is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -721,11 +1154,6 @@ mod tests {
         assert!(!plan.affected(
             &Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("unrelated.json"))
         ));
-        assert!(plan.directories.contains(&root));
-        assert!(plan.directories.contains(&root.join("src/pkg")));
-        assert!(!plan
-            .directories
-            .contains(&root.join("build/classes/java/main")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -919,7 +1347,7 @@ mod selected_kotlin_read_watch_tests {
     use notify::event::{DataChange, ModifyKind};
 
     #[test]
-    fn current_directory_membership_cannot_rely_on_a_directory_omitted_during_planning() {
+    fn new_directory_coverage_accounts_for_native_recursive_support() {
         let root = std::env::temp_dir().join(format!(
             "ktlsp-java-domain-watch-{}-{}",
             std::process::id(),
@@ -938,9 +1366,13 @@ mod selected_kotlin_read_watch_tests {
         std::fs::create_dir_all(&arrived).unwrap();
         assert!(
             plan.covers_read(&crate::paths::file_key(&arrived), true),
-            "logical read-tree coverage alone is insufficient for nonrecursive registrations"
+            "new descendants remain in the logical input read-tree"
         );
-        assert!(!plan.includes_directory_watch(&arrived));
+        assert_eq!(plan.includes_directory_watch(&arrived), cfg!(windows));
+        assert!(plan.affected(
+            &Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+                .add_path(existing.join("new"))
+        ));
         let current = WatchPlan::read_inputs(&[source]).unwrap();
         assert!(current.includes_directory_watch(&arrived));
         std::fs::remove_dir_all(root).unwrap();

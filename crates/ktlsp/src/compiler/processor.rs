@@ -640,7 +640,7 @@ impl Tasks {
 /// A completed output is watched before its first read by the following phase. Its invalidation
 /// token belongs to the lease, not to the report: retiring private files after publication must
 /// not invalidate an otherwise current source report.
-struct SealedOutput {
+pub(in crate::compile) struct SealedOutput {
     roots: Vec<PathBuf>,
     facts: Vec<Value>,
     invalid: Arc<AtomicBool>,
@@ -648,7 +648,7 @@ struct SealedOutput {
 }
 
 impl SealedOutput {
-    fn seal(roots: Vec<PathBuf>) -> anyhow::Result<Self> {
+    pub(in crate::compile) fn seal(roots: Vec<PathBuf>) -> anyhow::Result<Self> {
         let invalid = Arc::new(AtomicBool::new(false));
         let plan = crate::compiled_watch::WatchPlan::read_inputs(&roots)?;
         let (wake, _receiver) = tokio::sync::mpsc::channel(1);
@@ -668,7 +668,7 @@ impl SealedOutput {
         Ok(lease)
     }
 
-    fn check_live(&self) -> anyhow::Result<()> {
+    pub(in crate::compile) fn check_live(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.invalid.load(Ordering::Acquire),
             "processor-sealed-output-changed"

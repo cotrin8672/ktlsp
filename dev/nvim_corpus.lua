@@ -400,7 +400,7 @@ for _, prep in ipairs(prepared) do
 end
 if vim.env.KTLSP_CORPUS_EXTRA_PROBES then
   local ok, err = pcall(function()
-    dofile(vim.env.KTLSP_CORPUS_EXTRA_PROBES)({ repo = vim.fs.dirname(script_dir), client = client,
+    dofile(vim.env.KTLSP_CORPUS_EXTRA_PROBES)({ repo = vim.fs.dirname(script_dir), client = client, manifest = manifest,
       sources = sources, check = check, project = project, artifacts = artifacts, request_outcomes = request_outcomes })
   end)
   operational('external corpus probes complete', ok, ok and nil or tostring(err))

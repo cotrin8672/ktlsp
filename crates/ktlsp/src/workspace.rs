@@ -9073,12 +9073,7 @@ impl Workspace {
             })
             .collect();
         let first = *dirty.first()?;
-        if dirty.iter().any(|source| !source.key.ends_with(".java"))
-            || task
-                .source_files
-                .iter()
-                .any(|path| path.extension().and_then(|s| s.to_str()) != Some("kt"))
-        {
+        if dirty.iter().any(|source| !source.key.ends_with(".java")) {
             return None;
         }
         let (module, source) = model.owner_for_key(&first.key)?;
@@ -9093,35 +9088,27 @@ impl Workspace {
         }) || source.compiler_metadata_incomplete
             || source.classpath_incomplete
             || !source.unresolved.is_empty()
-            || source.compiler_tasks.len() != 2
         {
             return None;
         }
-        let primary = source.compiler_tasks.iter().find(|candidate| {
-            candidate.language == CompilerLanguage::Kotlin
-                && Some(candidate.task.as_str()) == source.kotlin_compile_task.as_deref()
-        })?;
-        let java = model.plain_java_task(&first.key)?;
-        if !primary.complete
-            || primary.problem.is_some()
-            || !source
-                .compiler_tasks
-                .iter()
-                .any(|candidate| std::ptr::eq(candidate, java))
-            || !java.annotation_processing_disabled()
-            || !java.annotation_processor_path.is_empty()
-            || dirty.iter().any(|overlay| {
-                !java
-                    .source_files
-                    .iter()
-                    .any(|path| crate::paths::file_key(path) == overlay.key)
-            })
-            || java
-                .source_files
-                .iter()
-                .any(|file| !primary.source_files.contains(file))
-        {
+        let java_replay = crate::compile::JavaProducerPlan::capture(module, source, model);
+        let primary = if java_replay.is_some() { None } else {
+            if source.compiler_tasks.len() != 2 || task.source_files.iter()
+                .any(|path| path.extension().and_then(|s| s.to_str()) != Some("kt")) { return None; }
+            Some(source.compiler_tasks.iter().find(|candidate| {
+                candidate.language == CompilerLanguage::Kotlin
+                    && Some(candidate.task.as_str()) == source.kotlin_compile_task.as_deref()
+            })?)
+        };
+        let java = if java_replay.is_some() { &source.compiler_tasks[0] } else { model.plain_java_task(&first.key)? };
+        if dirty.iter().any(|overlay| !java.source_files.iter().any(|path| crate::paths::file_key(path) == overlay.key)) {
             return None;
+        }
+        if let Some(primary) = primary {
+            if !primary.complete || primary.problem.is_some()
+                || !source.compiler_tasks.iter().any(|candidate| std::ptr::eq(candidate, java))
+                || !java.annotation_processing_disabled() || !java.annotation_processor_path.is_empty()
+                || java.source_files.iter().any(|file| !primary.source_files.contains(file)) { return None; }
         }
         let matches: Vec<_> = task
             .classpath
@@ -9138,6 +9125,7 @@ impl Workspace {
         if artifact.extension().and_then(|s| s.to_str()) != Some("jar") {
             return None;
         }
+        if let Some(primary) = primary {
         for other in model.modules.iter().flat_map(|module| &module.source_sets) {
             if std::ptr::eq(other, source) {
                 continue;
@@ -9156,11 +9144,13 @@ impl Workspace {
                 return None;
             }
         }
+        }
         Some(Box::new(crate::compile::KotlinDependencyCompilation {
             project_dir: module.project_dir.clone(),
             scope,
             source: source.clone(),
             artifact: (**artifact).clone(),
+            java_replay,
         }))
     }
 
@@ -9382,10 +9372,11 @@ impl Workspace {
             if clean && request.positive_diagnostics_only && diagnostic.path.ends_with(".kt") {
                 continue;
             }
-            let Some(source) = request.overlays.iter().find(|source| {
+            let Some(source) = request.diagnostic_overlays().find(|source| {
                 source.key == diagnostic.path
                     && (source.key.ends_with(".kt")
-                        || (source.key.ends_with(".java") && request.java_task.is_some()))
+                        || (source.key.ends_with(".java") && (request.java_task.is_some()
+                            || request.dependency_overlays.iter().any(|dependency| dependency.key == source.key))))
             }) else {
                 continue;
             };
@@ -9429,8 +9420,7 @@ impl Workspace {
                 });
         }
         let keys: Vec<_> = request
-            .overlays
-            .iter()
+            .diagnostic_overlays()
             .filter(|source| {
                 by_file.contains_key(&source.key) || (source.key.ends_with(".kt") && kotlin_clean)
             })
@@ -9469,8 +9459,7 @@ impl Workspace {
             || !self.open_docs.get(key).is_some_and(|doc| {
                 report
                     .request
-                    .overlays
-                    .iter()
+                    .diagnostic_overlays()
                     .any(|source| source.key == key && doc.text == source.text)
             })
         {
@@ -9517,8 +9506,7 @@ impl Workspace {
         };
         let source = report
             .request
-            .overlays
-            .iter()
+            .diagnostic_overlays()
             .find(|source| source.key == key)?;
         let source_hash: String = source
             .text_sha256
@@ -9539,6 +9527,78 @@ mod kotlin_diagnostic_lifecycle_tests {
     use super::*;
     use crate::compile::{CompileDiagnostic, KotlinDiagnosticOutcome};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    #[ignore = "requires genuine Gradle KTLSP_CROSS_MODULE_TEST_MODEL and valid Java6 SNAPSHOTS"]
+    fn current_java_only_producer_uses_private_gradle_archive_and_reports_source_level_errors() {
+        java_only_producer_source_level_case(true);
+    }
+
+    #[test]
+    #[ignore = "requires genuine Gradle KTLSP_CROSS_MODULE_TEST_MODEL and valid Java6 SNAPSHOTS"]
+    fn current_java_only_producer_reports_source_level_errors_without_prior_success() {
+        java_only_producer_source_level_case(false);
+    }
+
+    fn java_only_producer_source_level_case(check_prior_success: bool) {
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::env::var_os("KTLSP_CROSS_MODULE_TEST_MODEL").unwrap()).unwrap()).unwrap();
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(
+            serde_json::from_value(saved["modules"].clone()).unwrap()));
+        let producer_module = model.modules.iter().find(|module| module.module == ":problems-api").unwrap();
+        let consumer_module = model.modules.iter().find(|module| module.module == ":problems").unwrap();
+        let producer = crate::paths::file_key(&producer_module.project_dir.join(
+            "src/main/java/org/gradle/api/problems/internal/ProblemSummaryData.java"));
+        let invalid = crate::paths::file_key(&producer_module.project_dir.join(
+            "src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java"));
+        let consumer = crate::paths::file_key(&consumer_module.project_dir.join(
+            "src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt"));
+        let snapshots: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::env::var_os("KTLSP_CROSS_MODULE_TEST_SNAPSHOTS").unwrap()).unwrap()).unwrap();
+        let text = |role: &str| snapshots["snapshots"]["counter"][role].as_array().unwrap().iter()
+            .map(|line| line.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+        let mut ws = Workspace::new();
+        ws.set_project_model(model.clone());
+        ws.open(producer.clone(), text("producer"));
+        ws.open(consumer.clone(), text("consumer"));
+        let request = ws.begin_kotlin_diagnostics(&consumer).unwrap();
+        assert!(request.dependency_compilation.as_ref().unwrap().java_replay.is_some());
+        let (wake, _events) = tokio::sync::mpsc::channel(1);
+        let environment = crate::compile::KotlinDiagnosticEnvironment::prepare(&request, wake).unwrap();
+        if check_prior_success {
+            let outcome = crate::compile::run_kotlin_editor_compile(&request, &environment);
+            match &outcome {
+                KotlinDiagnosticOutcome::Verified { clean, diagnostics } => assert!(*clean
+                    && diagnostics.iter().all(|diagnostic| diagnostic.severity != crate::diagnostics::Severity::Error),
+                    "valid Java6 concrete method must reach the selected Kotlin compiler"),
+                KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
+            }
+            assert!(ws.finish_kotlin_diagnostics(&request, outcome, environment.invalid.clone()).contains(&consumer));
+            assert!(ws.kotlin_diagnostic_result_id(&consumer).is_some());
+            assert!(!environment.invalid.load(Ordering::Acquire), "private output retirement is not an original input edit");
+        }
+        let original = std::fs::read_to_string(&invalid).unwrap();
+        let end = original.rfind("\n}").unwrap();
+        let changed = format!("{}\n  default java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() {{ return new java.util.concurrent.atomic.AtomicInteger(); }}\n{}",
+            &original[..end], &original[end..]);
+        let expected = crate::text::LineIndex::new(&changed).position(&changed, changed.find("default java").unwrap());
+        ws.open(invalid.clone(), changed);
+        assert!(request.invalid.load(Ordering::Acquire), "later producer edits retire the accepted consumer request");
+        let current = ws.begin_kotlin_diagnostics(&consumer).unwrap();
+        assert!(environment.matches(&current));
+        let outcome = crate::compile::run_kotlin_editor_compile(&current, &environment);
+        match &outcome {
+            KotlinDiagnosticOutcome::Verified { clean, diagnostics } => assert!(!clean && diagnostics.iter().any(|diagnostic|
+                diagnostic.path == invalid && (diagnostic.line, diagnostic.col) == (expected.0 + 1, expected.1 + 1)
+                && diagnostic.severity == crate::diagnostics::Severity::Error)),
+            KotlinDiagnosticOutcome::Unverified(reason) => panic!("{reason}"),
+        }
+        assert!(ws.finish_kotlin_diagnostics(&current, outcome, environment.invalid.clone()).contains(&invalid));
+        assert!(!ws.current_kotlin_diagnostics(&invalid).is_empty());
+        assert!(ws.kotlin_diagnostic_result_id(&invalid).is_some());
+        assert!(ws.kotlin_diagnostic_result_id(&consumer).is_none(), "failed producer cannot certify Kotlin clean");
+        environment.close();
+    }
 
     #[test]
     #[ignore = "requires genuine KTLSP_CROSS_MODULE_TEST_MODEL and SNAPSHOTS with built producer inputs"]

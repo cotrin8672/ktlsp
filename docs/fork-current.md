@@ -12,7 +12,38 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Latest integrated source and binary
+## Current verification on releases42 and43
+
+Release43 passes the workspace suite: **1857 passed, 0 failed, 14 ignored**.
+The release build succeeds with609 unchanged input guards. Its immutable binary is
+`native-integrated120-43/bin/ktlsp.exe` (23,053,312 bytes), SHA256
+`2a8ace10d845b2a30d23260d86706d81cea3f0b779313a808eadbe73eeb46173`.
+Both build stages reach EOF/live0. Each cleans one retained, exact-owned MSVC
+`vctip.exe` helper; this is recorded separately from language-server termination.
+Release42 also passes1856 tests and builds with zero forced cleanup. Its SHA256 is
+`bccc86fd4139355d20ffaf2d3a197e3d7a2b9d159fa07ae78203370eb6061133`.
+
+| Feature or workflow | Current actual evidence | Limit / next action |
+|---|---|---|
+| CEM excluding Mixin semantics | Release42: original38/38 matched, no mismatch/unmeasured, all four runs stable and EOF/live0/forced0. `cem-final153-candidate42-1/receipt.json`. | Representative cases, not every CEM expression or a whole-project diagnostic certificate. |
+| Additional five projects, original completion/navigation cases | Release42: Moshi9, OkHttp10, Retrofit12, Spring10 and Gradle9 all match on first responses. `final-corpus153-release42/acceptance155.json`, `final-corpus153-gradle-release42/summary.json`. | These50 contain no diagnostic assertions. Spring normal's4 responses matched but its42 shutdown required Neovim termination; that operational failure is retained. |
+| Spring shutdown | Release43: same original4 responses match, clean shutdown3.967s within the unchanged15s observation, no terminate call, stable inputs and EOF/live0/forced0. `spring-shutdown155-release43/acceptance.json`. | Inventory cancellation has deterministic Rust coverage, but this replay emits no source_cancelled event; it does not prove the exact formerly slow phase occurred again. |
+| Declared callback parameter types | Release42: unchanged indexed10, ordinary top-level8 and member10 RPCs all match; portable semantic harness181 PASS/0 FAIL including8 new first-response completion/exact-goto checks. `callback155-42-replay/receipt.json`. | Uses declared parameter positions and generic receiver bindings. Ambiguous/unavailable declarations remain Unknown; this is not language-wide inference coverage. |
+| Shared edits and scoped compiler diagnostics | Release42: Moshi16, Spring16 and Retrofit22 match, including five current-version/source-SHA compiler passes, exact Retrofit invalid range and independently applied rename edits. `shared-diagnostics155-release42/final.json`, `independent-audit.json` in the same directory. | Certificates concern the observed documents; producer_closure_complete remains false. |
+| OkHttp shared edits | Release42: original16/16 match, stable inputs and clean shutdown. `okhttp-shared155-release42/acceptance.json`. | Java version4/wire-SHA delivery and a supported recipe are proven; the empty push does not certify a compiler-complete error absence. |
+| Gradle Java6-valid shared edits | Release42:14 matched, 0 mismatched,3 unmeasured; counter v4, invalid v8 and fixed v9 never reached a certified diagnostic RPC. `gradle-shared155-valid42-summary.json`. | Actual model imports repeatedly cancel amid modeled output-directory notifications. Coalescing during an owned import is being fixed; do not extend observation windows or count missing certificates as success. The original source6-invalid default-method fixture remains separate. |
+| Java-only producer, native failure route | Actual native44 invalid-only run passes with a located current Java error and clean:false. Earlier native42's valid producer/consumer phase passed, but its full run failed; native43's location failure is retained. | Current full editor canonical workflow above remains unverified. The fixed enum-name and Windows-path boundaries do not alone establish the full workflow. |
+| Source-library coverage | The same Gradle42 traces resolve all six repaired POM origins without failure; aggregate failed1/missingSources29, NeKoHTML binary retention remains explicit. `gradle155-source-coverage42.json`. | Retrofit still reports six failed source origins and9 missing sources; Spring reports six and16. Binary facts do not imply recovered original-source coverage. |
+| External shared-semantic extension | Current42 host and independently rebuilt child pass legacy26 plus optional46: actual model1->2/classpath3->4, stale rejection, fresh publication, crash/restart and applied rename. `project-facts143-42-final.json`; consumer4 tests/build in `external42-ready/ready.json`. | workspaceUri, source-only raw ABI and full-runtime ABI coverage remain Unknown. Full MC policy stays in mc-dev. |
+| Native watcher cost | Actual Rust replay of identical real inputs reduces physical registrations Kotlin493->357 and Java487->428 while preserving logical read sets. `diagnostic155-parent-watch-runtime41/receipt.json`. | Registration counts only, not startup latency or RSS. The earlier broad-suite unrelated-invalidation failure is not deterministically reproduced and its cause remains unproved. |
+
+The38+50 ordinary checks form a fixed checklist of representative operations.
+Their completion percentage is not the goal's implementation percentage or a
+grammar/whole-project coverage estimate. Plugin/build lifecycle results below retain
+their actual older versions; they have not all been rerun on43. Warm latency
+distributions also remain the earlier measurements.
+
+## Previous integrated baseline39
 
 `native-integrated120-39/main-ready.json`: workspace **1839 passed, 0 failed,
 11 ignored, 42 targets**; release build passed. All600 guarded inputs remained
@@ -71,7 +102,7 @@ for its actual invocation marker and worker terminal state, retaining overlap,
 generation and invocation assertions. Focused verification and the parallel32
 suite pass (`scheduler140-final.json`). No production timeout was changed.
 
-## Focused follow-up, not yet integrated
+## Earlier focused follow-up, before integration42
 
 Ordinary numeric expressions reproduced two missing first-response completions on39
 (`numeric154-result.json`). Shared numeric inference and Java primitive overload
@@ -119,7 +150,7 @@ conversion phases are not established by the focused numeric checks.
 | POM metadata encoding | Strict POM-only CP1252 decoding plus six-origin conditional/compiler metadata interpretation pass21 focused checks and integrated39. The exact12 selected POMs prove all6 UTF8 policies; all3,324 actual source entries decode strictly. Real library38 passes43 checks, including exact Selenium WebDriver.get source SHA/range (`pom153-selected-source-bytes.json`, `library153-editor-1/verification.json`). | Java-source encoding policy is unchanged; mixed/unknown candidate encodings remain rejected. A full-root post-fix index count is not yet measured. NeKoHTML has byte E9 in a comment with no encoding metadata; binary facts/stub navigation remain available, but original source coverage is not invented. |
 | Library probe readiness | The old151 scenario observes all250 listOf retries before source installation; Java negatives precede JDK completion and Selenium uses a binary-only stub. The existing probe now waits for the same accepted/dependency generation and successful indexing progress end, then uses first responses. Actual38 passes all original42 checks plus one coverage check, with EOF/live0/forced0 and all buffers restored. | Old151 artifacts/logs were restored byte-for-byte at their original paths. New artifacts and the explicit relocation map are under `library153-editor-1`; this is one semantic verification, not a new performance distribution. NeKoHTML still uses binary facts/generated stub navigation, not recovered original source coverage. |
 
-## Actual project and lifecycle acceptance
+## Historical project and lifecycle acceptance
 
 These are finite selected workflows, not whole-project absence-of-errors certificates.
 No project source is rewritten for tests: unsaved edits or disposable private copies
@@ -179,17 +210,22 @@ semantics are not certified by the test extension.
 
 ## Next actions and execution rules
 
-1. Qualify the Gradle counter case under the actual producer's language level and
-   processors, then implement the validated producer route. Preserve the original
-   unmeasured response; elapsed deadlines never count as semantic success.
-2. Retain the verified six-origin POM policy/byte audit and independent String-only
-   eligibility evidence. Retain source-charset Unknown where metadata is missing.
-3. Build one coherent final source snapshot, then replay existing CEM+five-project
-   and selected plugin/dependency lifecycle cases. Reuse existing controllers and
-   expectations; do not create another test framework or repeat unaffected suites.
-4. Update this short record, selectively commit/push verified changes, and report
-   practical coverage and remaining limits. Do not derive grammar coverage from counts.
-5. Keep the verified asynchronous IPC boundary usable by the independent mc-dev
+1. Finish output-notification coalescing during an owned Gradle model import without
+   discarding real changes. Replay the Java6-valid shared workflow and require actual
+   current-version counter/invalid/fixed compiler certificates. Preserve42's three
+   unmeasured results; deadlines and empty pushes never prove correctness.
+2. Establish an actual current Java compiler certificate for the OkHttp diagnostic
+   case, or reproduce and fix the unsupported path. Its versioned empty push and
+   supported recipe are insufficient.
+3. Retain the six-origin POM/byte proof and binary fallback limits; investigate real
+   failed source origins without guessing an encoding. Broader operator, bounded
+   generic and receiver-lambda inference remains outside proven coverage.
+4. Use one coherent final snapshot for affected editor/plugin/build lifecycle and
+   latency checks. Reuse existing controllers, goldens and genuine caches, repeating
+   only checks affected by later changes. Cold setup remains a separate measurement.
+5. Update this record, selectively commit/push verified changes, and report feature
+   evidence and gaps. Do not derive implementation or grammar percentages from counts.
+6. Keep the verified asynchronous IPC boundary usable by the independent mc-dev
    consumer; later fact capabilities remain scoped additions, with MC policy in mc-dev
    and no communication waits under Workspace locks.
 

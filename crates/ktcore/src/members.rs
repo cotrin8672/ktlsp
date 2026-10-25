@@ -2149,7 +2149,6 @@ fn bind_arguments_with_lambda_context<'a>(
         };
         if name != &format!("Function{}", parameters.len())
             || !matches!(package.as_str(), "kotlin" | "kotlin.jvm.functions")
-            || parameters.len() > 1
             || parameters.iter().any(|ty| !infer::constraint_type_is_known(index, ty, 0))
         {
             return Err(Applicability::Unknown);

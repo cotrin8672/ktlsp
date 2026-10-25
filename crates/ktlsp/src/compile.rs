@@ -2372,7 +2372,7 @@ impl SuccessfulCompileReceipt {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("receipt inventory has no path"))?;
             anyhow::ensure!(
-                inventory(Path::new(path))? == *input,
+                inventory_checked(Path::new(path), &|| self.request.check_live())? == *input,
                 "receipt input/output changed: {path}"
             );
         }
@@ -2499,7 +2499,7 @@ pub(crate) fn run_observed_compile(
         let mut before = Vec::new();
         let mut inventory_budget = MAX_RECEIPT_INVENTORY_ENTRIES;
         for path in &planned_reads {
-            let record = inventory(path)?;
+            let record = inventory_checked(path, &|| request.check_live())?;
             let records = 1 + record["entries"].as_array().map_or(0, Vec::len);
             inventory_budget = inventory_budget
                 .checked_sub(records)
@@ -2658,7 +2658,7 @@ pub(crate) fn run_observed_compile(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid host input"))?;
             anyhow::ensure!(
-                inventory(Path::new(path))? == *prior,
+                inventory_checked(Path::new(path), &|| request.check_live())? == *prior,
                 "host source/config/AP/toolchain input changed"
             );
         }
@@ -2682,7 +2682,7 @@ pub(crate) fn run_observed_compile(
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("invalid readset path"))?;
                 anyhow::ensure!(
-                    inventory(Path::new(path))? == *record,
+                    inventory_checked(Path::new(path), &|| request.check_live())? == *record,
                     "observed execution-boundary input changed"
                 );
                 if let Some(prior) = reads.insert(path.to_string(), record.clone()) {
@@ -2712,7 +2712,7 @@ pub(crate) fn run_observed_compile(
                 // An upstream compiler may consume an earlier task's output. A value that changed
                 // later cannot be silently replaced by the final inventory and still be certified.
                 anyhow::ensure!(
-                    inventory(Path::new(path))? == *record,
+                    inventory_checked(Path::new(path), &|| request.check_live())? == *record,
                     "upstream compiler input changed"
                 );
                 if let Some(prior) = reads.insert(path.to_string(), record.clone()) {
@@ -2967,7 +2967,15 @@ fn environment_hash() -> String {
 const MAX_RECEIPT_INVENTORY_ENTRIES: usize = 20_000;
 
 fn inventory(path: &Path) -> anyhow::Result<serde_json::Value> {
+    inventory_checked(path, &|| Ok(()))
+}
+
+fn inventory_checked(
+    path: &Path,
+    check_live: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<serde_json::Value> {
     use sha2::{Digest, Sha256};
+    check_live()?;
     let key = crate::paths::file_key(path);
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2985,6 +2993,7 @@ fn inventory(path: &Path) -> anyhow::Result<serde_json::Value> {
         let mut file = std::fs::File::open(path)?;
         let mut buffer = [0; 65536];
         loop {
+            check_live()?;
             let n = file.read(&mut buffer)?;
             if n == 0 {
                 break;
@@ -2998,6 +3007,7 @@ fn inventory(path: &Path) -> anyhow::Result<serde_json::Value> {
     anyhow::ensure!(metadata.is_dir(), "unsupported non-regular input");
     let mut entries = std::collections::BTreeMap::new();
     for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        check_live()?;
         let entry = entry?;
         anyhow::ensure!(
             !entry.file_type().is_symlink(),
@@ -3012,7 +3022,7 @@ fn inventory(path: &Path) -> anyhow::Result<serde_json::Value> {
         );
         entries.insert(
             crate::paths::file_key(entry.path()),
-            inventory(entry.path())?,
+            inventory_checked(entry.path(), check_live)?,
         );
     }
     Ok(
@@ -3568,6 +3578,9 @@ mod observed_path_cache_tests {
 
 #[path = "compiler/java.rs"]
 mod java_diagnostics;
+#[path = "compiler/java_producer.rs"]
+mod java_producer;
+pub(crate) use java_producer::Plan as JavaProducerPlan;
 
 pub(crate) use java_diagnostics::positive::{
     candidate as compiler_api_candidate, supported as compiler_api_supported,
@@ -3624,6 +3637,7 @@ pub(crate) struct KotlinDependencyCompilation {
     pub scope: crate::project_model::ProjectScope,
     pub source: crate::classpath::SourceSetClasspath,
     pub artifact: PathBuf,
+    pub java_replay: Option<JavaProducerPlan>,
 }
 
 fn serialize_kotlin_dependency_scope<S: serde::Serializer>(
@@ -3754,6 +3768,14 @@ pub(crate) struct KotlinDiagnosticRequest {
 }
 
 impl KotlinDiagnosticRequest {
+    pub(crate) fn diagnostic_overlays(&self) -> impl Iterator<Item = &KotlinSourceOverlay> {
+        let producer = self.dependency_compilation.as_deref().filter(|plan| plan.java_replay.is_some());
+        self.overlays.iter().chain(self.dependency_overlays.iter().filter(move |source| {
+            producer.is_some_and(|plan| plan.source.compiler_tasks[0].source_files.iter()
+                .any(|path| crate::paths::file_key(path) == source.key))
+        }))
+    }
+
     pub(crate) fn check_live(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.invalid.load(std::sync::atomic::Ordering::Acquire),
@@ -3978,6 +4000,8 @@ pub(crate) struct KotlinDiagnosticEnvironment {
     stamps: Vec<(PathBuf, KotlinInputStamp)>,
     environment_sha256: String,
     watch: std::sync::Arc<crate::compiled_watch::NativeInputWatch>,
+    // Each actual compiler recipe retains its own bounded watcher and shares owner invalidation.
+    java_dependency_watch: Option<std::sync::Arc<crate::compiled_watch::NativeInputWatch>>,
     // Failed helper builds retain their watched assets and cannot erase canonical Kotlin results.
     java_tools: std::sync::Mutex<Option<(java_diagnostics::Tools, Result<(), String>)>>,
     processor_artifacts: std::sync::Mutex<Option<java_diagnostics::processor::CachedArtifacts>>,
@@ -4015,6 +4039,7 @@ impl KotlinDiagnosticEnvironment {
         let dependency_environment = request
             .dependency_compilation
             .as_ref()
+            .filter(|plan| plan.java_replay.is_none())
             .map(|plan| {
                 Self::prepare_with_invalidation(
                     &plan.request(request)?,
@@ -4044,6 +4069,13 @@ impl KotlinDiagnosticEnvironment {
         if let Some(plan) = &key.processor_plan {
             inputs.extend(plan.watch_inputs());
         }
+        let java_inputs = key
+            .dependency_compilation
+            .as_ref()
+            .and_then(|plan| plan.java_replay.as_ref().map(|replay| (plan, replay)))
+            .map(|(plan, replay)| replay.watch_inputs(&plan.source, &plan.project_dir))
+            .transpose()?
+            .unwrap_or_default();
         let host = &key.recipe.gradle_java_home;
         anyhow::ensure!(host.is_absolute(), "compiler-host-jdk-relative");
         anyhow::ensure!(
@@ -4082,7 +4114,13 @@ impl KotlinDiagnosticEnvironment {
                 inputs.extend([home.join("jre/lib"), home.join("lib/tools.jar")]);
             }
         }
+        let consumer_inputs: Vec<_> = inputs.iter().cloned().collect();
+        inputs.extend(java_inputs.iter().cloned());
         let inputs: Vec<_> = inputs.into_iter().collect();
+        anyhow::ensure!(
+            inputs.len() <= crate::compiled_watch::MAX_INPUT_PATHS,
+            "compiler-native-input-cap"
+        );
         for input in &inputs {
             anyhow::ensure!(input.is_absolute(), "kotlin-relative-read-input");
             anyhow::ensure!(
@@ -4093,8 +4131,18 @@ impl KotlinDiagnosticEnvironment {
                 "kotlin-unbounded-project-read-input"
             );
         }
-        let plan = crate::compiled_watch::WatchPlan::read_inputs(&inputs)?;
-        let watch = crate::compiled_watch::NativeInputWatch::new(invalid.clone(), plan, wake)?;
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&consumer_inputs)?;
+        let watch = crate::compiled_watch::NativeInputWatch::new(invalid.clone(), plan, wake.clone())?;
+        let java_dependency_watch = if java_inputs.is_empty() {
+            None
+        } else {
+            let plan = crate::compiled_watch::WatchPlan::read_inputs(&java_inputs)?;
+            Some(crate::compiled_watch::NativeInputWatch::new(
+                invalid.clone(),
+                plan,
+                wake,
+            )?)
+        };
         let environment_sha256 = environment_hash();
         let mut hash = key.input_hasher(&environment_sha256)?;
         if let Some(dependency) = &dependency_environment {
@@ -4105,15 +4153,33 @@ impl KotlinDiagnosticEnvironment {
             hash.update(content_sha256);
         }
         let mut stamps = Vec::new();
-        for input in inputs {
-            let before = kotlin_input_stamp(&input)?;
-            hash.update(serde_json::to_vec(&inventory(&input)?)?);
-            anyhow::ensure!(
-                before == kotlin_input_stamp(&input)?,
-                "kotlin-input-changed-during-inventory"
-            );
-            stamps.push((input, before));
-        }
+        let inventory_started = std::time::Instant::now();
+        let input_count = inputs.len();
+        let check_live = || {
+            request.check_live()?;
+            anyhow::ensure!(!invalid.load(std::sync::atomic::Ordering::Acquire),
+                "stale-kotlin-compiler-input");
+            Ok(())
+        };
+        let inventory_result = (|| -> anyhow::Result<()> {
+            for input in inputs {
+                check_live()?;
+                let before = kotlin_input_stamp(&input)?;
+                hash.update(serde_json::to_vec(&inventory_checked(&input, &check_live)?)?);
+                anyhow::ensure!(
+                    before == kotlin_input_stamp(&input)?,
+                    "kotlin-input-changed-during-inventory"
+                );
+                stamps.push((input, before));
+            }
+            Ok(())
+        })();
+        crate::trace::span("compiler.kotlin_input_inventory", "compiler", inventory_started,
+            serde_json::json!({"inputs":input_count,"completed":stamps.len(),
+                "success":inventory_result.is_ok(),
+                "source_cancelled":request.invalid.load(std::sync::atomic::Ordering::Acquire),
+                "inputs_invalid":invalid.load(std::sync::atomic::Ordering::Acquire)}));
+        inventory_result?;
         let positive_supported = java_diagnostics::positive::supported(&request.task);
         let environment = std::sync::Arc::new(Self {
             key,
@@ -4124,6 +4190,7 @@ impl KotlinDiagnosticEnvironment {
             stamps,
             environment_sha256,
             watch,
+            java_dependency_watch,
             java_tools: std::sync::Mutex::new(None),
             processor_artifacts: std::sync::Mutex::new(None),
             positive_tools: std::sync::Mutex::new(None),
@@ -4164,6 +4231,9 @@ impl KotlinDiagnosticEnvironment {
             self.invalid
                 .store(true, std::sync::atomic::Ordering::Release);
             self.watch.close();
+            if let Some(watch) = &self.java_dependency_watch {
+                watch.close();
+            }
         }
         result
     }
@@ -4173,6 +4243,9 @@ impl KotlinDiagnosticEnvironment {
             dependency.close();
         }
         self.watch.close();
+        if let Some(watch) = &self.java_dependency_watch {
+            watch.close();
+        }
     }
 }
 
@@ -4735,7 +4808,8 @@ pub(crate) fn run_kotlin_editor_compile(
 struct CompiledKotlinDependency {
     _owner: KotlinEditorOverlay,
     producer: KotlinDiagnosticRequest,
-    environment: std::sync::Arc<KotlinDiagnosticEnvironment>,
+    environment: Option<std::sync::Arc<KotlinDiagnosticEnvironment>>,
+    sealed: Vec<java_diagnostics::processor::SealedOutput>,
     artifact: PathBuf,
     outputs: Vec<PathBuf>,
     output_inventory: Vec<serde_json::Value>,
@@ -4744,10 +4818,11 @@ struct CompiledKotlinDependency {
 impl CompiledKotlinDependency {
     fn check_live(&self) -> anyhow::Result<()> {
         self.producer.check_live()?;
-        self.environment.check_live()?;
+        if let Some(environment) = &self.environment { environment.check_live()?; }
+        for output in &self.sealed { output.check_live()?; }
         for (output, expected) in self.outputs.iter().zip(&self.output_inventory) {
             anyhow::ensure!(
-                inventory(output)? == *expected,
+                inventory_checked(output, &|| self.producer.check_live())? == *expected,
                 "kotlin-producer-output-changed"
             );
         }
@@ -4811,10 +4886,13 @@ impl CompiledKotlinDependency {
 fn compile_dependency_overlay(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
-) -> anyhow::Result<Option<CompiledKotlinDependency>> {
+) -> anyhow::Result<Result<Option<CompiledKotlinDependency>, KotlinDiagnosticOutcome>> {
     let Some(plan) = &request.dependency_compilation else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
+    if let Some(replay) = &plan.java_replay {
+        return java_producer::run(request, environment, plan, replay).map(|result| result.map(Some));
+    }
     anyhow::ensure!(
         request.processor_plan.is_none()
             && !request.positive_diagnostics_only
@@ -4871,12 +4949,13 @@ fn compile_dependency_overlay(
     );
     let output_inventory = outputs
         .iter()
-        .map(|path| inventory(path))
+        .map(|path| inventory_checked(path, &|| producer.check_live()))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let compiled = CompiledKotlinDependency {
         _owner: owner,
         producer,
-        environment: producer_environment,
+        environment: Some(producer_environment),
+        sealed: Vec::new(),
         artifact: plan.artifact.clone(),
         outputs,
         output_inventory,
@@ -4893,7 +4972,7 @@ fn compile_dependency_overlay(
             "outputs": compiled.output_inventory, "producer_closure": true, "generation": request.generation,
         }),
     );
-    Ok(Some(compiled))
+    Ok(Ok(Some(compiled)))
 }
 
 fn run_selected_kotlin_editor_compile(
@@ -4908,7 +4987,10 @@ fn run_selected_kotlin_editor_compile(
         if environment.positive_supported && request.dependency_compilation.is_none() {
             return java_diagnostics::positive::run(request, environment);
         }
-        let dependency = compile_dependency_overlay(request, environment)?;
+        let dependency = match compile_dependency_overlay(request, environment)? {
+            Ok(dependency) => dependency,
+            Err(outcome) => return Ok(outcome),
+        };
         let effective = dependency
             .as_ref()
             .map(|compiled| compiled.consumer_request(request))
@@ -5134,6 +5216,41 @@ mod kotlin_editor_compile_tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn input_inventory_cancels_mid_file_and_directory_without_changing_hashes() {
+        use sha2::{Digest, Sha256};
+        use std::{cell::Cell, sync::atomic::Ordering};
+        let tree = TestDirectory::new();
+        let file = tree.0.join("large.bin");
+        let bytes = vec![0xabu8; 512 * 1024];
+        std::fs::write(&file, &bytes).unwrap();
+        let expected_file = serde_json::json!({"path":crate::paths::file_key(&file),
+            "kind":"file","bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))});
+        assert_eq!(inventory(&file).unwrap(), expected_file);
+        let directory = tree.0.join("inputs");
+        std::fs::create_dir(&directory).unwrap();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            std::fs::write(directory.join(name), b"input").unwrap();
+        }
+        let expected_directory = inventory(&directory).unwrap();
+        for (input, cancel_at) in [(&file, 3), (&directory, 7)] {
+            let request = kotlin_test_request(&tree.0);
+            let polls = Cell::new(0);
+            let check = || {
+                polls.set(polls.get() + 1);
+                if polls.get() == cancel_at {
+                    request.invalid.store(true, Ordering::Release);
+                }
+                request.check_live()
+            };
+            let error = inventory_checked(input, &check).unwrap_err();
+            assert_eq!(error.to_string(), "stale-kotlin-source");
+            assert_eq!(polls.get(), cancel_at, "cancelled inventory must stop without a partial identity");
+        }
+        assert_eq!(inventory_checked(&file, &|| Ok(())).unwrap(), expected_file);
+        assert_eq!(inventory_checked(&directory, &|| Ok(())).unwrap(), expected_directory);
     }
 
     #[test]
@@ -6074,7 +6191,8 @@ mod kotlin_editor_compile_tests {
         let tree = TestDirectory::new();
         let mut request = kotlin_test_request(&tree.0);
         let mut files = Vec::new();
-        for n in 0..180 {
+        // Keep both plans below the resource cap: this checks read roles, not exhaustion.
+        for n in 0..120 {
             let path = tree.0.join(format!(
                 "transforms/{n}/isolated/transformed/input.any-name"
             ));
@@ -6084,7 +6202,11 @@ mod kotlin_editor_compile_tests {
         }
         request.task.declared_input_files.extend(files.clone());
         let legacy = KotlinEnvironmentKey::new(&request).unwrap();
-        assert!(crate::compiled_watch::WatchPlan::read_inputs(&legacy.extra_inputs).is_err());
+        let legacy_plan = crate::compiled_watch::WatchPlan::read_inputs(&legacy.extra_inputs).unwrap();
+        for file in &files {
+            assert!(legacy_plan.covers_read(&crate::paths::file_key(file), false));
+            assert!(legacy_plan.includes_directory_watch(file.parent().unwrap()));
+        }
         snapshot_fact(&mut request, &files, &[]);
         let key = KotlinEnvironmentKey::new(&request).unwrap();
         assert_eq!(key.gradle_fingerprint_inputs, files);
@@ -6093,7 +6215,9 @@ mod kotlin_editor_compile_tests {
             .iter()
             .all(|p| !key.gradle_fingerprint_inputs.contains(p)));
         let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.extra_inputs).unwrap();
-        assert!(!plan.includes_directory_watch(&tree.0.join("transforms/0/isolated/transformed")));
+        assert!(files.iter().all(|file|
+            !plan.includes_directory_watch(file.parent().unwrap())
+                && !plan.covers_read(&crate::paths::file_key(file), false)));
         assert!(plan.covers_read(
             &crate::paths::file_key(
                 &request

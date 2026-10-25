@@ -1,8 +1,7 @@
 -- Additional shared unsaved-edit cases for the existing corpus client.
 return function(env)
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
-  local path = env.repo .. '/dev/corpus/' .. vim.fs.basename(env.project) .. '-shared-edit.json'
-  local spec = assert(vim.json.decode(table.concat(vim.fn.readfile(path), '\n')).shared_edit)
+  local spec = assert(env.manifest.shared_edit)
   local client, order = env.client, { 'producer', 'consumer' }
   local canonical = spec.consumer:match('%.kt$') and (vim.env.KTLSP_PROBE_SERVER or 'ktlsp') ~= 'intellij'
   local paths, buffers, original, snapshots, pending, notified, requests = {}, {}, {}, {}, {}, {}, {}

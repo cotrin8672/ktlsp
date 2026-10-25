@@ -238,6 +238,9 @@ error ranges, valid Object/generic/varargs calls, delivery identity and restorat
 The selected Java source proof preserves unknown compiler-plugin and hierarchy cases.
 Its first cold diagnostic cost remains recorded as a performance gap in the fork
 acceptance log.
+The `semantic` harness also checks declared multi-parameter callback types: Int
+indices and generic elements retain different members, typed controls agree, and
+first completion responses and exact goto use the same shared inference.
 The Gradle reload probe also checks captured Kotlin source/library/JDK inputs. The
 project model records the selected compiler runtime and launch policy separately;
 captured configuration alone does not prove a compiler ran or diagnosed an unsaved buffer.
@@ -254,6 +257,9 @@ Kotlin 2.4.0 / Gradle 9.6.1 and selected Kotlin BTA DAEMON execution. Its standa
 CLI collector must match the successful canonical output; it does not replay
 the Gradle daemon. Large input graphs can still exceed native watcher limits,
 leaving compiler diagnostics unavailable.
+On Windows, renaming an ancestor that contains an open watched child directory can
+fail with access denied, even with delete sharing. This also applies to these native
+compiler watches; closing the watches releases those directory handles.
 The existing `corpus` route with `dev/corpus/binary-java-jar.json` and
 `KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_k2_java.lua"` checks one unsaved Java
 import error, its current compiler result and buffer restoration. Prepare its
@@ -478,6 +484,13 @@ KTLSP_CORPUS_EXTRA_PROBES="$PWD/dev/nvim_corpus_shared_edit_probes.lua" \
   dev/ktlsp-harness.sh corpus --root /path/to/retrofit-2.11.0 \
   --file "$PWD/dev/corpus/retrofit-2.11.0-shared-edit.json"
 ```
+
+For Gradle's Java 6 producer, use `gradle-8.14.3-shared-edit-valid-java6.json` with
+the same helper. It adds ordinary methods to `ProblemSummaryData` and exercises the
+private JavaCompile → parameterNamesIndex → Jar route. The older interface-default
+case is retained separately: its default method is invalid under the actual Java 6 task.
+Java editor overlays currently require explicit UTF-8 or a verified UTF-8 compiler
+recipe. Other encodings and unknown defaults remain unavailable; compiler flags are preserved.
 
 The Retrofit whole-file oracle used official same-version artifacts for missing recovered jars
 and checked both source files against the official source archive. One recovered scripting-jar

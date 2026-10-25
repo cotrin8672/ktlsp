@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "project_id": "gradle-8.14.3-shared-edit-valid-java6",
+  "revision": "e5ee1df3d88b8ca3a8074787a94f373e3090e1db",
+  "build_tool": "gradle",
+  "scope": "Full project root; selected exact cross-language probes. Whole-root coverage, editing UX and performance require separate acceptance checks.",
+  "compiler_baseline": "Focused task group passed on 2026-10-10; see docs/fork-corpus.md for commands and limits.",
+  "probes": [
+    {
+      "token": "ProblemReportCreator",
+      "target": "platforms/ide/problems-api/src/main/java/org/gradle/api/problems/internal/ProblemReportCreator.java",
+      "target_anchor": "public interface ProblemReportCreator {",
+      "target_token": "ProblemReportCreator",
+      "expected": "Kotlin implements Java ProblemReportCreator from :problems-api; required override signatures are createReportFile(File,List<ProblemSummaryData>) and addProblem(InternalProblem).",
+      "source_sha256": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8",
+      "compiler_status": "focused problems Java+Kotlin compilation passed (root 28m46s)",
+      "target_sha256": "dbb47bcb3ba697c291663e41df6cbbbb9f24ab97faec4edeb6c90547234db361",
+      "completion": false,
+      "module": ":problems",
+      "id": "gradle-kotlin-java-interface",
+      "source": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+      "anchor": ") : ProblemReportCreator {"
+    }
+  ],
+  "shared_edit": {
+    "producer": "platforms/ide/problems-api/src/main/java/org/gradle/api/problems/internal/ProblemSummaryData.java",
+    "consumer": "platforms/ide/problems/src/main/kotlin/org/gradle/problems/internal/impl/DefaultProblemsReportCreator.kt",
+    "source_sha256": {
+      "producer": "bbac14cdce21e5fb183e8c607e2d705cd8cf8e51062581ac024ec1c9be270853",
+      "consumer": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+    },
+    "control": "getCount",
+    "recipes": {
+      "text": {
+        "producer": "  public String ktlspSliceText() { return \"slice\"; }",
+        "consumer": "private fun ktlspConsumerSlice(provider: ProblemSummaryData): String {\n  return provider.ktlspSliceText().substring(0)\n}"
+      },
+      "counter": {
+        "producer": "  public java.util.concurrent.atomic.AtomicInteger ktlspSliceCounter() { return new java.util.concurrent.atomic.AtomicInteger(); }",
+        "consumer": "private fun ktlspConsumerSlice(provider: ProblemSummaryData): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}"
+      }
+    },
+    "additional_request_count": 16,
+    "consumer_insertion": "file",
+    "stages": {
+      "text": {
+        "producer": {
+          "sha256": "84a9d0b42bc39ea9084784aa84b9420ebd4557530ffe94002e7b5db3c65f1dc2"
+        },
+        "consumer": {
+          "sha256": "07405488498071cd2ec7c88d0bed7dcf4616703baf46da933819b7a63131fdc4"
+        }
+      },
+      "counter": {
+        "producer": {
+          "sha256": "50b0e29a8288b71a4c1304d90f1e0aa2ce44f5a292603dd61174a5583450d107"
+        },
+        "consumer": {
+          "sha256": "d4fd33488936dda08204f1aa96517bf640255c654c09af74d2118b840c021d1c"
+        }
+      },
+      "renamed": {
+        "producer": {
+          "sha256": "e29457f457bd2c0a9b48cf70fae76be8324ee9e13cb8bc4d0a3484d7be38c5fc"
+        },
+        "consumer": {
+          "sha256": "4abfa1e61d2b21218424f7a1cd29a2a7f7c048b2ec7637ca184d3d2b0e6efa8a"
+        }
+      },
+      "retracted": {
+        "producer": {
+          "sha256": "bbac14cdce21e5fb183e8c607e2d705cd8cf8e51062581ac024ec1c9be270853"
+        },
+        "consumer": {
+          "sha256": "d4fd33488936dda08204f1aa96517bf640255c654c09af74d2118b840c021d1c"
+        }
+      }
+    },
+    "oracle_status": "The whole counter producer passed the original Gradle wrapper8.14.2 :problems-api:compileJava with Java11/source6, ErrorProne and instrumentation processors. The actual private JavaCompile -> parameterNamesIndex -> Jar pipeline also passed with exact source/config/original-Jar preservation and the current AtomicInteger method descriptor (diagnostic153-producer4 and diagnostic153-archive8). Kotlin consumer/editor acceptance is pending product-route validation. The original default-interface-method manifest remains separate; its real Java6 task reports an error at36:3 (diagnostic153-producer3 and diagnostic153-overlay6-real).",
+    "diagnostic_cycle": {
+      "consumer": "private fun ktlspConsumerSlice(provider: ProblemReportCreator): Int {\n  return provider.ktlspSliceCounter().incrementAndGet()\n}",
+      "missing_member": "ktlspSliceCounter",
+      "source_sha256": {
+        "invalid": "7c9d1aff7f2f379c597ba08e5f399c316cad4f542f8c17eb4f0d33139fdb5832",
+        "fixed": "86a666507ad1b1850b2718596a3d8fb7f221c9f48a1c6f63d6182ba8c6564ea8"
+      }
+    }
+  }
+}
