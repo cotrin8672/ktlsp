@@ -206,15 +206,16 @@ impl Backend {
     }
 
     fn schedule_project_refresh(&self, force: bool, initial_delay: Duration) {
-        self.request_project_refresh(force, initial_delay, false, &[]);
+        self.request_project_refresh(force, initial_delay, false, &[], None);
     }
 
     fn request_project_refresh(
         &self,
         force: bool,
         initial_delay: Duration,
-        jar_only: bool,
+        build_output_only: bool,
         retired_origins: &[String],
+        cause: Option<(String, FileChangeType, Option<bool>)>,
     ) {
         let Some(root) = self.root.lock().clone() else {
             return;
@@ -225,7 +226,7 @@ impl Backend {
         }
         let (defer, coalesced) = {
             let mut watches = self.watches.lock();
-            if jar_only && watches.model_loading {
+            if build_output_only && watches.model_loading {
                 let coalesced = watches.pending_model_jar;
                 watches.pending_model_jar = true;
                 (true, coalesced)
@@ -233,7 +234,17 @@ impl Backend {
                 (false, false)
             }
         };
-        // Gradle may recreate build-logic JARs while importing its own model. Retain
+        if let Some((key, kind, cause_force)) = cause {
+            crate::trace::span(
+                "workspace.watch_refresh_cause",
+                "workspace",
+                Instant::now(),
+                serde_json::json!({"path": key, "kind": kind, "force": cause_force,
+                    "batch_force": force, "build_output_only": build_output_only,
+                    "deferred": defer, "coalesced": coalesced}),
+            );
+        }
+        // Gradle may recreate JARs or output directories while importing its own model. Retain
         // every such change, but let this owned dump close its tasks before retrying.
         // Advancing the generation prevents its unsettled model from being published.
         if !defer {
@@ -3339,7 +3350,8 @@ impl LanguageServer for Backend {
             .map(model_archive_origins)
             .unwrap_or_default();
         let mut retired_origins = std::collections::BTreeSet::new();
-        let mut jar_only = true;
+        let mut build_output_only = true;
+        let mut adopted_cause = None;
         let changes = {
             let mut ws = self.ws.lock();
             let current_generation = ws.analysis_generation();
@@ -3360,9 +3372,9 @@ impl LanguageServer for Backend {
                         return None;
                     }
                     drop(watches);
-                    (!ws.observe_compiled_resource(&key)).then_some(key)
+                    (!ws.observe_compiled_resource(&key)).then_some((key, change.typ))
                 })
-                .map(|key| {
+                .map(|(key, kind)| {
                     let change = project_change(&root, model.as_deref(), &key);
                     if change.is_some() {
                         if key.ends_with(".jar") && !is_project_configuration(Path::new(&key)) {
@@ -3371,8 +3383,12 @@ impl LanguageServer for Backend {
                         if let Some(origin) = archive_origins.get(&key) {
                             retired_origins.insert(origin.clone());
                         }
-                        jar_only &= key.ends_with(".jar")
-                            && !is_project_configuration(Path::new(&key));
+                        build_output_only &= !is_project_configuration(Path::new(&key))
+                            && (key.ends_with(".jar")
+                                || model.as_deref().is_some_and(|model| model.is_output_key(&key)));
+                        if adopted_cause.is_none() {
+                            adopted_cause = Some((key.chars().take(512).collect::<String>(), kind, change));
+                        }
                         tracing::debug!(path = key, force = ?change, "project refresh requested by client watch");
                     }
                     change
@@ -3388,8 +3404,9 @@ impl LanguageServer for Backend {
             self.request_project_refresh(
                 force,
                 PROJECT_REFRESH_DEBOUNCE,
-                jar_only,
+                build_output_only,
                 &retired_origins.into_iter().collect::<Vec<_>>(),
+                adopted_cause,
             );
         }
     }
@@ -9448,7 +9465,9 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             );
         }
         let dump = format!(
-            "PROJECT\t:app\t{}\nCP\t{}\nEND\t:app\n",
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}/src/main/java\nOUTPUT\tmain\t{}/build/classes/kotlin/main\nCP\t{}\nEND\t:app\n",
+            root.display(),
+            root.display(),
             root.display(),
             root.join("unbuilt.jar").display()
         );
@@ -9458,12 +9477,14 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         } else {
             "gradlew"
         });
+        // The real client passes `-I <script> <task>`. Source enrichment is a separate
+        // legitimate query; return the same model without taking the model-import lease.
         std::fs::write(&wrapper, if cfg!(windows) {
             // An OS lease survives only while this owned child is live. Cancellation can
             // leave a sentinel on disk, so its existence alone cannot prove overlap.
-            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"try { $lease=[IO.File]::Open('%~dp0running',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) } catch { [IO.File]::WriteAllText('%~dp0overlap','overlap'); exit 1 }; try { [IO.File]::AppendAllText('%~dp0invocations','invoked'+[Environment]::NewLine); if ([IO.File]::ReadAllLines('%~dp0invocations').Length -eq 2) { while ($true) { Start-Sleep -Milliseconds 20 } }; Start-Sleep -Milliseconds 600; [Console]::Write([IO.File]::ReadAllText('%~dp0dump.txt')) } finally { $lease.Dispose(); [IO.File]::Delete('%~dp0running') }\"\r\nexit /b %errorlevel%\r\n"
+            "@echo off\r\nif \"%~3\"==\"ktlspDumpSources\" goto sources\r\nif not \"%~3\"==\"ktlspDumpClasspath\" exit /b 2\r\npowershell.exe -NoProfile -NonInteractive -Command \"try { $lease=[IO.File]::Open('%~dp0running',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) } catch { [IO.File]::WriteAllText('%~dp0overlap','overlap'); exit 1 }; try { [IO.File]::AppendAllText('%~dp0invocations','invoked'+[Environment]::NewLine); $invocation=[IO.File]::ReadAllLines('%~dp0invocations').Length; if ($invocation -eq 2) { while (-not [IO.File]::Exists('%~dp0release-second')) { Start-Sleep -Milliseconds 20 } }; if ($invocation -eq 3) { while ($true) { Start-Sleep -Milliseconds 20 } }; Start-Sleep -Milliseconds 600; [Console]::Write([IO.File]::ReadAllText('%~dp0dump.txt')) } finally { $lease.Dispose(); [IO.File]::Delete('%~dp0running') }\"\r\nexit /b %errorlevel%\r\n:sources\r\ntype \"%~dp0dump.txt\"\r\nexit /b 0\r\n"
         } else {
-            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nif [ -f running ] && kill -0 \"$(cat running)\" 2>/dev/null; then touch overlap; fi\necho $$ > running\necho invoked >> invocations\nif [ \"$(wc -l < invocations)\" -eq 2 ]; then while :; do sleep 0.02; done; fi\nsleep 0.6\ncat dump.txt\nrm running\n"
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nif [ \"$3\" = \"ktlspDumpSources\" ]; then cat dump.txt; exit 0; fi\n[ \"$3\" = \"ktlspDumpClasspath\" ] || exit 2\nif [ -f running ] && kill -0 \"$(cat running)\" 2>/dev/null; then touch overlap; fi\necho $$ > running\necho invoked >> invocations\ninvocation=$(wc -l < invocations)\nif [ \"$invocation\" -eq 2 ]; then while [ ! -f release-second ]; do sleep 0.02; done; fi\nif [ \"$invocation\" -eq 3 ]; then while :; do sleep 0.02; done; fi\nsleep 0.6\ncat dump.txt\nrm running\n"
         }).unwrap();
         let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
         // This scheduler test does not inspect outgoing notifications. Close their
@@ -9543,6 +9564,29 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         backend.did_change_watched_files(event()).await;
         assert_eq!(backend.ws.lock().analysis_generation(), superseded);
         assert!(!active_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        let output = root.join("build/classes/kotlin/main/META-INF");
+        std::fs::create_dir_all(&output).unwrap();
+        let output_event = |kind| DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(Uri::from_file_path(&output).unwrap(), kind)],
+        };
+        assert_eq!(
+            project_change(
+                &root,
+                backend.ws.lock().project_snapshot().as_deref(),
+                &crate::paths::file_key(&output)
+            ),
+            Some(true)
+        );
+        backend
+            .did_change_watched_files(output_event(FileChangeType::CHANGED))
+            .await;
+        let pending = backend.ws.lock().analysis_generation();
+        assert_eq!(pending, superseded + 1);
+        assert!(backend.watches.lock().pending_model_jar);
+        assert!(
+            !active_cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "modeled output directory changes must not kill their own model dump"
+        );
         let build_jar = root.join("buildSrc/build/libs/buildSrc.jar");
         std::fs::create_dir_all(build_jar.parent().unwrap()).unwrap();
         std::fs::write(&build_jar, "first build-logic bytes").unwrap();
@@ -9556,8 +9600,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         backend
             .did_change_watched_files(jar_event(FileChangeType::CHANGED))
             .await;
-        let pending = backend.ws.lock().analysis_generation();
-        assert_eq!(pending, superseded + 1);
+        assert_eq!(backend.ws.lock().analysis_generation(), pending);
         assert!(backend.refresh.lock().force);
         assert!(backend.watches.lock().pending_model_jar);
         assert!(
@@ -9579,14 +9622,35 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         assert_eq!(backend.ws.lock().analysis_generation(), pending);
         assert!(backend.refresh.lock().force);
         assert!(!active_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        for kind in [
+            FileChangeType::CHANGED,
+            FileChangeType::DELETED,
+            FileChangeType::CREATED,
+        ] {
+            backend.did_change_watched_files(output_event(kind)).await;
+        }
+        assert_eq!(backend.ws.lock().analysis_generation(), pending);
+        std::fs::write(root.join("release-second"), "release").unwrap();
+        wait_for_fixture(backend, &root, 3, false).await;
+        assert_eq!(
+            invocations(),
+            3,
+            "output/JAR burst must drain exactly one retry after EOF"
+        );
+        assert!(!active_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(backend.ws.lock().analysis_generation(), pending);
+        let retry_cancelled = backend.refresh.lock().cancelled.clone();
         std::fs::write(root.join("build.gradle.kts"), "plugins { java }").unwrap();
         let mut mixed = event();
         mixed
             .changes
             .extend(jar_event(FileChangeType::CHANGED).changes);
+        mixed
+            .changes
+            .extend(output_event(FileChangeType::CHANGED).changes);
         backend.did_change_watched_files(mixed).await;
-        assert!(active_cancelled.load(std::sync::atomic::Ordering::Acquire));
-        wait_for_fixture(backend, &root, 3, true).await;
+        assert!(retry_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        wait_for_fixture(backend, &root, 4, true).await;
         assert!(!backend.refresh.lock().running);
         assert!(!backend.watches.lock().model_loading);
         assert!(!backend.watches.lock().pending_model_jar);
@@ -9595,7 +9659,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 .unwrap()
                 .lines()
                 .count(),
-            3
+            4
         );
         assert!(!root.join("overlap").exists());
         let mut ws = backend.ws.lock();
@@ -9606,6 +9670,23 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             "latest model was never published"
         );
         drop(ws);
+        // A source change mixed with outputs must still cancel an active import.
+        backend.refresh.lock().running = true;
+        backend.watches.lock().model_loading = true;
+        let source_cancelled = backend.refresh.lock().cancelled.clone();
+        let source = root.join("src/main/java/New.java");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "class New {}").unwrap();
+        let mut mixed_source = output_event(FileChangeType::CHANGED);
+        mixed_source.changes.push(FileEvent::new(
+            Uri::from_file_path(&source).unwrap(),
+            FileChangeType::CREATED,
+        ));
+        backend.did_change_watched_files(mixed_source).await;
+        assert!(source_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!backend.watches.lock().pending_model_jar);
+        backend.refresh.lock().running = false;
+        backend.watches.lock().model_loading = false;
         let mut watches = backend.watches.lock();
         for file in &excluded_jars {
             let key = crate::paths::file_key(file);

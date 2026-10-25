@@ -12,7 +12,16 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification on releases42 and43
+## Current verification on releases42 through44
+
+Release44 also passes **1857 passed, 0 failed, 14 ignored** and builds successfully.
+Its610 input guards remain unchanged, both build stages reach EOF/live0, and each
+records only one exact-owned MSVC helper cleanup. The immutable binary is
+23,056,896 bytes, SHA256
+`43a959df9bb9a1b3007e8991db192f017b81aaeef2dcc55be3916b65645456b8`
+(`native-integrated120-44/main-ready.json`). Modeled output notifications now use
+the existing owned-import coalescing path. The actual Gradle counter certificate
+must still be verified; unit and build success do not establish that result.
 
 Release43 passes the workspace suite: **1857 passed, 0 failed, 14 ignored**.
 The release build succeeds with609 unchanged input guards. Its immutable binary is
@@ -210,8 +219,8 @@ semantics are not certified by the test extension.
 
 ## Next actions and execution rules
 
-1. Finish output-notification coalescing during an owned Gradle model import without
-   discarding real changes. Replay the Java6-valid shared workflow and require actual
+1. Verify44's output-notification coalescing during an owned Gradle model import
+   without discarding real changes. Replay the Java6-valid workflow and require actual
    current-version counter/invalid/fixed compiler certificates. Preserve42's three
    unmeasured results; deadlines and empty pushes never prove correctness.
 2. Establish an actual current Java compiler certificate for the OkHttp diagnostic
