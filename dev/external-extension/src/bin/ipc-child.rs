@@ -37,6 +37,7 @@ fn analyze(
     next: &mut u64,
     params: &Value,
     barrier: &Option<PathBuf>,
+    project_facts: bool,
 ) -> Result<Value, String> {
     let evaluation = params["evaluation"].clone();
     let declarations = params["declarations"]
@@ -68,6 +69,33 @@ fn analyze(
         .ok_or("shadow name")?
         .trim_matches('`');
     let member = &read["facts"][1]["value"];
+    if project_facts {
+        let facts = request(
+            input,
+            output,
+            next,
+            "analysis/readFacts",
+            json!({"evaluation":evaluation,"queries":[
+                {"op":"projectContext"},
+                {"op":"typeJvm","target":target["value"]["id"]}
+            ]}),
+        )?;
+        let directory = barrier
+            .as_ref()
+            .ok_or("project facts fixture needs its barrier")?;
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        std::fs::write(
+            directory.join(format!(
+                "facts-{}.json",
+                evaluation.as_str().ok_or("evaluation token")?
+            )),
+            serde_json::to_vec(
+                &json!({"evaluation":evaluation,"owner":params["owner"],"facts":facts["facts"]}),
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if let Some(barrier) = barrier {
         if !barrier.join("released-once").exists() {
             std::fs::create_dir_all(barrier).map_err(|e| e.to_string())?;
@@ -115,11 +143,20 @@ fn analyze(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let barrier = match args.next().as_deref() {
-        Some("--barrier") => Some(PathBuf::from(args.next().ok_or("missing barrier")?)),
-        None => None,
-        _ => return Err("invalid child arguments".into()),
-    };
+    let mut barrier = None;
+    let mut project_facts = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--barrier" if barrier.is_none() => {
+                barrier = Some(PathBuf::from(args.next().ok_or("missing barrier")?))
+            }
+            "--project-facts" if !project_facts => project_facts = true,
+            _ => return Err("invalid child arguments".into()),
+        }
+    }
+    if project_facts && barrier.is_none() {
+        return Err("project facts fixture needs its barrier".into());
+    }
     let mut input = BufReader::new(std::io::stdin().lock());
     let mut output = std::io::stdout().lock();
     let mut next = 0;
@@ -133,10 +170,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     while let Some(message) = read_frame(&mut input)? {
         match message["method"].as_str() {
-            Some("initialize") => write_frame(
-                &mut output,
-                &json!({"jsonrpc":"2.0","id":message["id"],"result":{"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"capabilities":["semantic-v1"]}}),
-            )?,
+            Some("initialize") => {
+                let mut result = json!({"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"capabilities":["semantic-v1"]});
+                if project_facts {
+                    let offered = &message["params"];
+                    let supports = offered["capabilities"].as_array().is_some_and(|values| {
+                        values.iter().any(|value| value == "project-class-facts-v1")
+                    }) && ["projectContext", "typeJvm"].iter().all(|operation| {
+                        offered["supportedOps"]["project-class-facts-v1"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|value| value == *operation))
+                    });
+                    if !supports {
+                        return Err("host did not offer the two project facts operations".into());
+                    }
+                    result["capabilities"] = json!(["semantic-v1", "project-class-facts-v1"]);
+                    result["supportedOps"] =
+                        json!({"project-class-facts-v1":["projectContext","typeJvm"]});
+                }
+                write_frame(
+                    &mut output,
+                    &json!({"jsonrpc":"2.0","id":message["id"],"result":result}),
+                )?;
+            }
             Some("analysis/evaluate") => {
                 let result = analyze(
                     &mut input,
@@ -144,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut next,
                     &message["params"],
                     &barrier,
+                    project_facts,
                 );
                 let response = match result {
                     Ok(value) => json!({"jsonrpc":"2.0","id":message["id"],"result":value}),

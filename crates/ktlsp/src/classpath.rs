@@ -439,7 +439,29 @@ pub struct ProjectSnapshot {
     compiler_source_views: Vec<ktcore::index::CallerScopeVisibility>,
 }
 
+pub(crate) struct ExtensionProjectContext<'a> {
+    pub module: &'a str,
+    pub scope: ProjectScope,
+    pub source: &'a SourceSetClasspath,
+    pub sdk: Option<&'a SdkApiSelection>,
+    pub classpath_complete: bool,
+}
+
 impl ProjectSnapshot {
+    /// Borrow the accepted selection; extensions do not rediscover roots or choose an SDK.
+    pub(crate) fn extension_project_context(&self, file: &Path) -> Option<ExtensionProjectContext<'_>> {
+        let (module, source) = self.owner_for(file)?;
+        let source = source?;
+        Some(ExtensionProjectContext {
+            module: &module.module,
+            scope: project_scope(module, source),
+            source,
+            sdk: self.sdk_api_for_file(file),
+            classpath_complete: !source.classpath_incomplete
+                && source.unresolved.is_empty() && module.unresolved.is_empty(),
+        })
+    }
+
     pub fn new(modules: Vec<ModuleClasspath>) -> Self {
         let mut owners = BTreeMap::new();
         let mut output_owners: BTreeMap<String, OutputOwners> = BTreeMap::new();
@@ -4115,6 +4137,15 @@ pub(crate) mod tests {
         let model = Arc::new(ProjectSnapshot::new(vec![module.clone()]));
         let java_api = model.sdk_api_for_file(&java_path).unwrap();
         let kotlin_api = model.sdk_api_for_file(&kotlin_path).unwrap();
+        assert!(std::ptr::eq(
+            model.extension_project_context(&java_path).unwrap().sdk.unwrap(),
+            java_api
+        ));
+        assert!(std::ptr::eq(
+            model.extension_project_context(&kotlin_path).unwrap().sdk.unwrap(),
+            kotlin_api
+        ));
+        assert_eq!(kotlin_api.release, None);
         assert_eq!(java_api.release, Some(8));
         let new_java_path = source_root.join("NewApi8.java");
         let new_kotlin_path = source_root.join("NewApi17.kt");
@@ -6294,6 +6325,72 @@ CP\t/repo/unsupported/library.jar\nEND\t:unsupported\n",
         assert!(
             model.has_dependency_key("/external/local-sources.jar"),
             "old Arc view is immutable"
+        );
+    }
+
+    #[test]
+    fn extension_project_context_borrows_selected_scope_and_preserves_classpath_order() {
+        let model = ProjectSnapshot::new(parse_dump(
+            "PROJECT\t:editing\t/actual/module\nBUILD\t:included\n\
+             SOURCE\tmain\t/custom/java\nSOURCE\tmain\t/custom/kotlin\n\
+             OUTPUT\tmain\t/generated/classes\nSCP\tmain\t/libs/z.jar\n\
+             SCP\tmain\t/libs/a.jar\nSCP\tmain\t/libs/z.jar\nINCOMPLETE\tmain\n\
+             SOURCE\tintegration\t/selected/tests\nSCP\tintegration\t/libs/test.jar\nEND\t:editing\n",
+        ));
+        for file in ["/custom/java/Use.java", "/custom/kotlin/Use.kt"] {
+            let context = model.extension_project_context(Path::new(file)).unwrap();
+            assert_eq!(context.module, ":editing");
+            assert_eq!(context.scope.module, "gradle::included|:editing");
+            assert_eq!(context.scope.source_set, "main");
+            assert!(std::ptr::eq(
+                context.source,
+                &model.modules[0].source_sets[0]
+            ));
+            assert_eq!(
+                context.source.entries,
+                vec![
+                    PathBuf::from("/libs/z.jar"),
+                    PathBuf::from("/libs/a.jar"),
+                    PathBuf::from("/libs/z.jar")
+                ]
+            );
+            assert_eq!(
+                context.source.output_roots,
+                vec![PathBuf::from("/generated/classes")]
+            );
+            assert!(!context.classpath_complete);
+            assert!(context.sdk.is_none());
+            assert!(model.artifact_origin(&context.source.entries[0]).is_some());
+            assert_eq!(
+                model.artifact_origin(&context.source.entries[0]),
+                model.artifact_origin(&context.source.entries[2])
+            );
+        }
+        let context = model
+            .extension_project_context(Path::new("/selected/tests/Test.kt"))
+            .unwrap();
+        assert_eq!(context.scope.source_set, "integration");
+        assert!(context.classpath_complete);
+        assert!(
+            model
+                .extension_project_context(Path::new("/actual/module/Unregistered.kt"))
+                .is_none()
+        );
+        assert!(
+            model
+                .extension_project_context(Path::new("/unrelated/Use.java"))
+                .is_none()
+        );
+        let mut modules = model.modules.clone();
+        modules[0]
+            .unresolved
+            .push("unresolved module dependency".into());
+        let incomplete = ProjectSnapshot::new(modules);
+        assert!(
+            !incomplete
+                .extension_project_context(Path::new("/selected/tests/Test.kt"))
+                .unwrap()
+                .classpath_complete
         );
     }
 

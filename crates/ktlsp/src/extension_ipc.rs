@@ -1,9 +1,10 @@
 //! Versioned semantic extension transport. Framework rules belong in the child.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,24 @@ const MAX_BATCH: usize = 256;
 const MAX_HANDLES: usize = 16_384;
 const EVALUATION_LIMIT: Duration = Duration::from_secs(30);
 static NEXT_EVALUATION: AtomicU64 = AtomicU64::new(1);
+const PROJECT_FACTS: &str = "project-class-facts-v1";
+const PROJECT_CONTEXT: u8 = 1;
+const TYPE_JVM: u8 = 2;
+
+fn project_operations(result: &Value) -> u8 {
+    if !result["capabilities"].as_array()
+        .is_some_and(|values| values.iter().any(|value| value == PROJECT_FACTS))
+    {
+        return 0;
+    }
+    result["supportedOps"][PROJECT_FACTS].as_array().map_or(0, |operations| {
+        operations.iter().fold(0, |selected, operation| selected | match operation.as_str() {
+            Some("projectContext") => PROJECT_CONTEXT,
+            Some("typeJvm") => TYPE_JVM,
+            _ => 0,
+        })
+    })
+}
 
 /// Shared with the disposable child fixture; no core Rust identities cross this boundary.
 pub fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
@@ -112,6 +131,10 @@ fn fact<T>(value: &Fact<T>, mut found: impl FnMut(&T) -> Value) -> Value {
     }
 }
 
+fn missing_fact() -> Value {
+    fact(&Fact::<()>::Unknown(vec![IncompleteReason::MissingFacts]), |_| Value::Null)
+}
+
 fn decode_fact<T>(
     value: &Value,
     found: impl FnOnce(&Value) -> Result<T, String>,
@@ -175,6 +198,8 @@ pub(crate) struct Evaluation {
     pub pending: Option<PendingContributions>,
     pub failure: Option<String>,
     pub committed_revision: Option<u64>,
+    pub project: Option<Arc<crate::classpath::ProjectSnapshot>>,
+    pub project_operations: u8,
     handles: BTreeMap<String, Handle>,
     batches: usize,
 }
@@ -189,6 +214,8 @@ impl Evaluation {
             pending: None,
             failure: None,
             committed_revision: None,
+            project: None,
+            project_operations: 0,
             handles: BTreeMap::new(),
             batches: 0,
         }
@@ -197,6 +224,31 @@ impl Evaluation {
         let token = format!("{}:{}", self.id, self.handles.len());
         self.handles.insert(token.clone(), handle);
         token
+    }
+    fn project_context(&self) -> Value {
+        let mut value = json!({"workspaceUri":missing_fact(),"scope":missing_fact(),
+            "sourceRoots":missing_fact(),"outputRoots":missing_fact(),
+            "classpath":missing_fact(),"sdk":missing_fact()});
+        let Some(model) = self.project.as_ref() else { return value; };
+        let Some(context) = model.extension_project_context(std::path::Path::new(&self.owner)) else { return value; };
+        value["scope"] = json!({"state":"found","value":{"module":context.module,"sourceSet":context.scope.source_set}});
+        value["sourceRoots"] = json!({"state":"found","value":context.source.source_roots.iter().map(|path|path.to_string_lossy()).collect::<Vec<_>>()});
+        value["outputRoots"] = json!({"state":"found","value":context.source.output_roots.iter().map(|path|path.to_string_lossy()).collect::<Vec<_>>()});
+        let entries: Option<Vec<_>> = context.source.entries.iter().map(|path| {
+            Some(json!({"id":model.artifact_origin(path)?,"displayPath":path.to_string_lossy()}))
+        }).collect();
+        value["classpath"] = entries.map_or_else(missing_fact, |entries| json!({"state":"found","value":{
+            "entries":entries,
+            "coverage":if context.classpath_complete {json!({"state":"found","value":null})} else {fact(&Fact::<()>::Unknown(vec![IncompleteReason::IncompleteScope]), |_|Value::Null)}
+        }}));
+        if let Some(sdk) = context.sdk {
+            value["sdk"] = json!({"state":"found","value":{"identity":sdk.identity(),
+                "api":sdk.release.map_or_else(||json!({"kind":"full"}),|release|json!({"kind":"release","release":release}))}});
+        }
+        if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() > MAX_FRAME / 2) {
+            value["classpath"] = missing_fact();
+        }
+        value
     }
     fn ty(&self, value: &Value) -> Result<TypeId, String> {
         match self.handles.get(token(value)?) {
@@ -281,6 +333,25 @@ impl Evaluation {
         let id = self.issue(Handle::Member(candidate.id.clone()));
         json!({"id":id,"name":candidate.name,"kind":kind(candidate.kind),"signature":self.signature_fact(&candidate.signature),"dispatch":fact(&candidate.dispatch,|value|json!(dispatch(*value))),"visibility":fact(&candidate.visibility,|value|json!(format!("{value:?}"))),"synthetic":fact(&candidate.synthetic,|value|json!(value)),"mismatches":candidate.mismatches.iter().map(|value|format!("{value:?}")).collect::<Vec<_>>()})
     }
+
+    fn type_jvm(&mut self, facts: &TypeJvmFacts) -> Value {
+        let abi = match &facts.abi {
+            Knowledge::Found(class) => class_abi(class)
+                .map(|value| json!({"state":"found","value":value}))
+                .unwrap_or_else(missing_fact),
+            other => fact(other, |_| Value::Null),
+        };
+        json!({
+            "binaryName":fact(&facts.binary_name, |name| json!({"internalName":name.internal_name,"descriptor":name.descriptor})),
+            "classFlags":fact(&facts.class_flags, |flags| json!(flags)),
+            "declaredMembers":{
+                "members":facts.declared_members.iter().map(|member|self.member(member)).collect::<Vec<_>>(),
+                "coverage":fact(&facts.declared_members_coverage, |_|Value::Null)
+            },
+            "abi":abi,
+            "jvmAbiCoverage":fact(&facts.jvm_abi_coverage, |_|Value::Null)
+        })
+    }
     pub fn batch(
         &mut self,
         read: &mut ReadSession<'_>,
@@ -304,6 +375,19 @@ impl Evaluation {
                 let mut result = Vec::new();
                 for query in queries {
                     result.push(match query {
+                        ReadQuery::ProjectContext => {
+                            if self.project_operations & PROJECT_CONTEXT == 0 {
+                                return Err("projectContext was not negotiated".into());
+                            }
+                            self.project_context()
+                        }
+                        ReadQuery::TypeJvm {target} => {
+                            if self.project_operations & TYPE_JVM == 0 {
+                                return Err("typeJvm was not negotiated".into());
+                            }
+                            let facts = read.type_jvm(&self.ty(&json!(target))?).map_err(contract)?;
+                            self.type_jvm(&facts)
+                        }
                         ReadQuery::ResolveType {name} => self.type_fact(&read.resolve_type(&name)),
                         ReadQuery::ResolveTypeRef {reference} => {
                             let reference = match self.handles.get(&reference) { Some(Handle::TypeRef(value)) => value.clone(), _ => return Err("foreign type-reference token".into()) };
@@ -432,9 +516,47 @@ fn range(range: &std::ops::Range<usize>) -> Value {
     json!({"start":range.start,"end":range.end})
 }
 
+fn class_member(member: &ktcore::classfile::MemberFacts) -> Value {
+    json!({
+        "name":member.name.as_ref(), "descriptor":member.descriptor.as_ref(),
+        "accessFlags":member.access_flags, "signature":member.signature.as_deref(),
+        "attributeNames":member.attribute_names.iter().map(|name|name.as_ref()).collect::<Vec<_>>()
+    })
+}
+
+fn class_abi(class: &ktcore::classfile::ClassFileFacts) -> Option<Value> {
+    let ktcore::jvm::InputIdentity::Binary { content_sha256 } = &class.identity.input else {
+        return None;
+    };
+    let mut digest = String::with_capacity(64);
+    for byte in content_sha256 {
+        write!(&mut digest, "{byte:02x}").expect("formatting into a String");
+    }
+    let value = json!({
+        "identity":{
+            "originId":class.identity.origin_id, "internalName":class.identity.internal_name,
+            "contentSha256":digest
+        },
+        "majorVersion":class.major_version, "minorVersion":class.minor_version,
+        "accessFlags":class.access_flags, "superName":class.super_name.as_deref(),
+        "interfaces":class.interfaces.iter().map(|name|name.as_ref()).collect::<Vec<_>>(),
+        "signature":class.signature.as_deref(), "sourceFile":class.source_file.as_deref(),
+        "attributeNames":class.attribute_names.iter().map(|name|name.as_ref()).collect::<Vec<_>>(),
+        "innerClasses":class.inner_classes.iter().map(|inner|json!({
+            "inner":inner.inner.as_ref(),"outer":inner.outer.as_deref(),
+            "name":inner.name.as_deref(),"accessFlags":inner.access_flags
+        })).collect::<Vec<_>>(),
+        "fields":class.fields.iter().map(class_member).collect::<Vec<_>>(),
+        "methods":class.methods.iter().map(class_member).collect::<Vec<_>>()
+    });
+    (serde_json::to_vec(&value).ok()?.len() <= MAX_FRAME / 2).then_some(value)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum ReadQuery {
+    ProjectContext,
+    TypeJvm { target: String },
     ResolveType { name: String },
     ResolveTypeRef { reference: String },
     DeclarationType { declaration: String },
@@ -505,6 +627,7 @@ pub(crate) struct Worker {
     command: Vec<String>,
     stopped: AtomicBool,
     failed: Arc<AtomicBool>,
+    project_operations: AtomicU8,
     transport: Mutex<Option<Transport>>,
 }
 
@@ -515,6 +638,7 @@ impl Worker {
             command,
             stopped: AtomicBool::new(false),
             failed: Arc::new(AtomicBool::new(false)),
+            project_operations: AtomicU8::new(0),
             transport: Mutex::new(None),
         })
     }
@@ -523,6 +647,9 @@ impl Worker {
     }
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+    pub(crate) fn project_operations(&self) -> u8 {
+        self.project_operations.load(Ordering::Acquire)
     }
     pub fn close(&self) {
         self.stop();
@@ -548,7 +675,7 @@ impl Worker {
             }
             let transport = transport.as_mut().unwrap();
             if !transport.initialized {
-                transport.send(json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":work.provider,"capabilities":["semantic-v1"]}}))?;
+                transport.send(json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":work.provider,"capabilities":["semantic-v1",PROJECT_FACTS],"supportedOps":{PROJECT_FACTS:["projectContext","typeJvm"]}}}))?;
                 let response =
                     transport
                         .receive(Instant::now() + EVALUATION_LIMIT, &self.stopped, || Ok(()))?;
@@ -560,6 +687,7 @@ impl Worker {
                 {
                     return Err("incompatible extension protocol".into());
                 }
+                self.project_operations.store(project_operations(&response["result"]), Ordering::Release);
                 transport.initialized = true;
             }
             let id = work.evaluation.to_string();
@@ -757,6 +885,47 @@ impl Drop for Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_project_operations_require_both_capability_and_selected_operations() {
+        assert_eq!(project_operations(&json!({"capabilities":["semantic-v1"]})), 0);
+        assert_eq!(project_operations(&json!({"capabilities":[PROJECT_FACTS]})), 0);
+        assert_eq!(project_operations(&json!({"supportedOps":{PROJECT_FACTS:["typeJvm"]}})), 0);
+        let selected = json!({"capabilities":["semantic-v1",PROJECT_FACTS],
+            "supportedOps":{PROJECT_FACTS:["projectContext","typeJvm","unsupported"]}});
+        assert_eq!(project_operations(&selected), PROJECT_CONTEXT | TYPE_JVM);
+        let first = Worker::new(vec!["first".into()]);
+        let second = Worker::new(vec!["second".into()]);
+        first.project_operations.store(project_operations(&selected), Ordering::Release);
+        assert_eq!(first.project_operations(), PROJECT_CONTEXT | TYPE_JVM);
+        assert_eq!(second.project_operations(), 0);
+    }
+
+    #[test]
+    fn type_jvm_wire_keeps_generated_metadata_and_encodes_only_class_content_digest() {
+        use sha2::{Digest, Sha256};
+        const BYTES: &[u8] = include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Model$$serializer.class");
+        let class = ktcore::classfile::decode("selected", BYTES).unwrap();
+        let value = class_abi(&class).unwrap();
+        assert_eq!(value["identity"]["contentSha256"], format!("{:x}", Sha256::digest(BYTES)));
+        assert_eq!(value["methods"].as_array().unwrap().len(), class.methods.len());
+        assert_eq!(value["fields"].as_array().unwrap().len(), class.fields.len());
+        for (actual, expected) in value["methods"].as_array().unwrap().iter().zip(&class.methods) {
+            assert_eq!(actual, &class_member(expected));
+            assert!(actual.get("id").is_none(), "raw methods have no invented editing identity");
+        }
+        assert!(value["methods"].as_array().unwrap().iter().any(|method|
+            method["name"] == "deserialize" && method["accessFlags"] == 0x1041));
+        assert!(value["methods"].as_array().unwrap().iter().any(|method|
+            method["name"] == "deserialize" && method["accessFlags"] == 0x0001));
+        let mut oversized = class.clone();
+        oversized.attribute_names.push(Arc::from("x".repeat(MAX_FRAME)));
+        assert!(class_abi(&oversized).is_none());
+        let mut source = class;
+        source.identity.input = ktcore::jvm::InputIdentity::Source { file: "Model.kt".into(), revision: 1 };
+        assert!(class_abi(&source).is_none());
+    }
+
     #[test]
     fn declaration_member_reads_exact_overload_and_rejects_foreign_tokens() {
         use ktcore::index::{Index, Tier};

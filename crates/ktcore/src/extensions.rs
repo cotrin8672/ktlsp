@@ -203,6 +203,23 @@ pub struct DeclaredMemberFacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JvmBinaryName {
+    pub internal_name: String,
+    pub descriptor: String,
+}
+
+/// Editing members and positive raw JVM metadata have independent completeness.
+#[derive(Clone, Debug)]
+pub struct TypeJvmFacts {
+    pub binary_name: Fact<JvmBinaryName>,
+    pub class_flags: Fact<u16>,
+    pub declared_members: Vec<MemberCandidate>,
+    pub declared_members_coverage: Fact<()>,
+    pub abi: Fact<Arc<crate::classfile::ClassFileFacts>>,
+    pub jvm_abi_coverage: Fact<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclarationId {
     host: u64,
     generation: u64,
@@ -1858,6 +1875,52 @@ impl ReadSession<'_> {
             owner: owner.clone(),
             internal_name,
         })))
+    }
+
+    pub fn type_jvm(&mut self, owner: &TypeId) -> Result<TypeJvmFacts, ContractError> {
+        let binary_name = match self.reference_type(owner)? {
+            Knowledge::Found(JvmType::Reference(reference)) => Knowledge::Found(JvmBinaryName {
+                descriptor: format!("L{};", reference.internal_name),
+                internal_name: reference.internal_name,
+            }),
+            Knowledge::Unknown(reasons) => Knowledge::Unknown(reasons),
+            _ => unknown(IncompleteReason::MissingFacts),
+        };
+        let (declared_members, declared_members_coverage) = self.declared_members(owner)?;
+        let mut inputs = self.compiler_classes(owner)?;
+        if let Knowledge::Found(class) = self.compiled_class(owner)? {
+            inputs.push(class);
+        }
+        let mut abi = unknown(IncompleteReason::MissingFacts);
+        if let Knowledge::Found(name) = &binary_name {
+            for input in inputs {
+                self.check_compiled_class(&input)?;
+                if input.class.identity.internal_name != name.internal_name
+                    || !matches!(input.class.identity.input, crate::jvm::InputIdentity::Binary { .. })
+                {
+                    continue;
+                }
+                if matches!(&abi, Knowledge::Found(previous) if previous != &input.class) {
+                    abi = unknown(IncompleteReason::AmbiguousType);
+                    break;
+                }
+                abi = Knowledge::Found(input.class);
+            }
+        }
+        let class_flags = match &abi {
+            Knowledge::Found(class) => Knowledge::Found(class.access_flags),
+            Knowledge::Unknown(reasons) => Knowledge::Unknown(reasons.clone()),
+            Knowledge::DefinitelyAbsent => unknown(IncompleteReason::MissingFacts),
+        };
+        Ok(TypeJvmFacts {
+            binary_name,
+            class_flags,
+            declared_members,
+            declared_members_coverage,
+            abi,
+            // Existing inputs attest declarations, not full runtime ABI versus headers/SDK stubs.
+            jvm_abi_coverage: unknown(IncompleteReason::MissingFacts),
+        })
     }
 
     fn source_jvm_type(

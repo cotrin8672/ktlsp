@@ -1312,6 +1312,43 @@ fn compiled_host_type(index: &Index, store: &mut ExtensionStore, file: &str) -> 
     owner
 }
 
+#[test]
+fn type_jvm_preserves_raw_class_metadata_and_tracks_missing_or_replaced_inputs() {
+    let (index, mut store, class) = compiled_host_fixture();
+    let owner = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
+    let mut read = store.begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A).unwrap();
+    let source = read.type_jvm(&owner).unwrap();
+    assert!(matches!(source.abi, Knowledge::Unknown(_)));
+    assert!(matches!(source.jvm_abi_coverage, Knowledge::Unknown(_)));
+    let missing = read.finish();
+
+    store.replace_compiled_input(&index, &owner, Some(class.clone())).unwrap();
+    assert_eq!(store.commit(missing), Err(ContractError::Stale));
+    let mut read = store.begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A).unwrap();
+    let facts = read.type_jvm(&owner).unwrap();
+    let Knowledge::Found(name) = facts.binary_name else { panic!("exact JVM owner"); };
+    assert_eq!(name.internal_name, class.identity.internal_name);
+    assert_eq!(name.descriptor, format!("L{};", class.identity.internal_name));
+    assert_eq!(facts.class_flags, Knowledge::Found(class.access_flags));
+    let Knowledge::Found(actual) = facts.abi else { panic!("checked class metadata"); };
+    assert!(Arc::ptr_eq(&actual, &class));
+    assert_eq!(actual.methods, class.methods);
+    assert_eq!(actual.fields, class.fields);
+    assert!(matches!(facts.jvm_abi_coverage, Knowledge::Unknown(_)),
+        "parsed declarations do not prove runtime versus header/SDK provenance");
+    let selected = read.finish();
+    let mut read = store.begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_B).unwrap();
+    let Knowledge::Found(other) = read.resolve_type("pluginfixture.Person") else { panic!("other scope"); };
+    assert!(matches!(read.type_jvm(&other).unwrap().abi, Knowledge::Unknown(_)));
+    let _ = read.finish();
+    store.replace_compiled_input(&index, &owner, None).unwrap();
+    assert_eq!(store.commit(selected), Err(ContractError::Stale));
+
+    let (other_index, mut other_store, _) = compiled_host_fixture();
+    let mut other = other_store.begin(&other_index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A).unwrap();
+    assert_eq!(other.type_jvm(&owner).err(), Some(ContractError::ForeignIdentity));
+}
+
 fn compiled_host_getter_pending(
     index: &Index,
     store: &mut ExtensionStore,

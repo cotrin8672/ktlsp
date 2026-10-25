@@ -722,7 +722,9 @@ impl Workspace {
 
     pub(crate) fn take_ipc_work(&mut self) -> Vec<crate::extension_ipc::Work> {
         let revision = self.analysis_extensions.revision();
-        let work = self.analysis_extensions.take_ipc_work(&self.index);
+        let work = self
+            .analysis_extensions
+            .take_ipc_work(&self.index, self.project_model.as_ref());
         if self.analysis_extensions.revision() != revision {
             self.bump_index_revision();
         }
@@ -6044,6 +6046,64 @@ mod tests {
                 .count(),
             2
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ipc_project_model_replacement_rejects_late_batches_and_finish() {
+        let root = unique_tmp("ipc-project-model");
+        std::fs::create_dir_all(&root).unwrap();
+        let source_root = root.join("selected-source");
+        let key = crate::paths::file_key(&source_root.join("Owner.kt"));
+        let model = |module| {
+            Arc::new(crate::classpath::ProjectSnapshot::new(
+                crate::classpath::parse_dump(&format!(
+                    "PROJECT\t{module}\t{}\nSOURCE\tcustom\t{}\nEND\t{module}\n",
+                    root.display(),
+                    source_root.display()
+                )),
+            ))
+        };
+        let mut ws = Workspace::new();
+        ws.set_project_model(model(":before"));
+        ws.open(&key, "package ipc\nclass Owner".into());
+        ws.register_ipc_provider("test.context", vec!["fixture-child".into()])
+            .unwrap();
+        let work = ws.take_ipc_work().remove(0);
+        ws.ipc_batch(
+            work.evaluation,
+            "analysis/readFacts",
+            serde_json::json!({"evaluation":work.evaluation.to_string(),"queries":[]}),
+        )
+        .unwrap();
+        ws.set_project_model(model(":after"));
+        assert!(!ws.ipc_evaluation_current(work.evaluation));
+        assert!(
+            ws.ipc_batch(
+                work.evaluation,
+                "analysis/readFacts",
+                serde_json::json!({"evaluation":work.evaluation.to_string(),"queries":[]}),
+            )
+            .is_err()
+        );
+        assert!(ws.ipc_batch(
+            work.evaluation,
+            "analysis/finish",
+            serde_json::json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}}),
+        ).is_err());
+        assert!(
+            ws.analysis_extensions
+                .ipc_publication(work.evaluation)
+                .is_none()
+        );
+        ws.finish_ipc_work(work.evaluation, Err("Stale".into()));
+        let fresh = ws.take_ipc_work().remove(0);
+        assert!(ws.ipc_evaluation_current(fresh.evaluation));
+        ws.ipc_batch(
+            fresh.evaluation,
+            "analysis/finish",
+            serde_json::json!({"evaluation":fresh.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}}),
+        ).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

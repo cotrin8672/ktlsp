@@ -1,4 +1,5 @@
 use super::*;
+use crate::classpath::ProjectSnapshot;
 use crate::extension_ipc::{Evaluation, Work, Worker};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -48,12 +49,56 @@ mod tests {
     }
 
     #[test]
+    fn ipc_evaluation_shares_the_accepted_model_and_uses_its_read_set_lifetime() {
+        let (index, mut host) = host();
+        let model = Arc::new(ProjectSnapshot::new(crate::classpath::parse_dump(
+            "PROJECT\t:selected\t/project\nSOURCE\tcustom\t/ipc\nSCP\tcustom\t/library.jar\nEND\t:selected\n",
+        )));
+        let work = host.take_ipc_work(&index, Some(&model)).remove(0);
+        assert!(Arc::ptr_eq(
+            host.ipc_evaluations[&work.evaluation]
+                .project
+                .as_ref()
+                .unwrap(),
+            &model
+        ));
+        assert_eq!(Arc::strong_count(&model), 2);
+        assert!(work.params.get("project").is_none());
+        assert!(work.params.get("projectContext").is_none());
+        host.ipc_batch(
+            &index,
+            work.evaluation,
+            "analysis/readFacts",
+            json!({"evaluation":work.evaluation.to_string(),"queries":[]}),
+        )
+        .unwrap();
+        host.model_changed(&index);
+        assert!(!host.ipc_current(work.evaluation));
+        assert!(
+            host.ipc_batch(
+                &index,
+                work.evaluation,
+                "analysis/readFacts",
+                json!({"evaluation":work.evaluation.to_string(),"queries":[]}),
+            )
+            .is_err()
+        );
+        assert!(host.ipc_batch(
+            &index,
+            work.evaluation,
+            "analysis/finish",
+            json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}}),
+        ).is_err());
+        assert!(host.ipc_publication(work.evaluation).is_none());
+    }
+
+    #[test]
     fn completion_pending_tracks_queued_and_running_owners_until_commit() {
         let (index, mut host) = host();
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_completion_pending("/ipc/Target.kt"));
         assert!(!host.ipc_completion_pending("/ipc/Missing.kt"));
-        let work = host.take_ipc_work(&index).remove(0);
+        let work = host.take_ipc_work(&index, None).remove(0);
         assert_eq!(work.params["owner"], "/ipc/Owner.kt");
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         host.ipc_batch(
@@ -66,7 +111,7 @@ mod tests {
         assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_completion_pending("/ipc/Target.kt"));
         host.finish_ipc_work(work.evaluation, Ok(()));
-        let other = host.take_ipc_work(&index).remove(0);
+        let other = host.take_ipc_work(&index, None).remove(0);
         assert_eq!(other.params["owner"], "/ipc/Target.kt");
         assert!(host.ipc_completion_pending("/ipc/Target.kt"));
         assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
@@ -78,7 +123,7 @@ mod tests {
     #[test]
     fn stale_evaluation_is_not_pending_until_fresh_work_is_queued() {
         let (index, mut host) = host();
-        let work = host.take_ipc_work(&index).remove(0);
+        let work = host.take_ipc_work(&index, None).remove(0);
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         host.store.invalidate_model();
         assert!(!host.ipc_current(work.evaluation));
@@ -99,7 +144,7 @@ mod tests {
             Tier::Volatile,
         );
         host.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
-        let work = host.take_ipc_work(&index).remove(0);
+        let work = host.take_ipc_work(&index, None).remove(0);
         assert_eq!(work.params["source"], text);
         host.publish(&mut index);
         assert!(host.ipc_publication(work.evaluation).is_none());
@@ -155,7 +200,7 @@ mod tests {
     #[test]
     fn replacement_retracts_a_previously_published_evaluation() {
         let (mut index, mut host) = host();
-        let work = host.take_ipc_work(&index).remove(0);
+        let work = host.take_ipc_work(&index, None).remove(0);
         host.ipc_batch(
             &index,
             work.evaluation,
@@ -176,7 +221,7 @@ mod tests {
     #[test]
     fn late_old_failure_cannot_disable_or_clear_replacement_success() {
         let (mut index, mut host) = host();
-        let old = host.take_ipc_work(&index).remove(0);
+        let old = host.take_ipc_work(&index, None).remove(0);
         host.register_ipc(&index, "test.ipc", vec!["replacement-child".into()])
             .unwrap();
         assert!(host
@@ -188,12 +233,12 @@ mod tests {
             )
             .is_err());
         assert!(host.ipc_publication(old.evaluation).is_none());
-        let fresh = host.take_ipc_work(&index).remove(0);
+        let fresh = host.take_ipc_work(&index, None).remove(0);
         host.ipc_batch(&index,fresh.evaluation,"analysis/finish",json!({"evaluation":fresh.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})).unwrap();
         host.publish(&mut index);
         assert!(host.ipc_publication(fresh.evaluation).is_some());
         host.finish_ipc_work(fresh.evaluation, Ok(()));
-        let _next = host.take_ipc_work(&index).remove(0);
+        let _next = host.take_ipc_work(&index, None).remove(0);
         let instance = host.ipc_providers["test.ipc"].worker.id;
         assert!(host.ipc_providers["test.ipc"].running);
         assert!(host.ipc_publication(old.evaluation).is_none());
@@ -214,7 +259,7 @@ mod tests {
     #[test]
     fn foreign_token_poison_prevents_partial_publication() {
         let (index, mut host) = host();
-        let work = host.take_ipc_work(&index).remove(0);
+        let work = host.take_ipc_work(&index, None).remove(0);
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"declaredMembers","target":"foreign:0"}]})).is_err());
         assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
@@ -248,7 +293,7 @@ mod tests {
             ktcore::indexer::extract_symbols(&tree, text, "ipc"),
             Tier::Volatile,
         );
-        let work = host.take_ipc_work(&index).remove(0);
+        let work = host.take_ipc_work(&index, None).remove(0);
         let result=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Unopened"}]})).unwrap();
         assert_eq!(result["facts"][0]["state"], "unknown");
         assert!(host.wanted_ipc_sources().contains(file));
@@ -355,7 +400,11 @@ impl AnalysisExtensions {
         }
     }
 
-    pub(crate) fn take_ipc_work(&mut self, index: &dyn InferenceIndex) -> Vec<Work> {
+    pub(crate) fn take_ipc_work(
+        &mut self,
+        index: &dyn InferenceIndex,
+        project: Option<&Arc<ProjectSnapshot>>,
+    ) -> Vec<Work> {
         let dead: Vec<_> = self
             .ipc_providers
             .iter()
@@ -400,6 +449,8 @@ impl AnalysisExtensions {
             let Ok(mut read) = self.store.begin(index, &provider, &owner) else {
                 continue;
             };
+            // begin's model read guards this snapshot through resume and commit.
+            evaluation.project = project.cloned();
             let params = evaluation.source(&mut read);
             evaluation.pending = Some(read.finish());
             match params {
@@ -459,6 +510,11 @@ impl AnalysisExtensions {
             self.ipc_evaluations.insert(id, evaluation);
             return Err(error);
         }
+        evaluation.project_operations = self
+            .ipc_providers
+            .get(&evaluation.provider)
+            .filter(|slot| slot.worker.id == evaluation.instance)
+            .map_or(0, |slot| slot.worker.project_operations());
         let owner = evaluation.owner.clone();
         let Some(pending) = evaluation.pending.take() else {
             self.ipc_evaluations.insert(id, evaluation);

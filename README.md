@@ -552,6 +552,15 @@ token. It returns the host-normalized member and signature without guessing amon
 or overloads. Ambiguous JVM projections and incomplete facts remain Unknown. The same
 query is available to linked providers as `ReadSession::declaration_member`.
 
+The experimental `project-class-facts-v1` capability adds negotiated `projectContext`
+and `typeJvm` queries for host-selected project/SDK metadata and checked JVM declaration
+metadata. Full runtime ABI coverage and workspace URI stay Unknown where the host
+cannot establish them.
+The [wire contract](docs/architecture/extension-ipc.md) records the exact limits.
+The existing `corpus`/IPC probe route uses the fixture child's `--project-facts` mode
+with a disposable Gradle project to check model selection, stale evaluation rejection,
+and fresh contributions after a real dependency change.
+
 `dev/jvm_projection_project.lua` generates a disposable four-buffer Kotlin/JVM fixture for
 this route. Its `dev/corpus/jvm-projections.json` manifest checks the Java exported suspend
 alias and Kotlin authored name, including first responses while the declaration file is closed.

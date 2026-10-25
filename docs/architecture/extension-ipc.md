@@ -79,6 +79,48 @@ An authored Kotlin property with accessor projections, or an unsupported `@JvmOv
 lowering, does not prove a single JVM member; unresolved signature/modifier facts keep the
 whole correspondence Unknown. This query does not enumerate generated JVM projections.
 
+### Optional project/type facts (next source slice)
+
+The source adds `project-class-facts-v1` with `projectContext` and `typeJvm`.
+Focused Rust checks pass; the new real-child route still needs verification. Neither
+operation is present in the published release36 binary. Pin a verified host commit
+before using them.
+
+`initialize` advertises the optional capability and
+`supportedOps:{"project-class-facts-v1":["projectContext","typeJvm"]}`. The child
+selects supported operations in its reply. The host stores that intersection per
+worker instance and checks every batch. A semantic-v1-only reply remains valid;
+unsupported/unselected operations return the existing request error, not an absent fact.
+
+- `{"op":"projectContext"}` selects the subject from the evaluation owner and accepted
+  model. Independent facts describe `workspaceUri`, `scope` (raw Gradle `module` and
+  `sourceSet`), `sourceRoots`, `outputRoots`, ordered `classpath.entries` with host origin
+  IDs/display paths and coverage, and the selected `sdk` identity/full-or-release API.
+  The current host cannot attest a workspace URI, so that field remains Unknown.
+  Missing scope, entry origin or SDK selection stays Unknown rather than using a guessed
+  path or JAVA_HOME. Entry metadata does not grant filesystem authority.
+- `{"op":"typeJvm","target":"<host type token>"}` returns independent `binaryName`,
+  `classFlags`, editing-oriented `declaredMembers`, positive `abi` metadata and
+  `jvmAbiCoverage`. The ABI view preserves all parsed methods/fields, bridge/synthetic
+  members, raw flags, signatures, versions, interfaces, InnerClasses and attribute names
+  from a checked `ClassFileFacts` input. Raw members receive no invented editing IDs.
+  Its `identity.contentSha256` is a lowercase64-character hex JSON string, representing
+  the digest of that individual class input's bytes (`.class` or `.sig`), not an archive
+  digest or a hash recomputed from ABI JSON. Oversized or unavailable ABI facts are Unknown.
+
+Parsed metadata does not establish whether an input is a full runtime class, compiler
+header or selected SDK API stub. Consequently `jvmAbiCoverage` remains Unknown even
+when positive raw metadata is available. Source member coverage is separate and must
+not certify full generated JVM ABI. This slice cannot construct a complete-only
+ClassIndex/MC HostProjectSession and does not provide class bytes, Code/LVT payloads,
+catalog pagination, assignability, resources, commands or external read-set caches.
+
+The evaluation retains one shared model Arc, with no full model JSON cloned into each
+file payload. Existing model/source/compiled/configuration reads govern resume and
+publication; a model change rejects old batches and final contributions. Metadata
+projection uses accepted in-memory selections without filesystem reads. No MC-specific
+generation counters are introduced.
+
 Source facts preserve owner/annotation/declaration ranges, normalized annotation arguments,
 member kind and known signature/dispatch/visibility/synthetic facts for both languages.
 Class-valued annotation/type-reference tokens are resolved by the host in the owner scope.
