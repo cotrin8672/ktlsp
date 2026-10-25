@@ -25,12 +25,62 @@ vim.cmd("edit " .. vim.fn.fnameescape(main))
 local bufnr = vim.api.nvim_get_current_buf()
 vim.bo[bufnr].filetype = "kotlin"
 
-local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project })
+local readiness = { progress = {} }
+local progress_handler = vim.lsp.handlers["$/progress"]
+local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = project, handlers = {
+  ["$/progress"] = function(err, params, ctx, config)
+    if params and params.token == "ktlsp/index" then
+      if params.value.kind == "begin" then readiness.progress = { began = true }
+      elseif params.value.kind == "end" then
+        readiness.progress.ended = type(params.value.message) == "string"
+          and params.value.message:match("^indexed %d+ dependencies, %d+ files$") ~= nil
+      end
+    end
+    if progress_handler then return progress_handler(err, params, ctx, config) end
+  end,
+} })
 assert(id, "vim.lsp.start returned nil")
 vim.wait(8000, function()
   local c = vim.lsp.get_client_by_id(id)
   return c ~= nil and (c.initialized == true or (c.server_capabilities and c.server_capabilities.definitionProvider))
 end, 50)
+
+-- Observe the accepted generation, including the selected sources and SDK, before semantic RPCs.
+local function indexing_finished(generation, accepted, dependencies, progress)
+  return generation ~= nil and accepted ~= nil and dependencies ~= nil
+    and accepted.generation == generation and dependencies.generation == generation
+    and progress.began == true and progress.ended == true
+end
+assert(not indexing_finished(2, { generation = 1 }, { generation = 2 }, { began = true, ended = true }))
+assert(not indexing_finished(2, { generation = 2 }, { generation = 1 }, { began = true, ended = true }))
+assert(not indexing_finished(2, { generation = 2 }, { generation = 2 }, { began = true }))
+assert(indexing_finished(2, { generation = 2 }, { generation = 2 }, { began = true, ended = true }))
+local function read_indexing_state()
+  if not readiness.progress.ended then return false end
+  local file = io.open(assert(vim.env.KTLSP_TRACE, "missing library readiness trace"), "rb")
+  if not file then return false end
+  local generation, accepted, dependencies
+  local root = vim.fs.normalize(project):lower()
+  for line in file:lines() do
+    local decoded, event = pcall(vim.json.decode, line)
+    local args = decoded and type(event) == "table" and event.args
+    if type(args) == "table" and type(args.root) == "string" and vim.fs.normalize(args.root):lower() == root then
+      if event.name == "workspace.progress_begin" or event.name == "workspace.refresh_requested" then
+        generation = args.generation
+      elseif event.name == "workspace.accepted_finish" then accepted = args
+      elseif event.name == "deps.index_workspace" then dependencies = args end
+    end
+  end
+  file:close()
+  readiness.generation, readiness.accepted, readiness.dependencies = generation, accepted, dependencies
+  return indexing_finished(generation, accepted, dependencies, readiness.progress)
+end
+readiness.ready = vim.wait(300000, read_indexing_state, 200)
+vim.fn.writefile({ vim.json.encode(readiness) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/library-readiness.json")
+if not readiness.ready then
+  print("UNMEASURED library semantics: accepted indexing generation and progress end unavailable -> " .. vim.inspect(readiness))
+  os.exit(1)
+end
 
 local function find_token(token, occurrence)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -56,22 +106,11 @@ local function definition_for(token, occurrence)
   local line, col = find_token(token, occurrence)
   local params = { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }
   local loc
-  -- Dependency and JDK indexing run asynchronously after `initialize`, so retry until warm.
-  for _ = 1, 250 do
-    local r = vim.lsp.buf_request_sync(bufnr, "textDocument/definition", params, 1000) or {}
-    for _, v in pairs(r) do
-      if v.result and (v.result.uri or v.result[1]) then
-        loc = v.result
-        if loc[1] then
-          loc = loc[1]
-        end
-        break
-      end
-    end
-    if loc then
+  for _, response in pairs(vim.lsp.buf_request_sync(bufnr, "textDocument/definition", params, 8000) or {}) do
+    if response.result and (response.result.uri or response.result[1]) then
+      loc = response.result.uri and response.result or response.result[1]
       break
     end
-    vim.wait(200)
   end
   return loc
 end
@@ -100,6 +139,10 @@ local function request(buf, method, params)
     end
   end
 end
+
+check("accepted library source and JDK coverage", readiness.accepted.failed == 0
+  and readiness.accepted.missingSources == 0 and readiness.accepted.classpathComplete == true
+  and readiness.dependencies.jdkComplete == true, vim.inspect(readiness))
 
 ok = check_definition("goto listOf", "listOf", 1, function(loc)
   return loc.uri:match("kotlin%-stdlib")
@@ -683,6 +726,54 @@ if vim.fn.filereadable(plain_use) == 1 then
   if not executed then check("interface method probes execute", false, action_error) end
   if vim.env.KTLSP_TRACE then
     vim.fn.writefile({ vim.json.encode(action_report) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/library-interface-implementations.json")
+  end
+end
+
+-- This published dependency declares Windows-1252 in its POM, independently of Java sources.
+-- One request after the existing library probes: no retry based on the desired definition.
+do
+  local path = project .. "/src/main/java/app/Windows1252MetadataUse.java"
+  local buf = vim.fn.bufadd(path)
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "java"
+  assert(vim.lsp.buf_attach_client(buf, id), "could not attach CP1252 metadata caller")
+  vim.wait(200)
+  local line, character
+  for i, text in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    local start = text:find("driver.get(", 1, true)
+    if start then line, character = i - 1, start - 1 + #"driver." end
+  end
+  assert(line, "CP1252 metadata caller missing driver.get")
+  local params = { textDocument = { uri = vim.uri_from_bufnr(buf) },
+    position = { line = line, character = character } }
+  local raw = vim.lsp.buf_request_sync(buf, "textDocument/definition", params, 8000)
+  local locations = {}
+  for _, response in pairs(raw or {}) do
+    local result = response.result
+    if result and result ~= vim.NIL then
+      if result.uri or result.targetUri then result = { result } end
+      for _, location in ipairs(result) do locations[#locations + 1] = location end
+    end
+  end
+  local loc = #locations == 1 and locations[1] or nil
+  local uri = loc and (loc.uri or loc.targetUri)
+  local range = loc and (loc.targetSelectionRange or loc.range)
+  local source_sha256
+  if uri then
+    local source = io.open(vim.uri_to_fname(uri), "rb")
+    if source then source_sha256 = vim.fn.sha256(source:read("*a")); source:close() end
+  end
+  local matched = uri and uri:gsub("\\", "/"):match("/org/openqa/selenium/WebDriver%.java$")
+    and range and range.start.line == 67 and range.start.character == 7
+    and range["end"].line == 67 and range["end"].character == 10
+    and source_sha256 == "0ca4510521d3ec3220dd18de9e60ae910c60736ab03fc1d72657fb56ff187537"
+  check("CP1252 POM dependency goto WebDriver.get exact source and range", matched, vim.inspect(raw))
+  if vim.env.KTLSP_TRACE then
+    vim.fn.writefile({ vim.json.encode({ method = "textDocument/definition", params = params,
+      response = raw, first_response_only = true, source_sha256 = source_sha256,
+      expected_source_sha256 = "0ca4510521d3ec3220dd18de9e60ae910c60736ab03fc1d72657fb56ff187537",
+      expected_range = { start = { line = 67, character = 7 }, ["end"] = { line = 67, character = 10 } },
+      matched = not not matched }) }, vim.fs.dirname(vim.env.KTLSP_TRACE) .. "/library-pom-metadata.json")
   end
 end
 

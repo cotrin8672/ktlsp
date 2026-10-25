@@ -2572,20 +2572,28 @@ mod tests {
         let selected = root.join("selected/encoding-1-sources.jar");
         let selected_pom = root.join("selected/encoding-1.pom");
         let binary = root.join("encoding-1.jar");
-        write_sources_jar(
-            &selected,
-            &[(
-                "example/Policy.java",
-                "package example; public class Policy { public int café() { return 1; } }",
-            )],
-        );
+        let java_source =
+            "package example; public class Policy { public int café() { return 1; } }";
+        write_sources_jar(&selected, &[("example/Policy.java", java_source)]);
         write_sources_jar(&binary, &[]);
         let pom = |encoding: &str| {
             format!(
                 "<project><groupId>example</groupId><artifactId>encoding</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>"
             )
         };
-        fs::write(&selected_pom, pom("UTF-8")).unwrap();
+        let selected_metadata = pom("UTF-8");
+        let (before, after) = selected_metadata.split_once("<properties>").unwrap();
+        fs::write(
+            &selected_pom,
+            [
+                b"<?xml version=\"1.0\" encoding=\"Windows-1252\"?>".as_slice(),
+                before.as_bytes(),
+                b"<name>\x93caf\xe9\x94 \x80</name><properties>",
+                after.as_bytes(),
+            ]
+            .concat(),
+        )
+        .unwrap();
         let foreign = repos.m2.join("example/encoding/1/encoding-1.pom");
         fs::create_dir_all(foreign.parent().unwrap()).unwrap();
         fs::write(&foreign, pom("ISO-8859-1")).unwrap();
@@ -2606,6 +2614,40 @@ mod tests {
         let batches =
             resolve_library_source(&source, &mut KotlinParser::new(), &mut JavaParser::new())
                 .unwrap();
+        assert_eq!(
+            source.policy.as_ref().unwrap().java,
+            JavaSourceEncoding::Utf8
+        );
+        let mut workspace = crate::workspace::Workspace::new();
+        workspace.assume_index_complete_for_tests();
+        for batch in &batches {
+            workspace.index.replace_file(
+                &batch.file,
+                batch.symbols.clone(),
+                crate::index::Tier::Durable,
+            );
+        }
+        workspace.bump_index_revision();
+        let caller = "package app; import example.Policy; class Use { int run(Policy policy) { return policy.café(); } }";
+        workspace.open("Use.java", caller.to_owned());
+        let definitions = workspace.goto_definition("Use.java", caller.find("café").unwrap());
+        assert_eq!(
+            definitions.len(),
+            1,
+            "UTF8 source member must remain navigable with CP1252 POM metadata"
+        );
+        let expected_file = &batches
+            .iter()
+            .find(|batch| batch.file.ends_with("/Policy.java"))
+            .unwrap()
+            .file;
+        assert_eq!(definitions[0].file, *expected_file);
+        assert_eq!(definitions[0].start_byte, java_source.find("café").unwrap());
+        assert_eq!(
+            definitions[0].end_byte,
+            java_source.find("café").unwrap() + "café".len()
+        );
+        assert_eq!(fs::read_to_string(expected_file).unwrap(), java_source);
         let names = batches
             .iter()
             .flat_map(|batch| &batch.symbols)
@@ -7216,7 +7258,7 @@ worktree = "com.example:worktree:9.9"
         for (artifact, encoding) in [("encoding", "UTF8"), ("encoding-jvm", "ISO-8859-1")] {
             let base = repos.m2.join(format!("fixture/{artifact}/1"));
             fs::create_dir_all(&base).unwrap();
-            fs::write(base.join(format!("{artifact}-1.pom")), format!("<project><groupId>fixture</groupId><artifactId>{artifact}</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>")).unwrap();
+            fs::write(base.join(format!("{artifact}-1.pom")), format!("<project><groupId>fixture</groupId><artifactId>{artifact}</artifactId><version>1</version><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties><build><pluginManagement><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><configuration><compilerArgs>-Xlint</compilerArgs></configuration></plugin></plugins></pluginManagement></build></project>")).unwrap();
         }
         let archive = repos
             .m2

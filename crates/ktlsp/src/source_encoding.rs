@@ -231,6 +231,8 @@ struct Pom {
     active_encoding: Option<String>,
     managed_encoding: Option<String>,
     compiler_levels: Vec<String>,
+    compiler_encodings: Vec<String>,
+    compiler_memories: Vec<String>,
     unsupported_compiler_encoding: bool,
 }
 
@@ -282,19 +284,22 @@ impl Pom {
 
 #[derive(Default)]
 struct Plugin {
+    compiler_id: Option<String>,
+    properties_argument: bool,
     group: Option<String>,
     artifact: Option<String>,
     encoding: Option<String>,
     profile: bool,
     managed: bool,
     compiler_levels: Vec<String>,
+    compiler_encodings: Vec<String>,
+    compiler_memories: Vec<String>,
     unsupported: bool,
 }
 struct Frame {
     name: String,
     text: String,
     attributes: bool,
-    argument_override: bool,
     children: bool,
     plugin: Option<Plugin>,
 }
@@ -313,13 +318,47 @@ fn xml_chars(text: &str) -> bool {
         .all(|c| matches!(c, '\t' | '\r' | '\n') || c >= ' ' && c != '\u{fffe}' && c != '\u{ffff}')
 }
 
-fn xml_declared_encoding(declaration: &BytesDecl<'_>) -> anyhow::Result<JavaSourceEncoding> {
+// POM metadata encoding is independent of the Java source policy serialized in the cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PomXmlEncoding {
+    Source(JavaSourceEncoding),
+    Windows1252,
+}
+
+impl PomXmlEncoding {
+    fn decode(self, bytes: Vec<u8>) -> anyhow::Result<String> {
+        if let Self::Source(encoding) = self {
+            return encoding.decode(bytes);
+        }
+        // Microsoft CP1252 table; zero marks the five undefined bytes, never replacements.
+        // https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP1252.TXT
+        const C1: [u16; 32] = [
+            0x20ac, 0, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+            0x2039, 0x0152, 0, 0x017d, 0, 0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013,
+            0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0, 0x017e, 0x0178,
+        ];
+        let mut text = String::with_capacity(bytes.len());
+        for byte in bytes {
+            let character = if (0x80..=0x9f).contains(&byte) {
+                let codepoint = C1[usize::from(byte - 0x80)];
+                ensure!(codepoint != 0, "undefined Windows-1252 byte: {byte:#04x}");
+                char::from_u32(u32::from(codepoint)).context("invalid Windows-1252 mapping")?
+            } else {
+                char::from(byte)
+            };
+            text.push(character);
+        }
+        Ok(text)
+    }
+}
+
+fn xml_declared_encoding(declaration: &BytesDecl<'_>) -> anyhow::Result<PomXmlEncoding> {
     // BytesDecl::encoding alone returns the first occurrence and permits duplicate/order errors.
     // Validate the complete declaration with quick-xml's checked attribute iterator instead.
     ensure!(declaration.is_ascii(), "non-ASCII XML declaration");
     let start = BytesStart::from_content(std::str::from_utf8(declaration.as_ref())?, 3);
     let mut state = 0;
-    let mut encoding = JavaSourceEncoding::Utf8;
+    let mut encoding = PomXmlEncoding::Source(JavaSourceEncoding::Utf8);
     for attribute in start.attributes() {
         let attribute = attribute?;
         match (attribute.key.as_ref(), state) {
@@ -335,11 +374,13 @@ fn xml_declared_encoding(declaration: &BytesDecl<'_>) -> anyhow::Result<JavaSour
                 encoding = if label.eq_ignore_ascii_case(b"UTF-8")
                     || label.eq_ignore_ascii_case(b"UTF8")
                 {
-                    JavaSourceEncoding::Utf8
+                    PomXmlEncoding::Source(JavaSourceEncoding::Utf8)
                 } else if label.eq_ignore_ascii_case(b"ISO-8859-1")
                     || label.eq_ignore_ascii_case(b"ISO8859-1")
                 {
-                    JavaSourceEncoding::Iso88591
+                    PomXmlEncoding::Source(JavaSourceEncoding::Iso88591)
+                } else if label.eq_ignore_ascii_case(b"Windows-1252") {
+                    PomXmlEncoding::Windows1252
                 } else {
                     anyhow::bail!("unsupported POM XML encoding");
                 };
@@ -359,7 +400,7 @@ fn xml_declared_encoding(declaration: &BytesDecl<'_>) -> anyhow::Result<JavaSour
     Ok(encoding)
 }
 
-fn pom_text(bytes: &[u8]) -> anyhow::Result<(String, JavaSourceEncoding)> {
+fn pom_text(bytes: &[u8]) -> anyhow::Result<(String, PomXmlEncoding)> {
     let utf8_bom = bytes.starts_with(b"\xef\xbb\xbf");
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     ensure!(!bytes.starts_with(b"\xef\xbb\xbf"), "duplicate UTF8 BOM");
@@ -368,10 +409,10 @@ fn pom_text(bytes: &[u8]) -> anyhow::Result<(String, JavaSourceEncoding)> {
     let mut header = Reader::from_reader(bytes);
     let encoding = match header.read_event()? {
         Event::Decl(declaration) => xml_declared_encoding(&declaration)?,
-        _ => JavaSourceEncoding::Utf8,
+        _ => PomXmlEncoding::Source(JavaSourceEncoding::Utf8),
     };
     ensure!(
-        !utf8_bom || encoding == JavaSourceEncoding::Utf8,
+        !utf8_bom || encoding == PomXmlEncoding::Source(JavaSourceEncoding::Utf8),
         "BOM contradicts XML encoding"
     );
     Ok((encoding.decode(bytes.to_vec())?, encoding))
@@ -406,21 +447,18 @@ fn parse(bytes: &[u8]) -> anyhow::Result<Pom> {
                     && stack.last().is_some_and(|f| f.name == "configuration")
                     && stack.iter().any(|f| f.plugin.is_some());
                 let mut attributes = false;
-                let mut argument_override = false;
                 for attr in start.attributes() {
                     let attr = attr?;
                     let value = attr.unescape_value()?;
                     ensure!(xml_chars(&value), "invalid escaped XML attribute character");
-                    let override_attribute = argument_list
-                        && attr.key.as_ref() == b"combine.self"
-                        && value == "override";
-                    argument_override |= override_attribute;
+                    // All inherited/local argv candidates are checked independently, so
+                    // these merge modes cannot hide an unknown encoding-bearing argument.
+                    let merge_attribute = argument_list
+                        && matches!(attr.key.as_ref(), b"combine.self" | b"combine.children")
+                        && matches!(value.as_ref(), "append" | "override");
                     attributes |= attr.key.as_ref() != b"xmlns"
                         && !attr.key.as_ref().starts_with(b"xmlns:")
-                        && !(argument_list
-                            && attr.key.as_ref() == b"combine.children"
-                            && value == "append")
-                        && !override_attribute;
+                        && !merge_attribute;
                 }
                 if stack.is_empty() {
                     roots += 1;
@@ -453,7 +491,6 @@ fn parse(bytes: &[u8]) -> anyhow::Result<Pom> {
                     name,
                     text: String::new(),
                     attributes,
-                    argument_override,
                     children: false,
                     plugin,
                 });
@@ -577,22 +614,39 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
             .chain(std::iter::once(frame.name.clone()))
             .collect();
         let relative: Vec<&str> = names.iter().map(String::as_str).collect();
+        let execution = relative.starts_with(&["executions", "execution"]);
+        let configuration = if execution {
+            &relative[2..]
+        } else {
+            &relative[..]
+        };
         let argument_ancestor_attributes = stack[index + 1..].iter().any(|frame| frame.attributes);
         let plugin = stack[index].plugin.as_mut().unwrap();
-        match relative.as_slice() {
+        match configuration {
             ["groupId"] => set(&mut plugin.group, text.clone())?,
             ["artifactId"] => set(&mut plugin.artifact, text.clone())?,
             ["inherited"] => plugin.unsupported |= text != "true",
+            ["configuration", "compilerId"] => {
+                plugin.unsupported |=
+                    argument_ancestor_attributes || frame.attributes || frame.children;
+                set(&mut plugin.compiler_id, text.clone())?;
+            }
             ["configuration", "encoding"] => {
-                plugin.unsupported |= frame.attributes || frame.children;
-                set(&mut plugin.encoding, text.clone())?;
+                plugin.unsupported |=
+                    argument_ancestor_attributes || frame.attributes || frame.children;
+                if execution {
+                    ensure!(
+                        plugin.compiler_encodings.len() < MAX_PROPERTIES,
+                        "compiler encoding limit"
+                    );
+                    plugin.compiler_encodings.push(text.clone());
+                } else {
+                    set(&mut plugin.encoding, text.clone())?;
+                }
             }
             ["configuration"] => plugin.unsupported |= frame.attributes,
             ["configuration", "compilerArgs"] => {
-                // shortcut: only empty overrides; model inherited argument merging when an artifact needs it.
-                plugin.unsupported |= frame.attributes
-                    || !text.is_empty()
-                    || frame.argument_override && frame.children;
+                plugin.unsupported |= frame.attributes || !text.is_empty() && text != "-Xlint";
             }
             ["configuration", "compilerArgs", _] => {
                 // This fixed JVM boot-path option stays one CLI value; interpolation may only
@@ -600,23 +654,49 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
                 let boot_path = !frame.attributes
                     && !frame.children
                     && text.starts_with("-J-Xbootclasspath/p:");
-                plugin.unsupported |= frame.attributes
+                // Maven supplies its basedir as an absolute path in this single argv entry.
+                let source_path = text
+                    .strip_prefix("${project.basedir}/")
+                    .is_some_and(|tail| {
+                        !tail.is_empty()
+                            && tail.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric()
+                                    || matches!(byte, b'/' | b'_' | b'-' | b'.')
+                            })
+                    });
+                let memory = text.strip_prefix("-J-Xmx");
+                let jvm_encoding = text.strip_prefix("-J-Dfile.encoding=");
+                if let Some(value) = memory {
+                    ensure!(
+                        plugin.compiler_memories.len() < MAX_PROPERTIES,
+                        "compiler memory limit"
+                    );
+                    plugin.compiler_memories.push(value.to_owned());
+                }
+                if let Some(value) = jvm_encoding {
+                    ensure!(
+                        plugin.compiler_encodings.len() < MAX_PROPERTIES,
+                        "compiler encoding limit"
+                    );
+                    plugin.compiler_encodings.push(value.to_owned());
+                }
+                plugin.unsupported |= argument_ancestor_attributes
+                    || frame.attributes
                     || frame.children
-                    || !boot_path
+                    || !(boot_path || source_path || memory.is_some() || jvm_encoding.is_some())
                         && (text.starts_with('@')
                             || text.contains("-encoding")
                             || text.contains("${"));
             }
             ["configuration", "compilerArgs", ..] => plugin.unsupported = true,
-            ["configuration", "compilerArguments", "bootclasspath"] => {
-                // Maven's fixed map key becomes -bootclasspath and its value remains one
-                // separate argv entry; interpolating that path cannot add -encoding.
+            ["configuration", "compilerArguments", "bootclasspath" | "properties"] => {
+                plugin.properties_argument |= frame.name == "properties";
+                // Fixed map keys keep one path argv value. ECJ's -properties only loads
+                // org.eclipse.jdt.core.compiler.* preferences, excluding its charset key.
                 plugin.unsupported |=
                     argument_ancestor_attributes || frame.attributes || frame.children;
             }
-            ["configuration", "compilerArguments", "source" | "target"]
-            | ["executions", "execution", "configuration", "compilerArguments", "source" | "target"] =>
-            {
+            ["configuration", "compilerArguments", "source" | "target"] => {
                 plugin.unsupported |=
                     argument_ancestor_attributes || frame.attributes || frame.children;
                 ensure!(
@@ -645,7 +725,9 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
         ensure!(
             !(plugin.encoding.is_some()
                 || plugin.unsupported
-                || !plugin.compiler_levels.is_empty())
+                || !plugin.compiler_levels.is_empty()
+                || !plugin.compiler_encodings.is_empty()
+                || !plugin.compiler_memories.is_empty())
                 || !plugin
                     .artifact
                     .as_deref()
@@ -663,9 +745,13 @@ fn finish(frame: Frame, stack: &mut [Frame], pom: &mut Pom) -> anyhow::Result<()
                 .is_none_or(|g| g == "org.apache.maven.plugins")
         {
             pom.compiler_levels.extend(plugin.compiler_levels);
-            pom.unsupported_compiler_encoding |=
-                plugin.unsupported || plugin.profile && plugin.encoding.is_some();
-            if !plugin.profile {
+            pom.compiler_encodings.extend(plugin.compiler_encodings);
+            pom.compiler_memories.extend(plugin.compiler_memories);
+            pom.unsupported_compiler_encoding |= plugin.unsupported
+                || plugin.properties_argument && plugin.compiler_id.as_deref() != Some("eclipse");
+            if plugin.profile {
+                pom.compiler_encodings.extend(plugin.encoding);
+            } else {
                 if let Some(value) = plugin.encoding {
                     set(
                         if plugin.managed {
@@ -720,14 +806,28 @@ fn encoding(chain: &[Pom]) -> anyhow::Result<JavaSourceEncoding> {
     });
     let selected = if let Some(raw) = raw {
         let text = expand(raw, &properties, &mut used, &mut BTreeSet::new())?;
-        match text.to_ascii_uppercase().as_str() {
-            "UTF-8" | "UTF8" => JavaSourceEncoding::Utf8,
-            "ISO-8859-1" | "ISO8859-1" => JavaSourceEncoding::Iso88591,
-            _ => anyhow::bail!("unsupported declared Java source encoding {text:?}"),
-        }
+        declared_encoding(&text)?
     } else {
         JavaSourceEncoding::Utf8
     };
+    // Profiles/executions need no activation model when every possible charset agrees.
+    for raw in chain.iter().flat_map(|pom| &pom.compiler_encodings) {
+        let text = expand(raw, &properties, &mut used, &mut BTreeSet::new())?;
+        ensure!(
+            declared_encoding(&text)? == selected,
+            "conditional compiler encoding differs"
+        );
+    }
+    for raw in chain.iter().flat_map(|pom| &pom.compiler_memories) {
+        let memory = expand(raw, &properties, &mut used, &mut BTreeSet::new())?;
+        let digits = memory
+            .strip_suffix(['k', 'K', 'm', 'M', 'g', 'G'])
+            .unwrap_or(&memory);
+        ensure!(
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+            "unsupported compiler JVM memory argument"
+        );
+    }
     // A fixed map key selects -source/-target, but its value could still be an
     // argument file or injected options. Certify only bounded, numeric levels.
     for raw in chain.iter().flat_map(|pom| &pom.compiler_levels) {
@@ -749,6 +849,14 @@ fn encoding(chain: &[Pom]) -> anyhow::Result<JavaSourceEncoding> {
         "profile affects source encoding property closure"
     );
     Ok(selected)
+}
+
+fn declared_encoding(text: &str) -> anyhow::Result<JavaSourceEncoding> {
+    match text.to_ascii_uppercase().as_str() {
+        "UTF-8" | "UTF8" => Ok(JavaSourceEncoding::Utf8),
+        "ISO-8859-1" | "ISO8859-1" => Ok(JavaSourceEncoding::Iso88591),
+        _ => anyhow::bail!("unsupported declared Java source encoding {text:?}"),
+    }
 }
 
 fn expand(
@@ -851,6 +959,7 @@ mod tests {
         }
         for text in [
             format!("\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}", pom("")),
+            format!("<?xml version=\"1.0\" encoding=\"windows-1252\"?>{}", pom("")),
             pom("").replacen("<project>", "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">", 1),
             "<m:project xmlns:m=\"http://maven.apache.org/POM/4.0.0\"><m:groupId>example</m:groupId><m:artifactId>library</m:artifactId><m:version>1</m:version></m:project>".to_owned(),
         ] { assert_eq!(encoding(&[parse(text.as_bytes()).unwrap()]).unwrap(), JavaSourceEncoding::Utf8); }
@@ -868,7 +977,7 @@ mod tests {
             ("custom entity", pom(&source("&custom;"))),
             ("invalid numeric character", pom(&source("&#0;"))),
             ("invalid attribute character", pom("").replacen("<project>", "<project ignored=\"&#0;\">", 1)),
-            ("bad metadata encoding", format!("<?xml version=\"1.0\" encoding=\"windows-1252\"?>{}", pom(""))),
+            ("unsupported metadata encoding", format!("<?xml version=\"1.0\" encoding=\"unknown-encoding\"?>{}", pom(""))),
             ("duplicate root", pom("") + &pom("")),
             ("trailing text", pom("") + "foreign"),
             ("truncated", "<project><groupId>example</groupId>".to_owned()),
@@ -884,7 +993,7 @@ mod tests {
             ("selected expression profile", pom(&("<properties><charset>UTF8</charset></properties>".to_owned() + &plugin("<encoding>${charset}</encoding>") + "<profiles><profile><properties><charset>ISO-8859-1</charset></properties></profile></profiles>"))),
             ("encoding argument", pom(&plugin("<compilerArgs><arg>-encoding</arg><arg>UTF8</arg></compilerArgs>"))),
             ("unknown argument property", pom(&plugin("<compilerArgs><arg>${opts}</arg></compilerArgs>"))),
-            ("execution encoding", pom("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><executions><execution><configuration><encoding>UTF8</encoding></configuration></execution></executions></plugin></plugins></build>")),
+            ("execution encoding differs", pom("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><executions><execution><configuration><encoding>ISO-8859-1</encoding></configuration></execution></executions></plugin></plugins></build>")),
             ("merge attribute", pom("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><configuration combine.self=\"override\"><encoding>UTF8</encoding></configuration></plugin></plugins></build>")),
             ("interpolated compiler identity", pom("<build><plugins><plugin><artifactId>${compiler}</artifactId><configuration><encoding>UTF8</encoding></configuration></plugin></plugins></build>")),
             ("disabled plugin inheritance", pom("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><inherited>false</inherited><configuration><encoding>UTF8</encoding></configuration></plugin></plugins></build>")),
@@ -1073,6 +1182,154 @@ mod tests {
     }
 
     #[test]
+    fn published_compiler_pom_chains_share_one_verified_charset() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/source-encoding");
+        let mut failures = Vec::new();
+        for (gav, parents) in [
+            ("com.google.guava:guava:33.4.6-jre", 2),
+            ("com.google.guava:failureaccess:1.0.3", 2),
+            ("com.zaxxer:HikariCP:4.0.3", 2),
+            ("org.eclipse.jgit:org.eclipse.jgit:5.13.3.202401111512-r", 2),
+            (
+                "org.eclipse.jgit:org.eclipse.jgit.ssh.apache:5.13.3.202401111512-r",
+                2,
+            ),
+            ("org.jruby:jruby-base:9.4.7.0", 3),
+        ] {
+            let selected = Coordinate::parse(gav).unwrap();
+            match SourceTextPolicy::resolve_certified(&selected, |coordinate| {
+                Ok(vec![fixture.join(format!(
+                    "{}-{}.pom",
+                    coordinate.artifact, coordinate.version
+                ))])
+            }) {
+                Ok(policy) => {
+                    assert_eq!(policy.java, JavaSourceEncoding::Utf8, "{gav}");
+                    assert_eq!(policy.poms.len(), parents, "{gav}");
+                    policy.validate().unwrap();
+                }
+                Err(error) => failures.push(format!("{gav}: {error:#}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn published_selenium_poms_use_windows1252_metadata() {
+        for (artifact, bytes) in [
+            (
+                "selenium-api",
+                include_bytes!("../tests/fixtures/source-encoding/selenium-api-2.42.2.pom")
+                    .as_slice(),
+            ),
+            (
+                "selenium-htmlunit-driver",
+                include_bytes!(
+                    "../tests/fixtures/source-encoding/selenium-htmlunit-driver-2.42.2.pom"
+                )
+                .as_slice(),
+            ),
+            (
+                "selenium-remote-driver",
+                include_bytes!(
+                    "../tests/fixtures/source-encoding/selenium-remote-driver-2.42.2.pom"
+                )
+                .as_slice(),
+            ),
+        ] {
+            let (text, decoder) = pom_text(bytes).unwrap();
+            assert_eq!(decoder, PomXmlEncoding::Windows1252);
+            // These published bodies are ASCII; declaring CP1252 must still select its decoder.
+            assert_eq!(text.as_bytes(), bytes);
+            let parsed = parse(bytes).unwrap();
+            assert_eq!(
+                parsed.coordinate().unwrap().label(),
+                format!("org.seleniumhq.selenium:{artifact}:2.42.2")
+            );
+            assert_eq!(encoding(&[parsed]).unwrap(), JavaSourceEncoding::Utf8);
+        }
+    }
+
+    #[test]
+    fn windows1252_metadata_is_strict_and_does_not_select_java_encoding() {
+        // Independent expected characters from the Microsoft CP1252 mapping table.
+        let defined = [
+            (0x80, '€'),
+            (0x82, '‚'),
+            (0x83, 'ƒ'),
+            (0x84, '„'),
+            (0x85, '…'),
+            (0x86, '†'),
+            (0x87, '‡'),
+            (0x88, 'ˆ'),
+            (0x89, '‰'),
+            (0x8a, 'Š'),
+            (0x8b, '‹'),
+            (0x8c, 'Œ'),
+            (0x8e, 'Ž'),
+            (0x91, '‘'),
+            (0x92, '’'),
+            (0x93, '“'),
+            (0x94, '”'),
+            (0x95, '•'),
+            (0x96, '–'),
+            (0x97, '—'),
+            (0x98, '˜'),
+            (0x99, '™'),
+            (0x9a, 'š'),
+            (0x9b, '›'),
+            (0x9c, 'œ'),
+            (0x9e, 'ž'),
+            (0x9f, 'Ÿ'),
+        ];
+        for (byte, expected) in defined {
+            assert_eq!(
+                PomXmlEncoding::Windows1252.decode(vec![byte]).unwrap(),
+                expected.to_string()
+            );
+        }
+        for byte in (0..=0x7f).chain(0xa0..=0xff) {
+            assert_eq!(
+                PomXmlEncoding::Windows1252.decode(vec![byte]).unwrap(),
+                char::from(byte).to_string()
+            );
+        }
+        let metadata = |sample: &[u8]| {
+            [
+            b"<?xml version=\"1.0\" encoding=\"wInDoWs-1252\"?><project><groupId>example</groupId><artifactId>encoding</artifactId><version>1</version><properties><sample>".as_slice(),
+            sample,
+            b"</sample></properties></project>".as_slice(),
+        ].concat()
+        };
+        for byte in [0x81, 0x8d, 0x8f, 0x90, 0x9d] {
+            assert!(PomXmlEncoding::Windows1252.decode(vec![byte]).is_err());
+            assert!(
+                parse(&metadata(&[byte])).is_err(),
+                "undefined byte {byte:#x}"
+            );
+        }
+        let bytes = metadata(b"\x93caf\xe9\x94 \x96 \x80");
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed.properties["sample"], "“café” – €");
+        assert_eq!(encoding(&[parsed]).unwrap(), JavaSourceEncoding::Utf8);
+        assert!(parse(&[b"\xef\xbb\xbf".as_slice(), &bytes].concat()).is_err());
+        assert!(parse(&metadata(b"\x00")).is_err());
+        assert!(parse(&metadata(b"\x1f")).is_err());
+        assert!(parse(
+            &[
+                b"<?xml version=\"1.0\" encoding=\"Windows-1252\"?><!DOCTYPE project []>"
+                    .as_slice(),
+                pom("").as_bytes(),
+            ]
+            .concat()
+        )
+        .is_err());
+        // Supporting this metadata label does not add a Java source decoder.
+        let java_cp1252 = parse(pom("<properties><project.build.sourceEncoding>Windows-1252</project.build.sourceEncoding></properties>").as_bytes()).unwrap();
+        assert!(encoding(&[java_cp1252]).is_err());
+    }
+
+    #[test]
     fn xml_metadata_declared_encoding_and_byte_boundaries() {
         let content =
             pom("<properties><sample>© café &#xF6; <![CDATA[é]]> &amp;</sample></properties>");
@@ -1125,7 +1382,7 @@ mod tests {
             ),
             (
                 "unknown declaration",
-                declaration("windows-1252").into_bytes(),
+                declaration("unknown-encoding").into_bytes(),
             ),
             (
                 "unsupported UTF16 declaration",
@@ -1322,7 +1579,7 @@ mod tests {
             ("unmodeled argument child", "<compilerArgs><item>@args.txt</item></compilerArgs>"),
             ("bootpath leaf merge attribute", "<compilerArgs><arg combine.self=\"override\">-J-Xbootclasspath/p:${path}</arg></compilerArgs>"),
             ("bootpath nested value", "<compilerArgs><arg><value>-J-Xbootclasspath/p:${path}</value></arg></compilerArgs>"),
-            ("unmodeled argument-list merge", "<compilerArgs combine.self=\"override\"><arg>-J-Xbootclasspath/p:${path}</arg></compilerArgs>"),
+            ("argument-list override retains unknown argument", "<compilerArgs combine.self=\"override\"><arg>${opts}</arg></compilerArgs>"),
             ("different argument transport", "<compilerArgument>-J-Xbootclasspath/p:${path}</compilerArgument>"),
             ("JVM file-encoding setting", "<compilerArgs><arg>-J-Dfile.encoding=${charset}</arg></compilerArgs>"),
             ("bootclasspath leaf merge", "<compilerArguments><bootclasspath combine.self=\"override\">${path}</bootclasspath></compilerArguments>"),
@@ -1334,6 +1591,102 @@ mod tests {
             assert!(declared(&plugin(&("<encoding>UTF8</encoding>".to_owned() + configuration))).is_err(), "{name}");
         }
     }
+    #[test]
+    fn published_compiler_argument_shapes_preserve_encoding() {
+        let execution = |config: &str| {
+            format!("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><executions><execution><configuration>{config}</configuration></execution></executions></plugin></plugins></build>")
+        };
+        let profile = |config: &str| {
+            format!("<profiles><profile><build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><configuration>{config}</configuration></plugin></plugins></build></profile></profiles>")
+        };
+        let source = "<properties><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding><memory>2G</memory></properties>";
+        // Reduced from HikariCP, Guava/failureaccess, JGit, and JRuby published POMs.
+        for config in [
+            plugin("<compilerArgs>-Xlint</compilerArgs>"),
+            plugin("<compilerArgs combine.children=\"override\"><arg>-Xlint:all</arg></compilerArgs>") + &execution("<compilerArgs combine.children=\"append\" combine.self=\"append\"><arg>-XDignore.symbol.file</arg></compilerArgs>"),
+            execution("<compilerArgs combine.self=\"override\"><arg>-sourcepath</arg><arg>${project.basedir}/src</arg><arg>--add-reads=com.google.common=ALL-UNNAMED</arg></compilerArgs>"),
+            profile("<encoding>UTF8</encoding><compilerId>eclipse</compilerId><compilerArguments><properties>${project.basedir}/.settings/org.eclipse.jdt.core.prefs</properties></compilerArguments>"),
+            plugin("<encoding>utf-8</encoding>") + &execution("<compilerArgs><compilerArg>-J-Dfile.encoding=UTF-8</compilerArg><compilerArg>-J-Xmx${memory}</compilerArg></compilerArgs>"),
+            execution("<encoding>UTF8</encoding>"),
+        ] {
+            assert_eq!(declared(&(source.to_owned() + &config)).unwrap(), JavaSourceEncoding::Utf8, "{config}");
+        }
+        assert_eq!(
+            declared(&plugin(
+                "<encoding>ISO-8859-1</encoding><compilerArgs>-Xlint</compilerArgs>"
+            ))
+            .unwrap(),
+            JavaSourceEncoding::Iso88591
+        );
+        assert_eq!(
+            declared(
+                &(plugin("<encoding>ISO-8859-1</encoding>")
+                    + &profile("<encoding>ISO8859-1</encoding>"))
+            )
+            .unwrap(),
+            JavaSourceEncoding::Iso88591
+        );
+        for config in [
+            profile("<encoding>ISO-8859-1</encoding>"),
+            execution("<encoding>ISO-8859-1</encoding>"),
+            execution("<encoding>${unknown}</encoding>"),
+            execution("<compilerArgs><arg>-J-Dfile.encoding=ISO-8859-1</arg></compilerArgs>"),
+            execution("<compilerArgs><arg>-J-Xmx${unknown}</arg></compilerArgs>"),
+            execution("<compilerArgs><arg>-J-Xmx2G -J-Dfile.encoding=ISO-8859-1</arg></compilerArgs>"),
+            execution("<compilerArgs><arg>${opts}</arg></compilerArgs>"),
+            execution("<compilerArgs><arg>${project.basedir}/src[ISO-8859-1]</arg></compilerArgs>"),
+            execution("<compilerArgs><arg>-encoding</arg><arg>ISO-8859-1</arg></compilerArgs>"),
+            plugin("<compilerArgs>-Xlint -encoding ISO-8859-1</compilerArgs>"),
+            plugin("<compilerArgs implementation=\"java.util.List\">-Xlint</compilerArgs>"),
+            profile("<compilerArguments><properties>${project.basedir}/prefs</properties></compilerArguments>"),
+            profile("<compilerId>${compiler}</compilerId><compilerArguments><properties>${prefs}</properties></compilerArguments>"),
+            profile("<compilerId implementation=\"custom.Compiler\">eclipse</compilerId><compilerArguments><properties>${prefs}</properties></compilerArguments>"),
+            "<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><executions><execution combine.self=\"override\"><configuration><encoding>UTF8</encoding></configuration></execution></executions></plugin></plugins></build>".to_owned(),
+            profile("<compilerId>eclipse</compilerId><compilerArguments combine.children=\"append\"><properties>${prefs}</properties></compilerArguments>"),
+        ] {
+            assert!(declared(&(source.to_owned() + &config)).is_err(), "{config}");
+        }
+        // Checking every candidate must not hide unknown inherited args under an override.
+        let parent = parse(
+            pom(&plugin(
+                "<compilerArgs><arg>${unknown}</arg></compilerArgs>",
+            ))
+            .as_bytes(),
+        )
+        .unwrap();
+        let child = parse(pom(&plugin("<encoding>UTF8</encoding><compilerArgs combine.self=\"override\"><arg>-Xlint</arg></compilerArgs>")).as_bytes()).unwrap();
+        assert!(encoding(&[child, parent]).is_err());
+    }
+
+    #[test]
+    fn compiler_candidate_property_closures_remain_checked() {
+        let execution = |config: &str| {
+            format!("<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><executions><execution><configuration>{config}</configuration></execution></executions></plugin></plugins></build>")
+        };
+        for (properties, config) in [
+            (
+                "<memory>2G</memory><memory>3G</memory>",
+                "<compilerArgs><arg>-J-Xmx${memory}</arg></compilerArgs>",
+            ),
+            (
+                "<memory>${other}</memory><other>${memory}</other>",
+                "<compilerArgs><arg>-J-Xmx${memory}</arg></compilerArgs>",
+            ),
+            (
+                "<charset>UTF8</charset><charset>ISO-8859-1</charset>",
+                "<encoding>${charset}</encoding>",
+            ),
+        ] {
+            assert!(declared(&format!(
+                "<properties>{properties}</properties>{}",
+                execution(config)
+            ))
+            .is_err());
+        }
+        assert!(declared(&format!("<properties><charset>UTF8</charset></properties><profiles><profile><properties><charset>ISO-8859-1</charset></properties></profile></profiles>{}", execution("<encoding>${charset}</encoding>"))).is_err());
+        assert!(declared(&format!("<properties><memory>2G</memory></properties><profiles><profile><properties><memory>3G</memory></properties></profile></profiles>{}", execution("<compilerArgs><arg>-J-Xmx${memory}</arg></compilerArgs>"))).is_err());
+    }
+
     #[test]
     fn compiler_arg_alias_preserves_the_checked_string_boundary() {
         for element in ["arg", "compilerArg", "arbitraryItem"] {
@@ -1397,7 +1750,6 @@ mod tests {
             }
         }
         for unsupported in [
-            "<compilerArgs combine.self=\"override\"><arg>-Xlint:all</arg></compilerArgs>",
             "<compilerArgs combine.self=\"override\">-Xlint:all</compilerArgs>",
             "<compilerArgs combine.self=\"unknown\"/>",
             "<compilerArgs combine.self=\"override\" implementation=\"java.util.ArrayList\"/>",

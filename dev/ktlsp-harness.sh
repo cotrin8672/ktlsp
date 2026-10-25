@@ -285,7 +285,9 @@ configurations {
 }
 dependencies {
     implementation libs.stdlib
+    implementation('org.seleniumhq.selenium:selenium-api:2.42.2') { transitive = false }
     librarySources 'org.jetbrains.kotlin:kotlin-stdlib:2.2.20:sources'
+    librarySources 'org.seleniumhq.selenium:selenium-api:2.42.2:sources'
 }
 def librarySourceFiles = configurations.librarySources.incoming.files
 tasks.register('prepareLibrarySources') {
@@ -308,6 +310,7 @@ fun useConnection(connection: Connection) {
 }
 KOTLIN
   cp "$repo/dev/corpus/fixtures/java-diagnostics/"*.java "$project/src/main/java/app/"
+  cp "$repo/dev/corpus/fixtures/library/Windows1252MetadataUse.java" "$project/src/main/java/app/"
   printf '%s\n' "$project"
 }
 

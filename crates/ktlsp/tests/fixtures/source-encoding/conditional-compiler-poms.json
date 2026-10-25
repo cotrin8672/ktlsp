@@ -1,0 +1,99 @@
+{
+  "purpose": "Unmodified Gradle-selected published POM chains reproducing six source-index encoding metadata rejections",
+  "selected_model_sha256": "205b69fe3060c334ba91417cebe0449d98f4fb535ccfde6ec4413f2b79163c82",
+  "roots": [
+    "com.google.guava:guava:33.4.6-jre",
+    "com.google.guava:failureaccess:1.0.3",
+    "com.zaxxer:HikariCP:4.0.3",
+    "org.eclipse.jgit:org.eclipse.jgit:5.13.3.202401111512-r",
+    "org.eclipse.jgit:org.eclipse.jgit.ssh.apache:5.13.3.202401111512-r",
+    "org.jruby:jruby-base:9.4.7.0"
+  ],
+  "poms": [
+    {
+      "coordinate": "com.google.guava:failureaccess:1.0.3",
+      "file": "failureaccess-1.0.3.pom",
+      "sha256": "c54beff37f6d42d43e14722d54a522c9ad51ef97fc5b79277e62a3ebf882f3bb",
+      "bytes": 5560,
+      "publication_url": "https://repo.maven.apache.org/maven2/com/google/guava/failureaccess/1.0.3/failureaccess-1.0.3.pom"
+    },
+    {
+      "coordinate": "com.google.guava:guava-parent:33.4.0-android",
+      "file": "guava-parent-33.4.0-android.pom",
+      "sha256": "7220ede61026596fbc720ee4b93246fa2d14f328058532b59ef053de397c7d83",
+      "bytes": 21526,
+      "publication_url": "https://repo.maven.apache.org/maven2/com/google/guava/guava-parent/33.4.0-android/guava-parent-33.4.0-android.pom"
+    },
+    {
+      "coordinate": "com.google.guava:guava-parent:33.4.6-jre",
+      "file": "guava-parent-33.4.6-jre.pom",
+      "sha256": "0a8d2611081d3a477c2f94bd95563fe810cc75a673526a9e4afdb1189125cb44",
+      "bytes": 24119,
+      "publication_url": "https://repo.maven.apache.org/maven2/com/google/guava/guava-parent/33.4.6-jre/guava-parent-33.4.6-jre.pom"
+    },
+    {
+      "coordinate": "com.google.guava:guava:33.4.6-jre",
+      "file": "guava-33.4.6-jre.pom",
+      "sha256": "9e8922b14ffb34d1ae2b1cd33906455a43e873a4ee9bcb31fa3603e76f6e41f2",
+      "bytes": 9610,
+      "publication_url": "https://repo.maven.apache.org/maven2/com/google/guava/guava/33.4.6-jre/guava-33.4.6-jre.pom"
+    },
+    {
+      "coordinate": "com.zaxxer:HikariCP:4.0.3",
+      "file": "HikariCP-4.0.3.pom",
+      "sha256": "5ba94dbdc3741931323daff9440af3e48390a2b53b07251b32832cf834272036",
+      "bytes": 25960,
+      "publication_url": "https://repo.maven.apache.org/maven2/com/zaxxer/HikariCP/4.0.3/HikariCP-4.0.3.pom"
+    },
+    {
+      "coordinate": "org.eclipse.jgit:org.eclipse.jgit-parent:5.13.3.202401111512-r",
+      "file": "org.eclipse.jgit-parent-5.13.3.202401111512-r.pom",
+      "sha256": "87f779d91c050262439ba0807fce7a3325b6d8dd7e86565d0bc5a7106a4b9cc9",
+      "bytes": 33707,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/eclipse/jgit/org.eclipse.jgit-parent/5.13.3.202401111512-r/org.eclipse.jgit-parent-5.13.3.202401111512-r.pom"
+    },
+    {
+      "coordinate": "org.eclipse.jgit:org.eclipse.jgit.ssh.apache:5.13.3.202401111512-r",
+      "file": "org.eclipse.jgit.ssh.apache-5.13.3.202401111512-r.pom",
+      "sha256": "c6166af9c436a9c673a81e0c959f795e586531e6deedfdbce27db3c598ed911d",
+      "bytes": 7558,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/eclipse/jgit/org.eclipse.jgit.ssh.apache/5.13.3.202401111512-r/org.eclipse.jgit.ssh.apache-5.13.3.202401111512-r.pom"
+    },
+    {
+      "coordinate": "org.eclipse.jgit:org.eclipse.jgit:5.13.3.202401111512-r",
+      "file": "org.eclipse.jgit-5.13.3.202401111512-r.pom",
+      "sha256": "8a76a7ef6b37480c7cfd4abc883897f75282516792ff0b7aa899db27f85796df",
+      "bytes": 7552,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/eclipse/jgit/org.eclipse.jgit/5.13.3.202401111512-r/org.eclipse.jgit-5.13.3.202401111512-r.pom"
+    },
+    {
+      "coordinate": "org.jruby:jruby-base:9.4.7.0",
+      "file": "jruby-base-9.4.7.0.pom",
+      "sha256": "3bd313c92865f7d196e099d22be4bb9205922e7595da74663288b9a9e3645d0d",
+      "bytes": 29699,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/jruby/jruby-base/9.4.7.0/jruby-base-9.4.7.0.pom"
+    },
+    {
+      "coordinate": "org.jruby:jruby-parent:9.4.7.0",
+      "file": "jruby-parent-9.4.7.0.pom",
+      "sha256": "e9b1c4ab58456f225225e063c23719aa04a0bb997865aa3c83d459b553ceb686",
+      "bytes": 25071,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/jruby/jruby-parent/9.4.7.0/jruby-parent-9.4.7.0.pom"
+    },
+    {
+      "coordinate": "org.sonatype.oss:oss-parent:7",
+      "file": "oss-parent-7.pom",
+      "sha256": "b51f8867c92b6a722499557fc3a1fdea77bdf9ef574722fe90ce436a29559454",
+      "bytes": 4824,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/sonatype/oss/oss-parent/7/oss-parent-7.pom"
+    },
+    {
+      "coordinate": "org.sonatype.oss:oss-parent:9",
+      "file": "oss-parent-9.pom",
+      "sha256": "fb40265f982548212ff82e362e59732b2187ec6f0d80182885c14ef1f982827a",
+      "bytes": 6569,
+      "publication_url": "https://repo.maven.apache.org/maven2/org/sonatype/oss/oss-parent/9/oss-parent-9.pom"
+    }
+  ],
+  "policy": "All compiler charset candidates must agree; unknown argv/property closures and differing candidates remain errors. No Maven plugins or profiles are executed."
+}
