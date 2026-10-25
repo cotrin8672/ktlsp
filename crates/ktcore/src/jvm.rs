@@ -1689,6 +1689,11 @@ pub fn select_call<'a>(
             uncertain |= applicability == Applicability::Unknown;
         }
     }
+    if !conflicting {
+        if let Some(selection) = select_primitive_call(index, receiver, &accepted, args) {
+            return selection;
+        }
+    }
     if !conflicting && (accepted.len() > 1 || uncertain) && !accepted.is_empty() {
         let authored = accepted
             .iter()
@@ -1722,6 +1727,139 @@ pub fn select_call<'a>(
         applicability,
         compiled_dispatch_blocked: false,
     }
+}
+
+// shortcut: mixed reference/boxing and generic/vararg phases retain the existing selection.
+fn select_primitive_call<'a>(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    candidates: &[CallableCandidate<'a>],
+    args: &crate::members::CallArguments,
+) -> Option<CallSelection<'a>> {
+    use crate::members::{Applicability, CallMode};
+    let primitive = |ty: &Type| {
+        matches!(ty, Type::Class {
+        name, package: None, container: None, nullable: false, args, owner: None,
+    } if args.is_empty() && matches!(name.as_str(), "boolean" | "byte" | "short" | "char" | "int" | "long" | "float" | "double"))
+    };
+    if candidates.is_empty()
+        || args.types.is_empty()
+        || args.count != Some(args.types.len())
+        || args.names.is_some()
+        || args.has_spread
+        || args.trailing_lambda
+        || !infer::type_head_is_known(index, receiver)
+        || !args.types.iter().all(primitive)
+    {
+        return None;
+    }
+    let formals = candidates
+        .iter()
+        .map(|candidate| {
+            if candidate.params().len() != args.types.len() {
+                return None;
+            }
+            let params = match *candidate {
+                CallableCandidate::Authored(entry) => {
+                    if entry.sym.kind != SymbolKind::Function
+                        || !entry.sym.type_params.is_empty()
+                        || entry.sym.has_vararg
+                        || entry.sym.ext_receiver.is_some()
+                        || entry.sym.extension_receiver.is_some()
+                        || entry.sym.arity.map(usize::from) != args.count
+                        || entry.sym.min_arity.map(usize::from) != args.count
+                    {
+                        return None;
+                    }
+                    let ctx = FileCtx::new(entry.sym.package.clone(), Vec::new());
+                    entry
+                        .sym
+                        .params
+                        .iter()
+                        .map(|ty| {
+                            infer::declared_member_type(
+                                index,
+                                receiver,
+                                entry,
+                                ty,
+                                CallMode::Java,
+                                &ctx,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+                CallableCandidate::Jvm { owner, facts } => {
+                    if !facts.type_params.is_empty() {
+                        return None;
+                    }
+                    let (params, package) = match owner {
+                        JvmOwner::Source(source) => (
+                            resolved_params(index, source, facts)?,
+                            source.facts.package.clone(),
+                        ),
+                        JvmOwner::Compiled { class, .. } => (
+                            Cow::Borrowed(facts.params.as_slice()),
+                            class
+                                .internal_name
+                                .rsplit_once('/')
+                                .map(|(package, _)| package.replace('/', "."))
+                                .unwrap_or_default(),
+                        ),
+                    };
+                    let ctx = FileCtx::new(package, Vec::new());
+                    params
+                        .iter()
+                        .map(|ty| infer::declared_type(index, ty, &ctx))
+                        .collect()
+                }
+            };
+            params.iter().all(primitive).then_some(params)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let converts = |actual: &Type, formal: &Type| {
+        actual == formal
+            || infer::java_primitive_widening_accepts(
+                formal.name().unwrap(),
+                actual.name().unwrap(),
+            )
+    };
+    let applicable = (0..candidates.len())
+        .filter(|&candidate| {
+            args.types
+                .iter()
+                .zip(&formals[candidate])
+                .all(|(actual, formal)| converts(actual, formal))
+        })
+        .collect::<Vec<_>>();
+    let selected = applicable
+        .iter()
+        .copied()
+        .filter(|&candidate| {
+            !applicable.iter().copied().any(|other| {
+                other != candidate
+                    && formals[other] != formals[candidate]
+                    && formals[other]
+                        .iter()
+                        .zip(&formals[candidate])
+                        .all(|(actual, formal)| converts(actual, formal))
+            })
+        })
+        .map(|position| candidates[position])
+        .collect::<Vec<_>>();
+    let applicability = match selected.len() {
+        0 => Applicability::Rejected,
+        1 => Applicability::Applicable,
+        _ => Applicability::Unknown,
+    };
+    Some(CallSelection {
+        candidates: if selected.is_empty() {
+            candidates.to_vec()
+        } else {
+            selected
+        },
+        applicability,
+        compiled_dispatch_blocked: false,
+    })
 }
 
 /// Present the same JVM String through the caller's language, preserving its nullability.
@@ -1803,14 +1941,7 @@ pub fn projected_return_type_in_call_mode(
     {
         if let Some(entry) = source_property_entry(index, source, facts) {
             let returns = resolved_return(index, source, facts)?;
-            let result = infer::declared_member_type(
-                index,
-                receiver,
-                entry,
-                &returns,
-                mode,
-                ctx,
-            );
+            let result = infer::declared_member_type(index, receiver, entry, &returns, mode, ctx);
             return (!matches!(result, Type::Unknown)).then(|| kotlin_array_jvm_type(result));
         }
     }
@@ -2573,19 +2704,25 @@ class Resolver {
                     .iter()
                     .filter(|entry| !entry.sym.type_params.is_empty())
                 {
-                    let bound = crate::members::bind_arguments(&uncertain_index, &receiver, entry, &arguments, CallMode::Kotlin, &ctx)
-                        .ok()
-                        .unwrap();
-                    assert!(
-                        infer::projected_member_application(
-                            &uncertain_index,
-                            &receiver,
-                            entry,
-                            &bound
-                        )
-                        .is_some_and(|application| application.status
-                            == crate::solve::ConstraintStatus::Matched)
-                    );
+                    let bound = crate::members::bind_arguments(
+                        &uncertain_index,
+                        &receiver,
+                        entry,
+                        &arguments,
+                        CallMode::Kotlin,
+                        &ctx,
+                    )
+                    .ok()
+                    .unwrap();
+                    assert!(infer::projected_member_application(
+                        &uncertain_index,
+                        &receiver,
+                        entry,
+                        &bound
+                    )
+                    .is_some_and(
+                        |application| application.status == crate::solve::ConstraintStatus::Matched
+                    ));
                 }
             }
             assert!(

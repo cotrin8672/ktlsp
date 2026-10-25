@@ -17,6 +17,148 @@ const OVERLOAD_KOTLIN: &str = "/selection/typed/KotlinUse.kt";
 const OVERLOAD_USE: &str = "package typed; class JavaUse { void run(Target target, Decoy decoy, int number, String text) { target.twice(1); target.twice(\"x\"); target.twice(number); target.twice(text); decoy.twice(\"x\"); } }";
 
 #[test]
+fn standard_kotlin_arithmetic_uses_declared_overload_results_for_direct_and_local_receivers() {
+    let mut ws = Workspace::new();
+    // Selected kotlin-stdlib Primitives.kt/Char.kt signatures, including widening overloads.
+    ws.open("Numbers.kt", "package kotlin\nclass Int {\noperator fun plus(other: Int): Int\noperator fun plus(other: Long): Long\noperator fun plus(other: Float): Float\noperator fun plus(other: Double): Double\noperator fun minus(other: Int): Int\noperator fun times(other: Int): Int\noperator fun div(other: Int): Int\noperator fun rem(other: Int): Int\n}\nclass Long\nclass Float\nclass Double\nclass Char { operator fun plus(other: Int): Char\noperator fun minus(other: Char): Int\n}\n".into());
+    ws.open(
+        "OtherInt.kt",
+        "package other\nclass Int { operator fun plus(other: Int): Int = this }\n".into(),
+    );
+    let file = "Arithmetic.kt";
+    let source = "package arithmetic\nclass Custom { operator fun plus(other: Custom): Int = 1 }\nfun Int.onlyInt(): Int = this\nfun Long.onlyLong(): Long = this\nfun use(a: Int, b: Int, wide: Long, fraction: Float, precise: Double, char: Char, nullable: Int?, custom: Custom, fake: other.Int) {\nval sum = a + b\n(a + b).onlyInt()\nsum.onlyInt()\n(a + wide).onlyLong()\na + fraction\na + precise\na - b\na * b\na / b\na % b\nchar + a\nchar - char\na + char\nnullable + b\ncustom + custom\nfake + fake\na + missing\n}\n";
+    ws.open(file, source.into());
+    for (expression, expected) in [
+        ("a + b", "Int"),
+        ("a + wide", "Long"),
+        ("a + fraction", "Float"),
+        ("a + precise", "Double"),
+        ("a - b", "Int"),
+        ("a * b", "Int"),
+        ("a / b", "Int"),
+        ("a % b", "Int"),
+        ("char + a", "Char"),
+        ("char - char", "Int"),
+    ] {
+        assert_eq!(
+            infer_expression(&ws, file, expression),
+            Type::class(expected, Some("kotlin".into())),
+            "{expression}"
+        );
+    }
+    for expression in [
+        "a + char",
+        "nullable + b",
+        "custom + custom",
+        "a + missing",
+        "fake + fake",
+    ] {
+        assert_eq!(
+            infer_expression(&ws, file, expression),
+            Type::Unknown,
+            "{expression}"
+        );
+    }
+    for (prefix, member) in [
+        ("(a + b).onlyInt", "onlyInt"),
+        ("sum.onlyInt", "onlyInt"),
+        ("(a + wide).onlyLong", "onlyLong"),
+    ] {
+        assert!(labels(&mut ws, file, prefix).contains(member), "{prefix}");
+    }
+    for (call, member) in [
+        ("(a + b).onlyInt()", "onlyInt"),
+        ("sum.onlyInt()", "onlyInt"),
+        ("(a + wide).onlyLong()", "onlyLong"),
+    ] {
+        let expected = target(&ws, file, member, SymbolKind::Function);
+        assert_eq!(goto(&mut ws, file, call), vec![expected], "{call}");
+    }
+    ws.change(
+        file,
+        source.replace("val sum = a + b", "val sum = a + wide"),
+    );
+    let changed = labels(&mut ws, file, "sum.only");
+    assert!(changed.contains("onlyLong"));
+    assert!(!changed.contains("onlyInt"));
+}
+
+#[test]
+fn java_arithmetic_arguments_select_promoted_overloads_and_inferred_local_types() {
+    let mut ws = Workspace::new();
+    ws.open(
+        "Integer.java",
+        "package java.lang; public class Integer {}".into(),
+    );
+    let target = "ArithmeticTarget.java";
+    ws.open(target, "package arithmetic; class ArithmeticTarget { void choose(int value) {} void choose(long value) {} void choose(float value) {} void choose(double value) {} void choose(int left, int right) {} }".into());
+    let file = "ArithmeticUse.java";
+    ws.open(file, "package arithmetic; class ArithmeticUse { void run(ArithmeticTarget target, int a, int b, long wide, float fraction, double precise, byte small, char character, Integer boxed) { target.choose(a + b); target.choose(a + wide); target.choose(a + fraction); target.choose(a + precise); target.choose(small + character); target.choose(boxed + wide); target.choose(a * b); target.choose(a / b); target.choose(a % b); var sum = a - wide; target.choose(sum); } }".into());
+    for (call, parameter) in [
+        ("target.choose(a + b)", "int"),
+        ("target.choose(a + wide)", "long"),
+        ("target.choose(a + fraction)", "float"),
+        ("target.choose(a + precise)", "double"),
+        ("target.choose(small + character)", "int"),
+        ("target.choose(boxed + wide)", "long"),
+        ("target.choose(a * b)", "int"),
+        ("target.choose(a / b)", "int"),
+        ("target.choose(a % b)", "int"),
+        ("target.choose(sum)", "long"),
+    ] {
+        let expected = ws
+            .index
+            .lookup_by_name("choose")
+            .iter()
+            .find(|entry| {
+                entry.path.as_ref() == target
+                    && entry.sym.params.len() == 1
+                    && entry.sym.params[0].name == parameter
+            })
+            .map(|entry| Def {
+                file: target.into(),
+                start_byte: entry.sym.start_byte,
+                end_byte: entry.sym.end_byte,
+            })
+            .unwrap();
+        assert_eq!(goto(&mut ws, file, call), vec![expected], "{call}");
+    }
+}
+
+#[test]
+fn java_primitive_overloads_select_widening_without_narrowing_or_crossed_tiebreaks() {
+    let mut ws = Workspace::new();
+    let target = "WideningTarget.java";
+    ws.open(target, "package arithmetic; class WideningTarget { void widen(long value) {} void widen(double value) {} void character(short value) {} void character(int value) {} void crossed(int a, long b) {} void crossed(long a, int b) {} void mixed(int value) {} void mixed(Integer value) {} }".into());
+    let file = "WideningUse.java";
+    ws.open(file, "package arithmetic; class WideningUse { void run(WideningTarget target, byte small, char character, int a) { target.widen(small); target.character(character); target.crossed(a, a); target.widen(missing); target.mixed(a); } }".into());
+    for (call, name, parameter) in [
+        ("target.widen(small)", "widen", "long"),
+        ("target.character(character)", "character", "int"),
+    ] {
+        let expected = ws
+            .index
+            .lookup_by_name(name)
+            .iter()
+            .find(|entry| entry.path.as_ref() == target && entry.sym.params[0].name == parameter)
+            .map(|entry| Def {
+                file: target.into(),
+                start_byte: entry.sym.start_byte,
+                end_byte: entry.sym.end_byte,
+            })
+            .unwrap();
+        assert_eq!(goto(&mut ws, file, call), vec![expected], "{call}");
+    }
+    for call in [
+        "target.crossed(a, a)",
+        "target.widen(missing)",
+        "target.mixed(a)",
+    ] {
+        assert_eq!(goto(&mut ws, file, call).len(), 2, "{call}");
+    }
+}
+
+#[test]
 fn string_concatenation_has_typed_java_kotlin_completion_and_goto() {
     let mut ws = Workspace::new();
     ws.open(

@@ -1713,7 +1713,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-kotlin-ng"
 version = "1.1.0"
-source = "git+https://github.com/cotrin8672/tree-sitter-kotlin?rev=42f93dc3e3d73ef07a657fa5fd557e39c65704ee#42f93dc3e3d73ef07a657fa5fd557e39c65704ee"
+source = "git+https://github.com/cotrin8672/tree-sitter-kotlin?rev=9fcb964bf2aed03aea770f54809d8a8d9a8e3311#9fcb964bf2aed03aea770f54809d8a8d9a8e3311"
 dependencies = [
  "cc",
  "tree-sitter-language",

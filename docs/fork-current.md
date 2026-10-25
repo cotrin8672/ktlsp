@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-10-24 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
+Updated 2026-10-25 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
 correctness coverage are unmeasured; passing selected probes does not establish either.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
 by editing UX. Warm speed is accepted provisionally; cold startup is lower priority.
@@ -70,6 +70,32 @@ was not captured precisely;31 did not build a release binary. The test now waits
 for its actual invocation marker and worker terminal state, retaining overlap,
 generation and invocation assertions. Focused verification and the parallel32
 suite pass (`scheduler140-final.json`). No production timeout was changed.
+
+## Focused follow-up, not yet integrated
+
+Ordinary numeric expressions reproduced two missing first-response completions on39
+(`numeric154-result.json`). Shared numeric inference and Java primitive overload
+selection now pass22 focused checks on the updated parser:17 existing JVM checks,
+one Java argument-type check, two arithmetic editor-workspace checks, one widening
+check and the String regression. The original failed member run is retained under
+`arithmetic155-member1`; these are Rust checks, not a repaired real-Neovim result.
+
+The valid Kotlin statement `val sum = a + b` followed by a parenthesized statement
+also exposed a parser regression. The existing fork's unconditional newline-before-
+parenthesis suppression is now limited to constructor contexts. Revision
+`9fcb964bf2aed03aea770f54809d8a8d9a8e3311` passes all28 existing corpus cases and
+two new cases; independent Kotlin2.0.21 compiler checks preserve the original
+arithmetic fixture. Both workspace and external-extension locks use this revision
+(`arithmetic155-parser-published.json`, `arithmetic155-pin-update.json`).
+
+The Java-only producer route and bounded native watches are implemented but remain
+unverified. The actual watcher focus currently has12 passes and two failures:
+an obsolete directory-layout assertion after watch compaction, and Windows denying
+a watched parent-directory rename. Both failures remain recorded; native producer,
+workspace/release and the same-candidate six-project runs have not executed
+(`build155-final-focus-handoff.json`). Existing integrated39 remains the latest
+successful integrated build. Custom/unsigned Kotlin operators and broader overload
+conversion phases are not established by the focused numeric checks.
 
 ## Current fixes and open observations
 

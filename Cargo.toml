@@ -17,7 +17,7 @@ tree-sitter-java = "0.23"
 # parses generic calls with value arguments as calls (not comparison chains), and supports
 # context parameters (KEEP-0259).
 # Preserve the existing syntax fixes while including upstream scanner PR #11.
-tree-sitter-kotlin-ng = { git = "https://github.com/cotrin8672/tree-sitter-kotlin", rev = "42f93dc3e3d73ef07a657fa5fd557e39c65704ee" }
+tree-sitter-kotlin-ng = { git = "https://github.com/cotrin8672/tree-sitter-kotlin", rev = "9fcb964bf2aed03aea770f54809d8a8d9a8e3311" }
 ureq = { version = "3", features = ["rustls"] }
 walkdir = "2"
 zip = { version = "2.3", default-features = false, features = ["deflate"] }

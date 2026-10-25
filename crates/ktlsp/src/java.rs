@@ -19,7 +19,7 @@ use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
 use crate::imports::{self, ImportStyle};
 use crate::index::{Entry, InferenceIndex, Tier, Usage};
 use crate::indexer::TypeScope;
-use crate::infer::{self, FileCtx};
+use crate::infer::{self, java_boxed_type, java_primitive_widening_accepts, FileCtx};
 use crate::language;
 use crate::parser::{child_of_kind, name_field, node_text};
 use crate::semantic_query::{
@@ -1910,34 +1910,6 @@ fn java_boxing_accepts(formal: &str, actual: &str) -> bool {
             .is_some_and(|boxed| java_primitive_widening_accepts(boxed, actual))
 }
 
-fn java_boxed_type(primitive: &str) -> Option<&'static str> {
-    match primitive {
-        "boolean" => Some("Boolean"),
-        "byte" => Some("Byte"),
-        "char" => Some("Character"),
-        "double" => Some("Double"),
-        "float" => Some("Float"),
-        "int" => Some("Integer"),
-        "long" => Some("Long"),
-        "short" => Some("Short"),
-        _ => None,
-    }
-}
-
-fn java_primitive_widening_accepts(formal: &str, actual: &str) -> bool {
-    matches!(
-        (formal, actual),
-        ("short", "byte")
-            | ("int", "byte" | "short" | "char")
-            | ("long", "byte" | "short" | "char" | "int")
-            | ("float", "byte" | "short" | "char" | "int" | "long")
-            | (
-                "double",
-                "byte" | "short" | "char" | "int" | "long" | "float"
-            )
-    )
-}
-
 fn simple_java_type_name(name: &str) -> String {
     name.split('<')
         .next()
@@ -3722,12 +3694,11 @@ fn receiver_type(
             object.named_child(0)?,
             initializer_depth + 1,
         ),
-        "binary_expression"
-            if object
-                .child_by_field_name("operator")
-                .map(|node| node_text(node, src))
-                == Some("+") =>
-        {
+        "binary_expression" => {
+            let operator = node_text(object.child_by_field_name("operator")?, src);
+            if !matches!(operator, "+" | "-" | "*" | "/" | "%") {
+                return None;
+            }
             // An AST null is a known operand, distinct from a type we failed to resolve.
             let operand = |node: Node<'_>| {
                 if node.kind() == "null_literal" {
@@ -3739,17 +3710,31 @@ fn receiver_type(
             };
             let left = operand(object.child_by_field_name("left")?)?;
             let right = operand(object.child_by_field_name("right")?)?;
-            infer::string_concatenation_type(
-                ktcore::members::CallMode::Java,
-                left.as_ref().map_or(
-                    infer::StringConcatenationOperand::Null,
-                    infer::StringConcatenationOperand::Value,
-                ),
-                right.as_ref().map_or(
-                    infer::StringConcatenationOperand::Null,
-                    infer::StringConcatenationOperand::Value,
-                ),
-            )
+            (operator == "+")
+                .then(|| {
+                    infer::string_concatenation_type(
+                        ktcore::members::CallMode::Java,
+                        left.as_ref().map_or(
+                            infer::StringConcatenationOperand::Null,
+                            infer::StringConcatenationOperand::Value,
+                        ),
+                        right.as_ref().map_or(
+                            infer::StringConcatenationOperand::Null,
+                            infer::StringConcatenationOperand::Value,
+                        ),
+                    )
+                })
+                .flatten()
+                .or_else(|| {
+                    infer::arithmetic_type(
+                        index,
+                        ktcore::members::CallMode::Java,
+                        operator,
+                        left.as_ref()?,
+                        right.as_ref()?,
+                        &FileCtx::new(package_of(tree, src), Vec::new()),
+                    )
+                })
         }
         "array_creation_expression" => {
             if object.has_error() {
@@ -5948,6 +5933,39 @@ mod tests {
     fn usages(src: &str) -> Vec<Usage> {
         let tree = JavaParser::new().parse(src);
         extract_usages(&tree, src)
+    }
+
+    #[test]
+    fn java_arithmetic_argument_types_precede_overload_selection() {
+        let file = "ArithmeticUse.java";
+        let source = "package arithmetic; class ArithmeticUse { void run(int a, int b, long wide, float fraction, double precise, byte small, char character) { consume(a + b); consume(a + wide); consume(a + fraction); consume(a + precise); consume(small + character); var sum = a - wide; consume(sum); } }";
+        let tree = JavaParser::new().parse(source);
+        let mut index = Index::new();
+        index.replace_file(
+            file,
+            extract_symbols(&tree, source),
+            crate::index::Tier::Volatile,
+        );
+        for (expression, expected) in [
+            ("a + b", "int"),
+            ("a + wide", "long"),
+            ("a + fraction", "float"),
+            ("a + precise", "double"),
+            ("small + character", "int"),
+            ("sum", "long"),
+        ] {
+            let start = source.rfind(expression).unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + expression.len())
+                .unwrap();
+            assert_eq!(&source[node.byte_range()], expression);
+            assert_eq!(
+                java_argument_type(&index, file, source, &tree, node, 0),
+                Some(Type::class(expected, None)),
+                "{expression}"
+            );
+        }
     }
 
     fn java_class_literal_types(expression: &str, imports: &str) -> [Option<Type>; 3] {

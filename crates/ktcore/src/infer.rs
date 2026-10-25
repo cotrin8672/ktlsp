@@ -100,6 +100,105 @@ pub fn string_concatenation_type(
     }
 }
 
+/// Standard arithmetic only: Kotlin uses the indexed operator overload's declared result;
+/// Java primitive operands undergo binary numeric promotion.
+pub fn arithmetic_type(
+    index: &dyn InferenceIndex,
+    mode: members::CallMode,
+    operator: &str,
+    left: &Type,
+    right: &Type,
+    ctx: &FileCtx,
+) -> Option<Type> {
+    let name = match operator {
+        "+" => "plus",
+        "-" => "minus",
+        "*" => "times",
+        "/" => "div",
+        "%" => "rem",
+        _ => return None,
+    };
+    if mode == members::CallMode::Java {
+        let primitive = |ty: &Type| {
+            let Type::Class {
+                name,
+                package,
+                container: None,
+                args,
+                owner: None,
+                ..
+            } = ty
+            else {
+                return None;
+            };
+            if !args.is_empty() {
+                return None;
+            }
+            ["byte", "short", "char", "int", "long", "float", "double"]
+                .into_iter()
+                .find(|primitive| {
+                    (package.is_none() && !ty.is_nullable() && name.as_str() == *primitive)
+                        || (package.as_deref() == Some("java.lang")
+                            && java_boxed_type(primitive) == Some(name.as_str()))
+                })
+        };
+        let (left, right) = (primitive(left)?, primitive(right)?);
+        let result = ["double", "float", "long"]
+            .into_iter()
+            .find(|name| left == *name || right == *name)
+            .unwrap_or("int");
+        return Some(Type::class(result, None));
+    }
+    let standard_operand = |ty: &Type| {
+        matches!(ty, Type::Class {
+            name, package, container: None, nullable: false, args, owner: None,
+        } if args.is_empty() && package.as_deref() == Some("kotlin")
+            && matches!(name.as_str(), "Byte" | "Short" | "Int" | "Long" | "Float" | "Double" | "Char"))
+    };
+    if !standard_operand(left) || !standard_operand(right) {
+        return None;
+    }
+    let mut candidates = members::candidates(index, left, name, ctx);
+    candidates.members.retain(|entry| {
+        entry.sym.kind == SymbolKind::Function
+            && entry.sym.package == "kotlin"
+            && entry.sym.container.as_deref() == left.name()
+            && entry.sym.ext_receiver.is_none()
+            && entry.sym.extension_receiver.is_none()
+    });
+    // User extensions cannot replace an intrinsic operator on the standard final value types.
+    candidates.extensions.clear();
+    let arguments = CallArguments {
+        count: Some(1),
+        types: vec![right.clone()],
+        names: None,
+        has_spread: false,
+        trailing_lambda: false,
+        trailing_lambda_arguments: None,
+    };
+    let selected = candidates.select(index, left, &MemberUse::Call(arguments.clone()), ctx);
+    if selected.applicability != members::Applicability::Applicable {
+        return None;
+    }
+    let mut result = None;
+    for entry in selected.entries {
+        let ty = declared_member_call_type(
+            index,
+            left,
+            entry,
+            entry.sym.return_type.as_ref()?,
+            &arguments,
+            mode,
+            ctx,
+        );
+        if !standard_operand(&ty) || result.as_ref().is_some_and(|previous| previous != &ty) {
+            return None;
+        }
+        result = Some(ty);
+    }
+    result
+}
+
 /// The file-level facts inference needs to resolve a simple type name to a package: the file's own
 /// package and its imports. Built once per request from the (synthetic or real) tree.
 #[derive(Clone, Debug)]
@@ -387,17 +486,37 @@ fn infer_depth_with<R: ChildInfer>(
                 .into_non_null(),
             None => Type::Unknown,
         },
-        "binary_expression" if has_child_token(node, "+") && node.named_child_count() == 2 => {
+        "binary_expression" if node.named_child_count() == 2 => {
+            let Some(operator) = ["+", "-", "*", "/", "%"]
+                .into_iter()
+                .find(|operator| has_child_token(node, operator))
+            else {
+                return Type::Unknown;
+            };
             let left =
                 child_infer.infer_child(index, node.named_child(0).unwrap(), src, ctx, depth + 1);
             let right =
                 child_infer.infer_child(index, node.named_child(1).unwrap(), src, ctx, depth + 1);
-            string_concatenation_type(
-                members::CallMode::Kotlin,
-                StringConcatenationOperand::Value(&left),
-                StringConcatenationOperand::Value(&right),
-            )
-            .unwrap_or(Type::Unknown)
+            (operator == "+")
+                .then(|| {
+                    string_concatenation_type(
+                        members::CallMode::Kotlin,
+                        StringConcatenationOperand::Value(&left),
+                        StringConcatenationOperand::Value(&right),
+                    )
+                })
+                .flatten()
+                .or_else(|| {
+                    arithmetic_type(
+                        index,
+                        members::CallMode::Kotlin,
+                        operator,
+                        &left,
+                        &right,
+                        ctx,
+                    )
+                })
+                .unwrap_or(Type::Unknown)
         }
         // Unary, incl. the non-null assertion `a!!`: the argument's type with nullability stripped.
         // (`-n`/`!b` keep the argument's type too, which is correct for Int/Boolean.)
@@ -4953,6 +5072,34 @@ pub(crate) fn primitive_type_name(name: &str) -> &str {
     }
 }
 
+pub fn java_boxed_type(primitive: &str) -> Option<&'static str> {
+    match primitive {
+        "boolean" => Some("Boolean"),
+        "byte" => Some("Byte"),
+        "char" => Some("Character"),
+        "double" => Some("Double"),
+        "float" => Some("Float"),
+        "int" => Some("Integer"),
+        "long" => Some("Long"),
+        "short" => Some("Short"),
+        _ => None,
+    }
+}
+
+pub fn java_primitive_widening_accepts(formal: &str, actual: &str) -> bool {
+    matches!(
+        (formal, actual),
+        ("short", "byte")
+            | ("int", "byte" | "short" | "char")
+            | ("long", "byte" | "short" | "char" | "int")
+            | ("float", "byte" | "short" | "char" | "int" | "long")
+            | (
+                "double",
+                "byte" | "short" | "char" | "int" | "long" | "float"
+            )
+    )
+}
+
 /// Whether the type named `name` (in package `pkg` when known) is `target` or a subtype of it,
 /// walking the supertype closure (bounded).
 fn is_subtype(index: &dyn InferenceIndex, name: &str, pkg: Option<&str>, target: &str) -> bool {
@@ -6344,6 +6491,54 @@ mod tests {
     use super::named_type_params;
     use crate::index::{Index, Tier};
     use crate::symbol::{IndexedSymbol, SymbolKind};
+
+    #[test]
+    fn java_arithmetic_promotes_primitives_and_unboxes_nullable_standard_wrappers() {
+        use crate::members::CallMode::Java;
+        use crate::types::Type;
+        let index = Index::new();
+        let ctx = super::FileCtx::new("app".into(), Vec::new());
+        for (left, right, expected) in [
+            (Type::class("byte", None), Type::class("char", None), "int"),
+            (Type::class("int", None), Type::class("long", None), "long"),
+            (
+                Type::class("long", None),
+                Type::class("float", None),
+                "float",
+            ),
+            (
+                Type::class("float", None),
+                Type::class("double", None),
+                "double",
+            ),
+            (
+                Type::class("Integer", Some("java.lang".into())).with_nullability(true),
+                Type::class("long", None),
+                "long",
+            ),
+        ] {
+            assert_eq!(
+                super::arithmetic_type(&index, Java, "+", &left, &right, &ctx),
+                Some(Type::class(expected, None))
+            );
+        }
+        for invalid in [
+            Type::Unknown,
+            Type::class("boolean", None),
+            Type::class("Integer", Some("app".into())),
+            Type::class("Int", Some("kotlin".into())),
+        ] {
+            assert!(super::arithmetic_type(
+                &index,
+                Java,
+                "+",
+                &invalid,
+                &Type::class("int", None),
+                &ctx
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn string_concatenation_rule_distinguishes_modes_and_unproven_operands() {
