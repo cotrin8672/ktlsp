@@ -1,0 +1,5 @@
+Content-Length: 518
+
+{"id":7,"jsonrpc":"2.0","result":{"facts":[{"coverage":{"reasons":[{"code":"MissingFacts"}],"state":"unknown"},"next":null,"sources":[{"displayPath":"source-fixture/Empty.java","documentUri":{"reasons":[{"code":"MissingFacts"}],"state":"unknown"},"id":"42:0","identity":{"kind":"source","revision":"3"},"languageId":"java"},{"displayPath":"source-fixture/Owner.kt","documentUri":{"reasons":[{"code":"MissingFacts"}],"state":"unknown"},"id":"42:1","identity":{"kind":"source","revision":"2"},"languageId":"kotlin"}]}]}}Content-Length: 371
+
+{"id":8,"jsonrpc":"2.0","result":{"facts":[{"state":"found","value":{"displayPath":"source-fixture/Empty.java","documentUri":{"reasons":[{"code":"MissingFacts"}],"state":"unknown"},"id":"42:0","identity":{"kind":"source","revision":"3"},"languageId":"java","sha256":"bc7a8868a3b12631002a0619ed6d8b7b96f51c3d101f2f0fd5ece374c2e987ed","text":"// 未保存 Java 😀\n"}}]}}

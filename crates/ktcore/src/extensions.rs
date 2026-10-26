@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::diagnostics::Diagnostic;
 use crate::index::{Entry, InferenceIndex, ScopedIndex};
 use crate::knowledge::Knowledge;
+use crate::project_model::{ProjectScope, SourceRepresentation};
 use crate::symbol::{Def, SymbolKind};
 
 pub mod source;
@@ -39,6 +40,23 @@ pub enum IncompleteReason {
 }
 
 pub type Fact<T> = Knowledge<T, IncompleteReason>;
+
+/// A host-issued current source snapshot, valid only in the issuing read session.
+/// Its display path is not filesystem authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceHandle {
+    host: u64,
+    session: u64,
+    file: String,
+    generation: u64,
+    scope: ProjectScope,
+}
+
+impl SourceHandle {
+    pub fn file(&self) -> &str { &self.file }
+    pub fn revision(&self) -> u64 { self.generation }
+    pub fn scope(&self) -> &ProjectScope { &self.scope }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemberKind {
@@ -618,6 +636,7 @@ pub enum ContractError {
 
 struct SourceFacts {
     generation: u64,
+    scope: Option<ProjectScope>,
     text: Arc<str>,
     coverage: Fact<()>,
     members: BTreeMap<(usize, usize), DeclaredMemberFacts>,
@@ -643,6 +662,7 @@ struct ReadSet {
     files: BTreeMap<String, u64>,
     compiled: BTreeMap<String, u64>,
     missing_sources: BTreeSet<String>,
+    source_inventories: BTreeMap<ProjectScope, u64>,
 }
 
 pub struct PendingContributions {
@@ -670,6 +690,7 @@ pub struct ExtensionStore {
     next_generation: u64,
     model_generation: u64,
     namespace_generation: u64,
+    source_inventory_generations: BTreeMap<ProjectScope, u64>,
     namespace_coverage: Fact<()>,
     publication_revision: u64,
     sources: BTreeMap<String, SourceFacts>,
@@ -686,6 +707,7 @@ impl Default for ExtensionStore {
             next_generation: 0,
             model_generation: 0,
             namespace_generation: 0,
+            source_inventory_generations: BTreeMap::new(),
             namespace_coverage: unknown(IncompleteReason::IncompleteScope),
             publication_revision: 0,
             sources: BTreeMap::new(),
@@ -736,8 +758,10 @@ impl ExtensionStore {
         }
     }
 
-    /// The trusted host must first verify its actual successful invocation receipt and input CAS.
-    /// This validates semantic ownership, not Gradle success or filesystem freshness. Attaching an
+    /// The trusted host binds the selected binary artifact to current source/model/output identities.
+    /// A successful invocation receipt is one authority; selected external output CAS supplies only
+    /// positive API facts and never compiler-clean authority. This validates semantic ownership,
+    /// not Gradle success or filesystem freshness. Attaching an
     /// output does not change the authored generation that issued `owner`.
     pub fn replace_compiled_input(
         &mut self,
@@ -1103,11 +1127,22 @@ impl ExtensionStore {
             Some(prepared) => prepared.ranges,
             None => source::ordinary_reference_types(index, file, &text),
         };
+        let scope = index.origin_facts().and_then(|facts| facts.file_origin(file))
+            .filter(|origin| origin.representation == SourceRepresentation::Source)
+            .and_then(|origin| origin.project_scope.clone());
+        let previous_scope = self.sources.get(file).and_then(|source| source.scope.clone());
+        let membership_changed = !self.sources.contains_key(file) || previous_scope != scope;
         self.next_generation += 1;
+        if membership_changed {
+            for changed in previous_scope.iter().chain(scope.iter()) {
+                self.source_inventory_generations.insert(changed.clone(), self.next_generation);
+            }
+        }
         self.sources.insert(
             file.into(),
             SourceFacts {
                 generation: self.next_generation,
+                scope,
                 text,
                 coverage,
                 members: normalized,
@@ -1133,6 +1168,10 @@ impl ExtensionStore {
 
     pub fn remove_source(&mut self, file: &str) {
         if let Some(source) = self.sources.remove(file) {
+            if let Some(scope) = source.scope {
+                self.next_generation += 1;
+                self.source_inventory_generations.insert(scope, self.next_generation);
+            }
             if !source.types.is_empty() {
                 self.namespace_generation += 1;
             }
@@ -1242,6 +1281,7 @@ impl ExtensionStore {
                 files: BTreeMap::from([(owner.into(), owner_generation)]),
                 compiled: BTreeMap::new(),
                 missing_sources: BTreeSet::new(),
+                source_inventories: BTreeMap::new(),
             },
             set: ContributionSet::default(),
         })
@@ -1298,6 +1338,8 @@ impl ExtensionStore {
                 .reads
                 .namespace
                 .is_none_or(|generation| generation == self.namespace_generation)
+            && pending.reads.source_inventories.iter().all(|(scope, generation)|
+                self.source_inventory_generations.get(scope) == Some(generation))
             && pending.reads.files.iter().all(|(file, generation)| {
                 self.sources
                     .get(file)
@@ -1355,6 +1397,43 @@ pub struct ReadSession<'a> {
 }
 
 impl ReadSession<'_> {
+    /// Enumerate accepted Java/Kotlin snapshots in the host-selected project source set.
+    /// Completeness of the filesystem/model inventory is a separate host observation.
+    pub fn source_inventory(&mut self) -> Result<Vec<SourceHandle>, ContractError> {
+        let scope = self.index.origin_facts().and_then(|facts| facts.file_origin(self.owner))
+            .filter(|origin| origin.representation == SourceRepresentation::Source)
+            .and_then(|origin| origin.project_scope.clone()).ok_or(ContractError::ForeignFile)?;
+        let generation = self.store.source_inventory_generations.get(&scope)
+            .copied().ok_or(ContractError::MissingSource)?;
+        self.reads.source_inventories.insert(scope.clone(), generation);
+        let mut sources = Vec::new();
+        for (file, source) in &self.store.sources {
+            if source.scope.as_ref() != Some(&scope) || !(file.ends_with(".java") || file.ends_with(".kt")) {
+                continue;
+            }
+            self.reads.files.insert(file.clone(), source.generation);
+            sources.push(SourceHandle { host:self.store.host, session:self.session,
+                file:file.clone(), generation:source.generation, scope:scope.clone() });
+        }
+        Ok(sources)
+    }
+
+    /// Read the exact accepted text, including an unsaved overlay; never re-read a display path.
+    pub fn source_snapshot(&mut self, source: &SourceHandle) -> Result<Arc<str>, ContractError> {
+        if source.host != self.store.host || source.session != self.session {
+            return Err(ContractError::ForeignIdentity);
+        }
+        let current = self.store.sources.get(&source.file).ok_or(ContractError::MissingSource)?;
+        if current.generation != source.generation || current.scope.as_ref() != Some(&source.scope) {
+            return Err(ContractError::Stale);
+        }
+        let scope = self.index.origin_facts().and_then(|facts| facts.file_origin(self.owner))
+            .and_then(|origin| origin.project_scope.as_ref()).ok_or(ContractError::ForeignFile)?;
+        if scope != &source.scope { return Err(ContractError::ForeignFile); }
+        self.reads.files.insert(source.file.clone(), source.generation);
+        Ok(current.text.clone())
+    }
+
     pub fn compiler_classes(
         &mut self,
         owner: &TypeId,

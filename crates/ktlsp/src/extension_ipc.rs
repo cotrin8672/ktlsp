@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 
 pub const PROTOCOL_MAJOR: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
+pub(crate) const READ_FACTS_RESPONSE_BUDGET_EXCEEDED: &str =
+    "extension response batch too large; split queries";
 const MAX_BATCH: usize = 256;
 const MAX_HANDLES: usize = 16_384;
 const EVALUATION_LIMIT: Duration = Duration::from_secs(30);
@@ -24,20 +26,25 @@ static NEXT_EVALUATION: AtomicU64 = AtomicU64::new(1);
 const PROJECT_FACTS: &str = "project-class-facts-v1";
 const PROJECT_CONTEXT: u8 = 1;
 const TYPE_JVM: u8 = 2;
+const SOURCE_SNAPSHOTS: &str = "source-snapshots-v1";
+const SOURCE_INVENTORY: u8 = 4;
+const SOURCE_SNAPSHOT: u8 = 8;
 
 fn project_operations(result: &Value) -> u8 {
-    if !result["capabilities"].as_array()
-        .is_some_and(|values| values.iter().any(|value| value == PROJECT_FACTS))
-    {
-        return 0;
+    let mut selected = 0;
+    for (capability, operations) in [
+        (PROJECT_FACTS, [("projectContext", PROJECT_CONTEXT), ("typeJvm", TYPE_JVM)]),
+        (SOURCE_SNAPSHOTS, [("sourceInventory", SOURCE_INVENTORY), ("sourceSnapshot", SOURCE_SNAPSHOT)]),
+    ] {
+        if !result["capabilities"].as_array().is_some_and(|values|
+            values.iter().any(|value| value == capability)) { continue; }
+        if let Some(offered) = result["supportedOps"][capability].as_array() {
+            for (operation, bit) in operations {
+                if offered.iter().any(|value| value == operation) { selected |= bit; }
+            }
+        }
     }
-    result["supportedOps"][PROJECT_FACTS].as_array().map_or(0, |operations| {
-        operations.iter().fold(0, |selected, operation| selected | match operation.as_str() {
-            Some("projectContext") => PROJECT_CONTEXT,
-            Some("typeJvm") => TYPE_JVM,
-            _ => 0,
-        })
-    })
+    selected
 }
 
 /// Shared with the disposable child fixture; no core Rust identities cross this boundary.
@@ -181,6 +188,8 @@ fn token(value: &Value) -> Result<&str, String> {
 
 enum Handle {
     Type(TypeId),
+    Source(SourceHandle),
+    SourceInventory { sources: Arc<Vec<SourceHandle>>, next: usize },
     Declaration(DeclarationId),
     TypeRef(ktcore::types::TypeRef),
     Signature(MemberSignature),
@@ -224,6 +233,93 @@ impl Evaluation {
         let token = format!("{}:{}", self.id, self.handles.len());
         self.handles.insert(token.clone(), handle);
         token
+    }
+    fn source_descriptor(&self, source: &SourceHandle, id: &str) -> Value {
+        json!({"id":id,"displayPath":source.file(),
+            "documentUri":std::path::Path::new(source.file()).is_absolute()
+                .then(|| tower_lsp_server::ls_types::Uri::from_file_path(source.file())).flatten()
+                .map_or_else(missing_fact, |uri|json!({"state":"found","value":uri.to_string()})),
+            "languageId":if source.file().ends_with(".java") {"java"} else {"kotlin"},
+            "identity":{"kind":"source","revision":source.revision().to_string()}})
+    }
+    fn source_inventory(
+        &mut self, read: &mut ReadSession<'_>, after: Option<&str>, budget: usize,
+    ) -> Result<Value, String> {
+        let continuation = match after {
+            Some(token) => match self.handles.get(token) {
+                Some(Handle::SourceInventory { sources, next }) => Some((sources.clone(), *next)),
+                _ => return Err("foreign source inventory cursor".into()),
+            },
+            None => None,
+        };
+        let current = match read.source_inventory() {
+            Ok(sources) => sources,
+            Err(ContractError::ForeignFile | ContractError::MissingSource) if after.is_none() =>
+                return Ok(json!({"sources":[],"coverage":missing_fact(),"next":null})),
+            Err(error) => return Err(contract(error)),
+        };
+        let (sources, start) = match continuation {
+            Some((sources, next)) => {
+                if sources.as_ref() != &current || next == 0 || next >= sources.len() {
+                    return Err("stale source inventory cursor".into());
+                }
+                (sources, next)
+            }
+            None => (Arc::new(current), 0),
+        };
+        let coverage = self.project.as_ref().and_then(|model|
+            model.extension_project_context(std::path::Path::new(&self.owner)))
+            .map_or_else(missing_fact, |context| {
+                let accepted: std::collections::BTreeSet<_> = sources.iter().map(|source|source.file()).collect();
+                let complete = source_inventory_complete(context.source, &accepted);
+                if complete { json!({"state":"found","value":null}) } else { missing_fact() }
+            });
+        let limit = budget.min(MAX_FRAME / 2);
+        let cursor_bound = format!("{}:{}", self.id, MAX_HANDLES);
+        let size = |value: &Value| serde_json::to_vec(value).map(|bytes|bytes.len()).map_err(|error|error.to_string());
+        // Reserve both final coverage and a continuation before issuing any identities.
+        let mut used = size(&json!({"sources":[],"coverage":missing_fact(),"next":cursor_bound}))?
+            .max(size(&json!({"sources":[],"coverage":coverage,"next":cursor_bound}))?);
+        if used > limit { return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into()); }
+        let mut entries = Vec::new();
+        for (index, source) in sources.iter().enumerate().skip(start) {
+            let cursor_slot = usize::from(index + 1 < sources.len());
+            if self.handles.len() + entries.len() + 1 + cursor_slot > MAX_HANDLES {
+                if entries.is_empty() { return Err("source inventory handle limit".into()); }
+                break;
+            }
+            let id = format!("{}:{}", self.id, self.handles.len() + entries.len());
+            let entry = self.source_descriptor(source, &id);
+            let bytes = size(&entry)?.saturating_add(1);
+            if used.saturating_add(bytes) > limit { break; }
+            used += bytes;
+            entries.push(entry);
+        }
+        if entries.is_empty() && start < sources.len() {
+            return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into());
+        }
+        let end = start + entries.len();
+        for source in &sources[start..end] { self.issue(Handle::Source(source.clone())); }
+        let next = (end < sources.len()).then(||self.issue(Handle::SourceInventory { sources, next:end }));
+        let value = json!({"sources":entries,
+            "coverage":if next.is_some() { missing_fact() } else { coverage },"next":next});
+        if size(&value)? > limit { return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into()); }
+        Ok(value)
+    }
+    fn source_snapshot(&mut self, read: &mut ReadSession<'_>, token: &str) -> Result<Value, String> {
+        use sha2::{Digest, Sha256};
+        let source = match self.handles.get(token) {
+            Some(Handle::Source(source)) => source.clone(),
+            _ => return Err("foreign source token".into()),
+        };
+        let text = read.source_snapshot(&source).map_err(contract)?;
+        if text.len() > MAX_FRAME / 8 {
+            return Ok(fact(&Fact::<()>::Unknown(vec![IncompleteReason::UnsupportedSource]), |_|Value::Null));
+        }
+        let mut value = self.source_descriptor(&source, token);
+        value["text"] = json!(text.as_ref());
+        value["sha256"] = json!(format!("{:x}", Sha256::digest(text.as_bytes())));
+        Ok(json!({"state":"found","value":value}))
     }
     fn project_context(&self) -> Value {
         let mut value = json!({"workspaceUri":missing_fact(),"scope":missing_fact(),
@@ -373,8 +469,23 @@ impl Evaluation {
                     return Err("extension batch too large".into());
                 }
                 let mut result = Vec::new();
+                // Leave room for the JSON-RPC envelope. Count escaped UTF-8 bytes before
+                // retaining another fact, so a child can split a batch without dying.
+                let mut remaining = MAX_FRAME / 2;
                 for query in queries {
-                    result.push(match query {
+                    let value = match query {
+                        ReadQuery::SourceInventory { after } => {
+                            if self.project_operations & SOURCE_INVENTORY == 0 {
+                                return Err("sourceInventory was not negotiated".into());
+                            }
+                            self.source_inventory(read, after.as_deref(), remaining.saturating_sub(1))?
+                        }
+                        ReadQuery::SourceSnapshot { source } => {
+                            if self.project_operations & SOURCE_SNAPSHOT == 0 {
+                                return Err("sourceSnapshot was not negotiated".into());
+                            }
+                            self.source_snapshot(read, &source)?
+                        }
                         ReadQuery::ProjectContext => {
                             if self.project_operations & PROJECT_CONTEXT == 0 {
                                 return Err("projectContext was not negotiated".into());
@@ -402,7 +513,11 @@ impl Evaluation {
                             let (members,coverage) = read.declared_members(&self.ty(&json!(target))?).map_err(contract)?;
                             json!({"members":members.iter().map(|member|self.member(member)).collect::<Vec<_>>(),"coverage":fact(&coverage, |_|Value::Null)})
                         }
-                    });
+                    };
+                    let size = serde_json::to_vec(&value).map_err(|error|error.to_string())?.len();
+                    remaining = remaining.checked_sub(size.saturating_add(1))
+                        .ok_or_else(|| READ_FACTS_RESPONSE_BUDGET_EXCEEDED.to_string())?;
+                    result.push(value);
                 }
                 Ok(json!({"facts":result}))
             }
@@ -555,6 +670,8 @@ fn class_abi(class: &ktcore::classfile::ClassFileFacts) -> Option<Value> {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum ReadQuery {
+    SourceInventory { #[serde(default)] after: Option<String> },
+    SourceSnapshot { source: String },
     ProjectContext,
     TypeJvm { target: String },
     ResolveType { name: String },
@@ -562,6 +679,334 @@ enum ReadQuery {
     DeclarationType { declaration: String },
     DeclarationMember { declaration: String },
     DeclaredMembers { target: String },
+}
+
+fn source_inventory_complete(
+    source: &crate::classpath::SourceSetClasspath,
+    accepted: &std::collections::BTreeSet<&str>,
+) -> bool {
+    let mut normal = false;
+    !source.compiler_metadata_incomplete
+        && !source.compiler_tasks.is_empty()
+        && source.compiler_tasks.iter().all(|task| {
+            let known = match task.task_type.strip_suffix("_Decorated").unwrap_or(&task.task_type) {
+                "org.gradle.api.tasks.compile.JavaCompile"
+                | "org.jetbrains.kotlin.gradle.tasks.KotlinCompile" => {
+                    normal = true;
+                    crate::classpath::sdk_producer_roots(task).is_some_and(|(_, complete)| complete)
+                }
+                // These describe nonexecuted inputs; their claimed files must still be present.
+                "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask"
+                | "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask"
+                | "com.google.devtools.ksp.gradle.KspTaskJvm" => true,
+                _ => false,
+            };
+            known && task.complete && task.problem.is_none()
+                && task.source_files.iter()
+                    .filter(|path| matches!(path.extension().and_then(|ext|ext.to_str()),Some("java"|"kt")))
+                    .all(|path|accepted.contains(crate::paths::file_key(path).as_str()))
+        })
+        && normal
+}
+
+#[cfg(test)]
+mod source_snapshot_tests {
+    use super::*;
+    use ktcore::index::{Index, Tier};
+    use ktcore::project_model::{FileOrigin, ProjectScope, SourceRepresentation};
+
+    fn inventory_page_fixture(count: usize) -> (Index, ExtensionStore, Evaluation, Vec<String>) {
+        use crate::classpath::{CompilerTask, ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+        let root = std::path::PathBuf::from(if cfg!(windows) {"C:/source-inventory-fixture"} else {"/source-inventory-fixture"})
+            .join("descriptor-path-padding".repeat(8));
+        let files: Vec<_> = (0..count).map(|n|crate::paths::file_key(&root.join(format!("Source{n:04}.java")))).collect();
+        let task: CompilerTask = serde_json::from_value(json!({
+            "task":":inventory:compileJava","language":"java",
+            "task_type":"org.gradle.api.tasks.compile.JavaCompile",
+            "arguments":[],"annotation_processor_path":[],"source_files":files,
+            "options":{"sdkProducerClaims":{"adapter":"gradle-producing-source-trees-v1",
+                "language":"java","task":":inventory:compileJava","roots":[root],"complete":true}},
+            "output_roots":[],"complete":true,"problem":null
+        })).unwrap();
+        let project = Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+            module:":inventory".into(),build:":".into(),project_dir:root.clone(),
+            source_sets:vec![SourceSetClasspath { name:"main".into(),source_roots:vec![root],
+                compiler_tasks:vec![task], ..Default::default() }],entries:Vec::new(),unresolved:Vec::new(),
+        }]));
+        let mut index=Index::new();let mut store=ExtensionStore::default();
+        store.configure_provider("pages",true,Arc::from("{}"));
+        for file in &files {
+            index.replace_file(file,Vec::new(),Tier::Volatile);
+            index.set_file_origin(file,project.file_origin(std::path::Path::new(file)).unwrap());
+            store.replace_source(&index,file,Arc::from("// accepted empty source"),Knowledge::Found(()),Vec::new()).unwrap();
+        }
+        let mut evaluation=Evaluation::new("pages".into(),files[0].clone(),1);
+        evaluation.project=Some(project);evaluation.project_operations=SOURCE_INVENTORY|SOURCE_SNAPSHOT;
+        (index,store,evaluation,files)
+    }
+
+    #[test]
+    fn large_source_inventory_pages_preserve_all_sources_and_snapshot_batch_limits() {
+        // Real Gradle :dependency-management/main has 1257 files and >=808251 descriptor bytes.
+        let (index,mut store,mut evaluation,files)=inventory_page_fixture(1257);
+        let mut read=store.begin(&index,"pages",&files[0]).unwrap();
+        let sources=read.source_inventory().unwrap();
+        let whole:Vec<_>=sources.iter().enumerate().map(|(n,source)|evaluation.source_descriptor(source,&format!("{}:{n}",evaluation.id))).collect();
+        assert!(serde_json::to_vec(&json!({"sources":whole,"coverage":missing_fact(),"next":null})).unwrap().len()>MAX_FRAME/2);
+        let mut after=Value::Null;let mut ids=Vec::new();let mut paths=Vec::new();let mut pages=0;
+        loop {
+            let value=evaluation.batch(&mut read,"analysis/readFacts",json!({"evaluation":evaluation.id.to_string(),
+                "queries":[{"op":"sourceInventory","after":after}]})).unwrap();
+            let page=&value["facts"][0];pages+=1;
+            assert!(serde_json::to_vec(page).unwrap().len()+1<=MAX_FRAME/2);
+            for entry in page["sources"].as_array().unwrap() {
+                ids.push(entry["id"].as_str().unwrap().to_string());paths.push(entry["displayPath"].as_str().unwrap().to_string());
+            }
+            after=page["next"].clone();
+            if after.is_null() { assert_eq!(page["coverage"]["state"],"found");break; }
+            assert_eq!(page["coverage"]["state"],"unknown");
+            let pending=read.finish();read=store.resume(&index,&files[0],pending).unwrap();
+        }
+        assert_eq!(pages,2);assert_eq!(paths,files);
+        assert_eq!(ids.iter().collect::<std::collections::BTreeSet<_>>().len(),files.len());
+        assert_eq!(evaluation.handles.len(),files.len()+pages-1);
+        for chunk in ids.chunks(MAX_BATCH) {
+            let queries:Vec<_>=chunk.iter().map(|id|json!({"op":"sourceSnapshot","source":id})).collect();
+            let value=evaluation.batch(&mut read,"analysis/readFacts",json!({"evaluation":evaluation.id.to_string(),"queries":queries})).unwrap();
+            assert!(value["facts"].as_array().unwrap().iter().all(|fact|fact["value"]["text"]=="// accepted empty source"));
+        }
+        assert_eq!(evaluation.batches,pages+files.len().div_ceil(MAX_BATCH));assert!(evaluation.batches<64);
+    }
+
+    #[test]
+    fn inventory_cursors_reject_foreign_sessions_and_membership_changes_without_false_absence() {
+        for mutation in ["add-empty","remove-empty","body","foreign-scope"] {
+            let (mut index,mut store,mut evaluation,files)=inventory_page_fixture(1257);
+            let mut read=store.begin(&index,"pages",&files[0]).unwrap();
+            let first=evaluation.source_inventory(&mut read,None,MAX_FRAME/2-1).unwrap();
+            let cursor=first["next"].as_str().unwrap().to_string();
+            assert_eq!(first["coverage"]["state"],"unknown");
+            assert!(evaluation.source_inventory(&mut read,Some("foreign-cursor"),MAX_FRAME/2-1).is_err());
+            let source=first["sources"][0]["id"].as_str().unwrap();
+            assert!(evaluation.source_inventory(&mut read,Some(source),MAX_FRAME/2-1).is_err());
+            let pending=read.finish();
+            match mutation {
+                "add-empty" => {
+                    let extra=files[0].replace("Source0000.java","NewEmpty.java");
+                    index.replace_file(&extra,Vec::new(),Tier::Volatile);
+                    index.set_file_origin(&extra,index.file_origin(&files[0]).unwrap().clone());
+                    store.replace_source(&index,&extra,Arc::from(""),Knowledge::Found(()),Vec::new()).unwrap();
+                }
+                "remove-empty" => store.remove_source(&files[1]),
+                "body" => { store.replace_source(&index,&files[1],Arc::from("// edited"),Knowledge::Found(()),Vec::new()).unwrap(); }
+                "foreign-scope" => {
+                    let mut origin=index.file_origin(&files[0]).unwrap().clone();origin.project_scope.as_mut().unwrap().module="foreign".into();
+                    index.set_file_origin(&files[0],origin);
+                    store.replace_source(&index,&files[0],Arc::from("// moved"),Knowledge::Found(()),Vec::new()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(store.resume(&index,&files[0],pending).is_err(),"{mutation}");
+            let mut fresh=store.begin(&index,"pages",&files[0]).unwrap();
+            assert!(evaluation.source_inventory(&mut fresh,Some(&cursor),MAX_FRAME/2-1).is_err(),"{mutation}");
+        }
+    }
+
+    #[test]
+    fn inventory_final_page_preserves_unknown_coverage_and_handle_limits() {
+        let (mut index,mut store,mut evaluation,files)=inventory_page_fixture(1);
+        evaluation.project=None;
+        let mut read=store.begin(&index,"pages",&files[0]).unwrap();
+        let response=evaluation.source_inventory(&mut read,None,MAX_FRAME/2-1).unwrap();
+        assert!(response["next"].is_null());assert_eq!(response["sources"].as_array().unwrap().len(),1);
+        assert_eq!(response["coverage"]["state"],"unknown");
+        assert!(evaluation.source_inventory(&mut read,None,8).is_err());
+        while evaluation.handles.len()<MAX_HANDLES { evaluation.issue(Handle::Source(read.source_inventory().unwrap()[0].clone())); }
+        assert!(evaluation.source_inventory(&mut read,None,MAX_FRAME/2-1).unwrap_err().contains("handle limit"));
+        drop(read);
+        let empty_owner=files[0].replace(".java",".txt");
+        index.replace_file(&empty_owner,Vec::new(),Tier::Volatile);
+        index.set_file_origin(&empty_owner,index.file_origin(&files[0]).unwrap().clone());
+        store.replace_source(&index,&empty_owner,Arc::from(""),Knowledge::Found(()),Vec::new()).unwrap();
+        store.remove_source(&files[0]);
+        let mut empty=store.begin(&index,"pages",&empty_owner).unwrap();
+        let mut evaluation=Evaluation::new("pages".into(),empty_owner.clone(),1);
+        let response=evaluation.source_inventory(&mut empty,None,MAX_FRAME/2-1).unwrap();
+        assert_eq!(response["sources"],json!([]));assert!(response["next"].is_null());
+        assert_eq!(response["coverage"]["state"],"unknown");
+    }
+
+    #[test]
+    fn source_snapshot_host_batch_budget_allows_split_retry_and_publication() {
+        let mut index = Index::new();
+        let mut host = crate::analysis_extensions::AnalysisExtensions::new(Vec::new());
+        host.register_ipc(&index,"source-test",vec!["fixture-child".into()]).unwrap();
+        let file="/ipc/Owner.kt";
+        let text:Arc<str>=Arc::from(format!("// {}\nclass Owner {{ fun value(): Int = 1 }}", "x".repeat(96*1024)));
+        let tree=ktcore::parser::KotlinParser::new().parse(&text);
+        index.replace_file(file,ktcore::indexer::extract_symbols(&tree,&text,""),Tier::Volatile);
+        index.set_file_origin(file,FileOrigin { origin_id:"module".into(),representation:SourceRepresentation::Source,
+            project_scope:Some(ProjectScope { module:"module".into(),source_set:"main".into() }) });
+        host.replace_sources(&index,vec![(file.into(),text.clone(),tree)]);
+        let work=host.take_ipc_work(&index,None).remove(0);
+        work.worker.project_operations.store(SOURCE_INVENTORY|SOURCE_SNAPSHOT,Ordering::Release);
+        let id=work.evaluation.to_string();
+        let inventory=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",
+            json!({"evaluation":id,"queries":[{"op":"sourceInventory"}]})).unwrap();
+        let query=json!({"op":"sourceSnapshot","source":inventory["facts"][0]["sources"][0]["id"]});
+        let error=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",
+            json!({"evaluation":id,"queries":vec![query.clone();8]})).unwrap_err();
+        assert_eq!(error,READ_FACTS_RESPONSE_BUDGET_EXCEEDED);
+        assert!(host.ipc_current(work.evaluation));
+        assert!(host.ipc_completion_pending(file));
+        let smaller=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",
+            json!({"evaluation":id,"queries":[query]})).unwrap();
+        assert_eq!(smaller["facts"][0]["value"]["text"],text.as_ref());
+        host.ipc_batch(&index,work.evaluation,"analysis/finish",
+            json!({"evaluation":id,"contributions":{"sites":[],"diagnostics":[]}})).unwrap();
+        host.publish(&mut index);
+        assert!(host.ipc_publication(work.evaluation).is_some());
+    }
+
+    #[test]
+    fn source_snapshot_fixed_frames_match_the_actual_serializer() {
+        let mut index = Index::new();
+        let mut store = ExtensionStore::default();
+        store.configure_provider("source-test",true,Arc::from("{}"));
+        for (file,text) in [("source-fixture/Owner.kt","// Kotlin current\n"),
+            ("source-fixture/Empty.java","// 未保存 Java 😀\n")] {
+            index.replace_file(file,Vec::new(),Tier::Volatile);
+            index.set_file_origin(file,FileOrigin { origin_id:"module".into(),representation:SourceRepresentation::Source,
+                project_scope:Some(ProjectScope { module:"module".into(),source_set:"main".into() }) });
+            store.replace_source(&index,file,Arc::from(text),Knowledge::Found(()),Vec::new()).unwrap();
+        }
+        let mut read = store.begin(&index,"source-test","source-fixture/Owner.kt").unwrap();
+        let mut evaluation = Evaluation::new("source-test".into(),"source-fixture/Owner.kt".into(),1);
+        evaluation.id=42;
+        evaluation.project_operations=SOURCE_INVENTORY|SOURCE_SNAPSHOT;
+        let inventory=evaluation.batch(&mut read,"analysis/readFacts",json!({"evaluation":"42","queries":[{"op":"sourceInventory"}]})).unwrap();
+        let token=inventory["facts"][0]["sources"][0]["id"].clone();
+        let snapshot=evaluation.batch(&mut read,"analysis/readFacts",json!({"evaluation":"42","queries":[{"op":"sourceSnapshot","source":token}]})).unwrap();
+        let mut actual=Vec::new();
+        write_frame(&mut actual,&json!({"jsonrpc":"2.0","id":7,"result":inventory})).unwrap();
+        write_frame(&mut actual,&json!({"jsonrpc":"2.0","id":8,"result":snapshot})).unwrap();
+        let fixture=include_bytes!("../../../dev/external-extension/source-snapshots-v1.frames");
+        assert_eq!(actual.as_slice(),fixture.as_slice());
+        let mut input=std::io::Cursor::new(fixture);
+        assert_eq!(read_frame(&mut input).unwrap().unwrap()["result"]["facts"][0]["sources"][0]["identity"]["revision"],"3");
+        assert_eq!(read_frame(&mut input).unwrap().unwrap()["result"]["facts"][0]["value"]["text"],"// 未保存 Java 😀\n");
+        assert!(read_frame(&mut input).unwrap().is_none());
+    }
+
+    #[test]
+    fn source_inventory_coverage_rejects_unknown_roles_and_missing_generator_inputs() {
+        use crate::classpath::{CompilerLanguage, CompilerTask, SourceSetClasspath};
+        let root = std::env::current_dir().unwrap().join("source-fixture");
+        let owner = crate::paths::file_key(&root.join("Owner.kt"));
+        let java = crate::paths::file_key(&root.join("Empty.java"));
+        let task: CompilerTask = serde_json::from_value(json!({
+            "task":":compileJava","language":"java",
+            "task_type":"org.gradle.api.tasks.compile.JavaCompile",
+            "arguments":[],"annotation_processor_path":[],"source_files":[owner,java],
+            "options":{"sdkProducerClaims":{"adapter":"gradle-producing-source-trees-v1",
+                "language":"java","task":":compileJava","roots":[root],"complete":true}},
+            "output_roots":[],"complete":true,"problem":null
+        })).unwrap();
+        let mut source = SourceSetClasspath { compiler_tasks:vec![task.clone()], ..Default::default() };
+        let accepted = [owner.as_str(),java.as_str()].into_iter().collect();
+        assert!(source_inventory_complete(&source,&accepted));
+        let mut unknown = task;
+        unknown.task = ":customKotlin".into();
+        unknown.language = CompilerLanguage::Kotlin;
+        unknown.task_type = "custom.KotlinCompile".into();
+        unknown.source_files = vec![root.join("Missing.kt")];
+        source.compiler_tasks.push(unknown);
+        assert!(!source_inventory_complete(&source,&accepted));
+        source.compiler_tasks[1].task_type = "com.google.devtools.ksp.gradle.KspTaskJvm".into();
+        assert!(!source_inventory_complete(&source,&accepted),"nonexecuted generator inputs cannot disappear from coverage");
+        source.compiler_tasks[1].source_files = vec![owner.clone().into()];
+        assert!(source_inventory_complete(&source,&accepted));
+        source.compiler_metadata_incomplete = true;
+        assert!(!source_inventory_complete(&source,&accepted));
+    }
+
+    #[test]
+    fn source_snapshot_batch_budget_counts_escaped_bytes_and_allows_split_retry() {
+        let mut index = Index::new();
+        let mut store = ExtensionStore::default();
+        store.configure_provider("source-test",true,Arc::from("{}"));
+        let file = "/sources/Large.kt";
+        index.replace_file(file,Vec::new(),Tier::Volatile);
+        index.set_file_origin(file,FileOrigin { origin_id:"module".into(),representation:SourceRepresentation::Source,
+            project_scope:Some(ProjectScope { module:"module".into(),source_set:"main".into() }) });
+        store.replace_source(&index,file,Arc::from("\u{1}".repeat(24*1024)),Knowledge::Found(()),Vec::new()).unwrap();
+        let mut read = store.begin(&index,"source-test",file).unwrap();
+        let mut evaluation = Evaluation::new("source-test".into(),file.into(),1);
+        evaluation.project_operations = SOURCE_INVENTORY | SOURCE_SNAPSHOT;
+        let inventory = evaluation.source_inventory(&mut read, None, MAX_FRAME / 2 - 1).unwrap();
+        let token = inventory["sources"][0]["id"].clone();
+        let query = json!({"op":"sourceSnapshot","source":token});
+        let params = |queries:Vec<Value>| json!({"evaluation":evaluation.id.to_string(),"queries":queries});
+        let oversized = params(vec![query.clone();8]);
+        assert!(evaluation.batch(&mut read,"analysis/readFacts",oversized).unwrap_err().contains("split queries"));
+        let smaller = json!({"evaluation":evaluation.id.to_string(),"queries":[query]});
+        let response = evaluation.batch(&mut read,"analysis/readFacts",smaller).unwrap();
+        assert_eq!(response["facts"][0]["state"],"found");
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes,&json!({"jsonrpc":"2.0","id":2,"result":response})).unwrap();
+        assert!(bytes.len()<MAX_FRAME);
+    }
+
+    #[test]
+    fn source_snapshot_operations_preserve_scoped_unsaved_text_and_negative_reads() {
+        let mut index = Index::new();
+        let mut store = ExtensionStore::default();
+        store.configure_provider("source-test", true, Arc::from("{}"));
+        let scope = ProjectScope { module:"source-module".into(), source_set:"main".into() };
+        for (file,text,module) in [
+            ("/sources/Owner.kt","// Kotlin current\n","source-module"),
+            ("/sources/Empty.java","// 未保存 Java 😀\n","source-module"),
+            ("/foreign/Hidden.kt","// must not leak\n","other-module"),
+        ] {
+            index.replace_file(file, Vec::new(), Tier::Volatile);
+            index.set_file_origin(file, FileOrigin { origin_id:module.into(), representation:SourceRepresentation::Source,
+                project_scope:Some(ProjectScope { module:module.into(), source_set:"main".into() }) });
+            store.replace_source(&index,file,Arc::from(text),Knowledge::Found(()),Vec::new()).unwrap();
+        }
+        let mut read = store.begin(&index,"source-test","/sources/Owner.kt").unwrap();
+        let mut evaluation = Evaluation::new("source-test".into(),"/sources/Owner.kt".into(),1);
+        evaluation.id = 42;
+        evaluation.project_operations = SOURCE_INVENTORY | SOURCE_SNAPSHOT;
+        let inventory = evaluation.batch(&mut read,"analysis/readFacts",
+            json!({"evaluation":"42","queries":[{"op":"sourceInventory"}]})).unwrap();
+        let sources = inventory["facts"][0]["sources"].as_array().unwrap();
+        assert_eq!(sources.len(),2);
+        assert_eq!(sources[0]["displayPath"],"/sources/Empty.java");
+        assert_eq!(sources[0]["languageId"],"java");
+        assert_eq!(sources[1]["languageId"],"kotlin");
+        assert_eq!(inventory["facts"][0]["coverage"]["state"],"unknown",
+            "no complete project inventory is inferred from a partial index");
+        let token = sources[0]["id"].as_str().unwrap();
+        let snapshot = evaluation.batch(&mut read,"analysis/readFacts",
+            json!({"evaluation":"42","queries":[{"op":"sourceSnapshot","source":token}]})).unwrap();
+        assert_eq!(snapshot["facts"][0]["state"],"found");
+        assert_eq!(snapshot["facts"][0]["value"]["text"],"// 未保存 Java 😀\n");
+        assert_eq!(snapshot["facts"][0]["value"]["id"],token);
+        assert_eq!(snapshot["facts"][0]["value"]["identity"],sources[0]["identity"]);
+        assert!(evaluation.batch(&mut read,"analysis/readFacts",
+            json!({"evaluation":"42","queries":[{"op":"sourceSnapshot","source":"/foreign/Hidden.kt"}]})).is_err(),
+            "a display path cannot become a filesystem or foreign-scope grant");
+        let pending = read.finish();
+        index.replace_file("/sources/Added.java",Vec::new(),Tier::Volatile);
+        index.set_file_origin("/sources/Added.java",FileOrigin { origin_id:scope.module.clone(),
+            representation:SourceRepresentation::Source,project_scope:Some(scope) });
+        store.replace_source(&index,"/sources/Added.java",Arc::from("// no declarations"),Knowledge::Found(()),Vec::new()).unwrap();
+        assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)));
+        assert_eq!(project_operations(&json!({"capabilities":[SOURCE_SNAPSHOTS],
+            "supportedOps":{SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"]}})),SOURCE_INVENTORY | SOURCE_SNAPSHOT);
+        assert_eq!(project_operations(&json!({"capabilities":["semantic-v1"],
+            "supportedOps":{SOURCE_SNAPSHOTS:["sourceInventory"]}})),0);
+    }
 }
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -675,7 +1120,7 @@ impl Worker {
             }
             let transport = transport.as_mut().unwrap();
             if !transport.initialized {
-                transport.send(json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":work.provider,"capabilities":["semantic-v1",PROJECT_FACTS],"supportedOps":{PROJECT_FACTS:["projectContext","typeJvm"]}}}))?;
+                transport.send(json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":work.provider,"capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS],"supportedOps":{PROJECT_FACTS:["projectContext","typeJvm"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"]}}}))?;
                 let response =
                     transport
                         .receive(Instant::now() + EVALUATION_LIMIT, &self.stopped, || Ok(()))?;
@@ -689,6 +1134,18 @@ impl Worker {
                 }
                 self.project_operations.store(project_operations(&response["result"]), Ordering::Release);
                 transport.initialized = true;
+            }
+            if self.project_operations() & (SOURCE_INVENTORY | SOURCE_SNAPSHOT) != 0 {
+                let request = workspace.lock().begin_ipc_source_capture(
+                    work.evaluation, work.params["owner"].as_str().ok_or("missing source owner")?,
+                );
+                if let Some(request) = request {
+                    let prepared = crate::workspace::prepare_ipc_source_capture(request);
+                    if workspace.lock().finish_ipc_source_capture(prepared) > 0 {
+                        after_batch();
+                        return Err("Stale".into());
+                    }
+                }
             }
             let id = work.evaluation.to_string();
             transport.send(

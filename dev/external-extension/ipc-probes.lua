@@ -2,10 +2,11 @@ return function(env)
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
   local client, check = env.client, env.check
   local linked = vim.env.KTLSP_IPC_MODE == 'linked'
-  local facts = vim.env.KTLSP_IPC_MODE == 'project-facts'
+  local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots'
+  local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
   local paths, buffers, originals = {}, {}, {}
-  local proof = { mode = facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
+  local proof = { mode = source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
   local provider = linked and 'fixture.external-shadow' or 'fixture.ipc-shadow'
   local fresh_diagnostic = false
   local previous_diagnostics = client.handlers['textDocument/publishDiagnostics'] or vim.lsp.handlers['textDocument/publishDiagnostics']
@@ -37,6 +38,42 @@ return function(env)
       file:close()
     end
     return requested, accepted
+  end
+  local function source_snapshots(label, evaluation)
+    local file = barrier .. '/sources-' .. evaluation .. '.json'
+    assert(vim.fn.filereadable(file) == 1, 'missing child source snapshot capture')
+    local observed = vim.json.decode(table.concat(vim.fn.readfile(file), '\n'))
+    local sources, snapshots = observed.inventory.sources, observed.snapshots
+    check(label .. ' source inventory is explicitly complete', observed.inventory.coverage.state == 'found')
+    local owner, target, empty, seen = false, false, false, {}
+    for i, source in ipairs(sources) do
+      local snapshot = snapshots[i]
+      local key = probe.path_key(source.displayPath)
+      assert(not seen[key], 'duplicate source identity'); seen[key] = true
+      check(label .. ' source snapshot identity ' .. i, snapshot.state == 'found'
+        and snapshot.value.id == source.id and vim.deep_equal(snapshot.value.identity, source.identity))
+      if snapshot.state == 'found' then
+        check(label .. ' source snapshot hash ' .. i, vim.fn.sha256(snapshot.value.text) == snapshot.value.sha256)
+        check(label .. ' source revision is opaque host generation ' .. i,
+          type(source.identity.revision) == 'string' and source.identity.revision:match('^%d+$') ~= nil)
+        local expected
+        for k, path in pairs(paths) do
+          if key == probe.path_key(path) then
+            expected = probe.buffer_full_text(buffers[k])
+            if k == 'mixin' then owner = true end
+            if k == 'target' then target = true end
+          end
+        end
+        if expected then check(label .. ' snapshot is current wire ' .. i, snapshot.value.text == expected) end
+        if source.displayPath:match('/fixture/EmptySource%.java$') then
+          empty = snapshot.value.text == '' and snapshot.value.sha256 == vim.fn.sha256('')
+        end
+      end
+    end
+    check(label .. ' inventory contains owner and related target', owner and target)
+    check(label .. ' declaration-free empty source body is preserved', empty)
+    proof.source_snapshots = proof.source_snapshots or {}
+    proof.source_snapshots[label] = observed; save()
   end
   local function project_facts(label, evaluation)
     local file = barrier .. '/facts-' .. evaluation .. '.json'
@@ -114,6 +151,15 @@ return function(env)
     env.sources[path] = env.sources[path] or { buf = buf, disk = originals[key], sha256 = vim.fn.sha256(table.concat(originals[key], '\n')) }
     vim.lsp.buf_attach_client(buf, client.id)
   end
+  local empty_path, empty_buffer
+  if source_facts then
+    empty_path = env.project .. '/modules/editing/src/main/java/fixture/EmptySource.java'
+    assert(vim.fn.filereadable(empty_path) == 0, 'empty source sidecar must be disposable')
+    vim.fn.writefile({}, empty_path)
+    empty_buffer = vim.fn.bufadd(empty_path); vim.fn.bufload(empty_buffer)
+    vim.bo[empty_buffer].filetype = 'java'; vim.bo[empty_buffer].eol = false
+    vim.lsp.buf_attach_client(empty_buffer, client.id)
+  end
   local function lines(key) return vim.api.nvim_buf_get_lines(buffers[key], 0, -1, false) end
   local function deliver()
     require('vim.lsp._changetracking').flush(client)
@@ -137,6 +183,7 @@ return function(env)
     if not linked then
       value.command = { assert(vim.env.KTLSP_IPC_CHILD), '--barrier', barrier }
       if facts then value.command[#value.command + 1] = '--project-facts' end
+      if source_facts then value.command[#value.command + 1] = '--source-snapshots' end
     end
     client:notify('workspace/didChangeConfiguration', { settings = { analysisProviders = { [provider] = value } } })
   end
@@ -169,8 +216,14 @@ return function(env)
     record('normal-completion-returned-before-release')
     if facts then
       project_facts('initial', proof.paused_evaluation)
+      if source_facts then source_snapshots('initial', proof.paused_evaluation) end
       proof.initial_model_generation = model_state()
       assert(proof.initial_model_generation, 'initial accepted model generation is missing')
+      if source_facts then
+        local changed = vim.api.nvim_buf_get_lines(buffers.target, 0, -1, false)
+        changed[#changed + 1] = '// 未保存 source snapshot 😀'
+        vim.api.nvim_buf_set_lines(buffers.target, 0, -1, false, changed); deliver()
+      end
       local build = env.project .. '/modules/editing/build.gradle'
       assert(vim.fn.filereadable(env.project .. '/home/.m2/repository/fixture/reload/added/1.0/added-1.0.jar') == 1,
         'the classpath-change fixture JAR must already be built')
@@ -234,6 +287,7 @@ return function(env)
     check('fresh contribution matches the current owner bytes', accepted.args.source_sha256 == probe.buffer_sha256(buffers.mixin))
     proof.facts_publication = accepted
     local entries = project_facts('fresh', tostring(accepted.args.evaluation))
+    if source_facts then source_snapshots('fresh', tostring(accepted.args.evaluation)) end
     local initial = proof.project_facts.initial.selected.entries
     local added = env.project .. '/home/.m2/repository/fixture/reload/added/1.0/added-1.0.jar'
     local found = false
@@ -310,6 +364,11 @@ return function(env)
     vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, original)
     check('restore exact original buffer ' .. key, vim.deep_equal(lines(key), original))
     vim.bo[buffers[key]].modified = false
+  end
+  if empty_buffer then
+    vim.api.nvim_buf_delete(empty_buffer, { force = true })
+    assert(vim.fn.delete(empty_path) == 0, 'remove disposable empty source')
+    check('empty source sidecar is removed after disable', vim.fn.filereadable(empty_path) == 0)
   end
   deliver(); client.handlers['textDocument/publishDiagnostics'] = previous_diagnostics; save()
 end

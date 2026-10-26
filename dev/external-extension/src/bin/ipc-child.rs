@@ -31,6 +31,57 @@ fn request(
     }
 }
 
+fn read_source_snapshots(
+    input: &mut impl std::io::BufRead, output: &mut impl Write,
+    next: &mut u64, evaluation: &Value,
+) -> Result<(Value, Vec<Value>), String> {
+    let mut after=Value::Null;
+    let mut sources=Vec::new();let mut cursors=std::collections::BTreeSet::new();
+    let mut ids=std::collections::BTreeSet::new();
+    let coverage=loop {
+        let query=if after.is_null() {json!({"op":"sourceInventory"})}
+            else {json!({"op":"sourceInventory","after":after})};
+        let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":[query]}))?;
+        let page=&result["facts"][0];
+        for source in page["sources"].as_array().ok_or("missing source inventory")? {
+            if !ids.insert(source["id"].as_str().ok_or("source identity")?.to_string()) {
+                return Err("duplicate source inventory identity".into());
+            }
+            sources.push(source.clone());
+        }
+        after=page["next"].clone();
+        if after.is_null() {break page["coverage"].clone();}
+        if !cursors.insert(after.as_str().ok_or("inventory continuation")?.to_string()) {
+            return Err("repeated source inventory cursor".into());
+        }
+    };
+    let mut snapshots=Vec::new();let mut offset=0;let mut limit=256usize;
+    while offset<sources.len() {
+        let count=limit.min(sources.len()-offset);
+        let queries:Vec<_>=sources[offset..offset+count].iter()
+            .map(|source|json!({"op":"sourceSnapshot","source":source["id"]})).collect();
+        let result=match request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":queries})) {
+            Ok(result)=>result,
+            Err(error) if error.contains("split queries") && count>1 => {limit=count.div_ceil(2);continue;}
+            Err(error)=>return Err(error),
+        };
+        let facts=result["facts"].as_array().ok_or("missing source snapshots")?;
+        if facts.len()!=count {return Err("source snapshot count changed".into());}
+        for (source,snapshot) in sources[offset..offset+count].iter().zip(facts) {
+            if snapshot["state"]=="found" && (snapshot["value"]["id"]!=source["id"]
+                || snapshot["value"]["identity"]!=source["identity"]) {
+                return Err("source snapshot identity changed".into());
+            }
+            snapshots.push(snapshot.clone());
+        }
+        offset+=count;
+        if serde_json::to_vec(&result).map_err(|error|error.to_string())?.len()<256*1024 {
+            limit=(limit*2).min(256);
+        }
+    }
+    Ok((json!({"sources":sources,"coverage":coverage,"next":null}),snapshots))
+}
+
 fn analyze(
     input: &mut impl std::io::BufRead,
     output: &mut impl Write,
@@ -38,6 +89,7 @@ fn analyze(
     params: &Value,
     barrier: &Option<PathBuf>,
     project_facts: bool,
+    source_snapshots: bool,
 ) -> Result<Value, String> {
     let evaluation = params["evaluation"].clone();
     let declarations = params["declarations"]
@@ -96,6 +148,15 @@ fn analyze(
         )
         .map_err(|error| error.to_string())?;
     }
+    if source_snapshots {
+        let (inventory,snapshots)=read_source_snapshots(input,output,next,&evaluation)?;
+        let directory = barrier.as_ref().ok_or("source snapshots need barrier")?;
+        std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+        std::fs::write(directory.join(format!("sources-{}.json",evaluation.as_str().ok_or("evaluation token")?)),
+            serde_json::to_vec(&json!({"evaluation":evaluation,"owner":params["owner"],
+                "inventory":inventory,"snapshots":snapshots})).map_err(|error|error.to_string())?)
+            .map_err(|error|error.to_string())?;
+    }
     if let Some(barrier) = barrier {
         if !barrier.join("released-once").exists() {
             std::fs::create_dir_all(barrier).map_err(|e| e.to_string())?;
@@ -145,16 +206,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut barrier = None;
     let mut project_facts = false;
+    let mut source_snapshots = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--barrier" if barrier.is_none() => {
                 barrier = Some(PathBuf::from(args.next().ok_or("missing barrier")?))
             }
             "--project-facts" if !project_facts => project_facts = true,
+            "--source-snapshots" if !source_snapshots => source_snapshots = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
-    if project_facts && barrier.is_none() {
+    if (project_facts || source_snapshots) && barrier.is_none() {
         return Err("project facts fixture needs its barrier".into());
     }
     let mut input = BufReader::new(std::io::stdin().lock());
@@ -188,6 +251,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result["supportedOps"] =
                         json!({"project-class-facts-v1":["projectContext","typeJvm"]});
                 }
+                if source_snapshots {
+                    let offered = &message["params"];
+                    if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="source-snapshots-v1"))
+                        || !["sourceInventory","sourceSnapshot"].iter().all(|op|offered["supportedOps"]["source-snapshots-v1"]
+                            .as_array().is_some_and(|values|values.iter().any(|value|value==*op))) {
+                        return Err("host did not offer source snapshot operations".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("source-snapshots-v1"));
+                    if result.get("supportedOps").is_none() { result["supportedOps"]=json!({}); }
+                    result["supportedOps"]["source-snapshots-v1"]=json!(["sourceInventory","sourceSnapshot"]);
+                }
                 write_frame(
                     &mut output,
                     &json!({"jsonrpc":"2.0","id":message["id"],"result":result}),
@@ -201,6 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &message["params"],
                     &barrier,
                     project_facts,
+                    source_snapshots,
                 );
                 let response = match result {
                     Ok(value) => json!({"jsonrpc":"2.0","id":message["id"],"result":value}),
@@ -219,4 +294,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod source_inventory_client_tests {
+    use super::*;
+
+    #[test]
+    fn follows_large_inventory_and_recovers_only_the_snapshot_byte_budget() {
+        let sources:Vec<_>=(0..1257).map(|n|json!({"id":format!("source-{n}"),
+            "displayPath":format!("/sources/Source{n}.java"),
+            "identity":{"kind":"source","revision":n.to_string()}})).collect();
+        let body="x".repeat(3*1024);
+        let snapshot=|source:&Value| {let mut value=source.clone();value["text"]=json!(body);value["sha256"]=json!("checked-by-host");json!({"state":"found","value":value})};
+        let too_large:Vec<_>=sources[..256].iter().map(snapshot).collect();
+        assert!(serde_json::to_vec(&json!({"facts":too_large})).unwrap().len()>512*1024);
+        let mut input=Vec::new();
+        for (id,result) in [(1,json!({"facts":[{"sources":sources[..700],"coverage":{"state":"unknown"},"next":"opaque-next"}]})),
+            (2,json!({"facts":[{"sources":sources[700..],"coverage":{"state":"found","value":null},"next":null}]}))] {
+            write_frame(&mut input,&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+        }
+        write_frame(&mut input,&json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,
+            "message":"extension response batch too large; split queries"}})).unwrap();
+        for (n,chunk) in sources.chunks(128).enumerate() {
+            let facts:Vec<_>=chunk.iter().map(snapshot).collect();
+            let result=json!({"facts":facts});assert!(serde_json::to_vec(&result).unwrap().len()<512*1024);
+            write_frame(&mut input,&json!({"jsonrpc":"2.0","id":n+4,"result":result})).unwrap();
+        }
+        let mut input=std::io::Cursor::new(input);let mut output=Vec::new();let mut next=0;
+        let (inventory,snapshots)=read_source_snapshots(&mut input,&mut output,&mut next,&json!("evaluation")).unwrap();
+        assert_eq!(inventory["sources"],json!(sources));assert_eq!(inventory["coverage"]["state"],"found");
+        assert!(inventory["next"].is_null());assert_eq!(snapshots.len(),1257);
+        assert!(snapshots.iter().all(|fact|fact["value"]["text"]==body));
+        let mut output=std::io::Cursor::new(output);let mut requests=Vec::new();
+        while let Some(request)=read_frame(&mut output).unwrap() {requests.push(request);}
+        assert_eq!(requests[1]["params"]["queries"][0]["after"],"opaque-next");
+        assert!(requests.iter().all(|request|request["params"]["queries"].as_array().unwrap().len()<=256));
+        assert!(requests.len()+3<64,"leave room for the existing semantic queries");
+        assert_eq!(input.position() as usize,input.get_ref().len());
+    }
 }

@@ -63,6 +63,19 @@ pub(crate) struct ModelSourceUpdate {
     project_classes: Vec<ProjectClassInput>,
 }
 
+pub(crate) struct IpcSourceCapture {
+    evaluation: u64,
+    started: std::time::Instant,
+    model: Arc<crate::classpath::ProjectSnapshot>,
+    generation: u64,
+    expected: BTreeMap<String, (SourceStamp, [u8; 32], ktcore::project_model::FileOrigin)>,
+}
+
+pub(crate) struct PreparedIpcSources {
+    request: IpcSourceCapture,
+    sources: Vec<ProjectFileIndex>,
+}
+
 struct ProjectClassInput {
     key: String,
     text: Arc<str>,
@@ -769,6 +782,58 @@ impl Workspace {
             self.bump_index_revision();
         }
         work
+    }
+
+    /// Capture accepted project inputs for an explicitly negotiated source consumer.
+    /// Parsing and filesystem reads happen in its existing blocking worker.
+    pub(crate) fn begin_ipc_source_capture(&self, evaluation: u64, owner: &str) -> Option<IpcSourceCapture> {
+        if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) { return None; }
+        let model = self.project_model.as_ref()?;
+        let context = model.extension_project_context(Path::new(owner))?;
+        let mut expected = BTreeMap::new();
+        for path in context.source.compiler_tasks.iter().flat_map(|task| &task.source_files) {
+            if !matches!(path.extension().and_then(|extension| extension.to_str()), Some("java" | "kt")) { continue; }
+            let key = crate::paths::file_key(path);
+            if self.open_docs.contains_key(&key) || self.analysis_extensions.source_input_identity(&key).is_some() { continue; }
+            let Some(origin) = self.index.file_origin(&key) else { continue; };
+            if origin.representation != ktcore::project_model::SourceRepresentation::Source
+                || origin.project_scope.as_ref() != Some(&context.scope)
+                || model.file_origin(path).as_ref() != Some(origin) { continue; }
+            let (Some(stamp), Some(content)) = (self.source_stamps.get(&key), self.source_contents.get(&key)) else { continue; };
+            expected.insert(key, (*stamp, *content, origin.clone()));
+        }
+        (!expected.is_empty()).then(|| IpcSourceCapture {
+            evaluation, started: std::time::Instant::now(), model: model.clone(), generation: self.analysis_generation, expected,
+        })
+    }
+
+    pub(crate) fn finish_ipc_source_capture(&mut self, prepared: PreparedIpcSources) -> usize {
+        let prepared_count = prepared.sources.len();
+        let request = prepared.request;
+        if !self.ipc_evaluation_current(request.evaluation)
+            || self.project_refresh_pending || self.analysis_generation != request.generation
+            || !self.project_model.as_ref().is_some_and(|model| Arc::ptr_eq(model, &request.model)) { return 0; }
+        let mut sources = Vec::new();
+        for batch in prepared.sources {
+            let Some((stamp, content, origin)) = request.expected.get(&batch.key) else { continue; };
+            if self.open_docs.contains_key(&batch.key)
+                || self.analysis_extensions.source_input_identity(&batch.key).is_some()
+                || self.source_stamps.get(&batch.key) != Some(stamp)
+                || self.source_contents.get(&batch.key) != Some(content)
+                || self.index.file_origin(&batch.key) != Some(origin)
+                || batch.stamp.as_ref() != Some(stamp)
+                || <[u8; 32]>::from(Sha256::digest(batch.source.0.as_bytes())) != *content { continue; }
+            sources.push((batch.key, batch.source.0, batch.source.1));
+        }
+        let count = sources.len();
+        if count > 0 {
+            self.analysis_extensions.replace_sources(&self.index, sources);
+            self.bump_index_revision();
+        }
+        crate::trace::span("extension.ipc.source_capture", "extension", request.started,
+            serde_json::json!({"evaluation":request.evaluation,"generation":request.generation,
+                "requested":request.expected.len(),"prepared":prepared_count,"accepted":count}));
+        count
     }
 
     pub(crate) fn ipc_evaluation_current(&self, evaluation: u64) -> bool {
@@ -4453,6 +4518,12 @@ fn source_stamp(path: &Path) -> Option<SourceStamp> {
     })
 }
 
+pub(crate) fn prepare_ipc_source_capture(request: IpcSourceCapture) -> PreparedIpcSources {
+    let paths = request.expected.keys().map(std::path::PathBuf::from).collect();
+    let sources = parse_project_files(paths);
+    PreparedIpcSources { request, sources }
+}
+
 pub(crate) fn prepare_model_sources(
     model: &crate::classpath::ProjectSnapshot,
     known: &HashMap<String, SourceStamp>,
@@ -6141,6 +6212,78 @@ mod tests {
     }
 
     #[test]
+    fn ipc_source_capture_after_late_registration_preserves_closed_inputs_and_current_wire() {
+        for scenario in ["current", "wire", "model", "disk"] {
+            let root = unique_tmp(&format!("ipc-source-capture-{scenario}"));
+            let selected = root.join("selected");
+            let other = root.join("other");
+            std::fs::create_dir_all(&selected).unwrap();
+            std::fs::create_dir_all(&other).unwrap();
+            let owner = crate::paths::file_key(&selected.join("Owner.kt"));
+            let closed = crate::paths::file_key(&selected.join("Closed.java"));
+            let empty = crate::paths::file_key(&selected.join("Empty.java"));
+            let foreign = crate::paths::file_key(&other.join("Foreign.java"));
+            let owner_text = "package ipc\nclass Owner";
+            let closed_text = "package ipc; class Closed {}";
+            std::fs::write(&owner, owner_text).unwrap();
+            std::fs::write(&closed, closed_text).unwrap();
+            std::fs::write(&empty, "").unwrap();
+            std::fs::write(&foreign, "package other; class Foreign {}").unwrap();
+            let mut modules = crate::classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nSOURCE\tother\t{}\nEND\t:app\n",
+                root.display(), selected.display(), other.display()));
+            let main = modules[0].source_sets.iter_mut().find(|source|source.name=="main").unwrap();
+            for (task, language, kind, files) in [
+                (":compileJava", "java", "org.gradle.api.tasks.compile.JavaCompile", vec![closed.clone(),empty.clone()]),
+                (":compileKotlin", "kotlin", "org.jetbrains.kotlin.gradle.tasks.KotlinCompile", vec![owner.clone(),closed.clone(),empty.clone()]),
+            ] {
+                main.compiler_tasks.push(serde_json::from_value(serde_json::json!({
+                    "task":task,"language":language,"task_type":kind,"arguments":[],"annotation_processor_path":[],
+                    "source_files":files,"options":{"sdkProducerClaims":{"adapter":"gradle-producing-source-trees-v1",
+                        "language":language,"task":task,"roots":[selected],"complete":true}},
+                    "output_roots":[],"complete":true,"problem":null
+                })).unwrap());
+            }
+            main.kotlin_compile_task=Some(":compileKotlin".into());
+            let model=Arc::new(crate::classpath::ProjectSnapshot::new(modules.clone()));
+            let mut ws=Workspace::new();
+            ws.set_project_model(model);
+            ws.scan_model_sources();
+            ws.open(&owner,owner_text.into());
+            ws.register_ipc_provider("test.sources",vec!["fixture-child".into()]).unwrap();
+            assert!(ws.extension_source_input_identity(&closed).is_none());
+            let work=ws.take_ipc_work().remove(0);
+            let request=ws.begin_ipc_source_capture(work.evaluation,&owner).unwrap();
+            assert_eq!(request.expected.keys().cloned().collect::<BTreeSet<_>>(),[closed.clone(),empty.clone()].into_iter().collect());
+            if scenario=="disk" { std::fs::write(&closed,"package ipc; class Edited {}").unwrap(); }
+            let prepared=prepare_ipc_source_capture(request);
+            if scenario=="wire" { ws.open(&closed,"package ipc; class Unsaved {}".into()); }
+            if scenario=="model" { ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules))); }
+            let count=ws.finish_ipc_source_capture(prepared);
+            match scenario {
+                "current" => {
+                    assert_eq!(count,2);
+                    assert_eq!(ws.extension_source_input_identity(&closed).unwrap().as_ref(),closed_text);
+                    assert_eq!(ws.extension_source_input_identity(&empty).unwrap().as_ref(),"");
+                }
+                "wire" => {
+                    assert_eq!(ws.extension_source_input_identity(&closed).unwrap().as_ref(),"package ipc; class Unsaved {}");
+                }
+                "model" => { assert_eq!(count,0); assert!(ws.extension_source_input_identity(&closed).is_none()); }
+                "disk" => { assert!(ws.extension_source_input_identity(&closed).is_none(),"changed disk input cannot impersonate the accepted index bytes"); }
+                _ => unreachable!(),
+            }
+            assert!(ws.extension_source_input_identity(&foreign).is_none());
+            ws.finish_ipc_work(work.evaluation,Err("Stale".into()));
+            if scenario=="current" {
+                let next=ws.take_ipc_work().remove(0);
+                assert!(ws.begin_ipc_source_capture(next.evaluation,next.params["owner"].as_str().unwrap()).is_none(),"accepted closed inputs are not reparsed");
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn ipc_project_model_replacement_rejects_late_batches_and_finish() {
         let root = unique_tmp("ipc-project-model");
         std::fs::create_dir_all(&root).unwrap();
@@ -6804,6 +6947,12 @@ mod tests {
         let hover = ws.resolved_symbol_query(&caller_key, dirty.find("getName").unwrap() + 2)
             .and_then(|query| query.hover_markdown()).unwrap();
         assert!(hover.contains("String"), "generated getter must retain its decoded return type");
+        ws.change(&caller_key, format!("{dirty}// edit after output ingestion\n"));
+        assert!(labels(&mut ws).contains(&"getName".into()), "ordinary consumer edits must retain current generated APIs");
+        ws.index_dependency_file("/external-library/Unrelated.java", Vec::new());
+        ws.bump_index_revision();
+        assert!(labels(&mut ws).contains(&"getName".into()), "dependency publication must retain current generated APIs");
+        ws.change(&caller_key, dirty.clone());
 
         // Rejected output must retract the previous API even without a resource notification.
         std::fs::remove_file(&class_file).unwrap();

@@ -528,7 +528,11 @@ impl AnalysisExtensions {
             let result = evaluation.batch(&mut read, method, params);
             evaluation.pending = Some(read.finish());
             if let Err(error) = &result {
-                evaluation.failure = Some(error.clone());
+                if method != "analysis/readFacts"
+                    || error != crate::extension_ipc::READ_FACTS_RESPONSE_BUDGET_EXCEEDED
+                {
+                    evaluation.failure = Some(error.clone());
+                }
             }
             if result.is_ok() && method == "analysis/finish" {
                 self.store

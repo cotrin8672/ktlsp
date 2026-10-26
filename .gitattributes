@@ -1,6 +1,7 @@
 # Preserve published artifact bytes, including upstream trailing spaces, in regression fixtures.
 crates/ktlsp/tests/fixtures/source-encoding/*.pom -text whitespace=-blank-at-eol
 crates/ktlsp/tests/fixtures/extension_sources/Shadow.java -text whitespace=-blank-at-eol
+dev/external-extension/source-snapshots-v1.frames -text
 
 # Keep compiler input bytes consistent with the paired classfile hash manifest.
 crates/ktcore/tests/fixtures/classfile/sources/** -text

@@ -3083,3 +3083,52 @@ fn nominal_archive_multiple_jvm_actual_declarations_stay_ambiguous() {
         Knowledge::Unknown(_)
     ));
 }
+
+
+#[test]
+fn scoped_source_snapshots_track_empty_membership_overlays_and_session_identity() {
+    let mut index = Index::new();
+    let mut store = ExtensionStore::default();
+    store.configure_provider("sources", true, Arc::from("{}"));
+    let scope = ProjectScope { module:"scope-a".into(), source_set:"main".into() };
+    let other = ProjectScope { module:"scope-b".into(), source_set:"main".into() };
+    let publish = |index: &mut Index, store: &mut ExtensionStore, file: &str, text: &str, scope: &ProjectScope| {
+        index.replace_file(file, Vec::new(), Tier::Volatile);
+        index.set_file_origin(file, FileOrigin { origin_id:scope.module.clone(),
+            representation:SourceRepresentation::Source, project_scope:Some(scope.clone()) });
+        store.replace_source(index, file, Arc::from(text), Knowledge::Found(()), Vec::new()).unwrap();
+    };
+    publish(&mut index,&mut store,"/source/Owner.kt","// Kotlin owner",&scope);
+    publish(&mut index,&mut store,"/source/Empty.java","// 未保存 Java 😀",&scope);
+    publish(&mut index,&mut store,"/other/Foreign.java","// not in selected scope",&other);
+    let mut read = store.begin(&index,"sources","/source/Owner.kt").unwrap();
+    let sources = read.source_inventory().unwrap();
+    assert_eq!(sources.iter().map(|source|source.file()).collect::<Vec<_>>(),
+        ["/source/Empty.java","/source/Owner.kt"]);
+    let source = sources[0].clone();
+    assert_eq!(read.source_snapshot(&source).unwrap().as_ref(), "// 未保存 Java 😀");
+    let pending = read.finish();
+    publish(&mut index,&mut store,"/other/New.kt","// unrelated scope",&other);
+    assert!(store.validate_pending(&pending).is_ok(), "unrelated scope membership is independent");
+    publish(&mut index,&mut store,"/source/Added.java","// no declarations",&scope);
+    assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)),
+        "an empty source arrival invalidates the negative inventory read");
+    let mut read = store.begin(&index,"sources","/source/Owner.kt").unwrap();
+    assert!(matches!(read.source_snapshot(&source),Err(ContractError::ForeignIdentity)),
+        "a source handle cannot escape its evaluation session");
+    let sources = read.source_inventory().unwrap();
+    let source = sources.iter().find(|source|source.file()=="/source/Empty.java").unwrap().clone();
+    let pending = read.finish();
+    publish(&mut index,&mut store,"/source/Empty.java","// next unsaved Java",&scope);
+    assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)),
+        "body-only/empty-source content changes invalidate source identities");
+    let mut read = store.begin(&index,"sources","/source/Owner.kt").unwrap();
+    let sources = read.source_inventory().unwrap();
+    let current = sources.iter().find(|entry|entry.file()==source.file()).unwrap();
+    assert_ne!(current.revision(), source.revision());
+    assert_eq!(read.source_snapshot(current).unwrap().as_ref(),"// next unsaved Java");
+    let pending = read.finish();
+    store.remove_source("/source/Added.java");
+    assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)),
+        "source deletion invalidates inventory even without semantic declarations");
+}

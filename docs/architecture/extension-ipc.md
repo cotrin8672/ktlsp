@@ -121,6 +121,66 @@ publication; a model change rejects old batches and final contributions. Metadat
 projection uses accepted in-memory selections without filesystem reads. No MC-specific
 generation counters are introduced.
 
+### Optional current source snapshots
+
+`source-snapshots-v1` adds two independently negotiated `analysis/readFacts`
+operations. Select the capability and the operations in the initialize reply:
+
+```json
+{"capabilities":["semantic-v1","source-snapshots-v1"],"supportedOps":{"source-snapshots-v1":["sourceInventory","sourceSnapshot"]}}
+```
+
+`{"op":"sourceInventory"}` returns `{"sources":[...],"coverage":Fact<null>,"next":null}`.
+Large inventories return a byte-bounded page with opaque `next`; continue with
+`{"op":"sourceInventory","after":"<next>"}` in the same live evaluation. Cursors
+are bound to its read session and exact current scoped inventory. Foreign or stale
+cursors are rejected. A partial page has Unknown coverage; only consuming the
+chain through `next:null` and Found coverage establishes the complete inventory.
+An empty or one-page inventory retains the same fields and adds `next:null`.
+The list contains retained Java/Kotlin source snapshots in the evaluation owner's
+exact project module/source-set scope, including files without declarations.
+It does not enumerate libraries, other source sets, or arbitrary filesystem paths.
+Each entry has an opaque `id`, `displayPath`, typed `documentUri`, `languageId`,
+and `identity:{"kind":"source","revision":"<host generation>"}`.
+The revision is a decimal JSON string identifying the accepted host input; it is
+not an LSP document version. Document version is currently omitted.
+
+Coverage is Found only with complete known compiler source claims and every
+claimed Java/Kotlin input represented in the accepted snapshot list. Unknown
+compiler roles, missing captured inputs, or missing project scope remain typed
+Unknown. A partial list cannot prove absence. Coverage does not certify compiler
+success, complete language semantics, or generated JVM ABI.
+
+`{"op":"sourceSnapshot","source":"<inventory id>"}` returns a Fact containing
+the same descriptor and opaque ID, exact accepted UTF-8 `text`, and lowercase
+`sha256` of those text bytes. Unsaved editor content takes precedence. No newline
+or Unicode normalization is applied. The host reads its accepted in-memory
+snapshot; the child must not open `displayPath`. URI is Unknown for logical or
+unavailable paths. Relative display paths are never canonicalized or read.
+
+Source IDs belong to this evaluation and provider instance. Reusing them in
+another evaluation, after restart, or as paths is rejected. Inventory membership
+reads track additions and deletions, including empty files; identities and bodies
+track source revisions. These reads use the existing resume/final-publication
+validation together with model and provider configuration. A late response cannot
+publish against superseded inputs.
+
+The existing 1 MiB frame, 256-query batch and handle/evaluation limits apply.
+Bodies exceeding 128 KiB are typed Unknown; inventory and accumulated escaped
+response bytes have a 512 KiB budget. Oversized batches return a small request
+error so the child can split queries in the same live evaluation. Each page issues
+only its own source handles and optional continuation; the 16,384-handle and
+64-batch evaluation limits remain in force. Read snapshots in bounded multi-query
+batches, rather than one batch per file. This slice has no external read-cache
+validation, resource/class-byte access, or Minecraft policy.
+
+The fixed `dev/external-extension/source-snapshots-v1.frames` fixture contains
+two real serializer responses (inventory, then current non-ASCII Java text).
+The host regression compares exact framed bytes. The existing independent
+`ipc-child --project-facts --source-snapshots` consumer and `source-snapshots`
+editor-probe mode exercise the same protocol. Pin a verified host commit and its
+fixture before using this experimental addition.
+
 Source facts preserve owner/annotation/declaration ranges, normalized annotation arguments,
 member kind and known signature/dispatch/visibility/synthetic facts for both languages.
 Class-valued annotation/type-reference tokens are resolved by the host in the owner scope.

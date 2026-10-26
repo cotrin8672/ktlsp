@@ -21,7 +21,7 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification: candidate56
+## Current verification: candidates56 through58
 
 Candidate56 passes the complete Rust workspace: **1845 passed, 0 failed,
 13 ignored**, followed by a successful release build. The immutable binary is
@@ -62,19 +62,43 @@ Remaining current work is explicit: Moshi9, OkHttp10 and Retrofit12 selected
 checks pass on56; Spring and the Gradle counter are still in dependency indexing.
 The ordinary dirty-Java dependency header route passes focused checks but its
 original current-version Gradle counter is not yet proved.
-The original external KSP/KAPT workflow on55h improves to **113/114** with all
-four real external builds and runtime controls exercised. Its one remaining
-failure is an omitted Java diagnostic for an obsolete method of generated
-Kotlin source (`processor120/g55/receipt.json`), not failed generation.
+Candidate58 passes the complete workspace **1857 passed, 0 failed, 14 ignored**
+and both release builds. Its retained native K1 check separately verifies the
+new Kotlin-backed Java error and its current Workspace publication; actual raw
+Javac still reports all three expected errors. The unchanged original external
+KSP/KAPT workflow now passes **114/114** in real Neovim: its first Java pull
+returns all three located errors, including the previously omitted generated
+Kotlin method. Four external builds return0,0,1(expected disabled),0, with current
+wire/canonical results, stable guards, clean shutdown, EOF/live0/forced0 and
+restored dedicated Gradle settings (`processor120/p58/adjudication-review155.json`).
+The historical55h113/114 result remains preserved.
 
-The mc-dev source-inventory/current-source-snapshot API passes its core, wire,
-actual serializer and real host-wrapper budget controls. First real child testing
-preserves legacy26 and passes91/93 optional/source checks, including unsaved text,
-Unicode hashes, empty source text, stale/model rejection, rename and lifecycle.
-The two failures reveal missing closed-file bodies at late registration; that
-host input-producer fix is in progress. Paging is also being added for two actual
-Gradle source sets whose descriptors exceed512KiB. This new API is not yet
-published or claimed complete (`source-snapshots155-57/receipt.json`).
+The mc-dev source-inventory/current-source-snapshot API now passes **158/158**
+real Neovim/child checks:35 legacy/common and123 source/project checks, all
+measured and matched. Both inventories contain9 sources with complete coverage;
+five closed-file bodies match independently read disk bytes. Unsaved Unicode
+text, identity/revision/SHA, empty Java text, model/stale rejection, crash/restart,
+applied rename and disable all pass. Four owned stages reach EOF/live0/forced0,
+restore build files and preserve the dedicated Gradle profile. Independent
+recalculation agrees (`source-snapshots155-58-independent-review.json`). The
+historical57s126/128 result and its two closed-source failures remain preserved.
+
+Source bodies are prepared outside Workspace locks from accepted project inputs;
+installation checks the model, source hashes/stamps and current unsaved text.
+The existing evaluation lifetime tracks membership, body and model changes.
+Inventory paging preserves opaque handles and byte/batch limits. Two actual
+Gradle source sets have1257/1276 files and exceed512KiB as whole inventories;
+the handler/serializer and client batching tests pass, and measured real text
+fits the existing limits in27/31 whole-client batches. This is not a complete
+Neovim replay of those large source sets. Resources, raw class bytes/Code/LVT
+and command routing remain separate contracts.
+
+The remaining indexing bottleneck is now localized with a debug replay of733
+real Spring source files and four dependency sources: index work takes roughly
+4–47ms while repeated publication/normalization takes6.85–14.08s. One bounded
+four-file publication takes1.51–2.77s. This identifies repeated flush work;
+it is not a release latency or user-experience speedup claim. The temporary
+measurement code is removed and the production improvement is in progress.
 
 ## Previous checkpoints: releases42 through54
 
@@ -452,9 +476,9 @@ semantics are not certified by the test extension.
 1. Complete the Java6-valid dirty-source counter using Kotlin's ordinary Java
    source/header inputs and the original classpath. Keep Java-body authority
    separate; do not restore automatic Gradle archive replay or KAPT/KSP execution.
-2. Retain the actual external Lombok75 proof and fix the remaining Java
-   diagnostic for generated Kotlin. Preserve configuration changes, stale API
-   withdrawal and unsaved-buffer behavior in affected later verification.
+2. Retain the actual external Lombok75 and KSP/KAPT114 proofs. Preserve
+   configuration changes, stale API withdrawal and unsaved-buffer behavior in
+   affected later verification.
 3. Retain the six-origin POM/byte proof and binary fallback limits; investigate real
    failed source origins without guessing an encoding. Broader operator, bounded
    generic and receiver-lambda inference remains outside proven coverage.
@@ -466,10 +490,10 @@ semantics are not certified by the test extension.
 6. Keep the verified asynchronous IPC boundary usable by the independent mc-dev
    consumer; later fact capabilities remain scoped additions, with MC policy in mc-dev
    and no communication waits under Workspace locks.
-7. Deliver mc-dev's source inventory/current snapshot slice with actual serializer
-   fixtures and a real child/consumer check. Track source addition/deletion and
-   body changes within the existing evaluation lifetime; arbitrary path access,
-   resources, class bytes and command routing are separate contracts.
+7. Publish the verified mc-dev source inventory/current snapshot slice with its
+   serializer fixtures and real child evidence. Keep large-scope handler/budget
+   proof distinct from complete large-project editor proof; resources, raw class
+   bytes and command routing remain separate contracts.
 
 The human permits ongoing API-contract, implementation-commit and verification-result
 sharing with the same mc-dev task within this goal. That scoped technical coordination
