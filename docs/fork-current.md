@@ -21,7 +21,7 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification: candidates56 through58
+## Current verification: candidates56 through60
 
 Candidate56 passes the complete Rust workspace: **1845 passed, 0 failed,
 13 ignored**, followed by a successful release build. The immutable binary is
@@ -93,12 +93,28 @@ fits the existing limits in27/31 whole-client batches. This is not a complete
 Neovim replay of those large source sets. Resources, raw class bytes/Code/LVT
 and command routing remain separate contracts.
 
-The remaining indexing bottleneck is now localized with a debug replay of733
-real Spring source files and four dependency sources: index work takes roughly
-4–47ms while repeated publication/normalization takes6.85–14.08s. One bounded
-four-file publication takes1.51–2.77s. This identifies repeated flush work;
-it is not a release latency or user-experience speedup claim. The temporary
-measurement code is removed and the production improvement is in progress.
+Candidate59 publishes dependency updates in bounded chunks of32 files/1024
+symbols, keeps oversized files indivisible, checks cancellation between files,
+and fairly releases the workspace lock between chunks. This removes repeated
+semantic publication after every archive file while preserving generation and
+source-error handling. The full workspace passes **1858/0/14** and the release
+build succeeds (`native-integrated120-59/main-ready.json`). Spring and the
+original Gradle counter are running against this immutable release; their final
+requests remain unmeasured. Repeated Spring class-output change notifications
+are under investigation, not a passing acceptance result.
+
+A same-input debug replay uses733 real Spring sources and four dependency
+sources. Before chunking, publication takes6.85–14.08s; one production chunk
+takes1.48–2.81s (`dep-install155-production59-results.json`). Candidate60 then
+reuses each retained source tree when preparing ordinary-reference eligibility,
+instead of reparsing its text during normalization. With three warm samples per
+case, the same production replay changes1.579/1.485/1.665s to
+0.775/0.767/0.759s; the retained-source control changes2.775/2.815/2.748s to
+1.411/1.446/1.442s (`normalize60-results.json`). Java and Kotlin generic/source
+changes and index flushes pass the focused regression. Existing normalization
+and invalidation still run. Temporary measurement code is removed. These are
+debug causal measurements, not release/editor latency distributions; candidate60
+has not yet passed a full release/editor sweep.
 
 ## Previous checkpoints: releases42 through54
 

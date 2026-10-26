@@ -288,18 +288,17 @@ impl AnalysisExtensions {
         };
         let facts = crate::language::extension_source_facts(index, key, &input.tree, &input.text);
         let coverage = Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]);
-        let replaced = match input.prepared_references.clone() {
-            Some(prepared) => self
-                .store
-                .replace_prepared_source_declarations(index, prepared, coverage, facts),
-            None => self.store.replace_source_declarations(
+        let prepared = input.prepared_references.clone().unwrap_or_else(|| {
+            ktcore::extensions::source::prepare_source_references(
                 index,
                 key,
                 input.text.clone(),
-                coverage,
-                facts,
-            ),
-        };
+                &input.tree,
+            )
+        });
+        let replaced = self
+            .store
+            .replace_prepared_source_declarations(index, prepared, coverage, facts);
         if let Err(error) = replaced {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
             self.store.remove_source(key);
@@ -474,6 +473,60 @@ mod compiler_source_tests {
                 facts.clone(),
             );
             assert!(result.is_ok(), "{result:?}; {facts:?}");
+        }
+    }
+
+    #[test]
+    fn normalized_reference_eligibility_reuses_current_tree_after_index_and_source_changes() {
+        struct Probe;
+        impl AnalysisProvider for Probe {
+            fn id(&self) -> &str {
+                "reference-tree"
+            }
+            fn analyze(
+                &self,
+                _: &mut ktcore::extensions::ReadSession<'_>,
+            ) -> Result<(), ktcore::extensions::ContractError> {
+                Ok(())
+            }
+        }
+        for (file, plain, generic) in [
+            (
+                "/tree/Plain.java",
+                "package tree; class Plain {}",
+                "package tree; class Plain<T> {}",
+            ),
+            (
+                "/tree/Plain.kt",
+                "package tree\nclass Plain",
+                "package tree\nclass Plain<T>",
+            ),
+        ] {
+            let mut index = Index::new();
+            let mut parser = crate::language::LanguageParsers::new();
+            let mut extensions = AnalysisExtensions::new(vec![Arc::new(Probe)]);
+            for (text, expected) in [(plain, true), (generic, false), (plain, true)] {
+                let tree = parser.parse_for_key(file, text);
+                let language = crate::language::SourceLanguage::for_key(file);
+                let facts = crate::language::symbol_facts(language, &tree, text);
+                index.replace_file(file, facts.symbols, ktcore::index::Tier::Volatile);
+                extensions.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
+                // A dependency/index flush must preserve current source eligibility.
+                extensions.mark_index_changed();
+                extensions.flush_index_changed(&index);
+                let mut read = extensions
+                    .store
+                    .begin(&index, "reference-tree", file)
+                    .unwrap();
+                let Knowledge::Found(owner) = read.resolve_type("tree.Plain") else {
+                    panic!("current source identity");
+                };
+                assert_eq!(
+                    read.reference_type(&owner).unwrap().is_found(),
+                    expected,
+                    "{file}: {text}"
+                );
+            }
         }
     }
 

@@ -614,6 +614,110 @@ impl DependencyResult {
                 })
             })
     }
+    const INSTALL_CHUNK_FILES: usize = 32;
+    const INSTALL_CHUNK_SYMBOLS: usize = 1024;
+
+    fn install_batches(
+        &mut self,
+        ws: &Arc<Mutex<Workspace>>,
+        generation: u64,
+        cancelled: &std::sync::atomic::AtomicBool,
+        stats: &mut DepStats,
+    ) -> Vec<IndexedDependencyFile> {
+        let install_start = crate::trace::enabled().then(Instant::now);
+        let previous_files = stats.files;
+        let mut files_for_coord = Vec::new();
+        let mut lock_wait = std::time::Duration::ZERO;
+        let mut index_time = std::time::Duration::ZERO;
+        let mut flush_time = std::time::Duration::ZERO;
+        let mut accepted_files = 0usize;
+        let mut flushes = 0usize;
+        let mut max_lock_held = std::time::Duration::ZERO;
+        let mut batches = std::mem::take(&mut self.batches).into_iter().peekable();
+        while batches.peek().is_some() {
+            let lock_start = install_start.map(|_| Instant::now());
+            let mut guard = ws.lock();
+            if let Some(start) = lock_start {
+                lock_wait += start.elapsed();
+            }
+            if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                || !guard.is_current_generation(generation)
+            {
+                break;
+            }
+            let held_start = install_start.map(|_| Instant::now());
+            let mut chunk_files = 0usize;
+            let mut chunk_symbols = 0usize;
+            // Rebind retained sources once per bounded update, rather than once per archive file.
+            // An oversized individual file stays indivisible; it cannot pull other files with it.
+            while chunk_files < Self::INSTALL_CHUNK_FILES {
+                let Some(next) = batches.peek() else { break };
+                if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || chunk_files > 0
+                        && chunk_symbols.saturating_add(next.symbols.len()) > Self::INSTALL_CHUNK_SYMBOLS
+                {
+                    break;
+                }
+                let batch = batches.next().unwrap();
+                let symbol_count = batch.symbols.len();
+                stats.symbols += symbol_count;
+                if self.jdk {
+                    stats.jdk_symbols += symbol_count;
+                    stats.jdk_files += 1;
+                } else if self.local_jar {
+                    if batch.origin.as_ref().is_some_and(|origin| {
+                        origin.representation == crate::project_model::SourceRepresentation::Source
+                    }) {
+                        stats.local_source_symbols += symbol_count;
+                        stats.local_source_files += 1;
+                    } else {
+                        stats.local_stub_symbols += symbol_count;
+                        stats.local_stub_files += 1;
+                    }
+                } else {
+                    files_for_coord.push(IndexedDependencyFile {
+                        path: batch.file.clone(),
+                        symbols: symbol_count,
+                    });
+                }
+                let index_start = install_start.map(|_| Instant::now());
+                if guard.index_dependency_batch_for_generation(generation, batch) {
+                    accepted_files += 1;
+                }
+                if let Some(start) = index_start {
+                    index_time += start.elapsed();
+                }
+                stats.files += 1;
+                chunk_files += 1;
+                chunk_symbols += symbol_count;
+            }
+            if chunk_files > 0 {
+                let flush_start = install_start.map(|_| Instant::now());
+                guard.bump_index_revision();
+                if let Some(start) = flush_start {
+                    flush_time += start.elapsed();
+                }
+                flushes += 1;
+            }
+            if let Some(start) = held_start {
+                max_lock_held = max_lock_held.max(start.elapsed());
+            }
+            // Let an already queued editing request run at the boundary of an archive update.
+            parking_lot::MutexGuard::unlock_fair(guard);
+        }
+        if let Some(start) = install_start {
+            crate::trace::span(
+                "deps.install_batch",
+                "deps",
+                start,
+                serde_json::json!({ "label": self.label, "files": stats.files - previous_files,
+                    "lock_wait_us": lock_wait.as_micros(), "index_us": index_time.as_micros(),
+                    "flush_us": flush_time.as_micros(), "accepted_files": accepted_files,
+                    "flushes": flushes, "max_lock_held_us": max_lock_held.as_micros() }),
+            );
+        }
+        files_for_coord
+    }
 }
 
 fn dependency_index_threads() -> usize {
@@ -1735,69 +1839,7 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
         {
             continue;
         }
-        let install_start = crate::trace::enabled().then(Instant::now);
-        let previous_files = stats.files;
-        let mut files_for_coord = Vec::new();
-        let mut lock_wait = std::time::Duration::ZERO;
-        let mut index_time = std::time::Duration::ZERO;
-        let mut flush_time = std::time::Duration::ZERO;
-        let mut accepted_files = 0usize;
-        for batch in result.batches {
-            let lock_start = install_start.map(|_| Instant::now());
-            let mut guard = ws.lock();
-            if let Some(start) = lock_start {
-                lock_wait += start.elapsed();
-            }
-            if cancelled.load(std::sync::atomic::Ordering::Acquire)
-                || !guard.is_current_generation(generation)
-            {
-                break;
-            }
-            let symbol_count = batch.symbols.len();
-            stats.symbols += symbol_count;
-            if result.jdk {
-                stats.jdk_symbols += symbol_count;
-                stats.jdk_files += 1;
-            } else if result.local_jar {
-                if batch.origin.as_ref().is_some_and(|origin| {
-                    origin.representation == crate::project_model::SourceRepresentation::Source
-                }) {
-                    stats.local_source_symbols += symbol_count;
-                    stats.local_source_files += 1;
-                } else {
-                    stats.local_stub_symbols += symbol_count;
-                    stats.local_stub_files += 1;
-                }
-            } else {
-                files_for_coord.push(IndexedDependencyFile {
-                    path: batch.file.clone(),
-                    symbols: symbol_count,
-                });
-            }
-            let index_start = install_start.map(|_| Instant::now());
-            if guard.index_dependency_batch_for_generation(generation, batch) {
-                accepted_files += 1;
-            }
-            if let Some(start) = index_start {
-                index_time += start.elapsed();
-            }
-            let flush_start = install_start.map(|_| Instant::now());
-            guard.bump_index_revision();
-            if let Some(start) = flush_start {
-                flush_time += start.elapsed();
-            }
-            stats.files += 1;
-        }
-        if let Some(start) = install_start {
-            crate::trace::span(
-                "deps.install_batch",
-                "deps",
-                start,
-                serde_json::json!({ "label": result.label, "files": stats.files - previous_files,
-                    "lock_wait_us": lock_wait.as_micros(), "index_us": index_time.as_micros(),
-                    "flush_us": flush_time.as_micros(), "accepted_files": accepted_files }),
-            );
-        }
+        let files_for_coord = result.install_batches(ws, generation, &cancelled, &mut stats);
         if let Some(coord) = result.coord.clone() {
             indexed_files.insert(coord, files_for_coord);
         }
@@ -6353,6 +6395,69 @@ mod tests {
             assert_eq!(warm.jdk_reused, !failed_21);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn dependency_install_chunks_publish_symbols_once_and_reject_stale_work() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Count(Arc<AtomicUsize>);
+        impl crate::analysis_extensions::AnalysisProvider for Count {
+            fn id(&self) -> &str { "test.install-chunks" }
+            fn analyze(&self, _: &mut ktcore::extensions::ReadSession<'_>)
+                -> std::result::Result<(), ktcore::extensions::ContractError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        fn batch(name: &str, body: &str) -> crate::deps::FileSymbols {
+            let text = format!("package chunkfixture; class {name} {{ {body} }}");
+            let tree = crate::java::JavaParser::new().parse(&text);
+            let facts = crate::language::symbol_facts(crate::language::SourceLanguage::Java, &tree, &text);
+            crate::deps::FileSymbols { file: format!("/install-chunks/{name}.java"),
+                symbols: facts.symbols, jvm: facts.jvm, origin: None, library_source: None }
+        }
+        fn result(batches: Vec<crate::deps::FileSymbols>) -> DependencyResult {
+            DependencyResult { jdk_parse_plan: None, coord: None, label: "chunk fixture".into(),
+                batches, discovered: Vec::new(), failed: false, skipped: false, missing_source: false,
+                jdk: false, local_jar: false, local_origin: None }
+        }
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let mut workspace = Workspace::with_analysis_providers(vec![Arc::new(Count(evaluations.clone()))]);
+        workspace.open("/install-chunks/Owner.java", "package chunkfixture; class Owner {}".into());
+        let generation = workspace.analysis_generation();
+        let ws = Arc::new(Mutex::new(workspace));
+        evaluations.store(0, Ordering::SeqCst);
+        let count = DependencyResult::INSTALL_CHUNK_FILES + 1;
+        let mut input = result((0..count).map(|index| batch(&format!("F{index}"), "")).collect());
+        let mut stats = DepStats::default();
+        assert_eq!(input.install_batches(&ws, generation, &AtomicBool::new(false), &mut stats).len(), count);
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2, "one semantic publication per bounded chunk");
+        assert_eq!(stats.files, count);
+        for index in [0, count - 1] {
+            assert_eq!(ws.lock().index.lookup_by_name(&format!("F{index}")).len(), 1);
+        }
+        let methods = (0..DependencyResult::INSTALL_CHUNK_SYMBOLS)
+            .map(|index| format!("int m{index}() {{ return 0; }}")).collect::<String>();
+        let large = batch("Large", &methods);
+        assert!(large.symbols.len() > DependencyResult::INSTALL_CHUNK_SYMBOLS);
+        evaluations.store(0, Ordering::SeqCst);
+        let mut input = result(vec![batch("SmallBefore", ""), large, batch("SmallAfter", "")]);
+        let before = stats.files;
+        assert_eq!(input.install_batches(&ws, generation, &AtomicBool::new(false), &mut stats).len(), 3);
+        assert_eq!(stats.files - before, 3);
+        assert_eq!(evaluations.load(Ordering::SeqCst), 3, "an oversized file cannot extend a neighboring chunk");
+        assert_eq!(ws.lock().index.lookup_by_name("m1023").len(), 1);
+        let unchanged = stats.files;
+        evaluations.store(0, Ordering::SeqCst);
+        let mut cancelled = result(vec![batch("Cancelled", "")]);
+        assert!(cancelled.install_batches(&ws, generation, &AtomicBool::new(true), &mut stats).is_empty());
+        ws.lock().begin_analysis_generation();
+        let mut stale = result(vec![batch("Stale", "")]);
+        assert!(stale.install_batches(&ws, generation, &AtomicBool::new(false), &mut stats).is_empty());
+        assert_eq!(stats.files, unchanged);
+        assert_eq!(evaluations.load(Ordering::SeqCst), 0);
+        assert!(ws.lock().index.lookup_by_name("Cancelled").is_empty());
+        assert!(ws.lock().index.lookup_by_name("Stale").is_empty());
     }
 
     fn source_query_overlap_fixture(
