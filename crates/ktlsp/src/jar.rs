@@ -68,7 +68,7 @@ pub(crate) fn read_class_file(
         let mut archive = open_archive(path)?;
         // shortcut: Version-specific class selection is unsupported; reject only the affected owner.
         anyhow::ensure!(
-            !archive.file_names().any(|name| {
+            !archive.file_names().collect::<zip::result::ZipResult<Vec<_>>>()?.into_iter().any(|name| {
                 name.strip_prefix("META-INF/versions/")
                     .and_then(|name| name.split_once('/'))
                     .is_some_and(|(version, name)| {
@@ -127,7 +127,7 @@ pub(crate) fn plain_java_classpath_entry(path: &Path, processors_disabled: bool)
     };
     if archive
         .file_names()
-        .any(|name| name != MANIFEST && name.eq_ignore_ascii_case(MANIFEST))
+        .any(|name| name.map_or(true, |name| name != MANIFEST && name.eq_ignore_ascii_case(MANIFEST)))
     {
         return false;
     }
@@ -177,10 +177,10 @@ pub fn may_contain_definitions(jar: &Path) -> anyhow::Result<bool> {
     let mut module = false;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let name = entry.name();
+        let name = entry.name()?.into_owned();
         if name.ends_with(".class") {
             if module
-                || !module_descriptor_path(name)
+                || !module_descriptor_path(&name)
                 || entry.size() > ktcore::classfile::MAX_CLASS_FILE_BYTES as u64
             {
                 return Ok(true);
@@ -193,7 +193,7 @@ pub fn may_contain_definitions(jar: &Path) -> anyhow::Result<bool> {
                 .with_context(|| {
                     format!(
                         "read module descriptor {} from {}",
-                        entry.name(),
+                        name,
                         jar.display()
                     )
                 })?;
@@ -662,6 +662,8 @@ fn visit_class_stub_facts_selected(
     );
     let versioned: BTreeSet<_> = archive
         .file_names()
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
         .filter_map(|name| {
             let normalized = name.replace('\\', "/");
             let (version, owner) = normalized
@@ -3439,9 +3441,10 @@ mod tests {
             .unwrap();
         false_hint[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
         fs::write(&path, false_hint).unwrap();
+        let error = may_contain_definitions(&path).unwrap_err();
         assert!(
-            may_contain_definitions(&path).unwrap(),
-            "observed size is bounded even when the declared size is small"
+            format!("{error:#}").contains("declared uncompressed size"),
+            "an understated ZIP size must be rejected, not certify an empty artifact: {error:#}"
         );
         fs::remove_dir_all(root).unwrap();
     }

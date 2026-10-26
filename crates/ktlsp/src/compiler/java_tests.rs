@@ -181,46 +181,32 @@ fn gradle75_zero_java_options_preserve_strict_roles_and_processor_boundary() {
 
 #[test]
 #[ignore = "requires an explicitly selected captured Gradle model; read-only admission oracle"]
-fn captured_model_kotlin_producer_closure_admission() {
+fn captured_model_built_generated_analysis_admission() {
     let path = std::env::var_os("KTLSP_CAPTURED_PRODUCER_MODEL").expect("KTLSP_CAPTURED_PRODUCER_MODEL");
     let java_key = std::env::var("KTLSP_CAPTURED_PRODUCER_JAVA").expect("KTLSP_CAPTURED_PRODUCER_JAVA");
     let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let modules = serde_json::from_value(value["modules"].clone()).unwrap();
-    let model = Arc::new(ProjectSnapshot::new(modules));
+    let model = Arc::new(ProjectSnapshot::new(serde_json::from_value(value["modules"].clone()).unwrap()));
     let key = crate::paths::file_key(Path::new(&java_key));
-    let (owner, source) = model.owner_for_key(&key).expect("actual source owner");
+    let (_, source) = model.owner_for_key(&key).expect("actual source owner");
     let source = source.expect("actual source set");
     let primary = source.compiler_tasks.iter().find(|task|
         Some(task.task.as_str()) == source.kotlin_compile_task.as_deref()).unwrap();
-    let java = model.plain_java_task(&key).expect("actual supported plain Java selection");
-    assert_eq!(java.source_files.len(), 31);
-    let predicates: Vec<_> = model.modules.iter().flat_map(|module| &module.source_sets)
-        .filter(|source| source.name == "main")
-        .filter(|source| source.compiler_tasks.iter().any(|task|
-            [primary.task.as_str(), ":okhttp:compileKotlin", ":okhttp-tls:compileKotlin", ":mockwebserver:compileKotlin"]
-                .contains(&task.task.as_str())))
-        .filter_map(|source| {
-            let kt = source.compiler_tasks.iter().find(|t| Some(t.task.as_str()) == source.kotlin_compile_task.as_deref())?;
-            let java = source.compiler_tasks.iter().find(|t| t.language == crate::classpath::CompilerLanguage::Java)?;
-            Some(json!({"task":kt.task,"selected_supported":selected_tasks_supported(kt,java,&source.compiler_tasks),
-                "selected_denial":selected_tasks_supported_reason(kt,java,&source.compiler_tasks).err(),
-                "java_processing_disabled":java.annotation_processing_disabled(),
-                "kt_sdk_complete":crate::classpath::sdk_producer_roots(kt).map(|(_,c)|c),
-                "java_sdk_complete":crate::classpath::sdk_producer_roots(java).map(|(_,c)|c),
-                "kt_sources":kt.source_files.len(),"java_sources":java.source_files.len()}))
-        }).collect();
-    eprintln!("captured_admission_predicates={}", json!(predicates));
-    let plain = crate::compile::kotlin_producers::capture(&model,source,primary,java);
-    assert!(plain.is_none(), "active KAPT cannot receive plain compiler authority");
-    assert_eq!(selected_tasks_supported_reason(primary,java,&source.compiler_tasks),
-        Err("active-annotation-processor-path"));
+    let java = model.plain_java_task(&key).expect("actual proc:none Java recipe");
+    assert_eq!(selected_tasks_supported_reason(primary,java,&source.compiler_tasks), Ok(()));
+    let projected = kotlin_analysis_arguments(&primary.arguments).unwrap();
+    for path in kotlin_plugin_paths(&projected).unwrap() {
+        if path.file_name().is_some_and(|name| name == "jna-5.6.0.jar") {
+            let direct = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).map(|archive| archive.len());
+            eprintln!("actual_jna_reader raw_file={direct:?} production=whole-bytes-cursor path={}", path.display());
+        }
+        assert!(!kotlin_analysis_plugin(&path).unwrap());
+    }
     let mut ws = Workspace::new();
     ws.set_project_model(model);
     ws.open(key.clone(), std::fs::read_to_string(&key).unwrap());
     let request = ws.begin_kotlin_diagnostics(&key).unwrap();
-    assert!(request.java_task.is_none(), "active AP cannot borrow unverified built API authority");
-    assert!(!request.java_body_eligible, "configuration is not completed current generation authority");
-    assert!(request.kotlin_producers.is_empty());
+    assert!(request.java_task.is_some(), "actual built-input analysis must remain available");
+    assert!(ws.kotlin_diagnostic_trace(&key).is_none(), "configuration alone is not a compiler result");
 }
 
 #[test]
@@ -333,15 +319,14 @@ fn captured_legacy_profiles_reject_unproved_sdk_release_encoding_flags_and_proce
     assert!(selected_tasks_supported(&request.task, java, &tasks));
     let mut resolved_processors = tasks.clone();
     resolved_processors[2].annotation_processor_path.push(request.project_dir.join("moshi-kotlin-codegen.jar"));
-    assert_eq!(selected_tasks_supported_reason(&request.task, java, &resolved_processors),
-        Err("active-annotation-processor-path"),
-        "empty explicit processor names do not disable a nonempty discovered processor path");
+    assert_eq!(selected_tasks_supported_reason(&request.task, java, &resolved_processors), Ok(()),
+        "external generation metadata is not executed by ordinary input analysis");
     auxiliary[0]
         .options
         .insert("processors".into(), json!(["active.Processor"]));
     let mut active = vec![request.task.clone(), java.clone()];
     active.extend(auxiliary);
-    assert!(!selected_tasks_supported(&request.task, java, &active));
+    assert!(selected_tasks_supported(&request.task, java, &active));
     tasks[1].options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] =
         json!("custom.Action");
     assert!(!selected_tasks_supported(&request.task, &tasks[1], &tasks));
@@ -812,7 +797,7 @@ fn inactive_kapt_tasks(request: &KotlinDiagnosticRequest) -> Vec<CompilerTask> {
 }
 
 #[test]
-fn unknown_or_active_auxiliary_producers_cannot_authorize_import_absence() {
+fn generator_metadata_is_not_execution_but_unknown_roles_and_stub_reads_are_denied() {
     let (_owner, request) = fixture();
     let java = request.java_task.as_ref().unwrap();
     let tasks = |auxiliary: Vec<CompilerTask>| {
@@ -885,8 +870,9 @@ fn unknown_or_active_auxiliary_producers_cannot_authorize_import_absence() {
             _ => unreachable!(),
         }
         assert!(
-            !selected_tasks_supported(&request.task, java, &tasks(auxiliary)),
-            "{kind}"
+            selected_tasks_supported(&request.task, java, &tasks(auxiliary))
+                == !matches!(kind, "custom" | "extra-ksp" | "stub-output"),
+            "{kind}: generated inputs are checked independently of task execution metadata"
         );
     }
 }
@@ -935,8 +921,8 @@ fn active_processors_are_build_inputs_not_editor_generation_jobs() {
     ws.open(crate::paths::file_key(&processor), "class Processor { int unsaved; }".into());
     let key = crate::paths::file_key(&selected.project_dir.join("src/Main.java"));
     let current = ws.begin_kotlin_diagnostics(&key).unwrap();
-    assert!(current.java_task.is_none(), "active processors cannot certify absent Java API");
-    assert!(!current.java_body_eligible);
+    assert!(current.java_task.is_some(), "current built inputs can be analyzed without running processors");
+    assert!(ws.kotlin_diagnostic_trace(&key).is_none(), "metadata alone cannot certify a compiler result");
     assert!(current.dependency_compilation.is_none());
     assert!(current.kotlin_producers.is_empty());
     assert!(!current.dependency_overlays.iter().any(|source|
@@ -1030,23 +1016,39 @@ fn extension_provider_blocks_plain_java_negatives_without_disabling_kotlin_worke
 }
 
 #[test]
-fn auxiliary_producer_kotlin_clean_does_not_discard_an_independent_java_positive() {
+fn known_generator_metadata_keeps_kotlin_clean_and_independent_java_positive() {
     let (_owner, mut request) = fixture();
     request.positive_diagnostics_only = true;
     let java = crate::paths::file_key(&request.project_dir.join("src/Main.java"));
     let kt = crate::paths::file_key(&request.project_dir.join("src/Helper.kt"));
     let mut ws = workspace(&request, Vec::new());
     let pending = ws.begin_kotlin_diagnostics(&java).unwrap();
-    assert!(pending.positive_diagnostics_only);
+    assert!(!pending.positive_diagnostics_only);
     assert!(pending.java_task.is_some());
     let changed =
         ws.finish_kotlin_diagnostics(&pending, positive(&java), Arc::new(AtomicBool::new(false)));
-    assert_eq!(changed, vec![java.clone()]);
+    assert!(changed.contains(&java) && changed.contains(&kt));
     assert_eq!(
-        ws.kotlin_diagnostic_trace(&java).unwrap()["clean"],
-        json!(false)
+        ws.kotlin_diagnostic_trace(&kt).unwrap()["clean"],
+        json!(true)
     );
-    assert!(ws.kotlin_diagnostic_result_id(&kt).is_none());
+    let java_trace = ws.kotlin_diagnostic_trace(&java).unwrap();
+    assert_eq!(java_trace["clean"], json!(false), "Kotlin success is not a Java body receipt");
+    assert_eq!(java_trace["java_body"], Value::Null);
+    assert!(ws.kotlin_diagnostic_result_id(&kt).is_some());
+    assert!(ws.diagnostics(&java).iter().any(|diagnostic|
+        diagnostic.message == "パッケージgeneratedは存在しません"),
+        "a current Kotlin result does not discard the independent checked Java error");
+
+    let mut modules = ws.project_snapshot().unwrap().modules.clone();
+    let mut opaque = request.task.clone();
+    opaque.task = ":otherKotlinProducer".into();
+    opaque.task_type = "fixture.OpaqueKotlinProducer".into();
+    modules[0].source_sets[0].compiler_tasks.push(opaque);
+    ws.set_project_model(Arc::new(ProjectSnapshot::new(modules)));
+    let unknown = ws.begin_kotlin_diagnostics(&java).unwrap();
+    assert!(unknown.positive_diagnostics_only, "an unknown auxiliary producer still denies Kotlin clean");
+    assert!(unknown.java_task.is_none(), "unknown input roles cannot borrow Java compiler authority");
 }
 
 fn action_fact(declaring: &str) -> Value {
@@ -1066,7 +1068,7 @@ fn only_if_fact(kapt: bool) -> Value {
 }
 
 #[test]
-fn inactive_kapt_requires_actual_stock_action_and_absent_raw_providers() {
+fn nonexecuted_generator_actions_do_not_change_selected_input_analysis() {
     let (_owner, request) = fixture();
     let java = request.java_task.as_ref().unwrap();
     for case in [
@@ -1149,8 +1151,8 @@ fn inactive_kapt_requires_actual_stock_action_and_absent_raw_providers() {
         let mut tasks = vec![request.task.clone(), java.clone()];
         tasks.extend(auxiliary);
         assert!(
-            !selected_tasks_supported(&request.task, java, &tasks),
-            "{case}"
+            selected_tasks_supported(&request.task, java, &tasks),
+            "{case}: auxiliary actions are not executed by this analysis"
         );
     }
 }
@@ -1579,7 +1581,7 @@ fn selected_java_custom_actions_or_predicates_cannot_authorize_missing_imports()
 }
 
 #[test]
-fn selected_kotlin_and_stubs_custom_producers_cannot_be_replaced_by_a_partial_header_lease() {
+fn selected_primary_contract_is_preserved_while_stubs_are_nonexecuted_metadata() {
     let (_owner, request) = fixture();
     let java = request.java_task.as_ref().unwrap();
     for which in ["primary", "stubs"] {
@@ -1625,8 +1627,8 @@ fn selected_kotlin_and_stubs_custom_producers_cannot_be_replaced_by_a_partial_he
             let mut tasks = vec![primary.clone(), java.clone()];
             tasks.extend(auxiliary);
             assert!(
-                !selected_tasks_supported(&primary, java, &tasks),
-                "{which}/{case}"
+                selected_tasks_supported(&primary, java, &tasks) == (which != "primary"),
+                "{which}/{case}: the selected primary contract remains checked"
             );
         }
     }
@@ -3392,7 +3394,7 @@ fn built_generated_method_capture_paired_current_api_receiver_and_ranges() {
         let bytes = std::fs::read(classes.join(format!("generated/{api_name}.class"))).unwrap();
         let class = ktcore::classfile::decode("current-method-capture", &bytes).unwrap();
         assert_eq!(
-            class.identity.internal_name.as_ref(),
+            class.identity.internal_name.as_str(),
             format!("generated/{api_name}")
         );
         assert!(class

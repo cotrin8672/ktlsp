@@ -642,124 +642,26 @@ pub(super) fn selected_tasks_supported_reason(
     if auxiliary.is_empty() {
         return Ok(());
     }
-    if complete_k2 {
-        return Err("k2-auxiliary-tasks-unhandled");
-    }
-    // The only auxiliary path admitted here is KGP 1.8.21's inactive KAPT pair.
-    // KaptWithoutKotlincTask.compile returns before submitWork when both fields are empty,
-    // even if includeCompileClasspath=true. An empty AP path alone is insufficient.
-    if auxiliary.iter().any(|task| !task.annotation_processor_path.is_empty()) {
-        return Err("active-annotation-processor-path");
-    }
-    if auxiliary.len() != 2
-        || auxiliary.iter().any(|task| {
-            !task.complete
-                || task.problem.is_some()
-                || task
-                    .options
-                    .get("taskActionInventory")
-                    .and_then(|fact| fact.get("adapter"))
-                    .and_then(Value::as_str)
-                    != Some(adapter)
-                || task
-                    .options
-                    .get("taskOnlyIfInventory")
-                    .and_then(|fact| fact.get("adapter"))
-                    .and_then(Value::as_str)
-                    != Some(only_if_adapter)
-                || task.language != crate::classpath::CompilerLanguage::Kotlin
-                || !task.annotation_processor_path.is_empty()
-        })
-    {
-        return Err("auxiliary-stock-task-contract-unhandled");
-    }
-    let Some(apt) = auxiliary.iter().find(|task| {
-        matches!(
-            task.task_type.as_str(),
+    // Auxiliary generator tasks are not executed by analysis. Their saved outputs are
+    // ordinary inputs, checked by selected source membership, hashes and retained watches.
+    let reads: Vec<_> = primary.source_files.iter().chain(&java.source_files)
+        .chain(&primary.classpath).chain(&java.classpath).map(|path| header_key(path)).collect();
+    for task in auxiliary {
+        let kind = task.task_type.strip_suffix("_Decorated").unwrap_or(&task.task_type);
+        if !matches!(kind,
             "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask"
-                | "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask_Decorated"
-        )
-    }) else {
-        return Err("kapt-task-unknown");
-    };
-    let Some(stubs) = auxiliary.iter().find(|task| {
-        matches!(
-            task.task_type.as_str(),
-            "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask"
-                | "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated"
-        )
-    }) else {
-        return Err("kapt-stubs-task-unknown");
-    };
-    let empty_array = |name| {
-        apt.options
-            .get(name)
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    };
-    if !apt.arguments.is_empty()
-        || !empty_array("processors")
-        || !empty_array("providerArguments")
-        || apt
-            .options
-            .get("annotationProcessorOptionProviderCount")
-            .and_then(Value::as_u64)
-            != Some(0)
-        || !stock_task_action(
-            apt,
-            "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask",
-            "compile",
-        )
-        || !stock_only_if(apt, true)
-        || !stock_task_action(
-            stubs,
-            "org.jetbrains.kotlin.gradle.tasks.AbstractKotlinCompile",
-            "execute",
-        )
-        || !stock_only_if(stubs, false)
-        || stubs.kotlin_compiler.as_ref() != Some(runtime)
-        || stubs.java_home != primary.java_home
-    {
-        return Err("inactive-kapt-contract-unproved");
+                | "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask"
+                | "com.google.devtools.ksp.gradle.KspTaskJvm") {
+            return Err("auxiliary-input-role-unhandled");
+        }
+        // KAPT stubs are compiler scratch, never a current source/class API input.
+        if kind == "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask"
+            && task.output_roots.iter().chain(&task.declared_output_roots).any(|output|
+                reads.iter().any(|read| paths_overlap(&header_key(output), read))) {
+            return Err("kapt-stubs-output-read-unhandled");
+        }
     }
-    let main_sources: BTreeSet<_> = primary
-        .source_files
-        .iter()
-        .map(|path| header_key(path))
-        .collect();
-    let stub_sources: BTreeSet<_> = stubs
-        .source_files
-        .iter()
-        .map(|path| header_key(path))
-        .collect();
-    if main_sources != stub_sources
-        || stub_sources.len() != stubs.source_files.len()
-        || stubs.output_roots.is_empty()
-        || stubs.declared_output_roots.is_empty()
-    {
-        return Err("kapt-stubs-source-membership-unproved");
-    }
-    // Stubs are not a Java API lease. Their configured outputs must not supply any read slot;
-    // custom/KSP/active AP producers need a separate current-input proof before admission.
-    let reads = primary
-        .source_files
-        .iter()
-        .chain(java.source_files.iter())
-        .chain(primary.classpath.iter())
-        .chain(java.classpath.iter());
-    let reads: Vec<_> = reads.map(|path| header_key(path)).collect();
-    let outputs_supported = stubs.output_roots.iter().all(|root| {
-        stubs
-            .declared_output_roots
-            .iter()
-            .any(|declared| same_path(root, declared))
-    }) && stubs.declared_output_roots.iter().all(|root| {
-        root.is_absolute()
-            && reads
-                .iter()
-                .all(|read| !paths_overlap(&header_key(root), read))
-    });
-    if outputs_supported { Ok(()) } else { Err("kapt-stubs-output-read-unhandled") }
+    Ok(())
 }
 
 fn explicit_utf8_recipe(recipe: &JavaCompilerRecipe) -> bool {
@@ -1103,8 +1005,8 @@ fn kotlin(
     request: &KotlinDiagnosticRequest,
     environment: &KotlinDiagnosticEnvironment,
 ) -> anyhow::Result<(i32, String)> {
-    kotlin_analysis_plugins(arguments)?;
-    write_new(file, kotlin_argument_file(arguments)?.as_bytes())?;
+    let arguments = kotlin_analysis_arguments(arguments)?;
+    write_new(file, kotlin_argument_file(&arguments)?.as_bytes())?;
     let recipe = &environment.key.recipe;
     let runtime = std::env::join_paths(
         recipe
@@ -1190,7 +1092,7 @@ impl Tools {
         let mut pins = BTreeSet::new();
         pins.extend(environment.key.recipe.default_classpath.iter().cloned());
         pins.extend(environment.key.recipe.current_jvm_tools_jar.iter().cloned());
-        pins.extend(kotlin_plugin_paths(&request.task.arguments)?);
+        pins.extend(kotlin_plugin_paths(&kotlin_analysis_arguments(&request.task.arguments)?)?);
         let mut pin_text = String::new();
         for path in pins {
             pin_text.push_str(&format!(

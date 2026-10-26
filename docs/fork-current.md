@@ -21,7 +21,46 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification on releases42 through50
+## Current verification: candidate56
+
+Candidate56 passes the complete Rust workspace: **1845 passed, 0 failed,
+13 ignored**, followed by a successful release build. The immutable binary is
+22,779,904 bytes, SHA256
+`83450102d81324bce53fa8c7beb8986d405afbd20fa53ad6ca227e79c843944a`
+(`native-integrated120-56/main-ready.json`). Both stages reach EOF/live0;
+one exact owned MSVC telemetry helper is retired in each stage. This is a full
+suite result; candidate55h's earlier repaired-test composite remains separate.
+
+Actual Neovim on56 passes all original **CEM38/38**: normal9, incomplete17,
+getter8 and TypeTools4. All four stages have stable source/runtime guards,
+clean shutdown, EOF/live0/forced0 and a restored dedicated Gradle profile
+(`cem-final153-candidate56-1/adjudication-review155.json`). Missing source
+archives2 remain a coverage observation. Candidate55's CEM failures are retained:
+its Gradle9.6.1 init script failed Kotlin type inference in an unused action
+return. Removing that return fixes import; the original identity/resource and
+configuration-cache controls also pass on real Gradle9.6.1
+(`observed-action156-g9/receipt.json`).
+
+The dependency is ordinary registry **zip9.1.1**, with its checksum in Cargo.lock;
+there is no new fork, submodule or local ZIP patch. Its upstream Unicode-extra
+fix admits the actual JNA archive. Payload CRC and understated-size rejection
+remain strict. Focused JNA/CRC/size controls and the complete56 suite pass.
+
+Remaining current work is explicit: the additional five-project selected50
+replay is running; external Lombok56 still misses the first generated getter
+despite admitting one current class file; the ordinary dirty-Java dependency
+header route passes focused checks but its original Gradle counter is running.
+The original external KSP/KAPT workflow on55h improves to **113/114** with all
+four real external builds and runtime controls exercised. Its one remaining
+failure is an omitted Java diagnostic for an obsolete method of generated
+Kotlin source (`processor120/g55/receipt.json`), not failed generation.
+
+The mc-dev source-inventory/current-source-snapshot API is under implementation
+and review, including negative membership reads and unsaved text. Its new wire
+and consumer integration are not yet verified or published. Existing IPC
+capabilities retain the bounded proof recorded below.
+
+## Previous checkpoints: releases42 through54
 
 The private-generation results below document a superseded design, not additional
 completion requirements. The source now removes that executor, its cache and
@@ -394,13 +433,12 @@ semantics are not certified by the test extension.
 
 ## Next actions and execution rules
 
-1. Verify44's output-notification coalescing during an owned Gradle model import
-   without discarding real changes. Replay the Java6-valid workflow and require actual
-   current-version counter/invalid/fixed compiler certificates. Preserve42's three
-   unmeasured results; deadlines and empty pushes never prove correctness.
-2. Establish an actual current Java compiler certificate for the OkHttp diagnostic
-   case, or reproduce and fix the unsupported path. Its versioned empty push and
-   supported recipe are insufficient.
+1. Complete the Java6-valid dirty-source counter using Kotlin's ordinary Java
+   source/header inputs and the original classpath. Keep Java-body authority
+   separate; do not restore automatic Gradle archive replay or KAPT/KSP execution.
+2. Fix the actual external Lombok getter ingestion and the remaining Java
+   diagnostic for generated Kotlin. Verify the unchanged editor probes, including
+   configuration changes, stale API withdrawal and unsaved-buffer preservation.
 3. Retain the six-origin POM/byte proof and binary fallback limits; investigate real
    failed source origins without guessing an encoding. Broader operator, bounded
    generic and receiver-lambda inference remains outside proven coverage.
@@ -412,6 +450,10 @@ semantics are not certified by the test extension.
 6. Keep the verified asynchronous IPC boundary usable by the independent mc-dev
    consumer; later fact capabilities remain scoped additions, with MC policy in mc-dev
    and no communication waits under Workspace locks.
+7. Deliver mc-dev's source inventory/current snapshot slice with actual serializer
+   fixtures and a real child/consumer check. Track source addition/deletion and
+   body changes within the existing evaluation lifetime; arbitrary path access,
+   resources, class bytes and command routing are separate contracts.
 
 The human permits ongoing API-contract, implementation-commit and verification-result
 sharing with the same mc-dev task within this goal. That scoped technical coordination

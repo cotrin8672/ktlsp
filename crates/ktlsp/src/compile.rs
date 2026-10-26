@@ -3729,6 +3729,7 @@ impl KotlinDependencyCompilation {
             sources: primary.source_files.clone(),
             overlays,
             dependency_overlays,
+            java_dependency_sources: Default::default(),
             dependency_compilation: None,
             kotlin_producers: Vec::new(),
             visible_origins: consumer.visible_origins.clone(),
@@ -3768,7 +3769,9 @@ pub(crate) struct KotlinDiagnosticRequest {
     pub source_roots: Vec<PathBuf>,
     pub sources: Vec<PathBuf>,
     pub overlays: Vec<KotlinSourceOverlay>,
-    /// Visible other source sets are guards, not extra sources in this task's compilation.
+    /// Exact Java dependency headers admitted from the current model; never Java body authority.
+    pub java_dependency_sources: std::collections::BTreeSet<String>,
+    /// Other visible wires remain guards, including admitted headers.
     pub dependency_overlays: Vec<KotlinSourceOverlay>,
     /// A same-model producer whose complete fresh output can replace one selected binary slot.
     pub dependency_compilation: Option<Box<KotlinDependencyCompilation>>,
@@ -3911,6 +3914,7 @@ struct KotlinEnvironmentKey {
     java_dependencies: Vec<crate::classpath::SourceSetClasspath>,
     java_helper_sha256: Option<String>,
     java_editor_sources: std::collections::BTreeSet<String>,
+    java_dependency_sources: std::collections::BTreeSet<String>,
     dependency_compilation: Option<Box<KotlinDependencyCompilation>>,
     kotlin_producers: Vec<KotlinDependencyCompilation>,
 }
@@ -3972,6 +3976,7 @@ impl KotlinEnvironmentKey {
             } else {
                 Default::default()
             },
+            java_dependency_sources: request.java_dependency_sources.clone(),
             dependency_compilation: request.dependency_compilation.clone(),
             kotlin_producers: request.kotlin_producers.clone(),
         })
@@ -4244,8 +4249,10 @@ fn kotlin_plugin_paths(arguments: &[String]) -> anyhow::Result<Vec<PathBuf>> {
     Ok(result)
 }
 
-fn kotlin_analysis_plugin_archive<R: std::io::Read + std::io::Seek>(reader: R) -> anyhow::Result<()> {
+fn kotlin_analysis_plugin_archive<R: std::io::Read + std::io::Seek>(reader: R) -> anyhow::Result<bool> {
     let mut archive = zip::ZipArchive::new(reader)?;
+    let mut generator = false;
+    let mut ordinary = false;
     for service in ["ComponentRegistrar", "CompilerPluginRegistrar"] {
         let path = format!("META-INF/services/org.jetbrains.kotlin.compiler.plugin.{service}");
         let entry = match archive.by_name(&path) {
@@ -4258,22 +4265,54 @@ fn kotlin_analysis_plugin_archive<R: std::io::Read + std::io::Seek>(reader: R) -
         entry.take(8193).read_to_string(&mut providers)?;
         anyhow::ensure!(providers.len() <= 8192, "kotlin-plugin-service-unhandled");
         for provider in providers.lines().map(|line| line.split('#').next().unwrap().trim()) {
-            anyhow::ensure!(
-                !provider.starts_with("org.jetbrains.kotlin.kapt3.")
-                    && !provider.starts_with("org.jetbrains.kotlin.kapt4.")
-                    && !provider.starts_with("com.google.devtools.ksp."),
-                "kotlin-build-time-generator-plugin",
-            );
+            if provider.is_empty() { continue; }
+            if provider.starts_with("org.jetbrains.kotlin.kapt3.")
+                || provider.starts_with("org.jetbrains.kotlin.kapt4.")
+                || provider.starts_with("com.google.devtools.ksp.") {
+                generator = true;
+            } else { ordinary = true; }
         }
     }
-    Ok(())
+    anyhow::ensure!(!(generator && ordinary), "kotlin-mixed-generator-plugin-unhandled");
+    Ok(generator)
 }
 
-fn kotlin_analysis_plugins(arguments: &[String]) -> anyhow::Result<()> {
-    for plugin in kotlin_plugin_paths(arguments)? {
-        kotlin_analysis_plugin_archive(std::fs::File::open(plugin)?)?;
+fn kotlin_generator_option(value: &str) -> bool {
+    value.split(',').all(|option|
+        ["plugin:org.jetbrains.kotlin.kapt3:", "plugin:org.jetbrains.kotlin.kapt4:",
+            "plugin:com.google.devtools.ksp.symbol-processing:"].iter()
+            .any(|prefix| option.strip_prefix(prefix).is_some_and(|value| !value.is_empty())))
+}
+
+fn kotlin_analysis_plugin(path: &Path) -> anyhow::Result<bool> {
+    // Match the existing JAR reader's single-read, in-memory archive.
+    let bytes = std::fs::read(path).map_err(|error|
+        anyhow::anyhow!("kotlin-analysis-plugin-open [{}]: {error}", path.display()))?;
+    kotlin_analysis_plugin_archive(std::io::Cursor::new(bytes)).map_err(|error|
+        anyhow::anyhow!("kotlin-analysis-plugin-archive [{}]: {error}", path.display()))
+}
+
+/// Analyze the current source inputs without loading build-time generators. The original
+/// recipe and all plugin files remain in the environment identity and watched readset.
+fn kotlin_analysis_arguments(arguments: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < arguments.len() {
+        if arguments[i].starts_with("-Xplugin=") {
+            let mut retained = Vec::new();
+            for plugin in kotlin_plugin_paths(std::slice::from_ref(&arguments[i]))? {
+                let generator = kotlin_analysis_plugin(&plugin)?;
+                if !generator {
+                    retained.push(plugin.to_str().ok_or_else(|| anyhow::anyhow!("kotlin-plugin-path-encoding"))?.to_owned());
+                }
+            }
+            if !retained.is_empty() { result.push(format!("-Xplugin={}", retained.join(","))); }
+        } else if arguments[i] == "-P" && arguments.get(i + 1).is_some_and(|value| kotlin_generator_option(value)) {
+            i += 1;
+        } else { result.push(arguments[i].clone()); }
+        i += 1;
     }
-    Ok(())
+    Ok(result)
 }
 
 fn kotlin_scalar_annotation_options(value: &str) -> bool {
@@ -4369,7 +4408,9 @@ fn kotlin_editor_arguments(
                     .arguments
                     .get(i + 1)
                     .ok_or_else(|| anyhow::anyhow!("kotlin-plugin-option-unhandled-at-{i}"))?;
-                if kotlin_scalar_annotation_options(value) {
+                if kotlin_generator_option(value) {
+                    // Gradle generation configuration is retained in the captured model only.
+                } else if kotlin_scalar_annotation_options(value) {
                     // These name annotations, not files; preserve their exact selected order.
                     result.extend([argument.clone(), value.clone()]);
                 } else if let Some(original) =
@@ -4603,9 +4644,15 @@ impl KotlinEditorOverlay {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         request.check_live()?;
+        anyhow::ensure!(
+            request.java_dependency_sources.iter().all(|key| key.ends_with(".java")
+                && request.dependency_overlays.iter().any(|source| &source.key == key)),
+            "kotlin-dependency-header-membership-differs"
+        );
         for dependency in &request.dependency_overlays {
             anyhow::ensure!(
-                std::fs::read_to_string(&dependency.key).ok().as_deref()
+                request.java_dependency_sources.contains(&dependency.key)
+                    || std::fs::read_to_string(&dependency.key).ok().as_deref()
                     == Some(dependency.text.as_str()),
                 "dirty-visible-dependency-source-unhandled"
             );
@@ -4650,12 +4697,16 @@ impl KotlinEditorOverlay {
             .iter()
             .map(|path| crate::paths::file_key(path))
             .collect();
-        for (i, original) in request.sources.iter().enumerate() {
+        let headers = request.dependency_overlays.iter()
+            .filter(|source| request.java_dependency_sources.contains(&source.key))
+            .map(|source| PathBuf::from(&source.key));
+        for (i, original) in request.sources.iter().cloned().chain(headers).enumerate() {
             request.check_live()?;
-            let key = crate::paths::file_key(original);
+            let key = crate::paths::file_key(&original);
             anyhow::ensure!(
                 original.is_absolute()
-                    && (selected_sources.contains(&key)
+                    && (request.java_dependency_sources.contains(&key)
+                        || selected_sources.contains(&key)
                         || request
                             .source_roots
                             .iter()
@@ -4667,7 +4718,8 @@ impl KotlinEditorOverlay {
                 matches!(extension, Some("kt" | "java")),
                 "kotlin-script-source-unhandled"
             );
-            let text = match request.overlays.iter().find(|source| source.key == key) {
+            let text = match request.overlays.iter().chain(&request.dependency_overlays)
+                .find(|source| source.key == key) {
                 Some(source) => {
                     use sha2::{Digest, Sha256};
                     let hash: [u8; 32] = Sha256::digest(source.text.as_bytes()).into();
@@ -4677,7 +4729,7 @@ impl KotlinEditorOverlay {
                     );
                     source.text.clone()
                 }
-                None => std::fs::read_to_string(original)?,
+                None => std::fs::read_to_string(&original)?,
             };
             let destination = match original.strip_prefix(&request.project_dir) {
                 Ok(relative) => overlay.directory.join("sources/project").join(relative),
@@ -5057,7 +5109,8 @@ fn run_selected_kotlin_editor_compile(
         if !request.kotlin_producers.is_empty() {
             return kotlin_producers::run(request, environment);
         }
-        if environment.positive_supported && request.dependency_compilation.is_none() {
+        if environment.positive_supported && request.dependency_compilation.is_none()
+            && request.java_dependency_sources.is_empty() {
             return java_diagnostics::positive::run(request, environment);
         }
         let dependency = match compile_dependency_overlay(request, environment)? {
@@ -5091,13 +5144,12 @@ fn run_owned_kotlin_overlay(
     environment: &KotlinDiagnosticEnvironment,
     require_java_clean: bool,
 ) -> anyhow::Result<(KotlinDiagnosticOutcome, KotlinEditorOverlay)> {
-    kotlin_analysis_plugins(&request.task.arguments)?;
     let overlay = KotlinEditorOverlay::create(request)?;
-    let arguments = kotlin_editor_arguments(
+    let arguments = kotlin_analysis_arguments(&kotlin_editor_arguments(
         request,
         &overlay.directory.join("classes"),
         &overlay.sources,
-    )?;
+    )?)?;
     let argument_file = overlay.directory.join("compiler.args");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -5151,7 +5203,7 @@ fn run_owned_kotlin_overlay(
             &overlay.paths,
         );
         if let KotlinDiagnosticOutcome::Verified { diagnostics, clean, java_clean } = &mut outcome {
-            if request.java_task.is_some() {
+            if request.java_task.is_some() && request.java_dependency_sources.is_empty() {
                 let started = Instant::now();
                 let run_java = if require_java_clean {
                     java_diagnostics::run_for_producer
@@ -5258,6 +5310,7 @@ pub(crate) fn kotlin_test_request(root: &Path) -> KotlinDiagnosticRequest {
         source_roots: vec![root.join("src")],
         overlays: Vec::new(),
         dependency_overlays: Vec::new(),
+        java_dependency_sources: Default::default(),
         dependency_compilation: None,
         kotlin_producers: Vec::new(),
         visible_origins: Default::default(),
@@ -5513,6 +5566,38 @@ mod kotlin_editor_compile_tests {
     }
 
     #[test]
+    fn admitted_java_dependency_header_keeps_classpath_and_wire_guards() {
+        let tree = TestDirectory::new();
+        let mut request = kotlin_test_request(&tree.0);
+        for source in &request.sources {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source, "class Own").unwrap();
+        }
+        let dependency = tree.0.join("other/Dependency.java");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "class Dependency { int oldApi; }").unwrap();
+        let key = crate::paths::file_key(&dependency);
+        let wire = KotlinSourceOverlay::new(key.clone(), "class Dependency { int currentApi; }".into(), 7);
+        request.dependency_overlays.push(wire.clone());
+        request.java_dependency_sources.insert(key.clone());
+        let classpath = request.task.classpath.clone();
+        let environment = KotlinEnvironmentKey::new(&request).unwrap();
+        let overlay = KotlinEditorOverlay::create_in(&request, &tree.0.join("cache")).unwrap();
+        assert_eq!(overlay.sources.len(), request.sources.len() + 1);
+        let copied = overlay.paths.iter().find(|(_, original)| **original == key).unwrap().0;
+        assert_eq!(std::fs::read_to_string(copied).unwrap(), wire.text);
+        assert_eq!(std::fs::read_to_string(&dependency).unwrap(), "class Dependency { int oldApi; }");
+        assert_eq!(request.task.classpath, classpath);
+        assert!(!request.java_body_eligible);
+        let mut changed = request.clone();
+        changed.java_dependency_sources.clear();
+        assert!(KotlinEnvironmentKey::new(&changed).unwrap() != environment);
+        assert!(KotlinEditorOverlay::create_in(&changed, &tree.0.join("cache2")).is_err());
+        request.dependency_overlays[0].text.push_str(" mutated after capture");
+        assert!(KotlinEditorOverlay::create_in(&request, &tree.0.join("cache3")).is_err());
+    }
+
+    #[test]
     fn overlay_rejects_dirty_visible_dependency_and_corrupt_body_identity() {
         let tree = TestDirectory::new();
         let mut request = kotlin_test_request(&tree.0);
@@ -5630,7 +5715,7 @@ mod kotlin_editor_compile_tests {
     }
 
     #[test]
-    fn analysis_plugins_reject_generator_services_before_jvm_launch() {
+    fn analysis_projection_excludes_dedicated_generator_services() {
         let archive = |service: &str, providers: &str| {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
             writer.start_file(
@@ -5647,20 +5732,116 @@ mod kotlin_editor_compile_tests {
                 "com.google.devtools.ksp.KotlinSymbolProcessingComponentRegistrar",
                 "com.google.devtools.ksp.KotlinSymbolProcessingCompilerPluginRegistrar",
             ] {
-                let error = kotlin_analysis_plugin_archive(archive(service,
-                    &format!("# selected plugin\n  {provider}  # generator\n"))).unwrap_err();
-                assert_eq!(error.to_string(), "kotlin-build-time-generator-plugin");
+                assert!(kotlin_analysis_plugin_archive(archive(service,
+                    &format!("# selected plugin\n  {provider}  # generator\n"))).unwrap());
+                assert!(kotlin_analysis_plugin_archive(archive(service,
+                    &format!("{provider}\nordinary.PluginRegistrar\n"))).is_err(),
+                    "a mixed JAR cannot be removed without losing an ordinary compiler plugin");
             }
             for provider in [
                 "org.jetbrains.kotlin.allopen.AllOpenComponentRegistrar",
                 "org.jetbrains.kotlin.noarg.NoArgComponentRegistrar",
                 "org.jetbrains.kotlinx.serialization.compiler.extensions.SerializationComponentRegistrar",
             ] {
-                kotlin_analysis_plugin_archive(archive(service,
-                    &format!("# org.jetbrains.kotlin.kapt3.CommentOnly\n{provider} # ordinary plugin\n"))).unwrap();
+                assert!(!kotlin_analysis_plugin_archive(archive(service,
+                    &format!("# org.jetbrains.kotlin.kapt3.CommentOnly\n{provider} # ordinary plugin\n"))).unwrap());
             }
             assert!(kotlin_analysis_plugin_archive(archive(service, &"x".repeat(8193))).is_err());
         }
+    }
+
+    #[test]
+    fn analysis_projection_preserves_original_recipe_and_order_without_generation() {
+        let tree = TestDirectory::new();
+        let write_plugin = |name: &str, registrar: &str| {
+            let path = tree.0.join(name);
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            writer.start_file("META-INF/services/org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar",
+                zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(registrar.as_bytes()).unwrap();
+            writer.finish().unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let first = write_plugin("first.jar", "org.jetbrains.kotlin.allopen.AllOpenComponentRegistrar");
+        let generator = write_plugin("not-named-ksp.jar", "com.google.devtools.ksp.KotlinSymbolProcessingComponentRegistrar");
+        let last = write_plugin("last.jar", "org.jetbrains.kotlin.noarg.NoArgComponentRegistrar");
+        let original = vec!["-jvm-target".into(), "17".into(),
+            format!("-Xplugin={first},{generator},{last}"),
+            "-P".into(), "plugin:com.google.devtools.ksp.symbol-processing:apoption=apiVersion=2".into(),
+            "-P".into(), "plugin:org.jetbrains.kotlin.allopen:annotation=api.Open".into(),
+            "-Xexplicit-api=strict".into()];
+        let before = original.clone();
+        assert_eq!(kotlin_analysis_arguments(&original).unwrap(), vec![
+            "-jvm-target".to_owned(), "17".into(), format!("-Xplugin={first},{last}"),
+            "-P".into(), "plugin:org.jetbrains.kotlin.allopen:annotation=api.Open".into(),
+            "-Xexplicit-api=strict".into()]);
+        assert_eq!(original, before, "the captured recipe remains an invalidation input");
+        assert!(!kotlin_generator_option("plugin:opaque:option=1"));
+        assert!(!kotlin_generator_option("plugin:org.jetbrains.kotlin.kapt3:x=1,plugin:opaque:y=2"));
+        assert_eq!(std::fs::read_dir(&tree.0).unwrap().count(), 3, "analysis did not generate files");
+    }
+
+    #[test]
+    fn unicode_optional_metadata_crc_falls_back_but_service_payload_crc_is_required() {
+        const SERVICE: &str = "META-INF/services/org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar";
+        const PROVIDER: &str = "ordinary.PluginRegistrar\n";
+        let make = |name: &str, extra: Option<(u16, u32, &[u8])>| {
+            let mut options = zip::write::FileOptions::<zip::write::ExtendedFileOptions>::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let mut marker = Vec::new();
+            if let Some((_, crc, content)) = extra {
+                let mut data = vec![1];
+                data.extend(crc.to_le_bytes());
+                data.extend(content);
+                marker.extend([0x01, 0x29]);
+                marker.extend((data.len() as u16).to_le_bytes());
+                // Write an unreserved field, then label that exact fixture field as Unicode.
+                options.add_extra_data(0x2901, data.into_boxed_slice(), false).unwrap();
+            }
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer.start_file(name, options).unwrap();
+            writer.write_all(PROVIDER.as_bytes()).unwrap();
+            let mut bytes = writer.finish().unwrap().into_inner();
+            if let Some((kind, _, _)) = extra {
+                let positions: Vec<_> = bytes.windows(marker.len()).enumerate()
+                    .filter_map(|(i, bytes)| (bytes == marker).then_some(i)).collect();
+                assert_eq!(positions.len(), 2, "local and central fixture metadata");
+                for i in positions { bytes[i..i + 2].copy_from_slice(&kind.to_le_bytes()); }
+            }
+            bytes
+        };
+        assert!(!kotlin_analysis_plugin_archive(std::io::Cursor::new(make(SERVICE, None))).unwrap());
+        for kind in [0x7075, 0x6375] {
+            let bytes = make(SERVICE, Some((kind, 1, b"ignored-invalid-override")));
+            assert!(!kotlin_analysis_plugin_archive(std::io::Cursor::new(bytes.clone())).unwrap());
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let mut file = archive.by_name(SERVICE).unwrap();
+            assert_eq!(file.comment(), "");
+            let mut body = String::new();
+            file.read_to_string(&mut body).unwrap();
+            assert_eq!(body, PROVIDER);
+        }
+        // CRC32(SERVICE) is b1d29af7; a valid optional path still overrides the header name.
+        let valid = make(SERVICE, Some((0x7075, 0xb1d29af7, b"valid-unicode-name")));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(valid)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name().unwrap(), "valid-unicode-name");
+        let valid_comment = make(SERVICE, Some((0x6375, 0, b"valid-unicode-comment")));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(valid_comment)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().comment(), "valid-unicode-comment");
+
+        let mut legacy = make("plain", Some((0x7075, 1, b"ignored")));
+        let names: Vec<_> = legacy.windows(5).enumerate()
+            .filter_map(|(i, bytes)| (bytes == b"plain").then_some(i)).collect();
+        assert_eq!(names.len(), 2);
+        for i in names { legacy[i] = 0x82; } // CP437 e-acute, not valid UTF-8.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(legacy)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name().unwrap(), "élain");
+
+        let mut corrupt = make(SERVICE, Some((0x7075, 1, b"ignored")));
+        let payload = corrupt.windows(PROVIDER.len()).position(|bytes| bytes == PROVIDER.as_bytes()).unwrap();
+        corrupt[payload] ^= 1;
+        assert!(kotlin_analysis_plugin_archive(std::io::Cursor::new(corrupt)).is_err(),
+            "invalid actual service data must never bypass its payload CRC");
     }
 
     #[test]

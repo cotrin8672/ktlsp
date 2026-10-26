@@ -60,6 +60,17 @@ pub(crate) struct ModelSourceUpdate {
     current: HashSet<String>,
     batches: Vec<ProjectFileIndex>,
     complete: bool,
+    project_classes: Vec<ProjectClassInput>,
+}
+
+struct ProjectClassInput {
+    key: String,
+    text: Arc<str>,
+    tree: Tree,
+    class: Arc<ktcore::classfile::ClassFileFacts>,
+    inputs: [u8; 32],
+    output: [u8; 32],
+    reads: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -106,6 +117,8 @@ pub struct Workspace {
     compiler_api_environments:
         BTreeMap<ProjectScope, Arc<crate::compile::KotlinDiagnosticEnvironment>>,
     class_inventory: RefCell<crate::binary_diagnostics::ClassInventoryCache>,
+    project_class_bindings: HashMap<String, ([u8; 32], [u8; 32])>,
+    project_class_reads: HashSet<String>,
     // Keep this last: its destructor observes completion of all preceding field destruction.
     _drop_marker: WorkspaceDropMarker,
 }
@@ -169,6 +182,8 @@ impl Workspace {
             kotlin_diagnostic_changes: BTreeSet::new(),
             compiler_api_environments: BTreeMap::new(),
             class_inventory: RefCell::default(),
+            project_class_bindings: HashMap::new(),
+            project_class_reads: HashSet::new(),
             _drop_marker: WorkspaceDropMarker("workspace.fields.dropped"),
         }
     }
@@ -402,7 +417,13 @@ impl Workspace {
 
     pub(crate) fn apply_model_sources(&mut self, update: ModelSourceUpdate) -> usize {
         self.invalidate_observed_compile();
+        let extension_revision = self.analysis_extensions.revision();
+        self.analysis_extensions.withdraw_project_outputs(
+            &self.index,
+            self.project_class_bindings.keys().cloned(),
+        );
         self.project_refresh_pending = false;
+        let project_classes = update.project_classes;
         self.remove_obsolete_project_files(&update.current);
         self.source_stamps
             .retain(|key, _| update.current.contains(key));
@@ -466,10 +487,29 @@ impl Workspace {
                 extension_sources.push((batch.key, batch.source.0, batch.source.1));
             }
         }
-        let extension_revision = self.analysis_extensions.revision();
         self.analysis_extensions
             .replace_sources(&self.index, extension_sources);
         self.analysis_extensions.resume(&self.index);
+        self.project_class_reads.clear();
+        self.project_class_bindings.retain(|key, _| update.current.contains(key));
+        let mut outputs = Vec::new();
+        for input in project_classes {
+            self.project_class_reads.extend(input.reads);
+            if self.open_docs.get(&input.key).is_some_and(|doc| doc.text.as_str() != input.text.as_ref()) {
+                continue;
+            }
+            // Input edits cannot revive unchanged old output bytes by importing a new model.
+            if self.project_class_bindings.get(&input.key).is_some_and(|(inputs, output)| {
+                *inputs != input.inputs && *output == input.output
+            }) {
+                continue;
+            }
+            self.project_class_bindings.insert(input.key.clone(), (input.inputs, input.output));
+            outputs.push((input.key, input.text, input.tree, input.class));
+        }
+        if !outputs.is_empty() {
+            let _ = self.analysis_extensions.accept_project_outputs(&self.index, outputs);
+        }
         if count > 0 || self.analysis_extensions.revision() != extension_revision {
             self.bump_index_revision();
         }
@@ -4427,15 +4467,65 @@ pub(crate) fn prepare_model_sources(
         .filter(|path| {
             let key = crate::paths::file_key(path);
             source_stamp(path).is_none_or(|stamp| known.get(&key) != Some(&stamp))
+                || model.java_output_task(&key).is_some_and(|task| {
+                    !task.annotation_processor_path.is_empty() && task.output_roots[0].is_dir()
+                })
         })
         .collect();
     let expected = changed.len();
     let batches = parse_project_files(changed);
+    let project_classes = batches.iter().filter_map(|batch| prepare_project_class(model, batch)).collect();
     ModelSourceUpdate {
         current,
         complete: batches.len() == expected,
         batches,
+        project_classes,
     }
+}
+
+// Runs in the existing background source-install worker, never on completion/hover requests.
+fn prepare_project_class(model: &crate::classpath::ProjectSnapshot, batch: &ProjectFileIndex) -> Option<ProjectClassInput> {
+    let task = model.java_output_task(&batch.key)?;
+    if task.annotation_processor_path.is_empty() || !batch.clean { return None; }
+    let mut types = batch.symbols.iter().filter(|symbol| symbol.kind.is_type_like());
+    let owner = types.next()?;
+    if types.next().is_some() || owner.kind != SymbolKind::Class || owner.container.is_some() || !owner.type_params.is_empty() { return None; }
+    let internal = if batch.package.is_empty() { owner.name.to_string() } else { format!("{}/{}", batch.package.replace('.', "/"), owner.name) };
+    let output = task.output_roots[0].join(format!("{internal}.class"));
+    let before = source_stamp(&output)?;
+    if before.size > ktcore::classfile::MAX_CLASS_FILE_BYTES as u64 { return None; }
+    let bytes = std::fs::read(&output).ok()?;
+    if source_stamp(&output) != Some(before) || bytes.len() as u64 != before.size { return None; }
+    let origin = model.file_origin(Path::new(&batch.key))?;
+    if origin.project_scope.is_none() { return None; }
+    let class = ktcore::classfile::decode(&origin.origin_id, &bytes).ok()?;
+    if class.identity.internal_name.as_str() != internal || class.source_file.as_deref() != Path::new(&batch.key).file_name()?.to_str() { return None; }
+    let mut digest = Sha256::new();
+    digest.update(batch.source.0.as_bytes());
+    digest.update(serde_json::to_vec(task).ok()?);
+    let mut reads = vec![batch.key.clone(), crate::paths::file_key(&output)];
+    let mut latest = batch.stamp?.modified;
+    // Preserve actual and negative ancestor/configuration reads, including Lombok's external config.
+    for parent in Path::new(&batch.key).ancestors().skip(1) {
+        for name in ["lombok.config", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties"] {
+            let path = parent.join(name);
+            reads.push(crate::paths::file_key(&path));
+            digest.update(path.to_string_lossy().as_bytes());
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    latest = latest.max(source_stamp(&path)?.modified);
+                    digest.update([1]); digest.update(bytes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => digest.update([0]),
+                Err(_) => return None,
+            }
+        }
+    }
+    if before.modified < latest { return None; }
+    if let Some(parent) = output.parent() { reads.push(crate::paths::file_key(parent)); }
+    reads.push(crate::paths::file_key(&task.output_roots[0]));
+    Some(ProjectClassInput { key: batch.key.clone(), text: batch.source.0.clone(), tree: batch.source.1.clone(),
+        class: Arc::new(class), inputs: digest.finalize().into(), output: Sha256::digest(bytes).into(), reads })
 }
 
 fn is_dependency_origin(origin: &str) -> bool {
@@ -5919,6 +6009,7 @@ mod tests {
                 current: HashSet::from(["Current.kt".into()]),
                 batches: Vec::new(),
                 complete: true,
+                project_classes: Vec::new(),
             }),
             0
         );
@@ -6657,6 +6748,125 @@ mod tests {
                 "{needle}: expected {expected}, got {result:?}"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_project_classfiles_feed_shared_members_and_retract_stale_inputs() {
+        use crate::classpath::{CompilerLanguage, CompilerTask};
+        let root = unique_tmp("external-project-classfiles");
+        let source = root.join("src/main/java/pluginfixture");
+        let output = root.join("build/classes/java/main");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(output.join("pluginfixture")).unwrap();
+        let owner = source.join("Person.java");
+        let caller = source.join("Use.java");
+        let original = include_str!("../../ktcore/tests/fixtures/classfile/sources/pluginfixture/Person.java");
+        let call = "package pluginfixture; public class Use { String run(Person value) { return value.getName(); } }";
+        std::fs::write(&owner, original).unwrap();
+        std::fs::write(&caller, call).unwrap();
+        let config = root.join("lombok.config");
+        std::fs::write(&config, "config.stopBubbling = true\n").unwrap();
+        let class_file = output.join("pluginfixture/Person.class");
+        let original_class = include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let task = CompilerTask {
+            task: ":compileJava".into(), language: CompilerLanguage::Java,
+            task_type: "org.gradle.api.tasks.compile.JavaCompile".into(), arguments: Vec::new(),
+            annotation_processor_path: vec![root.join("processor.jar")], source_files: vec![owner.clone(), caller.clone()],
+            classpath: Vec::new(), declared_input_files: vec![owner.clone(), caller.clone()],
+            declared_output_roots: vec![output.clone()], java_home: None, kotlin_compiler: None,
+            options: BTreeMap::new(), output_roots: vec![output.clone()], complete: true, problem: None,
+        };
+        let model = Arc::new(crate::classpath::ProjectSnapshot::new(crate::classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nPROVIDES\tmain\t{}\nCOMPILER\tmain\t{}\nEND\t:app\n",
+            root.display(), root.join("src/main/java").display(), output.display(), output.display(), serde_json::to_string(&task).unwrap()
+        ))));
+        let mut ws = Workspace::new();
+        let caller_key = crate::paths::file_key(&caller);
+        let owner_key = crate::paths::file_key(&owner);
+        let dirty = format!("{call}\n// unsaved caller\n");
+        ws.open(caller_key.clone(), dirty.clone());
+        let refresh = |ws: &mut Workspace| {
+            let generation = ws.begin_analysis_generation();
+            let update = prepare_model_sources(&model, &ws.source_stamps());
+            assert!(ws.install_project_update(generation, model.clone(), update).is_some());
+        };
+        let labels = |ws: &mut Workspace| {
+            ws.complete(&caller_key, dirty.find("value.getName").unwrap() + "value.ge".len(), true)
+                .map(|value| value.items.into_iter().map(|item| item.label).collect::<Vec<_>>()).unwrap_or_default()
+        };
+        refresh(&mut ws);
+        assert!(!labels(&mut ws).contains(&"getName".into()), "missing output is not a generated member");
+        std::fs::write(&class_file, original_class).unwrap();
+        refresh(&mut ws);
+        assert!(labels(&mut ws).contains(&"getName".into()), "existing external class metadata must be shared");
+        assert_eq!(ws.open_docs[&caller_key].text, dirty);
+        let hover = ws.resolved_symbol_query(&caller_key, dirty.find("getName").unwrap() + 2)
+            .and_then(|query| query.hover_markdown()).unwrap();
+        assert!(hover.contains("String"), "generated getter must retain its decoded return type");
+
+        // Rejected output must retract the previous API even without a resource notification.
+        std::fs::remove_file(&class_file).unwrap();
+        refresh(&mut ws);
+        assert!(!labels(&mut ws).contains(&"getName".into()), "deleted output cannot leave a generated API");
+        std::fs::write(&class_file, b"not a class file").unwrap();
+        refresh(&mut ws);
+        assert!(!labels(&mut ws).contains(&"getName".into()), "invalid replacement cannot retain an old API");
+        std::fs::write(&class_file, original_class).unwrap();
+        refresh(&mut ws);
+        assert!(labels(&mut ws).contains(&"getName".into()));
+        let mut modules = model.modules.clone();
+        let mut other = modules[0].source_sets[0].clone();
+        other.name = "other".into();
+        other.source_roots = vec![root.join("src/other/java")];
+        other.compiler_tasks.clear();
+        modules[0].source_sets.push(other);
+        let ambiguous = Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+        let generation = ws.begin_analysis_generation();
+        let update = prepare_model_sources(&ambiguous, &ws.source_stamps());
+        assert!(ws.install_project_update(generation, ambiguous, update).is_some());
+        assert!(!labels(&mut ws).contains(&"getName".into()), "different output owners remain ambiguous");
+        refresh(&mut ws);
+        assert!(labels(&mut ws).contains(&"getName".into()), "duplicate declarations of the same owner are usable");
+        let mut modules = model.modules.clone();
+        modules[0].source_sets[0].compiler_tasks.clear();
+        let unowned = Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+        let generation = ws.begin_analysis_generation();
+        let update = prepare_model_sources(&unowned, &ws.source_stamps());
+        assert!(ws.install_project_update(generation, unowned, update).is_some());
+        assert!(!labels(&mut ws).contains(&"getName".into()), "output task ownership is required");
+        refresh(&mut ws);
+        assert!(labels(&mut ws).contains(&"getName".into()));
+
+        // A dirty owner must win over an old compiled class, even while its caller stays useful.
+        ws.open(owner_key.clone(), original.into());
+        ws.change(&owner_key, original.replace("String name", "String changedName"));
+        assert!(!labels(&mut ws).contains(&"getName".into()));
+        ws.close(&owner_key);
+        refresh(&mut ws);
+        assert!(labels(&mut ws).contains(&"getName".into()));
+
+        // Same path, size and timestamp: the class content identity must replace the old API.
+        let stamp = std::fs::metadata(&class_file).unwrap().modified().unwrap();
+        let mut replacement = original_class.to_vec();
+        let at = replacement.windows(7).position(|bytes| bytes == b"getName").unwrap();
+        replacement[at..at + 7].copy_from_slice(b"getNick");
+        std::fs::write(&class_file, replacement).unwrap();
+        std::fs::File::options().write(true).open(&class_file).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp)).unwrap();
+        refresh(&mut ws);
+        let names = labels(&mut ws);
+        assert!(names.contains(&"getNick".into()) && !names.contains(&"getName".into()));
+
+        std::fs::write(&config, "config.stopBubbling = true\nlombok.accessors.fluent = true\n").unwrap();
+        ws.observe_compiled_resource(&crate::paths::file_key(&config));
+        assert!(!labels(&mut ws).contains(&"getNick".into()), "config input invalidation is immediate");
+        refresh(&mut ws);
+        assert!(!labels(&mut ws).contains(&"getNick".into()), "a new model must not revive unchanged old output");
+        std::fs::remove_file(&class_file).unwrap();
+        refresh(&mut ws);
+        assert!(!labels(&mut ws).contains(&"getNick".into()));
+        assert_eq!(ws.open_docs[&caller_key].text, dirty);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7743,6 +7953,12 @@ impl Workspace {
     /// `true` only defers a known output event inside this exact active compile. Inputs,
     /// configuration, AP/ancestor/dependency files invalidate before any source-retention filter.
     pub(crate) fn observe_compiled_resource(&mut self, key: &str) -> bool {
+        if self.project_class_reads.contains(key) {
+            self.analysis_extensions.clear_compiler_api(&self.index);
+            if self.analysis_extensions.publish(&mut self.index) {
+                self.index_revision = self.index_revision.wrapping_add(1).max(1);
+            }
+        }
         self.invalidate_kotlin_source(key);
         let module_source = self
             .observed_compile
@@ -8991,6 +9207,10 @@ impl Workspace {
         let dependency_compilation = (compiler_sources_supported && kotlin_producers.is_empty())
             .then(|| Self::kotlin_dependency_compilation(&model, task, &dependency_overlays))
             .flatten();
+        let java_dependency_sources = if compiler_sources_supported
+            && kotlin_producers.is_empty() && dependency_compilation.is_none() {
+            self.kotlin_java_dependency_sources(&model, task, &dependency_overlays, &visible_origins)
+        } else { BTreeSet::new() };
         let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
         if self
             .kotlin_diagnostic_reports
@@ -9017,17 +9237,24 @@ impl Workspace {
             scope: scope.clone(),
             task: task.clone(),
             java_task,
-            java_body_eligible,
+            java_body_eligible: java_body_eligible && java_dependency_sources.is_empty(),
             kotlin_producers,
             java_dependencies,
             java_editor_sources,
             positive_diagnostics_only: source.compiler_tasks.iter().any(|candidate| {
                 candidate.language == CompilerLanguage::Kotlin && candidate.task != task.task
+                    && !matches!(
+                        candidate.task_type.strip_suffix("_Decorated").unwrap_or(&candidate.task_type),
+                        "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask"
+                            | "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask"
+                            | "com.google.devtools.ksp.gradle.KspTaskJvm"
+                    )
             }),
             source_roots: source.source_roots.clone(),
             sources: sources.into_values().collect(),
             overlays,
             dependency_overlays,
+            java_dependency_sources,
             dependency_compilation,
             visible_origins,
             generation,
@@ -9042,6 +9269,58 @@ impl Workspace {
             },
         );
         Ok(request)
+    }
+
+    fn kotlin_java_dependency_sources(
+        &self,
+        model: &crate::classpath::ProjectSnapshot,
+        consumer: &crate::classpath::CompilerTask,
+        overlays: &[crate::compile::KotlinSourceOverlay],
+        visible_origins: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        use crate::classpath::CompilerLanguage;
+        let classpath: BTreeSet<_> = consumer.classpath.iter()
+            .map(|path| crate::paths::file_key(path)).collect();
+        overlays.iter().filter_map(|overlay| {
+            if !overlay.key.ends_with(".java")
+                || self.source_contents.get(&overlay.key) == Some(&overlay.text_sha256) {
+                return None;
+            }
+            let origin = model.file_origin(Path::new(&overlay.key))?;
+            if !visible_origins.contains(&origin.origin_id) { return None; }
+            let (_, source) = model.owner_for_key(&overlay.key)?;
+            let source = source?;
+            if source.compiler_metadata_incomplete || source.classpath_incomplete
+                || !source.unresolved.is_empty() { return None; }
+            let java: Vec<_> = source.compiler_tasks.iter()
+                .filter(|task| task.language == CompilerLanguage::Java).collect();
+            let [java] = java.as_slice() else { return None; };
+            if !java.complete || java.problem.is_some()
+                || !java.source_files.iter().any(|path| crate::paths::file_key(path) == overlay.key)
+                || !java.classpath.iter().all(|path| classpath.contains(&crate::paths::file_key(path)))
+                || !source.provided_artifacts.iter().any(|path| classpath.contains(&crate::paths::file_key(path))) {
+                return None;
+            }
+            let artifacts: Vec<_> = source.provided_artifacts.iter()
+                .filter(|path| classpath.contains(&crate::paths::file_key(path))).collect();
+            if artifacts.iter().any(|artifact| model.modules.iter()
+                .flat_map(|module| &module.source_sets)
+                .filter(|candidate| candidate.provided_artifacts.iter()
+                    .any(|path| crate::paths::file_key(path) == crate::paths::file_key(artifact)))
+                .count() != 1) { return None; }
+            let doc = self.open_docs.get(&overlay.key)?;
+            if !java::declaration_headers_complete(&doc.tree, &doc.text) { return None; }
+            if !java.annotation_processor_path.is_empty() {
+                // shortcut: annotated processor-owned headers need shared virtual-member facts first.
+                let mut pending = vec![doc.tree.root_node()];
+                while let Some(node) = pending.pop() {
+                    if matches!(node.kind(), "annotation" | "marker_annotation") { return None; }
+                    let mut cursor = node.walk();
+                    pending.extend(node.children(&mut cursor));
+                }
+            }
+            Some(overlay.key.clone())
+        }).collect()
     }
 
     fn kotlin_dependency_compilation(
@@ -9341,6 +9620,10 @@ impl Workspace {
         let kotlin_clean = clean && !request.positive_diagnostics_only;
         let mut by_file: BTreeMap<String, Vec<crate::diagnostics::Diagnostic>> = BTreeMap::new();
         for diagnostic in diagnostics {
+            // Foreign Java headers only support owned Kotlin diagnostics, never Java body authority.
+            if !request.java_dependency_sources.is_empty() && !diagnostic.path.ends_with(".kt") {
+                continue;
+            }
             if clean && request.positive_diagnostics_only && diagnostic.path.ends_with(".kt") {
                 continue;
             }
@@ -9703,6 +9986,82 @@ mod kotlin_diagnostic_lifecycle_tests {
         environment.close();
     }
 
+    #[test]
+    fn dirty_java_dependency_header_admission_preserves_model_and_source_epochs() {
+        use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+        let (mut ws, editor, _, own_java) = fixture();
+        let mut modules = ws.project_model.as_ref().unwrap().modules.clone();
+        let root = modules[0].project_dir.clone();
+        let dependency_root = root.join("dependency");
+        let dependency = crate::paths::file_key(&dependency_root.join("src/Dependency.java"));
+        let artifact = dependency_root.join("dependency.jar");
+        let mut java = crate::compile::observed_test_request(&dependency_root).task.clone();
+        java.task = ":dependency:compileJava".into();
+        java.source_files = vec![std::path::PathBuf::from(&dependency)];
+        java.classpath = modules[0].source_sets[0].compiler_tasks[0].classpath.clone();
+        modules[0].source_sets[0].compiler_tasks[0].classpath.push(artifact.clone());
+        modules[0].source_sets[0].entries = modules[0].source_sets[0].compiler_tasks[0].classpath.clone();
+        modules.push(ModuleClasspath {
+            module: ":dependency".into(), project_dir: dependency_root.clone(), build: ":".into(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(), source_roots: vec![dependency_root.join("src")],
+                compiler_tasks: vec![java], provided_artifacts: vec![artifact.clone()],
+                ..Default::default()
+            }], entries: Vec::new(), unresolved: Vec::new(),
+        });
+        let model = Arc::new(ProjectSnapshot::new(modules));
+        ws.set_project_model(model.clone());
+        ws.open(dependency.clone(), "class Dependency { int currentApi; }".into());
+        let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        assert!(request.java_dependency_sources.contains(&dependency));
+        assert!(request.dependency_overlays.iter().any(|source| source.key == dependency));
+        assert!(request.task.classpath.contains(&artifact));
+        assert!(!request.java_body_eligible);
+        let mut captured = (*request).clone();
+        captured.java_task = Some(crate::compile::observed_test_request(&root).task.clone());
+        let request = Arc::new(captured);
+        ws.kotlin_diagnostic_tickets.get_mut(&request.scope).unwrap().request = request.clone();
+        let mut outcome = reported(&request, &editor, "Versioned");
+        if let KotlinDiagnosticOutcome::Verified { diagnostics, .. } = &mut outcome {
+            diagnostics.push(CompileDiagnostic { path: own_java.clone(), line: 1, col: 1,
+                severity: crate::diagnostics::Severity::Error, message: "frontend Java error".into() });
+            diagnostics.push(CompileDiagnostic { path: dependency.clone(), line: 1, col: 1,
+                severity: crate::diagnostics::Severity::Error, message: "foreign Java error".into() });
+        }
+        assert_eq!(ws.finish_kotlin_diagnostics(&request, outcome, Arc::new(AtomicBool::new(false))), vec![editor.clone()]);
+        assert!(ws.kotlin_diagnostic_trace(&own_java).is_none());
+        assert!(ws.kotlin_diagnostic_trace(&dependency).is_none());
+        ws.change(&dependency, "class Dependency { int nextApi; }".into());
+        assert!(request.check_live().is_err());
+        let next = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        assert!(next.java_dependency_sources.contains(&dependency));
+        assert!(next.dependency_overlays.iter().any(|source| source.text.contains("nextApi")));
+        let visible = next.visible_origins.clone();
+        assert!(ws.kotlin_java_dependency_sources(&model, &next.task,
+            &next.dependency_overlays, &BTreeSet::new()).is_empty());
+        for mutation in ["incomplete", "missing-membership", "missing-jar", "extra-cp", "ambiguous-artifact", "processor-annotation"] {
+            let mut modules = model.modules.clone();
+            let source = &mut modules[1].source_sets[0];
+            match mutation {
+                "incomplete" => source.compiler_metadata_incomplete = true,
+                "missing-membership" => source.compiler_tasks[0].source_files.clear(),
+                "missing-jar" => source.provided_artifacts.clear(),
+                "extra-cp" => source.compiler_tasks[0].classpath.push(root.join("invisible.jar")),
+                "ambiguous-artifact" => modules[0].source_sets[1].provided_artifacts.push(artifact.clone()),
+                "processor-annotation" => {
+                    source.compiler_tasks[0].annotation_processor_path.push(root.join("unknown-processor.jar"));
+                    ws.change(&dependency, "@Getter class Dependency { int nextApi; }".into());
+                }
+                _ => unreachable!(),
+            }
+            let altered = ProjectSnapshot::new(modules);
+            assert!(ws.kotlin_java_dependency_sources(&altered, &next.task,
+                &next.dependency_overlays, &visible).is_empty(), "{mutation}");
+        }
+        ws.close(&dependency);
+        assert!(next.check_live().is_err());
+    }
+
     fn fixture() -> (Workspace, String, String, String) {
         use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
         let root = std::env::temp_dir().join("ktlsp-kotlin-diagnostic-host-only");
@@ -9852,6 +10211,23 @@ mod kotlin_diagnostic_lifecycle_tests {
             .arguments
             .iter()
             .any(|argument| argument == "-P"));
+
+        for kind in [
+            "org.jetbrains.kotlin.gradle.internal.KaptWithoutKotlincTask",
+            "org.jetbrains.kotlin.gradle.internal.KaptGenerateStubsTask_Decorated",
+            "com.google.devtools.ksp.gradle.KspTaskJvm",
+        ] {
+            let (mut ws, editor, _, _) = fixture();
+            let mut modules = request_model(&ws);
+            let source = &mut modules[0].source_sets[0];
+            let mut auxiliary = source.compiler_tasks[0].clone();
+            auxiliary.task = ":app:buildTimeGenerator".into();
+            auxiliary.task_type = kind.into();
+            source.compiler_tasks.push(auxiliary);
+            ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+            assert!(!ws.begin_kotlin_diagnostics(&editor).unwrap().positive_diagnostics_only,
+                "nonexecuted generator metadata is not a competing normal compiler: {kind}");
+        }
 
         for mutation in [
             "missing",

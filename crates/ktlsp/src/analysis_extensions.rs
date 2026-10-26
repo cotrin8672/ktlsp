@@ -710,6 +710,7 @@ impl AnalysisExtensions {
             if self.retain_all_sources {
                 if let Some(input) = self.inputs.get_mut(&key) {
                     input.compiler_classes.clear();
+                    input.compiled = None;
                 }
             } else {
                 self.inputs.remove(&key);
@@ -770,5 +771,54 @@ impl AnalysisExtensions {
         }
         self.evaluate(index);
         result
+    }
+
+    pub(crate) fn withdraw_project_outputs(
+        &mut self,
+        index: &dyn InferenceIndex,
+        keys: impl IntoIterator<Item = String>,
+    ) {
+        for key in keys {
+            let Some(input) = self.inputs.get_mut(&key) else { continue };
+            if input.compiled.take().is_none() { continue; }
+            self.compiler_api_sources.remove(&key);
+            self.changed.insert(key.clone());
+            self.store.remove_source(&key);
+            if self.retain_all_sources {
+                let _ = self.normalize(index, &key);
+            } else {
+                self.inputs.remove(&key);
+            }
+        }
+        self.evaluate(index);
+    }
+
+    /// Selected externally built binary APIs are positive facts, not compiler-clean authority.
+    /// The host binds source/model/output identities before reaching this shared provider.
+    pub(crate) fn accept_project_outputs(
+        &mut self,
+        index: &dyn InferenceIndex,
+        owners: Vec<(String, Arc<str>, Tree, Arc<ktcore::classfile::ClassFileFacts>)>,
+    ) -> Result<(), String> {
+        if !self.compiled_enabled || self.suspended {
+            return Err("project-output-provider-disabled".into());
+        }
+        let mut keys = Vec::new();
+        for (key, text, tree, class) in owners {
+            self.compiler_api_sources.insert(key.clone());
+            self.changed.insert(key.clone());
+            keys.push(key.clone());
+            self.inputs.insert(key, SourceInput {
+                text, tree, compiled: Some(class), compiler_classes: Vec::new(), prepared_references: None,
+            });
+        }
+        for key in keys {
+            if let Err(error) = self.normalize(index, &key) {
+                self.clear_compiler_api(index);
+                return Err(error);
+            }
+        }
+        self.evaluate(index);
+        Ok(())
     }
 }

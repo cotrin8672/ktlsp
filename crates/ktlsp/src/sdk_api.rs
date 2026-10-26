@@ -26,8 +26,12 @@ pub(crate) fn release_entries(
         archive.len() <= crate::jar::MAX_SOURCE_FILES,
         "too many SDK signature entries"
     );
-    let selected = archive
+    let names = archive
         .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<zip::result::ZipResult<Vec<_>>>()?;
+    let selected = names
+        .iter()
         .filter_map(|name| {
             let (releases, rest) = name.split_once('/')?;
             (releases.contains(marker)
@@ -35,7 +39,7 @@ pub(crate) fn release_entries(
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
                 && rest.ends_with(".sig"))
-            .then_some((name, rest))
+            .then_some((name.as_str(), rest))
         })
         .collect::<Vec<_>>();
     // Object's canonical location proves the archive layout; a dotted component alone does not.

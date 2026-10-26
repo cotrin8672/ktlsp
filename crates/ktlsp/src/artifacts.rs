@@ -340,7 +340,10 @@ fn has_indexable_sources(path: &Path) -> bool {
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name();
+        let Ok(name) = entry.name() else {
+            // Extraction must surface the unreadable name rather than certify no sources.
+            return true;
+        };
         if name.ends_with(".kt") || name.ends_with(".java") {
             return true;
         }
@@ -476,7 +479,8 @@ fn jar_contains_any_suffix(jar: &Path, suffixes: &BTreeSet<String>) -> bool {
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        if suffixes.contains(entry.name()) {
+        let Ok(name) = entry.name() else { continue; };
+        if suffixes.contains(name.as_ref()) {
             return true;
         }
     }
@@ -1080,7 +1084,7 @@ fn read_embedded_poms(path: &Path) -> Option<Vec<String>> {
         let Ok(mut entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name();
+        let Ok(name) = entry.name().map(|name| name.into_owned()) else { continue; };
         if !name.starts_with("META-INF/maven/") || !name.ends_with("/pom.xml") {
             continue;
         }

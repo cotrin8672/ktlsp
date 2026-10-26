@@ -20,7 +20,7 @@ tree-sitter-java = "0.23"
 tree-sitter-kotlin-ng = { git = "https://github.com/cotrin8672/tree-sitter-kotlin", rev = "9fcb964bf2aed03aea770f54809d8a8d9a8e3311" }
 ureq = { version = "3", features = ["rustls"] }
 walkdir = "2"
-zip = { version = "2.3", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.1", default-features = false, features = ["deflate"] }
 toml = "1"
 bincode = "1"
 sha2 = "0.10"

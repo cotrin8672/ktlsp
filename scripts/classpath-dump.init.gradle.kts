@@ -112,7 +112,7 @@ abstract class KtlspCompilerRuntimes : org.gradle.api.services.BuildService<org.
 class KtlspObserverActions {
     private val owned = java.util.IdentityHashMap<Task, MutableSet<Any>>()
 
-    fun install(task: Task, first: Boolean, action: Action<Task>): Action<in Task> {
+    fun install(task: Task, first: Boolean, action: Action<Task>) {
         val before = task.actions.toList()
         if (first) task.doFirst(action) else task.doLast(action)
         val after = task.actions.toList()
@@ -127,7 +127,6 @@ class KtlspObserverActions {
             check(delegate === action) { "Observer action delegate differs" }
         }
         owned.getOrPut(task) { java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>()) }.add(inserted)
-        return inserted
     }
 
     fun visible(task: Task): List<Action<in Task>> {

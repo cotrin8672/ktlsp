@@ -726,6 +726,36 @@ impl ProjectSnapshot {
         }
     }
 
+    /// Positive metadata from an existing output; this never selects a task to execute.
+    pub(crate) fn java_output_task(&self, key: &str) -> Option<&CompilerTask> {
+        let (module, source) = self.owner_for_key(key)?;
+        let source = source?;
+        if source.compiler_metadata_incomplete || source.classpath_incomplete || !source.unresolved.is_empty() {
+            return None;
+        }
+        let mut selected = source.compiler_tasks.iter().filter(|task| {
+            task.language == CompilerLanguage::Java
+                && task.source_files.iter().any(|path| crate::paths::file_key(path) == key)
+        });
+        let task = selected.next()?;
+        if selected.next().is_some() || !task.complete || task.problem.is_some() || task.output_roots.len() != 1 {
+            return None;
+        }
+        let root = &task.output_roots[0];
+        if !root.is_absolute() || !task.declared_output_roots.iter().any(|path| path_key(path) == path_key(root)) {
+            return None;
+        }
+        let owners = &self.output_owners.get(&path_key(root))?.source_sets;
+        let &(mi, si) = owners.first()?;
+        // Gradle may expose one output both as classes and a provided artifact.
+        // Repeated declarations of the same owner do not make ownership ambiguous.
+        if owners.iter().any(|owner| *owner != (mi, si)) {
+            return None;
+        }
+        (std::ptr::eq(&self.modules[mi], module)
+            && std::ptr::eq(&self.modules[mi].source_sets[si], source)).then_some(task)
+    }
+
     pub(crate) fn is_output_key(&self, key: &str) -> bool {
         find_ancestor(key, |root| {
             self.output_owners.get(root).filter(|output| {

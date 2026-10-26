@@ -2394,6 +2394,7 @@ pub(crate) fn resolve_jdk_imports_from_zip(
     // Scan central-directory names once; local/unknown type names must not repeat directory walks.
     let mut matches = Vec::new();
     for name in archive.file_names() {
+        let Ok(name) = name else { return Vec::new(); };
         let normalized = name.replace('\\', "/");
         let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
         if let Some(candidates) = by_basename.get(basename) {
@@ -2508,7 +2509,8 @@ fn extract_sources_by_suffix(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().replace('\\', "/");
+        let Ok(name) = entry.name() else { continue; };
+        let name = name.replace('\\', "/");
         let Some(suffix) = remaining
             .iter()
             .find(|suffix| name.ends_with(*suffix))
