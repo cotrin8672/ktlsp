@@ -46,19 +46,35 @@ there is no new fork, submodule or local ZIP patch. Its upstream Unicode-extra
 fix admits the actual JNA archive. Payload CRC and understated-size rejection
 remain strict. Focused JNA/CRC/size controls and the complete56 suite pass.
 
-Remaining current work is explicit: the additional five-project selected50
-replay is running; external Lombok56 still misses the first generated getter
-despite admitting one current class file; the ordinary dirty-Java dependency
-header route passes focused checks but its original Gradle counter is running.
+Candidate57s subsequently passes the full Rust workspace **1852/0/13** and the
+release build (`native-integrated120-57s/main-ready.json`). Actual external
+Java/Lombok now passes **75/75** unchanged checks: initial `getName`, fluent
+configuration, field rename to `getTitle`, restoration, stale API withdrawal,
+String hover/chain completion and preserved unsaved consumer text. All four
+external Gradle builds, native watches and first responses are observed;
+EOF/live0/forced0 and stable guards hold (`j57sd/receipt.json`). A separate
+disposable online bootstrap populates a dedicated real Gradle home; the actual
+offline test starts without class outputs. No LSP generation command is used.
+The fix readmits current external facts after source/POM model enrichment;
+previously that model replacement cleared the freshly installed getter.
+
+Remaining current work is explicit: Moshi9, OkHttp10 and Retrofit12 selected
+checks pass on56; Spring and the Gradle counter are still in dependency indexing.
+The ordinary dirty-Java dependency header route passes focused checks but its
+original current-version Gradle counter is not yet proved.
 The original external KSP/KAPT workflow on55h improves to **113/114** with all
 four real external builds and runtime controls exercised. Its one remaining
 failure is an omitted Java diagnostic for an obsolete method of generated
 Kotlin source (`processor120/g55/receipt.json`), not failed generation.
 
-The mc-dev source-inventory/current-source-snapshot API is under implementation
-and review, including negative membership reads and unsaved text. Its new wire
-and consumer integration are not yet verified or published. Existing IPC
-capabilities retain the bounded proof recorded below.
+The mc-dev source-inventory/current-source-snapshot API passes its core, wire,
+actual serializer and real host-wrapper budget controls. First real child testing
+preserves legacy26 and passes91/93 optional/source checks, including unsaved text,
+Unicode hashes, empty source text, stale/model rejection, rename and lifecycle.
+The two failures reveal missing closed-file bodies at late registration; that
+host input-producer fix is in progress. Paging is also being added for two actual
+Gradle source sets whose descriptors exceed512KiB. This new API is not yet
+published or claimed complete (`source-snapshots155-57/receipt.json`).
 
 ## Previous checkpoints: releases42 through54
 
@@ -436,9 +452,9 @@ semantics are not certified by the test extension.
 1. Complete the Java6-valid dirty-source counter using Kotlin's ordinary Java
    source/header inputs and the original classpath. Keep Java-body authority
    separate; do not restore automatic Gradle archive replay or KAPT/KSP execution.
-2. Fix the actual external Lombok getter ingestion and the remaining Java
-   diagnostic for generated Kotlin. Verify the unchanged editor probes, including
-   configuration changes, stale API withdrawal and unsaved-buffer preservation.
+2. Retain the actual external Lombok75 proof and fix the remaining Java
+   diagnostic for generated Kotlin. Preserve configuration changes, stale API
+   withdrawal and unsaved-buffer behavior in affected later verification.
 3. Retain the six-origin POM/byte proof and binary fallback limits; investigate real
    failed source origins without guessing an encoding. Broader operator, bounded
    generic and receiver-lambda inference remains outside proven coverage.

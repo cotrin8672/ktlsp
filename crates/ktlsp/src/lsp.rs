@@ -1202,8 +1202,8 @@ fn index_dependencies_with_source_query(
             return binary;
         }
     };
-    {
-        let mut guard = ws.lock();
+    let known = {
+        let guard = ws.lock();
         if cancelled.load(std::sync::atomic::Ordering::Acquire)
             || !guard.is_current_generation(generation)
         {
@@ -1212,7 +1212,18 @@ fn index_dependencies_with_source_query(
         if Arc::ptr_eq(&accepted, &enriched) {
             return binary;
         }
-        guard.set_project_model(enriched.clone());
+        guard.source_stamps()
+    };
+    // Enrichment replaces the model and invalidates its semantic contributions. Rebind selected
+    // external outputs through the same source/output CAS as the initial install, outside the lock.
+    let update = crate::workspace::prepare_model_sources(&enriched, &known);
+    {
+        let mut guard = ws.lock();
+        if cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || guard.install_project_update(generation, enriched.clone(), update).is_none()
+        {
+            return binary;
+        }
         classpath::publish_snapshot(root, enriched.clone());
     }
     if ws.lock().is_current_generation(generation) {
@@ -1727,8 +1738,16 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
         let install_start = crate::trace::enabled().then(Instant::now);
         let previous_files = stats.files;
         let mut files_for_coord = Vec::new();
+        let mut lock_wait = std::time::Duration::ZERO;
+        let mut index_time = std::time::Duration::ZERO;
+        let mut flush_time = std::time::Duration::ZERO;
+        let mut accepted_files = 0usize;
         for batch in result.batches {
+            let lock_start = install_start.map(|_| Instant::now());
             let mut guard = ws.lock();
+            if let Some(start) = lock_start {
+                lock_wait += start.elapsed();
+            }
             if cancelled.load(std::sync::atomic::Ordering::Acquire)
                 || !guard.is_current_generation(generation)
             {
@@ -1755,8 +1774,18 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                     symbols: symbol_count,
                 });
             }
-            guard.index_dependency_batch_for_generation(generation, batch);
+            let index_start = install_start.map(|_| Instant::now());
+            if guard.index_dependency_batch_for_generation(generation, batch) {
+                accepted_files += 1;
+            }
+            if let Some(start) = index_start {
+                index_time += start.elapsed();
+            }
+            let flush_start = install_start.map(|_| Instant::now());
             guard.bump_index_revision();
+            if let Some(start) = flush_start {
+                flush_time += start.elapsed();
+            }
             stats.files += 1;
         }
         if let Some(start) = install_start {
@@ -1764,7 +1793,9 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                 "deps.install_batch",
                 "deps",
                 start,
-                serde_json::json!({ "label": result.label, "files": stats.files - previous_files }),
+                serde_json::json!({ "label": result.label, "files": stats.files - previous_files,
+                    "lock_wait_us": lock_wait.as_micros(), "index_us": index_time.as_micros(),
+                    "flush_us": flush_time.as_micros(), "accepted_files": accepted_files }),
             );
         }
         if let Some(coord) = result.coord.clone() {
@@ -6419,6 +6450,83 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&classpath::snapshot(&root).unwrap(), &enriched));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_enrichment_rebinds_external_java_outputs_without_overriding_dirty_owners() {
+        for dirty_owner in [false, true] {
+            let (root, ws, accepted, enriched) = source_query_overlap_fixture(
+                if dirty_owner { "external-api-dirty" } else { "external-api" },
+            );
+            let source_root = root.join("src/main/java");
+            let source_dir = source_root.join("pluginfixture");
+            let output = root.join("build/classes/java/main");
+            std::fs::create_dir_all(&source_dir).unwrap();
+            std::fs::create_dir_all(output.join("pluginfixture")).unwrap();
+            let person = source_dir.join("Person.java");
+            let caller = source_dir.join("Use.java");
+            let original = include_str!("../../ktcore/tests/fixtures/classfile/sources/pluginfixture/Person.java");
+            let consumer = "package pluginfixture; class Use { String run(Person value) { return value.getName(); } }\n// unsaved caller\n";
+            std::fs::write(&person, original).unwrap();
+            std::fs::write(&caller, consumer.trim_end_matches("// unsaved caller\n")).unwrap();
+            std::fs::write(output.join("pluginfixture/Person.class"), include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class",
+            )).unwrap();
+            let task: classpath::CompilerTask = serde_json::from_value(serde_json::json!({
+                "task":":app:compileJava", "language":"java",
+                "task_type":"org.gradle.api.tasks.compile.JavaCompile", "arguments":[],
+                "annotation_processor_path":[root.join("processor.jar")],
+                "source_files":[person, caller], "declared_input_files":[person, caller],
+                "classpath":[], "declared_output_roots":[output], "output_roots":[output],
+                "java_home":null, "kotlin_compiler":null, "options":{}, "complete":true, "problem":null,
+            })).unwrap();
+            let with_outputs = |model: &Arc<classpath::ProjectSnapshot>| {
+                let mut modules = model.modules.clone();
+                let source = &mut modules[0].source_sets[0];
+                source.source_roots = vec![source_root.clone()];
+                source.output_roots = vec![output.clone()];
+                source.provided_artifacts = vec![output.clone()];
+                source.compiler_tasks = vec![task.clone()];
+                Arc::new(classpath::ProjectSnapshot::new(modules))
+            };
+            let accepted = with_outputs(&accepted);
+            let enriched = with_outputs(&enriched);
+            let caller_key = crate::paths::file_key(&caller);
+            let person_key = crate::paths::file_key(&person);
+            let offset = consumer.find("value.getName").unwrap() + "value.ge".len();
+            let generation = {
+                let mut guard = ws.lock();
+                guard.open(caller_key.clone(), consumer.into());
+                let generation = guard.begin_analysis_generation();
+                let update = crate::workspace::prepare_model_sources(&accepted, &guard.source_stamps());
+                assert!(guard.install_project_update(generation, accepted.clone(), update).is_some());
+                assert!(guard.complete(&caller_key, offset, false).unwrap().items.iter().any(|item| item.label == "getName"));
+                generation
+            };
+            let query_ws = ws.clone();
+            let query_result = enriched.clone();
+            index_dependencies_with_source_query(
+                &ws, &root, Some(accepted), true, generation, None,
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                move |_, _, _| {
+                    if dirty_owner {
+                        let mut guard = query_ws.lock();
+                        guard.open(person_key.clone(), original.into());
+                        guard.change(&person_key, original.replace("String name", "String changedName"));
+                    }
+                    Ok(query_result)
+                },
+            );
+            let mut guard = ws.lock();
+            assert!(Arc::ptr_eq(&guard.project_snapshot().unwrap(), &enriched));
+            assert_eq!(guard.doc_text(&caller_key).as_deref(), Some(consumer));
+            let labels = guard.complete(&caller_key, offset, false).map(|result|
+                result.items.into_iter().map(|item| item.label).collect::<Vec<_>>()).unwrap_or_default();
+            assert_eq!(labels.contains(&"getName".into()), !dirty_owner,
+                "source enrichment must rebind fresh output and reject stale output for a dirty owner");
+            drop(guard);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
