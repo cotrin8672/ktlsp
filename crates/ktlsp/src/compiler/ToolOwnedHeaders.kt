@@ -42,6 +42,26 @@ private val PLUGINS = CompilerConfigurationKey.create<String>("ktlsp pinned plug
 private val SELECTED_CP = CompilerConfigurationKey.create<String>("ktlsp selected ordered classpath")
 private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 private fun key(file: File) = file.canonicalPath.replace('\\', '/').lowercase()
+// Only this source shape has no backend-created public member names. Other Kotlin APIs
+// retain their unknown member surface even when their individual signatures are usable.
+private fun plainMemberNames(type: KtClass): List<String>? {
+    val modifiers = setOf("", "public", "final", "public final", "final public")
+    if (type.isInterface() || type.annotationEntries.isNotEmpty() ||
+        type.text.substringBefore("class").trim() !in modifiers ||
+        type.typeParameters.isNotEmpty() || type.superTypeListEntries.isNotEmpty() ||
+        type.primaryConstructorParameters.isNotEmpty() ||
+        !type.primaryConstructor?.modifierList?.text.isNullOrBlank()) return null
+    val methods = mutableListOf<String>()
+    for (member in type.declarations) {
+        val function = member as? KtNamedFunction ?: return null
+        if (function.annotationEntries.isNotEmpty() ||
+            function.text.substringBefore("fun").trim() !in modifiers ||
+            function.valueParameters.isNotEmpty() || function.typeParameters.isNotEmpty() ||
+            function.receiverTypeReference != null) return null
+        methods.add(function.name ?: return null)
+    }
+    return methods.sorted().takeIf { it.distinct().size == it.size }
+}
 private fun json(v: Any?): String = when (v) {
     null -> "null"
     is Boolean, is Number -> v.toString()
@@ -245,6 +265,18 @@ private class HeaderExtension(private val originalConfiguration: CompilerConfigu
             expected.forEach { check(sha(it.third.readBytes()) == it.second) { "Source changed while generating headers" } }
             proof.finish()
             facts["outputs"] = records
+            facts["plainMemberNamespaces"] = files.filter { key(File(it.virtualFile.path)) !in unknown }.flatMap { file ->
+                file.declarations.filterIsInstance<KtClass>().mapNotNull { type ->
+                    val methods = plainMemberNames(type) ?: return@mapNotNull null
+                    val binary = listOf(file.packageFqName.asString(), type.name ?: return@mapNotNull null)
+                        .filter { it.isNotEmpty() }.joinToString(".")
+                    val source = key(File(file.virtualFile.path))
+                    val relative = binary.replace('.', '/') + ".class"
+                    if (outputs.none { it.first == relative && it.second == listOf(source) }) return@mapNotNull null
+                    mapOf("binaryName" to binary, "source" to source,
+                        "sourceSha256" to kt.getValue(source).second, "methods" to methods)
+                }
+            }
             facts["factoryDone"] = true
             facts["bindingIdentityPreserved"] = true
             facts["bindingDiagnosticsPreserved"] = true

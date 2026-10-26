@@ -3407,3 +3407,125 @@ fn built_generated_method_capture_paired_current_api_receiver_and_ranges() {
             .any(|method| method.name.as_ref() == absent));
     }
 }
+
+#[test]
+fn plain_kotlin_member_namespace_rejects_implicit_apis_and_stale_java_ranges() {
+    use ktcore::classfile::{ClassFileFacts,MemberFacts};
+    use ktcore::jvm::{ClassIdentity,InputIdentity};
+    let member=|name:&str,descriptor:&str,flags|MemberFacts {
+        name:Arc::from(name),descriptor:Arc::from(descriptor),access_flags:flags,
+        signature:None,attribute_names:vec![],
+    };
+    let mut class=ClassFileFacts {
+        identity:ClassIdentity {origin_id:"current-kotlin-header".into(),internal_name:"generated/KspKotlin".into(),input:InputIdentity::Binary {content_sha256:[7;32]}},
+        major_version:52,minor_version:0,access_flags:0x31,super_name:Some(Arc::from("java/lang/Object")),
+        interfaces:vec![],signature:None,source_file:Some(Arc::from("KspKotlin.kt")),
+        attribute_names:vec![],inner_classes:vec![],fields:vec![],
+        methods:vec![member("<init>","()V",1),member("versionTwo","()Ljava/lang/String;",0x11)],
+    };
+    let names=BTreeSet::from(["versionTwo".to_owned()]);
+    assert!(plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    class.fields.push(member("property","I",1));
+    assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    class.fields.clear();
+    for flags in [0x21,0x431,0x4031] {
+        class.access_flags=flags;
+        assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    }
+    class.access_flags=0x31;
+    class.interfaces.push(Arc::from("generated/Unknown"));
+    assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    class.interfaces.clear();
+    class.signature=Some(Arc::from("<T:Ljava/lang/Object;>Ljava/lang/Object;"));
+    assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    class.signature=None;
+    class.methods[1].signature=Some(Arc::from("()TT;"));
+    assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    class.methods[1].signature=None;
+    class.methods.push(member("copy","()Lgenerated/KspKotlin;",0x1011));
+    assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&names));
+    class.methods.pop();
+    assert!(!plain_kotlin_namespace_class(&class,"generated.KspKotlin",&BTreeSet::from(["versionOne".to_owned()])));
+    assert!(!plain_kotlin_namespace_class(&class,"generated.Other",&names));
+    let text="class JavaUse { /*😀*/ void f(KspKotlin kotlin) { kotlin.versionOne(); } }";
+    let byte=text.find("kotlin.versionOne()").unwrap();
+    let start=text[..byte].encode_utf16().count();
+    let receiver_end=start+"kotlin".len();let end=receiver_end+1+"versionOne".len();
+    let call=json!({"sourceUri":"file:///fixture/JavaUse.java","receiver":"kotlin","method":"versionOne",
+        "callStart":start,"selectStart":start,"receiverStart":start,"receiverEnd":receiver_end,"selectEnd":end,"callEnd":end+2});
+    let diagnostic=json!({"sourceUri":"file:///fixture/JavaUse.java","kind":"ERROR",
+        "code":"compiler.err.cant.resolve.location.args","start":start,"end":end,"position":receiver_end});
+    assert_eq!(bound_missing_zero_argument_selector(&diagnostic,&call,text),text.find("versionOne"));
+    for field in ["start","end","position"] {
+        let mut wrong=diagnostic.clone();wrong[field]=json!(wrong[field].as_u64().unwrap()+1);
+        assert!(bound_missing_zero_argument_selector(&wrong,&call,text).is_none());
+    }
+    let mut wrong=call.clone();wrong["sourceUri"]=json!("file:///foreign/JavaUse.java");
+    assert!(bound_missing_zero_argument_selector(&diagnostic,&wrong,text).is_none());
+    assert!(bound_missing_zero_argument_selector(&diagnostic,&call,&format!("/*changed*/{text}")).is_none());
+}
+
+#[test]
+#[ignore = "requires explicitly retained external-build phase1 model and wire sources; no Gradle execution"]
+fn captured_built_kotlin_member_namespace_publishes_current_missing_method() {
+    use sha2::Digest;
+    let report = std::env::var_os("KTLSP_CAPTURED_GENERATED_REPORT").expect("captured report");
+    let manifest = std::env::var_os("KTLSP_CAPTURED_GENERATED_MANIFEST").expect("captured manifest");
+    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    let captured = &report["refresh_ordering"]["1"]["model"];
+    let model_text = captured["cache_text"].as_str().unwrap();
+    assert_eq!(format!("{:x}", sha2::Sha256::digest(model_text.as_bytes())), captured["cache_sha256"].as_str().unwrap());
+    let model: Value = serde_json::from_str(model_text).unwrap();
+    let model = Arc::new(ProjectSnapshot::new(serde_json::from_value(model["modules"].clone()).unwrap()));
+    assert_eq!(manifest["exact_selected_membership"], json!(true));
+    let mut ws = Workspace::new();
+    let indexed = crate::workspace::prepare_model_sources(&model, &std::collections::HashMap::new());
+    ws.set_project_model(model);
+    ws.apply_model_sources(indexed);
+    let mut originals = Vec::new();
+    let load = |content: &Value| {
+        let bytes = std::fs::read(content["artifact"].as_str().unwrap()).unwrap();
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&bytes)), content["sha256"].as_str().unwrap());
+        String::from_utf8(bytes).unwrap()
+    };
+    for source in manifest["disk_files"].as_array().unwrap() {
+        let path = PathBuf::from(source["origin_path"].as_str().unwrap());
+        originals.push((path.clone(), std::fs::read(&path).unwrap()));
+        ws.open(crate::paths::file_key(&path), load(&source["content"]));
+    }
+    let mut java = None;
+    for overlay in manifest["wire_overlays"].as_array().unwrap() {
+        let key = crate::paths::file_key(Path::new(overlay["path"].as_str().unwrap()));
+        assert_eq!(overlay["identity_complete"], json!(true));
+        if overlay["label"] == "Java" { java = Some(key.clone()); }
+        ws.open(key, load(&overlay["wire_content"]));
+    }
+    let java = java.expect("current Java consumer");
+    let request = ws.begin_kotlin_diagnostics(&java).expect("actual captured Java request");
+    let (wake, _events) = tokio::sync::mpsc::channel(1);
+    let environment = crate::compile::KotlinDiagnosticEnvironment::prepare(&request, wake).unwrap();
+    let outcome = crate::compile::run_kotlin_editor_compile(&request, &environment);
+    // Always preserve the user's project, including when the positive assertion fails.
+    for (path, bytes) in originals { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    match &outcome {
+        KotlinDiagnosticOutcome::Verified { diagnostics, .. } => {
+            let rows: Vec<_> = diagnostics.iter().filter(|row| row.path == java && row.severity == Severity::Error).collect();
+            eprintln!("captured_current_java_errors={:?}", rows.iter().map(|row| (row.line, row.col, &row.message)).collect::<Vec<_>>());
+            assert!(rows.iter().any(|row| row.line == 6 && row.message.contains("versionOne")), "current KspKotlin missing method must be diagnosed");
+            assert_eq!(rows.len(), 1, "the compiler append only certifies the Kotlin owner; Java source positives come from shared analysis");
+        }
+        KotlinDiagnosticOutcome::Unverified(reason) => panic!("captured current generated input remained unknown: {reason}"),
+    }
+    let changed = ws.finish_kotlin_diagnostics(&request, outcome, environment.invalid.clone());
+    assert!(changed.contains(&java));
+    assert!(ws.kotlin_diagnostic_result_id(&java).is_some(), "positive must reach the current workspace publication");
+    let text = &request.overlays.iter().find(|source| source.key == java).unwrap().text;
+    let published = ws.diagnostics(&java);
+    let rows: Vec<_> = published.iter().filter(|row| row.severity == Severity::Error).collect();
+    let lines: Vec<_> = rows.iter().map(|row| text[..row.start_byte].bytes().filter(|byte| *byte == b'\n').count() + 1).collect();
+    eprintln!("captured_published_java_errors={:?}", rows.iter().zip(&lines).map(|(row,line)| (line,&row.message)).collect::<Vec<_>>());
+    assert_eq!(rows.len(), 1, "this isolated compiler replay publishes the newly proved Kotlin positive; full-editor Java source positives are verified by the editor scenario");
+    assert!(rows.iter().zip(&lines).any(|(row,line)| *line == 6 && row.message.contains("versionOne")));
+    environment.close();
+}

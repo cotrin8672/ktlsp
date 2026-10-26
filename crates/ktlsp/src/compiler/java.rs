@@ -2117,6 +2117,176 @@ fn import_diagnostics(
     Ok(result)
 }
 
+// Private host-side candidate; NOT applied to ROOT or included in 57s.
+// Caller must first validate the existing K1 header stage, exact source SHA membership,
+// sealed output SHA, and methodCalls' source/origin against that SAME owned invocation.
+fn plain_kotlin_namespace_class(
+    class: &ktcore::classfile::ClassFileFacts,
+    binary_name: &str,
+    methods: &BTreeSet<String>,
+) -> bool {
+    if class.identity.internal_name != binary_name.replace('.', "/")
+        || class.access_flags & 0x0011 != 0x0011
+        || class.access_flags & 0x6600 != 0
+        || class.super_name.as_deref() != Some("java/lang/Object")
+        || !class.interfaces.is_empty()
+        || !class.fields.is_empty()
+        || !class.inner_classes.is_empty()
+        || class.signature.is_some()
+        || class.methods.iter().filter(|method| method.name.as_ref() == "<init>").count() != 1
+    {
+        return false;
+    }
+    let mut names = BTreeSet::new();
+    for method in &class.methods {
+        if method.name.as_ref() == "<init>" {
+            if method.descriptor.as_ref() != "()V" || method.access_flags & 0x0001 == 0 {
+                return false;
+            }
+        } else if method.access_flags & 0x0011 != 0x0011
+            || method.access_flags & 0x1548 != 0
+            || !method.descriptor.starts_with("()")
+            || method.signature.is_some()
+            || method.name.contains('$')
+            || !names.insert(method.name.to_string())
+        {
+            return false;
+        }
+    }
+    names == *methods
+}
+
+// This only binds an already-observed Javac ERROR to a current, zero-argument method
+// token. It is not a member-absence proof; the per-owner namespace above is also required.
+fn bound_missing_zero_argument_selector(
+    diagnostic: &Value,
+    call: &Value,
+    text: &str,
+) -> Option<usize> {
+    if diagnostic["kind"] != "ERROR"
+        || diagnostic["code"] != "compiler.err.cant.resolve.location.args"
+        || diagnostic["sourceUri"] != call["sourceUri"]
+    {
+        return None;
+    }
+    let position = |row: &Value, key: &str| {
+        row[key].as_u64().and_then(|value| usize::try_from(value).ok())
+    };
+    let receiver = call["receiver"].as_str()?;
+    let method = call["method"].as_str()?;
+    let identifier = |name: &str| {
+        !name.is_empty() && name.bytes().enumerate().all(|(i, c)|
+            c.is_ascii_alphabetic() || c == b'_' || (i > 0 && c.is_ascii_digit()))
+    };
+    if !identifier(receiver) || !identifier(method) { return None; }
+    let start = position(call, "selectStart")?;
+    let receiver_end = position(call, "receiverEnd")?;
+    let end = position(call, "selectEnd")?;
+    let call_end = position(call, "callEnd")?;
+    if position(call, "callStart")? != start
+        || position(call, "receiverStart")? != start
+        || position(diagnostic, "start")? != start
+        || position(diagnostic, "end")? != end
+        || position(diagnostic, "position")? != receiver_end
+        || receiver_end != start.checked_add(receiver.encode_utf16().count())?
+        || end != receiver_end.checked_add(1 + method.encode_utf16().count())?
+        || call_end != end.checked_add(2)?
+    { return None; }
+    let start_byte = utf16_byte_offset(text, start)?;
+    let call_end_byte = utf16_byte_offset(text, call_end)?;
+    if text.get(start_byte..call_end_byte)? != format!("{receiver}.{method}()") {
+        return None;
+    }
+    utf16_byte_offset(text, receiver_end.checked_add(1)?)
+}
+
+// Called after import_diagnostics validates the same Javac task's complete input stream.
+// This publishes only located errors; it neither creates a clean result nor closes producers.
+fn plain_kotlin_method_diagnostics(
+    value: &Value,
+    header: &Value,
+    expected: &BTreeMap<String, String>,
+    overlay: &KotlinEditorOverlay,
+) -> anyhow::Result<Vec<CompileDiagnostic>> {
+    let Some(proofs) = header.get("plainMemberNamespaces").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    if header["component"] != "tool-owned-compiler-core-header-probe"
+        || header["headersUsable"] != true || header["allApiTypesKnown"] != true
+    { return Ok(Vec::new()); }
+    let Some(calls) = value.get("methodCalls").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let identifier = |name: &str| !name.is_empty() && name.bytes().enumerate().all(|(i,c)|
+        c.is_ascii_alphabetic() || c == b'_' || (i > 0 && c.is_ascii_digit()));
+    let mut certified = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for proof in proofs {
+        let (Some(binary),Some(source),Some(digest),Some(methods)) =
+            (proof["binaryName"].as_str(),proof["source"].as_str(),
+             proof["sourceSha256"].as_str(),proof["methods"].as_array()) else { continue; };
+        if !binary.split('.').all(identifier) || !source.ends_with(".kt")
+            || expected.get(&header_key(Path::new(source))).map(String::as_str) != Some(digest)
+            || !overlay.sources.iter().any(|path| same_path(path,Path::new(source)))
+            || !array(header,"sourceInventory")?.iter().any(|row|
+                row["kind"] == "kotlin" && row["sha256"] == digest
+                    && row["path"].as_str().is_some_and(|path|same_path(Path::new(path),Path::new(source))))
+        { continue; }
+        let Some(names) = methods.iter().map(|name| name.as_str().filter(|name|identifier(name)).map(str::to_owned))
+            .collect::<Option<BTreeSet<_>>>() else { continue; };
+        if names.len()!=methods.len() { continue; }
+        let relative=format!("{}.class",binary.replace('.',"/"));
+        let records:Vec<_>=array(header,"outputs")?.iter().filter(|row|
+            row["relativePath"]==relative && row["apiStatus"]=="SignatureChecked"
+                && row["sources"].as_array().is_some_and(|sources|
+                    sources.len()==1 && sources[0].as_str().is_some_and(|path|
+                        same_path(Path::new(path),Path::new(source))))).collect();
+        if records.len()!=1 { continue; }
+        let path=overlay.directory.join("lease").join(&relative);
+        let bytes=std::fs::read(&path)?;
+        let output_digest=sha(&bytes);
+        if records[0]["sha256"]!=output_digest || records[0]["bytes"].as_u64()!=Some(bytes.len() as u64) {
+            continue;
+        }
+        let class=ktcore::classfile::decode("current-kotlin-header",&bytes)?;
+        if !plain_kotlin_namespace_class(&class,binary,&names) { continue; }
+        if certified.insert(binary.to_owned(),(path,output_digest,names)).is_some() {
+            ambiguous.insert(binary.to_owned());
+        }
+    }
+    let mut by_uri=BTreeMap::new();
+    for row in array(value,"sourcesBefore")? {
+        let path=PathBuf::from(value_string(row,"path")?);
+        if expected.get(&header_key(&path)).map(String::as_str)==row["sha256"].as_str() {
+            by_uri.insert(value_string(row,"uri")?,path);
+        }
+    }
+    let mut diagnostics=Vec::new();
+    let mut seen=BTreeSet::new();
+    for diagnostic in array(value,"diagnostics")? {
+        let Some(uri)=diagnostic["sourceUri"].as_str() else { continue; };
+        let Some(path)=by_uri.get(uri) else { continue; };
+        let text=std::fs::read_to_string(path)?;
+        for call in calls {
+            let Some(binary)=call["receiverType"].as_str() else { continue; };
+            let Some((origin,digest,names))=certified.get(binary) else { continue; };
+            if ambiguous.contains(binary) || call["originKind"]!="class" || call["simpleOwnedApi"]!=true
+                || call["originSha256"]!=*digest
+                || !call["originPath"].as_str().is_some_and(|path|same_path(Path::new(path),origin))
+                || call["method"].as_str().is_none_or(|name|names.contains(name))
+            { continue; }
+            let Some(selector)=bound_missing_zero_argument_selector(diagnostic,call,&text) else { continue; };
+            let original=overlay.paths.get(&kotlin_path_key(&crate::paths::file_key(path)))
+                .ok_or_else(||anyhow::anyhow!("java-plain-kotlin-source-unmapped"))?;
+            if !seen.insert((original.clone(),selector)) { continue; }
+            let (line,col)=crate::text::LineIndex::new(&text).position(&text,selector);
+            diagnostics.push(CompileDiagnostic {path:original.clone(),line:line+1,col:col+1,
+                severity:Severity::Error,message:value_string(diagnostic,"message")?.to_owned()});
+        }
+    }
+    Ok(diagnostics)
+}
+
 // Called only after import_diagnostics validates this SAME task's full source/option/runtime stream.
 // K2 contributes complete current outputs; java.base receivers use the existing watched selected SDK.
 fn platform_method_diagnostics(
@@ -2575,6 +2745,7 @@ fn run_checked(
         exit,
         complete_k2,
     )?;
+    result.extend(plain_kotlin_method_diagnostics(&value, &receipt, &expected, overlay)?);
     if let Some(before) = &canonical_outputs {
         complete_outputs_match(
             &overlay.directory.join("classes"),
