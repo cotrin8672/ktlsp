@@ -601,7 +601,7 @@ object KtlspCompilerConfiguration {
     }.getOrNull()
 
 
-    private fun read(bean: Any, getter: String): Any? {
+    fun read(bean: Any, getter: String): Any? {
         val method = bean.javaClass.methods.firstOrNull { it.name == getter && it.parameterCount == 0 }
             ?: error("Compiler task does not expose $getter")
         val value = method.invoke(bean)
@@ -1365,8 +1365,7 @@ class KtlspDumpClasspathAction(
 // project's compiler configurations eagerly can violate Gradle's owner-lock requirement. The importer
 // disables configuration caching until cached provider values are proved to refresh compiler recipes
 // and source membership. Watching the configuration collection also handles plugins that create
-// `compileClasspath` from a later `afterEvaluate` callback. Modules without that configuration skip
-// task registration entirely.
+// JVM compilation configurations can also be target-specific in Kotlin Multiplatform projects.
 val compilerRuntimes = gradle.sharedServices.registerIfAbsent("ktlspCompilerRuntimes", KtlspCompilerRuntimes::class.java) {}
 
 allprojects {
@@ -1375,6 +1374,23 @@ allprojects {
     val currentBuildRoot = rootProject.projectDir.absolutePath
     val includedBuildRoots = gradle.includedBuilds.associate { it.name to it.projectDir.absolutePath }
     val sourceSets = mutableListOf<KtlspSourceSet>()
+    var dumpRegistered = false
+
+    fun registerDump(configuration: org.gradle.api.artifacts.Configuration) {
+        if (dumpRegistered) return
+        dumpRegistered = true
+        val classpathFiles = configuration.incoming.artifactView { isLenient = true }.files
+        val resolutionRoot = configuration.incoming.resolutionResult.rootComponent
+        listOf("ktlspDumpClasspath", "ktlspDumpSources").forEach { taskName ->
+            tasks.register(taskName) {
+                usesService(compilerRuntimes)
+                doLast(KtlspDumpClasspathAction(
+                    projectPath, projectDirPath, currentBuildRoot, includedBuildRoots,
+                    classpathFiles, resolutionRoot, sourceSets,
+                ))
+            }
+        }
+    }
 
     plugins.withId("java-base") {
         extensions.getByType(SourceSetContainer::class.java).all {
@@ -1462,21 +1478,91 @@ allprojects {
         }
     }
 
-    configurations.matching { it.name == "compileClasspath" }.all {
-        val classpathFiles = incoming.artifactView {
-            isLenient = true
-        }.files
-        val resolutionRoot = incoming.resolutionResult.rootComponent
+    configurations.matching { it.name == "compileClasspath" }.all { registerDump(this) }
 
-        listOf("ktlspDumpClasspath", "ktlspDumpSources").forEach { taskName ->
-          tasks.register(taskName) {
-            usesService(compilerRuntimes)
-            // Gradle 7 serializes enclosing Kotlin DSL closures, including their Project receiver.
-            doLast(KtlspDumpClasspathAction(
-                projectPath, projectDirPath, currentBuildRoot, includedBuildRoots,
-                classpathFiles, resolutionRoot, sourceSets,
-            ))
-          }
+    plugins.withId("org.jetbrains.kotlin.multiplatform") {
+        val extension = extensions.getByName("kotlin")
+        @Suppress("UNCHECKED_CAST")
+        val targets = KtlspCompilerConfiguration.read(extension, "getTargets") as org.gradle.api.DomainObjectCollection<Any>
+        targets.all {
+            val target = this
+            if (KtlspCompilerConfiguration.read(target, "getPlatformType").toString() == "jvm") {
+                @Suppress("UNCHECKED_CAST")
+                val compilations = KtlspCompilerConfiguration.read(target, "getCompilations") as org.gradle.api.DomainObjectCollection<Any>
+                compilations.all {
+                    val compilation = this
+                    val sourceSetName = KtlspCompilerConfiguration.read(compilation, "getDefaultSourceSetName") as String
+                    val configurationName = KtlspCompilerConfiguration.read(compilation, "getCompileDependencyConfigurationName") as String
+                    configurations.matching { it.name == configurationName }.all {
+                    val configuration = this
+                    val view = configuration.incoming.artifactView { isLenient = true }
+                    val javaProvider = runCatching {
+                        compilation.javaClass.methods.firstOrNull {
+                            it.name == "getCompileJavaTaskProvider" && it.parameterCount == 0
+                        }?.invoke(compilation) as? org.gradle.api.tasks.TaskProvider<*>
+                    }.getOrNull()
+                    // Replace only the Java SourceSet representing this same compilation, if present.
+                    val javaSet = extensions.findByType(SourceSetContainer::class.java)?.singleOrNull {
+                        it.compileJavaTaskName == javaProvider?.name
+                    }
+                    if (javaSet != null) sourceSets.removeAll { it.name == javaSet.name }
+                    val metadata = providers.provider {
+                        val kotlinTask = KtlspCompilerConfiguration.read(compilation, "getCompileTaskProvider") as Task
+                        val javaTask = javaProvider?.orNull as? JavaCompile
+                        val roots = linkedSetOf<java.io.File>()
+                        val kotlinSets = KtlspCompilerConfiguration.read(compilation, "getAllKotlinSourceSets") as Iterable<*>
+                        kotlinSets.filterNotNull().forEach { set ->
+                            roots.addAll((KtlspCompilerConfiguration.read(set, "getKotlin") as SourceDirectorySet).srcDirs)
+                        }
+                        javaTask?.source?.visit {
+                            if (!isDirectory) {
+                                var inputRoot = file
+                                relativePath.segments.forEach { inputRoot = inputRoot.parentFile }
+                                roots.add(inputRoot)
+                            }
+                        }
+                        javaTask?.options?.generatedSourceOutputDirectory?.orNull?.asFile?.let(roots::add)
+                        val output = KtlspCompilerConfiguration.read(compilation, "getOutput")!!
+                        val outputs = (KtlspCompilerConfiguration.read(output, "getAllOutputs") as FileCollection).files
+                        val provided = linkedSetOf<java.io.File>()
+                        if (KtlspCompilerConfiguration.read(compilation, "getName") == "main") {
+                            listOf("getApiElementsConfigurationName", "getRuntimeElementsConfigurationName").forEach { getter ->
+                                val name = KtlspCompilerConfiguration.read(target, getter) as String
+                                configurations.findByName(name)?.outgoing?.let { outgoing ->
+                                    provided.addAll(outgoing.artifacts.files.files)
+                                    outgoing.variants.forEach { provided.addAll(it.artifacts.files.files) }
+                                }
+                            }
+                        }
+                        val actualClasspath = runCatching {
+                            (KtlspCompilerConfiguration.read(compilation, "getCompileDependencyFiles") as FileCollection).files
+                        }
+                        val entries = actualClasspath.getOrElse { view.files.files }
+                        val compilers = listOfNotNull(javaTask?.let {
+                            KtlspCompilerConfiguration.dump(it, "java", compilerRuntimes)
+                        }) + KtlspCompilerConfiguration.dump(kotlinTask, "kotlin", compilerRuntimes)
+                        roots.map { "SOURCE\t${sourceSetName}\t${it.absolutePath}" } +
+                            outputs.map { "OUTPUT\t${sourceSetName}\t${it.absolutePath}" } +
+                            provided.map { "PROVIDES\t${sourceSetName}\t${it.absolutePath}" } +
+                            listOf("KOTLIN_COMPILE_TASK\t${sourceSetName}\t${JsonOutput.toJson(kotlinTask.path)}") +
+                            compilers.map { "COMPILER\t${sourceSetName}\t${it}" } +
+                            entries.map { "SCP\t${sourceSetName}\t${it.absolutePath}" } +
+                            if (actualClasspath.isFailure) listOf("INCOMPLETE\t${sourceSetName}") else emptyList()
+                    }
+                    sourceSets.add(KtlspSourceSet(sourceSetName, metadata, providers.provider {
+                        view.artifacts.artifacts.map { artifact ->
+                            val identity = when (val id = artifact.id.componentIdentifier) {
+                                is ModuleComponentIdentifier -> "MODULE\t${id.group}\t${id.module}\t${id.version}"
+                                is ProjectComponentIdentifier -> "PROJECT\t${KtlspBuildIdentity.path(id.build, currentBuildRoot, includedBuildRoots)}\t${id.projectPath}"
+                                else -> "FILE"
+                            }
+                            "ARTIFACT\t${sourceSetName}\t${artifact.file.absolutePath}\t${identity}"
+                        }
+                    }, configuration.incoming.resolutionResult.rootComponent))
+                    registerDump(configuration)
+                    }
+                }
+            }
         }
     }
 }

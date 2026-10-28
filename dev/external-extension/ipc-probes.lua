@@ -4,8 +4,9 @@ return function(env)
   local client, check = env.client, env.check
   local linked = vim.env.KTLSP_IPC_MODE == 'linked'
   local host_inputs = vim.env.KTLSP_IPC_MODE == 'host-inputs'
+  local catalog = vim.env.KTLSP_IPC_MODE == 'jvm-catalog'
   local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots' or host_inputs
-  local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts
+  local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts or catalog
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
   local paths, buffers, originals = {}, {}, {}
   local proof = { mode = source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
@@ -24,6 +25,7 @@ return function(env)
     vim.fn.writefile({ vim.json.encode(proof) }, env.artifacts .. '/extension-ipc-proof.json')
   end
   local inputs = host_inputs and dofile(env.repo .. '/dev/external-extension/host-input-probes.lua')(env, proof, save) or nil
+  local catalog_probe = catalog and dofile(env.repo .. '/dev/external-extension/jvm-catalog-probes.lua')(env, proof, save) or nil
   local function record(event) proof.ordering[#proof.ordering + 1] = event; save() end
   local function model_state()
     local requested, accepted
@@ -143,7 +145,7 @@ return function(env)
       and jvm.jvmAbiCoverage.state == 'unknown' and jvm.classFlags.state == 'unknown')
     proof.project_facts = proof.project_facts or {}
     proof.project_facts[label] = { evaluation = evaluation, observed = observed, model = snapshot,
-      selected = { module = module.module, source_set = source.name, entries = source.entries } }
+      selected = { module = module.module, source_set = source.name, entries = source.entries, java_home = java.java_home } }
     save()
     return source.entries
   end
@@ -188,6 +190,7 @@ return function(env)
       if facts then value.command[#value.command + 1] = '--project-facts' end
       if source_facts then value.command[#value.command + 1] = '--source-snapshots' end
       if host_inputs then value.command[#value.command + 1] = '--host-inputs'; value.configuration.runtimeClasses={'java/util/List','vendor/Versioned','vendor/Added','app/Main'} end
+      if catalog then value.command[#value.command + 1] = '--jvm-catalog' end
     end
     client:notify('workspace/didChangeConfiguration', { settings = { analysisProviders = { [provider] = value } } })
   end
@@ -198,6 +201,34 @@ return function(env)
   end
   if inputs then inputs.setup() end
   settings(true)
+  if catalog then
+    local denial, rejected, exited, published
+    local ready = vim.wait(15000, function()
+      local path = barrier .. '/catalog-denial.json'
+      if vim.fn.filereadable(path) == 0 then return false end
+      denial = vim.json.decode(table.concat(vim.fn.readfile(path), '\n'))
+      for _, line in ipairs(vim.fn.filereadable(vim.env.KTLSP_TRACE) == 1 and vim.fn.readfile(vim.env.KTLSP_TRACE) or {}) do
+        local ok, event = pcall(vim.json.decode, line)
+        if ok and event.args and event.args.provider == provider and event.name == 'extension.ipc.exited' then exited = event end
+        if ok and event.args and tostring(event.args.evaluation) == tostring(denial.evaluation) then
+          if event.name == 'extension.ipc.rejected' then rejected = event end
+          if event.name == 'extension.ipc.accepted' then published = true end
+        end
+      end
+      return rejected ~= nil and exited ~= nil
+    end, 25)
+    local before_path = barrier .. '/catalog-denial-before.json'
+    local before = vim.fn.filereadable(before_path) == 1 and vim.json.decode(table.concat(vim.fn.readfile(before_path), '\n')) or nil
+    local valid = ready and not published and not fresh_diagnostic and denial.error.code == -32602
+      and denial.error.message == 'foreign runtime class identity' and type(exited.args.instance) == 'number'
+      and before and tostring(before.evaluation) == tostring(denial.evaluation)
+      and type(before.descriptor.entry) == 'string' and before.descriptor.internalName == 'vendor/Versioned'
+    check('catalog handle denial rejects its evaluation without publication', valid)
+    assert(valid, 'catalog denial evaluation did not terminate correctly')
+    proof.jvm_catalog.denial = denial; proof.jvm_catalog.denial_before = before; proof.jvm_catalog.denial_rejection = rejected
+    proof.jvm_catalog.denial_exited = exited; save()
+    settings(false); settings(true)
+  end
   if linked then
     local changed = vim.split(table.concat(lines('target'), '\n'):gsub('value %* 2', 'value * 3'), '\n', { plain = true })
     vim.api.nvim_buf_set_lines(buffers.target, 0, -1, false, changed); deliver()
@@ -221,6 +252,7 @@ return function(env)
     record('normal-completion-returned-before-release')
     if facts then
       project_facts('initial', proof.paused_evaluation)
+      if catalog_probe then catalog_probe.capture('initial', proof.paused_evaluation) end
       if source_facts then source_snapshots('initial', proof.paused_evaluation) end
       if inputs then inputs.capture('initial', proof.paused_evaluation); inputs.change_wire() end
       proof.initial_model_generation = model_state()
@@ -290,9 +322,14 @@ return function(env)
       return false
     end, 25)
     assert(ready_facts, 'fresh facts did not produce an accepted contribution')
+    if catalog then
+      check('fresh catalog contribution uses a new provider instance', type(accepted.args.instance) == 'number'
+        and accepted.args.instance ~= proof.jvm_catalog.denial_exited.args.instance)
+    end
     check('fresh contribution matches the current owner bytes', accepted.args.source_sha256 == probe.buffer_sha256(buffers.mixin))
     proof.facts_publication = accepted
     local entries = project_facts('fresh', tostring(accepted.args.evaluation))
+    if catalog_probe then catalog_probe.capture('fresh', tostring(accepted.args.evaluation)) end
     if source_facts then source_snapshots('fresh', tostring(accepted.args.evaluation)) end
     if inputs then inputs.capture('fresh',tostring(accepted.args.evaluation)); inputs.native_lifecycle() end
     local initial = proof.project_facts.initial.selected.entries
@@ -302,6 +339,7 @@ return function(env)
     check('fresh projectContext observes the real added classpath entry', found and #entries > #initial)
     record('two-project-fact-operations-and-fresh-contribution-verified')
   end
+  if catalog then save(); return end
   request('fresh extension completion has shared descriptor and exact editable range', 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/completion', { context = { triggerKind = 1 } },
     function(result)
       for _, item in ipairs(result and (result.items or result) or {}) do

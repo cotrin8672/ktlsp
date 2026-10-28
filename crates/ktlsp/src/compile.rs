@@ -4527,6 +4527,8 @@ fn kotlin_editor_arguments(
             | "-progressive"
             | "-Xjvm-default=compatibility"
             | "-Xallow-no-source-files"
+            | "-Xmulti-platform"
+            | "-Xexpect-actual-classes"
             | "-java-parameters"
             | "-Xsam-conversions=class"
             | "-Xsuppress-version-warnings"
@@ -5688,6 +5690,40 @@ mod kotlin_editor_compile_tests {
         );
         assert_eq!(request.task.arguments, selected);
         assert!(KotlinEnvironmentKey::new(&request).unwrap() != original_key);
+    }
+
+    #[test]
+    fn argument_adapter_preserves_multiplatform_flags_private_sources_and_environment_identity() {
+        let root = std::env::temp_dir().join("ktlsp-multiplatform-args");
+        let mut request = kotlin_test_request(&root);
+        let recipe = request.task.kotlin_compiler.as_mut().unwrap();
+        recipe.compiler_version = "2.2.21".into();
+        recipe.gradle_plugin_version = "2.2.21".into();
+        recipe.run_via_build_tools_api = false;
+        recipe.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+        let output = root.join("private/classes");
+        let sources = [root.join("private/common/Expected.kt"), root.join("private/jvm/Actual.kt")];
+        let mut expected = kotlin_editor_arguments(&request, &output, &sources).unwrap();
+        let baseline = KotlinEnvironmentKey::new(&request).unwrap();
+        let position = request.task.arguments.len();
+        let flags = ["-Xmulti-platform", "-Xexpect-actual-classes"];
+        request.task.arguments.extend(flags.map(str::to_owned));
+        let selected = request.task.arguments.clone();
+        expected.splice(position..position, flags.map(str::to_owned));
+        assert_eq!(kotlin_editor_arguments(&request, &output, &sources).unwrap(), expected);
+        assert_eq!(request.task.arguments, selected);
+        let current = KotlinEnvironmentKey::new(&request).unwrap();
+        assert!(current != baseline);
+        for flag in flags {
+            let mut changed = request.clone();
+            changed.task.arguments.retain(|argument| argument != flag);
+            assert!(KotlinEnvironmentKey::new(&changed).unwrap() != current);
+        }
+        for argument in ["-Xmulti-platform=true", "-Xexpect-actual-classes=true", "-Xcommon-sources=unverified.kt"] {
+            let mut changed = request.clone();
+            changed.task.arguments.push(argument.into());
+            assert!(kotlin_editor_arguments(&changed, &output, &sources).is_err(), "{argument}");
+        }
     }
 
     #[test]

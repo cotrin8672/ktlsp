@@ -38,6 +38,9 @@ const RESOURCE_SNAPSHOT:u16=64;
 const RUNTIME_CLASSES: &str = "runtime-class-bytes-v1";
 const RUNTIME_CLASS: u16 = 128;
 const CLASS_BYTES: u16 = 256;
+const JVM_CATALOG: &str = "jvm-catalog-v1";
+const JVM_INVENTORY: u16 = 512;
+const JVM_CLASS: u16 = 1024;
 
 fn project_operations(result: &Value) -> u16 {
     let mut selected = 0;
@@ -46,6 +49,7 @@ fn project_operations(result: &Value) -> u16 {
         (SOURCE_SNAPSHOTS, &[("sourceInventory",SOURCE_INVENTORY),("sourceSnapshot",SOURCE_SNAPSHOT)][..]),
         (RESOURCES, &[("resourceInventory",RESOURCE_INVENTORY),("resourceLookup",RESOURCE_LOOKUP),("resourceSnapshot",RESOURCE_SNAPSHOT)][..]),
         (RUNTIME_CLASSES, &[("runtimeClass",RUNTIME_CLASS),("classBytes",CLASS_BYTES)][..]),
+        (JVM_CATALOG, &[("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)][..]),
     ] {
         if !result["capabilities"].as_array().is_some_and(|values|
             values.iter().any(|value| value == capability)) { continue; }
@@ -61,10 +65,11 @@ fn project_operations(result: &Value) -> u16 {
 fn initialize_message(provider:&str,commands:&std::collections::BTreeSet<String>)->Value {
     json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{
         "protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":provider,
-        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,"provider-commands-v1"],
+        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,"provider-commands-v1"],
         "commands":commands,"supportedOps":{
             PROJECT_FACTS:["projectContext","typeJvm"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"],
-            RESOURCES:["resourceInventory","resourceLookup","resourceSnapshot"],RUNTIME_CLASSES:["runtimeClass","classBytes"]
+            RESOURCES:["resourceInventory","resourceLookup","resourceSnapshot"],RUNTIME_CLASSES:["runtimeClass","classBytes"],
+            JVM_CATALOG:["jvmCatalog","jvmClass"]
         }}})
 }
 
@@ -208,6 +213,8 @@ fn token(value: &Value) -> Result<&str, String> {
 }
 
 enum Handle {
+    JvmCatalog,
+    JvmCatalogPage { prefix:String, next:usize },
     ClassIdentity { identity: ktcore::jvm::ClassIdentity, byte_length: usize },
     ClassBytesCursor { identity: ktcore::jvm::ClassIdentity, next: usize },
     Type(TypeId),
@@ -241,6 +248,10 @@ pub(crate) struct Evaluation {
     pub(crate) resource_results:BTreeMap<String,Result<Arc<crate::resource_inputs::ResourceBytes>,&'static str>>,
     class_scope: Option<Arc<crate::runtime_bytes::RuntimeClassScope>>,
     class_results: BTreeMap<String, crate::runtime_bytes::ClassReadResult>,
+    jvm_catalog: Option<Arc<crate::jvm_catalog::JvmCatalog>>,
+    jvm_catalog_token: Option<String>,
+    jvm_catalog_error: Option<String>,
+    jvm_classes: BTreeMap<usize, Result<Arc<ktcore::classfile::ClassFileFacts>,String>>,
     handles: BTreeMap<String, Handle>,
     batches: usize,
     stream_continuations: usize,
@@ -265,6 +276,7 @@ impl Evaluation {
             resource_catalog:None,resource_catalog_token:None,resource_results:BTreeMap::new(),
             class_scope: None,
             class_results: BTreeMap::new(),
+            jvm_catalog:None, jvm_catalog_token:None, jvm_catalog_error:None, jvm_classes:BTreeMap::new(),
             handles: BTreeMap::new(),
             batches: 0,
             stream_continuations: 0, stream_bytes: 0, prepaid_input: None, reply_is_stream: false,
@@ -274,6 +286,110 @@ impl Evaluation {
         let token = format!("{}:{}", self.id, self.handles.len());
         self.handles.insert(token.clone(), handle);
         token
+    }
+
+    fn jvm_entry(&self, token: &str) -> Result<usize,String> {
+        let authority = self.jvm_catalog_token.as_ref().ok_or("foreign JVM catalog entry")?;
+        let index = token.strip_prefix(&format!("{authority}@")).and_then(|index|index.parse::<usize>().ok())
+            .filter(|index|self.jvm_catalog.as_ref().is_some_and(|catalog|*index<catalog.entries.len()))
+            .ok_or("foreign JVM catalog entry")?;
+        Ok(index)
+    }
+    fn jvm_page(&self, prefix: &str, after: Option<&str>) -> Result<usize,String> {
+        if prefix.len()>4096 || prefix.starts_with('/') || prefix.contains("//")
+            || prefix.chars().any(|ch|ch.is_control() || matches!(ch,'\\'|'.'|':'|';'|'['|']')) {
+            return Err("invalid JVM binary-name prefix".into());
+        }
+        match after {
+            None => Ok(0),
+            Some(token) => match self.handles.get(token) {
+                Some(Handle::JvmCatalogPage {prefix:expected,next}) if expected==prefix => Ok(*next),
+                _ => Err("foreign JVM catalog cursor".into()),
+            }
+        }
+    }
+    pub(crate) fn begin_jvm_reads(&self, method:&str, params:&Value)
+        -> Result<Option<crate::jvm_catalog::CatalogPlan>,String> {
+        if method!="analysis/readFacts" {return Ok(None);}
+        self.ensure_input_read_budget(params)?;
+        let queries:Vec<ReadQuery>=serde_json::from_value(params["queries"].clone()).map_err(|error|error.to_string())?;
+        let mut wanted=false; let mut reads=Vec::new();
+        for query in queries {
+            match query {
+                ReadQuery::JvmCatalog{prefix,after} => {
+                    if self.project_operations&JVM_INVENTORY==0 {return Err("jvmCatalog was not negotiated".into());}
+                    self.jvm_page(&prefix,after.as_deref())?; wanted=true;
+                }
+                ReadQuery::JvmClass{entry} => {
+                    if self.project_operations&JVM_CLASS==0 {return Err("jvmClass was not negotiated".into());}
+                    reads.push(self.jvm_entry(&entry)?); wanted=true;
+                }
+                _=>{}
+            }
+        }
+        if !wanted {return Ok(None);}
+        if self.jvm_catalog.as_ref().is_some_and(|catalog|!catalog.current()) {return Err("Stale".into());}
+        if reads.is_empty() && self.jvm_catalog.is_some() {return Ok(None);}
+        let Some(model)=self.project.clone() else {return Ok(None);};
+        reads.sort_unstable(); reads.dedup();
+        Ok(Some(crate::jvm_catalog::CatalogPlan {evaluation:self.id,model,owner:self.owner.clone().into(),catalog:self.jvm_catalog.clone(),reads}))
+    }
+    pub(crate) fn finish_jvm_read(&mut self, read:&mut ReadSession<'_>, prepared:crate::jvm_catalog::PreparedCatalog) -> Result<(),String> {
+        if prepared.evaluation!=self.id || !self.project.as_ref().is_some_and(|model|Arc::ptr_eq(model,&prepared.model)) {return Err("Stale".into());}
+        match prepared.catalog {
+            Ok(catalog) => {
+                for guard in &catalog.guards {read.observe_host_input(guard.clone()).map_err(contract)?;}
+                if prepared.classes.values().any(|value|value.as_ref().is_err_and(|error|error=="Stale")) {return Err("Stale".into());}
+                if prepared.classes.values().any(|value|value.as_ref().is_err_and(|error|error==READ_FACTS_RESPONSE_BUDGET_EXCEEDED)) {
+                    return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into());
+                }
+                self.jvm_catalog=Some(catalog); self.jvm_classes=prepared.classes;
+            }
+            Err(error) if error=="Stale" => return Err(error),
+            Err(error) => {self.jvm_catalog_error=Some(error);}
+        }
+        Ok(())
+    }
+    fn jvm_inventory(&mut self, read:&mut ReadSession<'_>, prefix:&str, after:Option<&str>) -> Result<Value,String> {
+        let start=self.jvm_page(prefix,after)?;
+        let Some(catalog)=self.jvm_catalog.clone() else {return Ok(json!({"view":"selectedPhysicalJvmInputs","classes":[],"next":null,
+            "coverage":{"state":"unknown","reasons":[{"code":"JVM_CATALOG_UNAVAILABLE","detail":self.jvm_catalog_error}]},
+            "problems":[],"sourceCurrent":{"state":"unknown","reasons":[{"code":"notSourceAuthority"}]}}));};
+        for guard in &catalog.guards {read.observe_host_input(guard.clone()).map_err(contract)?;}
+        let authority=match &self.jvm_catalog_token {Some(token)=>token.clone(),None=>{
+            let token=self.issue(Handle::JvmCatalog);self.jvm_catalog_token=Some(token.clone());token}};
+        let mut end=start;let mut bytes=1024;let mut classes=Vec::new();
+        while end<catalog.entries.len() {
+            let entry=&catalog.entries[end];
+            if !entry.internal_name.starts_with(prefix) {
+                if entry.internal_name.as_str()>prefix {end=catalog.entries.len();break;}
+                end+=1;continue;
+            }
+            let value=json!({"entry":format!("{authority}@{end}"),"internalName":entry.internal_name,"originId":entry.origin,
+                "association":entry.association,"classpathOrder":entry.order,"authority":entry.authority});
+            let size=serde_json::to_vec(&value).map_err(|error|error.to_string())?.len()+1;
+            if bytes+size>MAX_FRAME/2-32*1024 {break;}
+            bytes+=size;classes.push(value);end+=1;
+        }
+        if end==start && end<catalog.entries.len() {return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into());}
+        let next=(end<catalog.entries.len()).then(||self.issue(Handle::JvmCatalogPage{prefix:prefix.into(),next:end}));
+        Ok(json!({"view":"selectedPhysicalJvmInputs","classes":classes,"next":next,
+            "coverage":if catalog.complete && end==catalog.entries.len(){json!({"state":"found","value":null})}else{missing_fact()},
+            "problems":catalog.problems,"sourceCurrent":{"state":"unknown","reasons":[{"code":"notSourceAuthority"}]}}))
+    }
+    fn jvm_class(&self, read:&mut ReadSession<'_>, token:&str) -> Result<Value,String> {
+        let index=self.jvm_entry(token)?;
+        let catalog=self.jvm_catalog.as_ref().ok_or("missing JVM catalog")?;
+        for guard in &catalog.guards {read.observe_host_input(guard.clone()).map_err(contract)?;}
+        let class=match self.jvm_classes.get(&index).ok_or("JVM class was not captured")? {
+            Ok(class)=>class,
+            Err(error)=>return Ok(json!({"state":"unknown","reasons":[{"code":"JVM_ABI_UNAVAILABLE","detail":error}]})),
+        };
+        let Some(abi)=class_abi(class) else {return Ok(missing_fact());};
+        let value=json!({"state":"found","value":{"entry":token,"authority":catalog.entries[index].authority,"abi":abi,
+            "sourceCurrent":{"state":"unknown","reasons":[{"code":"notSourceAuthority"}]}}});
+        if serde_json::to_vec(&value).map_err(|error|error.to_string())?.len()>MAX_FRAME/2-1024 {return Ok(missing_fact());}
+        Ok(value)
     }
     pub(crate) fn begin_class_reads(&self, method: &str, params: &Value)
         -> Result<Option<crate::runtime_bytes::ClassReadPlan>, String>
@@ -424,6 +540,10 @@ impl Evaluation {
                     if self.project_operations & RESOURCE_SNAPSHOT == 0 { return Err("resourceSnapshot was not negotiated".into()); }
                     self.resource_stream_cursor(resource, after)?;
                     continuations += 1;
+                }
+                ReadQuery::JvmCatalog {prefix,after:Some(after)} => {
+                    if self.project_operations&JVM_INVENTORY==0 {return Err("jvmCatalog was not negotiated".into());}
+                    self.jvm_page(prefix,Some(after))?; continuations+=1;
                 }
                 _ => {}
             }
@@ -883,6 +1003,14 @@ impl Evaluation {
                 let mut remaining = MAX_FRAME / 2;
                 for query in queries {
                     let value = match query {
+                        ReadQuery::JvmCatalog{prefix,after}=>{
+                            if self.project_operations&JVM_INVENTORY==0 {return Err("jvmCatalog was not negotiated".into());}
+                            self.jvm_inventory(read,&prefix,after.as_deref())?
+                        }
+                        ReadQuery::JvmClass{entry}=>{
+                            if self.project_operations&JVM_CLASS==0 {return Err("jvmClass was not negotiated".into());}
+                            self.jvm_class(read,&entry)?
+                        }
                         ReadQuery::ResourceInventory{after}=>{
                             if self.project_operations&RESOURCE_INVENTORY==0 {return Err("resourceInventory was not negotiated".into());}
                             self.resource_inventory(read,after.as_deref())?
@@ -1096,9 +1224,70 @@ fn class_abi(class: &ktcore::classfile::ClassFileFacts) -> Option<Value> {
     (serde_json::to_vec(&value).ok()?.len() <= MAX_FRAME / 2).then_some(value)
 }
 
+#[cfg(test)]
+pub(crate) fn assert_jvm_catalog_wire(catalog:Arc<crate::jvm_catalog::JvmCatalog>,
+    incomplete:Arc<crate::jvm_catalog::JvmCatalog>,changed_path:&std::path::Path,
+    invalidated:std::sync::mpsc::Receiver<()>) {
+    use std::io::Write;
+    let index=ktcore::index::Index::new(); let owner="/jvm-catalog/Owner.kt";
+    let mut store=ExtensionStore::default();store.configure_provider("catalog",true,Arc::from("{}"));
+    store.replace_source(&index,owner,Arc::from("// owner"),Knowledge::Found(()),Vec::new()).unwrap();
+    let mut read=store.begin(&index,"catalog",owner).unwrap();
+    let mut evaluation=Evaluation::new("catalog".into(),owner.into(),1);
+    evaluation.project=Some(catalog.model.clone());evaluation.jvm_catalog=Some(catalog.clone());
+    evaluation.project_operations=JVM_INVENTORY|JVM_CLASS|CLASS_BYTES;
+    let mut after=None;let mut count=0;let mut pages=0;
+    loop {
+        let params=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"jvmCatalog","prefix":"paging/","after":after}]});
+        evaluation.prepay_input_read("analysis/readFacts",&params).unwrap();
+        let response=evaluation.batch(&mut read,"analysis/readFacts",params).unwrap();
+        let page=&response["facts"][0];count+=page["classes"].as_array().unwrap().len();pages+=1;
+        after=page["next"].as_str().map(str::to_owned);
+        evaluation.account_stream_reply(&json!({"jsonrpc":"2.0","id":pages,"result":response})).unwrap();
+        if after.is_none() {assert_eq!(page["coverage"]["state"],"found");break;}
+        assert_eq!(page["coverage"]["state"],"unknown");
+        assert!(evaluation.jvm_page("other/",after.as_deref()).is_err());
+    }
+    assert_eq!(count,6000);assert!(pages>1);assert_eq!(evaluation.batches,1);
+    assert_eq!(evaluation.handles.len(),pages,"one authority and only page cursors");
+    let duplicates=evaluation.jvm_inventory(&mut read,"pluginfixture/Person",None).unwrap();
+    let entries=duplicates["classes"].as_array().unwrap();assert_eq!(entries.len(),2);
+    assert_eq!(entries[0]["originId"],"compile-first");assert_eq!(entries[1]["originId"],"compile-second");
+    let compile=entries[0]["entry"].as_str().unwrap().to_owned();
+    let sdk=evaluation.jvm_inventory(&mut read,"java/lang/Object",None).unwrap()["classes"][0]["entry"].as_str().unwrap().to_owned();
+    let params=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"jvmClass","entry":compile},{"op":"jvmClass","entry":sdk}]});
+    let plan=evaluation.begin_jvm_reads("analysis/readFacts",&params).unwrap().unwrap();
+    evaluation.finish_jvm_read(&mut read,crate::jvm_catalog::prepare(plan,Arc::new(||{}))).unwrap();
+    let response=evaluation.batch(&mut read,"analysis/readFacts",params).unwrap();
+    let compiled=&response["facts"][0]["value"];assert_eq!(compiled["authority"],"compiled-input");
+    assert_eq!(compiled["abi"]["identity"]["internalName"],"pluginfixture/Person");
+    assert!(compiled["abi"]["methods"].as_array().unwrap().iter().any(|method|method["attributeNames"].as_array().unwrap().iter().any(|name|name=="Code")));
+    assert_eq!(compiled["sourceCurrent"]["state"],"unknown");
+    let header=&response["facts"][1]["value"];assert_eq!(header["authority"],"sdk-api-header");
+    assert!(header["abi"]["methods"].as_array().unwrap().iter().all(|method|method["attributeNames"].as_array().unwrap().iter().all(|name|name!="Code")));
+    assert_eq!(evaluation.class_identity(&compile).unwrap_err(),"foreign runtime class identity");
+    let foreign=Evaluation::new("catalog".into(),owner.into(),2);assert!(foreign.jvm_entry(&compile).is_err());
+    let absent=evaluation.jvm_inventory(&mut read,"missing/",None).unwrap();assert!(absent["classes"].as_array().unwrap().is_empty());
+    assert_eq!(absent["coverage"]["state"],"found");
+    let mut partial=Evaluation::new("catalog".into(),owner.into(),1);partial.jvm_catalog=Some(incomplete);
+    assert_eq!(partial.jvm_inventory(&mut read,"missing/",None).unwrap()["coverage"]["state"],"unknown");
+    let pending=read.finish();
+    assert!(catalog.current(),"catalog guard must remain current before the controlled archive edit");
+    assert_eq!(store.validate_pending(&pending),Ok(()));
+    fs_for_test_append(changed_path);
+    // Native events arrive asynchronously. Synchronize with the actual observer;
+    // its callback runs only after the guard's invalid latch has been set.
+    invalidated.recv_timeout(Duration::from_secs(5)).expect("catalog archive edit must reach its native observer");
+    assert!(!catalog.current(),"the observed archive change must invalidate the catalog authority");
+    assert_eq!(store.validate_pending(&pending),Err(ktcore::extensions::ContractError::Stale));
+    fn fs_for_test_append(path:&std::path::Path) {std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(b"changed").unwrap();}
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum ReadQuery {
+    JvmCatalog { #[serde(default)] prefix:String, #[serde(default)] after:Option<String> },
+    JvmClass { entry:String },
     ResourceInventory { #[serde(default)] after:Option<String> },
     ResourceLookup { #[serde(rename="relativePath")] relative_path:String, #[serde(default)] association:Option<crate::resource_inputs::ResourceAssociation> },
     ResourceSnapshot { resource:String, #[serde(default)] after:Option<String> },
@@ -1665,12 +1854,13 @@ impl Worker {
                         continue;
                     };
                     let prepared_inputs=(||->Result<(),String> {
-                        let (reads,class)={
+                        let (reads,class,jvm)={
                             let mut workspace=workspace.lock();
                             workspace.prepay_ipc_input_read(work.evaluation,method,&message["params"])?;
                             let reads=workspace.begin_ipc_resource_reads(work.evaluation,method,&message["params"])?;
                             let class=workspace.begin_ipc_class_reads(work.evaluation,method,&message["params"])?;
-                            (reads,class)
+                            let jvm=workspace.begin_ipc_jvm_reads(work.evaluation,method,&message["params"])?;
+                            (reads,class,jvm)
                         };
                         let mut budget=64usize*1024*1024;
                         for mut read in reads {
@@ -1682,6 +1872,10 @@ impl Worker {
                         if let Some(class)=class {
                             let prepared=crate::runtime_bytes::prepare_class_read(class,after_batch.clone());
                             workspace.lock().finish_ipc_class_read(prepared)?;
+                        }
+                        if let Some(jvm)=jvm {
+                            let prepared=crate::jvm_catalog::prepare(jvm,after_batch.clone());
+                            workspace.lock().finish_ipc_jvm_read(prepared)?;
                         }
                         Ok(())
                     })();
@@ -2381,10 +2575,22 @@ mod initialize_stream_contract_tests {
         let offered=&actual["params"];
         assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==RESOURCES));
         assert_eq!(offered["supportedOps"][RESOURCES],json!(["resourceInventory","resourceLookup","resourceSnapshot"]));
+        assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==JVM_CATALOG));
+        assert_eq!(offered["supportedOps"][JVM_CATALOG],json!(["jvmCatalog","jvmClass"]));
         assert_eq!(project_operations(offered),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS);
         let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][RESOURCES]=json!(["resourceSnapshot"]);
         assert_eq!(project_operations(&acknowledgement)&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT),RESOURCE_SNAPSHOT);
+        for (operation,bit) in [("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)] {
+            let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][JVM_CATALOG]=json!([operation]);
+            assert_eq!(project_operations(&acknowledgement)&(JVM_INVENTORY|JVM_CLASS),bit);
+        }
+        let mut legacy=offered.clone();
+        legacy["capabilities"].as_array_mut().unwrap().retain(|capability|capability!=JVM_CATALOG);
+        assert_eq!(project_operations(&legacy),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES);
+        let mut no_operations=offered.clone();no_operations["supportedOps"].as_object_mut().unwrap().remove(JVM_CATALOG);
+        assert_eq!(project_operations(&no_operations)&(JVM_INVENTORY|JVM_CLASS),0);
     }
 
 }

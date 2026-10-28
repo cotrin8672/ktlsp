@@ -3624,13 +3624,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn sdk_selection_fixture() -> (PathBuf, Vec<ModuleClasspath>) {
+        // Concurrent fixtures must not share cleanup ownership when the clock repeats a tick.
         let root = std::env::temp_dir().join(format!(
-            "ktlsp-sdk-selection-{}-{}",
+            "ktlsp-sdk-selection-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            CACHE_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
         ));
         let mut modules = Vec::new();
         for feature in [17, 21] {
@@ -5258,6 +5260,50 @@ pub(crate) mod tests {
             serde_json::from_slice::<Vec<ModuleClasspath>>(&bytes).unwrap(),
             modules
         );
+    }
+
+    #[test]
+    fn jvm_compilation_source_sets_preserve_mixed_ownership_and_dependency_visibility() {
+        let kotlin = serde_json::json!({
+            "task": ":mixed:compileKotlinJvm", "language": "kotlin", "task_type": "KotlinCompile",
+            "arguments": [], "annotation_processor_path": [], "java_home": null,
+            "source_files": ["/repo/mixed/src/commonMain/kotlin/Shared.kt", "/repo/mixed/src/jvmMain/kotlin/Jvm.kt", "/repo/mixed/src/jvmMain/java/Bridge.java"],
+            "classpath": ["/repo/library.jar"], "options": {}, "output_roots": ["/repo/mixed/build/classes/kotlin/jvm/main"],
+            "complete": false, "problem": "Compiler recipe is unavailable"
+        });
+        let java = serde_json::json!({
+            "task": ":mixed:compileJvmMainJava", "language": "java", "task_type": "JavaCompile",
+            "arguments": [], "annotation_processor_path": [], "java_home": null,
+            "source_files": ["/repo/mixed/src/jvmMain/java/Bridge.java"], "classpath": ["/repo/library.jar"],
+            "options": {}, "output_roots": ["/repo/mixed/build/classes/java/jvmMain"], "complete": true, "problem": null
+        });
+        let dump = format!(
+            "PROJECT\t:consumer\t/repo/consumer\nBUILD\t:\nSOURCE\tmain\t/repo/consumer/src/main/java\n\
+             SCP\tmain\t/repo/mixed/build/libs/mixed-jvm.jar\nARTIFACT\tmain\t/repo/mixed/build/libs/mixed-jvm.jar\tPROJECT\t:\t:mixed\nEND\t:consumer\n\
+             PROJECT\t:mixed\t/repo/mixed\nBUILD\t:\nSOURCESET\tjvmMain\n\
+             SOURCE\tjvmMain\t/repo/mixed/src/commonMain/kotlin\nSOURCE\tjvmMain\t/repo/mixed/src/jvmMain/kotlin\nSOURCE\tjvmMain\t/repo/mixed/src/jvmMain/java\n\
+             OUTPUT\tjvmMain\t/repo/mixed/build/classes/kotlin/jvm/main\nOUTPUT\tjvmMain\t/repo/mixed/build/classes/java/jvmMain\nPROVIDES\tjvmMain\t/repo/mixed/build/libs/mixed-jvm.jar\n\
+             KOTLIN_COMPILE_TASK\tjvmMain\t\":mixed:compileKotlinJvm\"\nCOMPILER\tjvmMain\t{java}\nCOMPILER\tjvmMain\t{kotlin}\nSCP\tjvmMain\t/repo/library.jar\n\
+             SOURCESET\tjvmTest\nSOURCE\tjvmTest\t/repo/mixed/src/jvmTest/kotlin\nSCP\tjvmTest\t/repo/mixed/build/classes/kotlin/jvm/main\nEND\t:mixed\n"
+        );
+        let modules = parse_dump_reader(dump.as_bytes(), true).unwrap();
+        let model = ProjectSnapshot::new(modules);
+        for source in ["commonMain/kotlin/Shared.kt", "jvmMain/kotlin/Jvm.kt", "jvmMain/java/Bridge.java"] {
+            let path = PathBuf::from(format!("/repo/mixed/src/{source}"));
+            let (module, owner) = model.owner_for(&path).unwrap();
+            assert_eq!(module.module, ":mixed");
+            let owner = owner.unwrap();
+            assert_eq!(owner.name, "jvmMain");
+            assert_eq!(owner.kotlin_compile_task.as_deref(), Some(":mixed:compileKotlinJvm"));
+            assert_eq!(owner.compiler_tasks.len(), 2);
+            assert_eq!(owner.entries, [PathBuf::from("/repo/library.jar")]);
+            assert!(!owner.compiler_tasks[1].complete, "unavailable compiler authority must remain explicit");
+        }
+        assert_eq!(model.file_origin(Path::new("/repo/mixed/src/jvmTest/kotlin/Test.kt")).unwrap().project_scope.unwrap().source_set, "jvmTest");
+        let dependency = model.file_origin(Path::new("/repo/mixed/src/jvmMain/java/Bridge.java")).unwrap();
+        let consumer = model.file_origin(Path::new("/repo/consumer/src/main/java/Use.java")).unwrap();
+        assert!(model.scope_visibilities(&[]).iter().any(|view|
+            Some(&view.scope) == consumer.project_scope.as_ref() && view.ordered_origins.contains(&dependency.origin_id)));
     }
 
     #[test]

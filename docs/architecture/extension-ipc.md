@@ -653,7 +653,7 @@ at most 16 MiB. Existing 256-query batches, 16,384-handle limits, 512 KiB aggreg
 serialized fact-response budget and 1 MiB JSON body frame limit still apply. Split
 oversized batches on the existing recoverable response-budget error. Stream quotas
 are **separate** from the 64 ordinary metadata batches per evaluation: each validated
-`classBytes` or `resourceSnapshot` query with `after` consumes one of 256 shared
+`classBytes`, `resourceSnapshot`, or `jvmCatalog` query with `after` consumes one of 256 shared
 continuations. A continuation-only batch consumes no metadata batch; an initial read
 or mixed metadata/continuation batch still consumes one. Repeated valid cursors cost
 quota again, and failed prepared reads do not refund reservations. The shared stream
@@ -674,3 +674,106 @@ The [README host-input recipe](../../README.md) and
 dependency-JAR and compiled-application byte hashes. That editor run did not exercise
 the header-only SDK branch; its focused SDK checks are separate evidence. There is
 no new runtime-class golden-frame fixture or claim of Minecraft runtime/remapping parity.
+
+### Selected physical JVM catalog (`jvm-catalog-v1`)
+
+This additive source contract exposes the selected physical class inputs and their
+checked raw ABI. Its native checks and actual independent-child catalog result are
+recorded in the [current acceptance record](../fork-current.md); the earlier
+runtime/source/resource results remain separate. This does not declare the full
+eleven-command Minecraft integration ready.
+
+Negotiate the capability and the operations used in the child initialize response:
+
+```json
+{"capabilities":["semantic-v1","jvm-catalog-v1"],"supportedOps":{"jvm-catalog-v1":["jvmCatalog","jvmClass"]}}
+```
+
+Each operation uses `analysis/readFacts` with the current opaque `evaluation`.
+Unnegotiated operations, foreign selectors and invalid cursors are request errors.
+Valid but unavailable inputs return typed Unknown. Foreign or wrong-kind tokens
+and other invalid reads are fatal to the whole evaluation and can terminate or
+disable its provider instance; do not continue that evaluation after the error.
+Re-enable/restart establishes a fresh instance. An outer/internal trace reason
+may be normalized and is not a substitute for the public JSON-RPC error contract.
+
+`{"op":"jvmCatalog","prefix":"java/util/","after":null}` returns
+`{view:"selectedPhysicalJvmInputs", classes:[...], next, coverage, problems,
+sourceCurrent}`. `prefix` defaults to `""`; it matches exact JVM internal-name
+prefixes, not source qualified names. It is at most4096 UTF-8 bytes, cannot start
+with `/` or contain `//`, control characters, backslash, `.`, `:`, `;`, `[` or `]`.
+Follow each opaque `next` with the same prefix in `after` until JSON null. A cursor
+cannot be reused with another prefix, evaluation or provider instance. Pages are
+bounded by serialized bytes, not a child-selected item limit.
+
+Every `classes` descriptor contains:
+
+| Field | Meaning |
+| --- | --- |
+| `entry` | Opaque selector for this exact physical entry; use it unchanged in `jvmClass`. |
+| `internalName` | JVM binary internal name, including literal `$` where present. |
+| `originId` | Host-issued selected input origin; it grants no filesystem access. |
+| `association` | `"output"`, `"compileClasspath"`, or `"sdk"`. |
+| `classpathOrder` | Order within that association's selected inputs; SDK archive order for a full SDK. |
+| `authority` | `"compiled-input"`, `"sdk-runtime-input"`, or `"sdk-api-header"`. |
+
+The view enumerates the owner's accepted source-set class outputs, ordered compile
+classpath and selected SDK. It preserves duplicate class names and physical entries;
+it does not choose a winning definition across output/compile/SDK associations.
+Entries sort by internal name, association and per-association order. That sorting
+is pagination order, not a combined semantic precedence rule. Do not path-sort,
+deduplicate or treat compile-only inputs as runtime bytecode authority.
+
+Only terminal `coverage:{state:"found",value:null}` proves exhaustive membership
+of this **selected physical view**, including absence of an entry with the requested
+prefix. Intermediate pages and incomplete inputs have Unknown coverage. A complete
+name inventory does not prove that every body decodes; `jvmClass` can independently
+be unavailable. `sourceCurrent` remains Unknown with reason `notSourceAuthority`:
+this view does not certify unsaved source members, unbuilt generated output, complete
+source-callable members, or the whole source/generated JVM ABI world.
+
+Missing model/SDK selections, unresolved classpaths, unreadable/unsupported entries
+and the200000-class bound prevent complete coverage. With no usable catalog, the
+response has an empty list, null continuation and Unknown coverage with reason
+`JVM_CATALOG_UNAVAILABLE`; that is not successful absence. `problems` contains
+bounded diagnostic strings, not a stable enum. Ordinary versioned classes under
+`META-INF/versions/` are not resolved as a multi-release selection and make coverage
+Unknown. Recognized module-only artifacts/module descriptors may be excluded from
+the ordinary class inventory; that exception does not support arbitrary multi-release
+class selection.
+
+`{"op":"jvmClass","entry":"<entry>"}` reads precisely the issued entry and
+returns a typed fact. Found is
+`{entry, authority, abi, sourceCurrent}`. `abi` reuses the raw `class_abi` shape:
+checked origin/internal-name/individual-content SHA-256 identity, class versions,
+raw access flags, superclass/interfaces/signature, attributes, InnerClasses and
+all decoded fields/methods with exact descriptors, signatures and attribute names.
+Private, bridge, synthetic and generated entries are not filtered into an editing
+member list. No source MemberId, range or shared-binding identity is fabricated.
+Decode/name/size failures are Unknown `JVM_ABI_UNAVAILABLE`; an oversized ABI can
+remain Unknown `MissingFacts`. Coverage of the catalog is independent of this fact.
+
+A selected lower-release SDK uses its checked `ct.sym` API entries with authority
+`sdk-api-header`; a header containing Code is rejected. A normal selected SDK uses
+`sdk-runtime-input`. Even when the cataloged input is a real class file, its catalog
+selector grants **ABI only**: passing `entry` to `classBytes.classIdentity` fails
+with JSON-RPC `-32602`. Obtain a separate `runtimeClass` token for executable bytes
+under that operation's selected-SDK/runtime-classpath rules. Compile-only catalog
+membership cannot grant Code, and header-only SDK facts cannot provide executable
+bytes. Every found catalog ABI still has Unknown `sourceCurrent`.
+
+Enumeration, archive reads, decoding and hashes run outside Workspace locks.
+An evaluation retains one catalog/model and shared host-input leases; installation
+requires the same accepted model and current guards. Catalog membership and exact
+entry reads join the host read set and ordinary resume/final validation. Input
+replacement, directory membership, model/source and provider lifecycle changes
+invalidate obsolete work. These are evaluation-scoped facts, not external generation
+counters, persistent child cache validation or a new assignability operation.
+
+The existing1MiB frame,512KiB aggregate fact-response budget,256-query batches,
+16384 handles and64 metadata batches apply. `jvmCatalog` continuations share the
+256-continuation/64MiB serialized-reply quota with resource/class-byte continuations;
+continuation-only batches do not consume metadata batches. Each class input and
+one prepared multi-class ABI read are bounded to16MiB. Split oversized batches
+on the existing recoverable split-query error; never reinterpret a quota failure
+or Unknown coverage as a complete empty catalog.

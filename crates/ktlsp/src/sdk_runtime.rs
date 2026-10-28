@@ -96,6 +96,8 @@ impl SelectedSdkRuntime {
         self.lease.clone()
     }
 
+    pub(crate) fn archives(&self) -> &[(PathBuf, &'static str)] { &self.archives }
+
     pub(crate) fn read_class(
         &self,
         internal_name: &str,
@@ -248,7 +250,7 @@ fn runtime_archives(
     Ok(archives)
 }
 
-fn file_sha256(path: &std::path::Path) -> Result<String, SdkClassUnavailable> {
+pub(crate) fn file_sha256(path: &std::path::Path) -> Result<String, SdkClassUnavailable> {
     let mut file = fs::File::open(path).map_err(|error| invalid(error.to_string()))?;
     let mut hash = Sha256::new();
     let mut bytes = 0usize;

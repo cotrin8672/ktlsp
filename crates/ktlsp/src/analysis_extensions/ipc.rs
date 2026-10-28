@@ -690,6 +690,28 @@ impl AnalysisExtensions {
         evaluation.begin_class_reads(method, params)
     }
 
+    pub(crate) fn begin_ipc_jvm_reads(&mut self,id:u64,method:&str,params:&Value)
+        ->Result<Option<crate::jvm_catalog::CatalogPlan>,String> {
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        if evaluation.failure.is_some() || !evaluation.pending.as_ref().is_some_and(|pending|
+            self.store.validate_pending(pending).is_ok()) {return Err("Stale".into());}
+        evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance).map_or(0,|slot|slot.worker.project_operations());
+        evaluation.begin_jvm_reads(method,params)
+    }
+    pub(crate) fn finish_ipc_jvm_read(&mut self,index:&dyn InferenceIndex,prepared:crate::jvm_catalog::PreparedCatalog)->Result<(),String> {
+        let id=prepared.evaluation;
+        let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;
+        let result=(||{
+            let pending=evaluation.pending.take().ok_or("Stale")?;
+            let owner=evaluation.owner.clone();
+            let mut read=self.store.resume(index,&owner,pending).map_err(|_|"Stale")?;
+            let result=evaluation.finish_jvm_read(&mut read,prepared);
+            evaluation.pending=Some(read.finish()); result
+        })();
+        self.ipc_evaluations.insert(id,evaluation); result
+    }
+
     pub(crate) fn finish_ipc_class_read(&mut self, index: &dyn InferenceIndex,
         prepared: crate::runtime_bytes::PreparedClassRead) -> Result<(),String>
     {

@@ -13,6 +13,7 @@ pub mod classpath;
 pub mod resource_model;
 mod resource_inputs;
 mod runtime_bytes;
+mod jvm_catalog;
 pub mod commands;
 pub mod compile;
 mod compiled_watch;

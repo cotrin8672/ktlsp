@@ -995,6 +995,13 @@ impl Workspace {
         ->Result<Option<crate::runtime_bytes::ClassReadPlan>,String> {
         self.analysis_extensions.begin_ipc_class_reads(id,method,params)
     }
+    pub(crate) fn begin_ipc_jvm_reads(&mut self,id:u64,method:&str,params:&serde_json::Value)
+        ->Result<Option<crate::jvm_catalog::CatalogPlan>,String> {
+        self.analysis_extensions.begin_ipc_jvm_reads(id,method,params)
+    }
+    pub(crate) fn finish_ipc_jvm_read(&mut self,prepared:crate::jvm_catalog::PreparedCatalog)->Result<(),String> {
+        self.analysis_extensions.finish_ipc_jvm_read(&self.index,prepared)
+    }
     pub(crate) fn finish_ipc_class_read(&mut self,prepared:crate::runtime_bytes::PreparedClassRead)->Result<(),String> {
         self.analysis_extensions.finish_ipc_class_read(&self.index,prepared)
     }
@@ -9925,8 +9932,8 @@ impl Workspace {
         trace("entry", "", match &outcome {
             crate::compile::KotlinDiagnosticOutcome::Verified { diagnostics, clean, .. } =>
                 serde_json::json!({"verified": true, "clean": clean, "count": diagnostics.len()}),
-            crate::compile::KotlinDiagnosticOutcome::Unverified(_) =>
-                serde_json::json!({"verified": false}),
+            crate::compile::KotlinDiagnosticOutcome::Unverified(reason) =>
+                serde_json::json!({"verified": false, "reason": reason}),
         });
         let current = self
             .kotlin_diagnostic_tickets

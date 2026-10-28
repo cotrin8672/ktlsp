@@ -79,8 +79,10 @@ tasks.register('fixtureJars') { dependsOn(published, 'fakeJdkSources') }]=])
   for _, version in ipairs({ '1.0', '2.0' }) do
     local suffix = version == '1.0' and 'V1' or 'V2'
     local member = version == '1.0' and 'oldApi' or 'newApi'
+    local old_api = version == '2.0' and vim.env.KTLSP_IPC_MODE == 'jvm-catalog'
+      and '    public int oldApi() { return 7; }\n' or ''
     write(root .. '/build/fixture-src/' .. suffix .. '/vendor/Versioned.java',
-      'package vendor;\n\npublic class Versioned {\n    public int ' .. member .. '() { return 7; }\n}\n')
+      'package vendor;\n\npublic class Versioned {\n' .. old_api .. '    public int ' .. member .. '() { return 7; }\n}\n')
   end
   write(root .. '/build/fixture-src/Added/vendor/Added.java', [[package vendor;
 
@@ -116,6 +118,9 @@ function M.phase(root, phase)
       'package vendor;\n\npublic class Versioned {\n    public int newApi() { return 7; }\n}\n')
   end
   local deps = phase == 3 and '' or "    implementation 'fixture.reload:versioned:" .. version .. "'\n"
+  if phase == 0 and vim.env.KTLSP_IPC_MODE == 'jvm-catalog' then
+    deps = deps .. "    compileOnly files(rootProject.file('home/.m2/repository/fixture/reload/versioned/2.0/versioned-2.0.jar'))\n"
+  end
   if phase == 1 or phase == 2 then deps = deps .. "    implementation 'fixture.reload:added:1.0'\n" end
   write(root .. '/modules/editing/build.gradle', [=[plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0'; id 'java' }
 repositories {

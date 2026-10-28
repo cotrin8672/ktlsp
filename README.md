@@ -637,6 +637,20 @@ rtk proxy bash dev/ktlsp-harness.sh corpus --root "$project" \
   --bin "$repo/target/release/ktlsp" --no-build --run-dir "$scratch/editor"
 ```
 
+For the focused JVM catalog probe, use the same preparation and command with
+`KTLSP_IPC_MODE=jvm-catalog` set both when generating the fixture and when running
+the harness. The generator adds a second, compile-only version of the fixture JAR;
+the probe checks the two physical class origins and ABIs, catalog handle separation,
+and fresh results after the dependency change. The generator invocation is:
+
+```sh
+KTLSP_IPC_MODE=jvm-catalog rtk proxy nvim --headless -u NONE \
+  -c "lua dofile('dev/gradle_reload_project.lua').write('$project', vim.fn.getcwd())" -c qa
+```
+
+In the harness invocation above, replace `KTLSP_IPC_MODE=host-inputs` with
+`KTLSP_IPC_MODE=jvm-catalog`; the remaining paths and manifest stay the same.
+
 On Windows, use the existing native harness controller with the same fixture, manifest,
 mode and environment; append `.exe` to both binary paths. The fixture build must precede
 copying the reduced annotation and shadow sources. Use a fresh project and empty barrier

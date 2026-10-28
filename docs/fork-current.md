@@ -4,8 +4,9 @@ Updated 2026-10-28 (Asia/Tokyo). **Goal ACTIVE; completion declaration RETRACTED
 The earlier completion declaration overstated what the selected cases establish.
 Qualified CEM38, five-project50, the 1896-test suite and actual67's three editor RPCs
 remain finite evidence, not completion of the original Java/Kotlin editing goal.
-Independent validation on genuinely unseen real mixed-language repositories is
-still missing. Overall editing UX, project-model coverage, useful results where
+New validation on the previously unseen mixed-language MockK repository has
+positive editing results but still reproduces false diagnostics on valid code.
+Overall editing UX, project-model coverage, useful results where
 analysis remains Unknown, and IntelliJ IDEA-level quality are not established by
 the selected passing cases. This does not replace the original goal with an
 arbitrary requirement for 100% grammar or coverage.
@@ -28,7 +29,7 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification: selected evidence through67
+## Current verification: JVM catalog and MockK follow-up after67
 
 Retain qualified CEM38, Moshi9, OkHttp10, Retrofit12, Spring10 and Gradle9
 results; a newer binary alone does not require replaying all of them. The
@@ -42,15 +43,52 @@ fixed and qualified below; this does not certify the whole SDK. Tests and
 benchmarks are assigned to GPT-6.1 Terra/high; implementation fixes are assigned
 to GPT-6.1 Sol/high. No further optimization is scheduled.
 
-Next, two Terra verification roles are checking previously untested medium-sized
+Two Terra verification roles have checked previously untested medium-sized
 `mockk/mockk` at `c2fb66f841973e725b367650e69c4bac9babba20` (332 Kotlin and 22 Java
-files). This is new semantic evidence gathering, distinct from replaying the six
-selected projects, with no speed gate. `line/armeria` was cloned only, not tested.
-No unseen-project semantic acceptance result is claimed yet.
+files). Its real model contains10 JVM projects. Seven selected completion/navigation
+checks and two inspected applied calls pass on catalog batch2. Invalid-code
+canonical diagnostics now match the independent Kotlin2.2.21 result atv3,
+generation1 and the exact range, after two compiler-flag corrections and a full
+seven-plugin compiler oracle. However, the first pull after restoring validv4
+returns two false unresolved `MockKAgentLogger` diagnostics. Its known project
+source is in `commonMain`; the selected dependency JAR has not been built and the
+current-source producer closure did not supply that ABI. That concrete gap is being fixed next. MockK acceptance
+is **not achieved**. `line/armeria` was cloned only, not tested; there is no speed gate.
 
-The current mc-dev investigation also exposes a generic host gap around class
-catalogs, prefix queries and certified absence. The JVM implementation owner is
-investigating it; the requested host capabilities are not all declared ready.
+The earlier claim that two compiler plugins were missing is retracted: a Python
+MAX_PATH observation produced false negatives. Real Gradle/file observations and
+the full compiler oracle establish that all seven plugin inputs are present.
+Preserve those earlier failed observations as setup evidence, not missing-plugin
+production failures.
+
+The generic physical JVM catalog now passes actual independent-child verification:
+**46/46 semantic and10/10 operational**, zero mismatched/unmeasured checks
+(`jvm-catalog-live4/receipt.json`, `jvm-catalog-live4/independent-verification.json`).
+Seven individual class SHA-256 values match the actual dependency JAR/JDK inputs.
+Initial/fresh vendor and absent-prefix coverage is Found(null); both duplicate
+origins remain distinct. The catalog-only compatibility fixture retains old-only
+API inv1 and old+new API inv2. `Added` changes from absent to present. The actual
+SDK List entry is a runtime input; header-only SDK verification remains separate.
+
+The negative check receives public JSON-RPC-32602 for a foreign runtime-class
+token in evaluation3, publishes nothing and observes provider instance2 exit.
+Explicit re-enable starts fresh instance4. A later model change makes the positive
+evaluation5 stale, followed by fresh evaluation8. The outer internal trace reason
+is normalized to `Stale`; it is not a separate wire-contract guarantee. Invalid
+reads terminate their evaluation; consumers must not continue the same transaction.
+This proves the scoped catalog protocol, not all eleven MC commands or source ABI.
+
+Catalog batch2's full workspace result is **1898 passed,0 failed,16 existing
+ignored**. Batch3 separately passes argument-adapter6/0/1 existing ignored and
+catalog2/0/0, then builds both release host and child with stable guards and
+EOF/live0 (`jvm-catalog-batch3/main-ready.json`). Host SHA256 is
+`1c08c7769a0fd810a6c8b28f98aefd042dd4f1dda35ca9aa99c7727988d8bf07`;
+child SHA256 is
+`9bba5d72308c23ebe8411533f01261e8c4ea2ac17422fb3349260574a5b514f7`.
+The full1898 result is carried from batch2, not a new full batch3/1900-test claim.
+Remaining MC readiness requires the actual companion consumer review and its
+command/editor proof; missing proof of every SDK/language case is not itself a
+new foundation blocker.
 
 Candidate67 passes one combined `cargo test --workspace --locked --no-fail-fast`:
 **1896 passed, 0 failed, 16 existing ignored**, including doctests, followed by a

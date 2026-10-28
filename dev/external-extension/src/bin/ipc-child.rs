@@ -213,6 +213,63 @@ fn read_runtime_class_bytes(
     Ok(observations)
 }
 
+fn record_jvm_catalog(
+    input: &mut impl std::io::BufRead, output: &mut impl Write, next: &mut u64,
+    evaluation: &Value, barrier: &Option<PathBuf>,
+) -> Result<bool, String> {
+    let directory=barrier.as_ref().ok_or("catalog requires evidence directory")?;
+    std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+    let denial_path=directory.join("catalog-denial.json");
+    if !denial_path.exists() {
+        let response=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"jvmCatalog","prefix":"vendor/"}]}))?;
+        let selected=response["facts"][0]["classes"].as_array().and_then(|classes|classes.first())
+            .ok_or("catalog denial fixture entry")?;
+        let entry=selected["entry"].as_str().ok_or("catalog denial fixture identity")?;
+        std::fs::write(directory.join("catalog-denial-before.json"),serde_json::to_vec(&json!({"evaluation":evaluation,"descriptor":selected}))
+            .map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        let error=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"classBytes","classIdentity":entry}]})).err().ok_or("catalog entry granted runtime bytes")?;
+        let error:Value=serde_json::from_str(&error).map_err(|error|error.to_string())?;
+        if error["code"] != -32602 || error["message"] != "foreign runtime class identity" {
+            return Err("unexpected catalog/runtime handle rejection".into());
+        }
+        std::fs::write(&denial_path,serde_json::to_vec(&json!({"evaluation":evaluation,"error":error}))
+            .map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        return Ok(false);
+    }
+    let mut catalogs = Vec::new();
+    for prefix in ["vendor/", "ktlsp_catalog_absent/", "java/util/List"] {
+        let mut after = Value::Null;
+        let mut cursors = std::collections::BTreeSet::new();
+        let mut classes = Vec::new();
+        let (coverage, problems) = loop {
+            let mut query = json!({"op":"jvmCatalog","prefix":prefix});
+            if !after.is_null() { query["after"] = after; }
+            let response = request(input, output, next, "analysis/readFacts", json!({"evaluation":evaluation,"queries":[query]}))?;
+            let page = &response["facts"][0];
+            if page["view"] != "selectedPhysicalJvmInputs" || page["sourceCurrent"]["state"] != "unknown" {
+                return Err("catalog authority changed".into());
+            }
+            classes.extend(page["classes"].as_array().ok_or("catalog classes")?.iter().cloned());
+            after = page["next"].clone();
+            if after.is_null() { break (page["coverage"].clone(), page["problems"].clone()); }
+            if !cursors.insert(after.as_str().ok_or("catalog cursor")?.to_owned()) { return Err("repeated catalog cursor".into()); }
+        };
+        let mut decoded = Vec::new();
+        for class in &classes {
+            let entry = &class["entry"];
+            let response = request(input, output, next, "analysis/readFacts", json!({"evaluation":evaluation,"queries":[{"op":"jvmClass","entry":entry}]}))?;
+            let fact = response["facts"][0].clone();
+            decoded.push(json!({"descriptor":class,"fact":fact}));
+        }
+        catalogs.push(json!({"prefix":prefix,"coverage":coverage,"problems":problems,"classes":decoded,"pages":cursors.len()+1}));
+    }
+    std::fs::write(directory.join(format!("catalog-{}.json",evaluation.as_str().ok_or("evaluation identity")?)),
+        serde_json::to_vec(&catalogs).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    Ok(true)
+}
+
 fn record_host_inputs(
     input:&mut impl std::io::BufRead, output:&mut impl Write, next:&mut u64,
     params:&Value, barrier:&Option<PathBuf>, include_sources:bool,
@@ -247,6 +304,7 @@ fn analyze(
     project_facts: bool,
     source_snapshots: bool,
     host_inputs: bool,
+    jvm_catalog: bool,
 ) -> Result<Value, String> {
     let evaluation = params["evaluation"].clone();
     let declarations = params["declarations"]
@@ -315,6 +373,9 @@ fn analyze(
             .map_err(|error|error.to_string())?;
     }
     if host_inputs { record_host_inputs(input,output,next,params,barrier,false)?; }
+    if jvm_catalog && !record_jvm_catalog(input,output,next,&evaluation,barrier)? {
+        return Ok(json!({"sites":[],"diagnostics":[]}));
+    }
     if let Some(barrier) = barrier {
         if !barrier.join("released-once").exists() {
             std::fs::create_dir_all(barrier).map_err(|e| e.to_string())?;
@@ -367,6 +428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source_snapshots = false;
     let mut provider_commands = false;
     let mut host_inputs = false;
+    let mut jvm_catalog = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--barrier" if barrier.is_none() => {
@@ -376,6 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--source-snapshots" if !source_snapshots => source_snapshots = true,
             "--provider-commands" if !provider_commands => provider_commands = true,
             "--host-inputs" if !host_inputs => host_inputs = true,
+            "--jvm-catalog" if !jvm_catalog => jvm_catalog = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
@@ -440,6 +503,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         result["supportedOps"][capability]=json!(operations);
                     }
                 }
+                if jvm_catalog {
+                    let offered=&message["params"];
+                    if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="jvm-catalog-v1"))
+                        || !["jvmCatalog","jvmClass"].iter().all(|op|offered["supportedOps"]["jvm-catalog-v1"].as_array()
+                            .is_some_and(|values|values.iter().any(|value|value==*op))) {
+                        return Err("host did not offer JVM catalog operations".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("jvm-catalog-v1"));
+                    if result.get("supportedOps").is_none() { result["supportedOps"]=json!({}); }
+                    result["supportedOps"]["jvm-catalog-v1"]=json!(["jvmCatalog","jvmClass"]);
+                    if !host_inputs {
+                        if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="runtime-class-bytes-v1"))
+                            || !["runtimeClass","classBytes"].iter().all(|op|offered["supportedOps"]["runtime-class-bytes-v1"].as_array()
+                                .is_some_and(|values|values.iter().any(|value|value==*op))) {
+                            return Err("host did not offer runtime class operations".into());
+                        }
+                        result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("runtime-class-bytes-v1"));
+                        result["supportedOps"]["runtime-class-bytes-v1"]=json!(["runtimeClass","classBytes"]);
+                    }
+                }
                 if provider_commands {
                     if !message["params"]["capabilities"].as_array().is_some_and(|caps|caps.iter().any(|cap|cap=="provider-commands-v1")) {
                         return Err("host did not offer explicit provider commands".into());
@@ -467,6 +550,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     project_facts,
                     source_snapshots,
                     host_inputs,
+                    jvm_catalog,
                 );
                 let response = match result {
                     Ok(value) => json!({"jsonrpc":"2.0","id":message["id"],"result":value}),
