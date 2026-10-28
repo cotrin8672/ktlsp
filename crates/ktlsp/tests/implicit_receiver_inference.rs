@@ -88,6 +88,77 @@ fn infer_expression(ws: &Workspace, file: &str, expression: &str) -> Type {
 }
 
 #[test]
+fn kotlin_mapped_entry_properties_keep_java_calls_and_ordinary_bean_getters() {
+    use ktlsp::project_model::{FileOrigin, SourceRepresentation};
+    const MAP: &str = "package java.util; public interface Map<K,V> { public interface Entry<K,V> { public K getKey(); public V getValue(); public V setValue(V value); } }";
+    const CONCRETE: &str = "package probe; public class Concrete<K,V> implements java.util.Map.Entry<K,V> { public K getKey() { return null; } public V getValue() { return null; } public V setValue(V value) { return value; } }";
+    let mut ws = Workspace::new();
+    for (file, source) in [
+        ("Map.java", MAP),
+        ("Concrete.java", CONCRETE),
+        ("Bean.java", "package probe; public class Bean { public Payload getKey() { return null; } public Payload getMap() { return null; } }"),
+        ("Payload.kt", "package probe\nclass Payload { fun work(): Int = 1 }"),
+        ("Mapped.kt", "package probe\nfun use(entry: java.util.Map.Entry<Payload,Payload>, child: Concrete<Payload,Payload>, bean: Bean) { entry.key.work(); child.value.work(); child.getKey(); bean.getKey().work(); bean.getMap().work(); bean.map.work() }\nfun <K,V> generic(genericEntry: java.util.Map.Entry<K,V>) { genericEntry.key; genericEntry.getKey() }\nfun stars(starEntry: java.util.Map.Entry<*,*>) { starEntry.key; starEntry.getKey() }"),
+        ("Mapped.java", "package probe; class Use { void use(Concrete<Payload,Payload> child) { child.getKey(); } }"),
+    ] { ws.open(file, source.into()); }
+    let sdk_origin = |origin: &str| FileOrigin {
+        origin_id: origin.into(), representation: SourceRepresentation::Source, project_scope: None,
+    };
+    ws.index.set_file_origin("Map.java", sdk_origin("jdk-api:selected-fixture"));
+    for (receiver, property) in [("entry", "key"), ("child", "value")] {
+        let got = labels(&mut ws, "Mapped.kt", &format!("{receiver}."));
+        assert!(got.contains(property), "{receiver}: {got:?}");
+        assert!(!got.contains("getKey") && !got.contains("getValue"), "{receiver}: {got:?}");
+        assert!(labels(&mut ws, "Mapped.kt", &format!("{receiver}.{property}.")).contains("work"));
+    }
+    assert_eq!(goto(&mut ws, "Mapped.kt", "entry.key", "key"), vec![target(&ws, "Map.java", "getKey")]);
+    assert_eq!(goto(&mut ws, "Mapped.kt", "child.value", "value"), vec![target(&ws, "Concrete.java", "getValue")]);
+    for receiver in ["genericEntry", "starEntry"] {
+        let got = labels(&mut ws, "Mapped.kt", &format!("{receiver}."));
+        assert!(got.contains("key") && !got.contains("getKey"), "{receiver}: {got:?}");
+        assert_eq!(infer_expression(&ws, "Mapped.kt", &format!("{receiver}.getKey()")), Type::Unknown);
+        assert_eq!(goto(&mut ws, "Mapped.kt", &format!("{receiver}.key"), "key"), vec![target(&ws, "Map.java", "getKey")]);
+    }
+    assert_eq!(infer_expression(&ws, "Mapped.kt", "child.getKey()"), Type::Unknown);
+    for getter in ["getKey", "getMap"] {
+        assert!(labels(&mut ws, "Mapped.kt", &format!("bean.{getter}().")).contains("work"));
+    }
+    let bean = labels(&mut ws, "Mapped.kt", "bean.");
+    assert!(bean.contains("getKey") && bean.contains("getMap") && bean.contains("map"), "{bean:?}");
+    assert!(labels(&mut ws, "Mapped.kt", "bean.map.").contains("work"));
+    ws.change("Bean.java", "package probe; public class Bean extends Missing { public Payload getKey() { return null; } public Payload getMap() { return null; } }".into());
+    assert!(labels(&mut ws, "Mapped.kt", "bean.").contains("getKey"));
+    assert!(labels(&mut ws, "Mapped.java", "child.").contains("getKey"));
+    let receiver = Type::Class {
+        name: "Concrete".into(), package: Some("probe".into()), container: None, nullable: false,
+        args: vec![Type::class("Payload", Some("probe".into())); 2], owner: None,
+    };
+    assert!(ktcore::jvm::member_candidates(&ws.index, &receiver, "getKey").iter()
+        .any(|member| member.name() == "getKey"));
+    let applicability = |ws: &Workspace| {
+        let entry = ws.index.lookup_by_name("getKey").iter()
+            .find(|entry| entry.path.as_ref() == "Concrete.java").unwrap();
+        ktcore::members::kotlin_callable_applicability(&ws.index, &receiver, entry,
+            &FileCtx::new("probe".into(), Vec::new()))
+    };
+    assert_eq!(applicability(&ws), ktcore::members::Applicability::Rejected);
+    ws.index.set_file_origin("Map.java", sdk_origin("project:lookalike"));
+    assert_eq!(applicability(&ws), ktcore::members::Applicability::Unknown);
+    ws.index.set_file_origin("Map.java", sdk_origin("jdk-api:selected-fixture"));
+    ws.open("OtherMap.java", MAP.into());
+    assert_eq!(applicability(&ws), ktcore::members::Applicability::Unknown);
+    ws.change("OtherMap.java", "package probe; interface Other {}".into());
+    assert_eq!(applicability(&ws), ktcore::members::Applicability::Rejected);
+    ws.change("Concrete.java", CONCRETE.replace("java.util.Map.Entry<K,V>", "Missing<K,V>"));
+    assert_eq!(applicability(&ws), ktcore::members::Applicability::Unknown);
+    assert!(labels(&mut ws, "Mapped.kt", "child.get").contains("getKey"));
+    // An unproved mapped override does not erase the method's known authored return type.
+    assert_eq!(infer_expression(&ws, "Mapped.kt", "child.getKey()"), Type::class("Payload", Some("probe".into())));
+    ws.change("Concrete.java", CONCRETE.replace("public K getKey()", "public Bean getKey()"));
+    assert_eq!(applicability(&ws), ktcore::members::Applicability::Unknown);
+}
+
+#[test]
 fn java_constructor_getters_share_completion_goto_and_generic_result_binding() {
     let mut ws = Workspace::new();
     let properties = "package probe\nclass Payload { fun work(): Int = 1 }\nclass Box<T>(val value: T)\nclass Plain(val payload: Payload)\n";

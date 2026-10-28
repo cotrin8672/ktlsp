@@ -231,6 +231,77 @@ pub fn kotlin_java_getter_property_name(entry: &Entry) -> Option<String> {
     ))
 }
 
+/// Kotlin maps the selected Map.Entry accessors to properties, including proven Java overrides.
+/// The authored entry remains intact for Java calls, property navigation and raw JVM identities.
+pub fn kotlin_callable_applicability(
+    index: &dyn InferenceIndex,
+    receiver: &Type,
+    entry: &Entry,
+    ctx: &FileCtx,
+) -> Applicability {
+    let parameter = match entry.sym.name.as_str() {
+        "getKey" => 0,
+        "getValue" => 1,
+        _ => return Applicability::Applicable,
+    };
+    if kotlin_java_getter_property_name(entry).is_none() {
+        return Applicability::Applicable;
+    }
+    let mut mapped = Vec::new();
+    let mut incomplete = false;
+    let _ = infer::walk_supertypes(index, receiver, 32, |current| {
+        incomplete |= matches!(current, Type::Unknown);
+        if current.name() == Some("Entry") && current.package() == Some("java.util")
+            && current.container() == Some("Map") {
+            mapped.push(current.clone());
+        }
+        ControlFlow::Continue(())
+    });
+    if mapped.is_empty() {
+        return if incomplete { Applicability::Unknown } else { Applicability::Applicable };
+    }
+    if mapped.len() != 1 { return Applicability::Unknown; }
+    let owners: Vec<_> = index.lookup_type("Entry").into_iter().filter(|owner|
+        owner.sym.package == "java.util" && owner.sym.container.as_deref() == Some("Map")
+    ).collect();
+    let [owner] = owners.as_slice() else { return Applicability::Unknown; };
+    if owner.sym.kind != crate::symbol::SymbolKind::Interface || owner.sym.type_params.len() != 2
+        || index.origin_facts().and_then(|facts| facts.file_origin(&owner.path)).is_none_or(|origin|
+            !origin.origin_id.starts_with("jdk-api:") && !origin.origin_id.starts_with("jdk:")) {
+        return Applicability::Unknown;
+    }
+    let accessors: Vec<_> = index.members_of("Map.Entry").into_iter().filter(|parent|
+        parent.path == owner.path && parent.sym.package == "java.util"
+            && parent.sym.container.as_deref() == Some("Map.Entry")
+            && parent.sym.name == entry.sym.name && kotlin_java_getter_property_name(parent).is_some()
+    ).collect();
+    let [parent] = accessors.as_slice() else { return Applicability::Unknown; };
+    let Some(result) = &parent.sym.return_type else { return Applicability::Unknown; };
+    if result.name != owner.sym.type_params[parameter] || result.qualification.is_some()
+        || result.owner.is_some() || !result.args.is_empty() || result.nullable {
+        return Applicability::Unknown;
+    }
+    if entry.path == parent.path && entry.sym.start_byte == parent.sym.start_byte
+        && entry.sym.end_byte == parent.sym.end_byte {
+        return Applicability::Rejected;
+    }
+    if !inherited_method_relation(index, receiver, entry, parent, ctx).is_found() {
+        return Applicability::Unknown;
+    }
+    let declared = |member: &Entry| member.sym.return_type.as_ref().map(|result|
+        infer::declared_member_type(index, receiver, member, result, CallMode::Java, ctx));
+    let (Some(actual), Some(expected)) = (declared(entry), declared(parent)) else {
+        return Applicability::Unknown;
+    };
+    if reference_shape_known(index, &actual, false, 0)
+        && reference_shape_known(index, &expected, false, 0)
+        && reference_subtype(index, &actual, &expected, false) {
+        Applicability::Rejected
+    } else {
+        Applicability::Unknown
+    }
+}
+
 pub struct Candidates<'a> {
     pub members: Vec<&'a Entry>,
     pub property_getters: Vec<&'a Entry>,
@@ -2691,6 +2762,10 @@ pub(crate) fn function_applicability(
     ctx: &FileCtx,
     mode: CallMode,
 ) -> Applicability {
+    if mode == CallMode::Kotlin {
+        let source = kotlin_callable_applicability(index, receiver, entry, ctx);
+        if source != Applicability::Applicable { return source; }
+    }
     let bound = match bind_arguments(index, receiver, entry, args, mode, ctx) {
         Ok(bound) => bound,
         Err(status) => return status,

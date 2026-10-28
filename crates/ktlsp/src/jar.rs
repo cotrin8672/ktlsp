@@ -817,7 +817,7 @@ fn binary_owner_source<R: Read + io::Seek>(
     }
     let own_name = owner_name.rsplit('.').next().unwrap();
     let Some((mut source, unavailable)) =
-        java_declaration_stub_scoped(class, false, Some(own_name), enclosing, source_file)
+        java_declaration_stub_scoped(class, false, Some(own_name), enclosing, source_file, false)
     else {
         return Ok(None);
     };
@@ -948,7 +948,7 @@ pub(crate) fn selected_sdk_class_stub_facts(
             .entries
             .get(class.identity.internal_name.as_str())
             .is_some_and(Option::is_some))
-    .then(|| java_declaration_stub(class, true))
+    .then(|| selected_sdk_declaration_stub(class, None, false))
     .flatten()
 }
 
@@ -967,6 +967,7 @@ pub(crate) fn selected_sdk_nested_stub_facts(
     selection: &crate::classpath::SdkApiSelection,
     class: &ktcore::classfile::ClassFileFacts,
     name: &str,
+    package_static_ancestor: bool,
 ) -> Option<(
     String,
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
@@ -985,10 +986,12 @@ pub(crate) fn selected_sdk_nested_stub_facts(
         .iter()
         .find(|row| row.inner.as_ref() == class.identity.internal_name)?;
     if row.name.as_deref() != Some(name)
-        || !matches!(
-            (row.access_flags, class.access_flags),
-            (0x0609, 0x0601) | (0x4019, 0x4031)
-        )
+        || !(matches!((row.access_flags, class.access_flags),
+            (0x0609, 0x0601) | (0x4019, 0x4031))
+            || matches!(row.access_flags, 0x0009 | 0x0019 | 0x0409)
+                && class.access_flags & !0x0020 == row.access_flags & !0x0008
+            || package_static_ancestor && matches!(row.access_flags, 0x0008 | 0x0018 | 0x0408)
+                && class.access_flags & !0x0020 == row.access_flags & !0x0008)
         || !is_java_identifier(name)
     {
         return None;
@@ -996,7 +999,37 @@ pub(crate) fn selected_sdk_nested_stub_facts(
     if class.access_flags & 0x4000 != 0 {
         return selected_sdk_enum_stub(class, name);
     }
-    java_declaration_stub_named(class, true, Some(name))
+    selected_sdk_declaration_stub(class, Some(name), package_static_ancestor)
+}
+
+fn selected_sdk_declaration_stub(
+    class: &ktcore::classfile::ClassFileFacts,
+    source_name: Option<&str>,
+    package_static_ancestor: bool,
+) -> Option<(String, Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>)> {
+    let package = class.identity.internal_name.rsplit_once('/').map_or("", |(package, _)| package);
+    let normalize = |signature: &str| ktcore::classfile::signature_with_inner_classes_in_package(
+        signature, &class.inner_classes, package);
+    let mut declaration = class.clone();
+    if let Some(signature) = &class.signature {
+        declaration.signature = Some(normalize(signature)?.into());
+    }
+    for member in declaration.fields.iter_mut().chain(&mut declaration.methods) {
+        if let Some(signature) = &member.signature {
+            if let Some(signature) = normalize(signature) {
+                member.signature = Some(signature.into());
+            }
+        }
+    }
+    for field in &mut declaration.fields {
+        if field.signature.is_none() {
+            if let Some(signature) = normalize(&field.descriptor)
+                .filter(|signature| signature.as_str() != field.descriptor.as_ref()) {
+                field.signature = Some(signature.into());
+            }
+        }
+    }
+    java_declaration_stub_scoped(&declaration, true, source_name, &[], None, package_static_ancestor)
 }
 
 /// A selected final enum has an exact implicit superclass and self-typed constants.
@@ -1040,8 +1073,8 @@ fn selected_sdk_enum_stub(
     declaration
         .fields
         .retain(|field| field.access_flags & 0x4000 == 0);
-    let (source, unavailable) = java_declaration_stub_named(&declaration, true, Some(name))?;
-    let head = format!("public final class {name}");
+    let (source, unavailable) = selected_sdk_declaration_stub(&declaration, Some(name), false)?;
+    let head = format!("public static final class {name}");
     let source = source.replacen(&head, &format!("public static enum {name}"), 1);
     let opening = source.find("{\n")? + 2;
     let mut source = source;
@@ -1057,7 +1090,7 @@ fn java_declaration_stub_named(
     String,
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
 )> {
-    java_declaration_stub_scoped(class, selected_sdk, source_name, &[], None)
+    java_declaration_stub_scoped(class, selected_sdk, source_name, &[], None, false)
 }
 
 fn java_declaration_stub_scoped(
@@ -1066,6 +1099,7 @@ fn java_declaration_stub_scoped(
     source_name: Option<&str>,
     enclosing: &[&[ktcore::classfile::signature::SignatureParameter]],
     expected_source: Option<&str>,
+    package_static_ancestor: bool,
 ) -> Option<(
     String,
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
@@ -1079,7 +1113,7 @@ fn java_declaration_stub_scoped(
         .internal_name
         .rsplit_once('/')
         .unwrap_or(("", &class.identity.internal_name));
-    if class.access_flags & PUBLIC == 0
+    if class.access_flags & PUBLIC == 0 && !package_static_ancestor
         || class.access_flags & !(PUBLIC | 0x0010 | 0x0020 | INTERFACE | ABSTRACT) != 0
         || class.access_flags & 0x0410 == 0x0410
         || (class.source_file.is_some() || !selected_sdk)
@@ -1139,7 +1173,7 @@ fn java_declaration_stub_scoped(
         Some("java/lang/Object") | None => None,
         Some(parent) => Some(match &generic {
             Some(signature) => {
-                if parent == class.identity.internal_name || parent.contains('$') {
+                if parent == class.identity.internal_name || !selected_sdk && parent.contains('$') {
                     return None;
                 }
                 java_descriptor_type(&signature.superclass, class_parameters, !package.is_empty())?
@@ -1294,7 +1328,11 @@ fn java_declaration_stub_scoped(
     }
     let mut methods = std::collections::BTreeMap::new();
     for method in &class.methods {
+        let constructor = selected_sdk && source_name.is_some() && !is_interface
+            && method.name.as_ref() == "<init>";
         if method.access_flags & (PUBLIC | 0x0004) == 0
+            || constructor && (!matches!(method.access_flags, PUBLIC | 0x0004)
+                || !method.descriptor.ends_with(")V"))
             || is_interface && !matches!(method.access_flags, 0x0401 | 0x0001 | 0x0009)
             || is_interface
                 && !selected_sdk
@@ -1317,7 +1355,7 @@ fn java_declaration_stub_scoped(
                 != 0
             || method.access_flags & ABSTRACT != 0
                 && (class.access_flags & ABSTRACT == 0 || method.access_flags & 0x0938 != 0)
-            || !is_java_identifier(&method.name)
+            || !constructor && !is_java_identifier(&method.name)
             || method
                 .attribute_names
                 .iter()
@@ -1424,7 +1462,10 @@ fn java_declaration_stub_scoped(
         } else {
             ""
         };
-        let declaration = if method.access_flags & ABSTRACT != 0 {
+        let declaration = if constructor {
+            format!("    {access} {generic_declaration}{}({}) {{ throw null; }}\n",
+                source_name?, parameters.join(", "))
+        } else if method.access_flags & ABSTRACT != 0 {
             format!(
                 "    {access} abstract {generic_declaration}{returns} {}({});\n",
                 method.name,
@@ -1498,8 +1539,10 @@ fn java_declaration_stub_scoped(
             type_parameters.trim_end()
         ));
     } else {
+        let static_ = if selected_sdk && source_name.is_some() { "static " } else { "" };
+        let access = if class.access_flags & PUBLIC != 0 { "public " } else { "" };
         source.push_str(&format!(
-            "public {modifier}class {name}{}",
+            "{access}{static_}{modifier}class {name}{}",
             type_parameters.trim_end()
         ));
     }

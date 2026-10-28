@@ -397,7 +397,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
             false,
         );
     }
-    if node.kind() == "constructor_declaration" {
+    if !java && node.kind() == "constructor_declaration" {
         return SourceMemberFlags::new(
             MemberImplementation::Constructor,
             Dispatch::Instance,
@@ -421,7 +421,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     );
     if !value
         && !type_declaration
-        && !matches!(node.kind(), "function_declaration" | "method_declaration")
+        && !matches!(node.kind(), "function_declaration" | "method_declaration" | "constructor_declaration")
     {
         return SourceMemberFlags::default();
     }
@@ -448,6 +448,7 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
                 !matches!(
                     child.kind(),
                     "function_body"
+                        | "constructor_body"
                         | "block"
                         | "class_body"
                         | "interface_body"
@@ -543,6 +544,14 @@ pub fn source_member_flags(node: Node<'_>, src: &str, java: bool) -> SourceMembe
     } else {
         Visibility::Package
     };
+    if node.kind() == "constructor_declaration" {
+        return if conflicting_access {
+            SourceMemberFlags::default()
+        } else {
+            SourceMemberFlags::new(MemberImplementation::Constructor, Dispatch::Instance,
+                visibility, false, false).with_java_protected(java)
+        };
+    }
     if type_declaration {
         return if conflicting_access {
             SourceMemberFlags::default()

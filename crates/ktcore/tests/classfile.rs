@@ -21,6 +21,49 @@ fn method<'a>(class: &'a ClassFileFacts, name: &str, descriptor: &str) -> &'a Me
 }
 
 #[test]
+fn nested_signature_normalization_requires_whole_class_tokens() {
+    use ktcore::classfile::{method_types_with_inner_classes, signature_with_inner_classes, InnerClassFacts};
+    let rows = [InnerClassFacts { inner: "a$Entry".into(), outer: Some("a".into()),
+        name: Some("Entry".into()), access_flags: 0x0009 }];
+    for (input, expected) in [
+        ("(ILa$Entry;)V", "(ILa.Entry;)V"),
+        ("<K:Ljava/lang/Object;>(ILa$Entry<TK;>;)V", "<K:Ljava/lang/Object;>(ILa.Entry<TK;>;)V"),
+        ("<La$Entry:Ljava/lang/Object;>(TLa$Entry;La$Entry<TLa$Entry;>;)V",
+            "<La$Entry:Ljava/lang/Object;>(TLa$Entry;La.Entry<TLa$Entry;>;)V"),
+    ] {
+        assert_eq!(signature_with_inner_classes(input, &rows).as_deref(), Some(expected));
+    }
+    assert_eq!(method_types_with_inner_classes("(ILa$Entry;)V", &rows).unwrap().0.len(), 2);
+    let generic = signature_with_inner_classes("<K:Ljava/lang/Object;>(ILa$Entry<TK;>;)V", &rows).unwrap();
+    assert!(ktcore::classfile::signature::method_signature(&generic, "(ILa$Entry;)V", &[]).is_some());
+    for input in ["(LPrefixLa$Entry;)V", "(Lliteral$Entry;)V",
+        "(LPrefixLa$Entry<Ljava/lang/String;>;)V", "(TLa$Entry;)V"] {
+        assert_eq!(signature_with_inner_classes(input, &rows).as_deref(), Some(input),
+            "a row for a$Entry cannot rewrite another class or type variable");
+    }
+    assert!(method_types_with_inner_classes("(LPrefixLa$Entry;)V", &rows).is_none());
+    assert!(method_types_with_inner_classes("(Lliteral$Entry;)V", &rows).is_none());
+    let chain = [rows[0].clone(), InnerClassFacts { inner: "a$Entry$Deep".into(),
+        outer: Some("a$Entry".into()), name: Some("Deep".into()), access_flags: 0x4019 }];
+    assert_eq!(signature_with_inner_classes("(ILa$Entry$Deep;)V", &chain).as_deref(), Some("(ILa.Entry.Deep;)V"));
+    assert!(method_types_with_inner_classes("(ILa$Entry$Deep;)V", &chain).is_some());
+    assert!(signature_with_inner_classes("(La$Entry$Deep;)V", &chain[1..]).is_none());
+    for flags in [0x0001, 0x000a] {
+        let mut invalid = chain.clone(); invalid[0].access_flags = flags;
+        assert!(signature_with_inner_classes("(La$Entry$Deep;)V", &invalid).is_none());
+    }
+    let mut duplicate = chain.to_vec(); duplicate.push(chain[0].clone());
+    assert!(signature_with_inner_classes("(La$Entry$Deep;)V", &duplicate).is_none());
+    let package = [InnerClassFacts { inner: "pkg/Outer$Hidden".into(), outer: Some("pkg/Outer".into()),
+        name: Some("Hidden".into()), access_flags: 0x0408 }];
+    assert!(signature_with_inner_classes("Lpkg/Outer$Hidden;", &package).is_none());
+    assert!(ktcore::classfile::signature_with_inner_classes_in_package("Lpkg/Outer$Hidden;", &package, "other").is_none());
+    let normalized = ktcore::classfile::signature_with_inner_classes_in_package("Lpkg/Outer$Hidden;", &package, "pkg").unwrap();
+    assert_eq!(normalized, "Lpkg/Outer.Hidden;");
+    assert!(ktcore::classfile::signature::field_signature(&normalized, "Lpkg/Outer$Hidden;", &[]).is_some());
+}
+
+#[test]
 fn actual_lombok_getter_has_binary_origin_and_descriptor() {
     let class = decode("project:plugin-fixture:main", PERSON).unwrap();
     assert_eq!(class.identity.origin_id, "project:plugin-fixture:main");

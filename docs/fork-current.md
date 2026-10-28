@@ -1,13 +1,15 @@
 # Current fork state
 
-Updated 2026-10-28 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
-correctness coverage are unmeasured; passing selected probes does not establish either.
+Updated 2026-10-28 (Asia/Tokyo). Selected-project acceptance complete through67.
+General IDEA parity and language-wide correctness coverage remain unmeasured;
+passing the selected probes does not establish either. No reproduced functional
+gap remains in the selected acceptance cases.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
 by editing UX. Warm speed is accepted provisionally; cold startup is lower priority.
 KAPT/KSP execution belongs to the external build, not to ktlsp's analysis. The
-user explicitly rejected LSP-owned regeneration. Remove the private generation
-executor and analysis-triggered Gradle replay; do not retain them as optional
-features. Existing generated sources/classes, dependencies and plugin configuration
+user explicitly rejected LSP-owned regeneration. The private generation executor
+and analysis-triggered Gradle replay have been removed. Existing generated
+sources/classes, dependencies and plugin configuration
 must instead be reflected in editing features and refreshed after an external build.
 The [official KSP quickstart](https://kotlinlang.org/docs/ksp-quickstart.html#use-your-processor)
 explicitly says that an undefined generated function in the IDE is expected before
@@ -21,7 +23,7 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification: selected evidence through63
+## Current verification: selected evidence through67
 
 Retain qualified CEM38, Moshi9, OkHttp10, Retrofit12, Spring10 and Gradle9
 results; a newer binary alone does not require replaying all of them. The
@@ -30,10 +32,50 @@ affected behavior after a functional change, not the complete project corpus.
 The Gradle unsaved dependency counter diagnostic now passes the focused real-editor
 proof below. Retain the earlier16 shared-edit results separately; this is not a new
 17-request replay. The resources/runtime-class consumer also has the actual result
-recorded below. Selected SDK/source index coverage still needs qualification before
-making a broader analysis-completeness claim. Tests and
+recorded below. The reproduced selected-SDK and Kotlin mapped-getter gaps are now
+fixed and qualified below; this does not certify the whole SDK. Tests and
 benchmarks are assigned to GPT-6.1 Terra/high; implementation fixes are assigned
 to GPT-6.1 Sol/high. No further optimization is scheduled.
+
+Candidate67 passes one combined `cargo test --workspace --locked --no-fail-fast`:
+**1896 passed, 0 failed, 16 existing ignored**, including doctests, followed by a
+successful release build. All367 source guards remain stable
+(`sdk-host67/main-ready.json`). The immutable release SHA256 is
+`b682c0d6bfef78a2cab174c89499c841f70edc111d2e96a03a9feceb35e5898f`.
+
+The selected SDK fixes preserve public static nested owner chains, generic
+`Map.entrySet` results and usable navigation: static `Map.Entry<K,V>` has no
+instantiated enclosing owner. They also preserve public `KeySetView` and its
+package-private generic `CollectionView` superclass, including `getMap`, exact
+constructor visibility in cache format48, and bounded whole-token normalization. Kotlin's
+mapped getter filter is proved only for trusted `Map.Entry`; Java/raw JVM members
+and the ordinary `getMap` property remain available. Java `--release 8` compiler
+controls establish valid `entry.getKey()` and `ProcessBuilder.Redirect.PIPE.type().name()`. Separate Kotlin2.4
+controls establish valid `e.key`, invalid `e.getKey()`, and valid
+`KeySetView.getMap()`/`map` (`sdk8-kotlin-oracle`).
+
+Actual Neovim on immutable67 reuses the existing `sdk8-editor-cache` without
+clearing it. Java Redirect completion returns `name` on its first RPC. Both Kotlin
+RPCs match on the first response: `key.sub` offers `substring`, and `getK` excludes
+`getKey`, with three semantic assertions including the useful known-receiver
+control. Unsaved delivery, exact restoration and clean exit0 pass. The artifacts
+are `C:/Users/gummy/.codex/sdk8-redirect-green67/artifacts/corpus-results.json`
+and `C:/Users/gummy/.codex/sdk8-kotlin-editor-green67/artifacts/corpus-results.json`.
+Both report missingSources1/failed0, classpathComplete=true and jdkComplete=false;
+those coverage flags do not certify full SDK source coverage. SDK64's Java
+SimpleEntry first-response success is retained separately, not replayed on67.
+The real64 RED results remain evidence. The intervening65 static-owner and66
+two new native-test failures were test-premise/setup defects, corrected without
+weakening positive cases or retrying editor requests; they are not unresolved
+production failures.
+
+The current source/API contracts are already public through75002c7. Resources,
+runtime bytes and generic commands retain their separately qualified actual
+proofs below; no per-slice mc-dev wakeup or scheduled corpus replay is needed.
+CEM38 and the additional five projects'50 checks are carried evidence from the
+recorded releases, not a same-binary67 replay. Broader operators, bounded-generic
+and receiver-lambda inference, whole-SDK correctness and full IDEA parity remain
+unmeasured.
 
 Candidate56 passes the complete Rust workspace: **1845 passed, 0 failed,
 13 ignored**, followed by a successful release build. The immutable binary is
@@ -222,9 +264,10 @@ selected binary entries as fallback. The SDK/source coverage flag is not evidenc
 of29 language bugs or proof that every selected SDK origin is complete; qualify it
 separately from the certified counter result.
 Resource and class-byte host/serializer controls pass12 focused checks and a
-real selected-SDK Code/negative lookup passes separately. Their actual child
-integration, raw-resource owners and lower-release SDK header facts remain open;
-the whole mc-dev contract has not been handed off as complete.
+real selected-SDK Code/negative lookup passes separately. The actual child and
+raw-resource owner integration is qualified by immutable62 above; selected SDK
+qualification is updated through67. These scoped contracts do not establish the
+whole mc-dev integration or full SDK/runtime coverage.
 
 ## Previous checkpoints: releases42 through54
 
@@ -583,9 +626,9 @@ host-issued identities/read tracking and atomic checked contributions, starting
 with single-target Mixin/Shadow. That message only transmitted a policy proposal.
 Subsequently the mc-dev migration task received a new user instruction to replace
 its implementation with Rust, visible in its current task preview. Its requested
-general host IPC spike is now a separate next slice: publish the protocol boundary
-and prove delayed-child/unsaved-edit stale rejection without blocking ordinary
-completion. The direct human instruction to continue implementation overrides a
+general host IPC spike was subsequently implemented and published, proving
+delayed-child/unsaved-edit stale rejection without blocking ordinary completion.
+The direct human instruction to continue implementation overrides a
 subsequent mistaken pause request from the migration task. Core pending/resume
 and framing checks pass (2+1 tests in `ipc140-core-1` and `ipc140-lsp-1`). The
 later host controls pass4 tests and diagnostic lifecycle controls pass7 with one
@@ -597,35 +640,33 @@ do not introduce a broad diagnostic enum/transport refactor for the current migr
 Full MixinExtras/Lapis, generated/multiple-target and complex generic/value-class
 semantics are not certified by the test extension.
 
-## Next actions and execution rules
+## Completion limits and future execution rules
 
-1. Complete the Java6-valid dirty-source counter using Kotlin's ordinary Java
-   source/header inputs and the original classpath. Keep Java-body authority
-   separate; do not restore automatic Gradle archive replay or KAPT/KSP execution.
-2. Retain the actual external Lombok75 and KSP/KAPT114 proofs. Preserve
-   configuration changes, stale API withdrawal and unsaved-buffer behavior in
-   affected later verification.
-3. Retain the six-origin POM/byte proof and binary fallback limits; investigate real
-   failed source origins without guessing an encoding. Broader operator, bounded
-   generic and receiver-lambda inference remains outside proven coverage.
-4. Use one coherent final snapshot for affected editor/plugin/build lifecycle and
-   latency checks. Reuse existing controllers, goldens and genuine caches, repeating
-   only checks affected by later changes. Cold setup remains a separate measurement.
-5. Update this record, selectively commit/push verified changes, and report feature
-   evidence and gaps. Do not derive implementation or grammar percentages from counts.
-6. Keep the verified asynchronous IPC boundary usable by the independent mc-dev
-   consumer; later fact capabilities remain scoped additions, with MC policy in mc-dev
-   and no communication waits under Workspace locks.
-7. Publish the verified mc-dev source inventory/current snapshot slice with its
-   serializer fixtures and real child evidence. Keep large-scope handler/budget
-   proof distinct from complete large-project editor proof; resources, raw class
-   bytes and command routing remain separate contracts.
+1. No repeated corpus sweep, benchmark, optimization or per-slice mc-dev wakeup is
+   scheduled. Retain CEM38, the five-project50, the dirty-Java counter, Lombok75,
+   KSP/KAPT114 and the published source/resource/command proofs with their scopes.
+2. KAPT/KSP generation remains an external-build responsibility. Preserve current
+   generated-input refresh, stale API withdrawal and unsaved-buffer semantics;
+   do not restore private generation or analysis-triggered Gradle archive replay.
+3. Future concrete reproductions should use existing fixtures/controllers and
+   genuine caches. Group small related fixes, then run the full workspace suite
+   before calling the batch complete, as required by AGENTS.md. This does not
+   require repeating passing editor or benchmark cases. Cold setup remains a
+   separate measurement.
+4. Preserve SDK/source fallback limits and honest Unknown results. Broader grammar,
+   operator, bounded-generic, lambda, whole-SDK and IDEA-parity coverage requires
+   new evidence; do not derive percentages or known failures from missing coverage.
+5. Keep the published asynchronous API usable by the independent mc-dev consumer.
+   MC policy stays in mc-dev; later capabilities are scoped additions with no
+   communication waits under Workspace locks. Keep large-source handler/budget
+   proof distinct from complete large-project editor proof.
 
 The human permits ongoing API-contract, implementation-commit and verification-result
 sharing with the same mc-dev task within this goal. That scoped technical coordination
 does not require another permission request for each message.
 
-Native delegated work uses gpt-6.1-sol/high, at most5 agents, no new worktrees.
+Implementation work uses gpt-6.1-sol/high; tests and benchmarks use
+gpt-6.1-terra/high, at most5 agents and no new worktrees.
 One Cargo owner and a global Rust write freeze cover each native build. Immutable
 editor runs can overlap later source work. Cache directories are private; stdout
 stays JSON-RPC only. Keep raw logs on disk and read bounded summaries or exact errors.

@@ -1281,6 +1281,11 @@ fn member_candidates(
     }
     for entry in &shared_members.members {
         if language == SourceLanguage::Kotlin
+            && ktcore::members::kotlin_callable_applicability(inference_index, ty, entry, member_ctx)
+                == ktcore::members::Applicability::Rejected {
+            continue;
+        }
+        if language == SourceLanguage::Kotlin
             && entry.sym.name.starts_with(prefix)
             && ktcore::members::kotlin_enum_property_type_ref(inference_index, ty, entry).is_some()
         {

@@ -389,6 +389,30 @@ fn source_member_headers_distinguish_abstract_default_invalid_and_unfinished_bod
 }
 
 #[test]
+fn java_constructor_visibility_reuses_authored_access_without_implicit_defaults() {
+    use ktlsp::symbol::{MemberImplementation, SymbolKind};
+    for (modifier, visibility) in [("public", Visibility::Public),
+        ("protected", Visibility::Protected), ("private", Visibility::Private),
+        ("", Visibility::Package)] {
+        let source = format!("package oracle; class Owner {{ {modifier} Owner() {{}} }}");
+        let mut parsers = LanguageParsers::new();
+        let tree = parsers.parse(SourceLanguage::Java, &source);
+        let symbols = language::symbol_facts(SourceLanguage::Java, &tree, &source).symbols;
+        let flags = symbols.iter().find(|symbol| symbol.name == "Owner"
+            && symbol.kind == SymbolKind::Function).unwrap().source_member;
+        assert_eq!(flags.implementation(), Some(MemberImplementation::Constructor));
+        assert_eq!(flags.dispatch(), Some(Dispatch::Instance));
+        assert_eq!(flags.visibility(), Some(visibility));
+        assert_eq!(flags.protected_package_access(), visibility == Visibility::Protected);
+    }
+    let mut parsers = LanguageParsers::new();
+    let source = "package oracle; class Owner {}";
+    let tree = parsers.parse(SourceLanguage::Java, source);
+    assert!(!language::symbol_facts(SourceLanguage::Java, &tree, source).symbols.iter()
+        .any(|symbol| symbol.name == "Owner" && symbol.kind == SymbolKind::Function));
+}
+
+#[test]
 fn java_constructor_is_not_an_ordinary_method_descriptor_with_the_owner_name() {
     use ktlsp::symbol::MemberImplementation;
     let source = "package oracle; public class Owner { public Owner(int value) {} public int Owner(int value) { return value; } }";

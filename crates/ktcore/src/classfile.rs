@@ -235,33 +235,109 @@ pub fn method_types_with_inner_classes(
     if let Some(types) = method_types(descriptor) {
         return Some(types);
     }
-    let mut signature = descriptor.to_string();
-    let mut seen = HashSet::new();
-    for row in inner_classes {
-        let token = format!("L{};", row.inner);
-        if !descriptor.contains(&token) {
-            continue;
-        }
-        let outer = row.outer.as_deref()?;
-        let name = row.name.as_deref()?;
-        if !seen.insert(row.inner.as_ref())
-            || !matches!(
-                row.access_flags,
-                0x0009 | 0x0019 | 0x0409 | 0x0609 | 0x2609 | 0x4009 | 0x4019 | 0x4409
-            )
-            || outer.contains('$')
-            || name.contains('$')
-            || !internal_name(outer)
-            || !unqualified_name(name)
-            || row.inner.as_ref() != format!("{outer}${name}")
-        {
-            return None;
-        }
-        signature = signature.replace(&token, &format!("L{outer}.{name};"));
-    }
+    let signature = signature_with_inner_classes(descriptor, inner_classes)?;
     // The existing Signature parser validates identifiers and exact erasure against the input.
     let projected = signature::method_signature(&signature, descriptor, &[])?;
     Some((projected.parameters, projected.returns))
+}
+
+/// Spell only explicitly recorded public static nested references in Signature syntax.
+/// Callers must still validate the signature's exact erasure against the original binary facts.
+pub fn signature_with_inner_classes(
+    input: &str,
+    inner_classes: &[InnerClassFacts],
+) -> Option<String> {
+    signature_with_inner_classes_scoped(input, inner_classes, None)
+}
+
+/// Selected SDK declarations may name package-private static peers in their own package.
+/// This proves spelling only; it does not make the referenced type publicly accessible.
+pub fn signature_with_inner_classes_in_package(
+    input: &str,
+    inner_classes: &[InnerClassFacts],
+    package: &str,
+) -> Option<String> {
+    signature_with_inner_classes_scoped(input, inner_classes, Some(package))
+}
+
+fn signature_with_inner_classes_scoped(
+    input: &str,
+    inner_classes: &[InnerClassFacts],
+    package: Option<&str>,
+) -> Option<String> {
+    if input.len() > u16::MAX as usize { return None; }
+    let mut signature = String::with_capacity(input.len());
+    let (mut cursor, mut copied, mut depth) = (0, 0, 0usize);
+    let mut formals = input.starts_with('<');
+    let mut formal_name = false;
+    while cursor < input.len() {
+        // Formal names and type-variable names can contain L or literal dollar signs.
+        if formal_name {
+            cursor += input[cursor..].find(':')? + 1;
+            formal_name = false;
+            continue;
+        }
+        match input.as_bytes()[cursor] {
+            b'L' => {
+                let start = cursor + 1;
+                cursor = start + input[start..].find([';', '<', '.'])?;
+                let mut rows = inner_classes.iter().filter(|row| row.inner.as_ref() == &input[start..cursor]);
+                if let Some(row) = rows.next() {
+                    if rows.next().is_some() { return None; }
+                    let mut row = row;
+                    let mut names = Vec::new();
+                    let root = loop {
+                        let outer = row.outer.as_deref()?;
+                        let name = row.name.as_deref()?;
+                        if names.len() >= 64
+                            || !(matches!(row.access_flags,
+                                0x0009 | 0x0019 | 0x0409 | 0x0609 | 0x2609 | 0x4009 | 0x4019 | 0x4409)
+                                || matches!(row.access_flags, 0x0008 | 0x0018 | 0x0408)
+                                    && package == Some(outer.rsplit_once('/').map_or("", |(package, _)| package)))
+                            || name.contains('$') || !internal_name(outer) || !unqualified_name(name)
+                            || row.inner.as_ref() != format!("{outer}${name}")
+                        { return None; }
+                        names.push(name);
+                        if !outer.contains('$') { break outer; }
+                        let mut parents = inner_classes.iter().filter(|parent| parent.inner.as_ref() == outer);
+                        row = parents.next()?;
+                        if parents.next().is_some() { return None; }
+                    };
+                    signature.push_str(&input[copied..start]);
+                    signature.push_str(root);
+                    for name in names.into_iter().rev() {
+                        signature.push('.');
+                        signature.push_str(name);
+                    }
+                    copied = cursor;
+                }
+            }
+            b'T' => { cursor += 1 + input[cursor + 1..].find(';')?; }
+            // Source-style owner suffixes are identifiers, not additional L-type tokens.
+            b'.' => { cursor += 1 + input[cursor + 1..].find([';', '<', '.'])?; }
+            b'<' => {
+                depth += 1;
+                if depth > 64 { return None; }
+                formal_name = formals && depth == 1;
+                cursor += 1;
+            }
+            b'>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 { formals = false; }
+                cursor += 1;
+            }
+            b';' => {
+                cursor += 1;
+                formal_name = formals && depth == 1
+                    && !matches!(input.as_bytes().get(cursor), Some(b':' | b'>'));
+            }
+            b'(' | b')' | b'[' | b'+' | b'-' | b'*' | b':' | b'^'
+                | b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b'V' => cursor += 1,
+            _ => return None,
+        }
+    }
+    signature.push_str(&input[copied..]);
+    Some(signature)
 }
 
 /// Count descriptor parameters without claiming that their binary names are source types.

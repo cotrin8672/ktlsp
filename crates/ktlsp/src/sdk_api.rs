@@ -156,7 +156,27 @@ pub(crate) fn index_while_current(
         );
         classes.insert(owner.clone(), class);
     }
+    let mut package_ancestors = std::collections::BTreeSet::new();
+    for class in classes.values().filter(|class| class.identity.internal_name.contains('$')) {
+        ensure!(current(), "SDK indexing generation cancelled");
+        if static_nested_identity(class, &classes).is_none() { continue; }
+        let package = class.identity.internal_name.rsplit_once('/').map(|(package, _)| package);
+        let mut parent = class.super_name.as_deref();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            ensure!(current(), "SDK indexing generation cancelled");
+            let Some(name) = parent.filter(|name| name.contains('$')) else { break; };
+            if !seen.insert(name) { break; }
+            let Some(ancestor) = classes.get(name) else { break; };
+            if ancestor.identity.origin_id != class.identity.origin_id
+                || ancestor.identity.internal_name.rsplit_once('/').map(|(package, _)| package) != package
+                || static_nested_identity_with_access(ancestor, &classes, true).is_none() { break; }
+            if ancestor.access_flags & 1 == 0 { package_ancestors.insert(name.to_owned()); }
+            parent = ancestor.super_name.as_deref();
+        }
+    }
     let mut projections = BTreeMap::new();
+    let mut parents = BTreeMap::new();
     for (owner, class) in &classes {
         ensure!(current(), "SDK indexing generation cancelled");
         if owner.contains('$') {
@@ -185,16 +205,24 @@ pub(crate) fn index_while_current(
         if !owner.contains('$') {
             continue;
         }
-        let Some((outer, name)) = static_nested_identity(class, &classes) else {
+        let package_ancestor = package_ancestors.contains(owner);
+        let Some((outer, name, container)) = static_nested_identity_with_access(class, &classes, package_ancestor) else {
             complete = false;
             continue;
         };
         let Some((source, unavailable)) =
-            crate::jar::selected_sdk_nested_stub_facts(selection, class, &name)
+            crate::jar::selected_sdk_nested_stub_facts(selection, class, &name, package_ancestor)
         else {
             complete = false;
             continue;
         };
+        parents.insert(owner.clone(), outer);
+        projections.insert(owner.clone(), (source, vec![(name, Some(container), unavailable)]));
+    }
+    // A proved child binary name has its parent's prefix, so descendants fold first.
+    for (owner, outer) in parents.into_iter().rev() {
+        ensure!(current(), "SDK indexing generation cancelled");
+        let (source, child_owners) = projections.remove(&owner).unwrap();
         let Some((parent_source, owners)) = projections.get_mut(&outer) else {
             complete = false;
             continue;
@@ -208,11 +236,7 @@ pub(crate) fn index_while_current(
             .rfind('}')
             .context("SDK parent declaration missing close")?;
         parent_source.insert_str(end, &format!("\n{declaration}\n"));
-        owners.push((
-            name,
-            Some(outer.rsplit('/').next().unwrap().to_string()),
-            unavailable,
-        ));
+        owners.extend(child_owners);
     }
     for (owner, (source, owners)) in projections {
         ensure!(current(), "SDK indexing generation cancelled");
@@ -263,40 +287,67 @@ pub(crate) fn index_while_current(
     Ok(SdkApiIndex { batches, complete })
 }
 
-/// One-level public static interfaces or final enums only: no parameterized outer or instance capture.
+/// Every ancestor must prove a public static owner; no enclosing instance capture.
 fn static_nested_identity(
     class: &ktcore::classfile::ClassFileFacts,
     classes: &BTreeMap<String, ktcore::classfile::ClassFileFacts>,
-) -> Option<(String, String)> {
-    let row = class
-        .inner_classes
-        .iter()
-        .find(|row| row.inner.as_ref() == class.identity.internal_name)?;
-    let outer = row.outer.as_deref()?;
-    let name = row.name.as_deref()?;
-    if outer.contains('$')
-        || name.contains('$')
-        || !crate::jar::is_java_identifier(name)
-        || !matches!(
-            (row.access_flags, class.access_flags),
-            (0x0609, 0x0601) | (0x4019, 0x4031)
-        )
-        || class
-            .attribute_names
+) -> Option<(String, String, String)> {
+    static_nested_identity_with_access(class, classes, false)
+}
+
+fn static_nested_identity_with_access(
+    class: &ktcore::classfile::ClassFileFacts,
+    classes: &BTreeMap<String, ktcore::classfile::ClassFileFacts>,
+    package_static_ancestor: bool,
+) -> Option<(String, String, String)> {
+    let mut current = class;
+    let mut identity = None;
+    let mut names = Vec::new();
+    for _ in 0..64 {
+        let row = current
+            .inner_classes
             .iter()
-            .any(|a| a.as_ref() == "EnclosingMethod")
-        || class.identity.internal_name != format!("{outer}${name}")
-    {
-        return None;
+            .find(|row| row.inner.as_ref() == current.identity.internal_name)?;
+        let outer = row.outer.as_deref()?;
+        let name = row.name.as_deref()?;
+        if name.contains('$')
+            || !crate::jar::is_java_identifier(name)
+            || !(matches!((row.access_flags, current.access_flags),
+                (0x0609, 0x0601) | (0x4019, 0x4031))
+                || matches!(row.access_flags, 0x0009 | 0x0019 | 0x0409)
+                    && current.access_flags & !0x0020 == row.access_flags & !0x0008
+                || identity.is_none() && package_static_ancestor
+                    && matches!(row.access_flags, 0x0008 | 0x0018 | 0x0408)
+                    && current.access_flags & !0x0020 == row.access_flags & !0x0008)
+            || current.attribute_names.iter().any(|a| a.as_ref() == "EnclosingMethod")
+            || current.identity.internal_name != format!("{outer}${name}")
+        {
+            return None;
+        }
+        let parent = classes.get(outer)?;
+        if parent.identity.origin_id != class.identity.origin_id
+            || parent.access_flags & 1 == 0
+            || current.inner_classes.iter().filter(|other| other.inner == row.inner).count() != 1
+            || parent.inner_classes.iter().filter(|other| other.inner == row.inner).collect::<Vec<_>>() != [row]
+        {
+            return None;
+        }
+        if identity.is_none() {
+            identity = Some((outer.to_string(), name.to_string()));
+        } else {
+            names.push(name);
+        }
+        if !outer.contains('$') {
+            let root = outer.rsplit('/').next()?;
+            if !crate::jar::is_java_identifier(root) { return None; }
+            names.push(root);
+            names.reverse();
+            let (outer, name) = identity?;
+            return Some((outer, name, names.join(".")));
+        }
+        current = parent;
     }
-    let parent = classes.get(outer)?;
-    if parent.identity.origin_id != class.identity.origin_id
-        || parent.access_flags & 1 == 0
-        || !parent.inner_classes.iter().any(|other| other == row)
-    {
-        return None;
-    }
-    Some((outer.to_string(), name.to_string()))
+    None
 }
 
 #[cfg(test)]
@@ -394,6 +445,28 @@ mod tests {
                 )
                 .as_slice(),
             ),
+            (
+                "java/util/AbstractMap",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/AbstractMap.sig")
+                    .as_slice(),
+            ),
+            (
+                "java/util/AbstractMap$SimpleEntry",
+                include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/AbstractMap$SimpleEntry.sig")
+                    .as_slice(),
+            ),
+            ("java/lang/ProcessBuilder", include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/sdk17-release8/ProcessBuilder.sig").as_slice()),
+            ("java/lang/ProcessBuilder$Redirect", include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/sdk17-release8/ProcessBuilder$Redirect.sig").as_slice()),
+            ("java/lang/ProcessBuilder$Redirect$Type", include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/sdk17-release8/ProcessBuilder$Redirect$Type.sig").as_slice()),
+            ("java/util/concurrent/ConcurrentHashMap", include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/sdk17-release8/ConcurrentHashMap.sig").as_slice()),
+            ("java/util/concurrent/ConcurrentHashMap$KeySetView", include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/sdk17-release8/ConcurrentHashMap$KeySetView.sig").as_slice()),
+            ("java/util/concurrent/ConcurrentHashMap$CollectionView", include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/sdk17-release8/ConcurrentHashMap$CollectionView.sig").as_slice()),
         ] {
             zip.start_file(
                 format!("8/java.base/{owner}.sig"),
@@ -469,6 +542,245 @@ mod tests {
             assert_eq!(&target[defs[0].start_byte..defs[0].end_byte],"getKey");
             assert!(target[..defs[0].start_byte].contains("interface Entry"));
             assert!(!target.contains("interface Map$Entry"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_nested_class_regenerates_same_cache_with_generics_constructors_and_owner_guards() {
+        let (root, selection) = entry_selection();
+        let extract = root.join("extract");
+        let path = extract.join("jdk-api").join(format!("{:x}",
+            Sha256::digest(selection.identity().as_bytes()))).join("java/util/AbstractMap.java");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "package java.util; public abstract class AbstractMap<K,V> {}\n").unwrap();
+        let indexed = index(&selection, &extract).unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(source.contains("public static class SimpleEntry<"), "{source}");
+        assert!(source.contains("implements java.util.Map.Entry<K, V>, java.io.Serializable"), "{source}");
+        assert!(source.contains("public SimpleEntry(K p0, V p1)"), "{source}");
+        assert!(source.contains("public SimpleEntry(java.util.Map.Entry<? extends K, ? extends V> p0)"), "{source}");
+        assert!(!source.contains("SimpleEntry()") && !source.contains("interface SimpleEntry"));
+        let batch = indexed.batches.iter().find(|batch| batch.file == crate::paths::file_key(&path)).unwrap();
+        let owner = batch.symbols.iter().find(|symbol| symbol.name == "SimpleEntry"
+            && symbol.kind == ktcore::symbol::SymbolKind::Class).unwrap();
+        assert_eq!(owner.container.as_deref(), Some("AbstractMap"));
+        assert_eq!(owner.type_params, ["K", "V"]);
+        let constructors: Vec<_> = batch.symbols.iter().filter(|symbol|
+            symbol.name == "SimpleEntry" && symbol.kind == ktcore::symbol::SymbolKind::Function).collect();
+        assert_eq!(constructors.len(), 2);
+        assert!(constructors.iter().any(|constructor| constructor.params.len() == 2
+            && constructor.params[0].name == "K" && constructor.params[1].name == "V"));
+        let mut ws = crate::workspace::Workspace::new();
+        for batch in indexed.batches { assert!(ws.index_dependency_batch(batch)); }
+        ws.assume_index_complete_for_tests();
+        for (name, text, getter_prefix, getter_name, getter_token) in [
+            ("Nested.java", "class Nested { String f(java.util.AbstractMap.SimpleEntry<String,String> e) { return e.getKey().substring(0); } }", ".get", "getKey", "getKey()"),
+            ("Nested.kt", "fun f(e: java.util.AbstractMap.SimpleEntry<String,String>) = e.key.substring(0)", ".ke", "key", "key"),
+        ] {
+            let key = crate::paths::file_key(&root.join(name));
+            ws.open(&key, text.into());
+            for (prefix, wanted) in [(getter_prefix, getter_name), (".sub", "substring")] {
+                let result = ws.complete(&key, text.find(prefix).unwrap() + prefix.len(), true);
+                assert!(result.as_ref().is_some_and(|result| result.items.iter().any(|item| item.label == wanted)),
+                    "selected SDK nested class must preserve {wanted} in {name}: {result:?}");
+            }
+            if name.ends_with(".kt") {
+                let members = ws.complete(&key, text.find("e.key").unwrap() + "e.".len(), true)
+                    .expect("selected SimpleEntry Kotlin receiver completion");
+                assert!(members.items.iter().any(|item| item.label == "key"));
+                assert!(!members.items.iter().any(|item| item.label == "getKey"),
+                    "Kotlin compiler rejects the mapped physical getter name");
+            }
+            let definitions = ws.goto_definition(&key, text.find(getter_token).unwrap());
+            assert_eq!(definitions.len(), 1, "{definitions:?}");
+            assert_eq!(definitions[0].file, crate::paths::file_key(&path));
+            assert_eq!(&source[definitions[0].start_byte..definitions[0].end_byte], "getKey");
+        }
+        let parent = ktcore::classfile::decode(&selection.origin(), include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/sdk17-release8/AbstractMap.sig")).unwrap();
+        let child = ktcore::classfile::decode(&selection.origin(), include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/sdk17-release8/AbstractMap$SimpleEntry.sig")).unwrap();
+        assert!([&parent, &child].iter().all(|class| class.methods.iter().all(|method|
+            method.attribute_names.iter().all(|attribute| attribute.as_ref() != "Code"))));
+        assert_eq!(static_nested_identity(&child, &BTreeMap::from([
+            (parent.identity.internal_name.clone(), parent.clone())])),
+            Some(("java/util/AbstractMap".into(), "SimpleEntry".into(), "AbstractMap".into())));
+        for mutation in ["nonstatic", "private", "anonymous", "duplicate-child", "duplicate-parent", "local", "class-flags"] {
+            let mut parent = parent.clone();
+            let mut child = child.clone();
+            let own = child.inner_classes.iter().position(|row| row.inner.as_ref() == child.identity.internal_name).unwrap();
+            match mutation {
+                "nonstatic" => child.inner_classes[own].access_flags &= !8,
+                "private" => child.inner_classes[own].access_flags = 0x000a,
+                "anonymous" => child.inner_classes[own].name = None,
+                "duplicate-child" => child.inner_classes.push(child.inner_classes[own].clone()),
+                "duplicate-parent" => parent.inner_classes.push(child.inner_classes[own].clone()),
+                "local" => child.attribute_names.push("EnclosingMethod".into()),
+                "class-flags" => child.access_flags |= 0x1000,
+                _ => unreachable!(),
+            }
+            assert!(static_nested_identity(&child, &BTreeMap::from([
+                (parent.identity.internal_name.clone(), parent)])).is_none(), "{mutation}");
+        }
+        for mutation in ["missing", "nonstatic", "duplicate", "wrong-name"] {
+            let mut child = child.clone();
+            let entry = child.inner_classes.iter().position(|row| row.inner.as_ref() == "java/util/Map$Entry").unwrap();
+            match mutation {
+                "missing" => { child.inner_classes.remove(entry); },
+                "nonstatic" => child.inner_classes[entry].access_flags &= !8,
+                "duplicate" => child.inner_classes.push(child.inner_classes[entry].clone()),
+                "wrong-name" => child.inner_classes[entry].name = Some("Other".into()),
+                _ => unreachable!(),
+            }
+            assert!(crate::jar::selected_sdk_nested_stub_facts(&selection, &child, "SimpleEntry", false).is_none(),
+                "generic nested hierarchy needs proved binary identity: {mutation}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_static_ancestor_chain_keeps_redirect_type_and_top_level_generic_members() {
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let batch = indexed.batches.iter().find(|batch| batch.file.ends_with("java/lang/ProcessBuilder.java")).unwrap();
+        assert!(batch.symbols.iter().any(|symbol| symbol.name == "Type"
+            && symbol.kind == ktcore::symbol::SymbolKind::EnumClass
+            && symbol.container.as_deref() == Some("ProcessBuilder.Redirect")));
+        let source = std::fs::read_to_string(&batch.file).unwrap();
+        assert!(source.contains("public static enum Type"));
+        assert!(source.contains("java.lang.ProcessBuilder.Redirect.Type type()"), "{source}");
+        assert!(source.contains("java.lang.ProcessBuilder.Redirect PIPE;"), "{source}");
+        let map = indexed.batches.iter().find(|batch| batch.file.ends_with("java/util/Map.java")).unwrap();
+        let entry_set = map.symbols.iter().find(|symbol| symbol.name == "entrySet").unwrap();
+        let returns = entry_set.return_type.as_ref().unwrap();
+        assert_eq!(returns.name, "Set");
+        assert_eq!(returns.args[0].name, "Entry");
+        assert!(returns.args[0].owner.is_none(), "static Entry has no instantiated lexical owner");
+        assert_eq!(returns.args[0].qualification.as_deref(), Some("java.util.Map"));
+        assert_eq!(returns.args[0].args.iter().map(|argument| argument.name.as_str()).collect::<Vec<_>>(), ["K", "V"]);
+        let mut ws = crate::workspace::Workspace::new();
+        let project = root.join("consumer");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(ws.scan(&project), 0);
+        for batch in indexed.batches { assert!(ws.index_dependency_batch(batch)); }
+        ws.set_library_index_complete(true);
+        ws.set_jdk_index_complete(true);
+        let map_key = crate::paths::file_key(&project.join("MapUse.java"));
+        let map_text = "class MapUse { void f(java.util.Map<String,String> map) { map.entrySet(); } }";
+        ws.open(&map_key, map_text.into());
+        let definitions = ws.goto_definition(&map_key, map_text.find("entrySet()").unwrap());
+        assert_eq!(definitions.len(), 1, "qualified static Entry return type must preserve Map.entrySet navigation: {definitions:?}");
+        assert!(definitions[0].file.ends_with("java/util/Map.java"));
+        let map_source = std::fs::read_to_string(&definitions[0].file).unwrap();
+        assert_eq!(&map_source[definitions[0].start_byte..definitions[0].end_byte], "entrySet");
+        for (file, text) in [
+            ("Redirect.java", "class Use { String f() { return java.lang.ProcessBuilder.Redirect.PIPE.type().name().substring(0); } }"),
+            ("Redirect.kt", "fun f() = java.lang.ProcessBuilder.Redirect.PIPE.type().name.substring(0)"),
+        ] {
+            let key = crate::paths::file_key(&project.join(file));
+            ws.open(&key, text.into());
+            for (prefix, expected) in [(".ty", "type"), (".na", "name"), (".sub", "substring")] {
+                let result = ws.complete(&key, text.find(prefix).unwrap() + prefix.len(), true);
+                assert!(result.as_ref().is_some_and(|result| result.items.iter().any(|item| item.label == expected)),
+                    "proved static ancestor chain must retain {expected} in {file}: {result:?}");
+            }
+            for (token, expected_file) in [("PIPE", "java/lang/ProcessBuilder.java"),
+                ("type()", "java/lang/ProcessBuilder.java"), ("name", "java/lang/Enum.java")] {
+                let definitions = ws.goto_definition(&key, text.find(token).unwrap());
+                assert_eq!(definitions.len(), 1, "{file} {token}: {definitions:?}");
+                assert!(definitions[0].file.ends_with(expected_file), "{definitions:?}");
+                let target = std::fs::read_to_string(&definitions[0].file).unwrap();
+                assert_eq!(&target[definitions[0].start_byte..definitions[0].end_byte], token.trim_end_matches("()"));
+            }
+        }
+        let mut classes = BTreeMap::new();
+        for bytes in [include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/ProcessBuilder.sig").as_slice(),
+            include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/ProcessBuilder$Redirect.sig").as_slice(),
+            include_bytes!("../../ktcore/tests/fixtures/classfile/sdk17-release8/ProcessBuilder$Redirect$Type.sig").as_slice()] {
+            let class = ktcore::classfile::decode(&selection.origin(), bytes).unwrap();
+            classes.insert(class.identity.internal_name.clone(), class);
+        }
+        let inner = classes["java/lang/ProcessBuilder$Redirect$Type"].clone();
+        for mutation in ["missing-ancestor", "nonstatic-ancestor", "private-ancestor", "other-origin", "duplicate", "literal-dollar"] {
+            let mut classes = classes.clone();
+            if mutation == "missing-ancestor" { classes.remove("java/lang/ProcessBuilder$Redirect"); }
+            else {
+                let parent = classes.get_mut("java/lang/ProcessBuilder$Redirect").unwrap();
+                let row = parent.inner_classes.iter().position(|row| row.inner.as_ref() == parent.identity.internal_name).unwrap();
+                match mutation {
+                    "nonstatic-ancestor" => parent.inner_classes[row].access_flags &= !8,
+                    "private-ancestor" => parent.inner_classes[row].access_flags = 0x040a,
+                    "other-origin" => parent.identity.origin_id = "other".into(),
+                    "duplicate" => parent.inner_classes.push(parent.inner_classes[row].clone()),
+                    "literal-dollar" => parent.inner_classes[row].name = Some("Redirect$Other".into()),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(static_nested_identity(&inner, &classes).is_none(), "{mutation}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sdk_public_static_class_keeps_needed_package_superclass_without_exposing_it() {
+        use ktcore::extensions::Visibility;
+        let (root, selection) = entry_selection();
+        let indexed = index(&selection, &root.join("extract")).unwrap();
+        let batch = indexed.batches.iter().find(|batch| batch.file.ends_with("java/util/concurrent/ConcurrentHashMap.java")).unwrap();
+        let helper = batch.symbols.iter().find(|symbol| symbol.name == "CollectionView"
+            && symbol.kind == ktcore::symbol::SymbolKind::Class).unwrap();
+        assert_eq!(helper.source_member.visibility(), Some(Visibility::Package));
+        let public = batch.symbols.iter().find(|symbol| symbol.name == "KeySetView"
+            && symbol.kind == ktcore::symbol::SymbolKind::Class).unwrap();
+        assert_eq!(public.source_member.visibility(), Some(Visibility::Public));
+        assert_eq!(public.supertype_refs[0].name, "CollectionView");
+        assert_eq!(public.supertype_refs[0].args.iter().map(|argument| argument.name.as_str()).collect::<Vec<_>>(), ["K", "V", "K"]);
+        let source = std::fs::read_to_string(&batch.file).unwrap();
+        assert!(source.contains("static abstract class CollectionView<"));
+        assert!(!source.contains("public static abstract class CollectionView"));
+        assert!(batch.symbols.iter().any(|symbol| symbol.name == "newKeySet"));
+        let mut ws = crate::workspace::Workspace::new();
+        for batch in indexed.batches { assert!(ws.index_dependency_batch(batch)); }
+        ws.assume_index_complete_for_tests();
+        for (file, text) in [
+            ("View.java", "import java.util.concurrent.ConcurrentHashMap; class Use { String f(ConcurrentHashMap.KeySetView<String,String> view) { ConcurrentHashMap.newKeySet(); return view.getMap().get(\"key\").substring(0); } }"),
+            ("View.kt", "import java.util.concurrent.ConcurrentHashMap\nfun f(view: ConcurrentHashMap.KeySetView<String,String>): String { ConcurrentHashMap.newKeySet<String>(); return view.getMap().get(\"key\")!!.substring(0) }"),
+        ] {
+            let key = crate::paths::file_key(&root.join(file));
+            ws.open(&key, text.into());
+            for (prefix, expected) in [(".newK", "newKeySet"), (".getM", "getMap"), (".sub", "substring")] {
+                let result = ws.complete(&key, text.find(prefix).unwrap() + prefix.len(), true);
+                assert!(result.as_ref().is_some_and(|result| result.items.iter().any(|item| item.label == expected)),
+                    "public static view must preserve {expected} through its package superclass in {file}: {result:?}");
+            }
+            let definitions = ws.goto_definition(&key, text.find("getMap()").unwrap());
+            assert_eq!(definitions.len(), 1, "{definitions:?}");
+            assert!(definitions[0].file.ends_with("java/util/concurrent/ConcurrentHashMap.java"));
+            assert_eq!(&source[definitions[0].start_byte..definitions[0].end_byte], "getMap");
+        }
+        for (file, text) in [
+            ("Hidden.java", "class Outside { java.util.concurrent.ConcurrentHashMap.CollectionView hidden; }"),
+            ("Hidden.kt", "fun hidden(value: java.util.concurrent.ConcurrentHashMap.CollectionView) = value"),
+        ] {
+            let key = crate::paths::file_key(&root.join(file));
+            ws.open(&key, text.into());
+            let result = ws.complete(&key, text.find(".CollectionView").unwrap() + ".Coll".len(), true);
+            assert!(!result.is_some_and(|result| result.items.iter().any(|item| item.label == "CollectionView")),
+                "package-only superclass must not become a public completion in {file}");
+        }
+        let helper = ktcore::classfile::decode(&selection.origin(), include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/sdk17-release8/ConcurrentHashMap$CollectionView.sig")).unwrap();
+        let parent = ktcore::classfile::decode(&selection.origin(), include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/sdk17-release8/ConcurrentHashMap.sig")).unwrap();
+        let classes = BTreeMap::from([(parent.identity.internal_name.clone(), parent)]);
+        assert!(static_nested_identity(&helper, &classes).is_none());
+        assert!(static_nested_identity_with_access(&helper, &classes, true).is_some());
+        for flags in [0x0400, 0x040a, 0x040c] {
+            let mut helper = helper.clone();
+            let own = helper.inner_classes.iter_mut().find(|row| row.inner.as_ref() == helper.identity.internal_name).unwrap();
+            own.access_flags = flags;
+            assert!(static_nested_identity_with_access(&helper, &classes, true).is_none());
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -816,7 +1128,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                crate::jar::selected_sdk_nested_stub_facts(&selection, &child, "State").is_none(),
+                crate::jar::selected_sdk_nested_stub_facts(&selection, &child, "State", false).is_none(),
                 "{mutation}"
             );
         }
@@ -838,7 +1150,7 @@ mod tests {
         let mut classes = BTreeMap::from([(parent.identity.internal_name.clone(), parent.clone())]);
         assert_eq!(
             static_nested_identity(&child, &classes),
-            Some(("java/util/Map".into(), "Entry".into()))
+            Some(("java/util/Map".into(), "Entry".into(), "Map".into()))
         );
         for kind in [
             "nonstatic",
