@@ -1,9 +1,14 @@
 # Current fork state
 
-Updated 2026-10-28 (Asia/Tokyo). Selected-project acceptance complete through67.
-General IDEA parity and language-wide correctness coverage remain unmeasured;
-passing the selected probes does not establish either. No reproduced functional
-gap remains in the selected acceptance cases.
+Updated 2026-10-28 (Asia/Tokyo). **Goal ACTIVE; completion declaration RETRACTED.**
+The earlier completion declaration overstated what the selected cases establish.
+Qualified CEM38, five-project50, the 1896-test suite and actual67's three editor RPCs
+remain finite evidence, not completion of the original Java/Kotlin editing goal.
+Independent validation on genuinely unseen real mixed-language repositories is
+still missing. Overall editing UX, project-model coverage, useful results where
+analysis remains Unknown, and IntelliJ IDEA-level quality are not established by
+the selected passing cases. This does not replace the original goal with an
+arbitrary requirement for 100% grammar or coverage.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
 by editing UX. Warm speed is accepted provisionally; cold startup is lower priority.
 KAPT/KSP execution belongs to the external build, not to ktlsp's analysis. The
@@ -36,6 +41,16 @@ recorded below. The reproduced selected-SDK and Kotlin mapped-getter gaps are no
 fixed and qualified below; this does not certify the whole SDK. Tests and
 benchmarks are assigned to GPT-6.1 Terra/high; implementation fixes are assigned
 to GPT-6.1 Sol/high. No further optimization is scheduled.
+
+Next, two Terra verification roles are checking previously untested medium-sized
+`mockk/mockk` at `c2fb66f841973e725b367650e69c4bac9babba20` (332 Kotlin and 22 Java
+files). This is new semantic evidence gathering, distinct from replaying the six
+selected projects, with no speed gate. `line/armeria` was cloned only, not tested.
+No unseen-project semantic acceptance result is claimed yet.
+
+The current mc-dev investigation also exposes a generic host gap around class
+catalogs, prefix queries and certified absence. The JVM implementation owner is
+investigating it; the requested host capabilities are not all declared ready.
 
 Candidate67 passes one combined `cargo test --workspace --locked --no-fail-fast`:
 **1896 passed, 0 failed, 16 existing ignored**, including doctests, followed by a
@@ -648,11 +663,16 @@ semantics are not certified by the test extension.
 2. KAPT/KSP generation remains an external-build responsibility. Preserve current
    generated-input refresh, stale API withdrawal and unsaved-buffer semantics;
    do not restore private generation or analysis-triggered Gradle archive replay.
-3. Future concrete reproductions should use existing fixtures/controllers and
-   genuine caches. Group small related fixes, then run the full workspace suite
-   before calling the batch complete, as required by AGENTS.md. This does not
-   require repeating passing editor or benchmark cases. Cold setup remains a
-   separate measurement.
+3. Continue toward the original goal with independent evidence for its remaining
+   gaps, using existing fixtures/controllers and genuine caches for concrete
+   reproductions. Terra checks a new medium-sized real repository for semantic
+   omissions, wrong diagnostics or missing functionality; Sol batches fixes for
+   obvious reproduced gaps, then another unseen repository is checked. A clean
+   new repository adds OK evidence, not a new arbitrary coverage target or goal
+   completion. Batch small related fixes, verify the affected behavior, then
+   run the full workspace suite once for the final batch, as required by AGENTS.md.
+   A completed batch is not a completed goal. Avoid overengineering and repeats
+   of passing corpus or benchmark cases. Cold setup remains a separate measurement.
 4. Preserve SDK/source fallback limits and honest Unknown results. Broader grammar,
    operator, bounded-generic, lambda, whole-SDK and IDEA-parity coverage requires
    new evidence; do not derive percentages or known failures from missing coverage.
@@ -660,6 +680,11 @@ semantics are not certified by the test extension.
    MC policy stays in mc-dev; later capabilities are scoped additions with no
    communication waits under Workspace locks. Keep large-source handler/budget
    proof distinct from complete large-project editor proof.
+6. The user requires a conditional stop when Codex remaining usage reaches 50% or
+   less in the first available window. ROOT monitors each major checkpoint;
+   record the checkpoint and pause the goal at that threshold, never declare it
+   complete. Unavailable windows remain unknown. At the latest checkpoint,
+   weekly usage was 18% (82% remaining); the secondary window was unavailable.
 
 The human permits ongoing API-contract, implementation-commit and verification-result
 sharing with the same mc-dev task within this goal. That scoped technical coordination
