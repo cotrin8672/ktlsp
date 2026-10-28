@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "project_id": "semantic-ipc-project-facts",
+  "scope": "Opt-in two-operation child on the real disposable Gradle reload fixture; source-only ABI remains Unknown",
+  "probes": [
+    {
+      "id": "ipc-local-baseline",
+      "source": "modules/editing/src/main/java/fixture/IpcUse.java",
+      "anchor": "return target.twice(2)",
+      "token": "twice",
+      "completion_prefix": "tw",
+      "target_file": "modules/editing/src/main/java/fixture/Target.java",
+      "target_anchor": "public int twice",
+      "target_token": "twice"
+    }
+  ],
+  "build_tool": "gradle"
+}

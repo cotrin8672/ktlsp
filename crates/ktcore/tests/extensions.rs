@@ -3132,3 +3132,119 @@ fn scoped_source_snapshots_track_empty_membership_overlays_and_session_identity(
     assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)),
         "source deletion invalidates inventory even without semantic declarations");
 }
+
+#[derive(Debug)]
+struct TestHostInput(std::sync::atomic::AtomicBool);
+impl HostInputGuard for TestHostInput {
+    fn is_current(&self) -> bool { self.0.load(std::sync::atomic::Ordering::Acquire) }
+}
+
+#[test]
+fn host_input_guard_rejects_pending_and_withdraws_published_facts() {
+    use std::sync::atomic::Ordering;
+    let (index, mut store) = fixture();
+    let guard = Arc::new(TestHostInput(std::sync::atomic::AtomicBool::new(true)));
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    read.observe_host_input(guard.clone()).unwrap();
+    read.observe_host_input(guard.clone()).unwrap();
+    assert_eq!(Arc::strong_count(&guard), 2, "the same lease is retained once");
+    let pending = read.finish();
+    guard.0.store(false, Ordering::Release);
+    assert_eq!(store.validate_pending(&pending), Err(ContractError::Stale));
+    assert_eq!(store.commit(pending), Err(ContractError::Stale));
+    assert_eq!(Arc::strong_count(&guard), 1);
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    assert_eq!(read.observe_host_input(guard.clone()), Err(ContractError::Stale));
+    drop(read);
+
+    let guard = Arc::new(TestHostInput(std::sync::atomic::AtomicBool::new(true)));
+    let weak = Arc::downgrade(&guard);
+    let mut read = store.begin(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    read.observe_host_input(guard.clone()).unwrap();
+    let pending = read.finish();
+    drop(guard);
+    assert!(weak.upgrade().is_some(), "pending reads own native coverage");
+    store.commit(pending).unwrap();
+    assert!(store.contributions("mixin-consumer", MIXIN_FILE).is_some());
+    assert_eq!(store.contribution_sets().count(), 1);
+    assert!(weak.upgrade().is_some(), "published reads retain native coverage");
+    store.take_dirty();
+    let revision = store.publication_revision();
+    weak.upgrade().unwrap().0.store(false, Ordering::Release);
+    assert!(store.contributions("mixin-consumer", MIXIN_FILE).is_none());
+    assert_eq!(store.contribution_sets().count(), 0, "invalid facts are immediately hidden");
+    assert_eq!(store.refresh_host_inputs(), vec![("mixin-consumer".into(), MIXIN_FILE.into())]);
+    assert!(store.publication_revision() > revision);
+    assert_eq!(store.take_dirty(), vec![("mixin-consumer".into(), MIXIN_FILE.into())]);
+    assert!(weak.upgrade().is_none(), "retired reads release native coverage");
+    assert!(store.refresh_host_inputs().is_empty());
+}
+
+#[test]
+fn published_host_input_guard_retracts_real_bindings_from_cloned_index_snapshots() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut index, mut store) = fixture();
+    let pending = prefixed_pending(&index, &mut store, "mixin-consumer");
+    let guard = Arc::new(TestHostInput(AtomicBool::new(true)));
+    let mut read = store.resume(&index, MIXIN_FILE, pending).unwrap();
+    read.observe_host_input(guard.clone()).unwrap();
+    store.commit(read.finish()).unwrap();
+    let published = store.contributions("mixin-consumer", MIXIN_FILE).unwrap().clone();
+    assert!(!published.requirements().is_empty());
+    assert!(!published.sites().is_empty());
+    let byte = occurrence(MIXIN, "`shadow$twice`", 0).start + 1;
+    let target = published.binding_at(byte).unwrap().target.clone();
+    let rename = published.rename_subject_at(byte).unwrap();
+    assert!(!published.rename_edits(&rename, "renamed").unwrap().is_empty());
+    assert!(!published.references(&target).is_empty());
+    index.replace_contributions(std::collections::BTreeMap::from([(MIXIN_FILE.into(), vec![published.clone()])]));
+    let snapshot = index.inference_snapshot();
+    assert!(index.semantic_binding_at(MIXIN_FILE, byte).is_some());
+    assert!(snapshot.semantic_binding_at(MIXIN_FILE, byte).is_some());
+    guard.0.store(false, Ordering::Release);
+    // No refresh callback, model update, or Index mutation is needed to hide stale clones.
+    assert!(index.semantic_binding_at(MIXIN_FILE, byte).is_none());
+    assert!(snapshot.semantic_binding_at(MIXIN_FILE, byte).is_none());
+    assert!(published.requirements().is_empty());
+    assert!(published.sites().is_empty());
+    assert!(published.sites_at(byte).next().is_none());
+    assert!(published.binding_at(byte).is_none());
+    assert!(published.rename_subject_at(byte).is_none());
+    assert!(published.references(&target).is_empty());
+    assert_eq!(published.rename_edits(&rename, "renamed"), Err(ContractError::Stale));
+    assert_eq!(store.refresh_host_inputs(), vec![("mixin-consumer".into(), MIXIN_FILE.into())]);
+}
+
+#[test]
+fn nonpublishing_reads_survive_semantic_evaluations_without_withdrawing_index_bindings() {
+    let (mut index, mut store) = fixture();
+    let pending = prefixed_pending(&index, &mut store, "mixin-consumer");
+    store.commit(pending).unwrap();
+    let published = store.contributions("mixin-consumer", MIXIN_FILE).unwrap().clone();
+    let byte = occurrence(MIXIN, "`shadow$twice`", 0).start + 1;
+    index.replace_contributions(std::collections::BTreeMap::from([(MIXIN_FILE.into(), vec![published])]));
+    let target = index.semantic_binding_at(MIXIN_FILE, byte).unwrap().target.clone();
+    let revision = store.publication_revision();
+    let earlier = prefixed_pending(&index, &mut store, "mixin-consumer");
+    let first = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap().finish();
+    let second = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap().finish();
+    assert!(store.validate_pending(&earlier).is_ok(), "starting commands must not supersede ordinary work");
+    let semantic = prefixed_pending(&index, &mut store, "mixin-consumer");
+    assert_eq!(store.validate_pending(&earlier), Err(ContractError::Stale), "ordinary latest-wins policy remains unchanged");
+    assert!(store.validate_pending(&first).is_ok());
+    assert!(store.validate_pending(&second).is_ok());
+    store.fail(first).unwrap();
+    assert!(store.validate_pending(&semantic).is_ok(), "command release must not end the semantic evaluation");
+    assert_eq!(store.publication_revision(), revision);
+    assert_eq!(store.contributions("mixin-consumer", MIXIN_FILE).unwrap().binding_at(byte).unwrap().target, target);
+    store.commit(semantic).unwrap();
+    assert!(store.validate_pending(&second).is_ok(), "ordinary publication is not an input change");
+    store.fail(second).unwrap();
+    assert_eq!(store.contributions("mixin-consumer", MIXIN_FILE).unwrap().binding_at(byte).unwrap().target, target);
+    assert_eq!(index.semantic_binding_at(MIXIN_FILE, byte).unwrap().target, target);
+    let readonly = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap().finish();
+    let revision = store.publication_revision();
+    assert_eq!(store.commit(readonly), Err(ContractError::ForeignRequirement));
+    assert_eq!(store.publication_revision(), revision);
+    assert!(store.contributions("mixin-consumer", MIXIN_FILE).unwrap().binding_at(byte).is_some());
+}

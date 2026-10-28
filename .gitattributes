@@ -5,3 +5,5 @@ dev/external-extension/source-snapshots-v1.frames -text
 
 # Keep compiler input bytes consistent with the paired classfile hash manifest.
 crates/ktcore/tests/fixtures/classfile/sources/** -text
+dev/external-extension/provider-commands-v1.frames -text
+dev/external-extension/owned-resources-v1.frames -text

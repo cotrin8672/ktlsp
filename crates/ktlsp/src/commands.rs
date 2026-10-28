@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 pub const COMPILE: &str = "ktlsp.compile";
+pub const PROVIDER_COMMAND: &str = "ktlsp.providerCommand";
 
 pub const REINDEX: &str = "ktlsp.reindex";
 pub const TRACE_PATH: &str = "ktlsp.tracePath";
@@ -13,6 +14,7 @@ pub const DUMP_SYMBOL: &str = "ktlsp.dumpSymbol";
 pub fn all() -> Vec<String> {
     vec![
         REINDEX.to_string(),
+        PROVIDER_COMMAND.to_string(),
         COMPILE.to_string(),
         TRACE_PATH.to_string(),
         EXPLAIN_RESOLUTION.to_string(),

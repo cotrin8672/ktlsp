@@ -1,0 +1,5 @@
+Content-Length: 363
+
+{"id":7,"jsonrpc":"2.0","result":{"facts":[{"coverage":{"state":"found","value":true},"next":null,"resources":[{"association":"source","classpathOrder":0,"documentUri":{"reasons":[{"code":"MissingFacts"}],"state":"unknown"},"documentVersion":7,"editable":true,"id":"42:0#resource:0","identity":{"kind":"resource","revision":"7"},"relativePath":"config.json"}]}]}}Content-Length: 348
+
+{"id":8,"jsonrpc":"2.0","result":{"facts":[{"state":"found","value":{"base64":"eyLpm6oiOiLwn5iAIn0K","documentVersion":7,"identity":{"kind":"resource","revision":"7","sha256":"3f4e9b9e63e3e44e698e41bd96df75c5e84ab0c117c627b4723c42e7ab342d10"},"next":null,"offset":0,"size":15,"text":{"state":"found","value":"{\"雪\":\"😀\"}\n"},"utf8":true}}]}}

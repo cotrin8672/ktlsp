@@ -38,6 +38,8 @@ const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
 struct RefreshState {
     requested: u64,
     active_generation: Option<u64>,
+    settled: Option<(u64, bool)>,
+    completion: Arc<tokio::sync::Notify>,
     running: bool,
     force: bool,
     stopped: bool,
@@ -54,6 +56,8 @@ struct WatchState {
     configuration_contents: HashMap<String, [u8; 32]>,
     archive_contents: HashMap<String, [u8; 32]>,
     archive_inputs: Option<(u64, HashMap<String, [u8; 32]>)>,
+    // Modeled output notifications wait for off-lock capture publication.
+    output_capture: Arc<Mutex<()>>,
     observed_archives: std::collections::BTreeSet<String>,
     configuration_baselined: bool,
     model_loading: bool,
@@ -65,8 +69,8 @@ impl WatchState {
         self.archive_inputs
             .as_ref()
             .filter(|(input_generation, _)| *input_generation == generation)
-            .and_then(|(_, inputs)| inputs.get(key))
-            .or_else(|| self.archive_contents.get(key))
+            .and_then(|(_, inputs)| inputs.get(key).or_else(|| inputs.get(&format!("{key}/"))))
+            .or_else(|| self.archive_contents.get(key).or_else(|| self.archive_contents.get(&format!("{key}/"))))
     }
 
     fn finish_model_load(&mut self, current_generation: bool) {
@@ -218,12 +222,24 @@ impl Backend {
         retired_origins: &[String],
         cause: Option<(String, FileChangeType, Option<bool>)>,
     ) {
+        self.request_project_refresh_guarded(force, initial_delay, build_output_only, retired_origins, cause, None);
+    }
+
+    fn request_project_refresh_guarded(
+        &self,
+        force: bool,
+        initial_delay: Duration,
+        build_output_only: bool,
+        retired_origins: &[String],
+        cause: Option<(String, FileChangeType, Option<bool>)>,
+        permission: Option<&ProviderRefreshPermission<'_>>,
+    ) -> Option<u64> {
         let Some(root) = self.root.lock().clone() else {
-            return;
+            return None;
         };
         let mut state = self.refresh.lock();
         if state.stopped {
-            return;
+            return None;
         }
         let pending = state.running
             && state
@@ -256,14 +272,15 @@ impl Backend {
         // Gradle may recreate JARs or output directories while importing its own model. Retain
         // every such change, but let this owned dump close its tasks before retrying.
         // Advancing the generation prevents its unsettled model from being published.
-        if !defer {
-            state
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::Release);
-            state.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        }
         let changed = {
             let mut ws = self.ws.lock();
+            if permission.is_some_and(|permission| !permission.current(&ws)) { return None; }
+            if !defer {
+                state
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                state.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            }
             if !coalesced {
                 state.requested = ws.begin_analysis_generation();
                 crate::trace::span(
@@ -285,12 +302,8 @@ impl Backend {
             self.schedule_one_diagnostic(key);
         }
         state.force |= force;
-        if coalesced {
-            return;
-        }
-        if state.running {
-            return;
-        }
+        if coalesced || state.running { return Some(state.requested); }
+        let requested_generation=state.requested;
         state.running = true;
         let state = self.refresh.clone();
         let ws = self.ws.clone();
@@ -351,6 +364,8 @@ impl Backend {
                     &root,
                 );
                 let mut state = state.lock();
+                state.settled=Some((generation,ws.lock().provider_refresh_accepted(generation,gradle)));
+                state.completion.notify_waiters();
                 if watches.lock().pending_model_jar && state.requested == generation {
                     watches.lock().pending_model_jar = false;
                     state
@@ -367,6 +382,7 @@ impl Backend {
                 }
             }
         });
+        Some(requested_generation)
     }
 
     /// Bump `key`'s version and schedule a debounced diagnostics recompute. Off the request path; the
@@ -614,8 +630,8 @@ impl DependencyResult {
                 })
             })
     }
-    const INSTALL_CHUNK_FILES: usize = 32;
-    const INSTALL_CHUNK_SYMBOLS: usize = 1024;
+    const INSTALL_CHUNK_FILES: usize = 256;
+    const INSTALL_CHUNK_SYMBOLS: usize = 8192;
 
     fn install_batches(
         &mut self,
@@ -2289,7 +2305,7 @@ async fn index_workspace(
             &archive_contents,
             || !index_cancelled.load(std::sync::atomic::Ordering::Acquire)
                 && index_ws.lock().is_current_generation(generation),
-            configuration_content,
+            project_input_content,
         ) else {
             return (stats, None);
         };
@@ -2735,6 +2751,10 @@ fn stage_archive_inputs_with(
     watches: &Arc<Mutex<WatchState>>,
     mut fingerprinted: impl FnMut(&str),
 ) -> bool {
+    let output_capture = watches.lock().output_capture.clone();
+    let _output_capture = model.is_some_and(|model| model.modules.iter()
+        .any(|module| module.source_sets.iter().any(|source| !source.output_roots.is_empty())))
+        .then(|| output_capture.lock());
     let read_start = Instant::now();
     // A generation may suppress matching watches before publication, never rebase changed inputs.
     let (before, observed) = {
@@ -2784,7 +2804,8 @@ fn stage_archive_inputs_with(
         drop(guard);
         fingerprinted(key);
     };
-    let mut inputs = project_archive_contents_with(root, model, &mut accept);
+    let mut inputs = project_archive_contents_with(root, model,
+        || ws.lock().is_current_generation(generation), &mut accept);
     for key in observed {
         observed_preexisting += usize::from(inputs.contains_key(&key));
         if let Some(content) = configuration_content(Path::new(&key)) {
@@ -2838,16 +2859,136 @@ fn stage_archive_inputs_with(
     true
 }
 
+// Directory keys carry a trailing slash, so replacing a file with a directory
+// can never compare equal merely because their byte digests happen to match.
+fn output_directory_content(path: &Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() { return None; }
+    let mut members = std::collections::BTreeMap::new();
+    for (count, entry) in std::fs::read_dir(path).ok()?.enumerate() {
+        if count >= 131_072 { return None; }
+        let entry = entry.ok()?;
+        let kind = entry.file_type().ok()?;
+        let kind = if kind.is_file() { 1_u8 } else if kind.is_dir() { 2 } else { return None; };
+        members.insert(entry.file_name().into_string().ok()?, kind);
+    }
+    Some(Sha256::digest(serde_json::to_vec(&members).ok()?).into())
+}
+
+fn project_input_content(path: &Path) -> Option<[u8; 32]> {
+    if path.to_string_lossy().ends_with('/') {
+        output_directory_content(path)
+    } else if path.is_dir() {
+        None
+    } else {
+        configuration_content(path)
+    }
+}
+
+// One bounded walk/hash of normal class outputs. Directory hashes name every
+// direct child; together with every descendant file digest they prove the
+// complete subtree, including META-INF metadata. Assets/resources are excluded.
+fn selected_output_contents_with(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    current: &impl Fn() -> bool,
+    fingerprinted: &mut impl FnMut(&str, [u8; 32]),
+) -> HashMap<String, [u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let start = Instant::now();
+    let mut roots = std::collections::BTreeMap::<String, std::collections::BTreeSet<(usize, usize)>>::new();
+    if let Some(model) = model {
+        for (mi, module) in model.modules.iter().enumerate() {
+            for (si, source) in module.source_sets.iter().enumerate() {
+                for output in source.runtime.as_ref().filter(|runtime| runtime.usable())
+                    .into_iter().flat_map(|runtime| &runtime.class_outputs)
+                {
+                    if !root.starts_with(output)
+                        && !model.modules.iter().any(|module| module.source_sets.iter()
+                            .flat_map(|source| &source.source_roots).any(|source| source.starts_with(output)))
+                    {
+                        roots.entry(crate::paths::file_key(output)).or_default().insert((mi, si));
+                    }
+                }
+            }
+        }
+    }
+    let mut contents = HashMap::new();
+    let mut visited = 0_usize;
+    let mut files = 0_usize;
+    let mut classes = 0_usize;
+    let mut directories = 0_usize;
+    let mut bytes = 0_u64;
+    let mut truncated = false;
+    for (output, owners) in &roots {
+        if owners.len() != 1 { continue; }
+        let mut members = std::collections::BTreeMap::<String, std::collections::BTreeMap<String, u8>>::new();
+        let mut complete = true;
+        for entry in walkdir::WalkDir::new(output).follow_links(false).follow_root_links(false)
+            .max_depth(64).max_open(8)
+        {
+            if !current() { complete = false; break; }
+            visited += 1;
+            if visited > 131_072 || files >= 65_536 {
+                complete = false; truncated = true; break;
+            }
+            let Ok(entry) = entry else { complete = false; continue; };
+            let kind = if entry.file_type().is_file() { 1_u8 }
+                else if entry.file_type().is_dir() { 2 } else { complete = false; continue; };
+            let key = crate::paths::file_key(entry.path());
+            if entry.depth() != 0 {
+                let Some(name) = entry.file_name().to_str() else { complete = false; continue; };
+                let parent = crate::paths::file_key(entry.path().parent().unwrap());
+                members.entry(parent).or_default().insert(name.to_string(), kind);
+            }
+            if kind == 2 {
+                if entry.depth() == 64 { complete = false; }
+                members.entry(key).or_default();
+            } else {
+                let Ok(metadata) = entry.metadata() else { complete = false; continue; };
+                let size = metadata.len();
+                if size > 16 * 1024 * 1024 || bytes + size > 256 * 1024 * 1024 {
+                    complete = false; truncated = true; break;
+                }
+                let Some(content) = configuration_content(entry.path()) else { complete = false; continue; };
+                if !current() { complete = false; break; }
+                bytes += size;
+                files += 1;
+                classes += usize::from(key.ends_with(".class"));
+                fingerprinted(&key, content);
+                contents.insert(key, content);
+            }
+        }
+        // Never suppress a directory notification using an incomplete catalog.
+        if complete && current() {
+            for (directory, children) in members {
+                let key = format!("{directory}/");
+                let content = Sha256::digest(serde_json::to_vec(&children).unwrap()).into();
+                fingerprinted(&key, content);
+                contents.insert(key, content);
+                directories += 1;
+            }
+        }
+        if !current() || truncated { break; }
+    }
+    crate::trace::span("workspace.output_baseline", "workspace", start,
+        serde_json::json!({"root":root.to_string_lossy(),"roots":roots.len(),
+            "visited":visited,"files":files,"classes":classes,"directories":directories,
+            "bytes":bytes,"truncated":truncated}));
+    contents
+}
+
 fn project_archive_contents(
     root: &Path,
     model: Option<&classpath::ProjectSnapshot>,
 ) -> HashMap<String, [u8; 32]> {
-    project_archive_contents_with(root, model, |_, _| {})
+    project_archive_contents_with(root, model, || true, |_, _| {})
 }
 
 fn project_archive_contents_with(
     root: &Path,
     model: Option<&classpath::ProjectSnapshot>,
+    current: impl Fn() -> bool,
     mut fingerprinted: impl FnMut(&str, [u8; 32]),
 ) -> HashMap<String, [u8; 32]> {
     let discovery_start = Instant::now();
@@ -2857,6 +2998,7 @@ fn project_archive_contents_with(
         .into_keys()
         .collect();
     let model_count = keys.len();
+    let outputs = selected_output_contents_with(root, model, &current, &mut fingerprinted);
     let tracked = crate::workspace::git_tracked_project_files(root, &["*.jar"]).unwrap_or_default();
     let tracked_count = tracked.len();
     keys.extend(
@@ -2876,12 +3018,14 @@ fn project_archive_contents_with(
     let contents: HashMap<_, _> = keys
         .into_iter()
         .filter(|key| !is_project_configuration(Path::new(key)))
+        .take_while(|_| current())
         .filter_map(|key| {
             attempted += 1;
             let content = configuration_content(Path::new(&key))?;
             fingerprinted(&key, content);
             Some((key, content))
         })
+        .chain(outputs)
         .collect();
     crate::trace::span(
         "workspace.archive_hash",
@@ -2892,6 +3036,11 @@ fn project_archive_contents_with(
     contents
 }
 
+fn input_within(candidate: &str, directory: &str) -> bool {
+    let directory = directory.trim_end_matches('/');
+    candidate == directory || candidate.strip_prefix(directory).is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn unchanged_file_content(
     contents: &HashMap<String, [u8; 32]>,
     key: &str,
@@ -2899,24 +3048,35 @@ fn unchanged_file_content(
 ) -> bool {
     kind == FileChangeType::CHANGED
         && !is_project_configuration(Path::new(key))
-        && contents.get(key).is_some_and(|accepted| {
-            configuration_content(Path::new(key)).as_ref() == Some(accepted)
-        })
+        && (contents.contains_key(key) || contents.contains_key(&format!("{key}/")))
+        && contents.iter().filter(|(path, _)| input_within(path, key))
+            .all(|(path, accepted)| project_input_content(Path::new(path)).as_ref() == Some(accepted))
 }
 
 async fn unchanged_file_contents(contents: HashMap<String, [u8; 32]>) -> HashMap<String, [u8; 32]> {
-    if contents.is_empty() {
-        return contents;
-    }
+    if contents.is_empty() { return contents; }
     tokio::task::spawn_blocking(move || {
-        contents
-            .keys()
-            .filter(|key| unchanged_file_content(&contents, key, FileChangeType::CHANGED))
-            .map(|key| (key.clone(), contents[key]))
+        // Hash each known file/membership once, even for a notification on an
+        // ancestor directory. A new member changes its captured parent's digest.
+        let verified: std::collections::HashSet<_> = contents.iter()
+            .filter(|(key, accepted)| !is_project_configuration(Path::new(key))
+                && project_input_content(Path::new(key)).as_ref() == Some(*accepted))
+            .map(|(key, _)| key.as_str()).collect();
+        let mut invalid_subtrees = std::collections::HashSet::new();
+        for key in contents.keys().filter(|key| !verified.contains(key.as_str())) {
+            let mut ancestor = key.trim_end_matches('/');
+            loop {
+                invalid_subtrees.insert(ancestor.to_string());
+                let Some((parent, _)) = ancestor.rsplit_once('/') else { break; };
+                if parent.is_empty() { break; }
+                ancestor = parent;
+            }
+        }
+        contents.iter().filter(|(key, _)| verified.contains(key.as_str())
+                && (!key.ends_with('/') || !invalid_subtrees.contains(key.trim_end_matches('/'))))
+            .map(|(key, content)| (key.trim_end_matches('/').to_string(), *content))
             .collect()
-    })
-    .await
-    .unwrap_or_default()
+    }).await.unwrap_or_default()
 }
 
 fn finish_dependency_index_generation(
@@ -3257,7 +3417,11 @@ fn configure_analysis_providers(ws: &mut Workspace, options: &Option<serde_json:
         if let Some(command) = settings.get("command") {
             let registered = serde_json::from_value::<Vec<String>>(command.clone())
                 .map_err(|error| error.to_string())
-                .and_then(|command| ws.register_ipc_provider(id, command));
+                .and_then(|command| {
+                    let commands=settings.get("executeCommands").cloned().unwrap_or_else(||serde_json::json!([]));
+                    let commands=serde_json::from_value::<Vec<String>>(commands).map_err(|error|error.to_string())?;
+                    ws.register_ipc_provider_commands(id, command, commands)
+                });
             if let Err(error) = registered {
                 tracing::warn!(provider = id, error, "extension registration rejected");
                 continue;
@@ -3493,7 +3657,12 @@ impl LanguageServer for Backend {
             let text = doc.text;
             {
                 let mut ws = self.ws.lock();
-                ws.open(key.clone(), text);
+                if crate::language::SourceLanguage::for_project_path(Path::new(&key)).is_some() {
+                    ws.open(key.clone(), text);
+                    ws.record_owned_document(&key, None, doc.version, Some(doc.language_id));
+                } else {
+                    ws.record_owned_document(&key, Some(text), doc.version, Some(doc.language_id));
+                }
                 self.doc_versions
                     .lock()
                     .entry(key.clone())
@@ -3511,7 +3680,12 @@ impl LanguageServer for Backend {
             if let Some(change) = params.content_changes.into_iter().last() {
                 {
                     let mut ws = self.ws.lock();
-                    ws.change(&key, change.text);
+                    if crate::language::SourceLanguage::for_project_path(Path::new(&key)).is_some() {
+                        ws.change(&key, change.text);
+                        ws.record_owned_document(&key, None, params.text_document.version, None);
+                    } else {
+                        ws.record_owned_document(&key, Some(change.text), params.text_document.version, None);
+                    }
                     self.doc_versions
                         .lock()
                         .entry(key.clone())
@@ -3527,7 +3701,8 @@ impl LanguageServer for Backend {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             {
                 let mut ws = self.ws.lock();
-                ws.close(&key);
+                if crate::language::SourceLanguage::for_project_path(Path::new(&key)).is_some() { ws.close(&key); }
+                ws.close_owned_document(&key);
                 self.doc_versions.lock().remove(&key);
                 self.jdk_source_seeds.lock().remove(&key);
             }
@@ -3580,26 +3755,34 @@ impl LanguageServer for Backend {
         let Some(root) = self.root.lock().clone() else {
             return;
         };
+        let prior_model = self.ws.lock().project_snapshot();
+        if params.changes.iter().any(|change| change.uri.as_str().ends_with(".class")
+            || uri_to_key(&change.uri).is_some_and(|key|
+                prior_model.as_ref().is_some_and(|model| model.is_output_key(&key)))) {
+            // Windows/libuv also reports access-time changes. A hash read may itself
+            // queue this notification; wait until its input digest is published.
+            // No workspace/watch lock is held while waiting or reading files.
+            let capture = self.watches.lock().output_capture.clone();
+            let _ = tokio::task::spawn_blocking(move || drop(capture.lock())).await;
+        }
         let model = self.ws.lock().project_snapshot();
         // Disk reads may be large. Hash only selected event paths, outside the
         // workspace/watch locks so completion can proceed while IO is pending.
         let generation = self.ws.lock().analysis_generation();
-        let mut contents = {
-            let state = self.watches.lock();
-            let mut archives = state.archive_contents.clone();
-            if let Some((input_generation, inputs)) = &state.archive_inputs {
-                if *input_generation == generation {
-                    archives.extend(inputs.clone());
-                }
-            }
-            archives
-        };
         let changed_keys: std::collections::BTreeSet<_> = params
             .changes
             .iter()
             .filter(|event| event.typ == FileChangeType::CHANGED)
             .filter_map(|event| uri_to_key(&event.uri))
             .collect();
+        let mut contents = {
+            let state = self.watches.lock();
+            let staged = state.archive_inputs.as_ref().filter(|(input_generation, _)| *input_generation == generation);
+            state.archive_contents.keys().chain(staged.into_iter().flat_map(|(_, inputs)| inputs.keys()))
+                .filter(|key| changed_keys.iter().any(|changed| input_within(key, changed)))
+                .filter_map(|key| state.archive_content(key, generation).map(|content| (key.clone(), *content)))
+                .collect::<HashMap<_, _>>()
+        };
         {
             let ws = self.ws.lock();
             for key in &changed_keys {
@@ -3610,7 +3793,7 @@ impl LanguageServer for Backend {
                 }
             }
         };
-        contents.retain(|key, _| changed_keys.contains(key));
+        contents.retain(|key, _| changed_keys.iter().any(|changed| input_within(key, changed)));
         let unchanged_contents = unchanged_file_contents(contents).await;
         let archive_origins = model
             .as_deref()
@@ -4269,6 +4452,7 @@ impl LanguageServer for Backend {
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
         match params.command.as_str() {
+            crate::commands::PROVIDER_COMMAND => self.execute_provider_command(&params.arguments).await.map(Some),
             crate::commands::COMPILE => {
                 Ok(Some(self.execute_observed_compile(&params.arguments).await))
             }
@@ -8962,6 +9146,153 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
     }
 
     #[tokio::test]
+    async fn selected_class_output_reads_do_not_reload_but_real_changes_do() {
+        let root = std::env::temp_dir().join(format!("ktlsp_output_read_watch_{}", std::process::id()));
+        let classes = root.join("build/classes");
+        let class = classes.join("pkg/Outer$Inner.class");
+        let unselected = root.join("unselected/Outside.class");
+        std::fs::create_dir_all(class.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(unselected.parent().unwrap()).unwrap();
+        std::fs::write(&class, b"first class bytes").unwrap();
+        std::fs::write(&unselected, b"outside").unwrap();
+        std::fs::write(classes.join("compiler.inventory"), b"not a class").unwrap();
+        let mut modules = classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}/src\nOUTPUT\tmain\t{}\nEND\t:app\n",
+            crate::paths::file_key(&root), crate::paths::file_key(&root), crate::paths::file_key(&classes)
+        ));
+        modules[0].source_sets[0].runtime = Some(classpath::RuntimeClassInputs {
+            adapter: "gradle-runtime-class-inputs-v1".into(), classpath: vec![classes.clone()],
+            class_outputs: vec![classes.clone()], complete: true, problem: None,
+        });
+        let model = Arc::new(classpath::ProjectSnapshot::new(modules));
+        let key = crate::paths::file_key(&class);
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        *backend.gradle_project.lock() = true;
+        backend.refresh.lock().running = true;
+        backend.ws.lock().set_project_model(model.clone());
+        let dirty = crate::paths::file_key(&root.join("src/Use.java"));
+        backend.ws.lock().open(&dirty, "class Use { int unsaved; }".into());
+        let generation = backend.ws.lock().analysis_generation();
+        assert!(stage_archive_inputs(&root, Some(&model), generation, &backend.ws, &backend.watches));
+        let captured = backend.watches.lock().archive_inputs.as_ref().unwrap().1.clone();
+        assert!(captured.contains_key(&key));
+        assert!(!captured.contains_key(&crate::paths::file_key(&unselected)));
+        assert!(captured.contains_key(&crate::paths::file_key(&classes.join("compiler.inventory"))));
+        assert!(captured.contains_key(&format!("{}/", crate::paths::file_key(&classes))));
+        let event = |kind| DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(Uri::from_file_path(&class).unwrap(), kind)],
+        };
+        let requested = backend.refresh.lock().requested;
+        std::fs::read(&class).unwrap();
+        backend.did_change_watched_files(event(FileChangeType::CHANGED)).await;
+        assert_eq!(backend.refresh.lock().requested, requested, "a read-only notification is unchanged");
+        assert_eq!(backend.ws.lock().analysis_generation(), generation);
+
+        let directory_event = || DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(Uri::from_file_path(&classes).unwrap(), FileChangeType::CHANGED)],
+        };
+        backend.did_change_watched_files(directory_event()).await;
+        assert_eq!(backend.refresh.lock().requested, requested, "unchanged full subtree does not reload");
+        let modified = std::fs::metadata(&class).unwrap().modified().unwrap();
+        std::fs::write(&class, b"other class bytes").unwrap();
+        std::fs::File::options().write(true).open(&class).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        backend.did_change_watched_files(directory_event()).await;
+        assert!(backend.refresh.lock().requested > requested, "directory-only event detects same-name/size/mtime body change");
+        std::fs::write(&class, b"first class bytes").unwrap();
+        let generation = backend.ws.lock().analysis_generation();
+        assert!(stage_archive_inputs(&root, Some(&model), generation, &backend.ws, &backend.watches));
+        let metadata = classes.join("compiler.inventory");
+        let before = backend.refresh.lock().requested;
+        std::fs::write(&metadata, b"new metadata").unwrap();
+        backend.did_change_watched_files(directory_event()).await;
+        assert!(backend.refresh.lock().requested > before, "non-class compiler metadata is included");
+        std::fs::write(&metadata, b"not a class").unwrap();
+        let generation = backend.ws.lock().analysis_generation();
+        assert!(stage_archive_inputs(&root, Some(&model), generation, &backend.ws, &backend.watches));
+        let before = backend.refresh.lock().requested;
+        let added = classes.join("New.class");
+        std::fs::write(&added, b"new class").unwrap();
+        backend.did_change_watched_files(directory_event()).await;
+        assert!(backend.refresh.lock().requested > before, "new relative member cannot hide");
+        std::fs::remove_file(&added).unwrap();
+        let generation = backend.ws.lock().analysis_generation();
+        assert!(stage_archive_inputs(&root, Some(&model), generation, &backend.ws, &backend.watches));
+        let before = backend.refresh.lock().requested;
+        std::fs::remove_file(&class).unwrap();
+        backend.did_change_watched_files(directory_event()).await;
+        assert!(backend.refresh.lock().requested > before, "deleted member cannot hide");
+        std::fs::write(&class, b"first class bytes").unwrap();
+        let generation = backend.ws.lock().analysis_generation();
+        assert!(stage_archive_inputs(&root, Some(&model), generation, &backend.ws, &backend.watches));
+
+        // Reproduce the bootstrap boundary: read complete, digest not yet published.
+        // The notification must wait without taking a workspace/watch lock.
+        for notify_directory in [false, true] {
+        for mutate in [false, true] {
+            std::fs::write(&class, b"first class bytes").unwrap();
+            backend.watches.lock().archive_inputs = None;
+            backend.watches.lock().archive_contents.clear();
+            let capture = backend.watches.lock().output_capture.clone();
+            let capture_guard = capture.lock();
+            let original = project_archive_contents(&root, Some(&model));
+            let before = backend.refresh.lock().requested;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let ((), ()) = tokio::join!(
+                async {
+                    started_tx.send(()).unwrap();
+                    backend.did_change_watched_files(if notify_directory { directory_event() } else { event(FileChangeType::CHANGED) }).await;
+                },
+                async {
+                    started_rx.await.unwrap();
+                    if mutate {
+                        let metadata = std::fs::metadata(&class).unwrap();
+                        let modified = metadata.modified().unwrap();
+                        std::fs::write(&class, b"other class bytes").unwrap();
+                        std::fs::File::options().write(true).open(&class).unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+                        assert_eq!(std::fs::metadata(&class).unwrap().len(), metadata.len());
+                        assert_eq!(std::fs::metadata(&class).unwrap().modified().unwrap(), modified);
+                    }
+                    let current = backend.ws.lock().analysis_generation();
+                    backend.watches.lock().archive_inputs = Some((current, original));
+                    drop(capture_guard);
+                }
+            );
+            if mutate {
+                assert!(backend.refresh.lock().requested > before, "same-size/same-mtime write during capture is retained");
+            } else {
+                assert_eq!(backend.refresh.lock().requested, before, "capture cannot invalidate itself");
+            }
+        }
+        }
+        for kind in [FileChangeType::CREATED, FileChangeType::DELETED] {
+            let current = backend.ws.lock().analysis_generation();
+            let baseline = configuration_content(&class).unwrap();
+            backend.watches.lock().archive_inputs = Some((current, HashMap::from([(key.clone(), baseline)])));
+            let before = backend.refresh.lock().requested;
+            backend.did_change_watched_files(event(kind)).await;
+            assert!(backend.refresh.lock().requested > before, "create/delete stays conservative");
+        }
+        let before = backend.refresh.lock().requested;
+        std::fs::remove_file(&class).unwrap();
+        backend.did_change_watched_files(event(FileChangeType::CHANGED)).await;
+        assert!(backend.refresh.lock().requested > before, "missing class cannot be suppressed");
+        std::fs::write(&class, b"unknown new bytes").unwrap();
+        backend.watches.lock().archive_inputs = None;
+        backend.watches.lock().archive_contents.clear();
+        let before = backend.refresh.lock().requested;
+        backend.did_change_watched_files(event(FileChangeType::CHANGED)).await;
+        assert!(backend.refresh.lock().requested > before, "unknown class cannot be suppressed");
+        assert_eq!(backend.ws.lock().doc_text(&dirty).as_deref(), Some("class Use { int unsaved; }"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+
+    #[tokio::test]
     async fn unchanged_selected_binary_jar_watch_does_not_force_model_reload() {
         let root = std::env::temp_dir().join(format!(
             "ktlsp_unchanged_binary_jar_watch_{}",
@@ -10863,6 +11194,7 @@ impl Backend {
         let mut refresh = self.refresh.lock();
         if !refresh.stopped {
             refresh.stopped = true;
+            refresh.completion.notify_waiters();
             refresh
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -13015,5 +13347,259 @@ mod first_extension_source_tests {
             error.code,
             tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801)
         );
+    }
+}
+
+
+struct ProviderCommandStart {
+    work: crate::extension_ipc::Work,
+    owner: String,
+    revision: Option<u64>,
+    version: Option<i32>,
+}
+struct ProviderCommandCancellation { cancelled: Arc<std::sync::atomic::AtomicBool>, armed: bool }
+impl Drop for ProviderCommandCancellation {
+    fn drop(&mut self) { if self.armed { self.cancelled.store(true,std::sync::atomic::Ordering::Release); } }
+}
+struct ProviderCommandTicket { workspace:Arc<Mutex<Workspace>>, evaluation:u64, armed:bool }
+impl Drop for ProviderCommandTicket {
+    fn drop(&mut self) { if self.armed { self.workspace.lock().abandon_provider_command(self.evaluation); } }
+}
+struct ProviderRefreshPermission<'a> {
+    provider:&'a str, command:&'a str, instance:u64, owner:&'a str, text:&'a str, revision:Option<u64>,
+}
+impl ProviderRefreshPermission<'_> {
+    fn current(&self,ws:&Workspace)->bool {
+        ws.provider_command_instance(self.provider,self.command)==Some(self.instance)
+            && ws.owned_document_snapshot(self.owner).map(|doc|doc.revision)==self.revision
+            && ws.extension_source_input_identity(self.owner).is_some_and(|text|text.as_ref()==self.text)
+    }
+}
+fn provider_command_error(reason:String)->tower_lsp_server::jsonrpc::Error {
+    use tower_lsp_server::jsonrpc::{Error,ErrorCode};
+    let mut error=match reason.as_str() {
+        "Cancelled"=>Error::request_cancelled(),
+        "Stale"=>Error::content_modified(),
+        "CommandUnavailable"=>Error::new(ErrorCode::ServerError(-32002)),
+        _=>Error::internal_error(),
+    };
+    error.data=Some(serde_json::json!({"providerCommandReason":reason}));error
+}
+fn provider_command_path(raw:&str)->Option<String> {
+    // A native Windows drive is also parsed as a URI scheme. Prefer owned absolute paths,
+    // and check the scheme explicitly because Uri::to_file_path does not check it.
+    let key=if Path::new(raw).is_absolute() {crate::paths::file_key(Path::new(raw))}
+        else {raw.parse::<Uri>().ok().filter(|uri|uri.as_str().split_once(':').is_some_and(|(scheme,_)|scheme.eq_ignore_ascii_case("file")))
+            .and_then(|uri|uri_to_key(&uri))?};
+    if !Path::new(&key).is_absolute() || Path::new(&key).components().any(|part|matches!(part,std::path::Component::ParentDir)) { return None; }
+    Some(key)
+}
+impl Backend {
+    fn prepare_provider_command(&self,request:&crate::extension_ipc::ProviderCommandRequest)->Result<ProviderCommandStart> {
+        use sha2::Digest;
+        let root=self.root.lock().clone().ok_or_else(||provider_command_error("CommandUnavailable".into()))?;
+        let root_key=crate::paths::file_key(&root);
+        let owner=provider_command_path(request.context.document_uri.as_str()).ok_or_else(||tower_lsp_server::jsonrpc::Error::invalid_params("invalid provider command document"))?;
+        if provider_command_path(&request.context.workspace_root).as_deref()!=Some(root_key.as_str())
+            || provider_command_path(&owner).is_none() {
+            return Err(tower_lsp_server::jsonrpc::Error::invalid_params("provider command workspace ownership mismatch"));
+        }
+        let mut ws=self.ws.lock();
+        if !Path::new(&owner).starts_with(Path::new(&root_key)) && !ws.provider_command_external_owner(&owner) {
+            return Err(tower_lsp_server::jsonrpc::Error::invalid_params("provider command document has no current modeled owner"));
+        }
+        let owned=ws.owned_document_snapshot(&owner);
+        let text=ws.provider_command_source(&owner).ok_or_else(||provider_command_error("CommandUnavailable".into()))?;
+        let version=self.doc_versions.lock().get(&owner).and_then(|state|state.document_version);
+        if text.as_ref()!=request.context.buffer_text
+            || owned.as_ref().is_some_and(|doc|doc.text.as_ref()!=text.as_ref() || doc.document_version!=version)
+            || request.context.document_version.is_some_and(|expected|version.map(i64::from)!=Some(expected)) {
+            return Err(provider_command_error("Stale".into()));
+        }
+        let mut context=serde_json::json!({"workspaceRoot":root_key,"documentUri":request.context.document_uri,
+            "sourceSha256":format!("{:x}",sha2::Sha256::digest(text.as_bytes()))});
+        if let Some(version)=version { context["documentVersion"]=serde_json::json!(version); }
+        if let Some(doc)=&owned {context["languageId"]=serde_json::json!(doc.language_id);context["documentRevision"]=serde_json::json!(doc.revision.to_string());}
+        let work=ws.begin_provider_command(&request.provider,&owner,request.command.clone(),request.arguments.clone(),context).map_err(provider_command_error)?;
+        Ok(ProviderCommandStart {work,owner,revision:owned.map(|doc|doc.revision),version})
+    }
+
+    async fn run_provider_command_work(&self,start:ProviderCommandStart,dispatch:bool)->Result<serde_json::Value> {
+        let cancelled=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cancellation=ProviderCommandCancellation {cancelled:cancelled.clone(),armed:true};
+        let lease=ProviderCommandTicket {workspace:self.ws.clone(),evaluation:start.work.evaluation,armed:true};
+        let workspace=self.ws.clone();let versions=self.doc_versions.clone();
+        let weak_workspace=Arc::downgrade(&workspace);let client=self.client.clone();let wake_versions=versions.clone();
+        let runtime=tokio::runtime::Handle::current();
+        let wake:Arc<dyn Fn()+Send+Sync>=Arc::new(move|| {
+            if let Some(workspace)=weak_workspace.upgrade() {
+                let client=client.clone();let versions=wake_versions.clone();
+                runtime.spawn(async move {schedule_extension_sources(&workspace,&client,&versions);});
+            }
+        });
+        let result=tokio::task::spawn_blocking(move|| {
+            let mut lease=lease;
+            let result=start.work.worker.run_command(&start.work,&workspace,wake.clone(),&cancelled,dispatch);
+            let mut ws=workspace.lock();
+            let version=versions.lock().get(&start.owner).and_then(|state|state.document_version);
+            let result=if cancelled.load(std::sync::atomic::Ordering::Acquire) {Err("Cancelled".into())}
+                else if version!=start.version {Err("Stale".into())} else {result};
+            let result=ws.finish_provider_command(start.work.evaluation,&start.owner,start.revision,result);
+            lease.armed=false;drop(ws);wake();result
+        }).await;
+        cancellation.armed=false;
+        result.map_err(|_|tower_lsp_server::jsonrpc::Error::internal_error())?.map_err(provider_command_error)
+    }
+
+    async fn await_provider_refresh(&self,target:u64)->Result<u64> {
+        let completion=self.refresh.lock().completion.clone();
+        loop {
+            let notified=completion.notified();tokio::pin!(notified);notified.as_mut().enable();
+            {
+                let state=self.refresh.lock();
+                if state.stopped {return Err(provider_command_error("Cancelled".into()));}
+                if !state.running && state.requested>=target {
+                    if let Some((generation,accepted))=state.settled.filter(|(generation,_)|*generation==state.requested) {
+                        return if accepted {Ok(generation)} else {Err(provider_command_error("CommandUnavailable".into()))};
+                    }
+                }
+            }
+            notified.await;
+        }
+    }
+
+    async fn execute_provider_command(&self,arguments:&[serde_json::Value])->Result<serde_json::Value> {
+        let request=crate::extension_ipc::ProviderCommandRequest::decode(arguments)
+            .map_err(tower_lsp_server::jsonrpc::Error::invalid_params)?;
+        // The first phase only negotiates transport permissions: it never dispatches the command.
+        let start=self.prepare_provider_command(&request)?;
+        let instance=start.work.worker.id;let owner=start.owner.clone();let revision=start.revision;
+        self.run_provider_command_work(start,false).await?;
+        let generation=if request.refresh_project {
+            let permission=ProviderRefreshPermission {provider:&request.provider,command:&request.command,instance,
+                owner:&owner,text:&request.context.buffer_text,revision};
+            let target=self.request_project_refresh_guarded(true,Duration::ZERO,false,&[],None,Some(&permission))
+                .ok_or_else(||provider_command_error("Stale".into()))?;
+            Some(self.await_provider_refresh(target).await?)
+        } else {None};
+        let mut start=self.prepare_provider_command(&request)?;
+        if start.work.worker.id!=instance {self.ws.lock().abandon_provider_command(start.work.evaluation);return Err(provider_command_error("Stale".into()));}
+        if let Some(generation)=generation {start.work.params["context"]["refreshGeneration"]=serde_json::json!(generation.to_string());}
+        self.run_provider_command_work(start,true).await
+    }
+}
+
+#[cfg(test)]
+mod provider_command_context_tests {
+    use super::*;
+    use serde_json::json;
+    #[tokio::test]
+    async fn command_context_uses_owned_text_versions_and_selected_workspace() {
+        let root=std::env::temp_dir().join(format!("ktlsp-command-context-{}",std::process::id()));
+        let key=crate::paths::file_key(&root.join("Owner.kt"));
+        let (service,socket)=tower_lsp_server::LspService::new(Backend::new);drop(socket);
+        let backend=service.inner();*backend.root.lock()=Some(root.clone());
+        {
+            let mut ws=backend.ws.lock();
+            ws.open(key.clone(),"class Owner".into());
+            ws.record_owned_document(&key,None,7,Some("kotlin".into()));
+            ws.register_ipc_provider_commands("test.commands",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
+            backend.doc_versions.lock().entry(key.clone()).or_default().document_version=Some(7);
+        }
+        let envelope=json!({"provider":"test.commands","command":"fixture.echo","arguments":[{"OpaqueField":"KeepCase"}],
+            "context":{"workspaceRoot":crate::paths::file_key(&root),"documentUri":key_to_uri(&key).unwrap(),"bufferText":"class Owner","documentVersion":7}});
+        let request=crate::extension_ipc::ProviderCommandRequest::decode(&[envelope.clone()]).unwrap();
+        let start=backend.prepare_provider_command(&request).unwrap();
+        let result=backend.ws.lock().finish_provider_command(start.work.evaluation,&start.owner,start.revision,Ok(json!({"fresh":true}))).unwrap();
+        assert_eq!(result,json!({"fresh":true}));
+        for (field,value) in [("bufferText",json!("class Wrong")),("documentVersion",json!(6)),("workspaceRoot",json!(root.join("other").to_string_lossy())),
+            ("workspaceRoot",json!(key_to_uri(&key).unwrap().as_str().replacen("file:","https:",1))),
+            ("documentUri",json!(key_to_uri(&key).unwrap().as_str().replacen("file:","https:",1)))] {
+            let mut invalid=envelope.clone();invalid["context"][field]=value;
+            let request=crate::extension_ipc::ProviderCommandRequest::decode(&[invalid]).unwrap();
+            assert!(backend.prepare_provider_command(&request).is_err(),"{field}");
+        }
+        let start=backend.prepare_provider_command(&request).unwrap();
+        backend.ws.lock().record_owned_document(&key,None,8,None);
+        assert!(backend.ws.lock().finish_provider_command(start.work.evaluation,&start.owner,start.revision,Ok(json!({"sameTextOldVersion":true}))).is_err());
+        assert!(crate::commands::all().contains(&crate::commands::PROVIDER_COMMAND.to_owned()));
+        assert!(!crate::commands::all().contains(&"fixture.echo".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn raw_resource_commands_bind_only_captured_scope_and_current_owned_bytes() {
+        use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+        use crate::resource_model::{ResourceClaims, ResourceFile};
+        let root=std::env::temp_dir().join(format!("ktlsp-command-resource-{}",std::process::id()));
+        // A real Gradle selection may live outside the editor's physical workspace directory.
+        let resources=root.with_file_name(format!("ktlsp-command-external-resources-{}",std::process::id()));
+        let cases=[("rules.json","json","{\"class\":\"Fake { fun generated() {} }\"}"),
+            ("rules.accesswidener","accesswidener","accessWidener v2 named\naccessible class fixture/Target"),
+            ("rules.cfg","conf","public fixture.Target privateField")];
+        let claims=ResourceClaims {adapter:"gradle-source-set-resources-v1".into(),roots:vec![resources.clone()],trees:vec![],
+            files:cases.iter().map(|(name,_,_)|ResourceFile {path:resources.join(name),relative_path:(*name).into()}).collect(),
+            output_roots:vec![],configuration_inputs:vec![],default_excludes:vec![],complete:true,problem:None};
+        let source=SourceSetClasspath {name:"main".into(),resources:Some(claims),..Default::default()};
+        let decoy=SourceSetClasspath {name:"javaOnly".into(),source_roots:vec![resources.clone()],..Default::default()};
+        let external_root=root.with_file_name(format!("ktlsp-command-external-jvm-{}",std::process::id()));
+        let external_source=SourceSetClasspath {name:"externalJvm".into(),source_roots:vec![external_root.clone()],..Default::default()};
+        let module=ModuleClasspath {module:":app".into(),project_dir:root.clone(),build:String::new(),source_sets:vec![source.clone(),decoy,external_source.clone()],entries:vec![],unresolved:vec![]};
+        let model=Arc::new(ProjectSnapshot::new(vec![module.clone()]));
+        let (service,socket)=tower_lsp_server::LspService::new(Backend::new);drop(socket);
+        let backend=service.inner();*backend.root.lock()=Some(root.clone());
+        {
+            let mut ws=backend.ws.lock();ws.set_project_model(model.clone());
+            ws.register_ipc_provider_commands("test.commands",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
+        }
+        for (name,language,text) in cases {
+            let key=crate::paths::file_key(&resources.join(name));
+            backend.ws.lock().record_owned_document(&key,Some(text.into()),7,Some(language.into()));
+            backend.doc_versions.lock().entry(key.clone()).or_default().document_version=Some(7);
+            let request=crate::extension_ipc::ProviderCommandRequest::decode(&[json!({"provider":"test.commands","command":"fixture.echo","arguments":[],
+                "context":{"workspaceRoot":crate::paths::file_key(&root),"documentUri":key_to_uri(&key).unwrap(),"bufferText":text,"documentVersion":7}})]).unwrap();
+            let start=backend.prepare_provider_command(&request).unwrap();
+            assert_eq!(start.work.params["source"],text);
+            assert_eq!(start.work.params["context"]["languageId"],language);
+            assert!(start.work.params["declarations"].as_array().unwrap().is_empty(),"raw bytes must not create JVM declarations");
+            let mut ws=backend.ws.lock();
+            assert!(ws.index.entries_for_file(&key).is_empty());
+            assert_eq!(ws.index.file_origin(&key).unwrap().project_scope.as_ref().unwrap().source_set,"main");
+            assert_eq!(model.extension_project_context(Path::new(&key)).unwrap().scope.source_set,"main");
+            ws.record_owned_document(&key,Some(text.into()),8,None);
+            assert!(ws.extension_source_input_identity(&key).is_none(),"even a same-text version update withdraws the old anchor");
+            assert!(ws.finish_provider_command(start.work.evaluation,&key,start.revision,Ok(json!({"obsolete":true}))).is_err());
+            assert!(ws.provider_command_source(&key).is_some());
+            ws.close_owned_document(&key);
+            assert!(ws.provider_command_source(&key).is_none());
+            assert!(ws.index.file_origin(&key).is_none());
+        }
+        let external_key=crate::paths::file_key(&external_root.join("Owner.kt"));
+        {
+            let mut ws=backend.ws.lock();ws.open(external_key.clone(),"class External".into());
+            ws.record_owned_document(&external_key,None,7,Some("kotlin".into()));
+            backend.doc_versions.lock().entry(external_key.clone()).or_default().document_version=Some(7);
+        }
+        let external_request=crate::extension_ipc::ProviderCommandRequest::decode(&[json!({"provider":"test.commands","command":"fixture.echo","arguments":[],
+            "context":{"workspaceRoot":crate::paths::file_key(&root),"documentUri":key_to_uri(&external_key).unwrap(),"bufferText":"class External","documentVersion":7}})]).unwrap();
+        let start=backend.prepare_provider_command(&external_request).unwrap();
+        backend.ws.lock().finish_provider_command(start.work.evaluation,&external_key,start.revision,Ok(json!({"fresh":true}))).unwrap();
+        let key=crate::paths::file_key(&resources.join("rules.json"));
+        let mut ws=backend.ws.lock();
+        ws.record_owned_document(&key,Some("{}".into()),9,Some("json".into()));
+        assert!(ws.provider_command_source(&key).is_some());
+        let mut ambiguous=module;let mut other=source;other.name="other".into();ambiguous.source_sets.push(other);
+        let mut other_external=external_source;other_external.name="otherExternal".into();ambiguous.source_sets.push(other_external);
+        ws.set_project_model(Arc::new(ProjectSnapshot::new(vec![ambiguous])));
+        assert!(ws.extension_source_input_identity(&key).is_none());
+        assert!(ws.provider_command_source(&key).is_none(),"ambiguous resource ownership cannot borrow an arbitrary scope");
+        assert!(!ws.provider_command_external_owner(&external_key),"ambiguous external source ownership cannot borrow the first source root");
+        ws.set_project_model(model);
+        assert!(ws.provider_command_source(&key).is_some());
+        ws.begin_analysis_generation();
+        assert!(ws.extension_source_input_identity(&key).is_none());
+        assert!(ws.provider_command_source(&key).is_none(),"pending model generation cannot retain resource permission");
+        let foreign=crate::paths::file_key(&root.join("outside.json"));
+        ws.record_owned_document(&foreign,Some("{}".into()),1,Some("json".into()));
+        assert!(ws.provider_command_source(&foreign).is_none());
     }
 }

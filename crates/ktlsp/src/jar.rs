@@ -31,7 +31,19 @@ pub(crate) fn read_class_file(
     entry_name: &str,
     origin_id: &str,
 ) -> Result<Option<ktcore::classfile::ClassFileFacts>, String> {
-    let read = || -> anyhow::Result<Option<ktcore::classfile::ClassFileFacts>> {
+    read_class_bytes(path, entry_name)?
+        .map(|bytes| ktcore::classfile::decode(origin_id, &bytes)
+            .map_err(|error| format!("decode class {entry_name} from {}: {error:#}", path.display())))
+        .transpose()
+}
+
+/// Read one selected entry without rewriting attributes or loading the whole archive.
+/// Runtime-role and accepted-identity checks belong to the host's class read plan.
+pub(crate) fn read_class_bytes(
+    path: &Path,
+    entry_name: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let read = || -> anyhow::Result<Option<Vec<u8>>> {
         anyhow::ensure!(
             !entry_name.is_empty()
                 && Path::new(entry_name)
@@ -40,7 +52,7 @@ pub(crate) fn read_class_file(
             "class entry must be a relative path without parents"
         );
         let limit = ktcore::classfile::MAX_CLASS_FILE_BYTES;
-        let decode = |reader: &mut dyn Read, size: u64| {
+        let read_bytes = |reader: &mut dyn Read, size: u64| {
             anyhow::ensure!(size <= limit as u64, "class entry too large");
             let mut bytes = Vec::with_capacity(size.min(8192) as usize);
             reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
@@ -48,7 +60,7 @@ pub(crate) fn read_class_file(
                 bytes.len() <= limit && bytes.len() as u64 == size,
                 "class entry size mismatch"
             );
-            ktcore::classfile::decode(origin_id, &bytes).map(Some)
+            Ok(Some(bytes))
         };
         let metadata = fs::metadata(path)?;
         if metadata.is_dir() {
@@ -59,13 +71,14 @@ pub(crate) fn read_class_file(
             };
             let metadata = file.metadata()?;
             anyhow::ensure!(metadata.is_file(), "class entry is not a file");
-            return decode(&mut file, metadata.len());
+            return read_bytes(&mut file, metadata.len());
         }
         anyhow::ensure!(
             metadata.is_file(),
             "classpath entry is not a file or directory"
         );
-        let mut archive = open_archive(path)?;
+        let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
+        anyhow::ensure!(!archive.has_duplicate_names(), "duplicate class archive entries are ambiguous");
         // shortcut: Version-specific class selection is unsupported; reject only the affected owner.
         anyhow::ensure!(
             !archive.file_names().collect::<zip::result::ZipResult<Vec<_>>>()?.into_iter().any(|name| {
@@ -86,7 +99,7 @@ pub(crate) fn read_class_file(
         };
         anyhow::ensure!(!entry.is_dir(), "class entry is not a file");
         let size = entry.size();
-        decode(&mut entry, size)
+        read_bytes(&mut entry, size)
     };
     read().map_err(|error| format!("read class {entry_name} from {}: {error:#}", path.display()))
 }
@@ -3013,6 +3026,11 @@ mod tests {
             "classes/pluginfixture/Person.class",
         ] {
             write_binary_jar(&path, &[("unselected.class", b"invalid"), (entry, class)]);
+            let mut archive = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+            let mut fixture_bytes = Vec::new();
+            archive.by_name(entry).unwrap().read_to_end(&mut fixture_bytes).unwrap();
+            let raw = read_class_bytes(&path, entry).unwrap().unwrap();
+            assert_eq!(raw, fixture_bytes, "raw Code/LVT/annotation payloads are not re-encoded");
             let facts = read_class_file(&path, entry, "selected-origin")
                 .unwrap()
                 .unwrap();
@@ -3030,6 +3048,7 @@ mod tests {
             let disk_entry = root.join(entry);
             fs::create_dir_all(disk_entry.parent().unwrap()).unwrap();
             fs::write(disk_entry, class).unwrap();
+            assert_eq!(read_class_bytes(&root, entry).unwrap().unwrap(), raw);
             let disk_facts = read_class_file(&root, entry, "selected-origin")
                 .unwrap()
                 .unwrap();
@@ -3066,6 +3085,19 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // ZipWriter rejects duplicate names, so create a conforming two-entry archive
+        // then make the equally sized local+central names collide.
+        write_binary_jar(&path, &[("pluginfixture/Person.class", class),
+            ("pluginfixture/Persom.class", class)]);
+        let mut duplicate = fs::read(&path).unwrap();
+        let from = b"pluginfixture/Persom.class";
+        let positions: Vec<_> = duplicate.windows(from.len()).enumerate()
+            .filter_map(|(at, bytes)| (bytes == from).then_some(at)).collect();
+        assert_eq!(positions.len(), 2);
+        for at in positions { duplicate[at..at+from.len()].copy_from_slice(b"pluginfixture/Person.class"); }
+        fs::write(&path, duplicate).unwrap();
+        assert!(zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap().has_duplicate_names());
+        assert!(read_class_bytes(&path, "pluginfixture/Person.class").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

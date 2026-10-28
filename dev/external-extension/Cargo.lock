@@ -695,6 +695,7 @@ name = "ktlsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bincode",
  "ktcore",
  "mimalloc",
@@ -725,6 +726,7 @@ dependencies = [
 name = "ktlsp-external-shadow-fixture"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "ktcore",
  "ktlsp",
  "serde_json",

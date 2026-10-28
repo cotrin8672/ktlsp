@@ -1,8 +1,10 @@
 return function(env)
+  if vim.env.KTLSP_IPC_MODE == 'provider-commands' then return dofile(env.repo .. '/dev/external-extension/command-probes.lua')(env) end
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
   local client, check = env.client, env.check
   local linked = vim.env.KTLSP_IPC_MODE == 'linked'
-  local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots'
+  local host_inputs = vim.env.KTLSP_IPC_MODE == 'host-inputs'
+  local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots' or host_inputs
   local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
   local paths, buffers, originals = {}, {}, {}
@@ -21,6 +23,7 @@ return function(env)
   local function save()
     vim.fn.writefile({ vim.json.encode(proof) }, env.artifacts .. '/extension-ipc-proof.json')
   end
+  local inputs = host_inputs and dofile(env.repo .. '/dev/external-extension/host-input-probes.lua')(env, proof, save) or nil
   local function record(event) proof.ordering[#proof.ordering + 1] = event; save() end
   local function model_state()
     local requested, accepted
@@ -184,6 +187,7 @@ return function(env)
       value.command = { assert(vim.env.KTLSP_IPC_CHILD), '--barrier', barrier }
       if facts then value.command[#value.command + 1] = '--project-facts' end
       if source_facts then value.command[#value.command + 1] = '--source-snapshots' end
+      if host_inputs then value.command[#value.command + 1] = '--host-inputs'; value.configuration.runtimeClasses={'java/util/List','vendor/Versioned','vendor/Added','app/Main'} end
     end
     client:notify('workspace/didChangeConfiguration', { settings = { analysisProviders = { [provider] = value } } })
   end
@@ -192,6 +196,7 @@ return function(env)
     request(name, 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/definition', nil,
       function(result) return probe.exact_definition(result, paths.target, { target_range }) end)
   end
+  if inputs then inputs.setup() end
   settings(true)
   if linked then
     local changed = vim.split(table.concat(lines('target'), '\n'):gsub('value %* 2', 'value * 3'), '\n', { plain = true })
@@ -200,7 +205,7 @@ return function(env)
       function(result) for _, item in ipairs(result and (result.items or result) or {}) do if item.label:match('^twice') then return true end end return false end)
   end
   if not linked then
-    local paused = vim.wait(15000, function() return vim.fn.filereadable(barrier .. '/paused') == 1 end, 10)
+    local paused = vim.wait(host_inputs and 120000 or 15000, function() return vim.fn.filereadable(barrier .. '/paused') == 1 end, 10)
     check('real extension child reached pause barrier', paused, nil, 'operational')
     assert(paused, 'child did not reach barrier')
     proof.paused_evaluation = table.concat(vim.fn.readfile(barrier .. '/paused'), '')
@@ -217,6 +222,7 @@ return function(env)
     if facts then
       project_facts('initial', proof.paused_evaluation)
       if source_facts then source_snapshots('initial', proof.paused_evaluation) end
+      if inputs then inputs.capture('initial', proof.paused_evaluation); inputs.change_wire() end
       proof.initial_model_generation = model_state()
       assert(proof.initial_model_generation, 'initial accepted model generation is missing')
       if source_facts then
@@ -288,6 +294,7 @@ return function(env)
     proof.facts_publication = accepted
     local entries = project_facts('fresh', tostring(accepted.args.evaluation))
     if source_facts then source_snapshots('fresh', tostring(accepted.args.evaluation)) end
+    if inputs then inputs.capture('fresh',tostring(accepted.args.evaluation)); inputs.native_lifecycle() end
     local initial = proof.project_facts.initial.selected.entries
     local added = env.project .. '/home/.m2/repository/fixture/reload/added/1.0/added-1.0.jar'
     local found = false
@@ -360,6 +367,7 @@ return function(env)
       for _, location in ipairs(probe.locations(result)) do if probe.path_key(vim.uri_to_fname(location.uri or location.targetUri)) == probe.path_key(paths.target) then return false end end
       return true
     end)
+  if inputs then inputs.raw_commands() end
   for key, original in pairs(originals) do
     vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, original)
     check('restore exact original buffer ' .. key, vim.deep_equal(lines(key), original))
@@ -370,5 +378,6 @@ return function(env)
     assert(vim.fn.delete(empty_path) == 0, 'remove disposable empty source')
     check('empty source sidecar is removed after disable', vim.fn.filereadable(empty_path) == 0)
   end
+  if inputs then inputs.cleanup() end
   deliver(); client.handlers['textDocument/publishDiagnostics'] = previous_diagnostics; save()
 end

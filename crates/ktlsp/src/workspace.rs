@@ -34,6 +34,14 @@ use ktcore::knowledge::Knowledge;
 
 /// An open buffer: its current text plus the parsed tree, kept in sync so goto-definition reads an
 /// already-current tree instead of re-parsing on every request.
+#[derive(Clone)]
+pub(crate) struct OwnedDocumentSnapshot {
+    pub text: Arc<str>,
+    pub document_version: Option<i32>,
+    pub language_id: String,
+    pub revision: u64,
+}
+
 struct DocState {
     text: String,
     tree: Tree,
@@ -104,6 +112,11 @@ pub struct Workspace {
     _index_drop_marker: WorkspaceDropMarker,
     /// Open buffers, keyed by canonical identity. Take precedence over disk.
     open_docs: HashMap<String, DocState>,
+    owned_documents: HashMap<String, OwnedDocumentSnapshot>,
+    raw_command_sources: BTreeSet<String>,
+    resource_catalogs:BTreeMap<ktcore::project_model::ProjectScope,Arc<crate::resource_inputs::ResourceCatalog>>,
+    resource_overlay_epoch:Arc<std::sync::atomic::AtomicBool>,
+    owned_document_revision: u64,
     parsers: LanguageParsers,
     salsa: RefCell<SalsaState>,
     index_revision: u64,
@@ -118,6 +131,7 @@ pub struct Workspace {
     analysis_generation: u64,
     live_dependency_origins: BTreeSet<String>,
     project_refresh_pending: bool,
+    completed_analysis_generation: Option<u64>,
     analysis_extensions: crate::analysis_extensions::AnalysisExtensions,
     extension_sources_running: bool,
     annotated_type_owners: HashMap<String, BTreeSet<Def>>,
@@ -170,6 +184,10 @@ impl Workspace {
             index: Index::new(),
             _index_drop_marker: WorkspaceDropMarker("workspace.index.dropped"),
             open_docs: HashMap::new(),
+            owned_documents: HashMap::new(),
+            raw_command_sources: BTreeSet::new(),
+            resource_catalogs:BTreeMap::new(),resource_overlay_epoch:Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            owned_document_revision: 0,
             parsers: LanguageParsers::new(),
             salsa: RefCell::new(SalsaState::new()),
             index_revision: 0,
@@ -184,6 +202,7 @@ impl Workspace {
             analysis_generation: 0,
             live_dependency_origins: BTreeSet::new(),
             project_refresh_pending: false,
+            completed_analysis_generation: None,
             analysis_extensions: crate::analysis_extensions::AnalysisExtensions::new(providers),
             extension_sources_running: false,
             annotated_type_owners: HashMap::new(),
@@ -238,6 +257,7 @@ impl Workspace {
     }
 
     pub fn begin_analysis_generation(&mut self) -> u64 {
+        self.clear_raw_command_sources();
         self.invalidate_kotlin_diagnostics();
         self.class_inventory.get_mut().clear();
         self.invalidate_observed_compile();
@@ -269,6 +289,7 @@ impl Workspace {
         }
         self.set_library_index_complete(libraries);
         self.set_jdk_index_complete(jdk);
+        self.completed_analysis_generation = Some(generation);
         true
     }
 
@@ -298,6 +319,7 @@ impl Workspace {
     }
 
     pub fn set_project_model(&mut self, model: Arc<crate::classpath::ProjectSnapshot>) {
+        self.clear_raw_command_sources();
         self.invalidate_kotlin_diagnostics();
         self.class_inventory.get_mut().clear();
         self.invalidate_observed_compile();
@@ -382,6 +404,7 @@ impl Workspace {
                 || (active.contains(origin)
                     && previous_revisions.get(origin) == revisions.get(origin))
         });
+        self.invalidate_resource_overlay();
         self.project_model = Some(model);
         self.analysis_extensions.model_changed(&self.index);
         self.bump_index_revision();
@@ -753,13 +776,14 @@ impl Workspace {
     }
 
     pub fn register_ipc_provider(
-        &mut self,
-        provider: &str,
-        command: Vec<String>,
+        &mut self, provider: &str, command: Vec<String>,
     ) -> Result<bool, String> {
-        let changed = self
-            .analysis_extensions
-            .register_ipc(&self.index, provider, command)?;
+        self.register_ipc_provider_commands(provider, command, Vec::new())
+    }
+    pub(crate) fn register_ipc_provider_commands(
+        &mut self, provider: &str, command: Vec<String>, commands: Vec<String>,
+    ) -> Result<bool, String> {
+        let changed = self.analysis_extensions.register_ipc_commands(&self.index, provider, command, commands)?;
         if changed {
             let sources = self
                 .open_docs
@@ -773,7 +797,124 @@ impl Workspace {
         Ok(changed)
     }
 
+    pub(crate) fn owned_document_snapshot(&self, key: &str) -> Option<OwnedDocumentSnapshot> {
+        self.owned_documents.get(key).cloned()
+    }
+
+    // Source documents alias the accepted source allocation. Non-source documents stay raw.
+    pub(crate) fn record_owned_document(
+        &mut self, key: &str, raw: Option<String>, version: i32, language: Option<String>,
+    ) {
+        let text=raw.map(Arc::<str>::from)
+            .or_else(||self.analysis_extensions.source_input_identity(key))
+            .or_else(||self.open_docs.get(key).map(|doc|Arc::from(doc.text.as_str())));
+        let Some(text)=text else { return; };
+        let language_id=language.or_else(||self.owned_documents.get(key).map(|old|old.language_id.clone()))
+            .unwrap_or_else(||if key.ends_with(".java") {"java".into()} else if key.ends_with(".kt") {"kotlin".into()} else {String::new()});
+        self.owned_document_revision=self.owned_document_revision.wrapping_add(1).max(1);
+        self.owned_documents.insert(key.to_owned(),OwnedDocumentSnapshot {text,document_version:Some(version),language_id,revision:self.owned_document_revision});
+        self.withdraw_raw_command_source(key);
+        if !matches!(Path::new(key).extension().and_then(|extension|extension.to_str()),Some("java"|"kt"))
+            || self.project_model.as_ref().is_some_and(|model|matches!(model.resource_owner_context(Path::new(key)),ktcore::knowledge::Knowledge::Found(_))) {
+            self.invalidate_resource_overlay();
+        }
+    }
+
+    pub(crate) fn close_owned_document(&mut self,key:&str) {
+        self.withdraw_raw_command_source(key);
+        if self.owned_documents.remove(key).is_some() {self.invalidate_resource_overlay();}
+    }
+
+    fn withdraw_raw_command_source(&mut self, key: &str) {
+        if self.raw_command_sources.remove(key) {
+            self.index.remove_file(key);
+            self.analysis_extensions.remove_source(&self.index, key);
+            self.analysis_extensions.publish(&mut self.index);
+            self.bump_index_revision();
+        }
+    }
+
+    fn clear_raw_command_sources(&mut self) {
+        for key in self.raw_command_sources.iter().cloned().collect::<Vec<_>>() {
+            self.withdraw_raw_command_source(&key);
+        }
+    }
+
+    /// Bind a raw editor document only to its unique captured resource owner.
+    /// Its bytes remain raw; the empty syntax sentinel has no JVM declarations or coverage.
+    pub(crate) fn provider_command_source(&mut self, key: &str) -> Option<Arc<str>> {
+        if SourceLanguage::for_project_path(Path::new(key)).is_some() {
+            return self.analysis_extensions.source_input_identity(key);
+        }
+        if self.project_refresh_pending { return None; }
+        let owner = self.project_model.as_ref().and_then(|model| match model.resource_owner_context(Path::new(key)) {
+            ktcore::knowledge::Knowledge::Found(owner) => Some(owner), _ => None,
+        });
+        let Some((owner, document)) = owner.zip(self.owned_document_snapshot(key)) else {
+            self.withdraw_raw_command_source(key);
+            return None;
+        };
+        if self.raw_command_sources.contains(key)
+            && self.index.file_origin(key) == Some(&owner.origin)
+            && self.analysis_extensions.source_input_identity(key).as_ref().is_some_and(|text| Arc::ptr_eq(text, &document.text)) {
+            return Some(document.text);
+        }
+        self.withdraw_raw_command_source(key);
+        self.index.replace_file(key, Vec::new(), Tier::Volatile);
+        self.index.set_file_origin(key, owner.origin);
+        let empty_tree = self.parse_text("", "");
+        self.raw_command_sources.insert(key.to_owned());
+        self.analysis_extensions.replace_sources(&self.index, vec![(key.to_owned(), document.text.clone(), empty_tree)]);
+        self.analysis_extensions.publish(&mut self.index);
+        self.bump_index_revision();
+        self.analysis_extensions.source_input_identity(key)
+    }
+
+    pub(crate) fn provider_command_external_owner(&self, key: &str) -> bool {
+        let Some(document) = self.owned_documents.get(key).filter(|document|document.document_version.is_some()) else { return false; };
+        let Some(model) = self.project_model.as_ref() else { return false; };
+        if SourceLanguage::for_project_path(Path::new(key)).is_some() {
+            return model.unique_source_origin(Path::new(key)).as_ref().is_some_and(|origin|
+                self.index.file_origin(key)==Some(origin)
+                && self.analysis_extensions.source_input_identity(key).as_ref().is_some_and(|text|text.as_ref()==document.text.as_ref()));
+        }
+        matches!(model.resource_owner_context(Path::new(key)),ktcore::knowledge::Knowledge::Found(_))
+    }
+
+    pub(crate) fn provider_refresh_accepted(&self,generation:u64,gradle:bool) -> bool {
+        self.is_current_generation(generation) && self.completed_analysis_generation==Some(generation)
+            && !self.project_refresh_pending && self.completeness.project_scan_complete
+            && (!gradle || self.project_model.as_ref().is_some_and(|model|!model.modules.is_empty()))
+    }
+
+    pub(crate) fn provider_command_instance(&self,provider:&str,command:&str) -> Option<u64> {
+        self.analysis_extensions.ipc_command_instance(provider,command)
+    }
+
+    pub(crate) fn begin_provider_command(
+        &mut self,provider:&str,owner:&str,command:String,arguments:Vec<serde_json::Value>,context:serde_json::Value,
+    ) -> Result<crate::extension_ipc::Work,String> {
+        self.analysis_extensions.refresh_host_inputs();
+        if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
+        if self.project_refresh_pending { return Err("CommandUnavailable".into()); }
+        self.analysis_extensions.begin_ipc_command(&self.index,self.project_model.as_ref(),provider,owner,command,arguments,context)
+    }
+
+    pub(crate) fn finish_provider_command(
+        &mut self,evaluation:u64,owner:&str,revision:Option<u64>,result:Result<serde_json::Value,String>,
+    ) -> Result<serde_json::Value,String> {
+        let result=if self.owned_documents.get(owner).map(|doc|doc.revision)!=revision
+            && !result.as_ref().is_err_and(|error|error=="Cancelled") {Err("Stale".into())} else {result};
+        self.analysis_extensions.finish_ipc_command(evaluation,result)
+    }
+
+    pub(crate) fn abandon_provider_command(&mut self,evaluation:u64) {
+        let _=self.analysis_extensions.finish_ipc_command(evaluation,Err("Cancelled".into()));
+    }
+
     pub(crate) fn take_ipc_work(&mut self) -> Vec<crate::extension_ipc::Work> {
+        self.analysis_extensions.refresh_host_inputs();
+        if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
         let revision = self.analysis_extensions.revision();
         let work = self
             .analysis_extensions
@@ -786,6 +927,78 @@ impl Workspace {
 
     /// Capture accepted project inputs for an explicitly negotiated source consumer.
     /// Parsing and filesystem reads happen in its existing blocking worker.
+    fn invalidate_resource_overlay(&mut self) {
+        self.resource_overlay_epoch.store(true,std::sync::atomic::Ordering::Release);
+        self.resource_overlay_epoch=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.resource_catalogs.clear();
+        self.analysis_extensions.refresh_host_inputs();
+        if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
+    }
+
+    pub(crate) fn begin_ipc_resource_capture(&mut self,evaluation:u64)->Option<crate::resource_inputs::ResourceCapturePlan> {
+        if self.project_refresh_pending {return None;}
+        let owner=self.analysis_extensions.ipc_resource_owner(evaluation)?.to_owned();
+        let model=self.project_model.as_ref()?.clone();
+        let scope=if let Some(context)=model.extension_project_context(Path::new(&owner)) {context.scope}
+            else {match model.resource_owner_context(Path::new(&owner)) {
+                ktcore::knowledge::Knowledge::Found(context)=>context.scope,_=>return None,
+            }};
+        if let Some(catalog)=self.resource_catalogs.get(&scope).filter(|catalog|
+            Arc::ptr_eq(&catalog.model,&model) && catalog.guard.is_current()).cloned() {
+            let _=self.analysis_extensions.attach_ipc_resource_catalog(&self.index,evaluation,catalog);
+            return None;
+        }
+        let source=model.source_set_for_scope(&scope)?;
+        let module=model.modules.iter().find(|module|module.source_sets.iter().any(|candidate|std::ptr::eq(candidate,source)))?;
+        let runtime=source.runtime.as_ref().filter(|runtime|runtime.usable());
+        let mut directory_inputs:BTreeSet<_>=source.resources.iter().flat_map(|claims|claims.output_roots.iter()).cloned().collect();
+        if let Some(runtime)=runtime {directory_inputs.extend(runtime.class_outputs.iter().cloned());}
+        Some(crate::resource_inputs::ResourceCapturePlan {
+            evaluation,generation:self.analysis_generation,model:model.clone(),scope,claims:source.resources.clone(),
+            compile_classpath:source.entries.clone(),runtime_classpath:runtime.map(|runtime|runtime.classpath.clone()),
+            runtime_complete:runtime.is_some(),classpath_complete:!source.classpath_incomplete && source.unresolved.is_empty() && module.unresolved.is_empty(),
+            directory_inputs,configuration_base:module.project_dir.clone(),overlays:self.owned_documents.iter().map(|(key,value)|(key.clone(),value.clone())).collect(),
+            overlay_epoch:self.resource_overlay_epoch.clone(),
+        })
+    }
+
+    pub(crate) fn finish_ipc_resource_capture(&mut self,prepared:crate::resource_inputs::PreparedResourceCatalog)->Result<(),String> {
+        if self.project_refresh_pending || !self.ipc_evaluation_current(prepared.evaluation)
+            || prepared.generation!=self.analysis_generation || !self.project_model.as_ref().is_some_and(|model|Arc::ptr_eq(model,&prepared.model)) {
+            return Err("Stale".into());
+        }
+        let Ok(catalog)=prepared.catalog else {return Ok(());};
+        if !catalog.guard.is_current() {return Err("Stale".into());}
+        let catalog=self.resource_catalogs.get(&catalog.scope).filter(|previous|
+            Arc::ptr_eq(&previous.model,&catalog.model) && previous.guard.is_current()).cloned().unwrap_or(catalog);
+        self.analysis_extensions.attach_ipc_resource_catalog(&self.index,prepared.evaluation,catalog.clone())?;
+        self.resource_catalogs.insert(catalog.scope.clone(),catalog);Ok(())
+    }
+
+    pub(crate) fn prepay_ipc_input_read(&mut self,id:u64,method:&str,params:&serde_json::Value)->Result<(),String> {
+        self.analysis_extensions.prepay_ipc_input_read(id,method,params)
+    }
+    pub(crate) fn account_ipc_stream_reply(&mut self,id:u64,frame:&serde_json::Value)->Result<(),String> {
+        self.analysis_extensions.account_ipc_stream_reply(id,frame)
+    }
+    pub(crate) fn begin_ipc_resource_reads(&mut self,id:u64,method:&str,params:&serde_json::Value)
+        ->Result<Vec<crate::resource_inputs::ResourceReadPlan>,String> {
+        self.analysis_extensions.begin_ipc_resource_reads(id,method,params)
+    }
+    pub(crate) fn fail_ipc_input_read(&mut self,id:u64,error:&str) {
+        self.analysis_extensions.fail_ipc_input_read(id,error);
+    }
+    pub(crate) fn finish_ipc_resource_read(&mut self,prepared:crate::resource_inputs::PreparedResourceRead)->Result<(),String> {
+        self.analysis_extensions.finish_ipc_resource_read(&self.index,prepared)
+    }
+    pub(crate) fn begin_ipc_class_reads(&mut self,id:u64,method:&str,params:&serde_json::Value)
+        ->Result<Option<crate::runtime_bytes::ClassReadPlan>,String> {
+        self.analysis_extensions.begin_ipc_class_reads(id,method,params)
+    }
+    pub(crate) fn finish_ipc_class_read(&mut self,prepared:crate::runtime_bytes::PreparedClassRead)->Result<(),String> {
+        self.analysis_extensions.finish_ipc_class_read(&self.index,prepared)
+    }
+
     pub(crate) fn begin_ipc_source_capture(&self, evaluation: u64, owner: &str) -> Option<IpcSourceCapture> {
         if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) { return None; }
         let model = self.project_model.as_ref()?;
@@ -1612,6 +1825,8 @@ impl Workspace {
         offset: usize,
         snippets_supported: bool,
     ) -> Option<ShapedCompletions> {
+        self.analysis_extensions.refresh_host_inputs();
+        if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
         if let Some(completions) = self.contributed_completion(key, offset) {
             return Some(completions);
         }
@@ -8400,6 +8615,8 @@ impl Workspace {
     }
 
     fn refresh_compiled_freshness(&mut self) {
+        self.analysis_extensions.refresh_host_inputs();
+        if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
         if self.compiler_api_environments.values().any(|environment| {
             environment
                 .invalid

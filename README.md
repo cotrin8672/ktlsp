@@ -579,6 +579,11 @@ host with `--bin ... --no-build`. For the same-input control set `KTLSP_IPC_MODE
 and use `ktlsp-external-shadow-fixture` as the host. The exact evidence and remaining limits
 are recorded in the architecture document; these checks do not claim full extension parity.
 
+The external-child corpus also checks provider command routing: use the same fixture/child
+setup with `KTLSP_IPC_MODE=provider-commands`. It checks opaque DTOs, a versioned edit,
+cancellation, source staleness, disable/restart and a real host refresh through standard
+`workspace/executeCommand`. See [the explicit provider command contract](docs/architecture/extension-ipc.md#explicit-provider-commands).
+
 `analysis/readFacts` also supports `declarationMember` for an exact authored declaration
 token. It returns the host-normalized member and signature without guessing among names
 or overloads. Ambiguous JVM projections and incomplete facts remain Unknown. The same
@@ -592,6 +597,53 @@ The [wire contract](docs/architecture/extension-ipc.md) records the exact limits
 The existing `corpus`/IPC probe route uses the fixture child's `--project-facts` mode
 with a disposable Gradle project to check model selection, stale evaluation rejection,
 and fresh contributions after a real dependency change.
+
+`KTLSP_IPC_MODE=host-inputs` adds current resource bytes and document versions, a complete
+14 MiB resource stream, independently decoded runtime class bytes, selected SDK runtime bytes,
+raw JSON/AW/AT commands, and native resource add/replace/delete invalidation. It retains
+the nine-source inventory and the existing semantic, stale-response, crash/restart and
+applied-rename assertions. This mode uses the committed `dev/gradle_reload_project.lua`
+generator, not the small non-Gradle project above. From the repository root, prepare and
+run the disposable fixture as follows:
+
+```sh
+# Prerequisites: Neovim 0.12+, JDK 21 with lib/src.zip, and a private
+# GRADLE_USER_HOME populated with Gradle 9.6.1, Kotlin 2.4.0 and their dependencies.
+rtk cargo build --release --locked --bin ktlsp
+rtk cargo build --release --locked --manifest-path dev/external-extension/Cargo.toml --bin ipc-child
+repo="$PWD"
+scratch=$(mktemp -d)
+project="$scratch/project"
+rtk proxy nvim --headless -u NONE \
+  -c "lua dofile('dev/gradle_reload_project.lua').write('$project', vim.fn.getcwd())" -c qa
+(cd "$project" && rtk proxy ./gradlew fixtureJars :app:classes --offline --console=plain --max-workers=2)
+rtk proxy mkdir -p "$project/modules/editing/src/main/java/fixture" \
+  "$project/modules/editing/src/main/java/org/spongepowered/asm/mixin"
+rtk proxy cp dev/external-extension/project/fixture/Target.java \
+  dev/external-extension/project/fixture/CaseMixin.java "$project/modules/editing/src/main/java/fixture/"
+rtk proxy cp dev/external-extension/project/org/spongepowered/asm/mixin/Mixin.java \
+  dev/external-extension/project/org/spongepowered/asm/mixin/Shadow.java \
+  "$project/modules/editing/src/main/java/org/spongepowered/asm/mixin/"
+rtk proxy cp dev/external-extension/IpcUse.java "$project/modules/editing/src/main/java/fixture/"
+rtk proxy mkdir "$scratch/barrier"
+KTLSP_CORPUS_WAIT_INDEX=1 \
+KTLSP_JDK_SRC="$JAVA_HOME/lib/src.zip" \
+KTLSP_CORPUS_EXTRA_PROBES="$repo/dev/external-extension/ipc-probes.lua" \
+KTLSP_IPC_MODE=host-inputs \
+KTLSP_IPC_CHILD="$repo/dev/external-extension/target/release/ipc-child" \
+KTLSP_IPC_BARRIER="$scratch/barrier" \
+rtk proxy bash dev/ktlsp-harness.sh corpus --root "$project" \
+  --file "$repo/dev/external-extension/host-inputs-manifest.json" \
+  --bin "$repo/target/release/ktlsp" --no-build --run-dir "$scratch/editor"
+```
+
+On Windows, use the existing native harness controller with the same fixture, manifest,
+mode and environment; append `.exe` to both binary paths. The fixture build must precede
+copying the reduced annotation and shadow sources. Use a fresh project and empty barrier
+for each run: the probe edits dependencies and creates disposable resources. Inspect
+`artifacts/summary.txt`, `corpus-results.json` and `extension-ipc-proof.json` under the
+editor run directory. These checks establish the host-input contract, not Mixin runtime
+or production remapping behavior.
 
 `dev/jvm_projection_project.lua` generates a disposable four-buffer Kotlin/JVM fixture for
 this route. Its `dev/corpus/jvm-projections.json` manifest checks the Java exported suspend

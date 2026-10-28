@@ -82,6 +82,162 @@ fn read_source_snapshots(
     Ok((json!({"sources":sources,"coverage":coverage,"next":null}),snapshots))
 }
 
+/// Test consumer: read only host-issued resource identities. The barrier directory
+/// records RPC evidence; resource display paths are never opened by the child.
+fn read_owned_resources(
+    input:&mut impl std::io::BufRead,output:&mut impl std::io::Write,next:&mut u64,evaluation:&Value,
+)->Result<Value,String> {
+    let mut descriptors=Vec::new();let mut after=Value::Null;let mut pages=0usize;
+    let coverage=loop {
+        let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"resourceInventory","after":after}]}))?;
+        let page=&result["facts"][0];pages+=1;
+        descriptors.extend(page["resources"].as_array().ok_or("resource inventory descriptors")?.iter().cloned());
+        after=page["next"].clone();
+        if after.is_null() {break page["coverage"].clone();}
+        if pages>=64 {return Err("resource inventory exceeded metadata batch contract".into());}
+    };
+    let mut lookups=Vec::new();let mut snapshots=Vec::new();
+    for (association,name) in [
+        ("source","ktlsp/config.json"),("source","ktlsp/empty.aw"),("source","META-INF/ktlsp.at"),
+        ("source","ktlsp/large.json"),("source","ktlsp/new.json"),("output","ktlsp/processed.json"),
+        ("configuration","gradle.properties"),("compileClasspath","META-INF/MANIFEST.MF"),
+        ("runtimeClasspath","META-INF/MANIFEST.MF"),
+    ] {
+        let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"resourceLookup","association":association,"relativePath":name}]}))?;
+        let lookup=result["facts"][0].clone();
+        // The host preserves all classpath matches. One actual payload per role is
+        // enough for this fixture; no match is never converted to a successful empty.
+        if lookup["state"]=="found" {
+            for descriptor in lookup["value"].as_array().ok_or("resource lookup descriptors")?.iter().take(1) {
+                let id=descriptor["id"].clone();let mut after=Value::Null;let mut chunks=Vec::new();
+                loop {
+                    let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+                        "queries":[{"op":"resourceSnapshot","resource":id,"after":after}]}))?;
+                    let chunk=result["facts"][0].clone();
+                    let more=chunk["value"]["next"].clone();
+                    chunks.push(chunk);
+                    if more.is_null() {break;}
+                    if chunks.len()>=256 {return Err("resource stream exceeded continuation contract".into());}
+                    after=more;
+                }
+                snapshots.push(json!({"association":association,"relativePath":name,"descriptor":descriptor,"chunks":chunks}));
+            }
+        }
+        lookups.push(json!({"association":association,"relativePath":name,"fact":lookup}));
+    }
+    Ok(json!({"inventory":{"resources":descriptors,"pages":pages,"coverage":coverage},"lookups":lookups,"snapshots":snapshots}))
+}
+
+fn read_runtime_class_bytes(
+    input: &mut impl std::io::BufRead, output: &mut impl Write,
+    next: &mut u64, params: &Value,
+) -> Result<Vec<Value>, String> {
+    use base64::Engine as _;
+    let evaluation = &params["evaluation"];
+    let names = params["configuration"]["runtimeClasses"].as_array()
+        .ok_or("runtime bytes fixture requires exact internal names")?;
+    if names.len() > 8 { return Err("runtime bytes fixture class limit".into()); }
+    let mut observations = Vec::new();
+    for name in names {
+        let result = request(input, output, next, "analysis/readFacts", json!({
+            "evaluation":evaluation,"queries":[{"op":"runtimeClass","internalName":name}]
+        }))?;
+        let descriptor = result["facts"][0].clone();
+        if descriptor["state"] != "found" {
+            observations.push(json!({"internalName":name,"descriptor":descriptor}));
+            continue;
+        }
+        let value = &descriptor["value"];
+        if value["authority"] == "sdk-api-header" {
+            if value["codeAvailable"] != false || value["runtimeAbiCoverage"]["state"] != "unknown"
+                || value["classHeader"]["state"] != "found" || value["hierarchy"]["state"] != "found" {
+                return Err("SDK header authority/coverage was mixed with runtime Code".into());
+            }
+            let response = request(input,output,next,"analysis/readFacts",json!({
+                "evaluation":evaluation,"queries":[{"op":"classBytes","classIdentity":value["id"]}]
+            }))?;
+            let unavailable = &response["facts"][0];
+            if unavailable["state"] != "unknown" || !unavailable["reasons"].as_array().is_some_and(|reasons|
+                reasons.iter().any(|reason|reason["code"]=="BYTECODE_UNAVAILABLE")) {
+                return Err("API header granted executable class bytes".into());
+            }
+            observations.push(json!({"internalName":name,"descriptor":descriptor,"bytecodeUnavailable":true}));
+            continue;
+        }
+        if value["runtimeOnly"] != true || value["sourceCurrent"]["state"] != "unknown"
+            || value["internalName"] != *name { return Err("runtime/source authority was mixed".into()); }
+        let identity = value["id"].clone();
+        let length = value["byteLength"].as_u64().ok_or("class byte length")? as usize;
+        if length > ktcore::classfile::MAX_CLASS_FILE_BYTES { return Err("class byte bound".into()); }
+        let mut bytes = Vec::with_capacity(length);
+        let mut after = Value::Null;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let mut query = json!({"op":"classBytes","classIdentity":identity});
+            if !after.is_null() { query["after"] = after; }
+            let page = request(input, output, next, "analysis/readFacts", json!({
+                "evaluation":evaluation,"queries":[query]
+            }))?;
+            let chunk = &page["facts"][0];
+            if chunk["state"] != "found" { return Err("selected runtime bytes unavailable".into()); }
+            let chunk = &chunk["value"];
+            if chunk["classIdentity"] != identity || chunk["offset"].as_u64() != Some(bytes.len() as u64)
+                || chunk["byteLength"].as_u64() != Some(length as u64) { return Err("class chunk identity/offset changed".into()); }
+            let decoded = base64::engine::general_purpose::STANDARD.decode(chunk["bytesBase64"].as_str().ok_or("class base64")?)
+                .map_err(|error|error.to_string())?;
+            if decoded.is_empty() || decoded.len() > length - bytes.len() { return Err("class chunk byte bound".into()); }
+            bytes.extend(decoded);
+            after = chunk["next"].clone();
+            if after.is_null() { break; }
+            if !seen.insert(after.as_str().ok_or("opaque class continuation")?.to_owned()) {
+                return Err("repeated class continuation".into());
+            }
+        }
+        if bytes.len() != length { return Err("class byte stream truncated".into()); }
+        let class = ktcore::classfile::decode("independent-child-decode", &bytes).map_err(|error|error.to_string())?;
+        let ktcore::jvm::InputIdentity::Binary { content_sha256 } = class.identity.input else {
+            return Err("decoded runtime class has no byte digest".into());
+        };
+        let digest = content_sha256.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+        if value["contentSha256"] != digest || class.identity.internal_name.as_str() != name.as_str().ok_or("internal name")? {
+            return Err("host runtime identity differs from independently decoded bytes".into());
+        }
+        observations.push(json!({"internalName":name,"descriptor":descriptor,"actualByteLength":bytes.len(),
+            "actualContentSha256":digest,"methods":class.methods.len(),"fields":class.fields.len(),
+            "hasCode":class.methods.iter().any(|method|method.attribute_names.iter().any(|name|name.as_ref()=="Code")),
+            "containsLocalVariableTableName":bytes.windows(b"LocalVariableTable".len()).any(|name|name==b"LocalVariableTable"),
+            "chunks":seen.len()+1}));
+    }
+    Ok(observations)
+}
+
+fn record_host_inputs(
+    input:&mut impl std::io::BufRead, output:&mut impl Write, next:&mut u64,
+    params:&Value, barrier:&Option<PathBuf>, include_sources:bool,
+) -> Result<Value,String> {
+    let evaluation=&params["evaluation"];
+    let directory=barrier.as_ref().ok_or("host inputs require configured evidence directory")?;
+    std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+    let sources=if include_sources {
+        let (inventory,snapshots)=read_source_snapshots(input,output,next,evaluation)?;
+        let sources=json!({"evaluation":evaluation,"owner":params["owner"],"inventory":inventory,"snapshots":snapshots});
+        std::fs::write(directory.join(format!("sources-{}.json",evaluation.as_str().ok_or("evaluation identity")?)),
+            serde_json::to_vec(&sources).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+        Some(sources)
+    } else {None};
+    let resources=read_owned_resources(input,output,next,evaluation)?;
+    let runtime=read_runtime_class_bytes(input,output,next,params)?;
+    for (prefix,value) in [("resources",resources.clone()),("runtime",json!(runtime))] {
+        std::fs::write(directory.join(format!("{prefix}-{}.json",evaluation.as_str().ok_or("evaluation identity")?)),
+            serde_json::to_vec(&value).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    }
+    // Full chunk payloads stay in configured evidence files; command envelopes remain bounded.
+    Ok(json!({"evaluation":evaluation,"sourceCount":sources.as_ref().and_then(|source|source["inventory"]["sources"].as_array()).map(Vec::len),
+        "resourceCount":resources["inventory"]["resources"].as_array().map(Vec::len),"runtimeClassCount":runtime.len()}))
+}
+
 fn analyze(
     input: &mut impl std::io::BufRead,
     output: &mut impl Write,
@@ -90,6 +246,7 @@ fn analyze(
     barrier: &Option<PathBuf>,
     project_facts: bool,
     source_snapshots: bool,
+    host_inputs: bool,
 ) -> Result<Value, String> {
     let evaluation = params["evaluation"].clone();
     let declarations = params["declarations"]
@@ -157,6 +314,7 @@ fn analyze(
                 "inventory":inventory,"snapshots":snapshots})).map_err(|error|error.to_string())?)
             .map_err(|error|error.to_string())?;
     }
+    if host_inputs { record_host_inputs(input,output,next,params,barrier,false)?; }
     if let Some(barrier) = barrier {
         if !barrier.join("released-once").exists() {
             std::fs::create_dir_all(barrier).map_err(|e| e.to_string())?;
@@ -207,6 +365,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut barrier = None;
     let mut project_facts = false;
     let mut source_snapshots = false;
+    let mut provider_commands = false;
+    let mut host_inputs = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--barrier" if barrier.is_none() => {
@@ -214,15 +374,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--project-facts" if !project_facts => project_facts = true,
             "--source-snapshots" if !source_snapshots => source_snapshots = true,
+            "--provider-commands" if !provider_commands => provider_commands = true,
+            "--host-inputs" if !host_inputs => host_inputs = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
+    if host_inputs { project_facts=true; source_snapshots=true; }
     if (project_facts || source_snapshots) && barrier.is_none() {
         return Err("project facts fixture needs its barrier".into());
     }
     let mut input = BufReader::new(std::io::stdin().lock());
     let mut output = std::io::stdout().lock();
     let mut next = 0;
+    let mut command_count = 0u64;
     if let Some(directory) = barrier.clone() {
         std::thread::spawn(move || loop {
             if directory.join("crash").exists() {
@@ -262,12 +426,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if result.get("supportedOps").is_none() { result["supportedOps"]=json!({}); }
                     result["supportedOps"]["source-snapshots-v1"]=json!(["sourceInventory","sourceSnapshot"]);
                 }
+                if host_inputs {
+                    let offered=&message["params"];
+                    for (capability,operations) in [("owned-resources-v1",&["resourceInventory","resourceLookup","resourceSnapshot"][..]),
+                        ("runtime-class-bytes-v1",&["runtimeClass","classBytes"][..])] {
+                        if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value==capability))
+                            || !operations.iter().all(|operation|offered["supportedOps"][capability].as_array()
+                                .is_some_and(|values|values.iter().any(|value|value==*operation))) {
+                            return Err("host did not offer owned resource/runtime class operations".into());
+                        }
+                        result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!(capability));
+                        if result.get("supportedOps").is_none() {result["supportedOps"]=json!({});}
+                        result["supportedOps"][capability]=json!(operations);
+                    }
+                }
+                if provider_commands {
+                    if !message["params"]["capabilities"].as_array().is_some_and(|caps|caps.iter().any(|cap|cap=="provider-commands-v1")) {
+                        return Err("host did not offer explicit provider commands".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("provider-commands-v1"));
+                    // The fourth entry deliberately proves that host configuration still bounds acknowledgement.
+                    result["commands"]=json!(["fixture.echo","fixture.pause","fixture.refresh","fixture.unapproved"]);
+                }
                 write_frame(
                     &mut output,
                     &json!({"jsonrpc":"2.0","id":message["id"],"result":result}),
                 )?;
             }
             Some("analysis/evaluate") => {
+                if provider_commands {
+                    write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":{"sites":[],"diagnostics":[]}}))?;
+                    continue;
+                }
                 let result = analyze(
                     &mut input,
                     &mut output,
@@ -276,6 +466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &barrier,
                     project_facts,
                     source_snapshots,
+                    host_inputs,
                 );
                 let response = match result {
                     Ok(value) => json!({"jsonrpc":"2.0","id":message["id"],"result":value}),
@@ -284,6 +475,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 write_frame(&mut output, &response)?;
+            }
+            Some("analysis/executeCommand") if provider_commands => {
+                command_count+=1;
+                let params=&message["params"];
+                let name=params["command"].as_str().ok_or("missing routed command")?;
+                if !matches!(name,"fixture.echo"|"fixture.pause"|"fixture.refresh") { return Err("unapproved command dispatched".into()); }
+                let lookup=params["arguments"][0]["lookup"].as_str().unwrap_or("fixture.Target");
+                let facts=request(&mut input,&mut output,&mut next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
+                    "queries":[{"op":"resolveType","name":lookup}]}))?;
+                if name=="fixture.pause" {
+                    let case=params["arguments"][0]["pauseCase"].as_str().ok_or("missing command pause case")?;
+                    if !matches!(case,"source"|"cancel"|"disable") { return Err("invalid fixture pause case".into()); }
+                    let directory=barrier.as_ref().ok_or("command fixture needs barrier")?;
+                    std::fs::create_dir_all(directory)?;
+                    std::fs::write(directory.join(format!("command-{case}-paused")),message["id"].as_str().ok_or("command identity")?)?;
+                    let cancellation=read_frame(&mut input)?.ok_or("host closed at command barrier")?;
+                    if cancellation["method"]!="$/cancelRequest" || cancellation["params"]["id"]!=message["id"] {return Err("expected routed command cancellation".into());}
+                    std::fs::write(directory.join(format!("command-{case}-cancelled")),b"1")?;
+                    while !directory.join(format!("command-{case}-release")).exists() {std::thread::sleep(std::time::Duration::from_millis(10));}
+                }
+                let mut result=json!({
+                    "protocolVersion":1,"serverVersion":"fixture-command-v1","capabilities":[name],
+                    "result":{"arguments":params["arguments"],"owner":params["owner"],"source":params["source"],
+                        "context":params["context"],"configuration":params["configuration"],"facts":facts["facts"],"commandCount":command_count}});
+                if host_inputs { result["result"]["hostInputs"]=record_host_inputs(&mut input,&mut output,&mut next,params,&barrier,true)?; }
+                if params["arguments"][0]["requestEdit"]==true {
+                    if params["context"]["documentVersion"].as_i64().is_none() {return Err("fixture action needs a host document version".into());}
+                    result["result"]["edit"]=json!({"documentChanges":[{"textDocument":{"uri":params["context"]["documentUri"],"version":params["context"]["documentVersion"]},
+                        "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"// provider action\n"}]}]});
+                }
+                write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":result}))?;
             }
             Some("exit") => break,
             Some("shutdown") => write_frame(

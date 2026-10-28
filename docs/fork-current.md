@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-10-26 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
+Updated 2026-10-28 (Asia/Tokyo). Goal active. General IDEA parity and language-wide
 correctness coverage are unmeasured; passing selected probes does not establish either.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
 by editing UX. Warm speed is accepted provisionally; cold startup is lower priority.
@@ -21,7 +21,16 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification: candidates56 through60
+## Current verification: selected evidence through62
+
+Retain qualified CEM38, Moshi9, OkHttp10, Retrofit12, Spring10 and Gradle9
+results; a newer binary alone does not require replaying all of them. The
+unnecessary CEM/Moshi/OkHttp/Retrofit and Spring repeats are canceled. Recheck
+affected behavior after a functional change, not the complete project corpus.
+The remaining editor proof is the Gradle unsaved dependency counter diagnostic;
+the resources/runtime-class consumer now has the actual result recorded below. Tests and
+benchmarks are assigned to GPT-6.1 Terra/high; implementation fixes are assigned
+to GPT-6.1 Sol/high. No further optimization is scheduled.
 
 Candidate56 passes the complete Rust workspace: **1845 passed, 0 failed,
 13 ignored**, followed by a successful release build. The immutable binary is
@@ -58,10 +67,17 @@ offline test starts without class outputs. No LSP generation command is used.
 The fix readmits current external facts after source/POM model enrichment;
 previously that model replacement cleared the freshly installed getter.
 
-Remaining current work is explicit: Moshi9, OkHttp10 and Retrofit12 selected
-checks pass on56; Spring and the Gradle counter are still in dependency indexing.
-The ordinary dirty-Java dependency header route passes focused checks but its
-original current-version Gradle counter is not yet proved.
+Moshi9, OkHttp10 and Retrofit12 selected checks pass on56. Spring10 already
+passed the selected corpus on32. Spring59's later four normal first responses
+match; completion takes
+26.655/34.534ms and definition3.623/21.705ms. Its controller remains RED because
+it incorrectly guards the current repository copy of an init script embedded at
+build time. The executed cached script still matches59's compiled input; runtime
+and project inputs are unchanged, with clean shutdown and EOF/live0/forced0.
+Preserve that controller result and the raw4/4 separately. That later run did
+not reach incomplete6; it does not reopen the previously qualified Spring10.
+The ordinary dirty-Java dependency header route passes focused
+checks, but the original current-version Gradle counter is still unproved.
 Candidate58 passes the complete workspace **1857 passed, 0 failed, 14 ignored**
 and both release builds. Its retained native K1 check separately verifies the
 new Kotlin-backed Java error and its current Workspace publication; actual raw
@@ -98,10 +114,15 @@ symbols, keeps oversized files indivisible, checks cancellation between files,
 and fairly releases the workspace lock between chunks. This removes repeated
 semantic publication after every archive file while preserving generation and
 source-error handling. The full workspace passes **1858/0/14** and the release
-build succeeds (`native-integrated120-59/main-ready.json`). Spring and the
-original Gradle counter are running against this immutable release; their final
-requests remain unmeasured. Repeated Spring class-output change notifications
-are under investigation, not a passing acceptance result.
+build succeeds (`native-integrated120-59/main-ready.json`). The original Gradle
+counter remains in progress. Spring59 finishes four normal checks as qualified
+above. Its release trace records114532 installed files in4260 flushes: index
+work10.538s versus repeated normalization/publication3425.206s. Total run time
+is4119.875s; these are initial indexing observations, not warm editing latency.
+Six source-encoding policies are unavailable and16 source artifacts are missing;
+binary fallback remains separate from source-navigation coverage. In particular,
+EclipseLink's1488 installed files are binary fallback, not a truncated1695-entry
+source archive. The next throughput comparison preserves that actual fallback.
 
 A same-input debug replay uses733 real Spring sources and four dependency
 sources. Before chunking, publication takes6.85–14.08s; one production chunk
@@ -113,8 +134,60 @@ case, the same production replay changes1.579/1.485/1.665s to
 1.411/1.446/1.442s (`normalize60-results.json`). Java and Kotlin generic/source
 changes and index flushes pass the focused regression. Existing normalization
 and invalidation still run. Temporary measurement code is removed. These are
-debug causal measurements, not release/editor latency distributions; candidate60
-has not yet passed a full release/editor sweep.
+debug causal measurements, not release/editor latency distributions. They do
+not impose another full release/editor sweep.
+
+Candidate60 fixes Windows/libuv access notifications causing model refreshes
+while class outputs are only being read. Exact bytes and complete directory
+membership are captured off the workspace lock for model-owned normal class
+outputs. Unknown, incomplete, symlinked or oversized inputs remain conservative.
+The real Neovim control observes20 native watch notifications: class and directory
+reads keep generation1 with zero refresh causes; a valid class rewrite preserving
+both size and modification time advances to generation2, and restoring the bytes
+advances to3. The two authored completion/navigation requests and17 additional
+checks pass, with restored outputs/profile and EOF/live0/forced0
+(`selected-output-read160b/adjudication.json`). This is a small actual model15
+project; it does not add broader Spring coverage.
+
+Generic provider commands now pass35/35 actual Neovim checks, including all15
+first-attempt command responses, opaque DTOs/Unicode, applied edits, source
+staleness, cancellation, disable/restart and one real host refresh
+(`command61-runtime2/adjudication-review155.json`). The first runtime exposed a
+shared semantic-evaluation ticket and semantic-set withdrawal during a read-only
+command. Independent read transactions fix both without weakening input checks;
+published facts also retain native input guards through Index/Snapshot clones.
+The intermediate cancellation probe incorrectly expected a callback that the
+installed Neovim suppresses for-32800; its RED result is preserved. The final
+probe verifies the first native wire acknowledgement and zero callbacks.
+
+The new host-input consumer passes **194/194 semantic and 10/10 operational
+checks** in real Neovim on immutable62. All17 request outcomes match on their
+first attempt. The14 MiB resource is returned completely in38 chunks in each
+of five captures; current JSON/AW/AT text and versions, nine-source inventories,
+and native resource addition, equal-size replacement and deletion all match.
+Runtime bytes independently match the selected JDK21 jmod, dependency JARs and
+compiled application by length and SHA-256. All three owned stages close with
+EOF/live0/forced0, stable guards and restored Gradle settings
+(`host-input62-run2/receipt.json`, `independent-verification.json`). The initial
+run ended at its15-second setup barrier; the passing run observes readiness for
+up to120 seconds. This is not a performance result. The SDK header-only editor
+branch was not exercised; focused native SDK checks remain separate evidence.
+The tested helper and manifest are now committed-source candidates under
+`dev/external-extension/`, with the existing harness route and fixture recipe in
+README; their content matches the actual run, apart from the portable helper path.
+
+The new integrated Rust run records **1890 native tests passed, 0 test failures,
+16 ignored**, but the overall command exits101 because both doctest targets
+fail dependency loading with E0463 (`workspace-host62-1`). A separate
+workspace-selected doctest phase subsequently succeeds for both targets
+(`workspace-doc-host62-1`). All357 guarded source files are unchanged between
+these runs. The original loading failure is retained and unexplained; do not
+describe the first whole-workspace command as passing. Passing native tests
+were not repeated, and doctests were not disabled.
+Resource and class-byte host/serializer controls pass12 focused checks and a
+real selected-SDK Code/negative lookup passes separately. Their actual child
+integration, raw-resource owners and lower-release SDK header facts remain open;
+the whole mc-dev contract has not been handed off as complete.
 
 ## Previous checkpoints: releases42 through54
 

@@ -348,14 +348,29 @@ struct Signal {
     invalid: Arc<AtomicBool>,
     closed: AtomicBool,
     wake: mpsc::Sender<()>,
+    callback: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Signal {
+    fn disarm(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.invalid.store(true, Ordering::Release);
+        // Callback only schedules existing work and cannot take Workspace inline.
+        // Taking this slot also waits for an already scheduled callback to return.
+        self.callback.lock().take();
+    }
+
     fn invalidate(&self) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        self.invalid.store(true, Ordering::Release);
+        let first = !self.invalid.swap(true, Ordering::AcqRel);
+        if first {
+            let callback = self.callback.lock();
+            if !self.closed.load(Ordering::Acquire) {
+                if let Some(callback) = &*callback { callback(); }
+            }
+        }
         // One monotone bit + one bounded wake, never an unbounded path/event queue.
         // Full means an invalidation is already queued for this same owner.
         let _ = self.wake.try_send(());
@@ -438,10 +453,20 @@ impl NativeInputWatch {
         plan: WatchPlan,
         wake: mpsc::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_callback(invalid, plan, wake, None)
+    }
+
+    pub(crate) fn new_with_callback(
+        invalid: Arc<AtomicBool>,
+        plan: WatchPlan,
+        wake: mpsc::Sender<()>,
+        callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> anyhow::Result<Arc<Self>> {
         let signal = Arc::new(Signal {
             invalid,
             closed: AtomicBool::new(false),
             wake,
+            callback: Mutex::new(callback),
         });
         let shared = Arc::new(RwLock::new(plan.clone()));
         let mut watcher = match Self::watcher(&signal, &shared) {
@@ -585,6 +610,43 @@ impl Drop for NativeInputWatch {
     }
 }
 
+/// One host input lease is shared by a scope's opaque handles and final read set.
+/// The callback only schedules existing extension work; it must not lock Workspace inline.
+pub(crate) struct HostInputLease {
+    invalid: Arc<AtomicBool>,
+    watch: Option<Arc<NativeInputWatch>>,
+}
+
+impl std::fmt::Debug for HostInputLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostInputLease").field("invalid", &self.invalid.load(Ordering::Acquire)).finish()
+    }
+}
+
+impl HostInputLease {
+    pub(crate) fn new(plan: WatchPlan, wake: Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<Arc<Self>> {
+        let invalid = Arc::new(AtomicBool::new(false));
+        let (sender, _receiver) = mpsc::channel(1);
+        let watch = NativeInputWatch::new_with_callback(invalid.clone(), plan, sender, Some(wake))?;
+        Ok(Arc::new(Self { invalid, watch: Some(watch) }))
+    }
+}
+
+impl Drop for HostInputLease {
+    fn drop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            // Like Worker::drop, final retirement may happen under Workspace access.
+            // Disarm synchronously; native notify destruction/join runs off that lock.
+            watch.signal.disarm();
+            std::thread::spawn(move || drop(watch));
+        }
+    }
+}
+
+impl ktcore::extensions::HostInputGuard for HostInputLease {
+    fn is_current(&self) -> bool { !self.invalid.load(Ordering::Acquire) }
+}
+
 /// Observed class-output receipts retain their existing owner and lifecycle.
 pub(crate) struct NativeCompileWatch {
     pub(crate) owner: Arc<ObservedCompileRequest>,
@@ -614,6 +676,25 @@ impl NativeCompileWatch {
 mod tests {
     use super::*;
     use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+
+    #[test]
+    fn host_input_callback_wakes_once_and_never_after_close() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let (wake, _receiver) = mpsc::channel(1);
+        let signal = Signal { invalid: Arc::new(AtomicBool::new(false)),
+            closed: AtomicBool::new(false), wake,
+            callback: Mutex::new(Some(Arc::new(move || { counted.fetch_add(1, Ordering::AcqRel); }))) };
+        signal.invalidate(); signal.invalidate();
+        assert!(signal.invalid.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        signal.disarm();
+        assert!(signal.callback.lock().is_none());
+        signal.invalidate();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
 
     #[test]
     fn read_coverage_never_promotes_parent_guards_outputs_or_file_slots_to_trees() {
@@ -707,6 +788,7 @@ mod tests {
             invalid: invalid.clone(),
             closed: AtomicBool::new(false),
             wake: tx,
+            callback: Mutex::new(None),
         };
         let plan = RwLock::new(plan());
         signal.event(
@@ -941,6 +1023,7 @@ mod tests {
             invalid: invalid.clone(),
             closed: AtomicBool::new(false),
             wake,
+            callback: Mutex::new(None),
         };
         signal.event(
             &RwLock::new(plan()),
@@ -953,6 +1036,7 @@ mod tests {
             invalid: invalid.clone(),
             closed: AtomicBool::new(false),
             wake,
+            callback: Mutex::new(None),
         };
         signal.event(
             &RwLock::new(plan()),
@@ -1395,6 +1479,7 @@ mod selected_kotlin_read_watch_tests {
             invalid: invalid.clone(),
             closed: AtomicBool::new(false),
             wake,
+            callback: Mutex::new(None),
         };
         let shared = RwLock::new(plan);
         for path in [runtime.clone(), runtime, plugin, sdk] {

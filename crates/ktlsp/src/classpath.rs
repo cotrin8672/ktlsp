@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 14;
+const MODEL_VERSION: u32 = 15;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,8 +341,39 @@ impl CompilerTask {
 
 }
 
+/// Explicit Gradle runtime inputs; absence in a legacy model is unknown authority.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeClassInputs {
+    pub adapter: String,
+    pub classpath: Vec<PathBuf>,
+    pub class_outputs: Vec<PathBuf>,
+    pub complete: bool,
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+impl RuntimeClassInputs {
+    pub(crate) fn usable(&self) -> bool {
+        self.adapter == "gradle-runtime-class-inputs-v1"
+            && self.complete && self.problem.is_none()
+            && self.classpath.len() <= 16_384 && self.class_outputs.len() <= 1024
+            && self.classpath.iter().chain(&self.class_outputs).all(|path|
+                path.is_absolute() && !path.components().any(|part|
+                    matches!(part, std::path::Component::ParentDir)))
+            && self.classpath.iter().map(|path|crate::paths::file_key(path))
+                .collect::<std::collections::BTreeSet<_>>().len() == self.classpath.len()
+            && self.class_outputs.iter().map(|path|crate::paths::file_key(path))
+                .collect::<std::collections::BTreeSet<_>>().len() == self.class_outputs.len()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSetClasspath {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::resource_model::ResourceClaims>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeClassInputs>,
     pub name: String,
     pub source_roots: Vec<PathBuf>,
     pub output_roots: Vec<PathBuf>,
@@ -454,8 +485,16 @@ pub(crate) struct ExtensionProjectContext<'a> {
 impl ProjectSnapshot {
     /// Borrow the accepted selection; extensions do not rediscover roots or choose an SDK.
     pub(crate) fn extension_project_context(&self, file: &Path) -> Option<ExtensionProjectContext<'_>> {
-        let (module, source) = self.owner_for(file)?;
-        let source = source?;
+        let Some((module, Some(source))) = self.owner_for(file)
+            .filter(|_| crate::language::SourceLanguage::for_project_path(file).is_some()) else {
+            let ktcore::knowledge::Knowledge::Found(owner) = self.resource_owner_context(file) else { return None; };
+            let source = self.source_set_for_scope(&owner.scope)?;
+            let module = self.modules.iter().find(|module|module.source_sets.iter().any(|candidate|
+                std::ptr::eq(candidate,source)))?;
+            return Some(ExtensionProjectContext {module:&module.module,scope:owner.scope.clone(),source,
+                sdk:self.sdk_api_for_scope(&owner.scope),
+                classpath_complete:!source.classpath_incomplete && source.unresolved.is_empty() && module.unresolved.is_empty()});
+        };
         Some(ExtensionProjectContext {
             module: &module.module,
             scope: project_scope(module, source),
@@ -773,6 +812,112 @@ impl ProjectSnapshot {
     /// Exact selected compiler inputs also need watch events, without assigning file ownership.
     pub(crate) fn has_selected_kotlin_source_key(&self, key: &str) -> bool {
         self.selected_kotlin_source_keys.contains(key)
+    }
+
+    pub(crate) fn source_set_for_scope(&self, scope: &ProjectScope) -> Option<&SourceSetClasspath> {
+        let mut found=None;
+        for module in &self.modules {
+            for source in &module.source_sets {
+                if &project_scope(module,source)!=scope { continue; }
+                if found.is_some() { return None; }
+                found=Some(source);
+            }
+        }
+        found
+    }
+
+    /// External editor documents require one modeled source owner, including current task inputs.
+    pub(crate) fn unique_source_origin(&self, file: &Path) -> Option<FileOrigin> {
+        let selected = self.file_origin(file)?;
+        let mut found = None;
+        for module in &self.modules {
+            for source in &module.source_sets {
+                if !source.source_roots.iter().any(|root|file.starts_with(root))
+                    && !source.compiler_tasks.iter().any(|task|task.source_files.iter().any(|input|path_key(input)==path_key(file))) { continue; }
+                let scope = project_scope(module, source);
+                if found.as_ref().is_some_and(|previous|previous!=&scope) { return None; }
+                found = Some(scope);
+            }
+        }
+        (found.as_ref()==selected.project_scope.as_ref()).then_some(selected)
+    }
+
+    /// Model-only ownership check. A resource URI is never an arbitrary filesystem grant.
+    pub(crate) fn resource_owner_context(&self, file: &Path) -> ktcore::extensions::Fact<crate::resource_model::OwnedResourceContext> {
+        use ktcore::knowledge::Knowledge;
+        let mut found = None;
+        for module in &self.modules {
+            for source in &module.source_sets {
+                let Some(claims) = source.resources.as_ref().filter(|claims| claims.valid()) else { continue; };
+                let mut matches = Vec::new();
+                for selected in &claims.files {
+                    if crate::paths::file_key(&selected.path)==crate::paths::file_key(file) {
+                        matches.push(("source",selected.relative_path.clone()));
+                    }
+                }
+                for tree in &claims.trees {
+                    let Ok(relative) = file.strip_prefix(&tree.root) else { continue; };
+                    let relative = crate::paths::file_key(relative);
+                    if claims.complete && claims.selects(tree, &relative) == Some(true) { matches.push(("source",relative)); }
+                }
+                for root in &claims.output_roots {
+                    if let Ok(relative) = file.strip_prefix(root) {
+                        let relative = crate::paths::file_key(relative);
+                        if crate::resource_model::safe_relative(&relative) { matches.push(("output",relative)); }
+                    }
+                }
+                for input in &claims.configuration_inputs {
+                    if crate::paths::file_key(input)==crate::paths::file_key(file) {
+                        if let Some(name)=file.file_name().and_then(|name|name.to_str()) { matches.push(("configuration",name.into())); }
+                    }
+                }
+                if matches.is_empty() { continue; }
+                matches.sort();matches.dedup();
+                if matches.len()!=1 { return Knowledge::Unknown(vec![ktcore::extensions::IncompleteReason::IncompleteScope]); }
+                let scope=project_scope(module,source);
+                let context=crate::resource_model::OwnedResourceContext {
+                    origin:FileOrigin { origin_id:project_origin_id(&scope),representation:SourceRepresentation::Source,project_scope:Some(scope.clone()) },
+                    scope,path:file.into(),relative_path:matches[0].1.clone(),association:matches[0].0,
+                };
+                if found.as_ref().is_some_and(|previous: &crate::resource_model::OwnedResourceContext| previous.scope!=context.scope) {
+                    return Knowledge::Unknown(vec![ktcore::extensions::IncompleteReason::IncompleteScope]);
+                }
+                found=Some(context);
+            }
+        }
+        found.map(Knowledge::Found).unwrap_or_else(||Knowledge::Unknown(vec![ktcore::extensions::IncompleteReason::MissingFacts]))
+    }
+
+    /// A raw resource has no Java/Kotlin filename suffix from which to select an SDK.
+    /// Require every configured language in its unique scope to agree exactly.
+    pub(crate) fn sdk_api_for_scope(&self, scope: &ProjectScope) -> Option<&SdkApiSelection> {
+        let source = self.source_set_for_scope(scope)?;
+        let selected = self.sdk_selections.get(scope)?;
+        let mut common = None;
+        for (language, suffix) in [(CompilerLanguage::Java, "java"), (CompilerLanguage::Kotlin, "kt")] {
+            if !source.compiler_tasks.iter().any(|task| task.language == language) { continue; }
+            let sdk = selected.get(suffix)?;
+            if common.is_some_and(|known| known != sdk) { return None; }
+            common = Some(sdk);
+        }
+        common
+    }
+
+
+    /// The ordinary model cache already records present and negative configuration
+    /// stamps. Reuse them off-lock before arming resource facts from that selection.
+    pub(crate) fn resource_configuration_current(&self,inputs:&[PathBuf])->bool {
+        if inputs.is_empty() || self.mtimes.is_empty() {return false;}
+        inputs.iter().all(|path| {
+            let Some(recorded)=self.mtimes.get(&path_key(path)) else {return false;};
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()=>metadata.modified().ok()
+                    .and_then(|time|time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .is_some_and(|time|time.as_nanos()==*recorded),
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>*recorded==0,
+                _=>false,
+            }
+        })
     }
 
     pub fn file_origin(&self, file: &Path) -> Option<FileOrigin> {
@@ -2083,6 +2228,8 @@ fn parse_dump_reader(
     let mut out = Vec::new();
     let mut current: Option<ModuleClasspath> = None;
     let mut kotlin_compile_task_sources = std::collections::BTreeSet::new();
+    let mut resource_input_sources = std::collections::BTreeSet::new();
+    let mut runtime_input_sources = std::collections::BTreeSet::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -2099,6 +2246,8 @@ fn parse_dump_reader(
                     Some(
                         "BUILD"
                             | "SOURCESET"
+                            | "RUNTIME_INPUTS"
+                            | "RESOURCE_INPUTS"
                             | "SOURCE"
                             | "OUTPUT"
                             | "PROVIDES"
@@ -2121,6 +2270,8 @@ fn parse_dump_reader(
         match record {
             Some("PROJECT") => {
                 kotlin_compile_task_sources.clear();
+                resource_input_sources.clear();
+                runtime_input_sources.clear();
                 anyhow::ensure!(
                     !require_complete || current.is_none(),
                     "nested PROJECT before matching END in classpath dump"
@@ -2152,7 +2303,9 @@ fn parse_dump_reader(
                 }
             }
             Some(
-                record @ ("SOURCESET"
+                record @ ("RUNTIME_INPUTS"
+                | "RESOURCE_INPUTS"
+                | "SOURCESET"
                 | "SOURCE"
                 | "OUTPUT"
                 | "PROVIDES"
@@ -2196,6 +2349,22 @@ fn parse_dump_reader(
                             *artifacts = Some(Vec::new());
                             *incomplete = parts.next() != Some("complete");
                         }
+                        continue;
+                    }
+                    if record == "RESOURCE_INPUTS" {
+                        let parsed = parts.next().and_then(|json|
+                            serde_json::from_str::<crate::resource_model::ResourceClaims>(json).ok());
+                        source.resources = if resource_input_sources.insert(name.to_owned()) && parts.next().is_none() {
+                            parsed.filter(crate::resource_model::ResourceClaims::valid)
+                        } else { None };
+                        continue;
+                    }
+                    if record == "RUNTIME_INPUTS" {
+                        let runtime = parts.next().and_then(|json|
+                            serde_json::from_str::<RuntimeClassInputs>(json).ok());
+                        source.runtime = if runtime_input_sources.insert(name.to_owned()) && parts.next().is_none() {
+                            runtime
+                        } else { None };
                         continue;
                     }
                     if record == "KOTLIN_COMPILE_TASK" {
@@ -3229,6 +3398,85 @@ fn coordinate_from_gradle_cache_path(path: &Path) -> Option<Coordinate> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn resource_scope_sdk_requires_all_configured_languages_to_agree() {
+        let root = std::env::temp_dir().join("ktlsp_resource_sdk_scope_only");
+        let java = CompilerTask { task:":compileJava".into(), language:CompilerLanguage::Java,
+            task_type:"JavaCompile".into(), arguments:Vec::new(), annotation_processor_path:Vec::new(),
+            source_files:Vec::new(), classpath:Vec::new(), declared_input_files:Vec::new(),
+            declared_output_roots:Vec::new(), java_home:None, kotlin_compiler:None,
+            options:BTreeMap::new(), output_roots:Vec::new(), complete:true, problem:None };
+        let mut kotlin = java.clone(); kotlin.task=":compileKotlin".into(); kotlin.language=CompilerLanguage::Kotlin;
+        let source = SourceSetClasspath { name:"main".into(), compiler_tasks:vec![java,kotlin], ..Default::default() };
+        let module = ModuleClasspath {module:":app".into(), project_dir:root.clone(), build:String::new(),
+            source_sets:vec![source], entries:Vec::new(), unresolved:Vec::new()};
+        let scope = project_scope(&module,&module.source_sets[0]);
+        let mut model = ProjectSnapshot::new(vec![module]);
+        model.sdk_selections.clear();
+        assert!(model.sdk_api_for_scope(&scope).is_none());
+        let sdk = SdkApiSelection {home:root.clone(), source_zip:Some(root.join("lib/src.zip")), release:None,
+            archive:root.join("lib/src.zip"), archive_sha256:"fixture-model-only".into(),
+            archive_revision:"fixture-model-only".into(), entries:std::sync::Arc::new(BTreeMap::new())};
+        model.sdk_selections.insert(scope.clone(), BTreeMap::from([("java".into(),sdk.clone())]));
+        assert!(model.sdk_api_for_scope(&scope).is_none(), "unknown Kotlin selection cannot borrow Java's SDK");
+        model.sdk_selections.get_mut(&scope).unwrap().insert("kt".into(),sdk.clone());
+        assert_eq!(model.sdk_api_for_scope(&scope),Some(&sdk));
+        model.sdk_selections.get_mut(&scope).unwrap().get_mut("kt").unwrap().release=Some(11);
+        assert!(model.sdk_api_for_scope(&scope).is_none(), "different targets cannot silently choose one SDK");
+    }
+
+
+    #[test]
+    fn resource_runtime_metadata_preserves_selected_owners_and_unknown_authority() {
+        use crate::resource_model::{ResourceClaims, ResourceFile, ResourcePatterns, ResourceTree};
+        use ktcore::knowledge::Knowledge;
+        let root = std::env::current_dir().unwrap().join("resource-model-no-io-fixture");
+        let resources = root.join("src/main/resources");
+        let selected = resources.join("META-INF/😀.json");
+        let mut claims = ResourceClaims {
+            adapter: "gradle-source-set-resources-v1".into(), roots: vec![resources.clone()],
+            trees: vec![ResourceTree {root:resources.clone(), patterns:vec![ResourcePatterns {
+                includes:vec!["META-INF/**".into()], excludes:vec!["**/excluded.json".into()]
+            }],future_complete:true}],
+            files:vec![ResourceFile {path:selected.clone(),relative_path:"META-INF/😀.json".into()}],
+            output_roots:vec![root.join("build/resources/main")], configuration_inputs:vec![root.join("gradle.properties")],
+            default_excludes:vec!["**/.git/**".into()], complete:true, problem:None,
+        };
+        let runtime=RuntimeClassInputs {adapter:"gradle-runtime-class-inputs-v1".into(),
+            classpath:vec![root.join("build/classes/java/main"),root.join("dep.jar")],
+            class_outputs:vec![root.join("build/classes/java/main")],complete:true,problem:None};
+        let dump=|claims:&ResourceClaims,tail:&str|format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nRESOURCE_INPUTS\tmain\t{}\nRUNTIME_INPUTS\tmain\t{}\n{tail}END\t:app\n",
+            root.display(),serde_json::to_string(claims).unwrap(),serde_json::to_string(&runtime).unwrap());
+        let model=ProjectSnapshot::new(parse_dump_reader(dump(&claims,"").as_bytes(),true).unwrap());
+        let source=&model.modules[0].source_sets[0];
+        assert_eq!(source.resources.as_ref(),Some(&claims));
+        assert_eq!(source.runtime.as_ref().unwrap().classpath,runtime.classpath);
+        assert!(source.runtime.as_ref().unwrap().usable());
+        assert!(!source.compiler_metadata_incomplete);
+        let Knowledge::Found(owner)=model.resource_owner_context(&selected) else {panic!("selected resource")};
+        assert_eq!(owner.scope.source_set,"main"); assert_eq!(owner.association,"source");
+        assert_eq!(owner.relative_path,"META-INF/😀.json");
+        assert!(matches!(model.resource_owner_context(&resources.join("META-INF/new.aw")),Knowledge::Found(_)));
+        for denied in [resources.join("other.json"), resources.join("META-INF/excluded.json"), root.join("unselected.json")] {
+            assert!(matches!(model.resource_owner_context(&denied),Knowledge::Unknown(_)));
+        }
+        // A custom future predicate never erases an actual selected file, and never
+        // authorizes a new buffer merely because its path is under a resource root.
+        claims.complete=false;claims.problem=Some("opaque-filter".into());claims.trees[0].future_complete=false;
+        let model=ProjectSnapshot::new(parse_dump_reader(dump(&claims,"").as_bytes(),true).unwrap());
+        assert!(matches!(model.resource_owner_context(&selected),Knowledge::Found(_)));
+        assert!(matches!(model.resource_owner_context(&resources.join("META-INF/new.aw")),Knowledge::Unknown(_)));
+        let duplicate=format!("RESOURCE_INPUTS\tmain\t{}\nRUNTIME_INPUTS\tmain\t{}\n",
+            serde_json::to_string(&claims).unwrap(),serde_json::to_string(&runtime).unwrap());
+        let invalid=parse_dump_reader(dump(&claims,&duplicate).as_bytes(),true).unwrap();
+        assert!(invalid[0].source_sets[0].resources.is_none()); assert!(invalid[0].source_sets[0].runtime.is_none());
+        assert!(!invalid[0].source_sets[0].compiler_metadata_incomplete);
+        let legacy=ProjectSnapshot::new(parse_dump_reader(format!("PROJECT\t:app\t{}\nSOURCESET\tmain\nEND\t:app\n",root.display()).as_bytes(),true).unwrap());
+        assert!(legacy.modules[0].source_sets[0].resources.is_none());assert!(legacy.modules[0].source_sets[0].runtime.is_none());
+        assert!(matches!(legacy.resource_owner_context(&selected),Knowledge::Unknown(_)));
+    }
+
     fn selected_kotlin_recipe() -> serde_json::Value {
         serde_json::json!({
             "default_classpath": ["/compiler/z-runtime.jar", "/compiler/a-runtime.jar"],

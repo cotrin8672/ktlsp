@@ -247,11 +247,26 @@ impl AnalysisExtensions {
         self.inputs.get(key).map(|input| input.text.clone())
     }
 
+    /// Native callbacks only wake the existing scheduler; publication and requeue
+    /// happen under the ordinary host lock with atomic liveness checks only.
+    pub(crate) fn refresh_host_inputs(&mut self)->bool {
+        let changed=self.store.refresh_host_inputs();
+        let any=!changed.is_empty();
+        for(provider,owner) in changed {
+            self.changed.insert(owner.clone());
+            if let Some(slot)=self.ipc_providers.get_mut(&provider).filter(|slot|slot.enabled) {
+                slot.queued.insert(owner);
+            }
+        }
+        self.requeue_stale_ipc();any
+    }
+
     pub fn revision(&self) -> u64 {
         self.store.publication_revision()
     }
 
     pub fn publish(&mut self, index: &mut Index) -> bool {
+        self.refresh_host_inputs();
         if self.published_revision == self.revision() {
             return false;
         }
@@ -287,7 +302,7 @@ impl AnalysisExtensions {
             return Ok(());
         };
         let facts = crate::language::extension_source_facts(index, key, &input.tree, &input.text);
-        let coverage = Knowledge::Unknown(vec![IncompleteReason::IncompleteTarget]);
+        let coverage = Knowledge::Unknown(vec![if crate::language::SourceLanguage::for_project_path(std::path::Path::new(key)).is_some() { IncompleteReason::IncompleteTarget } else { IncompleteReason::UnsupportedSource }]);
         let prepared = input.prepared_references.clone().unwrap_or_else(|| {
             ktcore::extensions::source::prepare_source_references(
                 index,

@@ -381,3 +381,156 @@ first Shadow spike passes. None of the rows below expands that spike.
 This slice has focused Rust and real-editor evidence, not a new broad workspace/release
 acceptance result. The next coherent integrated verification is tracked separately from
 this captured build-2 prototype.
+
+## Explicit provider commands
+
+The server advertises one standard `workspace/executeCommand` command,
+`ktlsp.providerCommand`. Provider domain command IDs are not added to the LSP
+capability list. Configuring a transport route does not claim that Minecraft or
+any other domain feature has its required facts.
+
+An IPC provider opts in using an explicit configuration allowlist:
+
+```json
+{"analysisProviders":{"example.provider":{
+  "command":["/path/to/companion"],
+  "enabled":true,
+  "executeCommands":["example.complete","example.reindex"],
+  "configuration":{}
+}}}
+```
+
+The ordinary child initialization offers `provider-commands-v1` and the
+configured `commands` list. An opting-in child returns that capability and its
+own `commands` list. Only the intersection is dispatchable. Legacy providers
+remain usable without this capability. Initialization of the LSP connection
+does not start a child or wait for provider I/O.
+
+The editor sends exactly one outer argument:
+
+```json
+{"command":"ktlsp.providerCommand","arguments":[{
+  "provider":"example.provider",
+  "command":"example.complete",
+  "context":{
+    "workspaceRoot":"/workspace",
+    "documentUri":"file:///workspace/Owner.kt",
+    "bufferText":"class Owner",
+    "documentVersion":7
+  },
+  "arguments":[{"domainPayload":"unchanged"}],
+  "refreshProject":false
+}]}
+```
+
+`documentVersion` is optional; an unknown host version is never filled with zero.
+The workspace and document are selection hints, not filesystem grants. The host
+requires the selected workspace, an owned document, matching current text and
+any supplied version. The same check is repeated through the command's final
+read transaction. Non-file URIs and parent-directory escapes are rejected.
+
+The child receives `analysis/executeCommand`, with an evaluation-scoped token,
+the existing `owner`, `source`, `configuration` and declaration handles, the
+domain `command` and original `arguments`, and validated host `context`.
+The latter contains the document URI, source SHA-256 and available document
+version/language/revision. These are host observations, not an LSP version
+inferred from a file timestamp. The domain argument array is forwarded without
+decoding, lowercasing, or dropping legacy payload fields.
+
+The child may use the negotiated `analysis/readFacts` and `analysis/require`
+operations. It cannot publish semantic contributions or issue arbitrary LSP
+requests during a command. Its JSON-RPC `result` is returned unchanged, including
+any domain result-or-error envelope. The editor's domain adapter remains
+responsible for interpreting and applying domain edits with their preconditions.
+The host does not synthesize domain `supportedCommands`, project completeness,
+Minecraft DTOs, or successful empty results.
+
+Only an enabled provider's current instance can execute. Disable, restart,
+configuration changes and source/model/SDK changes invalidate obsolete reads;
+resource and binary reads also retain their issued host input guards. Positive
+and negative read sets are validated before exposing a result. No workspace or
+read-session borrow is held across child I/O. Cancellation stays cancellation;
+a cancelled caller leaves an owned worker to drain or close its existing child,
+and its result cannot be published later.
+
+`refreshProject:true` is an explicit host preparation step. The provider command
+must first be configured and acknowledged, and its root/document context must
+still match. The existing project controller is requested once. After a current
+accepted refresh, the host opens a fresh evaluation and dispatches the child
+command once. Failed model acquisition returns typed unavailability. Cancelling
+the wait does not dispatch the command. A refresh is never requested from an old
+read transaction, and child command results are never automatically replayed.
+Domain adapters can use this outer flag for their reindex/reload operations;
+their domain cache policy remains in the companion.
+
+The bounds are 64 configured/acknowledged command IDs, 128 ASCII identifier bytes
+per ID, 128 KiB for the outer argument JSON, 256 opaque arguments, eight pending
+commands per provider instance, and 512 KiB for the returned result. Existing
+1 MiB frames, fact-query limits and evaluation-scoped handle limits still apply.
+Host errors use JSON-RPC invalid params (`-32602`), stale content (`-32801`),
+cancellation (`-32800`) or unavailable provider/context (`-32002`). Domain typed
+errors remain inside the companion's unchanged result envelope.
+
+The existing external-child corpus probe has a `provider-commands` mode. It uses
+the same independent child executable with `--provider-commands`, then checks
+the complete returned envelope, an applied versioned edit, current unsaved
+text, allowlist intersection, source staleness, explicit cancellation, disable/
+restart and one real host refresh. Ordinary completion is requested while the
+command child is paused. These are generic transport checks; the eleven MC
+domain commands require their own companion integration proof.
+
+### Owned resources (`owned-resources-v1`)
+
+The optional capability negotiates `resourceInventory`, `resourceLookup`, and
+`resourceSnapshot`. These operations use the evaluation's host-selected source set.
+They never interpret Minecraft metadata, process resources, execute Gradle tasks,
+or grant child filesystem access.
+
+The host captures actual Gradle resource membership and resource output directories,
+ordered compile/runtime classpaths, and selected build configuration inputs. Missing
+legacy metadata, unsupported future filters, unreadable inputs, and stale configuration
+produce typed unknown coverage. An actual selected resource can remain available even
+when future membership is unknown. Runtime resources do not establish source or compiler
+parity; executable class bytes use the separate runtime-class capability.
+
+`resourceInventory {after?}` returns `{resources, next, coverage}`. Follow every opaque
+`next` cursor; coverage is found only on the last page of a complete current catalog.
+Each descriptor contains an opaque `id`, a host-captured `relativePath`, `association`
+(`source`, `output`, `compileClasspath`, `runtimeClasspath`, or `configuration`),
+`classpathOrder`, `editable`, optional `documentVersion`, typed `documentUri`, and
+`identity: {kind: "resource", revision}`. The revision is an opaque host capture
+revision, not an LSP document version. Archive entries need no file URI.
+
+One opaque catalog authority validates its entry selectors; inventory size does not
+consume one handle per filename. A selector cannot address another evaluation, scope,
+catalog, class identity, or filesystem path. Snapshot cursors remain typed and bounded.
+
+`resourceLookup {relativePath, association?}` performs an exact relative-name lookup in
+that catalog, without requiring an inventory of every unrelated asset first. Absolute
+paths, traversal, and drive-qualified names are rejected. Found results retain every
+matching descriptor and ordered classpath association. A definitely-absent result is
+possible only with complete current coverage; otherwise absence is unknown.
+
+`resourceSnapshot {resource, after?}` reads an entry scoped by the issued catalog and returns a
+typed fact. Its found value contains `identity` (including the full-content `sha256`),
+`documentVersion`, full `size`, chunk `offset`, standard `base64`, `utf8`, typed `text`,
+and optional opaque `next`. Reassemble chunks in order and verify the full SHA-256.
+Small UTF-8 bodies also have found text; empty UTF-8 content is found `""`. Binary
+content has definitely-absent UTF-8 text; larger UTF-8 bodies remain available as byte
+chunks even when the convenience text field is unknown. No JSON/AW/AT parsing occurs
+in the host. Open documents use their exact current buffer bytes, including its actual
+newline convention; the host does not synthesize a final newline.
+
+Resource input reads and archive payload CRC checks run outside the workspace lock.
+Current scope captures and bounded body caches are reused. The pending and published
+read sets retain input guards: buffer edits, addition/deletion/replacement, negative
+lookup changes, configuration changes, model changes, and provider lifecycle changes
+invalidate the relevant authority. Known-invalid guards also withdraw semantic facts
+from copied index views immediately; scheduled host publication removes and requeues
+the affected owner. No successful empty result substitutes for missing authority.
+
+The usual frame, aggregate serialized response, metadata batch, handle, and cache
+limits apply. Oversized response batches return the existing recoverable split-query
+error. The raw payload cache is bounded to 64 MiB per current resource scope; unsupported
+sizes are typed unknown rather than partially certified content. The fixed
+`owned-resources-v1.frames` fixture is compared byte-for-byte with the actual serializer.

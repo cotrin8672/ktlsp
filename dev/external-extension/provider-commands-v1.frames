@@ -1,0 +1,3 @@
+Content-Length: 368
+
+{"id":"7","jsonrpc":"2.0","method":"analysis/executeCommand","params":{"arguments":[{"CallbackName":"KeepCase","text":"😀"}],"command":"example.complete","configuration":{},"context":{"documentUri":"file:///workspace/Owner.kt","documentVersion":3,"workspaceRoot":"/workspace"},"declarations":[],"evaluation":"7","owner":"/workspace/Owner.kt","source":"class Owner"}}

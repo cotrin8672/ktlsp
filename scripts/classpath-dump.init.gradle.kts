@@ -25,6 +25,137 @@ import org.gradle.api.tasks.SourceSet
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.compile.JavaCompile
 
+// Captures selections only. No resource processing or producer task is executed.
+object KtlspResourceInputs {
+    private fun read(value: Any, name: String): Any? = value.javaClass.methods
+        .firstOrNull { it.name == name && it.parameterCount == 0 }?.invoke(value)
+
+    private fun builtinJavaExclusion(spec: Any, javaSource: SourceDirectorySet): Boolean = runCatching {
+        // Verified DefaultSourceSet constructor predicate; a project-supplied closure is not equivalent.
+        check(spec.javaClass.isSynthetic)
+        val method=spec.javaClass.getDeclaredMethod("writeReplace").apply { isAccessible=true }
+        val lambda=method.invoke(spec) as java.lang.invoke.SerializedLambda
+        lambda.implClass=="org/gradle/api/internal/tasks/DefaultSourceSet" &&
+            lambda.implMethodName=="lambda\$new\$e8f07a1\$1" &&
+            lambda.implMethodSignature=="(Lorg/gradle/api/file/FileCollection;Lorg/gradle/api/file/FileTreeElement;)Z" &&
+            lambda.implMethodKind==6 && lambda.capturedArgCount==1 && lambda.getCapturedArg(0)===javaSource
+    }.getOrDefault(false)
+
+    private fun patterns(value: Any, javaSource: SourceDirectorySet, root: java.io.File, depth: Int = 0): List<Map<String, Any?>> {
+        check(depth < 32)
+        val kind = value.javaClass.name
+        check(kind in setOf("org.gradle.api.tasks.util.PatternSet", "org.gradle.api.tasks.util.internal.IntersectionPatternSet"))
+        check(read(value, "isCaseSensitive") == true)
+        check((read(value, "getIncludeSpecs") as? Collection<*>)?.isEmpty() == true)
+        val excludes=read(value,"getExcludeSpecs") as? Collection<*> ?: error("missing resource exclusions")
+        for(exclusion in excludes) {
+            check(exclusion!=null && builtinJavaExclusion(exclusion,javaSource))
+            // No Java source can be inside this resource tree; overlapping/opaque cases
+            // retain the exact selected files but do not claim future complete membership.
+            check(javaSource.srcDirs.none { directory ->
+                val path=directory.absoluteFile.normalize().toPath()
+                root.toPath().startsWith(path) || path.startsWith(root.toPath())
+            })
+        }
+        fun strings(name: String): List<String> = (read(value, name) as Collection<*>).map { it as String }
+            .onEach { check(it.length <= 4096 && '\\' !in it && !it.any { character -> java.lang.Character.isISOControl(character) }) }
+        val own = mapOf("includes" to strings("getIncludes"), "excludes" to strings("getExcludes"))
+        return listOf(own) + if (kind.endsWith("IntersectionPatternSet")) patterns(checkNotNull(read(value,"getOther")),javaSource,root,depth+1) else emptyList()
+    }
+
+    fun capture(project: Project, sourceSet: SourceSet): Map<String, Any?> = runCatching {
+        captureSelected(project,sourceSet)
+    }.getOrElse { failure -> linkedMapOf("adapter" to "gradle-source-set-resources-v1",
+        "roots" to emptyList<String>(),"trees" to emptyList<Any>(),"files" to emptyList<Any>(),
+        "output_roots" to emptyList<String>(),"configuration_inputs" to emptyList<String>(),
+        "default_excludes" to emptyList<String>(),"complete" to false,"problem" to failure.javaClass.name) }
+
+    private fun captureSelected(project: Project, sourceSet: SourceSet): Map<String, Any?> {
+        val resources = sourceSet.resources
+        val roots = resources.srcDirs.map { it.absoluteFile.normalize() }
+        val trees = mutableListOf<Map<String, Any?>>()
+        val files = mutableListOf<Map<String, Any?>>()
+        var defaults = emptyList<String>()
+        var complete = true
+        var problem: String? = null
+        try {
+            val loader = Task::class.java.classLoader
+            val ant = Class.forName("org.apache.tools.ant.DirectoryScanner",false,loader)
+            val initial = ant.getDeclaredField("DEFAULTEXCLUDES").apply { isAccessible=true }.get(null) as Array<*>
+            val current = ant.getMethod("getDefaultExcludes").invoke(null) as Array<*>
+            check(initial.toSet()==current.toSet())
+            defaults=current.map { it as String }.sorted()
+            val visitorType=Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor",false,loader)
+            val treeType=Class.forName("org.gradle.api.internal.file.FileCollectionInternal",false,loader)
+            val visitType=Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType",false,loader)
+            val visit=visitType.enumConstants.firstOrNull { (it as Enum<*>).name=="Visit" }
+                ?: visitType.enumConstants.single { (it as Enum<*>).name=="Spec" }
+            val visitor=java.lang.reflect.Proxy.newProxyInstance(visitorType.classLoader,arrayOf(visitorType)) { _, method, args ->
+                when(method.name) {
+                    "startVisit" -> true
+                    "prepareForVisit" -> visit
+                    "visitFileTree" -> {
+                        check(method.parameterCount==3)
+                        val root=checkNotNull(args?.get(0) as? java.io.File).absoluteFile.normalize()
+                        check(root in roots)
+                        val selection=runCatching { patterns(checkNotNull(args?.get(1)),sourceSet.java,root) }
+                        trees.add(mapOf("root" to root.absolutePath,"patterns" to selection.getOrDefault(emptyList()),
+                            "future_complete" to selection.isSuccess))
+                        if(selection.isFailure) complete=false
+                        null
+                    }
+                    "visitCollection","visitGenericFileTree","visitFileTreeBackedByFile" -> { complete=false; null }
+                    "toString" -> "ktlsp selected resource trees"
+                    "hashCode" -> 0
+                    "equals" -> false
+                    else -> error("Unsupported resource structure visitor method: ${method.name}")
+                }
+            }
+            check(treeType.isInstance(resources.asFileTree))
+            treeType.getMethod("visitStructure",visitorType).invoke(resources.asFileTree,visitor)
+            // A missing root still needs a witnessed stock pattern selection for negative reads.
+            if(roots.any { root -> trees.none { it["root"]==root.absolutePath } }) complete=false
+        } catch(failure: Exception) { complete=false; problem=failure.javaClass.name }
+        // Current selection remains usable even if a custom future-membership predicate
+        // cannot be represented. Never turn an unknown future tree into empty authority.
+        try {
+            resources.visit {
+                if(!isDirectory) files.add(mapOf("path" to file.absoluteFile.normalize().absolutePath,
+                    "relative_path" to relativePath.pathString.replace('\\','/')))
+            }
+        } catch(failure: Exception) { complete=false; problem=failure.javaClass.name }
+        val outputs=linkedSetOf<java.io.File>()
+        sourceSet.output.resourcesDir?.let { outputs.add(it.absoluteFile.normalize()) }
+        val process=project.tasks.findByName(sourceSet.processResourcesTaskName)
+        if(process is org.gradle.language.jvm.tasks.ProcessResources) outputs.add(process.destinationDir.absoluteFile.normalize())
+        else { complete=false; problem="resource-output-task-unavailable" }
+        val configuration=linkedSetOf<java.io.File>()
+        configuration.add(project.buildFile.absoluteFile.normalize())
+        configuration.add(project.rootProject.buildFile.absoluteFile.normalize())
+        for(directory in listOf(project.projectDir,project.rootProject.projectDir)) {
+            for(name in listOf("settings.gradle","settings.gradle.kts","build.gradle","build.gradle.kts","gradle.properties","gradle/libs.versions.toml")) {
+                configuration.add(java.io.File(directory,name).absoluteFile.normalize())
+            }
+        }
+        return linkedMapOf("adapter" to "gradle-source-set-resources-v1",
+            "roots" to roots.map { it.absolutePath },"trees" to trees,"files" to files,
+            "output_roots" to outputs.map { it.absolutePath },"configuration_inputs" to configuration.map { it.absolutePath },
+            "default_excludes" to defaults,"complete" to complete,"problem" to problem)
+    }
+}
+
+object KtlspRuntimeInputs {
+    fun capture(sourceSet: SourceSet): Map<String, Any?> {
+        val runtimeClasspath = runCatching { sourceSet.runtimeClasspath.files.map { it.absolutePath } }
+        val classOutputs = runCatching { sourceSet.output.classesDirs.files.map { it.absolutePath } }
+        return linkedMapOf("adapter" to "gradle-runtime-class-inputs-v1",
+            "classpath" to runtimeClasspath.getOrDefault(emptyList()),
+            "classOutputs" to classOutputs.getOrDefault(emptyList()),
+            "complete" to (runtimeClasspath.isSuccess && classOutputs.isSuccess),
+            "problem" to (runtimeClasspath.exceptionOrNull() ?: classOutputs.exceptionOrNull())?.javaClass?.name)
+    }
+}
+
 class KtlspSourceSet(
     val name: String,
     val metadata: Provider<List<String>>,
@@ -1303,6 +1434,8 @@ allprojects {
                         }
                     val actualClasspath = runCatching { sourceSet.compileClasspath.files }
                     val entries = actualClasspath.getOrElse { view.files.files }
+                    listOf("RESOURCE_INPUTS\t${sourceSetName}\t${JsonOutput.toJson(KtlspResourceInputs.capture(project, sourceSet))}") +
+                    listOf("RUNTIME_INPUTS\t${sourceSetName}\t${JsonOutput.toJson(KtlspRuntimeInputs.capture(sourceSet))}") +
                     roots.map { "SOURCE\t${sourceSetName}\t${it.absolutePath}" } +
                         outputs.map { "OUTPUT\t${sourceSetName}\t${it.absolutePath}" } +
                         provided.map { "PROVIDES\t${sourceSetName}\t${it.absolutePath}" } +

@@ -453,8 +453,21 @@ pub enum RenameTarget {
     Declaration(DeclarationId),
 }
 
+#[derive(Clone, Debug, Default)]
+struct PublishedHostInputs(Vec<Arc<dyn HostInputGuard>>);
+impl PartialEq for PublishedHostInputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(|(a,b)|Arc::ptr_eq(a,b))
+    }
+}
+impl Eq for PublishedHostInputs {}
+impl PublishedHostInputs {
+    fn current(&self) -> bool { self.0.iter().all(|guard|guard.is_current()) }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContributionSet {
+    host_inputs: PublishedHostInputs,
     requirements: Vec<ResolvedRequirement>,
     sites: Vec<BoundSite>,
     diagnostics: Vec<Diagnostic>,
@@ -468,6 +481,7 @@ impl ContributionSet {
         &self,
         owner: &Def,
     ) -> Option<&crate::classfile::ClassFileFacts> {
+        if !self.host_inputs.current() { return None; }
         self.compiled_value_namespaces
             .iter()
             .find(|namespace| namespace.owner.definition() == owner)
@@ -484,7 +498,7 @@ impl ContributionSet {
             bool,
         ),
     > {
-        self.compiled_fields.iter().map(|field| {
+        self.compiled_fields.iter().filter(|_|self.host_inputs.current()).map(|field| {
             (
                 field.owner.definition(),
                 field.class.as_ref(),
@@ -504,7 +518,7 @@ impl ContributionSet {
             &crate::jvm::CallableFacts,
         ),
     > {
-        self.compiled.iter().map(|callable| {
+        self.compiled.iter().filter(|_|self.host_inputs.current()).map(|callable| {
             (
                 callable.owner.definition(),
                 callable.class.as_ref(),
@@ -518,26 +532,26 @@ impl ContributionSet {
         &self,
         byte: usize,
     ) -> impl Iterator<Item = (&BoundSite, &ResolvedRequirement)> {
-        self.sites
+        self.sites()
             .iter()
             .filter(move |site| site.full_range.start <= byte && byte <= site.full_range.end)
             .map(|site| (site, &self.requirements[site.requirement]))
     }
 
     pub fn requirements(&self) -> &[ResolvedRequirement] {
-        &self.requirements
+        if self.host_inputs.current() { &self.requirements } else { &[] }
     }
 
     pub fn sites(&self) -> &[BoundSite] {
-        &self.sites
+        if self.host_inputs.current() { &self.sites } else { &[] }
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+        if self.host_inputs.current() { &self.diagnostics } else { &[] }
     }
 
     pub fn binding_at(&self, byte: usize) -> Option<&MemberBinding> {
-        self.sites.iter().find_map(|site| {
+        self.sites().iter().find_map(|site| {
             if !site.full_range.contains(&byte) {
                 return None;
             }
@@ -549,7 +563,7 @@ impl ContributionSet {
     }
 
     pub fn references(&self, target: &MemberId) -> Vec<&BoundSite> {
-        self.sites
+        self.sites()
             .iter()
             .filter(|site| {
                 matches!(&self.requirements[site.requirement].binding,
@@ -559,7 +573,7 @@ impl ContributionSet {
     }
 
     pub fn rename_subject_at(&self, byte: usize) -> Option<RenameTarget> {
-        self.sites.iter().find_map(|site| {
+        self.sites().iter().find_map(|site| {
             if !site.full_range.contains(&byte) {
                 return None;
             }
@@ -578,6 +592,7 @@ impl ContributionSet {
         target: &RenameTarget,
         new_name: &str,
     ) -> Result<Vec<Replacement>, ContractError> {
+        if !self.host_inputs.current() { return Err(ContractError::Stale); }
         // The language adapter still validates keywords and language-specific escaped names.
         // This boundary accepts plain identifier text, never literal/descriptor delimiters.
         let mut characters = new_name.chars();
@@ -655,6 +670,12 @@ struct ProviderState {
     config: Arc<str>,
 }
 
+/// Host-owned read authority. This check must be nonblocking and perform no IO.
+/// The guard owns its watcher/lease for the full pending and published read lifetime.
+pub trait HostInputGuard: std::fmt::Debug + Send + Sync {
+    fn is_current(&self) -> bool;
+}
+
 #[derive(Clone, Debug)]
 struct ReadSet {
     model: u64,
@@ -663,6 +684,7 @@ struct ReadSet {
     compiled: BTreeMap<String, u64>,
     missing_sources: BTreeSet<String>,
     source_inventories: BTreeMap<ProjectScope, u64>,
+    host_inputs: Vec<Arc<dyn HostInputGuard>>,
 }
 
 pub struct PendingContributions {
@@ -671,6 +693,7 @@ pub struct PendingContributions {
     owner: String,
     provider_generation: u64,
     evaluation: u64,
+    read_only: bool,
     session: u64,
     reads: ReadSet,
     set: ContributionSet,
@@ -947,6 +970,7 @@ impl ExtensionStore {
     pub fn contribution_sets(&self) -> impl Iterator<Item = (&str, &str, &ContributionSet)> {
         self.sets
             .iter()
+            .filter(|(_, pending)| pending.reads.host_inputs.iter().all(|input| input.is_current()))
             .map(|((provider, owner), pending)| (provider.as_str(), owner.as_str(), &pending.set))
     }
 
@@ -1237,6 +1261,7 @@ impl ExtensionStore {
     /// A current failed evaluation removes only its own previous set. A delayed failure cannot
     /// remove a newer successful evaluation, nor can its token be published after cleanup.
     pub fn fail(&mut self, pending: PendingContributions) -> Result<(), ContractError> {
+        if pending.read_only { return self.validate_pending(&pending); }
         self.validate_pending(&pending)?;
         let key = (pending.provider, pending.owner);
         self.evaluations.remove(&key);
@@ -1252,6 +1277,21 @@ impl ExtensionStore {
         provider: &str,
         owner: &'a str,
     ) -> Result<ReadSession<'a>, ContractError> {
+        self.begin_session(index, provider, owner, false)
+    }
+
+    /// A nonpublishing command read has its own lifetime alongside semantic evaluations.
+    /// It observes the same inputs, but neither supersedes nor withdraws provider contributions.
+    pub fn begin_read<'a>(
+        &'a mut self, index: &'a dyn InferenceIndex, provider: &str, owner: &'a str,
+    ) -> Result<ReadSession<'a>, ContractError> {
+        self.begin_session(index, provider, owner, true)
+    }
+
+    fn begin_session<'a>(
+        &'a mut self, index: &'a dyn InferenceIndex, provider: &str, owner: &'a str,
+        read_only: bool,
+    ) -> Result<ReadSession<'a>, ContractError> {
         let provider_state = self
             .providers
             .get(provider)
@@ -1265,8 +1305,7 @@ impl ExtensionStore {
         let owner_generation = source.generation;
         self.next_generation += 1;
         let evaluation = self.next_generation;
-        self.evaluations
-            .insert((provider.into(), owner.into()), evaluation);
+        if !read_only { self.evaluations.insert((provider.into(), owner.into()), evaluation); }
         Ok(ReadSession {
             store: self,
             index: ScopedIndex::new(index, owner),
@@ -1274,6 +1313,7 @@ impl ExtensionStore {
             provider: provider.into(),
             provider_generation: provider_state.generation,
             evaluation,
+            read_only,
             session: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             reads: ReadSet {
                 model: self.model_generation,
@@ -1282,12 +1322,16 @@ impl ExtensionStore {
                 compiled: BTreeMap::new(),
                 missing_sources: BTreeSet::new(),
                 source_inventories: BTreeMap::new(),
+                host_inputs: Vec::new(),
             },
             set: ContributionSet::default(),
         })
     }
 
     pub fn commit(&mut self, pending: PendingContributions) -> Result<(), ContractError> {
+        if pending.read_only {
+            return Err(ContractError::ForeignRequirement);
+        }
         self.validate_pending(&pending)?;
         self.evaluations
             .remove(&(pending.provider.clone(), pending.owner.clone()));
@@ -1315,6 +1359,7 @@ impl ExtensionStore {
             provider: pending.provider,
             provider_generation: pending.provider_generation,
             evaluation: pending.evaluation,
+            read_only: pending.read_only,
             session: pending.session,
             reads: pending.reads,
             set: pending.set,
@@ -1324,6 +1369,7 @@ impl ExtensionStore {
     pub fn contributions(&self, provider: &str, owner: &str) -> Option<&ContributionSet> {
         self.sets
             .get(&(provider.into(), owner.into()))
+            .filter(|pending| pending.reads.host_inputs.iter().all(|input| input.is_current()))
             .map(|pending| &pending.set)
     }
 
@@ -1333,6 +1379,7 @@ impl ExtensionStore {
             .is_some_and(|provider| {
                 provider.enabled && provider.generation == pending.provider_generation
             })
+            && pending.reads.host_inputs.iter().all(|input| input.is_current())
             && pending.reads.model == self.model_generation
             && pending
                 .reads
@@ -1352,15 +1399,25 @@ impl ExtensionStore {
             })
     }
 
+    /// Withdraw externally invalidated facts without scanning valid source/model read sets.
+    pub fn refresh_host_inputs(&mut self) -> Vec<(String, String)> {
+        let stale: Vec<_> = self.sets.iter().filter(|(_, pending)|
+            pending.reads.host_inputs.iter().any(|input| !input.is_current()))
+            .map(|(key, _)| key.clone()).collect();
+        if !stale.is_empty() {
+            for key in &stale { self.sets.remove(key); self.dirty.insert(key.clone()); }
+            self.publication_revision += 1;
+        }
+        stale
+    }
+
     pub fn validate_pending(&self, pending: &PendingContributions) -> Result<(), ContractError> {
         if pending.host != self.host {
             return Err(ContractError::ForeignIdentity);
         }
-        if !self.is_current(pending)
-            || self
-                .evaluations
-                .get(&(pending.provider.clone(), pending.owner.clone()))
-                != Some(&pending.evaluation)
+        let registered = pending.read_only
+            || self.evaluations.get(&(pending.provider.clone(), pending.owner.clone())) == Some(&pending.evaluation);
+        if !self.is_current(pending) || !registered
         {
             return Err(ContractError::Stale);
         }
@@ -1391,12 +1448,22 @@ pub struct ReadSession<'a> {
     provider: String,
     provider_generation: u64,
     evaluation: u64,
+    read_only: bool,
     session: u64,
     reads: ReadSet,
     set: ContributionSet,
 }
 
 impl ReadSession<'_> {
+    /// Only the trusted host may attach an owned external-input lease to a read.
+    pub fn observe_host_input(&mut self, input: Arc<dyn HostInputGuard>) -> Result<(), ContractError> {
+        if !input.is_current() { return Err(ContractError::Stale); }
+        if !self.reads.host_inputs.iter().any(|known| Arc::ptr_eq(known, &input)) {
+            self.reads.host_inputs.push(input);
+        }
+        Ok(())
+    }
+
     /// Enumerate accepted Java/Kotlin snapshots in the host-selected project source set.
     /// Completeness of the filesystem/model inventory is a separate host observation.
     pub fn source_inventory(&mut self) -> Result<Vec<SourceHandle>, ContractError> {
@@ -2491,13 +2558,16 @@ impl ReadSession<'_> {
         Ok(())
     }
 
-    pub fn finish(self) -> PendingContributions {
+    pub fn finish(mut self) -> PendingContributions {
+        // Index and inference snapshots clone this set without retaining PendingContributions.
+        self.set.host_inputs = PublishedHostInputs(self.reads.host_inputs.clone());
         PendingContributions {
             host: self.store.host,
             provider: self.provider,
             owner: self.owner.into(),
             provider_generation: self.provider_generation,
             evaluation: self.evaluation,
+            read_only: self.read_only,
             session: self.session,
             reads: self.reads,
             set: self.set,

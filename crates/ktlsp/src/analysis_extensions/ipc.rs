@@ -11,6 +11,8 @@ pub(super) struct Slot {
     worker: Arc<Worker>,
     pub queued: BTreeSet<String>,
     running: bool,
+    commands: BTreeSet<String>,
+    running_commands: usize,
 }
 
 #[cfg(test)]
@@ -319,6 +321,49 @@ mod tests {
             .queued
             .contains("/ipc/Owner.kt"));
     }
+
+    #[test]
+    fn explicit_commands_keep_read_lifetimes_without_publishing_contributions() {
+        let (index,mut host)=host();
+        host.register_ipc_commands(&index,"test.ipc",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
+        assert!(host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","not.allowed".into(),vec![],json!({})).is_err());
+        let revision=host.store.publication_revision();
+        let work=host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","fixture.echo".into(),vec![json!({"PreserveCase":"Value"})],json!({})).unwrap();
+        let value=json!({"protocolVersion":1,"result":{"PreserveCase":"Value","callbacks":[{"name":"RunMe"}]}});
+        assert_eq!(host.finish_ipc_command(work.evaluation,Ok(value.clone())).unwrap(),value);
+        assert_eq!(host.store.publication_revision(),revision);
+        assert_eq!(host.ipc_providers["test.ipc"].running_commands,0);
+        let work=host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","fixture.echo".into(),vec![],json!({})).unwrap();
+        assert!(host.ipc_batch(&index,work.evaluation,"analysis/finish",json!({"evaluation":work.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})).is_err());
+        assert!(host.finish_ipc_command(work.evaluation,Ok(json!({"cannotLaunder":true}))).is_err());
+        let mut pending=Vec::new();
+        for _ in 0..8 {pending.push(host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","fixture.echo".into(),vec![],json!({})).unwrap());}
+        assert!(host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","fixture.echo".into(),vec![],json!({})).is_err());
+        assert!(pending.iter().all(|work|host.ipc_current(work.evaluation)), "independent command reads must remain current together");
+        for work in pending {assert_eq!(host.finish_ipc_command(work.evaluation,Err("Cancelled".into())).unwrap_err(),"Cancelled");}
+        assert_eq!(host.ipc_providers["test.ipc"].running_commands,0);
+        assert!(host.ipc_evaluations.is_empty());
+    }
+
+    #[test]
+    fn command_negative_reads_source_model_disable_and_restart_reject_obsolete_results() {
+        for change in ["source","model","disable","restart","negative"] {
+            let (index,mut host)=host();
+            host.register_ipc_commands(&index,"test.ipc",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
+            let work=host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","fixture.echo".into(),vec![],json!({})).unwrap();
+            host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Absent"}]})).unwrap();
+            match change {
+                "source"=>{let text="package ipc\nclass Owner { fun changed()=1 }";host.replace_sources(&index,vec![("/ipc/Owner.kt".into(),Arc::from(text),KotlinParser::new().parse(text))]);}
+                "model"=>host.model_changed(&index),
+                "disable"=>{host.configure(&index,"test.ipc",false,Arc::from("{}"));},
+                "restart"=>{host.register_ipc_commands(&index,"test.ipc",vec!["new-fixture-child".into()],vec!["fixture.echo".into()]).unwrap();}
+                "negative"=>{let text="package ipc\nclass Absent";host.replace_sources(&index,vec![("/ipc/Target.kt".into(),Arc::from(text),KotlinParser::new().parse(text))]);}
+                _=>unreachable!(),
+            }
+            assert!(host.finish_ipc_command(work.evaluation,Ok(json!({"obsolete":change}))).is_err(),"{change}");
+            assert!(host.ipc_evaluations.is_empty());
+        }
+    }
 }
 
 impl AnalysisExtensions {
@@ -328,6 +373,16 @@ impl AnalysisExtensions {
         id: &str,
         command: Vec<String>,
     ) -> Result<bool, String> {
+        self.register_ipc_commands(index, id, command, Vec::new())
+    }
+    pub(crate) fn register_ipc_commands(
+        &mut self, index: &dyn InferenceIndex, id: &str,
+        command: Vec<String>, commands: Vec<String>,
+    ) -> Result<bool, String> {
+        if commands.len()>64 || !commands.iter().all(|name|crate::extension_ipc::valid_command_id(name)) {
+            return Err("invalid provider command allowlist".into());
+        }
+        let commands:BTreeSet<_>=commands.into_iter().collect();
         if id.is_empty()
             || self.providers.contains_key(id)
             || command.first().is_none_or(|item| item.is_empty())
@@ -337,7 +392,7 @@ impl AnalysisExtensions {
         if self
             .ipc_providers
             .get(id)
-            .is_some_and(|slot| slot.command == command)
+            .is_some_and(|slot| slot.command == command && slot.commands == commands)
         {
             return Ok(false);
         }
@@ -354,12 +409,14 @@ impl AnalysisExtensions {
         self.ipc_providers.insert(
             id.into(),
             Slot {
-                worker: Worker::new(command.clone()),
+                worker: Worker::with_commands(command.clone(), commands.clone()),
                 command,
                 enabled: true,
                 configuration: Arc::from("{}"),
                 queued: BTreeSet::new(),
                 running: false,
+                commands,
+                running_commands: 0,
             },
         );
         self.retain_all_sources = true;
@@ -373,7 +430,8 @@ impl AnalysisExtensions {
         if let Some(slot) = self.ipc_providers.get_mut(id) {
             if slot.enabled != enabled || &slot.configuration != config {
                 slot.worker.stop();
-                slot.worker = Worker::new(slot.command.clone());
+                slot.worker = Worker::with_commands(slot.command.clone(), slot.commands.clone());
+                slot.running_commands = 0;
                 slot.running = false;
                 slot.enabled = enabled;
                 slot.configuration = config.clone();
@@ -386,6 +444,7 @@ impl AnalysisExtensions {
 
     pub(super) fn requeue_stale_ipc(&mut self) {
         for evaluation in self.ipc_evaluations.values() {
+            if evaluation.command { continue; }
             if evaluation
                 .pending
                 .as_ref()
@@ -405,6 +464,7 @@ impl AnalysisExtensions {
         index: &dyn InferenceIndex,
         project: Option<&Arc<ProjectSnapshot>>,
     ) -> Vec<Work> {
+        self.refresh_host_inputs();
         let dead: Vec<_> = self
             .ipc_providers
             .iter()
@@ -457,6 +517,7 @@ impl AnalysisExtensions {
                 Ok(params) => {
                     slot.running = true;
                     work.push(Work {
+                        command: None,
                         evaluation: evaluation.id,
                         provider,
                         worker,
@@ -471,6 +532,56 @@ impl AnalysisExtensions {
             }
         }
         work
+    }
+
+
+    pub(crate) fn ipc_command_instance(&self,provider:&str,command:&str) -> Option<u64> {
+        let slot=self.ipc_providers.get(provider)?;
+        (slot.enabled && !slot.worker.failed() && slot.commands.contains(command)
+            && slot.worker.command_acknowledged(command)).then_some(slot.worker.id)
+    }
+
+    pub(crate) fn begin_ipc_command(
+        &mut self, index: &dyn InferenceIndex, project: Option<&Arc<ProjectSnapshot>>,
+        provider: &str, owner: &str, command: String, arguments: Vec<Value>, context: Value,
+    ) -> Result<Work,String> {
+        if self.suspended { return Err("CommandUnavailable".into()); }
+        let slot=self.ipc_providers.get_mut(provider).ok_or("CommandUnavailable")?;
+        if !slot.enabled || slot.worker.failed() || !slot.commands.contains(&command) || slot.running_commands>=8 {
+            return Err("CommandUnavailable".into());
+        }
+        let worker=slot.worker.clone();
+        let mut evaluation=Evaluation::new(provider.to_owned(),owner.to_owned(),worker.id);
+        evaluation.command=true;
+        evaluation.project=project.cloned();
+        let mut read=self.store.begin_read(index,provider,owner).map_err(|_|"CommandUnavailable")?;
+        let params=evaluation.source(&mut read);
+        evaluation.pending=Some(read.finish());
+        let mut params=match params {
+            Ok(params)=>params,
+            Err(error)=>{let _=self.store.fail(evaluation.pending.take().unwrap());return Err(error);}
+        };
+        params["command"]=Value::String(command.clone());
+        params["arguments"]=Value::Array(arguments);
+        params["context"]=context;
+        slot.running_commands+=1;
+        let work=Work {command:Some(command),evaluation:evaluation.id,provider:provider.to_owned(),worker,params};
+        self.ipc_evaluations.insert(evaluation.id,evaluation);
+        Ok(work)
+    }
+
+    pub(crate) fn finish_ipc_command(&mut self,id:u64,result:Result<Value,String>) -> Result<Value,String> {
+        let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;
+        let current=self.ipc_providers.get(&evaluation.provider).is_some_and(|slot|
+            slot.enabled && slot.worker.id==evaluation.instance && !slot.worker.failed());
+        let valid=evaluation.command && current && evaluation.failure.is_none()
+            && evaluation.pending.as_ref().is_some_and(|pending|self.store.validate_pending(pending).is_ok());
+        if let Some(pending)=evaluation.pending.take() { let _=self.store.fail(pending); }
+        if let Some(slot)=self.ipc_providers.get_mut(&evaluation.provider).filter(|slot|slot.worker.id==evaluation.instance) {
+            slot.running_commands=slot.running_commands.saturating_sub(1);
+        }
+        if !valid && !result.as_ref().is_err_and(|error|error=="Cancelled") { return Err("Stale".into()); }
+        result
     }
 
     pub(crate) fn ipc_current(&self, id: u64) -> bool {
@@ -496,6 +607,104 @@ impl AnalysisExtensions {
                                     })
                             })))
             })
+    }
+
+    pub(crate) fn ipc_resource_owner(&self,id:u64)->Option<&str> {
+        self.ipc_current(id).then(||self.ipc_evaluations.get(&id).map(|evaluation|evaluation.owner.as_str())).flatten()
+    }
+
+    pub(crate) fn prepay_ipc_input_read(&mut self,id:u64,method:&str,params:&Value)->Result<(),String> {
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance)
+            .map_or(0,|slot|slot.worker.project_operations());
+        evaluation.prepay_input_read(method,params)
+    }
+    pub(crate) fn account_ipc_stream_reply(&mut self,id:u64,frame:&Value)->Result<(),String> {
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        let result=evaluation.account_stream_reply(frame);
+        if let Err(error)=&result {evaluation.failure=Some(error.clone());}
+        result
+    }
+
+    pub(crate) fn fail_ipc_input_read(&mut self,id:u64,error:&str) {
+        if let Some(evaluation)=self.ipc_evaluations.get_mut(&id) {evaluation.cancel_prepaid_input();}
+        if error!=crate::extension_ipc::READ_FACTS_RESPONSE_BUDGET_EXCEEDED {
+            if let Some(evaluation)=self.ipc_evaluations.get_mut(&id) {evaluation.failure=Some(error.to_owned());}
+        }
+    }
+
+    pub(crate) fn attach_ipc_resource_catalog(&mut self,index:&dyn InferenceIndex,id:u64,
+        catalog:Arc<crate::resource_inputs::ResourceCatalog>)->Result<(),String> {
+        let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;
+        let result=(|| {
+            if !evaluation.project.as_ref().is_some_and(|model|Arc::ptr_eq(model,&catalog.model)) {return Err("Stale".into());}
+            let pending=evaluation.pending.take().ok_or("Stale")?;
+            let owner=evaluation.owner.clone();
+            let mut read=self.store.resume(index,&owner,pending).map_err(|_|"Stale")?;
+            let observed=read.observe_host_input(catalog.guard.clone()).map_err(|_|"Stale".to_owned());
+            evaluation.pending=Some(read.finish());
+            observed?;
+            evaluation.resource_catalog=Some(catalog);Ok(())
+        })();
+        self.ipc_evaluations.insert(id,evaluation);result
+    }
+
+    pub(crate) fn begin_ipc_resource_reads(&mut self,id:u64,method:&str,params:&Value)
+        ->Result<Vec<crate::resource_inputs::ResourceReadPlan>,String> {
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance)
+            .map_or(0,|slot|slot.worker.project_operations());
+        evaluation.begin_resource_reads(method,params)
+    }
+
+    pub(crate) fn finish_ipc_resource_read(&mut self,index:&dyn InferenceIndex,
+        prepared:crate::resource_inputs::PreparedResourceRead)->Result<(),String> {
+        let id=prepared.evaluation;
+        let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;
+        let result=(|| {
+            let catalog=evaluation.resource_catalog.as_ref().ok_or("Stale")?;
+            if !Arc::ptr_eq(&catalog.model,&prepared.model) || !catalog.guard.is_current() {return Err("Stale".into());}
+            let pending=evaluation.pending.take().ok_or("Stale")?;
+            let owner=evaluation.owner.clone();
+            let mut read=self.store.resume(index,&owner,pending).map_err(|_|"Stale")?;
+            let observed=read.observe_host_input(catalog.guard.clone()).map_err(|_|"Stale".to_owned());
+            evaluation.pending=Some(read.finish());observed?;
+            evaluation.resource_results.insert(prepared.token,prepared.content);Ok(())
+        })();
+        self.ipc_evaluations.insert(id,evaluation);result
+    }
+
+    pub(crate) fn begin_ipc_class_reads(&mut self, id: u64, method: &str, params: &Value)
+        -> Result<Option<crate::runtime_bytes::ClassReadPlan>, String>
+    {
+        let evaluation = self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        if evaluation.failure.is_some() || !evaluation.pending.as_ref().is_some_and(|pending|
+            self.store.validate_pending(pending).is_ok()) { return Err("Stale".into()); }
+        evaluation.project_operations = self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot| slot.enabled && slot.worker.id == evaluation.instance)
+            .map_or(0,|slot|slot.worker.project_operations());
+        evaluation.begin_class_reads(method, params)
+    }
+
+    pub(crate) fn finish_ipc_class_read(&mut self, index: &dyn InferenceIndex,
+        prepared: crate::runtime_bytes::PreparedClassRead) -> Result<(),String>
+    {
+        let id = prepared.evaluation;
+        let mut evaluation = self.ipc_evaluations.remove(&id).ok_or("Stale")?;
+        let result = (|| {
+            let pending = evaluation.pending.take().ok_or("Stale")?;
+            let owner = evaluation.owner.clone();
+            let mut read = self.store.resume(index, &owner, pending).map_err(|_|"Stale")?;
+            let result = evaluation.finish_class_read(&mut read, prepared);
+            evaluation.pending = Some(read.finish());
+            result
+        })();
+        self.ipc_evaluations.insert(id, evaluation);
+        result
     }
 
     pub(crate) fn ipc_batch(
