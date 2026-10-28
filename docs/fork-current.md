@@ -21,14 +21,17 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Current verification: selected evidence through62
+## Current verification: selected evidence through63
 
 Retain qualified CEM38, Moshi9, OkHttp10, Retrofit12, Spring10 and Gradle9
 results; a newer binary alone does not require replaying all of them. The
 unnecessary CEM/Moshi/OkHttp/Retrofit and Spring repeats are canceled. Recheck
 affected behavior after a functional change, not the complete project corpus.
-The remaining editor proof is the Gradle unsaved dependency counter diagnostic;
-the resources/runtime-class consumer now has the actual result recorded below. Tests and
+The Gradle unsaved dependency counter diagnostic now passes the focused real-editor
+proof below. Retain the earlier16 shared-edit results separately; this is not a new
+17-request replay. The resources/runtime-class consumer also has the actual result
+recorded below. Selected SDK/source index coverage still needs qualification before
+making a broader analysis-completeness claim. Tests and
 benchmarks are assigned to GPT-6.1 Terra/high; implementation fixes are assigned
 to GPT-6.1 Sol/high. No further optimization is scheduled.
 
@@ -76,8 +79,8 @@ build time. The executed cached script still matches59's compiled input; runtime
 and project inputs are unchanged, with clean shutdown and EOF/live0/forced0.
 Preserve that controller result and the raw4/4 separately. That later run did
 not reach incomplete6; it does not reopen the previously qualified Spring10.
-The ordinary dirty-Java dependency header route passes focused
-checks, but the original current-version Gradle counter is still unproved.
+The ordinary dirty-Java dependency header route passed focused checks on58, but
+the current-version Gradle counter remained unproved until the63 follow-up below.
 Candidate58 passes the complete workspace **1857 passed, 0 failed, 14 ignored**
 and both release builds. Its retained native K1 check separately verifies the
 new Kotlin-backed Java error and its current Workspace publication; actual raw
@@ -115,7 +118,7 @@ and fairly releases the workspace lock between chunks. This removes repeated
 semantic publication after every archive file while preserving generation and
 source-error handling. The full workspace passes **1858/0/14** and the release
 build succeeds (`native-integrated120-59/main-ready.json`). The original Gradle
-counter remains in progress. Spring59 finishes four normal checks as qualified
+counter remained unproved on59. Spring59 finishes four normal checks as qualified
 above. Its release trace records114532 installed files in4260 flushes: index
 work10.538s versus repeated normalization/publication3425.206s. Total run time
 is4119.875s; these are initial indexing observations, not warm editing latency.
@@ -172,7 +175,7 @@ EOF/live0/forced0, stable guards and restored Gradle settings
 run ended at its15-second setup barrier; the passing run observes readiness for
 up to120 seconds. This is not a performance result. The SDK header-only editor
 branch was not exercised; focused native SDK checks remain separate evidence.
-The tested helper and manifest are now committed-source candidates under
+The tested helper and manifest are published under
 `dev/external-extension/`, with the existing harness route and fixture recipe in
 README; their content matches the actual run, apart from the portable helper path.
 
@@ -182,8 +185,42 @@ fail dependency loading with E0463 (`workspace-host62-1`). A separate
 workspace-selected doctest phase subsequently succeeds for both targets
 (`workspace-doc-host62-1`). All357 guarded source files are unchanged between
 these runs. The original loading failure is retained and unexplained; do not
-describe the first whole-workspace command as passing. Passing native tests
-were not repeated, and doctests were not disabled.
+describe the first whole-workspace command as passing. During that documentation
+follow-up, passing native tests were not repeated, and doctests were not disabled.
+
+Candidate63 fixes the ordinary compiler gate conflating unrelated native compiler
+API facts with explicitly registered framework providers. Only that gate changes;
+affected-file contributions, source/model/classpath/header checks and annotation
+processor restrictions remain enforced. The existing lifecycle regression retains
+a real unrelated native API and verifies admission, then independently rejects an
+annotation-free affected-file contribution and an explicit framework provider.
+The focused lifecycle suite passes10/0/1 ignored; the release host is SHA256
+`49c29c3f2f1c7e2e7ff8de1dbdc971dfa5f00e02e05533bcf814548b536429dc`
+(`lifecycle-host63/main-ready.json`).
+
+The same original Java6-valid concrete-class counter now passes in actual Neovim:
+**2/2 first responses** (baseline definition and counter diagnostics), zero mismatch
+or unmeasured requests, stable guards and EOF/live0/forced0. The full diagnostic
+response contains no items and resultId `kotlin:1:4:2:1204`; current wire/source SHA
+`e783358e5c408c4ac2817a20fc9802d9482ba4fcbbba49d3eaf70951bf95aa1d`,
+source generation4 and both canonical/absence certification agree. Producer closure
+remains false: this proves the owned Kotlin document, not Java-body or whole-project
+cleanliness (`focused63/receipt.json`, `shared-edit-diagnostics.json`). The earlier62
+unhandled outcome and focused-probe accounting defect remain preserved. The latter
+is corrected by removing two unused planned rows, without changing source snapshots,
+clean-result expectations, certification checks or the300-second observation window.
+
+After this functional fix, one complete workspace command passes independently:
+**1890 passed, 0 failed, 16 ignored**, including both doctest targets
+(`workspace-host63-1/receipt.json`). Its357 source guards match the release63 host;
+no new editor sweep or release rebuild follows this result. The earlier62 E0463
+failure remains historical, not relabeled as passing or assigned an unproved cause.
+
+The Gradle63 index reports classpathComplete=true, one failed source archive,
+missingSources=29 and jdkComplete=false. NekoHTML1.9.20's invalid-UTF8 source keeps25
+selected binary entries as fallback. The SDK/source coverage flag is not evidence
+of29 language bugs or proof that every selected SDK origin is complete; qualify it
+separately from the certified counter result.
 Resource and class-byte host/serializer controls pass12 focused checks and a
 real selected-SDK Code/negative lookup passes separately. Their actual child
 integration, raw-resource owners and lower-release SDK header facts remain open;
@@ -516,7 +553,7 @@ are used, with original contents and Git metadata guarded.
 | Moshi mixed shared edits | Original atomic6 passes on28. Shared16 improves from15 matched/1 unmeasured on28 to16/16 first responses on29, including current Kotlin1.8.21 counter diagnostics. Original/copied sources and JAR unchanged; original missing producer JAR stays absent. `moshi-focused140-shared29/semantic-handoff.json`. | Tested workflow achieved. Editor API retraction completion/goto passes; compiler retraction diagnostics are separately established by the native lifecycle case. |
 | Spring mixed shared edits | Original16/16 first responses pass on28, including current-version complete compiler pass certifying empty document diagnostics.10861 original tracked inputs unchanged. `spring-shared138-final.json`. | Whole-project producer closure remains false; do not broaden the document-level claim. |
 | Retrofit mixed shared edits | Portable original22 first responses pass on27; exact invalid-diagnostic range separately audited against the same payload. Applied rename inspected. `retrofit-shared137-portable27/final-summary.json`. | Final source changes must retain the existing expectations. |
-| Gradle mixed shared edits | Actual37 closes16 matched/0 mismatch/1 unmeasured. The invalid and fixed canonical checks pass; the counter remains unverified. Native nvim exit1 accompanies normal LSP shutdown/exit0, no forced cleanup or surviving children,19 guards stable, and all25,569 tracked files unchanged (`gradle-shared134-native37/receipt.json`, `gradle-shared134-tracked37-final.json`). | Counter sourcegen4 is rejected as dirty-visible-dependency-source-unhandled before compiler launch. A real Java11/source6/ErrorProne/processor compilation rejects its default interface method; the old Java17 clean oracle was incorrect for this project. Preserve that result, qualify a concrete-class Java6-valid variant, and implement the validated producer route (`diagnostic153-cause.json`, `diagnostic153-producer3`). Do not increase the300s window or label fast empty diagnostics canonical. |
+| Gradle mixed shared edits | Actual37's16 qualified requests remain retained. The Java6-valid concrete-class counter passes the focused63 follow-up with matching current source generation/SHA, full empty diagnostic response and canonical/absence certification; baseline definition also matches, both on first attempt (`focused63/receipt.json`). | Selected counter gap closed. The old default interface method was invalid for the recorded Java6 model; its incorrect Java17 clean oracle and original failures remain preserved. This is a cross-release qualification, not a same-run17/17 or whole-project/Java-body cleanliness claim. Producer closure is false, and SDK/source index coverage remains qualified separately. |
 | Libraries added/replaced by real Gradle builds | Actual33 versioned90/61 first RPCs/4 builds and same-path47/23 first RPCs/2 builds both pass. New API, old API withdrawal, exact source navigation, current diagnostics and unsaved-buffer preservation are checked; all8 guards stable, clean shutdown/EOF/0 live/forced cleanup (`dependency-lifecycle141-final.json`). | Tested lifecycle workflows achieved. Missing dependency and source archives were restored by genuine Gradle resolution; the original offline acceptance stayed unchanged. Failed setup/readiness runs are retained separately, with no latency claim. |
 | Compiler plugins / generated sources | Historical32 has109/114 pass and correct0,0,1(disabled),0(restored) builds. The5 unavailable/mismatched phase1 requirements now pass within original focused8 on33: Java/Kotlin each one diagnostic response, exact3 obsolete calls per language, current v4 SHA/result identity,2 actual builds/RuntimeCheck12 each,32 stable guards and clean EOF/0 live/forced cleanup (`processor120/processor-phase1-release33-resume141b/semantic-adjudication141.json`). | Focused semantic gap closed. The original cold indexing120s check still fails, so that run is34/35 and exit1; do not call the full114 rerun or all35 successful. No semantic retry or deadline increase; producer closure remains false. |
 | External shared-semantic extension | Embedded exact-declaration provider: own-lock4 tests/build and Neovim90 first responses/144 assertions pass (`external-public140-30/editor-receipt.json`). New actual child IPC26 checks/12 extra RPCs and linked14 checks/6 RPCs both close cleanly with stable guards, EOF and no live/forced cleanup. Same-input completion edits, goto, references and applied3-buffer rename match (`ipc140-editor-2/receipt.json`, `ipc140-editor-linked-1/receipt.json`, `ipc140-linked-equivalence.json`). | Single Java shadow-method IPC spike achieved, including cancellation/stale rejection, idle-crash index retraction, restart and disable. Kotlin/fields/unopened-dependency wire acceptance and full MC policy remain separate. The first fixture-restoration failure is retained in `ipc140-editor-1`. |

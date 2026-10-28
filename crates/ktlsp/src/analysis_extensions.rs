@@ -71,6 +71,10 @@ impl AnalysisExtensions {
             && self.compiler_api_sources.is_empty()
     }
 
+    pub fn has_framework_providers(&self) -> bool {
+        self.retain_all_sources
+    }
+
     pub fn configure(
         &mut self,
         index: &dyn InferenceIndex,

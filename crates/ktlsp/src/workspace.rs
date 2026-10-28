@@ -9516,7 +9516,7 @@ impl Workspace {
         dependency_overlays.sort_by(|a, b| a.key.cmp(&b.key));
         // Plain javac cannot reject virtual targets contributed by LSPExtension providers.
         // Until Java compiler positives reconcile with those facts, keep this surface unavailable.
-        let compiler_sources_supported = self.analysis_extensions.is_empty()
+        let compiler_sources_supported = !self.analysis_extensions.has_framework_providers()
             && sources
                 .keys()
                 .chain(dependency_overlays.iter().map(|source| &source.key))
@@ -10359,7 +10359,7 @@ mod kotlin_diagnostic_lifecycle_tests {
         let mut modules = ws.project_model.as_ref().unwrap().modules.clone();
         let root = modules[0].project_dir.clone();
         let dependency_root = root.join("dependency");
-        let dependency = crate::paths::file_key(&dependency_root.join("src/Dependency.java"));
+        let dependency = crate::paths::file_key(&dependency_root.join("src/Person.java"));
         let artifact = dependency_root.join("dependency.jar");
         let mut java = crate::compile::observed_test_request(&dependency_root).task.clone();
         java.task = ":dependency:compileJava".into();
@@ -10377,6 +10377,19 @@ mod kotlin_diagnostic_lifecycle_tests {
         });
         let model = Arc::new(ProjectSnapshot::new(modules));
         ws.set_project_model(model.clone());
+        const SOURCE: &str = include_str!("../../ktcore/tests/fixtures/classfile/sources/pluginfixture/Person.java");
+        const CLASS: &[u8] = include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let unrelated = crate::paths::file_key(&root.join("test/Person.java"));
+        ws.reindex(&unrelated, SOURCE);
+        let class = Arc::new(ktcore::classfile::decode(
+            &model.file_origin(Path::new(&unrelated)).unwrap().origin_id, CLASS,
+        ).unwrap());
+        ws.analysis_extensions.accept_project_outputs(&ws.index, vec![(
+            unrelated.clone(), Arc::from(SOURCE), crate::java::JavaParser::new().parse(SOURCE), class,
+        )]).unwrap();
+        ws.analysis_extensions.publish(&mut ws.index);
+        assert!(!ws.analysis_extensions.is_empty());
+        assert!(!ws.index.contributions_for_file(&unrelated).is_empty());
         ws.open(dependency.clone(), "class Dependency { int currentApi; }".into());
         let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
         assert!(request.java_dependency_sources.contains(&dependency));
@@ -10424,6 +10437,31 @@ mod kotlin_diagnostic_lifecycle_tests {
             assert!(ws.kotlin_java_dependency_sources(&altered, &next.task,
                 &next.dependency_overlays, &visible).is_empty(), "{mutation}");
         }
+        const AFFECTED_SOURCE: &str = "package pluginfixture; public final class Person { private String name; }";
+        ws.change(&dependency, AFFECTED_SOURCE.into());
+        let class = Arc::new(ktcore::classfile::decode(
+            &model.file_origin(Path::new(&dependency)).unwrap().origin_id, CLASS,
+        ).unwrap());
+        ws.analysis_extensions.accept_project_outputs(&ws.index, vec![(
+            dependency.clone(), Arc::from(AFFECTED_SOURCE), crate::java::JavaParser::new().parse(AFFECTED_SOURCE), class,
+        )]).unwrap();
+        ws.analysis_extensions.publish(&mut ws.index);
+        assert!(!ws.index.contributions_for_file(&dependency).is_empty());
+        assert!(ws.begin_kotlin_diagnostics(&editor).unwrap().java_dependency_sources.is_empty(),
+            "affected-file contributions still require compiler reconciliation");
+
+        struct Provider;
+        impl crate::analysis_extensions::AnalysisProvider for Provider {
+            fn id(&self) -> &str { "diagnostic-header-test" }
+            fn analyze(&self, _: &mut ktcore::extensions::ReadSession<'_>)
+                -> Result<(), ktcore::extensions::ContractError> { Ok(()) }
+        }
+        ws.analysis_extensions = crate::analysis_extensions::AnalysisExtensions::new(vec![Arc::new(Provider)]);
+        ws.change(&dependency, "class Dependency { int nextApi; }".into());
+        ws.index.replace_contributions(BTreeMap::new());
+        assert!(ws.index.contributions_for_file(&dependency).is_empty());
+        assert!(ws.begin_kotlin_diagnostics(&editor).unwrap().java_dependency_sources.is_empty(),
+            "an explicit framework provider blocks the route even without published contributions");
         ws.close(&dependency);
         assert!(next.check_live().is_err());
     }
