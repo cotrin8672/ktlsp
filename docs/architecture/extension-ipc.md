@@ -170,7 +170,8 @@ Bodies exceeding 128 KiB are typed Unknown; inventory and accumulated escaped
 response bytes have a 512 KiB budget. Oversized batches return a small request
 error so the child can split queries in the same live evaluation. Each page issues
 only its own source handles and optional continuation; the 16,384-handle and
-64-batch evaluation limits remain in force. Read snapshots in bounded multi-query
+64-metadata-batch evaluation limits remain in force. Resource/class byte continuations
+have the separate shared stream quota described below. Read snapshots in bounded multi-query
 batches, rather than one batch per file. This slice has no external read-cache
 validation, resource/class-byte access, or Minecraft policy.
 
@@ -534,3 +535,142 @@ limits apply. Oversized response batches return the existing recoverable split-q
 error. The raw payload cache is bounded to 64 MiB per current resource scope; unsupported
 sizes are typed unknown rather than partially certified content. The fixed
 `owned-resources-v1.frames` fixture is compared byte-for-byte with the actual serializer.
+
+### Selected runtime classes (`runtime-class-bytes-v1`)
+
+Negotiate the capability and each operation in the initialize reply:
+
+```json
+{"capabilities":["semantic-v1","runtime-class-bytes-v1"],"supportedOps":{"runtime-class-bytes-v1":["runtimeClass","classBytes"]}}
+```
+
+Both operations use `analysis/readFacts` with the current opaque `evaluation` string;
+the response is `{"facts":[...]}` in query order. Unnegotiated operations are request
+errors. `{"op":"runtimeClass","internalName":"app/Main"}` requests an exact JVM
+internal name, without `.class`. Names must be nonempty, at most 4096 UTF-8 bytes,
+and contain no empty slash segment, control character, backslash, `.`, `:`, `;`,
+`[` or `]`. A name is a selector, never a path or an identity grant.
+
+The host selects the evaluation owner's accepted module/source set and SDK, then
+checks the selected SDK first and the ordered **runtime** classpath second. The first
+runtime directory/JAR containing the class wins; malformed earlier inputs cannot be
+bypassed for later definitions. Ambiguous SDK module definitions are unavailable.
+Compile-only artifacts, compiler-private headers, source archives and another installed
+JDK are not fallback runtime authorities. Missing/legacy runtime selection, unavailable
+bytes, malformed input and negative lookups return
+`{"state":"unknown","reasons":[{"code":"BYTECODE_UNAVAILABLE","detail":"..."}]}`.
+The detail is diagnostic text, not a stable enum. In particular this operation does
+not expose `definitelyAbsent` or certify a complete class catalog. Negative reads
+still retain the selected input guards so a later addition invalidates them.
+
+A found `runtimeClass` fact has these exact value fields:
+
+| Field | JSON type and meaning |
+| --- | --- |
+| `id` | Opaque string used as the next request's `classIdentity`. |
+| `internalName`, `originId` | Strings identifying the exact selected binary name and host origin. |
+| `contentSha256` | Lowercase 64-character hex string hashing the individual `.class` or `.sig` bytes, not the archive or projected JSON. |
+| `byteLength` | Integer: full executable class input length; zero for an API header. |
+| `authority` | `"runtime-bytecode"` or `"sdk-api-header"`. |
+| `codeAvailable` | Boolean: executable input bytes are available. This does not assert that every method has a Code attribute. |
+| `runtimeOnly` | `true` for runtime bytecode, `false` for an API header. |
+| `classHeader` | Typed fact containing the checked API header described below; runtime bytecode returns Unknown `MissingFacts`. |
+| `hierarchy` | Typed fact of `{superName, interfaces, accessFlags, signature}` for an API header; runtime bytecode returns Unknown `MissingFacts`. |
+| `runtimeAbiCoverage` | Found null for the selected runtime class; Unknown `MissingFacts` for an API header. This is not source/generated-output or catalog coverage. |
+| `sourceCurrent` | Always `{"state":"unknown","reasons":[{"code":"notSourceAuthority"}]}`. |
+
+The host's opaque `id` binds the evaluation/provider instance, selected scope, origin,
+name and content identity under the accepted model and input guards. No generation or
+LSP version field is added to this descriptor. Do not reconstruct a token from the
+display fields or reuse it across evaluations. Runtime bytes do not establish that
+compiled output matches current unsaved source; use source snapshots independently.
+
+For a selected lower-release SDK, the checked `ct.sym` `.sig` can instead return
+`authority:"sdk-api-header"`, `runtimeOnly:false`, `codeAvailable:false`,
+`byteLength:0`, and Unknown `runtimeAbiCoverage`. Its `contentSha256` still hashes the
+actual signature input. `classHeader` uses the existing raw ABI shape: `identity`
+(`originId`, `internalName`, `contentSha256`), integer `majorVersion`, `minorVersion`,
+`accessFlags`, nullable strings `superName`, `signature`, `sourceFile`, string arrays
+`interfaces` and `attributeNames`, plus `innerClasses`, `fields` and `methods` arrays.
+Each inner-class entry is `{inner, outer, name, accessFlags}` (`outer` and `name` may
+be null); each member is `{name, descriptor, accessFlags, signature, attributeNames}`
+with nullable `signature`. `hierarchy` projects the same superclass, interfaces,
+flags and generic signature. An oversized `classHeader` stays Unknown `MissingFacts`.
+The SDK reader rejects a `.sig` containing Code rather than granting executable
+authority. A class present only in the installed runtime but unavailable in the
+selected release is unavailable; it cannot fall through to a dependency definition.
+
+`{"op":"classBytes","classIdentity":"<id>"}` returns a typed fact whose found
+value is exactly `{classIdentity, offset, byteLength, bytesBase64, next}`. The first
+three fields are the same opaque string, integer byte offset and full integer length;
+`bytesBase64` is standard Base64 of up to 256 KiB of original bytes. `next` is an
+opaque continuation string or JSON null. Continue using the same `classIdentity`
+and `{"op":"classBytes","classIdentity":"<id>","after":"<next>"}` until null.
+Check every offset/length/identity and the reassembled full SHA-256 against the
+descriptor. Code, local-variable tables, annotations and other attributes are
+preserved in the bytes, without host-side rewriting. Foreign, stale or wrongly typed
+tokens/cursors are request errors; a cursor for another class cannot select bytes.
+An API-header token returns exactly
+`{"state":"unknown","reasons":[{"code":"BYTECODE_UNAVAILABLE","detail":"sdk-api-header"}]}`
+and does not schedule a raw-byte read. No empty successful byte stream substitutes
+for unavailable Code.
+
+The following examples show the actual serializer's field/envelope shapes, with
+illustrative lengths and angle-bracket placeholders; they are not captured fixtures.
+The first response describes a hypothetical 300000-byte runtime input:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"analysis/readFacts","params":{"evaluation":"<evaluation>","queries":[{"op":"runtimeClass","internalName":"app/Main"}]}}
+{"jsonrpc":"2.0","id":1,"result":{"facts":[{"state":"found","value":{
+  "id":"<class-id>","internalName":"app/Main","originId":"<host-origin>",
+  "contentSha256":"<64 lowercase hex characters>","byteLength":300000,
+  "authority":"runtime-bytecode","codeAvailable":true,"runtimeOnly":true,
+  "classHeader":{"state":"unknown","reasons":[{"code":"MissingFacts"}]},
+  "hierarchy":{"state":"unknown","reasons":[{"code":"MissingFacts"}]},
+  "runtimeAbiCoverage":{"state":"found","value":null},
+  "sourceCurrent":{"state":"unknown","reasons":[{"code":"notSourceAuthority"}]}
+}}]}}
+```
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"analysis/readFacts","params":{"evaluation":"<evaluation>","queries":[{"op":"classBytes","classIdentity":"<class-id>"}]}}
+{"jsonrpc":"2.0","id":2,"result":{"facts":[{"state":"found","value":{"classIdentity":"<class-id>","offset":0,"byteLength":300000,"bytesBase64":"<base64 of first 262144 bytes>","next":"<cursor>"}}]}}
+{"jsonrpc":"2.0","id":3,"method":"analysis/readFacts","params":{"evaluation":"<evaluation>","queries":[{"op":"classBytes","classIdentity":"<class-id>","after":"<cursor>"}]}}
+{"jsonrpc":"2.0","id":3,"result":{"facts":[{"state":"found","value":{"classIdentity":"<class-id>","offset":262144,"byteLength":300000,"bytesBase64":"<base64 of remaining 37856 bytes>","next":null}}]}}
+```
+
+SDK inventory, runtime directory/JAR reads, decoding and hashing run outside the
+workspace lock. The evaluation shares one runtime-scope lease and one selected-SDK
+lease, rather than creating a native watcher per class. Positive and negative reads
+join the normal resume/final-publication validation. Runtime/SDK replacement, directory
+membership changes, accepted model/source changes and provider lifecycle changes
+invalidate obsolete reads and their published facts. Reusing cached bytes requires
+the exact retained identity and current guards; an input change cannot certify old
+bytes as current or silently rebind an old handle.
+
+The class-file input bound is 16 MiB; one prepared multi-class byte read also retains
+at most 16 MiB. Existing 256-query batches, 16,384-handle limits, 512 KiB aggregate
+serialized fact-response budget and 1 MiB JSON body frame limit still apply. Split
+oversized batches on the existing recoverable response-budget error. Stream quotas
+are **separate** from the 64 ordinary metadata batches per evaluation: each validated
+`classBytes` or `resourceSnapshot` query with `after` consumes one of 256 shared
+continuations. A continuation-only batch consumes no metadata batch; an initial read
+or mixed metadata/continuation batch still consumes one. Repeated valid cursors cost
+quota again, and failed prepared reads do not refund reservations. The shared stream
+budget is 64 MiB of actual serialized JSON-RPC reply bodies for batches containing
+continuations, including their envelopes/errors, excluding Content-Length framing;
+it is not a decoded-byte allowance. Thus a 16 MiB class can complete its 64 chunks
+without consuming 64 metadata batches. Resource payload-cache bounds are separate.
+
+Existing regression coverage is in `runtime_class_tests`, `sdk_api_header_wire_tests`
+and `stream_quota_tests` in `crates/ktlsp/src/extension_ipc.rs`, with ordered-reader
+controls in `runtime_bytes.rs` and selected full/lower-release SDK controls in
+`sdk_runtime.rs`. The independent consumer is
+`dev/external-extension/src/bin/ipc-child.rs` (`--host-inputs`), exercised by the
+existing `corpus` harness route, `ipc-probes.lua` and `host-inputs-manifest.json`.
+The [README host-input recipe](../../README.md) and
+[current acceptance record](../fork-current.md) retain the actual immutable62
+194/194 semantic-check producer/consumer result, including independent JDK21 jmod,
+dependency-JAR and compiled-application byte hashes. That editor run did not exercise
+the header-only SDK branch; its focused SDK checks are separate evidence. There is
+no new runtime-class golden-frame fixture or claim of Minecraft runtime/remapping parity.
