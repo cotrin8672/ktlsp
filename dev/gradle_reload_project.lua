@@ -75,6 +75,12 @@ tasks.register('fakeJdkSources', Jar) {
     archiveFileName = 'fake-jdk-src.zip'
 }
 tasks.register('fixtureJars') { dependsOn(published, 'fakeJdkSources') }]=])
+  if vim.env.KTLSP_IPC_MODE == 'binary-annotations' then
+    local directory = root .. '/build/binary-annotation-fixture/annotationfixture'
+    vim.fn.mkdir(directory, 'p')
+    assert(vim.uv.fs_copyfile(repo .. '/crates/ktcore/tests/fixtures/classfile/annotationfixture/CustomPoint.class',
+      directory .. '/CustomPoint.class'))
+  end
   write(root .. '/build/fake-jdk-src/java/lang/Object.java', 'package java.lang;\npublic class Object { }\n')
   for _, version in ipairs({ '1.0', '2.0' }) do
     local suffix = version == '1.0' and 'V1' or 'V2'
@@ -120,6 +126,21 @@ function M.phase(root, phase)
   local deps = phase == 3 and '' or "    implementation 'fixture.reload:versioned:" .. version .. "'\n"
   if phase == 0 and vim.env.KTLSP_IPC_MODE == 'jvm-catalog' then
     deps = deps .. "    compileOnly files(rootProject.file('home/.m2/repository/fixture/reload/versioned/2.0/versioned-2.0.jar'))\n"
+  end
+  if phase == 0 and vim.env.KTLSP_IPC_MODE == 'binary-annotations' then
+    -- Keep the V1 API selected; the annotation input must not also introduce V2's Versioned class.
+    local build = root .. '/build.gradle'
+    if not table.concat(vim.fn.readfile(build), '\n'):find("tasks.register('jarBinaryAnnotationFixture'", 1, true) then
+      vim.fn.writefile(vim.split([=[
+tasks.register('jarBinaryAnnotationFixture', Jar) {
+    from(layout.projectDirectory.dir('build/binary-annotation-fixture'))
+    destinationDirectory = layout.buildDirectory.dir('binary-annotation-jars')
+    archiveFileName = 'annotationfixture.jar'
+}
+tasks.named('fixtureJars') { dependsOn('jarBinaryAnnotationFixture') }
+]=], '\n', { plain = true }), build, 'a')
+    end
+    deps = deps .. "    compileOnly files(rootProject.file('build/binary-annotation-jars/annotationfixture.jar'))\n"
   end
   if phase == 1 or phase == 2 then deps = deps .. "    implementation 'fixture.reload:added:1.0'\n" end
   write(root .. '/modules/editing/build.gradle', [=[plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0'; id 'java' }

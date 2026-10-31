@@ -106,6 +106,12 @@ fn is_java_path(key: &str) -> bool {
     SourceLanguage::for_key(key).is_java()
 }
 
+#[derive(Debug)]
+struct ProjectInputOverlayGuard(Arc<std::sync::atomic::AtomicBool>);
+impl ktcore::extensions::HostInputGuard for ProjectInputOverlayGuard {
+    fn is_current(&self)->bool {!self.0.load(std::sync::atomic::Ordering::Acquire)}
+}
+
 pub struct Workspace {
     _drop_start_marker: WorkspaceDropMarker,
     pub index: Index,
@@ -943,6 +949,23 @@ impl Workspace {
             else {match model.resource_owner_context(Path::new(&owner)) {
                 ktcore::knowledge::Knowledge::Found(context)=>context.scope,_=>return None,
             }};
+        self.begin_ipc_resource_capture_for_scope(evaluation,scope)
+    }
+
+    pub(crate) fn begin_ipc_resource_captures(&mut self,evaluation:u64,whole_project:bool)
+        ->Vec<crate::resource_inputs::ResourceCapturePlan> {
+        if !whole_project {return self.begin_ipc_resource_capture(evaluation).into_iter().collect();}
+        if self.project_refresh_pending {return Vec::new();}
+        let Some(owner)=self.analysis_extensions.ipc_resource_owner(evaluation).map(str::to_owned) else {return Vec::new();};
+        let scopes=self.project_model.as_ref().map_or_else(Vec::new,|model|model.extension_project_scopes(Path::new(&owner)));
+        if scopes.len()>1024 {return Vec::new();}
+        scopes.into_iter().filter_map(|scope|self.begin_ipc_resource_capture_for_scope(evaluation,scope)).collect()
+    }
+
+    fn begin_ipc_resource_capture_for_scope(&mut self,evaluation:u64,scope:ProjectScope)
+        ->Option<crate::resource_inputs::ResourceCapturePlan> {
+        if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) {return None;}
+        let model=self.project_model.as_ref()?.clone();
         if let Some(catalog)=self.resource_catalogs.get(&scope).filter(|catalog|
             Arc::ptr_eq(&catalog.model,&model) && catalog.guard.is_current()).cloned() {
             let _=self.analysis_extensions.attach_ipc_resource_catalog(&self.index,evaluation,catalog);
@@ -951,8 +974,11 @@ impl Workspace {
         let source=model.source_set_for_scope(&scope)?;
         let module=model.modules.iter().find(|module|module.source_sets.iter().any(|candidate|std::ptr::eq(candidate,source)))?;
         let runtime=source.runtime.as_ref().filter(|runtime|runtime.usable());
-        let mut directory_inputs:BTreeSet<_>=source.resources.iter().flat_map(|claims|claims.output_roots.iter()).cloned().collect();
-        if let Some(runtime)=runtime {directory_inputs.extend(runtime.class_outputs.iter().cloned());}
+        // A selected test classpath can inherit an absent, empty main output directory.
+        let directory_inputs:BTreeSet<_>=module.source_sets.iter().flat_map(|candidate|
+            candidate.resources.iter().filter(|claims|claims.valid()).flat_map(|claims|claims.output_roots.iter())
+                .chain(candidate.runtime.iter().filter(|runtime|runtime.usable()).flat_map(|runtime|runtime.class_outputs.iter()))
+        ).cloned().collect();
         Some(crate::resource_inputs::ResourceCapturePlan {
             evaluation,generation:self.analysis_generation,model:model.clone(),scope,claims:source.resources.clone(),
             compile_classpath:source.entries.clone(),runtime_classpath:runtime.map(|runtime|runtime.classpath.clone()),
@@ -1020,18 +1046,23 @@ impl Workspace {
         (!capture.expected.is_empty()).then_some(capture)
     }
 
-    pub(crate) fn begin_ipc_source_capture(&self, evaluation: u64, owner: &str) -> Option<IpcSourceCapture> {
+    pub(crate) fn begin_ipc_source_capture(&self,evaluation:u64,owner:&str)->Option<IpcSourceCapture> {
+        self.begin_ipc_project_source_capture(evaluation,owner,false)
+    }
+    pub(crate) fn begin_ipc_project_source_capture(&self,evaluation:u64,owner:&str,whole_project:bool)->Option<IpcSourceCapture> {
         if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) { return None; }
         let model = self.project_model.as_ref()?;
         let context = model.extension_project_context(Path::new(owner))?;
         let mut expected = BTreeMap::new();
-        for path in context.source.compiler_tasks.iter().flat_map(|task| &task.source_files) {
+        let selected:Vec<_>=if whole_project {model.extension_project_module(Path::new(owner))?.source_sets.iter().collect()}
+            else {vec![context.source]};
+        for path in selected.iter().flat_map(|source|&source.compiler_tasks).flat_map(|task|&task.source_files) {
             if !matches!(path.extension().and_then(|extension| extension.to_str()), Some("java" | "kt")) { continue; }
             let key = crate::paths::file_key(path);
             if self.open_docs.contains_key(&key) || self.analysis_extensions.source_input_identity(&key).is_some() { continue; }
             let Some(origin) = self.index.file_origin(&key) else { continue; };
             if origin.representation != ktcore::project_model::SourceRepresentation::Source
-                || origin.project_scope.as_ref() != Some(&context.scope)
+                || (!whole_project && origin.project_scope.as_ref() != Some(&context.scope))
                 || model.file_origin(path).as_ref() != Some(origin) { continue; }
             let (Some(stamp), Some(content)) = (self.source_stamps.get(&key), self.source_contents.get(&key)) else { continue; };
             expected.insert(key, (*stamp, *content, origin.clone()));
@@ -1080,6 +1111,19 @@ impl Workspace {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        if method=="analysis/readFacts" && params["queries"].as_array().is_some_and(|queries|
+            queries.iter().any(|query|query["op"]=="projectInputs")) {
+            self.analysis_extensions.observe_ipc_project_inputs(&self.index,evaluation,
+                Arc::new(ProjectInputOverlayGuard(self.resource_overlay_epoch.clone())))?;
+        }
+        let index_state=serde_json::json!({"state":"found","value":{
+            "analysisGeneration":self.analysis_generation,"completedAnalysisGeneration":self.completed_analysis_generation,
+            "indexRevision":self.index_revision,"projectRefreshPending":self.project_refresh_pending,
+            "projectScanComplete":self.completeness.project_scan_complete,
+            "libraryIndexComplete":self.completeness.library_index_complete,"jdkIndexComplete":self.completeness.jdk_index_complete,
+            "counts":{"domain":"workspace-accepted-unique-inputs","projectSourceFiles":self.project_file_meta.len(),
+                "completedDependencyOrigins":self.completed_dependency_origins.len(),"liveDependencyOrigins":self.live_dependency_origins.len()}}});
+        self.analysis_extensions.set_ipc_project_index(evaluation,index_state);
         let revision = self.analysis_extensions.revision();
         let result = self
             .analysis_extensions
@@ -5016,6 +5060,61 @@ fn is_generated_source_file(root: &Path, path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_resource_inventory_accepts_inherited_empty_main_output_but_not_missing_jar() {
+        use crate::classpath::{ModuleClasspath,ProjectSnapshot,RuntimeClassInputs,SourceSetClasspath};
+        use crate::resource_model::ResourceClaims;
+        let root=unique_tmp("test-resource-empty-main-output");
+        let main_sources=root.join("src/main/kotlin");
+        std::fs::create_dir_all(&main_sources).unwrap();
+        let main_output=root.join("build/resources/main");
+        let test_output=root.join("build/resources/test");
+        let test_classes=root.join("build/classes/java/test");
+        let claims=|output:std::path::PathBuf|ResourceClaims {adapter:"gradle-source-set-resources-v1".into(),
+            roots:vec![],trees:vec![],files:vec![],output_roots:vec![output],configuration_inputs:vec![],
+            default_excludes:vec![],complete:true,problem:None};
+        let main=SourceSetClasspath {name:"main".into(),source_roots:vec![main_sources.clone()],
+            resources:Some(claims(main_output.clone())),..Default::default()};
+        let test=SourceSetClasspath {name:"test".into(),source_roots:vec![root.join("src/test/java")],
+            resources:Some(claims(test_output.clone())),entries:vec![main_output.clone()],
+            runtime:Some(RuntimeClassInputs {adapter:"gradle-runtime-class-inputs-v1".into(),
+                classpath:vec![test_classes.clone(),test_output,main_output.clone()],class_outputs:vec![test_classes],
+                complete:true,problem:None}),..Default::default()};
+        let model=Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {module:":app".into(),project_dir:root.clone(),
+            build:String::new(),source_sets:vec![main,test],entries:vec![],unresolved:vec![]}]));
+        let owner=crate::paths::file_key(&main_sources.join("Owner.kt"));
+        let mut ws=Workspace::new();ws.set_project_model(model.clone());ws.open(owner.clone(),"class Owner".into());
+        ws.register_ipc_provider_commands("test.resources",vec!["not-spawned".into()],vec!["fixture.echo".into()]).unwrap();
+        let work=ws.begin_provider_command("test.resources",&owner,"fixture.echo".into(),vec![],serde_json::json!({})).unwrap();
+        let mut scope=model.extension_project_context(Path::new(&owner)).unwrap().scope;scope.source_set="test".into();
+        #[derive(Debug)] struct Current;
+        impl ktcore::extensions::HostInputGuard for Current {fn is_current(&self)->bool {true}}
+        let capture=|plan:crate::resource_inputs::ResourceCapturePlan| {
+            let inputs:Vec<_>=plan.compile_classpath.iter().chain(plan.runtime_classpath.iter().flatten())
+                .chain(plan.claims.iter().flat_map(|claims|&claims.output_roots)).cloned().collect();
+            let read_coverage=crate::compiled_watch::WatchPlan::read_inputs(&inputs).unwrap();
+            crate::resource_inputs::ResourceCatalog::prepare(crate::resource_inputs::ResourceSelection {
+                model:plan.model,scope:plan.scope,claims:plan.claims,compile_classpath:plan.compile_classpath,
+                runtime_classpath:plan.runtime_classpath,runtime_complete:plan.runtime_complete,
+                classpath_complete:plan.classpath_complete,directory_inputs:plan.directory_inputs,
+                configuration_base:plan.configuration_base,overlays:plan.overlays,guard:Arc::new(Current),read_coverage,
+            })
+        };
+        let plan=ws.begin_ipc_resource_capture_for_scope(work.evaluation,scope.clone()).unwrap();
+        assert_eq!(plan.compile_classpath,vec![main_output.clone()]);
+        assert!(!main_output.exists(),"the LSP must not build empty output directories");
+        let catalog=capture(plan);
+        assert!(catalog.complete,"{:?}",catalog.problems);
+        assert!(catalog.entries.is_empty());
+        let mut plan=ws.begin_ipc_resource_capture_for_scope(work.evaluation,scope).unwrap();
+        plan.compile_classpath.push(root.join("missing-dependency.jar"));
+        let missing=capture(plan);
+        assert!(!missing.complete);
+        assert!(missing.problems.contains(&"unavailable-resource-classpath-entry"));
+        assert!(!main_output.exists());
+        drop(missing);drop(catalog);drop(ws);std::fs::remove_dir_all(root).unwrap();
+    }
+
     const IMPLEMENT_INTERFACE_ACTION_TITLE: &str = "Implement missing methods";
 
     // Explicit unit-test inventory, not a claim that source-only fixtures have a selected SDK.
@@ -5087,7 +5186,7 @@ mod tests {
                 interfaces: Vec::new(),
                 signature: None,
                 source_file: None,
-                attribute_names: Vec::new(),
+                attribute_names: Vec::new(), annotations: Vec::new(),
                 inner_classes: Vec::new(),
                 fields: Vec::new(),
                 methods: Vec::new(),
@@ -6878,7 +6977,7 @@ mod tests {
                 interfaces: Vec::new(),
                 signature: None,
                 source_file: None,
-                attribute_names: Vec::new(),
+                attribute_names: Vec::new(), annotations: Vec::new(),
                 inner_classes: Vec::new(),
                 fields: Vec::new(),
                 methods: Vec::new(),
@@ -9628,16 +9727,32 @@ impl Workspace {
         let dependency_compilation = (compiler_sources_supported && kotlin_producers.is_empty())
             .then(|| Self::kotlin_dependency_compilation(&model, task, &dependency_overlays))
             .flatten();
-        if kotlin_producers.is_empty() && dependency_compilation.is_none() && task.classpath.iter().any(|read|
-            !read.exists() && model.modules.iter().flat_map(|m| &m.source_sets).any(|producer|
-                producer.provided_artifacts.iter().any(|artifact|
-                    crate::paths::file_key(artifact) == crate::paths::file_key(read)))) {
-            return Err("project-kotlin-producer-closure-unhandled");
-        }
         let java_dependency_sources = if compiler_sources_supported
             && kotlin_producers.is_empty() && dependency_compilation.is_none() {
             self.kotlin_java_dependency_sources(&model, task, &dependency_overlays, &visible_origins)
         } else { BTreeSet::new() };
+        if kotlin_producers.is_empty() && dependency_compilation.is_none() && task.classpath.iter().any(|read| {
+            if read.exists() { return false; }
+            let owners: Vec<_> = model.modules.iter().flat_map(|module| &module.source_sets)
+                .filter(|producer| producer.provided_artifacts.iter().any(|artifact|
+                    crate::paths::file_key(artifact) == crate::paths::file_key(read))).collect();
+            let [owner] = owners.as_slice() else { return !owners.is_empty(); };
+            let [java] = owner.compiler_tasks.as_slice() else { return true; };
+            if java.language != CompilerLanguage::Java { return true; }
+            let selected: BTreeSet<_> = java.source_files.iter().map(|path| crate::paths::file_key(path)).collect();
+            if selected.is_empty() || selected.len() != java.source_files.len() { return true; }
+            // Capture dirty unsupported Java wires only; the compiler's overlay boundary stays Unverified.
+            if !compiler_sources_supported {
+                return selected.iter().any(|key| !dependency_overlays.iter()
+                    .any(|overlay| overlay.key.ends_with(".java") && &overlay.key == key
+                        && self.source_contents.get(key) != Some(&overlay.text_sha256)));
+            }
+            // Header admission already checked the unique artifact, visibility, task/CP and processor policy.
+            // An absent binary is covered only when every selected Java source has that proof.
+            !selected.is_subset(&java_dependency_sources)
+        }) {
+            return Err("project-kotlin-producer-closure-unhandled");
+        }
         let generation = *self.kotlin_source_generations.get(&scope).unwrap_or(&0);
         if self
             .kotlin_diagnostic_reports
@@ -10525,6 +10640,78 @@ mod kotlin_diagnostic_lifecycle_tests {
             "an explicit framework provider blocks the route even without published contributions");
         ws.close(&dependency);
         assert!(next.check_live().is_err());
+    }
+
+    #[test]
+    fn missing_java_artifact_requires_complete_exact_header_coverage() {
+        use crate::classpath::{ModuleClasspath, ProjectSnapshot, SourceSetClasspath};
+        let (mut ws, editor, _, _) = fixture();
+        let mut modules = ws.project_model.as_ref().unwrap().modules.clone();
+        let root = modules[0].project_dir.join("header-coverage-dependency");
+        let first = crate::paths::file_key(&root.join("src/First.java"));
+        let second = crate::paths::file_key(&root.join("src/Second.java"));
+        let artifact = root.join("missing-header-coverage.jar");
+        assert!(!artifact.exists(), "header admission must not manufacture the selected binary");
+        let mut java = crate::compile::observed_test_request(&root).task.clone();
+        java.source_files = vec![std::path::PathBuf::from(&first), std::path::PathBuf::from(&second)];
+        java.classpath = modules[0].source_sets[0].compiler_tasks[0].classpath.clone();
+        modules[0].source_sets[0].compiler_tasks[0].classpath.push(artifact.clone());
+        modules[0].source_sets[0].entries = modules[0].source_sets[0].compiler_tasks[0].classpath.clone();
+        modules.push(ModuleClasspath {
+            module: ":header-coverage-dependency".into(), project_dir: root.clone(), build: ":".into(),
+            source_sets: vec![SourceSetClasspath {
+                name: "main".into(), source_roots: vec![root.join("src")],
+                compiler_tasks: vec![java], provided_artifacts: vec![artifact.clone()],
+                ..Default::default()
+            }], entries: Vec::new(), unresolved: Vec::new(),
+        });
+        let model = Arc::new(ProjectSnapshot::new(modules));
+        ws.set_project_model(model.clone());
+        ws.open(first.clone(), "class First { int firstApi; }".into());
+        assert_eq!(ws.begin_kotlin_diagnostics(&editor).err(), Some("project-kotlin-producer-closure-unhandled"),
+            "one admitted header cannot cover another selected source");
+        ws.open(second.clone(), "class Second { int secondApi; }".into());
+        let request = ws.begin_kotlin_diagnostics(&editor).unwrap();
+        assert_eq!(request.java_dependency_sources, BTreeSet::from([first.clone(), second]));
+        assert!(request.kotlin_producers.is_empty() && request.dependency_compilation.is_none());
+        assert!(!artifact.exists());
+        struct HeaderCoverageProvider;
+        impl crate::analysis_extensions::AnalysisProvider for HeaderCoverageProvider {
+            fn id(&self) -> &str { "header-coverage-counter" }
+            fn analyze(&self, _: &mut ktcore::extensions::ReadSession<'_>)
+                -> Result<(), ktcore::extensions::ContractError> { Ok(()) }
+        }
+        ws.analysis_extensions = crate::analysis_extensions::AnalysisExtensions::new(vec![Arc::new(HeaderCoverageProvider)]);
+        assert!(ws.begin_kotlin_diagnostics(&editor).unwrap().java_dependency_sources.is_empty(),
+            "unsupported dirty wires carry no header authority");
+        let digest = request.dependency_overlays.iter().find(|overlay| overlay.key == first).unwrap().text_sha256;
+        let previous = ws.source_contents.insert(first.clone(), digest);
+        assert_eq!(ws.begin_kotlin_diagnostics(&editor).err(), Some("project-kotlin-producer-closure-unhandled"),
+            "an unchanged unsupported overlay cannot cover an absent artifact");
+        match previous {
+            Some(digest) => { ws.source_contents.insert(first, digest); }
+            None => { ws.source_contents.remove(&first); }
+        }
+        ws.analysis_extensions = crate::analysis_extensions::AnalysisExtensions::new(Vec::new());
+        for fault in ["duplicate-source", "ambiguous-artifact", "mixed-kotlin-owner", "uncovered-artifact"] {
+            let mut modules = model.modules.clone();
+            match fault {
+                "duplicate-source" => {
+                    let java = &mut modules[1].source_sets[0].compiler_tasks[0];
+                    java.source_files.push(java.source_files[0].clone());
+                }
+                "ambiguous-artifact" => modules[0].source_sets[1].provided_artifacts.push(artifact.clone()),
+                "mixed-kotlin-owner" => modules[1].source_sets[0].compiler_tasks.push(crate::compile::kotlin_test_request(&root).task),
+                "uncovered-artifact" => {
+                    let missing = root.join("another-owner.jar");
+                    modules[0].source_sets[0].compiler_tasks[0].classpath.push(missing.clone());
+                    modules[0].source_sets[1].provided_artifacts.push(missing);
+                }
+                _ => unreachable!(),
+            }
+            ws.set_project_model(Arc::new(ProjectSnapshot::new(modules)));
+            assert_eq!(ws.begin_kotlin_diagnostics(&editor).err(), Some("project-kotlin-producer-closure-unhandled"), "{fault}");
+        }
     }
 
     fn fixture() -> (Workspace, String, String, String) {

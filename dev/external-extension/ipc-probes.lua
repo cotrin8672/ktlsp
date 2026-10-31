@@ -1,16 +1,18 @@
 return function(env)
-  if vim.env.KTLSP_IPC_MODE == 'provider-commands' then return dofile(env.repo .. '/dev/external-extension/command-probes.lua')(env) end
+  if vim.env.KTLSP_IPC_MODE == 'provider-commands' or vim.env.KTLSP_IPC_MODE == 'project-inputs'
+    or vim.env.KTLSP_IPC_MODE == 'binary-annotations' then return dofile(env.repo .. '/dev/external-extension/command-probes.lua')(env) end
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
   local client, check = env.client, env.check
   local linked = vim.env.KTLSP_IPC_MODE == 'linked'
   local host_inputs = vim.env.KTLSP_IPC_MODE == 'host-inputs'
   local catalog = vim.env.KTLSP_IPC_MODE == 'jvm-catalog'
   local locations = vim.env.KTLSP_IPC_MODE == 'source-locations'
+  local source_v2 = vim.env.KTLSP_IPC_MODE == 'source-facts-v2'
   local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots' or host_inputs
   local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts or catalog or locations
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
   local paths, buffers, originals = {}, {}, {}
-  local proof = { mode = locations and 'source-locations' or source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
+  local proof = { mode = source_v2 and 'source-facts-v2' or locations and 'source-locations' or source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
   local provider = linked and 'fixture.external-shadow' or 'fixture.ipc-shadow'
   local fresh_diagnostic = false
   local previous_diagnostics = client.handlers['textDocument/publishDiagnostics'] or vim.lsp.handlers['textDocument/publishDiagnostics']
@@ -54,6 +56,39 @@ return function(env)
     end
     proof.source_locations=proof.source_locations or {};proof.source_locations[label]=observed;save()
   end
+  local function source_facts_v2(label,evaluation)
+    local observed=vim.json.decode(table.concat(vim.fn.readfile(barrier..'/source-facts-'..evaluation..'.json'),'\n'))
+    local declaration=observed.rich
+    local text=probe.buffer_full_text(buffers.mixin)
+    local function slice(range) return text:sub(range.start+1,range['end']) end
+    check(label..' first evaluation reads negotiated source v2',observed.evaluation==evaluation and observed.ownerEvaluation==1
+      and observed.legacy.fullRange==nil and observed.legacy.modifiers==nil)
+    check(label..' source v2 has exact declaration ranges',slice(declaration.nameRange)=='sourceFactsProbe'
+      and slice(declaration.bodyRange)=='{}' and slice(declaration.headerRange):find('public static final void sourceFactsProbe()',1,true)~=nil)
+    local annotation=declaration.annotations[1]
+    check(label..' annotation name range is exact',slice(annotation.nameRange)=='SourceFactsExample')
+    local arguments=annotation.arguments
+    local mapped=arguments[1].value.value
+    check(label..' decoded literal concatenation has no false content range',mapped.kind=='mappedString'
+      and mapped.value=='tick()V' and mapped.contentRange==nil and #mapped.segments==7)
+    check(label..' decoded escape preserves whole source spelling',slice(mapped.segments[3].source)==[=[\u0063]=]
+      and mapped.segments[3].decoded.start==2 and mapped.segments[3].decoded['end']==3)
+    local nested=arguments[2].value.value.annotation
+    check(label..' nested annotation keeps exact name and full range',slice(nested.nameRange)=='SourceFactsAt'
+      and slice(nested.range):find('@SourceFactsAt(',1,true)==1)
+    check(label..' nested annotation contains useful target strings',nested.arguments[1].value.state=='found'
+      and nested.arguments[1].value.value.kind=='string' and nested.arguments[1].value.value.value=='INVOKE'
+      and nested.arguments[2].value.state=='found' and nested.arguments[2].value.value.kind=='string'
+      and nested.arguments[2].value.value.value=='Lpkg/C;m()V')
+    for i,name in ipairs({'fixture.SourceFactsExample','fixture.SourceFactsAt'}) do
+      check(label..' annotation type resolves through host facts '..name,observed.types[i].state=='found'
+        and observed.types[i].value.qualifiedName==name)
+    end
+    check(label..' nested ordinal is typed Int',vim.deep_equal(nested.arguments[3].value.value,{kind='integer',type='int',value=1}))
+    check(label..' long literal is typed Long',vim.deep_equal(arguments[3].value.value,{kind='integer',type='long',value=2}))
+    proof.source_facts_v2=proof.source_facts_v2 or {};proof.source_facts_v2[label]=observed;save()
+  end
+
   local function model_state()
     local requested, accepted
     local file = io.open(vim.env.KTLSP_TRACE, 'r')
@@ -188,6 +223,16 @@ return function(env)
     paths[key],originals[key] = path,vim.fn.readfile(path)
     if not (locations and key=='target') then attach(key) end
   end
+  if source_v2 then
+    vim.api.nvim_buf_set_lines(buffers.mixin, -1, -1, false, {
+      '@interface SourceFactsAt { String value(); String target(); int ordinal(); }',
+      '@interface SourceFactsExample { String method(); SourceFactsAt at(); long index(); }',
+      'class SourceFactsProbe {',
+      [=[  @SourceFactsExample(method="ti\u0063k" + "()V", at=@SourceFactsAt(value="INVOKE", target="Lpkg/C;m()V", ordinal=1), index=2L)]=],
+      '  public static final void sourceFactsProbe() {}',
+      '}',
+    })
+  end
   local empty_path, empty_buffer
   if source_facts then
     empty_path = env.project .. '/modules/editing/src/main/java/fixture/EmptySource.java'
@@ -222,6 +267,7 @@ return function(env)
       if facts then value.command[#value.command + 1] = '--project-facts' end
       if source_facts then value.command[#value.command + 1] = '--source-snapshots' end
       if locations then value.command[#value.command + 1] = '--source-locations' end
+      if source_v2 then value.command[#value.command + 1] = '--source-facts-v2' end
       if host_inputs then value.command[#value.command + 1] = '--host-inputs'; value.configuration.runtimeClasses={'java/util/List','vendor/Versioned','vendor/Added','app/Main'} end
       if catalog then value.command[#value.command + 1] = '--jvm-catalog' end
     end
@@ -234,6 +280,38 @@ return function(env)
   end
   if inputs then inputs.setup() end
   settings(true)
+  if source_v2 then
+    local ok, failure = xpcall(function()
+      local evaluation
+      local ready = vim.wait(30000, function()
+        local files = vim.fn.glob(barrier .. '/source-facts-*.json', false, true)
+        if #files == 0 then return false end
+        assert(#files == 1, 'source facts must succeed on the first owner evaluation')
+        evaluation = vim.json.decode(table.concat(vim.fn.readfile(files[1]), '\n')).evaluation
+        for _, line in ipairs(vim.fn.filereadable(vim.env.KTLSP_TRACE) == 1 and vim.fn.readfile(vim.env.KTLSP_TRACE) or {}) do
+          local decoded, event = pcall(vim.json.decode, line)
+          if decoded and event.name == 'extension.ipc.accepted' and event.args
+            and event.args.provider == provider and tostring(event.args.evaluation) == tostring(evaluation) then
+            proof.accepted = event.args
+            return true
+          end
+        end
+        return false
+      end, 25)
+      check('first negotiated source-facts evaluation is accepted by the host', ready)
+      assert(ready, 'source facts were not accepted on the first evaluation')
+      check('accepted source-facts evaluation matches the unsaved source bytes', proof.accepted.source_sha256 == vim.fn.sha256(probe.buffer_full_text(buffers.mixin)))
+      source_facts_v2('initial', evaluation)
+    end, debug.traceback)
+    settings(false)
+    for key, original in pairs(originals) do
+      vim.api.nvim_buf_set_lines(buffers[key], 0, -1, false, original)
+      vim.bo[buffers[key]].modified = false
+    end
+    deliver(); client.handlers['textDocument/publishDiagnostics'] = previous_diagnostics; save()
+    if not ok then error(failure) end
+    return
+  end
   if catalog then
     local denial, rejected, exited, published
     local ready = vim.wait(15000, function()

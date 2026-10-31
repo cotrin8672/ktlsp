@@ -3118,13 +3118,158 @@ fn k2_platform_origin_rejects_release_and_patched_system_modules() {
     assert!(configured_recipe(&request).is_err());
 }
 
+fn selected_captured_gradle982_fragment_profile(original: &mut KotlinDiagnosticRequest) {
+    let runtime = original.task.kotlin_compiler.as_mut().unwrap();
+    runtime.compiler_version = "2.2.21".into();
+    runtime.gradle_plugin_version = "2.2.21".into();
+    runtime.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+    let target = original.task.arguments.iter().position(|argument| argument == "-jvm-target").unwrap() + 1;
+    original.task.arguments[target] = "1.8".into();
+    original.task.arguments.extend(["-language-version", "2.1", "-api-version", "2.1",
+        "-Xmulti-platform", "-Xexpect-actual-classes", "-Xfragments=jvmTest,commonTest",
+        "-Xfragment-refines=jvmTest:commonTest"].map(str::to_owned));
+    let roles: Vec<_> = original.task.source_files.iter()
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("kt"))
+        .map(|path| format!("jvmTest:{}", path.display())).collect();
+    original.task.arguments.push(format!("-Xfragment-sources={}", roles.join(",")));
+    original.task.options.insert("kotlinFragmentSourceRoles".into(), json!({
+        "adapter":"kgp-2.2.21-jvm-fragment-sources-v1", "task":original.task.task,
+        "fragments":["jvmTest","commonTest"], "refines":["jvmTest:commonTest"], "sources":roles,
+    }));
+    for task in [&mut original.task, original.java_task.as_mut().unwrap()] {
+        task.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!("gradle-9.8.2-stock-actions-v1");
+        task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] =
+            json!("org.gradle.api.internal.project.taskfactory.IncrementalTaskAction");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!("gradle-9.8.2-stock-onlyif-v1");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"] =
+            json!("org.gradle.api.internal.tasks.execution.SelfDescribingSpec");
+    }
+}
+
+fn selected_captured_gradle982_release8(request: &mut KotlinDiagnosticRequest) {
+    selected_captured_legacy_profile(request, true);
+    let mut recipe = request.java_task.as_ref().unwrap().java_compiler_recipe().unwrap();
+    recipe.adapter = "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1".into();
+    recipe.language_version = "21".into();
+    recipe.java_runtime_version = "21.0.4+7-LTS".into();
+    recipe.gradle_java_version = "21.0.4".into();
+    set_recipe(request, recipe);
+    selected_captured_gradle982_fragment_profile(request);
+    request.task.arguments.push("-Xjdk-release=8".into());
+    // Argument-admission fixtures read SDK release/ct.sym metadata without launching a compiler.
+    let sdk = &request.task.kotlin_compiler.as_ref().unwrap().gradle_java_home;
+    std::fs::create_dir_all(sdk.join("lib")).unwrap();
+    std::fs::write(sdk.join("release"), "JAVA_VERSION=\"21.0.4\"\n").unwrap();
+    std::fs::write(sdk.join("lib/ct.sym"), b"selected release8 fixture input").unwrap();
+}
+
+#[test]
+fn captured_gradle982_kmp_fragment_contract_requires_exact_roles_and_stock_tasks() {
+    let root = std::env::temp_dir().join("ktlsp-gradle982-kmp-contract");
+    let mut original = request(&root);
+    selected_captured_gradle982_fragment_profile(&mut original);
+    original.java_task.as_mut().unwrap().options.remove("javaCompilerRecipe");
+    let supported = |request: &KotlinDiagnosticRequest| selected_tasks_supported_reason(
+        &request.task, request.java_task.as_ref().unwrap(),
+        &[request.task.clone(), request.java_task.as_ref().unwrap().clone()]);
+    assert_eq!(supported(&original), Ok(()));
+    assert!(configured_recipe(&original).is_err(), "source admission cannot invent the missing Java recipe");
+    for fault in ["compiler", "plugin", "build-api", "strategy", "daemon-options", "language", "api", "target",
+        "duplicate-language", "missing-roles", "foreign-roles", "missing-source", "duplicate-source", "scalar-mismatch",
+        "unknown-fragment-input", "cycle", "incomplete", "kotlin-action", "java-action", "java-method", "java-parameters",
+        "extra-action", "kotlin-predicate", "java-predicate", "predicate-class", "extra-predicate", "gradle980", "gradle93"] {
+        let mut changed = original.clone();
+        let java = changed.java_task.as_mut().unwrap();
+        match fault {
+            "compiler" => changed.task.kotlin_compiler.as_mut().unwrap().compiler_version = "2.2.20".into(),
+            "plugin" => changed.task.kotlin_compiler.as_mut().unwrap().gradle_plugin_version = "2.2.20".into(),
+            "build-api" => changed.task.kotlin_compiler.as_mut().unwrap().run_via_build_tools_api = true,
+            "strategy" => changed.task.kotlin_compiler.as_mut().unwrap().execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::InProcess,
+            "daemon-options" => changed.task.kotlin_compiler.as_mut().unwrap().normalized_daemon_jvm_arguments.push("-Dopaque=true".into()),
+            "language" | "api" | "target" => {
+                let flag = match fault { "language" => "-language-version", "api" => "-api-version", _ => "-jvm-target" };
+                let index = changed.task.arguments.iter().position(|argument| argument == flag).unwrap() + 1;
+                changed.task.arguments[index] = "17".into();
+            }
+            "duplicate-language" => changed.task.arguments.extend(["-language-version", "2.1"].map(str::to_owned)),
+            "missing-roles" => { changed.task.options.remove("kotlinFragmentSourceRoles"); }
+            "foreign-roles" => changed.task.options.get_mut("kotlinFragmentSourceRoles").unwrap()["task"] = json!(":foreign:compileKotlin"),
+            "missing-source" => changed.task.source_files.retain(|source| source.extension().and_then(|e| e.to_str()) != Some("kt")),
+            "duplicate-source" => changed.task.source_files.push(root.join("src/Helper.kt")),
+            "scalar-mismatch" => changed.task.arguments.push("-Xfragments=unmodeled".into()),
+            "unknown-fragment-input" => changed.task.arguments.push("-Xfragment-dependencies=unmodeled.klib".into()),
+            "cycle" => {
+                changed.task.options.get_mut("kotlinFragmentSourceRoles").unwrap()["refines"] = json!(["jvmTest:commonTest", "commonTest:jvmTest"]);
+                *changed.task.arguments.iter_mut().find(|arg| arg.starts_with("-Xfragment-refines=")).unwrap() =
+                    "-Xfragment-refines=jvmTest:commonTest,commonTest:jvmTest".into();
+            }
+            "incomplete" => changed.task.complete = false,
+            "kotlin-action" => changed.task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] = json!("custom.Action"),
+            "java-action" => java.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] = json!("custom.Action"),
+            "java-method" => java.options.get_mut("taskActionInventory").unwrap()["actions"][0]["method"] = json!("customCompile"),
+            "java-parameters" => java.options.get_mut("taskActionInventory").unwrap()["actions"][0]["parameterTypes"] = json!([]),
+            "extra-action" => java.options.get_mut("taskActionInventory").unwrap()["actions"].as_array_mut().unwrap().push(json!({"class":"custom.Action"})),
+            "kotlin-predicate" => changed.task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["stockEnabledPredicate"] = json!(false),
+            "java-predicate" => java.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["stockEnabledPredicate"] = json!(false),
+            "predicate-class" => java.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"] = json!("custom.Predicate"),
+            "extra-predicate" => java.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"].as_array_mut().unwrap().push(json!({"class":"custom.Predicate"})),
+            "gradle980" | "gradle93" => {
+                let version = if fault == "gradle980" { "9.8.0" } else { "9.3.0" };
+                for task in [&mut changed.task, java] {
+                    task.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!(format!("gradle-{version}-stock-actions-v1"));
+                    task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!(format!("gradle-{version}-stock-onlyif-v1"));
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(supported(&changed), Err("selected-stock-task-contract-unhandled"), "{fault}");
+    }
+}
+
+#[test]
+fn captured_gradle982_release8_recipe_requires_actual_sdk_charset_and_options() {
+    let (_owner, mut original) = fixture();
+    selected_captured_gradle982_release8(&mut original);
+    assert!(configured_recipe(&original).is_ok());
+    assert_eq!(header_assets(&original).into_iter().map(|(name, _)| name).collect::<Vec<_>>(), ["JavacDiagnostics.java"],
+        "normal Kotlin output needs only the existing public Javac helper");
+    let mut saved = original.clone();
+    saved.overlays.clear();
+    assert!(configured_recipe(&saved).is_ok(), "closed producer sources may be saved files");
+    for fault in ["charset", "runtime", "sdk", "release", "source", "target", "encoding", "raw-args",
+        "options", "processor", "custom-action", "missing-role", "kotlin-release"] {
+        let mut changed = original.clone();
+        let task = changed.java_task.as_mut().unwrap();
+        let mut recipe = task.java_compiler_recipe().unwrap();
+        match fault {
+            "charset" => recipe.effective_charset = "windows-31j".into(),
+            "runtime" => recipe.java_runtime_version = "17.0.7+8".into(),
+            "sdk" => task.java_home = Some(changed.project_dir.join("different-sdk")),
+            "release" => { task.options.insert("release".into(), json!(17)); }
+            "source" => { task.options.insert("sourceCompatibility".into(), json!("17")); }
+            "target" => { task.options.insert("targetCompatibility".into(), json!("17")); }
+            "encoding" => { task.options.insert("encoding".into(), json!("UTF-8")); }
+            "raw-args" => task.arguments.push("-Xlint".into()),
+            "options" => recipe.api_options.push("-Xplugin:opaque".into()),
+            "processor" => task.annotation_processor_path.push(changed.project_dir.join("processor.jar")),
+            "custom-action" => task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] = json!("custom.Action"),
+            "missing-role" => { changed.task.options.remove("kotlinFragmentSourceRoles"); }
+            "kotlin-release" => changed.task.arguments.retain(|argument| argument != "-Xjdk-release=8"),
+            _ => unreachable!(),
+        }
+        changed.java_task.as_mut().unwrap().options.insert("javaCompilerRecipe".into(), serde_json::to_value(recipe).unwrap());
+        assert!(configured_recipe(&changed).is_err(), "{fault}");
+    }
+}
+
 // Native, baseline-compilable regression: the current helper compiles/runs but has no
 // methodCalls attribution facts. Explicitly run with the captured SDK17, never auto-skip.
 #[test]
 fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
-    for profile in [0, 1, 2] {
+    for profile in [0, 1, 2, 3] {
     let stock75_producers = profile == 1;
-    let kmp_producers = profile == 2;
+    let kmp_producers = profile == 2 || profile == 3;
+    let mixed_kmp_producers = profile == 3;
     let (owner, _) = fixture();
     let mut requests = Vec::new();
     let mut modules = Vec::new();
@@ -3133,7 +3278,7 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
         let root = owner.directory.join(name);
         let mut selected = request(&root);
         if stock75_producers { selected_captured_legacy_profile(&mut selected, false); }
-        if kmp_producers {
+        if kmp_producers && !mixed_kmp_producers {
             let runtime = selected.task.kotlin_compiler.as_mut().unwrap();
             runtime.compiler_version = "2.2.21".into();
             runtime.gradle_plugin_version = "2.2.21".into();
@@ -3152,11 +3297,12 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
         }
         selected.scope.module = format!(":{name}");
         selected.task.task = format!(":{name}:compileKotlin");
+        if mixed_kmp_producers { selected_captured_gradle982_release8(&mut selected); }
         selected.task.classpath.clear();
         let java = selected.java_task.as_mut().unwrap();
         java.task = format!(":{name}:compileJava");
         java.classpath = selected.task.output_roots.clone();
-        if name != "consumer" || kmp_producers {
+        if (name != "consumer" || kmp_producers) && !(mixed_kmp_producers && name == "mock") {
             selected.task.source_files.retain(|path| path.extension().and_then(|e| e.to_str()) == Some("kt"));
             selected.task.declared_input_files.retain(|path| path.extension().and_then(|e| e.to_str()) != Some("java"));
             java.source_files.clear();
@@ -3248,23 +3394,48 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
     let source = &mut consumer.dependency_overlays[0];
     *source = KotlinSourceOverlay::new(source.key.clone(), source.text.clone(), 2);
     assert_ne!(crate::compile::kotlin_producers::identity(&consumer).unwrap(), identity);
+    if mixed_kmp_producers {
+        let before = crate::compile::kotlin_producers::identity(&consumer).unwrap();
+        let java = consumer.dependency_overlays.iter_mut().find(|source| source.key.ends_with(".java")).unwrap();
+        *java = KotlinSourceOverlay::new(java.key.clone(), format!("{}\n// current Java API edit", java.text), 2);
+        assert_ne!(crate::compile::kotlin_producers::identity(&consumer).unwrap(), before);
+        for fault in ["missing-recipe", "foreign-java-source", "duplicate-java", "unknown-java-claims"] {
+            let mut changed = modules.clone();
+            let java = changed[0].source_sets[0].compiler_tasks.iter_mut()
+                .find(|task| task.language == crate::classpath::CompilerLanguage::Java).unwrap();
+            match fault {
+                "missing-recipe" => { java.options.remove("javaCompilerRecipe"); }
+                "foreign-java-source" => java.source_files.push(owner.directory.join("foreign.java")),
+                "duplicate-java" => java.source_files.push(java.source_files[0].clone()),
+                "unknown-java-claims" => { java.options.remove("sdkProducerClaims"); }
+                _ => unreachable!(),
+            }
+            let changed = ProjectSnapshot::new(changed);
+            assert!(crate::compile::kotlin_producers::capture(&changed, &changed.modules[3].source_sets[0],
+                &consumer.task, consumer.java_task.as_ref().unwrap()).is_none(), "{fault}");
+        }
+    }
     let mut bindings = BTreeMap::new();
     for (i, slot) in all_slots.iter().enumerate() {
         let output = owner.directory.join(format!("private-output-{i}"));
         std::fs::create_dir(&output).unwrap();
-        bindings.insert(kotlin_path_key(&crate::paths::file_key(slot)), output);
+        bindings.insert(kotlin_path_key(&crate::paths::file_key(slot)), vec![output]);
     }
     if kmp_producers {
         for plan in &consumer.kotlin_producers {
             let kt = plan.source.compiler_tasks.iter().find(|t| t.language == crate::classpath::CompilerLanguage::Kotlin).unwrap();
             let java = plan.source.compiler_tasks.iter().find(|t| t.language == crate::classpath::CompilerLanguage::Java).unwrap();
-            let private_kt = bindings[&kotlin_path_key(&crate::paths::file_key(&kt.output_roots[0]))].clone();
-            let private_java = bindings[&kotlin_path_key(&crate::paths::file_key(&java.output_roots[0]))].clone();
+            let private_kt = bindings[&kotlin_path_key(&crate::paths::file_key(&kt.output_roots[0]))][0].clone();
+            let private_java = bindings[&kotlin_path_key(&crate::paths::file_key(&java.output_roots[0]))][0].clone();
             bindings.extend(crate::compile::kotlin_producers::output_bindings(&consumer, plan, &private_kt, &private_java).unwrap());
+            for artifact in &plan.source.provided_artifacts {
+                assert_eq!(bindings[&kotlin_path_key(&crate::paths::file_key(artifact))],
+                    vec![private_kt.clone(), private_java.clone()], "a selected JAR binds both retained output roles");
+            }
         }
     }
     let covered = consumer.dependency_overlays.iter().map(|s| s.key.clone()).collect();
-    if kmp_producers {
+    if kmp_producers && !mixed_kmp_producers {
         let mut mixed = consumer.clone();
         mixed.java_task.as_mut().unwrap().source_files.push(mixed.project_dir.join("src/Main.java"));
         assert!(crate::compile::kotlin_producers::effective(&mixed, &bindings, &covered).err().expect("mixed Java must be rejected")
@@ -3284,7 +3455,7 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
         assert!(!effective.task.classpath.contains(slot));
         assert!(!effective.java_task.as_ref().unwrap().classpath.contains(slot));
     }
-    assert_eq!(effective.task.classpath.len(), if kmp_producers { 4 } else { 6 });
+    assert_eq!(effective.task.classpath.len(), if kmp_producers { 7 } else { 6 });
     let kotlin_cp = effective.task.arguments.iter().position(|arg| arg == "-classpath").unwrap() + 1;
     assert_eq!(effective.task.arguments[kotlin_cp], joined_classpath(&effective.task.classpath).unwrap());
     assert!(effective.dependency_overlays.is_empty());
@@ -3487,13 +3658,13 @@ fn plain_kotlin_member_namespace_rejects_implicit_apis_and_stale_java_ranges() {
     use ktcore::jvm::{ClassIdentity,InputIdentity};
     let member=|name:&str,descriptor:&str,flags|MemberFacts {
         name:Arc::from(name),descriptor:Arc::from(descriptor),access_flags:flags,
-        signature:None,attribute_names:vec![],
+        signature:None,attribute_names:vec![], annotations: Vec::new(),
     };
     let mut class=ClassFileFacts {
         identity:ClassIdentity {origin_id:"current-kotlin-header".into(),internal_name:"generated/KspKotlin".into(),input:InputIdentity::Binary {content_sha256:[7;32]}},
         major_version:52,minor_version:0,access_flags:0x31,super_name:Some(Arc::from("java/lang/Object")),
         interfaces:vec![],signature:None,source_file:Some(Arc::from("KspKotlin.kt")),
-        attribute_names:vec![],inner_classes:vec![],fields:vec![],
+        attribute_names:vec![], annotations: Vec::new(),inner_classes:vec![],fields:vec![],
         methods:vec![member("<init>","()V",1),member("versionTwo","()Ljava/lang/String;",0x11)],
     };
     let names=BTreeSet::from(["versionTwo".to_owned()]);

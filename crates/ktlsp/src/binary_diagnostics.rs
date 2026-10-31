@@ -354,9 +354,14 @@ impl ClassInventoryCache {
     }
 }
 
+fn annotation_weight(values: &Vec<ktcore::classfile::BinaryAnnotation>) -> usize {
+    values.capacity()*std::mem::size_of::<ktcore::classfile::BinaryAnnotation>()
+        + values.iter().map(|value|value.annotation.heap_size()).sum::<usize>()
+}
 fn class_weight(class: &ClassFileFacts) -> usize {
     let text = |value: &Arc<str>| value.len() + 2 * std::mem::size_of::<usize>();
     std::mem::size_of::<ClassFileFacts>()
+        + annotation_weight(&class.annotations)
         + class.identity.origin_id.capacity()
         + class.identity.internal_name.capacity()
         + class.fields.capacity() * std::mem::size_of::<ktcore::classfile::MemberFacts>()
@@ -377,7 +382,8 @@ fn class_weight(class: &ClassFileFacts) -> usize {
             .iter()
             .chain(&class.methods)
             .map(|member| {
-                text(&member.name)
+                annotation_weight(&member.annotations)
+                    + text(&member.name)
                     + text(&member.descriptor)
                     + member.attribute_names.capacity() * std::mem::size_of::<Arc<str>>()
                     + member

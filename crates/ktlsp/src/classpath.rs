@@ -30,7 +30,7 @@ const INIT_SCRIPT: &str = include_str!("../../../scripts/classpath-dump.init.gra
 static RESOLUTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SNAPSHOTS: LazyLock<Mutex<BTreeMap<String, Arc<ProjectSnapshot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-const MODEL_VERSION: u32 = 15;
+const MODEL_VERSION: u32 = 16;
 
 /// Gradle's resolved identity, independent of where an artifact happens to be cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +203,8 @@ impl CompilerTask {
                 "17"
             ) | ("gradle-9.6.1-current-jdk21-utf8-javac-api-v1", "21")
                 | (
-                    "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1",
+                    "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+                        | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1",
                     "21"
                 )
         ) && recipe.compiler_type
@@ -233,7 +234,8 @@ impl CompilerTask {
             "gradle-7.4.2-current-jdk17-javac-api-v1" => {
                 (&["-source", "17", "-target", "17"], &[], true)
             }
-            "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1" => {
+            "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+            | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1" => {
                 (&["--release", "8"], &[], false)
             }
             "gradle-7.5-current-jdk17-utf8-javac-api-v1" => match task.arguments.as_slice() {
@@ -368,8 +370,56 @@ impl RuntimeClassInputs {
     }
 }
 
+/// Observations from one Gradle dump invocation; caches retain the original capture.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradleProjectCapture {
+    pub identity: String,
+    pub captured_at_unix_ms: u64,
+    pub gradle_version: String,
+    pub build_identity: String,
+    pub source_sets: Vec<String>,
+    pub java_source_sets_complete: bool,
+    pub plugin_classes: Vec<String>,
+    pub kotlin_present: bool,
+    pub kotlin_source_sets: Option<Vec<GradleKotlinSourceSet>>,
+    pub kotlin_targets: Option<Vec<GradleKotlinTarget>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradleKotlinSourceSet {
+    pub name: String,
+    pub depends_on: Vec<String>,
+    pub source_roots: Vec<PathBuf>,
+    pub source_files: Vec<PathBuf>,
+    pub resource_roots: Vec<PathBuf>,
+    pub resource_files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradleKotlinTarget {
+    pub name: String,
+    pub platform_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradleSourceSetConfigurations {
+    pub compile_classpath: String,
+    pub runtime_classpath: String,
+    pub annotation_processor: String,
+    pub api_elements: String,
+    pub runtime_elements: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSetClasspath {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_capture: Option<GradleProjectCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configurations: Option<GradleSourceSetConfigurations>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<crate::resource_model::ResourceClaims>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -483,6 +533,64 @@ pub(crate) struct ExtensionProjectContext<'a> {
 }
 
 impl ProjectSnapshot {
+    /// Select through the already accepted owner, including the composite-build identity.
+    pub(crate) fn extension_project_module(&self, file: &Path) -> Option<&ModuleClasspath> {
+        if crate::language::SourceLanguage::for_project_path(file).is_some() {
+            let key=crate::paths::file_key(file);
+            let mut selected=self.modules.iter().filter(|module|module.source_sets.iter().any(|source|
+                source.compiler_tasks.iter().any(|task|task.source_files.iter().any(|path|crate::paths::file_key(path)==key))));
+            if let Some(module)=selected.next() {return selected.next().is_none().then_some(module);}
+            let scope=self.unique_source_origin(file)?.project_scope?;
+            let source=self.source_set_for_scope(&scope)?;
+            return self.modules.iter().find(|module|module.source_sets.iter().any(|candidate|std::ptr::eq(candidate,source)));
+        }
+        let context = self.extension_project_context(file)?;
+        self.modules.iter().find(|module| module.source_sets.iter().any(|source|
+            std::ptr::eq(source, context.source)))
+    }
+
+    pub(crate) fn extension_project_scopes(&self, file: &Path) -> Vec<ProjectScope> {
+        self.extension_project_module(file).into_iter().flat_map(|module|
+            module.source_sets.iter().map(move |source|project_scope(module,source))).collect()
+    }
+
+    /// Compiler selections and verified stock future policies establish membership, independently of ownership.
+    pub(crate) fn extension_source_memberships(&self, file: &Path, owner: &Path) -> Vec<ProjectScope> {
+        let key = crate::paths::file_key(file);
+        self.extension_project_module(owner).into_iter().flat_map(|module|
+            module.source_sets.iter().filter(|source|source.compiler_tasks.iter().any(|task|
+                task.source_files.iter().any(|path|crate::paths::file_key(path)==key)
+                || (task.complete && task.problem.is_none() && sdk_producer_roots(task).is_some_and(|(_,complete)|complete)
+                    && file.extension().and_then(|suffix|suffix.to_str()).and_then(|suffix|sdk_source_policy(task,source,suffix))
+                        .is_some_and(|policy|ktcore::index::CallerScopeVisibility {
+                            visibility:ScopeVisibility {scope:project_scope(module,source),ordered_origins:Vec::new()},
+                            suffix:if task.language==CompilerLanguage::Java {"java".into()} else {"kt".into()},
+                            source_files:BTreeSet::new(),authored_roots:policy.future_roots,
+                            generated_roots:policy.generated_roots,excluded_segments:policy.excluded_segments,
+                        }.matches_file(&key)))))
+                .map(move |source|project_scope(module,source))).collect()
+    }
+
+    pub(crate) fn extension_source_editable(&self,file:&Path,owner:&Path)->Option<bool> {
+        let key=crate::paths::file_key(file);
+        let source_module=self.extension_project_module(owner)?;
+        let mut decisions=BTreeSet::new();
+        for source in &source_module.source_sets {
+            for task in &source.compiler_tasks {
+                if (task.language==CompilerLanguage::Java && file.extension().and_then(|suffix|suffix.to_str())!=Some("java"))
+                    || (task.language==CompilerLanguage::Kotlin && file.extension().and_then(|suffix|suffix.to_str())!=Some("kt")) {continue;}
+                if !task.source_files.iter().any(|path|crate::paths::file_key(path)==key) {continue;}
+                let suffix=file.extension()?.to_str()?;
+                let policy=sdk_source_policy(task,source,suffix)?;
+                let generated=policy.generated_roots.iter().any(|root|key==*root || path_under_key(&key,root));
+                let authored=policy.authored_roots.iter().any(|root|key==*root || path_under_key(&key,root));
+                if !generated && !authored {return None;}
+                decisions.insert(!generated);
+            }
+        }
+        (decisions.len()==1).then(||*decisions.first().unwrap())
+    }
+
     /// Borrow the accepted selection; extensions do not rediscover roots or choose an SDK.
     pub(crate) fn extension_project_context(&self, file: &Path) -> Option<ExtensionProjectContext<'_>> {
         let Some((module, Some(source))) = self.owner_for(file)
@@ -1708,6 +1816,7 @@ fn sdk_inputs(task: &CompilerTask) -> Option<SdkInputs<'_>> {
     let (plugin_version, maximum_target) = match selection.adapter.as_str() {
         "kgp-1.8.21-jvm-sdk-options-v1" => ("1.8.21", 19),
         "kgp-1.9.25-jvm-sdk-options-v1" => ("1.9.25", 21),
+        "kgp-2.2.21-jvm-sdk-options-v1" => ("2.2.21", 24),
         _ => return None,
     };
     if task.language != CompilerLanguage::Kotlin
@@ -2230,6 +2339,9 @@ fn parse_dump_reader(
     let mut kotlin_compile_task_sources = std::collections::BTreeSet::new();
     let mut resource_input_sources = std::collections::BTreeSet::new();
     let mut runtime_input_sources = std::collections::BTreeSet::new();
+    let mut project_capture: Option<GradleProjectCapture> = None;
+    let mut capture_seen = false;
+    let mut configuration_sources = BTreeSet::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -2272,6 +2384,9 @@ fn parse_dump_reader(
                 kotlin_compile_task_sources.clear();
                 resource_input_sources.clear();
                 runtime_input_sources.clear();
+                project_capture = None;
+                capture_seen = false;
+                configuration_sources.clear();
                 anyhow::ensure!(
                     !require_complete || current.is_none(),
                     "nested PROJECT before matching END in classpath dump"
@@ -2302,8 +2417,19 @@ fn parse_dump_reader(
                     cur.build = build.to_string();
                 }
             }
+            Some("PROJECT_INPUTS") => {
+                let capture = parts.next().and_then(|json|serde_json::from_str::<GradleProjectCapture>(json).ok());
+                project_capture = if !capture_seen && parts.next().is_none() {
+                    capture.filter(|capture| !capture.identity.is_empty() && capture.captured_at_unix_ms > 0
+                        && !capture.gradle_version.is_empty() && capture.source_sets.len() <= 1024
+                        && capture.source_sets.iter().collect::<BTreeSet<_>>().len() == capture.source_sets.len()
+                        && capture.plugin_classes.len() <= 1024)
+                } else { None };
+                capture_seen = true;
+            }
             Some(
-                record @ ("RUNTIME_INPUTS"
+                record @ ("SOURCESET_CONFIGURATIONS"
+                | "RUNTIME_INPUTS"
                 | "RESOURCE_INPUTS"
                 | "SOURCESET"
                 | "SOURCE"
@@ -2349,6 +2475,16 @@ fn parse_dump_reader(
                             *artifacts = Some(Vec::new());
                             *incomplete = parts.next() != Some("complete");
                         }
+                        continue;
+                    }
+                    if record == "SOURCESET_CONFIGURATIONS" {
+                        let parsed = parts.next().and_then(|json|
+                            serde_json::from_str::<GradleSourceSetConfigurations>(json).ok());
+                        source.configurations = if configuration_sources.insert(name.to_owned()) && parts.next().is_none() {
+                            parsed.filter(|value|[&value.compile_classpath,&value.runtime_classpath,&value.annotation_processor,
+                                &value.api_elements,&value.runtime_elements].iter().all(|name|
+                                    !name.is_empty() && name.len() <= 4096 && !name.chars().any(char::is_control)))
+                        } else { None };
                         continue;
                     }
                     if record == "RESOURCE_INPUTS" {
@@ -2518,7 +2654,13 @@ fn parse_dump_reader(
                     );
                     anyhow::ensure!(line.ends_with('\n'), "unterminated END in classpath dump");
                 }
-                if let Some(done) = current.take() {
+                if let Some(mut done) = current.take() {
+                    if let Some(capture) = project_capture.take().filter(|capture| {
+                        let names: BTreeSet<_> = done.source_sets.iter().map(|source|source.name.as_str()).collect();
+                        names == capture.source_sets.iter().map(String::as_str).collect()
+                    }) {
+                        for source in &mut done.source_sets {source.project_capture=Some(capture.clone());}
+                    }
                     out.push(done);
                 }
             }
@@ -3396,6 +3538,36 @@ fn coordinate_from_gradle_cache_path(path: &Path) -> Option<Coordinate> {
     Coordinate::parse(&format!("{group}:{artifact}:{version}"))
 }
 
+
+#[cfg(test)]
+mod project_input_capture_tests {
+    use super::*;
+    #[test]
+    fn captures_model_identity_configurations_and_cache_provenance_without_legacy_defaults() {
+        let capture=serde_json::json!({"identity":"original-capture","captured_at_unix_ms":1234,
+            "gradle_version":"9.6.1","build_identity":":build","source_sets":["main","test"],"java_source_sets_complete":true,
+            "plugin_classes":["org.gradle.api.plugins.JavaPlugin"],"kotlin_present":false,
+            "kotlin_source_sets":null,"kotlin_targets":null});
+        let configurations=serde_json::json!({"compile_classpath":"compileClasspath","runtime_classpath":"runtimeClasspath",
+            "annotation_processor":"annotationProcessor","api_elements":"apiElements","runtime_elements":"runtimeElements"});
+        let dump=format!("PROJECT\t:app\t/project\nBUILD\t:build\nPROJECT_INPUTS\t{capture}\nSOURCESET\tmain\nSOURCESET_CONFIGURATIONS\tmain\t{configurations}\nSOURCESET\ttest\nEND\t:app\n");
+        let modules=parse_dump(&dump);
+        assert_eq!(modules[0].source_sets[0].project_capture.as_ref().unwrap().identity,"original-capture");
+        assert_eq!(modules[0].source_sets[1].project_capture,modules[0].source_sets[0].project_capture);
+        assert_eq!(modules[0].source_sets[0].configurations.as_ref().unwrap().compile_classpath,"compileClasspath");
+        let cached=serde_json::to_vec(&modules).unwrap();
+        let restored:Vec<ModuleClasspath>=serde_json::from_slice(&cached).unwrap();
+        assert_eq!(restored,modules,"loading a cache must preserve original capture identity/time");
+        let legacy=parse_dump("PROJECT\t:app\t/project\nSOURCESET\tmain\nEND\t:app\n");
+        assert!(legacy[0].source_sets[0].project_capture.is_none());
+        assert!(legacy[0].source_sets[0].configurations.is_none());
+        let duplicate=dump.replace("SOURCESET\tmain",&format!("PROJECT_INPUTS\t{capture}\nSOURCESET\tmain"));
+        assert!(parse_dump(&duplicate)[0].source_sets.iter().all(|source|source.project_capture.is_none()));
+        let missing=dump.replace("SOURCESET\ttest\n","");
+        assert!(parse_dump(&missing)[0].source_sets.iter().all(|source|source.project_capture.is_none()));
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
@@ -3725,6 +3897,9 @@ pub(crate) mod tests {
             "valid-1.8.21",
             "valid-1.8.21-target19",
             "1.8.21-target20",
+            "valid-2.2.21-target8",
+            "valid-2.2.21-target24",
+            "2.2.21-target25",
             "missing",
             "adapter",
             "task",
@@ -3760,6 +3935,17 @@ pub(crate) mod tests {
                             }
                         ]);
                     }
+                }
+                "valid-2.2.21-target8" | "valid-2.2.21-target24" | "2.2.21-target25" => {
+                    proof["adapter"] = "kgp-2.2.21-jvm-sdk-options-v1".into();
+                    proof["arguments"] = serde_json::json!([
+                        "-jvm-target",
+                        match fault {
+                            "valid-2.2.21-target8" => "1.8",
+                            "valid-2.2.21-target24" => "24",
+                            _ => "25",
+                        }
+                    ]);
                 }
                 "adapter" => proof["adapter"] = "unverified".into(),
                 "task" => proof["task"] = ":different:compileKotlin".into(),

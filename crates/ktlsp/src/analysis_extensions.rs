@@ -549,6 +549,49 @@ mod compiler_source_tests {
         }
     }
 
+    #[test]
+    fn source_annotation_enum_refreshes_after_dependency_update_without_owner_edit() {
+        use ktcore::extensions::{source::AnnotationValue, Fact};
+        struct Probe(Arc<std::sync::Mutex<Option<Fact<AnnotationValue>>>>);
+        impl AnalysisProvider for Probe {
+            fn id(&self) -> &str { "enum-refresh" }
+            fn analyze(&self, read: &mut ktcore::extensions::ReadSession<'_>)
+                -> Result<(), ktcore::extensions::ContractError> {
+                if let Some(argument) = read.declarations().iter().flat_map(|declaration| &declaration.annotations)
+                    .flat_map(|annotation| &annotation.arguments).next() {
+                    *self.0.lock().unwrap() = Some(argument.value.clone());
+                }
+                Ok(())
+            }
+        }
+        for (owner, dependency, owner_text, initial, updated) in [
+            ("/enum-refresh/Owner.java", "/enum-refresh/Mode.java",
+                "package cache; @interface A { Mode value(); } @A(Mode.NEW) class Owner {}",
+                "package cache; enum Mode { OLD }", "package cache; enum Mode { OLD, NEW }"),
+            ("/enum-refresh/Owner.kt", "/enum-refresh/Mode.kt",
+                "package cache\nannotation class A(val value: Mode)\n@A(Mode.NEW) class Owner",
+                "package cache\nenum class Mode { OLD }", "package cache\nenum class Mode { OLD, NEW }"),
+        ] {
+            let observed = Arc::new(std::sync::Mutex::new(None));
+            let mut workspace = crate::workspace::Workspace::with_analysis_providers(vec![Arc::new(Probe(observed.clone()))]);
+            let mut parsers = crate::language::LanguageParsers::new();
+            let language = crate::language::SourceLanguage::for_key(dependency);
+            let tree = parsers.parse(language, initial);
+            let facts = crate::language::file_facts(language, &tree, initial);
+            assert!(workspace.index_dependency_file(dependency, facts.symbols));
+            workspace.bump_index_revision();
+            workspace.open(owner, owner_text.into());
+            assert!(matches!(&*observed.lock().unwrap(), Some(Knowledge::Unknown(_))), "{owner}: missing enum entry");
+            let tree = parsers.parse(language, updated);
+            let facts = crate::language::file_facts(language, &tree, updated);
+            assert!(workspace.index_dependency_file(dependency, facts.symbols));
+            workspace.bump_index_revision();
+            assert_eq!(workspace.doc_text(owner).as_deref(), Some(owner_text));
+            assert!(matches!(&*observed.lock().unwrap(), Some(Knowledge::Found(AnnotationValue::Enum {ty, name}))
+                if ty.name == "Mode" && name == "NEW"), "{owner}: unchanged owner must observe the dependency update");
+        }
+    }
+
     fn input(text: &str, value_namespace: bool) -> SourceInput {
         SourceInput {
             text: Arc::from(text),

@@ -599,6 +599,9 @@ with a disposable Gradle project to check model selection, stale evaluation reje
 and fresh contributions after a real dependency change.
 
 The same fixture recipe below also supports `KTLSP_IPC_MODE=source-locations`.
+That probe also checks `source-facts-v2` on the first evaluation: exact authored
+ranges/modifiers, nested annotations, typed integers, and decoded literal string
+maps, while the initial legacy payload preserves honest unknown values.
 The child negotiates `source-locations-v1` and first reads a target never opened
 in Neovim, then checks exact cross-file type/member URIs, UTF-16 ranges and source
 hashes after a Unicode unsaved target edit/model change. It uses the same
@@ -803,3 +806,12 @@ Transformed APIs such as Lombok remain covered by their separate compiler-plugin
 ## License
 
 MIT
+
+
+The existing external provider-command corpus probe also accepts
+`KTLSP_IPC_PROJECT_INPUTS=1` to read `project-inputs-v1` through the real child and Neovim.
+It requires a disposable Gradle fixture with main/test source sets and checks model capture,
+actual index generation, scoped source/resource inventories and unsaved text in
+`extension-command-proof.json`. See `dev/external-extension/README.md` for the same-harness
+recipe and `docs/architecture/extension-ipc.md` for the negotiated boundary. This probe addition
+still requires native build/editor validation; it does not establish whole-project semantic parity.

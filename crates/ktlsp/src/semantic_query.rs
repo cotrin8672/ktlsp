@@ -3338,7 +3338,7 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
             interfaces: Vec::new(),
             signature: None,
             source_file: Some(Arc::from("Person.java")),
-            attribute_names: Vec::new(),
+            attribute_names: Vec::new(), annotations: Vec::new(),
             inner_classes: Vec::new(),
             fields: Vec::new(),
             methods: vec![MemberFacts {
@@ -3346,7 +3346,7 @@ fun main(repo: Repo, userId: UserId, pagination: Pagination?) {
                 descriptor: Arc::from("()Ljava/lang/String;"),
                 access_flags: 0x0001,
                 signature: None,
-                attribute_names: Vec::new(),
+                attribute_names: Vec::new(), annotations: Vec::new(),
             }],
         });
         store

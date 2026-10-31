@@ -13444,7 +13444,17 @@ impl Backend {
             let version=versions.lock().get(&start.owner).and_then(|state|state.document_version);
             let result=if cancelled.load(std::sync::atomic::Ordering::Acquire) {Err("Cancelled".into())}
                 else if version!=start.version {Err("Stale".into())} else {result};
-            let result=ws.finish_provider_command(start.work.evaluation,&start.owner,start.revision,result);
+            let result=if dispatch || result.is_err() {
+                ws.finish_provider_command(start.work.evaluation,&start.owner,start.revision,result)
+            } else {
+                // Source hydration can invalidate this read; preflight has no child result to commit.
+                let current=start.work.command.as_deref().is_some_and(|command|ProviderRefreshPermission {
+                    provider:&start.work.provider,command,instance:start.work.worker.id,owner:&start.owner,
+                    text:start.work.params["source"].as_str().unwrap_or_default(),revision:start.revision,
+                }.current(&ws));
+                ws.abandon_provider_command(start.work.evaluation);
+                if current {result} else {Err("Stale".into())}
+            };
             lease.armed=false;drop(ws);wake();result
         }).await;
         cancellation.armed=false;
@@ -13471,9 +13481,9 @@ impl Backend {
     async fn execute_provider_command(&self,arguments:&[serde_json::Value])->Result<serde_json::Value> {
         let request=crate::extension_ipc::ProviderCommandRequest::decode(arguments)
             .map_err(tower_lsp_server::jsonrpc::Error::invalid_params)?;
-        // The first phase only negotiates transport permissions: it never dispatches the command.
+        // Preflight negotiates permissions and hydrates sources without dispatching the command.
         let start=self.prepare_provider_command(&request)?;
-        let instance=start.work.worker.id;let owner=start.owner.clone();let revision=start.revision;
+        let instance=start.work.worker.id;let owner=start.owner.clone();let revision=start.revision;let version=start.version;
         self.run_provider_command_work(start,false).await?;
         let generation=if request.refresh_project {
             let permission=ProviderRefreshPermission {provider:&request.provider,command:&request.command,instance,
@@ -13482,8 +13492,14 @@ impl Backend {
                 .ok_or_else(||provider_command_error("Stale".into()))?;
             Some(self.await_provider_refresh(target).await?)
         } else {None};
+        if generation.is_some() {
+            // A refreshed model needs its own preparation before the single child dispatch.
+            self.run_provider_command_work(self.prepare_provider_command(&request)?,false).await?;
+        }
         let mut start=self.prepare_provider_command(&request)?;
-        if start.work.worker.id!=instance {self.ws.lock().abandon_provider_command(start.work.evaluation);return Err(provider_command_error("Stale".into()));}
+        if start.work.worker.id!=instance || start.owner!=owner || start.revision!=revision || start.version!=version {
+            self.ws.lock().abandon_provider_command(start.work.evaluation);return Err(provider_command_error("Stale".into()));
+        }
         if let Some(generation)=generation {start.work.params["context"]["refreshGeneration"]=serde_json::json!(generation.to_string());}
         self.run_provider_command_work(start,true).await
     }

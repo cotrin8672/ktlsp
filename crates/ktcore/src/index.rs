@@ -1320,6 +1320,13 @@ impl<'a> ScopedIndex<'a> {
         }
     }
 
+    /// Select another caller from the same host index without widening this view.
+    pub fn for_file<'b>(&self,file:&'b str)->ScopedIndex<'b> where 'a:'b {
+        let mut index=ScopedIndex::new(self.index,file);
+        index.declaration_types=self.declaration_types;
+        index
+    }
+
     pub fn with_declaration_types(
         mut self,
         query: &'a dyn Fn(&Entry) -> Option<crate::types::Type>,

@@ -35,12 +35,19 @@ fn read_source_snapshots(
     input: &mut impl std::io::BufRead, output: &mut impl Write,
     next: &mut u64, evaluation: &Value,
 ) -> Result<(Value, Vec<Value>), String> {
+    read_scoped_source_snapshots(input,output,next,evaluation,None)
+}
+fn read_scoped_source_snapshots(
+    input: &mut impl std::io::BufRead, output: &mut impl Write,
+    next: &mut u64, evaluation: &Value, scope:Option<&Value>,
+) -> Result<(Value, Vec<Value>), String> {
     let mut after=Value::Null;
     let mut sources=Vec::new();let mut cursors=std::collections::BTreeSet::new();
     let mut ids=std::collections::BTreeSet::new();
     let coverage=loop {
-        let query=if after.is_null() {json!({"op":"sourceInventory"})}
+        let mut query=if after.is_null() {json!({"op":"sourceInventory"})}
             else {json!({"op":"sourceInventory","after":after})};
+        if let Some(scope)=scope {query["scope"]=scope.clone();}
         let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":[query]}))?;
         let page=&result["facts"][0];
         for source in page["sources"].as_array().ok_or("missing source inventory")? {
@@ -87,10 +94,15 @@ fn read_source_snapshots(
 fn read_owned_resources(
     input:&mut impl std::io::BufRead,output:&mut impl std::io::Write,next:&mut u64,evaluation:&Value,
 )->Result<Value,String> {
+    read_scoped_owned_resources(input,output,next,evaluation,None)
+}
+fn read_scoped_owned_resources(
+    input:&mut impl std::io::BufRead,output:&mut impl std::io::Write,next:&mut u64,evaluation:&Value,scope:Option<&Value>,
+)->Result<Value,String> {
     let mut descriptors=Vec::new();let mut after=Value::Null;let mut pages=0usize;
     let coverage=loop {
         let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
-            "queries":[{"op":"resourceInventory","after":after}]}))?;
+            "queries":[{"op":"resourceInventory","after":after,"scope":scope}]}))?;
         let page=&result["facts"][0];pages+=1;
         descriptors.extend(page["resources"].as_array().ok_or("resource inventory descriptors")?.iter().cloned());
         after=page["next"].clone();
@@ -105,7 +117,7 @@ fn read_owned_resources(
         ("runtimeClasspath","META-INF/MANIFEST.MF"),
     ] {
         let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
-            "queries":[{"op":"resourceLookup","association":association,"relativePath":name}]}))?;
+            "queries":[{"op":"resourceLookup","association":association,"relativePath":name,"scope":scope}]}))?;
         let lookup=result["facts"][0].clone();
         // The host preserves all classpath matches. One actual payload per role is
         // enough for this fixture; no match is never converted to a successful empty.
@@ -128,6 +140,96 @@ fn read_owned_resources(
         lookups.push(json!({"association":association,"relativePath":name,"fact":lookup}));
     }
     Ok(json!({"inventory":{"resources":descriptors,"pages":pages,"coverage":coverage},"lookups":lookups,"snapshots":snapshots}))
+}
+
+fn read_project_inputs(
+    input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,evaluation:&Value,source_facts_v2:bool,
+)->Result<Value,String> {
+    let mut records=Vec::new();let mut after=Value::Null;let mut cursors=std::collections::BTreeSet::new();
+    let coverage=loop {
+        let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"projectInputs","after":after}]}))?;
+        let page=&result["facts"][0];
+        records.extend(page["records"].as_array().ok_or("missing project input records")?.iter().cloned());
+        if records.len()>131072 {return Err("project input record limit".into());}
+        after=page["next"].clone();if after.is_null() {break page["coverage"].clone();}
+        if !cursors.insert(after.as_str().ok_or("project input cursor")?.to_owned()) || cursors.len()>256 {
+            return Err("invalid project input continuation".into());
+        }
+    };
+    let mut scopes=Vec::new();let mut seen=std::collections::BTreeSet::new();
+    for record in records.iter().filter(|record|record["kind"]=="sourceSet") {
+        let scope=record["id"].as_str().ok_or("project source-set handle")?;
+        if !seen.insert(scope.to_owned()) {return Err("duplicate project scope handle".into());}
+        let (inventory,snapshots)=read_scoped_source_snapshots(input,output,next,evaluation,Some(&record["id"]))?;
+        let resources=read_scoped_owned_resources(input,output,next,evaluation,Some(&record["id"]))?;
+        let mut normalized=Vec::new();
+        if source_facts_v2 {
+            for chunk in inventory["sources"].as_array().ok_or("source inventory")?.chunks(8) {
+                let queries:Vec<_>=chunk.iter().map(|source|json!({"op":"sourceFacts","source":source["id"]})).collect();
+                let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":queries}))?;
+                let mut facts=result["facts"].as_array().ok_or("normalized source facts")?.clone();
+                if facts.len()!=chunk.len() {return Err("normalized source count changed".into());}
+                let mut declarations=Vec::new();
+                for (position,fact) in facts.iter().enumerate() {
+                    for declaration in fact["declarations"].as_array().ok_or("normalized declarations")? {
+                        declarations.push((position,declaration["id"].clone()));
+                    }
+                }
+                for fact in &mut facts {fact["declarationFacts"]=json!([]);}
+                for chunk in declarations.chunks(32) {
+                    let queries:Vec<_>=chunk.iter().flat_map(|(_,declaration)|[
+                        json!({"op":"declarationType","declaration":declaration}),
+                        json!({"op":"declarationMember","declaration":declaration}),
+                    ]).collect();
+                    let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":queries}))?;
+                    let values=result["facts"].as_array().ok_or("snapshot declaration facts")?;
+                    if values.len()!=chunk.len()*2 {return Err("snapshot declaration fact count changed".into());}
+                    for ((position,declaration),pair) in chunk.iter().zip(values.chunks_exact(2)) {
+                        facts[*position]["declarationFacts"].as_array_mut().ok_or("declaration fact list")?.push(
+                            json!({"declaration":declaration,"type":pair[0],"member":pair[1]}));
+                    }
+                }
+                let mut locations=Vec::new();let mut positions=Vec::new();
+                for (position,fact) in facts.iter().enumerate() {
+                    if let Some(declaration)=fact["declarations"].as_array().and_then(|values|values.first()) {
+                        positions.push(position);locations.push(json!({"op":"sourceLocation","target":declaration["id"]}));
+                    }
+                }
+                if !locations.is_empty() {
+                    let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":locations}))?;
+                    let values=result["facts"].as_array().ok_or("snapshot declaration locations")?;
+                    if values.len()!=positions.len() {return Err("snapshot location count changed".into());}
+                    for (position,location) in positions.into_iter().zip(values) {facts[position]["sampleLocation"]=location.clone();}
+                }
+                normalized.extend(facts);
+            }
+        }
+        scopes.push(json!({"scope":scope,"name":record["name"],"inventory":inventory,"snapshots":snapshots,
+            "sourceFacts":normalized,"resources":resources}));
+    }
+    Ok(json!({"records":records,"coverage":coverage,"scopes":scopes}))
+}
+
+fn read_binary_annotation_fixture(
+    input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,evaluation:&Value,
+)->Result<Value,String> {
+    let catalog=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+        "queries":[{"op":"jvmCatalog","prefix":"annotationfixture/CustomPoint"}]}))?;
+    let page=&catalog["facts"][0];
+    let classes=page["classes"].as_array().ok_or("annotation fixture catalog")?;
+    if classes.len()!=1 || !page["next"].is_null() || page["coverage"]["state"]!="found"
+        || classes[0]["internalName"]!="annotationfixture/CustomPoint"
+        || classes[0]["association"]!="compileClasspath" {
+        return Err("expected one selected compile-only annotation fixture".into());
+    }
+    let response=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,"queries":[
+        {"op":"jvmClass","entry":classes[0]["entry"]},
+        {"op":"runtimeClass","internalName":"annotationfixture/CustomPoint"},
+    ]}))?;
+    let facts=response["facts"].as_array().ok_or("annotation fixture facts")?;
+    if facts.len()!=2 {return Err("annotation fixture fact count".into());}
+    Ok(json!({"descriptor":classes[0],"class":facts[0],"runtime":facts[1]}))
 }
 
 fn read_runtime_class_bytes(
@@ -452,6 +554,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut host_inputs = false;
     let mut jvm_catalog = false;
     let mut source_locations = false;
+    let mut project_inputs = false;
+    let mut source_facts_v2 = false;
+    let mut binary_annotations = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--barrier" if barrier.is_none() => {
@@ -463,10 +568,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--host-inputs" if !host_inputs => host_inputs = true,
             "--jvm-catalog" if !jvm_catalog => jvm_catalog = true,
             "--source-locations" if !source_locations => source_locations = true,
+            "--project-inputs" if !project_inputs => project_inputs = true,
+            "--source-facts-v2" if !source_facts_v2 => source_facts_v2 = true,
+            "--binary-annotations" if !binary_annotations => binary_annotations = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
     if host_inputs { project_facts=true; source_snapshots=true; }
+    if project_inputs {source_snapshots=true;source_facts_v2=true;source_locations=true;}
     if source_locations { project_facts=true; }
     if (project_facts || source_snapshots) && barrier.is_none() {
         return Err("project facts fixture needs its barrier".into());
@@ -475,6 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = std::io::stdout().lock();
     let mut next = 0;
     let mut command_count = 0u64;
+    let mut source_evaluations = std::collections::BTreeMap::<String, u64>::new();
     if let Some(directory) = barrier.clone() {
         std::thread::spawn(move || loop {
             if directory.join("crash").exists() {
@@ -503,6 +613,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result["supportedOps"] =
                         json!({"project-class-facts-v1":["projectContext","typeJvm"]});
                 }
+                if source_facts_v2 {
+                    let offered=&message["params"];
+                    if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="source-facts-v2"))
+                        || !offered["supportedOps"]["source-facts-v2"].as_array()
+                            .is_some_and(|values|values.iter().any(|value|value=="sourceFacts")) {
+                        return Err("host did not offer source facts v2".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("source-facts-v2"));
+                    if result.get("supportedOps").is_none() {result["supportedOps"]=json!({});}
+                    result["supportedOps"]["source-facts-v2"]=json!(["sourceFacts"]);
+                }
+                if binary_annotations {
+                    if !message["params"]["capabilities"].as_array().is_some_and(|values|
+                        values.iter().any(|value|value=="binary-annotations-v1")) {
+                        return Err("host did not offer binary declaration annotations".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("binary-annotations-v1"));
+                }
+                if project_inputs {
+                    let offered=&message["params"];
+                    if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="project-inputs-v1"))
+                        || !offered["supportedOps"]["project-inputs-v1"].as_array().is_some_and(|values|values.iter().any(|value|value=="projectInputs")) {
+                        return Err("host did not offer selected-project inputs".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("project-inputs-v1"));
+                    if result.get("supportedOps").is_none() {result["supportedOps"]=json!({});}
+                    result["supportedOps"]["project-inputs-v1"]=json!(["projectInputs"]);
+                }
                 if source_locations {
                     let offered=&message["params"];
                     if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="source-locations-v1"))
@@ -524,7 +662,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if result.get("supportedOps").is_none() { result["supportedOps"]=json!({}); }
                     result["supportedOps"]["source-snapshots-v1"]=json!(["sourceInventory","sourceSnapshot"]);
                 }
-                if host_inputs {
+                if host_inputs || project_inputs {
                     let offered=&message["params"];
                     for (capability,operations) in [("owned-resources-v1",&["resourceInventory","resourceLookup","resourceSnapshot"][..]),
                         ("runtime-class-bytes-v1",&["runtimeClass","classBytes"][..])] {
@@ -576,6 +714,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":{"sites":[],"diagnostics":[]}}))?;
                     continue;
                 }
+                if source_facts_v2 {
+                    let owner_evaluation=source_evaluations.entry(message["params"]["owner"].to_string()).or_default();
+                    *owner_evaluation+=1;
+                    record_source_facts_v2(&mut input,&mut output,&mut next,&message["params"],&barrier,*owner_evaluation)?;
+                    if !project_facts && !source_snapshots {
+                        write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":{"sites":[],"diagnostics":[]}}))?;
+                        continue;
+                    }
+                }
+                if project_inputs {
+                    let capture=read_project_inputs(&mut input,&mut output,&mut next,&message["params"]["evaluation"],source_facts_v2)?;
+                    let directory=barrier.as_ref().ok_or("project inputs need barrier")?;
+                    std::fs::create_dir_all(directory)?;
+                    std::fs::write(directory.join(format!("project-inputs-{}.json",message["params"]["evaluation"].as_str().ok_or("evaluation")?)),serde_json::to_vec(&capture)?)?;
+                }
                 let result = analyze(
                     &mut input,
                     &mut output,
@@ -620,6 +773,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "result":{"arguments":params["arguments"],"owner":params["owner"],"source":params["source"],
                         "context":params["context"],"configuration":params["configuration"],"facts":facts["facts"],"commandCount":command_count}});
                 if host_inputs { result["result"]["hostInputs"]=record_host_inputs(&mut input,&mut output,&mut next,params,&barrier,true)?; }
+                if project_inputs {result["result"]["projectInputs"]=read_project_inputs(&mut input,&mut output,&mut next,&params["evaluation"],source_facts_v2)?;}
+                if params["configuration"]["binaryAnnotationsProbe"]==true {
+                    result["result"]["binaryAnnotations"]=read_binary_annotation_fixture(&mut input,&mut output,&mut next,&params["evaluation"])?;
+                }
                 if params["arguments"][0]["requestEdit"]==true {
                     if params["context"]["documentVersion"].as_i64().is_none() {return Err("fixture action needs a host document version".into());}
                     result["result"]["edit"]=json!({"documentChanges":[{"textDocument":{"uri":params["context"]["documentUri"],"version":params["context"]["documentVersion"]},
@@ -675,4 +832,46 @@ mod source_inventory_client_tests {
         assert!(requests.len()+3<64,"leave room for the existing semantic queries");
         assert_eq!(input.position() as usize,input.get_ref().len());
     }
+}
+
+fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
+    params:&Value,barrier:&Option<PathBuf>,owner_evaluation:u64)->Result<(),String> {
+    let Some(legacy)=params["declarations"].as_array().ok_or("initial declarations")?.iter()
+        .find(|declaration|declaration["name"]=="sourceFactsProbe") else {return Ok(());};
+    if legacy.get("fullRange").is_some() || legacy.get("modifiers").is_some() {
+        return Err("v2 metadata leaked into the legacy initial payload".into());
+    }
+    let legacy_annotation=&legacy["annotations"][0];
+    if legacy_annotation.get("nameRange").is_some()
+        || !legacy_annotation["arguments"].as_array().ok_or("legacy arguments")?.iter()
+            .all(|argument|argument["value"]["state"]=="unknown") {
+        return Err("new annotation values must remain honest Unknown in the legacy payload".into());
+    }
+    let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
+        "queries":[{"op":"sourceFacts"}]}))?;
+    let rich=result["facts"][0]["declarations"].as_array().ok_or("source facts declarations")?.iter()
+        .find(|declaration|declaration["name"]=="sourceFactsProbe").ok_or("v2 probe declaration")?;
+    if rich["nameRange"]!=legacy["range"] || rich["modifiers"]["static"]!=json!({"state":"found","value":true})
+        || rich["modifiers"]["final"]!=json!({"state":"found","value":true}) {
+        return Err("source facts declaration ranges/modifiers were not normalized".into());
+    }
+    let arguments=&rich["annotations"][0]["arguments"];
+    let string=&arguments[0]["value"]["value"];
+    let nested=&arguments[1]["value"]["value"];
+    if string["kind"]!="mappedString" || string["value"]!="tick()V" || string.get("contentRange").is_some()
+        || nested["kind"]!="annotation" || nested["annotation"]["arguments"][2]["value"]["value"]
+            !=json!({"kind":"integer","type":"int","value":1})
+        || arguments[2]["value"]["value"]!=json!({"kind":"integer","type":"long","value":2}) {
+        return Err("source facts nested annotation/string/integer facts were not normalized".into());
+    }
+    let types=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],"queries":[
+        {"op":"resolveTypeRef","reference":rich["annotations"][0]["typeRef"]},
+        {"op":"resolveTypeRef","reference":nested["annotation"]["typeRef"]},
+    ]}))?;
+    let directory=barrier.as_ref().ok_or("source facts fixture barrier")?;
+    std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+    std::fs::write(directory.join(format!("source-facts-{}.json",params["evaluation"].as_str().ok_or("evaluation")?)),
+        serde_json::to_vec(&json!({"evaluation":params["evaluation"],"ownerEvaluation":owner_evaluation,"legacy":legacy,"rich":rich,"types":types["facts"]})).map_err(|error|error.to_string())?)
+        .map_err(|error|error.to_string())?;
+    Ok(())
 }

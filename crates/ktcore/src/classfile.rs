@@ -1,7 +1,6 @@
 //! Source-less JVM declaration metadata. Reading a class never loads or executes it.
 //!
-//! These are positive binary facts, not a verified callable surface: bytecode and annotation
-//! payloads are opaque. Generic declaration signatures can be projected with [`signature`].
+//! These are positive binary facts, not a verified callable surface: bytecode is opaque; declaration annotation values are raw metadata. Generic declaration signatures can be projected with [`signature`].
 //! A consumer must establish output
 //! freshness, selected origin, language callability, and any real source mapping separately. In
 //! particular, a public JVM constructor need not be callable from Kotlin source.
@@ -17,6 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::jvm::{ClassIdentity, InputIdentity};
 
 pub mod signature;
+mod annotations;
+pub use annotations::{Annotation, AnnotationElement, AnnotationValue, BinaryAnnotation};
 
 /// An oversized input is unsupported, never evidence that a declaration is absent.
 pub const MAX_CLASS_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -33,6 +34,7 @@ pub struct ClassFileFacts {
     /// A debug filename hint, not an editable source location or identity.
     pub source_file: Option<Arc<str>>,
     pub attribute_names: Vec<Arc<str>>,
+    pub annotations: Vec<BinaryAnnotation>,
     pub inner_classes: Vec<InnerClassFacts>,
     pub fields: Vec<MemberFacts>,
     pub methods: Vec<MemberFacts>,
@@ -54,8 +56,9 @@ pub struct MemberFacts {
     /// Raw JVM flags; synthetic/bridge members are retained without exposing them as source APIs.
     pub access_flags: u16,
     pub signature: Option<Arc<str>>,
-    /// Includes annotation presence, without interpreting annotation or Code payloads.
+    /// Code and unsupported attributes remain opaque.
     pub attribute_names: Vec<Arc<str>>,
+    pub annotations: Vec<BinaryAnnotation>,
 }
 
 /// Decode declaration metadata for one selected artifact origin and exact classfile contents.
@@ -69,7 +72,9 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
     let mut strings = Strings {
         pool: class.pool(),
         values: HashMap::new(),
+        utf16_values: HashMap::new(),
         remaining_text_work: bytes.len() * 16,
+        remaining_annotation_nodes: bytes.len().min(65_536),
     };
     let internal_name = strings.class_name(class.this_class())?;
     let super_name = class
@@ -97,6 +102,7 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
             access_flags: field.access_flags().bits(),
             signature: attributes.signature,
             attribute_names: attributes.names,
+            annotations: attributes.annotations,
         });
     }
     let mut methods = Vec::new();
@@ -131,6 +137,7 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
             access_flags: method.access_flags().bits(),
             signature: attributes.signature,
             attribute_names: attributes.names,
+            annotations: attributes.annotations,
         });
     }
     for members in [&fields, &methods] {
@@ -159,6 +166,7 @@ pub fn decode(origin_id: &str, bytes: &[u8]) -> Result<ClassFileFacts> {
         signature: attributes.signature,
         source_file: attributes.source_file,
         attribute_names: attributes.names,
+            annotations: attributes.annotations,
         inner_classes: attributes.inner_classes.unwrap_or_default(),
         fields,
         methods,
@@ -374,7 +382,9 @@ pub fn is_requires_only_module(bytes: &[u8]) -> Result<bool> {
     let mut strings = Strings {
         pool: class.pool(),
         values: HashMap::new(),
+        utf16_values: HashMap::new(),
         remaining_text_work: bytes.len() * 16,
+        remaining_annotation_nodes: bytes.len().min(65_536),
     };
     if strings.class_name(class.this_class())?.as_ref() != "module-info" {
         return Ok(false);
@@ -517,7 +527,9 @@ fn marker_annotations(strings: &mut Strings<'_, '_>, mut input: &[u8]) -> Result
 struct Strings<'pool, 'input> {
     pool: &'pool cpool::ConstantPool<'input>,
     values: HashMap<u16, Arc<str>>,
+    utf16_values: HashMap<u16, Arc<[u16]>>,
     remaining_text_work: usize,
+    remaining_annotation_nodes: usize,
 }
 
 impl<'input> Strings<'_, 'input> {
@@ -592,6 +604,7 @@ struct Attributes {
     names: Vec<Arc<str>>,
     signature: Option<Arc<str>>,
     source_file: Option<Arc<str>>,
+    annotations: Vec<BinaryAnnotation>,
 }
 
 fn attributes<'input>(
@@ -601,10 +614,15 @@ fn attributes<'input>(
 ) -> Result<Attributes> {
     let mut result = Attributes::default();
     let mut synthetic = false;
+    let mut annotation_attributes = HashSet::new();
     for attribute in input {
         let attribute = attribute?;
         let name = strings.get(attribute.name())?;
         match name.as_ref() {
+            "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations" => {
+                ensure!(annotation_attributes.insert(name.clone()), "duplicate annotation attribute");
+                result.annotations.extend(annotations::decode(strings, attribute.content(), name.as_ref()=="RuntimeVisibleAnnotations")?);
+            }
             "Signature" => {
                 ensure!(result.signature.is_none(), "duplicate Signature attribute");
                 result.signature = Some(strings.attribute_string(attribute.content())?);

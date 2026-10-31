@@ -4375,6 +4375,103 @@ fn kotlin_jvm_abi_plugin_supported(request: &KotlinDiagnosticRequest) -> anyhow:
     Ok(found)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KotlinFragmentSourceRoles {
+    adapter: String,
+    task: String,
+    fragments: Vec<String>,
+    refines: Vec<String>,
+    sources: Vec<String>,
+}
+
+fn kotlin_private_source_role<'a>(
+    task: &crate::classpath::CompilerTask, selected_sources: &[PathBuf],
+    role: &str, sources: &'a [PathBuf],
+) -> anyhow::Result<Option<&'a str>> {
+    let original = Path::new(role);
+    anyhow::ensure!(original.is_absolute() && original.extension().and_then(|e|e.to_str())==Some("kt")
+        && !role.contains(',') && !role.chars().any(char::is_control)
+        && !original.components().any(|c|matches!(c,std::path::Component::ParentDir|std::path::Component::CurDir)),
+        "kotlin-source-role-path-unhandled");
+    let key = kotlin_path_key(role);
+    anyhow::ensure!(task.source_files.iter().filter(|path|
+        kotlin_path_key(&crate::paths::file_key(path))==key).count()==1, "kotlin-source-role-not-selected");
+    let positions: Vec<_> = selected_sources.iter().enumerate().filter(|(_,path)|
+        kotlin_path_key(&crate::paths::file_key(path))==key).map(|(index,_)|index).collect();
+    let [position] = positions.as_slice() else {anyhow::bail!("kotlin-source-role-not-owned");};
+    // Empty sources are the existing validation-only calls before private copies exist.
+    if sources.is_empty() {return Ok(None);}
+    anyhow::ensure!(sources.len()==selected_sources.len(), "kotlin-source-copy-count-unhandled");
+    let path = sources.get(*position).ok_or_else(||anyhow::anyhow!("kotlin-source-copy-missing"))?;
+    let text = path.to_str().ok_or_else(||anyhow::anyhow!("kotlin-source-copy-encoding"))?;
+    anyhow::ensure!(path.is_absolute() && !text.contains(',') && !text.chars().any(char::is_control)
+        && !path.components().any(|c|matches!(c,std::path::Component::ParentDir|std::path::Component::CurDir)),
+        "kotlin-source-copy-unhandled");
+    Ok(Some(text))
+}
+
+fn kotlin_fragment_source_roles(
+    task: &crate::classpath::CompilerTask, selected_sources: &[PathBuf],
+) -> anyhow::Result<Option<KotlinFragmentSourceRoles>> {
+    if !task.arguments.iter().any(|argument|argument.starts_with("-Xfragment")) {return Ok(None);}
+    let recipe = task.kotlin_compiler.as_ref().ok_or_else(||anyhow::anyhow!("kotlin-fragment-runtime-unknown"))?;
+    anyhow::ensure!(recipe.compiler_version=="2.2.21" && recipe.gradle_plugin_version=="2.2.21"
+        && task.complete && task.problem.is_none()
+        && task.arguments.iter().any(|argument|argument=="-Xmulti-platform")
+        && !task.arguments.iter().any(|argument|argument.starts_with("-Xcommon-sources")),
+        "kotlin-fragment-profile-unhandled");
+    let roles: KotlinFragmentSourceRoles = serde_json::from_value(task.options.get("kotlinFragmentSourceRoles")
+        .cloned().ok_or_else(||anyhow::anyhow!("kotlin-fragment-source-roles-unknown"))?)?;
+    anyhow::ensure!(roles.adapter=="kgp-2.2.21-jvm-fragment-sources-v1" && roles.task==task.task
+        && !roles.fragments.is_empty() && roles.fragments.len()<=256 && roles.refines.len()<=1024
+        && roles.sources.len()<=65_536, "kotlin-fragment-source-roles-unhandled");
+    let mut names = std::collections::BTreeSet::new();
+    for name in &roles.fragments {
+        anyhow::ensure!(!name.is_empty() && name.len()<=256
+            && name.chars().all(|c|c.is_ascii_alphanumeric() || matches!(c,'_'|'-'|'.'))
+            && names.insert(name.as_str()), "kotlin-fragment-name-unhandled");
+    }
+    let mut edges = std::collections::BTreeSet::new();
+    for edge in &roles.refines {
+        let (from,to) = edge.split_once(':').ok_or_else(||anyhow::anyhow!("kotlin-fragment-edge-unhandled"))?;
+        anyhow::ensure!(names.contains(from) && names.contains(to) && from!=to && edges.insert((from,to)),
+            "kotlin-fragment-edge-unhandled");
+    }
+    for start in &names {
+        let mut pending = vec![*start];let mut seen=std::collections::BTreeSet::new();
+        while let Some(node)=pending.pop() {
+            if !seen.insert(node) {continue;}
+            for (_,to) in edges.iter().filter(|(from,_)|*from==node) {
+                anyhow::ensure!(*to!=*start,"kotlin-fragment-cycle-unhandled");pending.push(*to);
+            }
+        }
+    }
+    let mut assigned = std::collections::BTreeSet::new();
+    for source in &roles.sources {
+        let (fragment,file)=source.split_once(':').ok_or_else(||anyhow::anyhow!("kotlin-fragment-source-unhandled"))?;
+        anyhow::ensure!(names.contains(fragment) && assigned.insert(kotlin_path_key(file)),
+            "kotlin-fragment-source-unhandled");
+        kotlin_private_source_role(task,selected_sources,file,&[])?;
+    }
+    for selected in [task.source_files.as_slice(),selected_sources] {
+        let kotlin:std::collections::BTreeSet<_>=selected.iter().filter(|path|
+            path.extension().and_then(|extension|extension.to_str())==Some("kt"))
+            .map(|path|kotlin_path_key(&crate::paths::file_key(path))).collect();
+        anyhow::ensure!(assigned==kotlin,"kotlin-fragment-source-coverage-unhandled");
+    }
+    for (flag,values) in [("-Xfragments=",&roles.fragments),("-Xfragment-refines=",&roles.refines),("-Xfragment-sources=",&roles.sources)] {
+        let actual:Vec<_>=task.arguments.iter().filter(|argument|argument.starts_with(flag)).collect();
+        let expected:Vec<_>=if values.is_empty() {Vec::new()} else {vec![format!("{flag}{}",values.join(","))]};
+        anyhow::ensure!(actual.iter().map(|argument|argument.as_str()).eq(expected.iter().map(String::as_str)),
+            "kotlin-fragment-arguments-differ-from-model");
+    }
+    anyhow::ensure!(task.arguments.iter().filter(|argument|argument.starts_with("-Xfragment")).all(|argument|
+        ["-Xfragments=","-Xfragment-refines=","-Xfragment-sources="].iter().any(|flag|argument.starts_with(flag))),
+        "kotlin-fragment-argument-unhandled");
+    Ok(Some(roles))
+}
+
 fn kotlin_editor_arguments(
     request: &KotlinDiagnosticRequest,
     output: &Path,
@@ -4389,6 +4486,7 @@ fn kotlin_editor_arguments(
     let mut jvm_abi_output = false;
     let mut jdk_release = None;
     let mut common_sources = false;
+    let fragment_roles = kotlin_fragment_source_roles(&request.task,&request.sources)?;
     let path_separator = if cfg!(windows) { ';' } else { ':' };
     for path in &request.task.classpath {
         anyhow::ensure!(path.is_absolute(), "kotlin-relative-target-classpath");
@@ -4478,7 +4576,7 @@ fn kotlin_editor_arguments(
                 continue;
             }
             "-d" | "-jvm-target" | "-module-name" | "-language-version" | "-api-version"
-            | "-jdk-home" => {
+            | "-jdk-home" | "-jvm-default" | "-opt-in" => {
                 let value = request
                     .task
                     .arguments
@@ -4501,6 +4599,21 @@ fn kotlin_editor_arguments(
                     destination = true;
                     result.extend([argument.clone(), output.to_string_lossy().into_owned()]);
                 } else {
+                    if argument == "-jvm-default" {
+                        anyhow::ensure!(value == "no-compatibility"
+                            && request.task.kotlin_compiler.as_ref().is_some_and(|runtime|
+                                runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21"),
+                            "kotlin-jvm-default-policy-unhandled");
+                    }
+                    if argument == "-opt-in" {
+                        anyhow::ensure!(request.task.kotlin_compiler.as_ref().is_some_and(|runtime|
+                            runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21")
+                            && value.split(',').all(|name| name.split('.').all(|part| {
+                                let mut chars=part.chars();
+                                chars.next().is_some_and(|ch|ch.is_alphabetic() || ch=='_' || ch=='$')
+                                    && chars.all(|ch|ch.is_alphanumeric() || ch=='_' || ch=='$')
+                            })), "kotlin-opt-in-policy-unhandled");
+                    }
                     if argument == "-module-name" {
                         anyhow::ensure!(
                             !value.chars().any(|ch| matches!(ch, '/' | '\\')),
@@ -4545,27 +4658,24 @@ fn kotlin_editor_arguments(
                 let mut seen = std::collections::BTreeSet::new();
                 let mut private = Vec::new();
                 for role in roles.split(',') {
-                    let original = Path::new(role);
-                    anyhow::ensure!(original.is_absolute() && original.extension().and_then(|e| e.to_str()) == Some("kt")
-                        && !role.chars().any(char::is_control)
-                        && !original.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)),
-                        "kotlin-common-source-path-unhandled");
-                    let key = kotlin_path_key(role);
-                    anyhow::ensure!(seen.insert(key.clone()) && request.task.source_files.iter().any(|p|
-                        kotlin_path_key(&crate::paths::file_key(p)) == key), "kotlin-common-source-not-selected");
-                    let positions: Vec<_> = request.sources.iter().enumerate().filter(|(_, p)|
-                        kotlin_path_key(&crate::paths::file_key(p)) == key).map(|(i, _)| i).collect();
-                    let [position] = positions.as_slice() else { anyhow::bail!("kotlin-common-source-not-owned"); };
-                    // Empty sources are validation-only calls before private copies exist.
-                    if !sources.is_empty() {
-                        let path = sources.get(*position).ok_or_else(|| anyhow::anyhow!("kotlin-common-source-copy-missing"))?;
-                        let path = path.to_str().ok_or_else(|| anyhow::anyhow!("kotlin-common-source-copy-encoding"))?;
-                        anyhow::ensure!(!path.contains(',') && !path.chars().any(char::is_control), "kotlin-common-source-copy-unhandled");
-                        private.push(path);
-                    }
+                    anyhow::ensure!(seen.insert(kotlin_path_key(role)), "kotlin-common-source-not-selected");
+                    if let Some(path)=kotlin_private_source_role(&request.task,&request.sources,role,sources)? {private.push(path);}
                 }
                 if !private.is_empty() { result.push(format!("-Xcommon-sources={}", private.join(","))); }
                 common_sources = true;
+            }
+            _ if argument.starts_with("-Xfragments=") || argument.starts_with("-Xfragment-refines=") => {
+                anyhow::ensure!(fragment_roles.is_some(), "kotlin-fragment-source-roles-unknown");
+                result.push(argument.clone());
+            }
+            _ if argument.starts_with("-Xfragment-sources=") => {
+                let roles=fragment_roles.as_ref().ok_or_else(||anyhow::anyhow!("kotlin-fragment-source-roles-unknown"))?;
+                let mut private=Vec::new();
+                for source in &roles.sources {
+                    let (fragment,file)=source.split_once(':').ok_or_else(||anyhow::anyhow!("kotlin-fragment-source-unhandled"))?;
+                    if let Some(path)=kotlin_private_source_role(&request.task,&request.sources,file,sources)? {private.push(format!("{fragment}:{path}"));}
+                }
+                if !private.is_empty() {result.push(format!("-Xfragment-sources={}",private.join(",")));}
             }
             _ if argument.starts_with("-Xjdk-release=") => {
                 let value = argument.strip_prefix("-Xjdk-release=").unwrap();
@@ -5725,6 +5835,92 @@ mod kotlin_editor_compile_tests {
     }
 
     #[test]
+    fn argument_adapter_preserves_kgp2221_jvm_default_no_compatibility() {
+        let root=std::env::temp_dir().join("ktlsp-jvm-default-2221");
+        let mut request=kotlin_test_request(&root);
+        let runtime=request.task.kotlin_compiler.as_mut().unwrap();
+        runtime.compiler_version="2.2.21".into();runtime.gradle_plugin_version="2.2.21".into();
+        runtime.run_via_build_tools_api=false;
+        runtime.execution_strategy=crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+        let target=request.task.arguments.iter().position(|argument|argument=="-jvm-target").unwrap()+1;
+        request.task.arguments[target]="1.8".into();
+        let output=root.join("private/classes");
+        let sources=request.sources.clone();
+        let mut expected=kotlin_editor_arguments(&request,&output,&sources).unwrap();
+        let position=request.task.arguments.iter().position(|argument|argument=="-no-stdlib").unwrap();
+        let mode=["-jvm-default".to_owned(),"no-compatibility".to_owned()];
+        request.task.arguments.splice(position..position,mode.clone());
+        expected.splice(position..position,mode);
+        let captured=request.task.arguments.clone();
+        assert_eq!(kotlin_editor_arguments(&request,&output,&sources).unwrap(),expected);
+        assert_eq!(request.task.arguments,captured,"the captured mode is not normalized or reordered");
+        for value in ["","unknown","no-compatibility-extra","@opaque.args","-no-reflect"] {
+            let mut invalid=request.clone();invalid.task.arguments[position+1]=value.into();
+            assert!(kotlin_editor_arguments(&invalid,&output,&sources).is_err(),"{value}");
+        }
+        let mut missing=request.clone();missing.task.arguments.truncate(position+1);
+        assert!(kotlin_editor_arguments(&missing,&output,&sources).is_err());
+        let mut foreign=request.clone();foreign.task.kotlin_compiler.as_mut().unwrap().compiler_version="2.4.0".into();
+        assert!(kotlin_editor_arguments(&foreign,&output,&sources).is_err());
+    }
+
+    #[test]
+    fn argument_adapter_preserves_okio_closure_scalar_profiles_and_release8() {
+        let directory=TestDirectory::new();
+        let mut base=kotlin_test_request(&directory.0);
+        let sdk=base.task.java_home.clone().unwrap();
+        std::fs::create_dir_all(sdk.join("lib")).unwrap();
+        std::fs::write(sdk.join("release"),"JAVA_VERSION=\"21.0.3\"\n").unwrap();
+        // Argument-boundary metadata only; existing SDK tests verify real signature bytes/leases.
+        std::fs::write(sdk.join("lib/ct.sym"),b"argument-boundary fixture").unwrap();
+        let runtime=base.task.kotlin_compiler.as_mut().unwrap();
+        runtime.compiler_version="2.2.21".into();runtime.gradle_plugin_version="2.2.21".into();
+        runtime.run_via_build_tools_api=false;
+        runtime.execution_strategy=crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+        let target=base.task.arguments.iter().position(|argument|argument=="-jvm-target").unwrap()+1;
+        base.task.arguments[target]="1.8".into();
+        base.task.arguments.extend(["-api-version","2.1","-language-version","2.1"].map(str::to_owned));
+        let output=directory.0.join("private/classes");
+        for (task,tail) in [
+            (":okio:compileKotlinJvm",vec!["-jvm-default","no-compatibility","-opt-in","kotlinx.cinterop.ExperimentalForeignApi,kotlin.contracts.ExperimentalContracts"]),
+            (":okio-fakefilesystem:compileKotlinJvm",vec!["-jvm-default","no-compatibility","-opt-in","kotlin.time.ExperimentalTime"]),
+            (":okio-testing-support:compileKotlinJvm",vec!["-jvm-default","no-compatibility","-opt-in","kotlin.time.ExperimentalTime"]),
+            (":samples:compileKotlinJvm",vec!["-Xjdk-release=8"]),
+            (":samples:compileTestKotlinJvm",vec!["-Xjdk-release=8"]),
+        ] {
+            let mut request=base.clone();request.task.task=task.into();
+            let position=request.task.arguments.len();
+            let mut expected=kotlin_editor_arguments(&request,&output,&request.sources).unwrap();
+            request.task.arguments.extend(tail.iter().map(|argument|argument.to_string()));
+            expected.splice(position..position,tail.iter().map(|argument|argument.to_string()));
+            let captured=request.task.arguments.clone();
+            assert_eq!(kotlin_editor_arguments(&request,&output,&request.sources).unwrap(),expected,"{task}");
+            assert_eq!(request.task.arguments,captured);
+            let identity=KotlinEnvironmentKey::new(&request).unwrap();
+            let mut changed=request.clone();changed.task.arguments.truncate(position);
+            assert!(KotlinEnvironmentKey::new(&changed).unwrap()!=identity,"selected scalar policies belong to the environment identity");
+            if tail[0]=="-Xjdk-release=8" {
+                for value in ["-Xjdk-release=","-Xjdk-release","-Xjdk-release=garbage","-Xjdk-release=17"] {
+                    let mut invalid=request.clone();invalid.task.arguments[position]=value.into();
+                    assert!(kotlin_editor_arguments(&invalid,&output,&invalid.sources).is_err(),"{value}");
+                }
+                let mut changed=request.clone();changed.task.java_home=Some(directory.0.join("different-sdk"));
+                assert!(KotlinEnvironmentKey::new(&changed).unwrap()!=identity);
+                assert!(kotlin_editor_arguments(&changed,&output,&changed.sources).is_err());
+            } else {
+                for value in ["","api..Marker","api.Marker,","@opaque.args","api.Marker\n"] {
+                    let mut invalid=request.clone();invalid.task.arguments[position+3]=value.into();
+                    assert!(kotlin_editor_arguments(&invalid,&output,&invalid.sources).is_err(),"{value}");
+                }
+                let mut missing=request.clone();missing.task.arguments.pop();
+                assert!(kotlin_editor_arguments(&missing,&output,&missing.sources).is_err());
+                let mut foreign=request.clone();foreign.task.kotlin_compiler.as_mut().unwrap().gradle_plugin_version="2.4.0".into();
+                assert!(kotlin_editor_arguments(&foreign,&output,&foreign.sources).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn argument_adapter_preserves_multiplatform_flags_private_sources_and_environment_identity() {
         let root = std::env::temp_dir().join("ktlsp-multiplatform-args");
         let mut request = kotlin_test_request(&root);
@@ -5778,6 +5974,68 @@ mod kotlin_editor_compile_tests {
             changed.task.arguments.push(argument.into());
             assert!(kotlin_editor_arguments(&changed, &output, &sources).is_err(), "{argument}");
         }
+    }
+
+    #[test]
+    fn argument_adapter_replays_attested_fragment_roles_with_private_source_copies() {
+        let root=std::env::temp_dir().join("ktlsp-fragment-role-args");
+        let mut request=kotlin_test_request(&root);
+        let recipe=request.task.kotlin_compiler.as_mut().unwrap();
+        recipe.compiler_version="2.2.21".into();recipe.gradle_plugin_version="2.2.21".into();
+        recipe.run_via_build_tools_api=false;
+        recipe.execution_strategy=crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+        let common=root.join("common/Expected.kt");let jvm=root.join("jvm/Actual.kt");
+        request.sources=vec![jvm.clone(),common.clone()];request.task.source_files=vec![common.clone(),jvm.clone()];
+        let private=[root.join("private/Actual.kt"),root.join("private/Expected.kt")];let output=root.join("private/classes");
+        let target=request.task.arguments.iter().position(|argument|argument=="-jvm-target").unwrap()+1;
+        request.task.arguments[target]="1.8".into();
+        request.task.arguments.extend(["-language-version","2.1","-api-version","2.1","-Xmulti-platform","-Xexpect-actual-classes",
+            "-Xfragment-refines=jvmMain:commonMain","-Xfragments=jvmMain,commonMain"].map(str::to_owned));
+        let roles=vec![format!("commonMain:{}",common.display()),format!("jvmMain:{}",jvm.display())];
+        request.task.arguments.push(format!("-Xfragment-sources={}",roles.join(",")));
+        request.task.options.insert("kotlinFragmentSourceRoles".into(),serde_json::json!({
+            "adapter":"kgp-2.2.21-jvm-fragment-sources-v1","task":request.task.task,
+            "fragments":["jvmMain","commonMain"],"refines":["jvmMain:commonMain"],"sources":roles}));
+        let original=request.task.arguments.clone();
+        let remapped=kotlin_editor_arguments(&request,&output,&private).unwrap();
+        assert!(remapped.contains(&format!("-Xfragment-sources=commonMain:{},jvmMain:{}",private[1].display(),private[0].display())));
+        assert!(!remapped.contains(original.last().unwrap()));assert_eq!(request.task.arguments,original);
+        let refines=remapped.iter().position(|argument|argument=="-Xfragment-refines=jvmMain:commonMain").unwrap();
+        let fragments=remapped.iter().position(|argument|argument=="-Xfragments=jvmMain,commonMain").unwrap();
+        assert!(refines<fragments,"captured scalar and source-role order is preserved");
+        assert!(!kotlin_editor_arguments(&request,&output,&[]).unwrap().iter().any(|argument|argument.starts_with("-Xfragment-sources=")));
+        for case in ["missing-model","foreign-task","wrong-runtime","scalar-order","duplicate-scalar","source-role-order",
+            "outside-source","duplicate-source","omitted-source","unknown-fragment","cycle","missing-owner","duplicate-selected","unmodeled-dependency"] {
+            let mut changed=request.clone();
+            match case {
+                "missing-model"=>{changed.task.options.remove("kotlinFragmentSourceRoles");}
+                "foreign-task"=>changed.task.options.get_mut("kotlinFragmentSourceRoles").unwrap()["task"]=serde_json::json!(":foreign:compileKotlin"),
+                "wrong-runtime"=>changed.task.kotlin_compiler.as_mut().unwrap().compiler_version="2.4.0".into(),
+                "scalar-order"=>{let argument=changed.task.arguments.iter_mut().find(|argument|argument.starts_with("-Xfragments=")).unwrap();*argument="-Xfragments=commonMain,jvmMain".into();}
+                "duplicate-scalar"=>changed.task.arguments.push("-Xfragments=jvmMain,commonMain".into()),
+                "source-role-order"=>*changed.task.arguments.last_mut().unwrap()=format!("-Xfragment-sources={}",roles.iter().rev().cloned().collect::<Vec<_>>().join(",")),
+                "missing-owner"=>{changed.sources.pop();}
+                "duplicate-selected"=>changed.task.source_files.push(common.clone()),
+                "unmodeled-dependency"=>changed.task.arguments.push("-Xfragment-dependencies=commonMain:unmodeled.klib".into()),
+                "cycle"=>{
+                    changed.task.options.get_mut("kotlinFragmentSourceRoles").unwrap()["refines"]=serde_json::json!(["jvmMain:commonMain","commonMain:jvmMain"]);
+                    *changed.task.arguments.iter_mut().find(|argument|argument.starts_with("-Xfragment-refines=")).unwrap()="-Xfragment-refines=jvmMain:commonMain,commonMain:jvmMain".into();
+                }
+                _=>{
+                    let mapped=match case {
+                        "outside-source"=>vec![roles[0].clone(),format!("jvmMain:{}",root.join("outside.kt").display())],
+                        "duplicate-source"=>vec![roles[0].clone(),format!("jvmMain:{}",common.display())],
+                        "omitted-source"=>vec![roles[0].clone()],
+                        "unknown-fragment"=>vec![roles[0].clone(),format!("unknown:{}",jvm.display())],
+                        _=>unreachable!(),
+                    };
+                    changed.task.options.get_mut("kotlinFragmentSourceRoles").unwrap()["sources"]=serde_json::json!(mapped);
+                    *changed.task.arguments.last_mut().unwrap()=format!("-Xfragment-sources={}",mapped.join(","));
+                }
+            }
+            assert!(kotlin_editor_arguments(&changed,&output,&private).is_err(),"{case}");
+        }
+        assert!(kotlin_editor_arguments(&request,&output,&private[..1]).is_err());
     }
 
     #[test]

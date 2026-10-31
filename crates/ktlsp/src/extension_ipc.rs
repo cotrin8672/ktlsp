@@ -43,9 +43,16 @@ const JVM_INVENTORY: u16 = 512;
 const JVM_CLASS: u16 = 1024;
 const SOURCE_LOCATIONS: &str = "source-locations-v1";
 const SOURCE_LOCATION: u16 = 2048;
+const PROJECT_INPUT_CAPABILITY: &str = "project-inputs-v1";
+pub(crate) const PROJECT_INPUTS: u16 = 8192;
+const SOURCE_FACTS_V2: &str = "source-facts-v2";
+const SOURCE_FACTS: u16 = 4096;
+const BINARY_ANNOTATION_CAPABILITY: &str = "binary-annotations-v1";
+const BINARY_ANNOTATIONS: u16 = 16384;
 
 fn project_operations(result: &Value) -> u16 {
-    let mut selected = 0;
+    let mut selected = if result["capabilities"].as_array().is_some_and(|values|
+        values.iter().any(|value|value==BINARY_ANNOTATION_CAPABILITY)) {BINARY_ANNOTATIONS} else {0};
     for (capability, operations) in [
         (PROJECT_FACTS, &[("projectContext",PROJECT_CONTEXT),("typeJvm",TYPE_JVM)][..]),
         (SOURCE_SNAPSHOTS, &[("sourceInventory",SOURCE_INVENTORY),("sourceSnapshot",SOURCE_SNAPSHOT)][..]),
@@ -53,6 +60,8 @@ fn project_operations(result: &Value) -> u16 {
         (RUNTIME_CLASSES, &[("runtimeClass",RUNTIME_CLASS),("classBytes",CLASS_BYTES)][..]),
         (JVM_CATALOG, &[("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)][..]),
         (SOURCE_LOCATIONS, &[("sourceLocation",SOURCE_LOCATION)][..]),
+        (PROJECT_INPUT_CAPABILITY, &[("projectInputs",PROJECT_INPUTS)][..]),
+        (SOURCE_FACTS_V2, &[("sourceFacts",SOURCE_FACTS)][..]),
     ] {
         if !result["capabilities"].as_array().is_some_and(|values|
             values.iter().any(|value| value == capability)) { continue; }
@@ -68,11 +77,11 @@ fn project_operations(result: &Value) -> u16 {
 fn initialize_message(provider:&str,commands:&std::collections::BTreeSet<String>)->Value {
     json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{
         "protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":provider,
-        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,SOURCE_LOCATIONS,"provider-commands-v1"],
+        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,SOURCE_LOCATIONS,SOURCE_FACTS_V2,PROJECT_INPUT_CAPABILITY,BINARY_ANNOTATION_CAPABILITY,"provider-commands-v1"],
         "commands":commands,"supportedOps":{
             PROJECT_FACTS:["projectContext","typeJvm"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"],
             RESOURCES:["resourceInventory","resourceLookup","resourceSnapshot"],RUNTIME_CLASSES:["runtimeClass","classBytes"],
-            JVM_CATALOG:["jvmCatalog","jvmClass"],SOURCE_LOCATIONS:["sourceLocation"]
+            JVM_CATALOG:["jvmCatalog","jvmClass"],SOURCE_LOCATIONS:["sourceLocation"],PROJECT_INPUT_CAPABILITY:["projectInputs"],SOURCE_FACTS_V2:["sourceFacts"]
         }}})
 }
 
@@ -167,6 +176,10 @@ fn fact<T>(value: &Fact<T>, mut found: impl FnMut(&T) -> Value) -> Value {
     }
 }
 
+fn unsupported_source_fact()->Value {
+    fact(&Fact::<()>::Unknown(vec![IncompleteReason::UnsupportedSource]),|_|Value::Null)
+}
+
 fn missing_fact() -> Value {
     fact(&Fact::<()>::Unknown(vec![IncompleteReason::MissingFacts]), |_| Value::Null)
 }
@@ -216,6 +229,9 @@ fn token(value: &Value) -> Result<&str, String> {
 }
 
 enum Handle {
+    ProjectModule,
+    ProjectSourceSet(ktcore::project_model::ProjectScope),
+    ProjectInputsPage { records:Arc<Vec<Value>>, next:usize },
     JvmCatalog,
     JvmCatalogPage { prefix:String, next:usize },
     ClassIdentity { identity: ktcore::jvm::ClassIdentity, byte_length: usize },
@@ -225,9 +241,13 @@ enum Handle {
     ResourceCatalog {revision:u64},
     ResourceInventory { revision:u64,next:usize },
     ResourceBytes { resource:String,bytes:Arc<crate::resource_inputs::ResourceBytes>,next:usize },
-    SourceInventory { sources: Arc<Vec<SourceHandle>>, next: usize },
+    SourceInventory { sources: Arc<Vec<SourceHandle>>, next: usize, scope:Option<ktcore::project_model::ProjectScope> },
     Declaration(DeclarationId),
     TypeRef(ktcore::types::TypeRef),
+    SnapshotDeclaration {source:SourceHandle,value:DeclarationId},
+    SnapshotTypeRef {source:SourceHandle,value:ktcore::types::TypeRef},
+    SnapshotType {source:SourceHandle,value:TypeId},
+    SnapshotMember {source:SourceHandle,value:MemberId},
     Signature(MemberSignature),
     Member(MemberId),
     Requirement(RequirementId),
@@ -244,6 +264,12 @@ pub(crate) struct Evaluation {
     pub project: Option<Arc<crate::classpath::ProjectSnapshot>>,
     pub project_operations: u16,
     pub command: bool,
+    pub(crate) project_index:Option<Value>,
+    project_input_index:Option<Value>,
+    project_input_records:Option<Arc<Vec<Value>>>,
+    project_source_tokens:BTreeMap<ktcore::project_model::ProjectScope,String>,
+    pub(crate) project_resource_catalogs:BTreeMap<ktcore::project_model::ProjectScope,Arc<crate::resource_inputs::ResourceCatalog>>,
+    resource_catalog_tokens:BTreeMap<u64,String>,
     pub(crate) resource_catalog:Option<Arc<crate::resource_inputs::ResourceCatalog>>,
     resource_catalog_token:Option<String>,
     pub(crate) resource_results:BTreeMap<String,Result<Arc<crate::resource_inputs::ResourceBytes>,&'static str>>,
@@ -274,6 +300,8 @@ impl Evaluation {
             project: None,
             project_operations: 0,
             command: false,
+            project_index:None,project_input_index:None,project_input_records:None,
+            project_source_tokens:BTreeMap::new(),project_resource_catalogs:BTreeMap::new(),resource_catalog_tokens:BTreeMap::new(),
             resource_catalog:None,resource_catalog_token:None,resource_results:BTreeMap::new(),
             class_scope: None,
             class_results: BTreeMap::new(),
@@ -386,7 +414,7 @@ impl Evaluation {
             Ok(class)=>class,
             Err(error)=>return Ok(json!({"state":"unknown","reasons":[{"code":"JVM_ABI_UNAVAILABLE","detail":error}]})),
         };
-        let Some(abi)=class_abi(class) else {return Ok(missing_fact());};
+        let Some(abi)=class_abi(class,self.project_operations&BINARY_ANNOTATIONS!=0) else {return Ok(missing_fact());};
         let value=json!({"state":"found","value":{"entry":token,"authority":catalog.entries[index].authority,"abi":abi,
             "sourceCurrent":{"state":"unknown","reasons":[{"code":"notSourceAuthority"}]}}});
         if serde_json::to_vec(&value).map_err(|error|error.to_string())?.len()>MAX_FRAME/2-1024 {return Ok(missing_fact());}
@@ -487,7 +515,7 @@ impl Evaluation {
         };
         let byte_length = result.byte_length;
         let api_header = result.api_header.clone();
-        let header_fact = api_header.as_ref().and_then(|header|class_abi(header))
+        let header_fact = api_header.as_ref().and_then(|header|class_abi(header,self.project_operations&BINARY_ANNOTATIONS!=0))
             .map(|header|json!({"state":"found","value":header})).unwrap_or_else(missing_fact);
         let hierarchy = api_header.as_ref().map(|header|json!({"state":"found","value":{
             "superName":header.super_name.as_deref(),"interfaces":header.interfaces.iter().map(|name|name.as_ref()).collect::<Vec<_>>(),
@@ -542,6 +570,10 @@ impl Evaluation {
                     self.resource_stream_cursor(resource, after)?;
                     continuations += 1;
                 }
+                ReadQuery::ProjectInputs {after:Some(after)} => {
+                    if self.project_operations&PROJECT_INPUTS==0 {return Err("projectInputs was not negotiated".into());}
+                    self.project_page(after)?;continuations+=1;
+                }
                 ReadQuery::JvmCatalog {prefix,after:Some(after)} => {
                     if self.project_operations&JVM_INVENTORY==0 {return Err("jvmCatalog was not negotiated".into());}
                     self.jvm_page(prefix,Some(after))?; continuations+=1;
@@ -590,24 +622,56 @@ impl Evaluation {
     }
 
     fn source_descriptor(&self, source: &SourceHandle, id: &str) -> Value {
-        json!({"id":id,"displayPath":source.file(),
+        let mut value=json!({"id":id,"displayPath":source.file(),
             "documentUri":std::path::Path::new(source.file()).is_absolute()
                 .then(|| tower_lsp_server::ls_types::Uri::from_file_path(source.file())).flatten()
                 .map_or_else(missing_fact, |uri|json!({"state":"found","value":uri.to_string()})),
             "languageId":if source.file().ends_with(".java") {"java"} else {"kotlin"},
-            "identity":{"kind":"source","revision":source.revision().to_string()}})
+            "identity":{"kind":"source","revision":source.revision().to_string()}});
+        if self.project_operations&PROJECT_INPUTS!=0 {
+            let scope=|scope:&ktcore::project_model::ProjectScope|json!({"module":scope.module,"sourceSet":scope.source_set,
+                "id":self.project_source_tokens.get(scope)});
+            let owner=self.project.as_ref().and_then(|model|model.unique_source_origin(std::path::Path::new(source.file())))
+                .and_then(|origin|origin.project_scope);
+            value["ownerScope"]=owner.as_ref().map_or_else(missing_fact,|owner|json!({"state":"found","value":scope(owner)}));
+            value["memberships"]=self.project.as_ref().map_or_else(missing_fact,|model|json!({"state":"found","value":
+                model.extension_source_memberships(std::path::Path::new(source.file()),std::path::Path::new(&self.owner))
+                    .iter().map(scope).collect::<Vec<_>>()}));
+            value["editable"]=self.project.as_ref().and_then(|model|
+                model.extension_source_editable(std::path::Path::new(source.file()),std::path::Path::new(&self.owner)))
+                .map_or_else(missing_fact,|editable|json!({"state":"found","value":editable}));
+        }
+        value
     }
     fn source_inventory(
         &mut self, read: &mut ReadSession<'_>, after: Option<&str>, budget: usize,
     ) -> Result<Value, String> {
+        self.source_inventory_for_project_scope(read,None,after,budget)
+    }
+    fn source_inventory_for_project_scope(
+        &mut self, read:&mut ReadSession<'_>,scope:Option<ktcore::project_model::ProjectScope>,
+        after:Option<&str>,budget:usize,
+    )->Result<Value,String> {
         let continuation = match after {
             Some(token) => match self.handles.get(token) {
-                Some(Handle::SourceInventory { sources, next }) => Some((sources.clone(), *next)),
+                Some(Handle::SourceInventory { sources, next, scope:expected }) if expected==&scope => Some((sources.clone(), *next)),
                 _ => return Err("foreign source inventory cursor".into()),
             },
             None => None,
         };
-        let current = match read.source_inventory() {
+        let current = match if let Some(scope)=&scope {
+            let source=self.project.as_ref().and_then(|model|model.source_set_for_scope(scope))
+                .ok_or("foreign project source-set handle")?;
+            let mut selected:std::collections::BTreeSet<_>=source.compiler_tasks.iter().flat_map(|task|&task.source_files)
+                .filter(|path|matches!(path.extension().and_then(|extension|extension.to_str()),Some("java"|"kt")))
+                .map(|path|crate::paths::file_key(path)).collect();
+            if let Some(model)=&self.project {
+                selected.extend(read.source_inventory_candidates().filter(|file|
+                    model.extension_source_memberships(std::path::Path::new(file),std::path::Path::new(&self.owner)).contains(scope))
+                    .map(str::to_owned));
+            }
+            read.source_inventory_for_scope(scope.clone(),selected)
+        } else {read.source_inventory()} {
             Ok(sources) => sources,
             Err(ContractError::ForeignFile | ContractError::MissingSource) if after.is_none() =>
                 return Ok(json!({"sources":[],"coverage":missing_fact(),"next":null})),
@@ -622,11 +686,12 @@ impl Evaluation {
             }
             None => (Arc::new(current), 0),
         };
-        let coverage = self.project.as_ref().and_then(|model|
-            model.extension_project_context(std::path::Path::new(&self.owner)))
-            .map_or_else(missing_fact, |context| {
+        let coverage = self.project.as_ref().and_then(|model|match &scope {
+            Some(scope)=>model.source_set_for_scope(scope),
+            None=>model.extension_project_context(std::path::Path::new(&self.owner)).map(|context|context.source),
+        }).map_or_else(missing_fact, |selected_source| {
                 let accepted: std::collections::BTreeSet<_> = sources.iter().map(|source|source.file()).collect();
-                let complete = source_inventory_complete(context.source, &accepted);
+                let complete = source_inventory_complete(selected_source, &accepted);
                 if complete { json!({"state":"found","value":null}) } else { missing_fact() }
             });
         let limit = budget.min(MAX_FRAME / 2);
@@ -655,7 +720,7 @@ impl Evaluation {
         }
         let end = start + entries.len();
         for source in &sources[start..end] { self.issue(Handle::Source(source.clone())); }
-        let next = (end < sources.len()).then(||self.issue(Handle::SourceInventory { sources, next:end }));
+        let next = (end < sources.len()).then(||self.issue(Handle::SourceInventory { sources, next:end,scope }));
         let value = json!({"sources":entries,
             "coverage":if next.is_some() { missing_fact() } else { coverage },"next":next});
         if size(&value)? > limit { return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into()); }
@@ -676,6 +741,182 @@ impl Evaluation {
         value["sha256"] = json!(format!("{:x}", Sha256::digest(text.as_bytes())));
         Ok(json!({"state":"found","value":value}))
     }
+    fn project_scope(&self, token: &str) -> Result<ktcore::project_model::ProjectScope,String> {
+        if self.project_operations&PROJECT_INPUTS==0 {return Err("projectInputs was not negotiated".into());}
+        let Some(Handle::ProjectSourceSet(scope))=self.handles.get(token) else {return Err("foreign project source-set handle".into());};
+        let model=self.project.as_ref().ok_or("project inputs were not captured")?;
+        if !model.extension_project_scopes(std::path::Path::new(&self.owner)).contains(scope) {
+            return Err("foreign project source-set handle".into());
+        }
+        Ok(scope.clone())
+    }
+
+    fn project_scope_token(&mut self, scope: &ktcore::project_model::ProjectScope) -> String {
+        if let Some(token)=self.project_source_tokens.get(scope) {return token.clone();}
+        let token=self.issue(Handle::ProjectSourceSet(scope.clone()));
+        self.project_source_tokens.insert(scope.clone(),token.clone());token
+    }
+
+    fn project_page(&self, after: &str) -> Result<(Arc<Vec<Value>>,usize),String> {
+        match self.handles.get(after) {
+            Some(Handle::ProjectInputsPage {records,next}) if self.project_input_records.as_ref()
+                .is_some_and(|current|Arc::ptr_eq(current,records)) && *next>0 && *next<records.len()
+                && self.project_input_index==self.project_index => Ok((records.clone(),*next)),
+            _=>Err("foreign or stale project input cursor".into()),
+        }
+    }
+
+    fn project_records(&mut self) -> Result<Option<Arc<Vec<Value>>>,String> {
+        if let Some(records)=&self.project_input_records {
+            if self.project_input_index!=self.project_index {return Err("stale project index observation".into());}
+            return Ok(Some(records.clone()));
+        }
+        let Some(model)=self.project.clone() else {return Ok(None);};
+        let owner_path=self.owner.clone();let owner=std::path::Path::new(&owner_path);
+        let Some(module)=model.extension_project_module(owner) else {return Ok(None);};
+        if module.source_sets.len()>1024 || self.handles.len()+module.source_sets.len()+2>MAX_HANDLES {
+            return Err("project input handle limit".into());
+        }
+        let project=self.issue(Handle::ProjectModule);
+        let owner_scope=if crate::language::SourceLanguage::for_project_path(owner).is_some() {
+            model.unique_source_origin(owner).and_then(|origin|origin.project_scope)
+        } else {match model.resource_owner_context(owner) {Knowledge::Found(context)=>Some(context.scope),_=>None}};
+        let owner_scope=owner_scope.filter(|scope|model.extension_project_scopes(owner).contains(scope))
+            .map(|scope|self.project_scope_token(&scope));
+        let capture=module.source_sets.first().and_then(|source|source.project_capture.as_ref())
+            .filter(|capture|module.source_sets.iter().all(|source|source.project_capture.as_ref()==Some(*capture)));
+        let found=|value:Value|json!({"state":"found","value":value});
+        let mut records=vec![json!({"kind":"project","id":project,
+            "owningSourceSet":owner_scope.map_or_else(missing_fact,|scope|found(json!(scope))),
+            "projectPath":module.module,"projectDirectory":module.project_dir,
+            "buildIdentity":capture.map_or_else(missing_fact,|capture|found(json!(capture.build_identity))),
+            "capture":capture.map_or_else(missing_fact,|capture|found(json!({
+                "identity":capture.identity,"capturedAtUnixMs":capture.captured_at_unix_ms,
+                "gradleVersion":capture.gradle_version,
+                "domain":"java-source-sets-and-kotlin-logical-source-set-declarations",
+                "javaSourceSetsComplete":capture.java_source_sets_complete,
+                "kotlinPresent":capture.kotlin_present,
+                "kotlinSourceSetsCaptured":capture.kotlin_source_sets.is_some(),
+                "kotlinTargets":capture.kotlin_targets,
+                "pluginClasses":capture.plugin_classes}))),
+            "index":self.project_index.clone().unwrap_or_else(missing_fact)})];
+        if let Some(capture)=capture {
+            for source in capture.kotlin_source_sets.iter().flatten() {
+                // Logical sets describe Gradle membership; only exported compiler scopes grant reads.
+                records.push(json!({"kind":"kotlinLogicalSourceSet","project":project,"name":source.name,
+                    "dependsOn":source.depends_on,"compilerScope":missing_fact(),"runtime":missing_fact()}));
+                for (role,roots) in [("source",&source.source_roots),("resource",&source.resource_roots)] {
+                    for (order,path) in roots.iter().enumerate() {records.push(json!({"kind":"logicalRoot",
+                        "project":project,"sourceSet":source.name,"role":role,"order":order,"path":path}));}
+                }
+                for (role,files) in [("source",&source.source_files),("resource",&source.resource_files)] {
+                    for path in files {records.push(json!({"kind":"logicalMembership","project":project,
+                        "sourceSet":source.name,"role":role,"path":path}));}
+                }
+            }
+        }
+        for source in &module.source_sets {
+            let scope=model.extension_project_scopes(owner).into_iter()
+                .find(|scope|scope.source_set==source.name).ok_or("missing project source-set scope")?;
+            let token=self.project_scope_token(&scope);
+            records.push(json!({"kind":"sourceSet","id":token,"project":project,"name":source.name,
+                "configurations":source.configurations.as_ref().map_or_else(missing_fact,|value|found(json!(value))),
+                "compileClasspathCoverage":if !source.classpath_incomplete && source.unresolved.is_empty()
+                    && module.unresolved.is_empty() {found(Value::Null)} else {missing_fact()},
+                "runtimeCoverage":if source.runtime.as_ref().is_some_and(|runtime|runtime.usable()) {found(Value::Null)} else {missing_fact()},
+                "compilerMetadataComplete":!source.compiler_metadata_incomplete,
+                "unresolved":source.unresolved,
+                "counts":{"domain":"this-source-set-ordered-entries","compileClasspath":source.entries.len(),
+                    "runtimeClasspath":source.runtime.as_ref().map(|runtime|runtime.classpath.len()),
+                    "classOutputs":source.runtime.as_ref().map(|runtime|runtime.class_outputs.len())}}));
+            for (role,paths) in [("source",source.source_roots.as_slice()),("output",source.output_roots.as_slice()),
+                ("providedArtifact",source.provided_artifacts.as_slice())] {
+                for (order,path) in paths.iter().enumerate() {records.push(json!({"kind":"root","scope":token,
+                    "role":role,"order":order,"path":path}));}
+            }
+            for (role,paths) in [("compile",source.entries.as_slice()),
+                ("runtime",source.runtime.as_ref().map_or(&[][..],|runtime|runtime.classpath.as_slice())),
+                ("classOutput",source.runtime.as_ref().map_or(&[][..],|runtime|runtime.class_outputs.as_slice()))] {
+                for (order,path) in paths.iter().enumerate() {
+                    let components:Vec<_>=source.artifacts.iter().filter(|artifact|artifact.path==*path).collect();
+                    let component=match components.as_slice() {
+                        [artifact]=>found(json!(artifact.component)),_=>missing_fact(),
+                    };
+                    records.push(json!({"kind":"classpathEntry","scope":token,"role":role,"order":order,
+                        "path":path,"component":component,
+                        "identity":model.artifact_origin(path).map_or_else(missing_fact,|identity|found(json!(identity)))}));
+                }
+            }
+            if let Some(claims)=&source.resources {
+                for (role,paths) in [("resource",&claims.roots),("resourceOutput",&claims.output_roots),
+                    ("configuration",&claims.configuration_inputs)] {
+                    for (order,path) in paths.iter().enumerate() {records.push(json!({"kind":"root","scope":token,
+                        "role":role,"order":order,"path":path}));}
+                }
+            }
+            for task in &source.compiler_tasks {
+                records.push(json!({"kind":"compilerTask","scope":token,"task":task.task,"taskType":task.task_type,
+                    "language":task.language,"complete":task.complete,"problem":task.problem,
+                    "primaryKotlin":source.kotlin_compile_task.as_deref()==Some(task.task.as_str())}));
+                for path in &task.source_files {records.push(json!({"kind":"sourceMembership","scope":token,
+                    "task":task.task,"path":path}));}
+            }
+        }
+        if records.len()>131_072 || records.iter().map(|record|serde_json::to_vec(record).map(|bytes|bytes.len()))
+            .collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?.into_iter().sum::<usize>()>MAX_STREAM_BYTES {
+            return Err("project input inventory limit".into());
+        }
+        let records=Arc::new(records);self.project_input_records=Some(records.clone());
+        self.project_input_index=self.project_index.clone();Ok(Some(records))
+    }
+
+    fn project_inputs(&mut self, read:&mut ReadSession<'_>,after:Option<&str>,budget:usize)->Result<Value,String> {
+        let (records,start)=match after {
+            Some(after)=>self.project_page(after)?,
+            None=>match self.project_records()? {
+                Some(records)=>(records,0),None=>return Ok(json!({"records":[],"next":null,"coverage":missing_fact()})),
+            },
+        };
+        // Namespace changes retire index attestations along with ordinary semantic reads.
+        read.observe_project_namespace();
+        let limit=budget.min(MAX_FRAME/2);let mut size=512;let mut end=start;
+        while let Some(record)=records.get(end) {
+            let bytes=serde_json::to_vec(record).map_err(|error|error.to_string())?.len()+1;
+            if size+bytes>limit {break;}size+=bytes;end+=1;
+        }
+        if start==end && end<records.len() {return Err(READ_FACTS_RESPONSE_BUDGET_EXCEEDED.into());}
+        if end<records.len() && self.handles.len()>=MAX_HANDLES {return Err("project input handle limit".into());}
+        let next=(end<records.len()).then(||self.issue(Handle::ProjectInputsPage{records:records.clone(),next:end}));
+        // Enumerating a compilation list cannot attest logical/non-JVM coverage.
+        let complete=self.project.as_ref().and_then(|model|model.extension_project_module(std::path::Path::new(&self.owner)))
+            .and_then(|module|module.source_sets.first()?.project_capture.as_ref())
+            .is_some_and(|capture|capture.java_source_sets_complete && (!capture.kotlin_present
+                || (capture.kotlin_source_sets.is_some() && capture.kotlin_targets.as_ref().is_some_and(|targets|
+                    !targets.is_empty() && targets.iter().all(|target|target.platform_type=="jvm")))));
+        Ok(json!({"records":records[start..end],"next":next,"coverage":if complete && end==records.len() {
+            json!({"state":"found","value":{"domain":"java-source-sets-and-kotlin-logical-source-set-declarations"}})
+        } else {missing_fact()}}))
+    }
+
+    fn scoped_source_inventory(&mut self,read:&mut ReadSession<'_>,scope:Option<&str>,after:Option<&str>,budget:usize)->Result<Value,String> {
+        let scope=scope.map(|token|self.project_scope(token)).transpose()?;
+        self.source_inventory_for_project_scope(read,scope,after,budget)
+    }
+
+    fn resource_catalog_for_scope(&self,scope:Option<&str>)->Result<Option<Arc<crate::resource_inputs::ResourceCatalog>>,String> {
+        match scope {
+            None=>Ok(self.resource_catalog.clone()),
+            Some(token)=>Ok(self.project_resource_catalogs.get(&self.project_scope(token)?).cloned()),
+        }
+    }
+
+    pub(crate) fn resource_catalog_for_identity(&self,token:&str)->Result<Arc<crate::resource_inputs::ResourceCatalog>,String> {
+        let (prefix,_)=token.split_once("#resource:").ok_or("invalid resource identity")?;
+        let Some(Handle::ResourceCatalog{revision})=self.handles.get(prefix) else {return Err("foreign resource catalog".into());};
+        self.resource_catalog.iter().chain(self.project_resource_catalogs.values())
+            .find(|catalog|catalog.revision==*revision).cloned().ok_or_else(||"foreign resource catalog".into())
+    }
+
     fn project_context(&self) -> Value {
         let mut value = json!({"workspaceUri":missing_fact(),"scope":missing_fact(),
             "sourceRoots":missing_fact(),"outputRoots":missing_fact(),
@@ -704,12 +945,14 @@ impl Evaluation {
     fn ty(&self, value: &Value) -> Result<TypeId, String> {
         match self.handles.get(token(value)?) {
             Some(Handle::Type(value)) => Ok(value.clone()),
+            Some(Handle::SnapshotType {..}|Handle::SnapshotMember {..})=>Err("UnsupportedSource: snapshot identities are read-only".into()),
             _ => Err("foreign type token".into()),
         }
     }
     fn declaration(&self, value: &Value) -> Result<DeclarationId, String> {
         match self.handles.get(token(value)?) {
             Some(Handle::Declaration(value)) => Ok(value.clone()),
+            Some(Handle::SnapshotDeclaration {..}|Handle::SnapshotMember {..})=>Err("UnsupportedSource: snapshot identities are read-only".into()),
             _ => Err("foreign declaration token".into()),
         }
     }
@@ -731,58 +974,133 @@ impl Evaluation {
             |signature| json!({"id":self.issue(Handle::Signature(signature.clone())),"kind":kind(signature.kind()),"descriptor":signature.descriptor()}),
         )
     }
-    fn annotation(&mut self, annotation: &SourceAnnotation) -> Value {
-        let reference = self.issue(Handle::TypeRef(annotation.ty.clone()));
-        json!({"typeRef":reference,"useSiteTarget":annotation.use_site_target,"range":range(&annotation.range),"arguments":annotation.arguments.iter().map(|argument|self.argument(argument)).collect::<Vec<_>>()})
-    }
-    fn argument(&mut self, argument: &AnnotationArgument) -> Value {
-        let value = fact(&argument.value, |value| match value {
-            AnnotationValue::Class(ty) => {
-                json!({"kind":"class","typeRef":self.issue(Handle::TypeRef(ty.clone()))})
-            }
-            AnnotationValue::String {
-                value,
-                content_range,
-            } => json!({"kind":"string","value":value,"contentRange":range(content_range)}),
-            AnnotationValue::Boolean(value) => json!({"kind":"boolean","value":value}),
-            AnnotationValue::Array(values) => {
-                json!({"kind":"array","values":values.iter().map(|value|self.argument(value)).collect::<Vec<_>>()})
-            }
+    fn annotation(&mut self, annotation: &SourceAnnotation, v2: bool,source:Option<&SourceHandle>) -> Value {
+        let reference = self.issue(match source {
+            Some(source)=>Handle::SnapshotTypeRef {source:source.clone(),value:annotation.ty.clone()},
+            None=>Handle::TypeRef(annotation.ty.clone()),
         });
+        let mut value=json!({"typeRef":reference,"useSiteTarget":annotation.use_site_target,
+            "range":range(&annotation.range),"arguments":annotation.arguments.iter()
+                .map(|argument|self.argument(argument,v2,source)).collect::<Vec<_>>()});
+        if v2 {value["nameRange"]=range(&annotation.name_range);}
+        value
+    }
+    fn argument(&mut self, argument: &AnnotationArgument, v2: bool,source:Option<&SourceHandle>) -> Value {
+        let value = if !v2 && matches!(&argument.value,Knowledge::Found(AnnotationValue::Integer {..}
+            |AnnotationValue::Enum {..}|AnnotationValue::Annotation(_)|AnnotationValue::MappedString {..})) {
+            fact(&Fact::<()>::Unknown(vec![IncompleteReason::UnsupportedSource]),|_|Value::Null)
+        } else {fact(&argument.value, |value| match value {
+            AnnotationValue::Class(ty) => json!({"kind":"class","typeRef":self.issue(match source {
+                Some(source)=>Handle::SnapshotTypeRef {source:source.clone(),value:ty.clone()},
+                None=>Handle::TypeRef(ty.clone()),
+            })}),
+            AnnotationValue::String {value,content_range} =>
+                json!({"kind":"string","value":value,"contentRange":range(content_range)}),
+            AnnotationValue::MappedString {value,segments} => json!({"kind":"mappedString","value":value,
+                "segments":segments.iter().map(|segment|json!({"decoded":range(&segment.decoded),
+                    "source":range(&segment.source)})).collect::<Vec<_>>()}),
+            AnnotationValue::Integer {value,ty} => json!({"kind":"integer","value":value,"type":match ty {
+                ktcore::extensions::source::AnnotationIntegerType::Int=>"int",
+                ktcore::extensions::source::AnnotationIntegerType::Long=>"long"}}),
+            AnnotationValue::Enum {ty,name} => json!({"kind":"enum","typeRef":self.issue(match source {
+                Some(source)=>Handle::SnapshotTypeRef {source:source.clone(),value:ty.clone()},
+                None=>Handle::TypeRef(ty.clone()),
+            }),"name":name}),
+            AnnotationValue::Annotation(annotation) => json!({"kind":"annotation","annotation":self.annotation(annotation,v2,source)}),
+            AnnotationValue::Boolean(value) => json!({"kind":"boolean","value":value}),
+            AnnotationValue::Array(values) => json!({"kind":"array","values":values.iter()
+                .map(|value|self.argument(value,v2,source)).collect::<Vec<_>>()}),
+        })};
         json!({"name":argument.name,"range":range(&argument.range),"value":value})
     }
-    pub fn source(&mut self, read: &mut ReadSession<'_>) -> Result<Value, String> {
-        let declarations = read.declarations().to_vec();
-        let mut ids = Vec::new();
-        for declaration in &declarations {
-            let id = read
-                .declaration(declaration.definition.start_byte..declaration.definition.end_byte)
-                .map_err(contract)?;
-            ids.push(self.issue(Handle::Declaration(id)));
-        }
-        let mut values = Vec::new();
-        for (position, declaration) in declarations.iter().enumerate() {
-            let owner = declaration
-                .owner
-                .as_ref()
-                .and_then(|owner| {
-                    declarations
-                        .iter()
-                        .position(|candidate| &candidate.definition == owner)
-                })
-                .map(|index| ids[index].clone());
-            values.push(json!({"id":ids[position],"owner":owner,"range":{"start":declaration.definition.start_byte,"end":declaration.definition.end_byte},"name":read.source().get(declaration.definition.start_byte..declaration.definition.end_byte),"annotations":declaration.annotations.iter().map(|annotation|self.annotation(annotation)).collect::<Vec<_>>()}));
-        }
-        if self.handles.len() > MAX_HANDLES {
-            return Err("too many extension handles".into());
-        }
-        Ok(
-            json!({"evaluation":self.id.to_string(),"owner":self.owner,"source":read.source(),"configuration":serde_json::from_str::<Value>(read.configuration()).map_err(|e|e.to_string())?,"declarations":values}),
-        )
+    fn source_declarations(&mut self,read:&mut ReadSession<'_>,v2:bool)->Result<Vec<Value>,String> {
+        let declarations=read.declarations().to_vec();
+        self.encode_source_declarations(read,declarations,None,None,v2)
     }
-    fn member(&mut self, candidate: &MemberCandidate) -> Value {
-        let id = self.issue(Handle::Member(candidate.id.clone()));
-        json!({"id":id,"name":candidate.name,"kind":kind(candidate.kind),"signature":self.signature_fact(&candidate.signature),"dispatch":fact(&candidate.dispatch,|value|json!(dispatch(*value))),"visibility":fact(&candidate.visibility,|value|json!(format!("{value:?}"))),"synthetic":fact(&candidate.synthetic,|value|json!(value)),"mismatches":candidate.mismatches.iter().map(|value|format!("{value:?}")).collect::<Vec<_>>()})
+    fn encode_source_declarations(&mut self,read:&mut ReadSession<'_>,declarations:Vec<ktcore::extensions::source::SourceDeclaration>,
+        text:Option<&str>,source:Option<&SourceHandle>,v2:bool)->Result<Vec<Value>,String> {
+        let mut ids=Vec::new();
+        for declaration in &declarations {
+            let range=declaration.definition.start_byte..declaration.definition.end_byte;
+            let handle=if let Some(source)=source {
+                let id=read.source_snapshot_declaration(source,range).map_err(contract)?;
+                let Knowledge::Found(value)=id else {return Err("UnsupportedSource: snapshot declaration scope unavailable".into());};
+                Handle::SnapshotDeclaration {source:source.clone(),value}
+            } else {Handle::Declaration(read.declaration(range).map_err(contract)?)};
+            ids.push(self.issue(handle));
+        }
+        let mut values=Vec::new();
+        for (position,declaration) in declarations.iter().enumerate() {
+            let owner=declaration.owner.as_ref().and_then(|owner|declarations.iter()
+                .position(|candidate|&candidate.definition==owner)).map(|index|ids[index].clone());
+            let mut value=json!({"id":ids[position],"owner":owner,
+                "range":{"start":declaration.definition.start_byte,"end":declaration.definition.end_byte},
+                "name":text.unwrap_or_else(||read.source()).get(declaration.definition.start_byte..declaration.definition.end_byte),
+                "annotations":declaration.annotations.iter().map(|annotation|self.annotation(annotation,v2,source)).collect::<Vec<_>>()});
+            if v2 {
+                value["sourceKind"]=json!(format!("{:?}",declaration.kind));
+                value["fullRange"]=range(&declaration.range);
+                value["headerRange"]=range(&declaration.header_range);
+                value["nameRange"]=range(&declaration.name_range);
+                value["bodyRange"]=declaration.body_range.as_ref().map_or(Value::Null,range);
+                let modifiers=&declaration.modifiers;
+                value["modifiers"]=json!({"visibility":fact(&modifiers.visibility,|visibility|json!(format!("{visibility:?}"))),
+                    "static":fact(&modifiers.is_static,|value|json!(value)),
+                    "final":fact(&modifiers.is_final,|value|json!(value)),
+                    "abstract":fact(&modifiers.is_abstract,|value|json!(value))});
+            }
+            values.push(value);
+        }
+        if self.handles.len()>MAX_HANDLES {return Err("too many extension handles".into());}
+        Ok(values)
+    }
+    fn source_type_fact(&mut self,value:&Fact<TypeId>,source:&SourceHandle)->Value {
+        fact(value,|ty| {
+            let id=self.issue(Handle::SnapshotType {source:source.clone(),value:ty.clone()});
+            let context=self.issue(Handle::Source(source.clone()));
+            json!({"id":id,"qualifiedName":ty.qualified_name(),"package":ty.package(),"readOnly":true,
+                "contextSource":self.source_descriptor(source,&context)})
+        })
+    }
+
+    fn read_source_facts(&mut self,read:&mut ReadSession<'_>,source:Option<&str>)->Result<Value,String> {
+        let Some(token)=source else {return Ok(json!({"declarations":self.source_declarations(read,true)?}));};
+        let source=match self.handles.get(token) {
+            Some(Handle::Source(source))=>source.clone(),
+            _=>return Err("foreign source token".into()),
+        };
+        let text=read.source_snapshot(&source).map_err(contract)?;
+        let declarations=read.source_snapshot_declarations(&source).map_err(contract)?;
+        let scope=read.source_semantic_scope(&source).map_err(contract)?;
+        let values=if scope.is_found() {
+            self.encode_source_declarations(read,declarations,Some(&text),Some(&source),true)?
+        } else {Vec::new()};
+        Ok(json!({"source":self.source_descriptor(&source,token),"declarations":values,
+            "semanticScope":fact(&scope,|_|Value::Null)}))
+    }
+
+    pub fn source(&mut self,read:&mut ReadSession<'_>)->Result<Value,String> {
+        let declarations=self.source_declarations(read,false)?;
+        Ok(json!({"evaluation":self.id.to_string(),"owner":self.owner,"source":read.source(),
+            "configuration":serde_json::from_str::<Value>(read.configuration()).map_err(|e|e.to_string())?,
+            "declarations":declarations}))
+    }
+
+    fn member(&mut self,candidate:&MemberCandidate)->Value {
+        self.member_in_source(candidate,None)
+    }
+    fn member_in_source(&mut self,candidate:&MemberCandidate,source:Option<&SourceHandle>)->Value {
+        let id=self.issue(match source {
+            Some(source)=>Handle::SnapshotMember {source:source.clone(),value:candidate.id.clone()},
+            None=>Handle::Member(candidate.id.clone()),
+        });
+        let mut value=json!({"id":id,"name":candidate.name,"kind":kind(candidate.kind),"signature":self.signature_fact(&candidate.signature),"dispatch":fact(&candidate.dispatch,|value|json!(dispatch(*value))),"visibility":fact(&candidate.visibility,|value|json!(format!("{value:?}"))),"synthetic":fact(&candidate.synthetic,|value|json!(value)),"mismatches":candidate.mismatches.iter().map(|value|format!("{value:?}")).collect::<Vec<_>>()});
+        if let Some(source)=source {
+            let context=self.issue(Handle::Source(source.clone()));
+            value["readOnly"]=json!(true);
+            value["contextSource"]=self.source_descriptor(source,&context);
+        }
+        value
     }
 
     fn source_location(&self, read: &mut ReadSession<'_>, target: &str) -> Result<Value,String> {
@@ -790,6 +1108,9 @@ impl Evaluation {
         let location = match self.handles.get(target) {
             Some(Handle::Type(value)) => read.type_source_location(value),
             Some(Handle::Member(value)) => read.member_source_location(value),
+            Some(Handle::SnapshotDeclaration {source,value})=>read.snapshot_declaration_location(source,value),
+            Some(Handle::SnapshotType {source,value})=>read.snapshot_type_location(source,value),
+            Some(Handle::SnapshotMember {source,value})=>read.snapshot_member_location(source,value),
             _ => return Err("foreign source-location target".into()),
         }.map_err(contract)?;
         let Knowledge::Found(location) = location else { return Ok(fact(&location, |_|Value::Null)); };
@@ -808,7 +1129,7 @@ impl Evaluation {
 
     fn type_jvm(&mut self, facts: &TypeJvmFacts) -> Value {
         let abi = match &facts.abi {
-            Knowledge::Found(class) => class_abi(class)
+            Knowledge::Found(class) => class_abi(class,self.project_operations&BINARY_ANNOTATIONS!=0)
                 .map(|value| json!({"state":"found","value":value}))
                 .unwrap_or_else(missing_fact),
             other => fact(other, |_| Value::Null),
@@ -825,17 +1146,20 @@ impl Evaluation {
         })
     }
     fn resource_identity(&mut self,catalog:&crate::resource_inputs::ResourceCatalog,index:usize)->String {
-        let prefix=if let Some(prefix)=&self.resource_catalog_token {prefix.clone()} else {
+        let prefix=if let Some(prefix)=self.resource_catalog_tokens.get(&catalog.revision) {prefix.clone()} else {
             let prefix=self.issue(Handle::ResourceCatalog{revision:catalog.revision});
-            self.resource_catalog_token=Some(prefix.clone());prefix
+            self.resource_catalog_tokens.insert(catalog.revision,prefix.clone());
+            if self.resource_catalog.as_ref().is_some_and(|owner|owner.revision==catalog.revision) {
+                self.resource_catalog_token=Some(prefix.clone());
+            }
+            prefix
         };
         format!("{prefix}#resource:{index:x}")
     }
 
     fn resource_index(&self,catalog:&crate::resource_inputs::ResourceCatalog,token:&str)->Result<usize,String> {
         let (prefix,slot)=token.split_once("#resource:").ok_or("invalid resource identity")?;
-        if self.resource_catalog_token.as_deref()!=Some(prefix)
-            || !matches!(self.handles.get(prefix),Some(Handle::ResourceCatalog{revision}) if *revision==catalog.revision)
+        if !matches!(self.handles.get(prefix),Some(Handle::ResourceCatalog{revision}) if *revision==catalog.revision)
             || slot.is_empty() || slot.len()>16 || !slot.bytes().all(|byte|byte.is_ascii_hexdigit()) {return Err("foreign resource catalog".into());}
         let index=usize::from_str_radix(slot,16).map_err(|_|"invalid resource index")?;
         if index>=catalog.entries.len() || format!("{index:x}")!=slot {return Err("foreign resource index".into());}
@@ -843,8 +1167,8 @@ impl Evaluation {
     }
 
     fn resource_stream_cursor(&self,resource:&str,after:&str)->Result<(),String> {
-        let catalog=self.resource_catalog.as_ref().ok_or("resource inputs were not captured")?;
-        self.resource_index(catalog,resource)?;
+        let catalog=self.resource_catalog_for_identity(resource)?;
+        self.resource_index(&catalog,resource)?;
         match self.handles.get(after) {
             Some(Handle::ResourceBytes{resource:expected,..}) if expected==resource=>Ok(()),
             _=>Err("invalid resource snapshot cursor".into()),
@@ -853,10 +1177,10 @@ impl Evaluation {
 
     fn resource_descriptor(&mut self, catalog:&crate::resource_inputs::ResourceCatalog, index:usize)->Value {
         let id=self.resource_identity(catalog,index);
-        Self::resource_descriptor_value(catalog,index,&id)
+        self.resource_descriptor_value(catalog,index,&id)
     }
 
-    fn resource_descriptor_value(catalog:&crate::resource_inputs::ResourceCatalog,index:usize,id:&str)->Value {
+    fn resource_descriptor_value(&self,catalog:&crate::resource_inputs::ResourceCatalog,index:usize,id:&str)->Value {
         use crate::resource_inputs::ResourceLocation;
         let entry=&catalog.entries[index];
         let uri=match &entry.location {
@@ -864,14 +1188,28 @@ impl Evaluation {
                 .map_or_else(missing_fact,|uri|json!({"state":"found","value":uri.to_string()})),
             ResourceLocation::Archive{..}|ResourceLocation::File(_)=>missing_fact(),
         };
-        json!({"id":id,"relativePath":entry.relative_path,"association":entry.association.name(),
+        let mut value=json!({"id":id,"relativePath":entry.relative_path,"association":entry.association.name(),
             "classpathOrder":entry.order,"editable":entry.editable,"documentUri":uri,
             "documentVersion":entry.document.as_ref().and_then(|document|document.document_version),
-            "identity":{"kind":"resource","revision":catalog.revision.to_string()}})
+            "identity":{"kind":"resource","revision":catalog.revision.to_string()}});
+        if self.project_operations&PROJECT_INPUTS!=0 {
+            value["ownerScope"]=match &entry.location {
+                ResourceLocation::File(path)=>match catalog.model.resource_owner_context(path) {
+                    Knowledge::Found(owner)=>json!({"state":"found","value":{"module":owner.scope.module,"sourceSet":owner.scope.source_set}}),
+                    _=>missing_fact(),
+                },
+                _=>missing_fact(),
+            };
+            value["membershipScope"]=json!({"module":catalog.scope.module,"sourceSet":catalog.scope.source_set});
+        }
+        value
     }
 
     fn resource_inventory(&mut self,read:&mut ReadSession<'_>,after:Option<&str>)->Result<Value,String> {
-        let Some(catalog)=self.resource_catalog.clone() else {return Ok(json!({"resources":[],"next":null,"coverage":missing_fact()}));};
+        self.scoped_resource_inventory(read,None,after)
+    }
+    fn scoped_resource_inventory(&mut self,read:&mut ReadSession<'_>,scope:Option<&str>,after:Option<&str>)->Result<Value,String> {
+        let Some(catalog)=self.resource_catalog_for_scope(scope)? else {return Ok(json!({"resources":[],"next":null,"coverage":missing_fact()}));};
         read.observe_host_input(catalog.guard.clone()).map_err(|error|format!("{error:?}"))?;
         let start=match after {
             None=>0,
@@ -883,7 +1221,7 @@ impl Evaluation {
         let mut values=Vec::new();let mut bytes=512;let mut end=start;
         while end<catalog.entries.len() {
             let id=self.resource_identity(&catalog,end);
-            let descriptor=Self::resource_descriptor_value(&catalog,end,&id);
+            let descriptor=self.resource_descriptor_value(&catalog,end,&id);
             let size=serde_json::to_vec(&descriptor).map_err(|error|error.to_string())?.len()+1;
             if bytes+size>MAX_FRAME/2-4096 {break;}
             values.push(descriptor);bytes+=size;end+=1;
@@ -897,8 +1235,12 @@ impl Evaluation {
 
     fn resource_lookup(&mut self,read:&mut ReadSession<'_>,relative:&str,
         association:Option<crate::resource_inputs::ResourceAssociation>)->Result<Value,String> {
+        self.scoped_resource_lookup(read,None,relative,association)
+    }
+    fn scoped_resource_lookup(&mut self,read:&mut ReadSession<'_>,scope:Option<&str>,relative:&str,
+        association:Option<crate::resource_inputs::ResourceAssociation>)->Result<Value,String> {
         if !crate::resource_model::safe_relative(relative) {return Err("invalid resource relative path".into());}
-        let Some(catalog)=self.resource_catalog.clone() else {return Ok(missing_fact());};
+        let Some(catalog)=self.resource_catalog_for_scope(scope)? else {return Ok(missing_fact());};
         read.observe_host_input(catalog.guard.clone()).map_err(|error|format!("{error:?}"))?;
         let indices:Vec<_>=catalog.entries.iter().enumerate().filter(|(_,entry)|
             entry.relative_path==relative && association.is_none_or(|kind|kind==entry.association))
@@ -924,22 +1266,25 @@ impl Evaluation {
         for value in queries {
             let query:ReadQuery=serde_json::from_value(value.clone()).map_err(|error|error.to_string())?;
             match query {
-                ReadQuery::ResourceInventory{after}=>{
+                ReadQuery::ResourceInventory{after,scope}=>{
                     if self.project_operations&RESOURCE_INVENTORY==0 {return Err("resourceInventory was not negotiated".into());}
+                    let catalog=self.resource_catalog_for_scope(scope.as_deref())?;
+                    if catalog.as_ref().is_some_and(|catalog|!catalog.guard.is_current()) {return Err("Stale".into());}
                     if let Some(after)=after {
-                        if !matches!(self.handles.get(&after),Some(Handle::ResourceInventory{revision,..}) if catalog.is_some_and(|catalog|catalog.revision==*revision)) {
+                        if !matches!(self.handles.get(&after),Some(Handle::ResourceInventory{revision,..}) if catalog.as_ref().is_some_and(|catalog|catalog.revision==*revision)) {
                             return Err("invalid resource inventory cursor".into());
                         }
                     }
                 }
-                ReadQuery::ResourceLookup{relative_path,..}=>{
+                ReadQuery::ResourceLookup{relative_path,scope,..}=>{
                     if self.project_operations&RESOURCE_LOOKUP==0 {return Err("resourceLookup was not negotiated".into());}
+                    self.resource_catalog_for_scope(scope.as_deref())?;
                     if !crate::resource_model::safe_relative(&relative_path) {return Err("invalid resource relative path".into());}
                 }
                 ReadQuery::ResourceSnapshot{resource,after}=>{
                     if self.project_operations&RESOURCE_SNAPSHOT==0 {return Err("resourceSnapshot was not negotiated".into());}
-                    let catalog=catalog.ok_or("resource inputs were not captured")?;
-                    let index=self.resource_index(catalog,&resource)?;
+                    let catalog=self.resource_catalog_for_identity(&resource)?;
+                    let index=self.resource_index(&catalog,&resource)?;
                     if let Some(after)=after {
                         self.resource_stream_cursor(&resource,&after)?;
                         continue;
@@ -959,7 +1304,7 @@ impl Evaluation {
 
     fn resource_snapshot(&mut self,read:&mut ReadSession<'_>,resource:&str,after:Option<&str>)->Result<Value,String> {
         use base64::Engine;
-        let catalog=self.resource_catalog.clone().ok_or("resource inputs were not captured")?;
+        let catalog=self.resource_catalog_for_identity(resource)?;
         self.resource_index(&catalog,resource)?;
         read.observe_host_input(catalog.guard.clone()).map_err(|error|format!("{error:?}"))?;
         let (body,start)=match after {
@@ -1033,13 +1378,13 @@ impl Evaluation {
                             if self.project_operations&JVM_CLASS==0 {return Err("jvmClass was not negotiated".into());}
                             self.jvm_class(read,&entry)?
                         }
-                        ReadQuery::ResourceInventory{after}=>{
+                        ReadQuery::ResourceInventory{after,scope}=>{
                             if self.project_operations&RESOURCE_INVENTORY==0 {return Err("resourceInventory was not negotiated".into());}
-                            self.resource_inventory(read,after.as_deref())?
+                            self.scoped_resource_inventory(read,scope.as_deref(),after.as_deref())?
                         }
-                        ReadQuery::ResourceLookup{relative_path,association}=>{
+                        ReadQuery::ResourceLookup{relative_path,association,scope}=>{
                             if self.project_operations&RESOURCE_LOOKUP==0 {return Err("resourceLookup was not negotiated".into());}
-                            self.resource_lookup(read,&relative_path,association)?
+                            self.scoped_resource_lookup(read,scope.as_deref(),&relative_path,association)?
                         }
                         ReadQuery::ResourceSnapshot{resource,after}=>{
                             if self.project_operations&RESOURCE_SNAPSHOT==0 {return Err("resourceSnapshot was not negotiated".into());}
@@ -1053,17 +1398,21 @@ impl Evaluation {
                             if self.project_operations & CLASS_BYTES == 0 { return Err("classBytes was not negotiated".into()); }
                             self.class_bytes(&class_identity, after.as_deref())?
                         }
-                        ReadQuery::SourceInventory { after } => {
+                        ReadQuery::SourceInventory { after, scope } => {
                             if self.project_operations & SOURCE_INVENTORY == 0 {
                                 return Err("sourceInventory was not negotiated".into());
                             }
-                            self.source_inventory(read, after.as_deref(), remaining.saturating_sub(1))?
+                            self.scoped_source_inventory(read,scope.as_deref(),after.as_deref(),remaining.saturating_sub(1))?
                         }
                         ReadQuery::SourceSnapshot { source } => {
                             if self.project_operations & SOURCE_SNAPSHOT == 0 {
                                 return Err("sourceSnapshot was not negotiated".into());
                             }
                             self.source_snapshot(read, &source)?
+                        }
+                        ReadQuery::ProjectInputs {after} => {
+                            if self.project_operations&PROJECT_INPUTS==0 {return Err("projectInputs was not negotiated".into());}
+                            self.project_inputs(read,after.as_deref(),remaining.saturating_sub(1))?
                         }
                         ReadQuery::ProjectContext => {
                             if self.project_operations & PROJECT_CONTEXT == 0 {
@@ -1075,22 +1424,59 @@ impl Evaluation {
                             if self.project_operations & TYPE_JVM == 0 {
                                 return Err("typeJvm was not negotiated".into());
                             }
-                            let facts = read.type_jvm(&self.ty(&json!(target))?).map_err(contract)?;
-                            self.type_jvm(&facts)
+                            if matches!(self.handles.get(&target),Some(Handle::SnapshotType {..})) {
+                                json!({"binaryName":unsupported_source_fact(),"classFlags":unsupported_source_fact(),
+                                    "declaredMembers":{"members":[],"coverage":unsupported_source_fact()},
+                                    "abi":unsupported_source_fact(),"jvmAbiCoverage":unsupported_source_fact()})
+                            } else {
+                                let facts=read.type_jvm(&self.ty(&json!(target))?).map_err(contract)?;
+                                self.type_jvm(&facts)
+                            }
                         }
                         ReadQuery::ResolveType {name} => self.type_fact(&read.resolve_type(&name)),
                         ReadQuery::ResolveTypeRef {reference} => {
-                            let reference = match self.handles.get(&reference) { Some(Handle::TypeRef(value)) => value.clone(), _ => return Err("foreign type-reference token".into()) };
-                            self.type_fact(&read.resolve_type_ref(&reference))
+                            let (reference,source)=match self.handles.get(&reference) {
+                                Some(Handle::TypeRef(value))=>(value.clone(),None),
+                                Some(Handle::SnapshotTypeRef {source,value})=>(value.clone(),Some(source.clone())),
+                                _=>return Err("foreign type-reference token".into()),
+                            };
+                            if let Some(source)=source {
+                                let value=read.resolve_source_type_ref(&source,&reference).map_err(contract)?;
+                                self.source_type_fact(&value,&source)
+                            } else {self.type_fact(&read.resolve_type_ref(&reference))}
                         }
-                        ReadQuery::DeclarationType {declaration} => self.type_fact(&read.declaration_type(&self.declaration(&json!(declaration))?).map_err(contract)?),
+                        ReadQuery::DeclarationType {declaration} => {
+                            let snapshot=match self.handles.get(&declaration) {
+                                Some(Handle::SnapshotDeclaration {source,value})=>Some((source.clone(),value.clone())),_=>None,
+                            };
+                            if let Some((source,declaration))=snapshot {
+                                let value=read.snapshot_declaration_type(&source,&declaration).map_err(contract)?;
+                                self.source_type_fact(&value,&source)
+                            } else {self.type_fact(&read.declaration_type(&self.declaration(&json!(declaration))?).map_err(contract)?)}
+                        },
                         ReadQuery::DeclarationMember {declaration} => {
-                            let member = read.declaration_member(&self.declaration(&json!(declaration))?).map_err(contract)?;
-                            fact(&member, |member| self.member(member))
+                            let snapshot=match self.handles.get(&declaration) {
+                                Some(Handle::SnapshotDeclaration {source,value})=>Some((source.clone(),value.clone())),_=>None,
+                            };
+                            if let Some((source,declaration))=snapshot {
+                                let value=read.snapshot_declaration_member(&source,&declaration).map_err(contract)?;
+                                fact(&value,|member|self.member_in_source(member,Some(&source)))
+                            } else {
+                                let member=read.declaration_member(&self.declaration(&json!(declaration))?).map_err(contract)?;
+                                fact(&member,|member|self.member(member))
+                            }
                         }
                         ReadQuery::DeclaredMembers {target} => {
-                            let (members,coverage) = read.declared_members(&self.ty(&json!(target))?).map_err(contract)?;
-                            json!({"members":members.iter().map(|member|self.member(member)).collect::<Vec<_>>(),"coverage":fact(&coverage, |_|Value::Null)})
+                            if matches!(self.handles.get(&target),Some(Handle::SnapshotType {..})) {
+                                json!({"members":[],"coverage":unsupported_source_fact()})
+                            } else {
+                                let (members,coverage)=read.declared_members(&self.ty(&json!(target))?).map_err(contract)?;
+                                json!({"members":members.iter().map(|member|self.member(member)).collect::<Vec<_>>(),"coverage":fact(&coverage,|_|Value::Null)})
+                            }
+                        }
+                        ReadQuery::SourceFacts {source} => {
+                            if self.project_operations & SOURCE_FACTS == 0 { return Err("sourceFacts was not negotiated".into()); }
+                            self.read_source_facts(read,source.as_deref())?
                         }
                         ReadQuery::SourceLocation {target} => {
                             if self.project_operations & SOURCE_LOCATION == 0 {return Err("sourceLocation was not negotiated".into());}
@@ -1214,15 +1600,44 @@ fn range(range: &std::ops::Range<usize>) -> Value {
     json!({"start":range.start,"end":range.end})
 }
 
-fn class_member(member: &ktcore::classfile::MemberFacts) -> Value {
-    json!({
+fn binary_annotation_value(value: &ktcore::classfile::AnnotationValue) -> Value {
+    use ktcore::classfile::AnnotationValue::*;
+    match value {
+        Byte(value)=>json!({"kind":"byte","value":value}), Char(value)=>json!({"kind":"char","value":value}),
+        DoubleBits(value)=>json!({"kind":"double","bits":format!("{value:016x}")}),
+        FloatBits(value)=>json!({"kind":"float","bits":format!("{value:08x}")}),
+        Int(value)=>json!({"kind":"int","value":value}), Long(value)=>json!({"kind":"long","value":value.to_string()}),
+        Short(value)=>json!({"kind":"short","value":value}), Boolean(value)=>json!({"kind":"boolean","value":value}),
+        String(value)=>json!({"kind":"string","value":value.as_ref()}),
+        StringUtf16(value)=>json!({"kind":"string","utf16":value.as_ref()}),
+        Enum {descriptor,name}=>json!({"kind":"enum","descriptor":descriptor.as_ref(),"name":name.as_ref()}),
+        Class(value)=>json!({"kind":"class","descriptor":value.as_ref()}),
+        Annotation(value)=>json!({"kind":"annotation","value":binary_annotation(value)}),
+        Array(values)=>json!({"kind":"array","values":values.iter().map(binary_annotation_value).collect::<Vec<_>>()}),
+    }
+}
+fn binary_annotation(value: &ktcore::classfile::Annotation) -> Value {
+    json!({"descriptor":value.descriptor.as_ref(),"elements":value.elements.iter().map(|element|
+        json!({"name":element.name.as_ref(),"value":binary_annotation_value(&element.value)})).collect::<Vec<_>>()})
+}
+fn binary_annotations(values: &[ktcore::classfile::BinaryAnnotation]) -> Vec<Value> {
+    values.iter().map(|value| {
+        let mut annotation=binary_annotation(&value.annotation);
+        annotation["runtimeVisible"]=json!(value.runtime_visible);
+        annotation
+    }).collect()
+}
+fn class_member(member: &ktcore::classfile::MemberFacts, with_annotations: bool) -> Value {
+    let mut value=json!({
         "name":member.name.as_ref(), "descriptor":member.descriptor.as_ref(),
         "accessFlags":member.access_flags, "signature":member.signature.as_deref(),
         "attributeNames":member.attribute_names.iter().map(|name|name.as_ref()).collect::<Vec<_>>()
-    })
+    });
+    if with_annotations {value["annotations"]=json!(binary_annotations(&member.annotations));}
+    value
 }
 
-fn class_abi(class: &ktcore::classfile::ClassFileFacts) -> Option<Value> {
+fn class_abi(class: &ktcore::classfile::ClassFileFacts, with_annotations: bool) -> Option<Value> {
     let ktcore::jvm::InputIdentity::Binary { content_sha256 } = &class.identity.input else {
         return None;
     };
@@ -1230,7 +1645,7 @@ fn class_abi(class: &ktcore::classfile::ClassFileFacts) -> Option<Value> {
     for byte in content_sha256 {
         write!(&mut digest, "{byte:02x}").expect("formatting into a String");
     }
-    let value = json!({
+    let mut value = json!({
         "identity":{
             "originId":class.identity.origin_id, "internalName":class.identity.internal_name,
             "contentSha256":digest
@@ -1244,10 +1659,73 @@ fn class_abi(class: &ktcore::classfile::ClassFileFacts) -> Option<Value> {
             "inner":inner.inner.as_ref(),"outer":inner.outer.as_deref(),
             "name":inner.name.as_deref(),"accessFlags":inner.access_flags
         })).collect::<Vec<_>>(),
-        "fields":class.fields.iter().map(class_member).collect::<Vec<_>>(),
-        "methods":class.methods.iter().map(class_member).collect::<Vec<_>>()
+        "fields":class.fields.iter().map(|member|class_member(member,with_annotations)).collect::<Vec<_>>(),
+        "methods":class.methods.iter().map(|member|class_member(member,with_annotations)).collect::<Vec<_>>()
     });
+    if with_annotations {value["annotations"]=json!(binary_annotations(&class.annotations));}
     (serde_json::to_vec(&value).ok()?.len() <= MAX_FRAME / 2).then_some(value)
+}
+
+#[cfg(test)]
+fn assert_current_raw_abi(value: &Value) {
+    #[derive(Deserialize)]
+    #[serde(rename_all="camelCase",deny_unknown_fields)]
+    struct CurrentRawMember {
+        name:String, descriptor:String, access_flags:u16,
+        signature:Option<String>, attribute_names:Vec<String>,
+    }
+    assert!(value.get("annotations").is_none());
+    for member in value["fields"].as_array().unwrap().iter().chain(value["methods"].as_array().unwrap()) {
+        // The current MC consumer decodes this exact member shape with deny_unknown_fields.
+        let current:CurrentRawMember=serde_json::from_value(member.clone()).unwrap();
+        assert_eq!(*member,json!({"name":current.name,"descriptor":current.descriptor,
+            "accessFlags":current.access_flags,"signature":current.signature,"attributeNames":current.attribute_names}));
+    }
+}
+
+#[cfg(test)]
+mod binary_annotation_wire_tests {
+    use super::*;
+
+    #[test]
+    fn binary_annotations_require_explicit_selection_on_type_jvm_and_sdk_headers() {
+        let offered=initialize_message("annotations",&Default::default());
+        assert!(offered["params"]["capabilities"].as_array().unwrap().iter().any(|value|value==BINARY_ANNOTATION_CAPABILITY));
+        assert!(offered["params"]["supportedOps"].get(BINARY_ANNOTATION_CAPABILITY).is_none());
+        assert_eq!(project_operations(&json!({"supportedOps":{BINARY_ANNOTATION_CAPABILITY:["binaryAnnotations"]}})),0);
+        let selected=project_operations(&json!({"capabilities":[BINARY_ANNOTATION_CAPABILITY]}));
+        assert_eq!(selected,BINARY_ANNOTATIONS);
+        assert_eq!(selected&(TYPE_JVM|JVM_CLASS|RUNTIME_CLASS|CLASS_BYTES|PROJECT_INPUTS),0);
+        let class=Arc::new(ktcore::classfile::decode("compile-only-annotation",include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/annotationfixture/CustomPoint.class")).unwrap());
+        let facts=TypeJvmFacts {
+            binary_name:Knowledge::Found(JvmBinaryName {internal_name:class.identity.internal_name.clone(),descriptor:"Lannotationfixture/CustomPoint;".into()}),
+            class_flags:Knowledge::Found(class.access_flags),declared_members:Vec::new(),
+            declared_members_coverage:Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),
+            abi:Knowledge::Found(class.clone()),jvm_abi_coverage:Knowledge::Found(()),
+        };
+        for flags in [0,selected] {
+            let mut evaluation=Evaluation::new("annotations".into(),"/Owner.kt".into(),1);
+            evaluation.project_operations=TYPE_JVM|RUNTIME_CLASS|CLASS_BYTES|flags;
+            let ty=evaluation.type_jvm(&facts);
+            evaluation.class_results.insert(class.identity.internal_name.clone(),crate::runtime_bytes::ClassReadResult {
+                internal_name:class.identity.internal_name.clone(),identity:Some(class.identity.clone()),
+                byte_length:0,bytes:None,unavailable:None,api_header:Some(class.clone()),
+            });
+            let header=evaluation.runtime_class(&class.identity.internal_name).unwrap();
+            for abi in [&ty["abi"]["value"],&header["value"]["classHeader"]["value"]] {
+                if flags==0 {assert_current_raw_abi(abi);} else {
+                    assert_eq!(abi["annotations"][0]["descriptor"],"Lannotationfixture/AtCode;");
+                    assert_eq!(abi["annotations"][0]["elements"][0]["value"],json!({"kind":"string","value":"CUSTOM"}));
+                    assert_eq!(abi["fields"][0]["annotations"][0]["runtimeVisible"],false);
+                    assert!(abi["methods"].as_array().unwrap().iter().find(|member|member["name"]=="probe").unwrap()["annotations"].as_array().unwrap().len()>0);
+                }
+            }
+            let token=header["value"]["id"].as_str().unwrap();
+            assert_eq!(header["value"]["codeAvailable"],false);
+            assert_eq!(evaluation.class_bytes(token,None).unwrap()["reasons"][0]["code"],"BYTECODE_UNAVAILABLE");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1281,9 +1759,16 @@ pub(crate) fn assert_jvm_catalog_wire(catalog:Arc<crate::jvm_catalog::JvmCatalog
     assert_eq!(entries[0]["originId"],"compile-first");assert_eq!(entries[1]["originId"],"compile-second");
     let compile=entries[0]["entry"].as_str().unwrap().to_owned();
     let sdk=evaluation.jvm_inventory(&mut read,"java/lang/Object",None).unwrap()["classes"][0]["entry"].as_str().unwrap().to_owned();
-    let params=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"jvmClass","entry":compile},{"op":"jvmClass","entry":sdk}]});
+    let annotated=evaluation.jvm_inventory(&mut read,"annotationfixture/CustomPoint",None).unwrap();
+    assert_eq!(annotated["classes"].as_array().unwrap().len(),1);
+    assert_eq!(annotated["classes"][0]["association"],"compileClasspath");
+    let annotated=annotated["classes"][0]["entry"].as_str().unwrap().to_owned();
+    let params=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"jvmClass","entry":compile},{"op":"jvmClass","entry":sdk},{"op":"jvmClass","entry":annotated}]});
     let plan=evaluation.begin_jvm_reads("analysis/readFacts",&params).unwrap().unwrap();
     evaluation.finish_jvm_read(&mut read,crate::jvm_catalog::prepare(plan,Arc::new(||{}))).unwrap();
+    let current=evaluation.batch(&mut read,"analysis/readFacts",params.clone()).unwrap();
+    for fact in current["facts"].as_array().unwrap() {assert_current_raw_abi(&fact["value"]["abi"]);}
+    evaluation.project_operations|=project_operations(&json!({"capabilities":[BINARY_ANNOTATION_CAPABILITY]}));
     let response=evaluation.batch(&mut read,"analysis/readFacts",params).unwrap();
     let compiled=&response["facts"][0]["value"];assert_eq!(compiled["authority"],"compiled-input");
     assert_eq!(compiled["abi"]["identity"]["internalName"],"pluginfixture/Person");
@@ -1291,6 +1776,60 @@ pub(crate) fn assert_jvm_catalog_wire(catalog:Arc<crate::jvm_catalog::JvmCatalog
     assert_eq!(compiled["sourceCurrent"]["state"],"unknown");
     let header=&response["facts"][1]["value"];assert_eq!(header["authority"],"sdk-api-header");
     assert!(header["abi"]["methods"].as_array().unwrap().iter().all(|method|method["attributeNames"].as_array().unwrap().iter().all(|name|name!="Code")));
+    let annotated_value=&response["facts"][2]["value"];
+    assert_eq!(annotated_value["authority"],"compiled-input");
+    assert_eq!(annotated_value["sourceCurrent"]["state"],"unknown");
+    let abi=&annotated_value["abi"];
+    assert_eq!(abi["identity"]["originId"],"compile-first");
+    assert_eq!(abi["identity"]["internalName"],"annotationfixture/CustomPoint");
+    use sha2::{Digest,Sha256};
+    assert_eq!(abi["identity"]["contentSha256"],format!("{:x}",Sha256::digest(include_bytes!("../../ktcore/tests/fixtures/classfile/annotationfixture/CustomPoint.class"))));
+    assert_eq!(abi["annotations"],json!([
+        {"runtimeVisible":true,"descriptor":"Lannotationfixture/AtCode;","elements":[
+            {"name":"value","value":{"kind":"string","value":"CUSTOM"}},
+            {"name":"namespace","value":{"kind":"string","value":"example"}}
+        ]},
+        {"runtimeVisible":false,"descriptor":"Lannotationfixture/Invisible;","elements":[
+            {"name":"value","value":{"kind":"string","value":"classInvisible"}}
+        ]}
+    ]));
+    assert_eq!(abi["fields"][0]["annotations"],json!([
+        {"runtimeVisible":false,"descriptor":"Lannotationfixture/Invisible;","elements":[
+            {"name":"value","value":{"kind":"string","value":"fieldInvisible"}}
+        ]}
+    ]));
+    let probe=abi["methods"].as_array().unwrap().iter().find(|method|method["name"]=="probe").unwrap();
+    assert_eq!(probe["annotations"],json!([
+        {"runtimeVisible":true,"descriptor":"Lannotationfixture/Payload;","elements":[
+            {"name":"b","value":{"kind":"byte","value":-7}},
+            {"name":"c","value":{"kind":"char","value":55296}},
+            {"name":"d","value":{"kind":"double","bits":"8000000000000000"}},
+            {"name":"f","value":{"kind":"float","bits":"7f800000"}},
+            {"name":"i","value":{"kind":"int","value":-17}},
+            {"name":"j","value":{"kind":"long","value":"9223372036854775807"}},
+            {"name":"s","value":{"kind":"short","value":-123}},
+            {"name":"z","value":{"kind":"boolean","value":true}},
+            {"name":"text","value":{"kind":"string","value":"nul\0😃"}},
+            {"name":"utf16","value":{"kind":"string","utf16":[55296,120,56320,55357,56835,0]}},
+            {"name":"choice","value":{"kind":"enum","descriptor":"Lannotationfixture/Choice;","name":"SECOND"}},
+            {"name":"type","value":{"kind":"class","descriptor":"[[I"}},
+            {"name":"nested","value":{"kind":"annotation","value":{"descriptor":"Lannotationfixture/Nested;","elements":[
+                {"name":"value","value":{"kind":"string","value":"nestedValue"}}
+            ]}}},
+            {"name":"array","value":{"kind":"array","values":[
+                {"kind":"int","value":1},{"kind":"int","value":-2},{"kind":"int","value":3}
+            ]}}
+        ]},
+        {"runtimeVisible":false,"descriptor":"Lannotationfixture/Invisible;","elements":[
+            {"name":"value","value":{"kind":"string","value":"methodInvisible"}}
+        ]}
+    ]));
+    assert_eq!(evaluation.class_identity(&annotated).unwrap_err(),"foreign runtime class identity");
+    assert!(evaluation.class_bytes(&annotated,None).is_err());
+    let foreign=Evaluation::new("catalog".into(),owner.into(),2);
+    assert!(foreign.jvm_entry(&annotated).is_err());
+    assert!(evaluation.jvm_entry("forged-annotation-entry").is_err());
+
     assert_eq!(evaluation.class_identity(&compile).unwrap_err(),"foreign runtime class identity");
     let foreign=Evaluation::new("catalog".into(),owner.into(),2);assert!(foreign.jvm_entry(&compile).is_err());
     let absent=evaluation.jvm_inventory(&mut read,"missing/",None).unwrap();assert!(absent["classes"].as_array().unwrap().is_empty());
@@ -1305,6 +1844,8 @@ pub(crate) fn assert_jvm_catalog_wire(catalog:Arc<crate::jvm_catalog::JvmCatalog
     // its callback runs only after the guard's invalid latch has been set.
     invalidated.recv_timeout(Duration::from_secs(5)).expect("catalog archive edit must reach its native observer");
     assert!(!catalog.current(),"the observed archive change must invalidate the catalog authority");
+    let stale=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"jvmClass","entry":annotated}]});
+    assert!(matches!(evaluation.begin_jvm_reads("analysis/readFacts",&stale),Err(error) if error=="Stale"));
     assert_eq!(store.validate_pending(&pending),Err(ktcore::extensions::ContractError::Stale));
     fn fs_for_test_append(path:&std::path::Path) {std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(b"changed").unwrap();}
 }
@@ -1314,13 +1855,14 @@ pub(crate) fn assert_jvm_catalog_wire(catalog:Arc<crate::jvm_catalog::JvmCatalog
 enum ReadQuery {
     JvmCatalog { #[serde(default)] prefix:String, #[serde(default)] after:Option<String> },
     JvmClass { entry:String },
-    ResourceInventory { #[serde(default)] after:Option<String> },
-    ResourceLookup { #[serde(rename="relativePath")] relative_path:String, #[serde(default)] association:Option<crate::resource_inputs::ResourceAssociation> },
+    ResourceInventory { #[serde(default)] after:Option<String>, #[serde(default)] scope:Option<String> },
+    ResourceLookup { #[serde(rename="relativePath")] relative_path:String, #[serde(default)] association:Option<crate::resource_inputs::ResourceAssociation>, #[serde(default)] scope:Option<String> },
     ResourceSnapshot { resource:String, #[serde(default)] after:Option<String> },
     RuntimeClass { #[serde(rename="internalName")] internal_name: String },
     ClassBytes { #[serde(rename="classIdentity")] class_identity: String, #[serde(default)] after: Option<String> },
-    SourceInventory { #[serde(default)] after: Option<String> },
+    SourceInventory { #[serde(default)] after: Option<String>, #[serde(default)] scope:Option<String> },
     SourceSnapshot { source: String },
+    ProjectInputs { #[serde(default)] after:Option<String> },
     ProjectContext,
     TypeJvm { target: String },
     ResolveType { name: String },
@@ -1329,6 +1871,7 @@ enum ReadQuery {
     DeclarationMember { declaration: String },
     DeclaredMembers { target: String },
     SourceLocation { target: String },
+    SourceFacts { #[serde(default)] source:Option<String> },
 }
 
 #[cfg(test)]
@@ -1456,6 +1999,66 @@ mod source_snapshot_tests {
         let mut evaluation=Evaluation::new("pages".into(),files[0].clone(),1);
         evaluation.project=Some(project);evaluation.project_operations=SOURCE_INVENTORY|SOURCE_SNAPSHOT;
         (index,store,evaluation,files)
+    }
+
+    #[test]
+    fn project_inputs_page_all_owner_project_sets_and_bind_inventory_scope_handles() {
+        let (index,mut store,mut evaluation,files)=inventory_page_fixture(3);
+        let mut modules=evaluation.project.as_ref().unwrap().modules.clone();
+        let mut test=modules[0].source_sets[0].clone();test.name="test".into();
+        test.compiler_tasks[0].task=":inventory:compileTestJava".into();
+        *test.compiler_tasks[0].options.get_mut("sdkProducerClaims").expect("fixture producer claims")
+            .get_mut("task").expect("fixture producer task")=json!(test.compiler_tasks[0].task);
+        modules[0].source_sets[0].compiler_tasks[0].source_files=files[..2].iter().map(std::path::PathBuf::from).collect();
+        test.compiler_tasks[0].source_files=files[1..].iter().map(std::path::PathBuf::from).collect();
+        test.entries=(0..120).map(|i|std::path::PathBuf::from(&files[0]).with_file_name(format!("dependency-{i:03}.jar"))).collect();
+        modules[0].source_sets.push(test);
+        evaluation.project=Some(Arc::new(crate::classpath::ProjectSnapshot::new(modules.clone())));
+        evaluation.project_operations|=PROJECT_INPUTS;
+        let mut read=store.begin(&index,"pages",&files[0]).unwrap();
+        assert!(evaluation.project_inputs(&mut read,None,8).is_err());
+        let mut page=evaluation.project_inputs(&mut read,None,4096).unwrap();
+        let mut records=Vec::new();let mut pages=0;
+        loop {
+            records.extend(page["records"].as_array().unwrap().iter().cloned());pages+=1;
+            if page["next"].is_null() {break;}
+            let cursor=page["next"].as_str().unwrap().to_owned();
+            page=evaluation.project_inputs(&mut read,Some(&cursor),4096).unwrap();
+        }
+        assert!(pages>1);assert_eq!(page["coverage"]["state"],"unknown","legacy data must not acquire capture authority");
+        assert_eq!(records.iter().filter(|record|record["kind"]=="sourceSet").count(),2);
+        assert_eq!(records.iter().filter(|record|record["kind"]=="classpathEntry").count(),120);
+        assert!(records.iter().find(|record|record["kind"]=="project").unwrap()["index"]["state"]=="unknown");
+        let token=records.iter().find(|record|record["kind"]=="sourceSet" && record["name"]=="test").unwrap()["id"].as_str().unwrap();
+        let inventory=evaluation.scoped_source_inventory(&mut read,Some(token),None,MAX_FRAME/2).unwrap();
+        assert_eq!(inventory["sources"].as_array().unwrap().len(),2);
+        let returned:std::collections::BTreeSet<_>=inventory["sources"].as_array().unwrap().iter()
+            .map(|source|source["displayPath"].as_str().unwrap()).collect();
+        assert_eq!(returned,files[1..].iter().map(String::as_str).collect());
+        let shared=inventory["sources"].as_array().unwrap().iter().find(|source|source["displayPath"]==files[1]).unwrap();
+        assert_eq!(shared["memberships"]["value"].as_array().unwrap().len(),2);
+        assert_eq!(shared["ownerScope"]["state"],"unknown","shared selection must not pick a unique owner");
+        assert_eq!(evaluation.source_snapshot(&mut read,shared["id"].as_str().unwrap()).unwrap()["value"]["text"],"// accepted empty source");
+        assert!(evaluation.scoped_source_inventory(&mut read,Some("foreign"),None,MAX_FRAME/2).is_err());
+        assert!(evaluation.project_inputs(&mut read,Some(token),4096).is_err());
+        let fresh=Evaluation::new("pages".into(),files[0].clone(),1);
+        assert!(fresh.project_scope(token).is_err());
+        let pending=read.finish();
+        store.invalidate_model();assert_eq!(store.validate_pending(&pending),Err(ContractError::Stale));
+
+        let capture:crate::classpath::GradleProjectCapture=serde_json::from_value(json!({"identity":"captured-model","captured_at_unix_ms":1234,
+            "gradle_version":"9.6.1","build_identity":":build","source_sets":["main","test"],"java_source_sets_complete":true,
+            "plugin_classes":["org.gradle.api.plugins.JavaPlugin"],"kotlin_present":true,
+            "kotlin_targets":[{"name":"native","platform_type":"native"}],
+            "kotlin_source_sets":[{"name":"commonMain","depends_on":[],"source_roots":[],
+                "source_files":[],"resource_roots":[],"resource_files":[]}]})).unwrap();
+        for source in &mut modules[0].source_sets {source.project_capture=Some(capture.clone());}
+        let mut evaluation=Evaluation::new("pages".into(),files[0].clone(),1);
+        evaluation.project_operations=PROJECT_INPUTS;evaluation.project=Some(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+        let mut read=store.begin(&index,"pages",&files[0]).unwrap();
+        let page=evaluation.project_inputs(&mut read,None,MAX_FRAME/2).unwrap();
+        assert!(page["records"].as_array().unwrap().iter().any(|record|record["kind"]=="kotlinLogicalSourceSet" && record["name"]=="commonMain"));
+        assert_eq!(page["coverage"]["state"],"unknown","a captured non-JVM target is not an all-project compiler model");
     }
 
     #[test]
@@ -1899,23 +2502,29 @@ impl Worker {
                 if !self.command_acknowledged(command) { return Err("CommandUnavailable".into()); }
                 if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
                 if !workspace.lock().ipc_evaluation_current(work.evaluation) { return Err("Stale".into()); }
-                if !dispatch { return Ok(Value::Null); }
             }
-            if work.command.is_none() && self.project_operations() & (SOURCE_INVENTORY | SOURCE_SNAPSHOT) != 0 {
-                let request = workspace.lock().begin_ipc_source_capture(
-                    work.evaluation, work.params["owner"].as_str().ok_or("missing source owner")?,
+            let mut source_prepared = false;
+            if self.project_operations() & (SOURCE_INVENTORY | SOURCE_SNAPSHOT) != 0 {
+                let request = workspace.lock().begin_ipc_project_source_capture(
+                    work.evaluation, work.params["owner"].as_str().ok_or("missing source owner")?,self.project_operations()&PROJECT_INPUTS!=0,
                 );
                 if let Some(request) = request {
                     let prepared = crate::workspace::prepare_ipc_source_capture(request);
                     if workspace.lock().finish_ipc_source_capture(prepared) > 0 {
                         after_batch();
-                        return Err("Stale".into());
+                        if dispatch || work.command.is_none() { return Err("Stale".into()); }
+                        source_prepared = true;
                     }
                 }
             }
+            if work.command.is_some() && !dispatch {
+                if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
+                if !source_prepared && !workspace.lock().ipc_evaluation_current(work.evaluation) { return Err("Stale".into()); }
+                return Ok(Value::Null);
+            }
             if self.project_operations()&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT)!=0 {
-                let plan=workspace.lock().begin_ipc_resource_capture(work.evaluation);
-                if let Some(plan)=plan {
+                let plans=workspace.lock().begin_ipc_resource_captures(work.evaluation,self.project_operations()&PROJECT_INPUTS!=0);
+                for plan in plans {
                     let prepared=crate::resource_inputs::prepare_resource_catalog(plan,after_batch.clone());
                     workspace.lock().finish_ipc_resource_capture(prepared)?;
                 }
@@ -2181,12 +2790,12 @@ mod tests {
         use sha2::{Digest, Sha256};
         const BYTES: &[u8] = include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Model$$serializer.class");
         let class = ktcore::classfile::decode("selected", BYTES).unwrap();
-        let value = class_abi(&class).unwrap();
+        let value = class_abi(&class,false).unwrap();
         assert_eq!(value["identity"]["contentSha256"], format!("{:x}", Sha256::digest(BYTES)));
         assert_eq!(value["methods"].as_array().unwrap().len(), class.methods.len());
         assert_eq!(value["fields"].as_array().unwrap().len(), class.fields.len());
         for (actual, expected) in value["methods"].as_array().unwrap().iter().zip(&class.methods) {
-            assert_eq!(actual, &class_member(expected));
+            assert_eq!(actual, &class_member(expected,false));
             assert!(actual.get("id").is_none(), "raw methods have no invented editing identity");
         }
         assert!(value["methods"].as_array().unwrap().iter().any(|method|
@@ -2195,10 +2804,10 @@ mod tests {
             method["name"] == "deserialize" && method["accessFlags"] == 0x0001));
         let mut oversized = class.clone();
         oversized.attribute_names.push(Arc::from("x".repeat(MAX_FRAME)));
-        assert!(class_abi(&oversized).is_none());
+        assert!(class_abi(&oversized,false).is_none());
         let mut source = class;
         source.identity.input = ktcore::jvm::InputIdentity::Source { file: "Model.kt".into(), revision: 1 };
-        assert!(class_abi(&source).is_none());
+        assert!(class_abi(&source,false).is_none());
     }
 
     #[test]
@@ -2461,6 +3070,74 @@ mod runtime_class_tests {
 #[cfg(test)]
 mod resource_tests {
     #[test]
+    fn project_scope_resource_identities_keep_sibling_bytes_and_negative_guards_separate() {
+        let root=std::env::current_dir().unwrap();let owner=crate::paths::file_key(&root.join("InputOwner.kt"));
+        let mut modules=crate::classpath::parse_dump(&format!(
+            "PROJECT\t:inputs\t{}\nSOURCE\tmain\t{}\nSOURCE\ttest\t{}\nEND\t:inputs\n",
+            root.display(),root.display(),root.join("test").display()));
+        modules[0].source_sets.iter_mut().find(|source|source.name=="test").unwrap().resources=Some(crate::resource_model::ResourceClaims {
+            adapter:"gradle-source-set-resources-v1".into(),roots:vec![root.join("test")],trees:vec![],
+            files:vec![crate::resource_model::ResourceFile {path:root.join("test/ktlsp/config.json"),relative_path:"ktlsp/config.json".into()}],
+            output_roots:vec![],configuration_inputs:vec![],default_excludes:vec![],complete:true,problem:None,
+        });
+        let model=Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+        let scopes=model.extension_project_scopes(std::path::Path::new(&owner));
+        let main=scopes.iter().find(|scope|scope.source_set=="main").unwrap().clone();
+        let test=scopes.iter().find(|scope|scope.source_set=="test").unwrap().clone();
+        let mut index=Index::new();index.replace_file(&owner,Vec::new(),Tier::Volatile);
+        index.set_file_origin(&owner,model.file_origin(std::path::Path::new(&owner)).unwrap());
+        let mut store=ExtensionStore::default();store.configure_provider("resources",true,Arc::from("{}"));
+        store.replace_source(&index,&owner,Arc::from("// owner"),Knowledge::Found(()),Vec::new()).unwrap();
+        let flag=Arc::new(Flag(AtomicBool::new(false)));
+        let prepare=|scope:ProjectScope,text:&str| {
+            let mut catalog=ResourceCatalog::prepare(ResourceSelection {
+                model:model.clone(),scope,claims:Some(crate::resource_model::ResourceClaims {
+                    adapter:"gradle-source-set-resources-v1".into(),roots:vec![],trees:vec![],files:vec![],output_roots:vec![],
+                    configuration_inputs:vec![],default_excludes:vec![],complete:true,problem:None,
+                }),compile_classpath:vec![],runtime_classpath:Some(vec![]),runtime_complete:true,classpath_complete:true,
+                directory_inputs:std::collections::BTreeSet::new(),configuration_base:root.clone(),overlays:BTreeMap::new(),
+                guard:flag.clone(),read_coverage:crate::compiled_watch::WatchPlan::read_inputs(&[]).unwrap(),
+            });
+            catalog.entries.push(ResourceEntry {association:ResourceAssociation::Source,order:0,relative_path:"ktlsp/config.json".into(),
+                location:ResourceLocation::File(root.join("test/ktlsp/config.json")),editable:true,
+                document:Some(crate::workspace::OwnedDocumentSnapshot {text:Arc::from(text),document_version:Some(7),language_id:"json".into(),revision:7})});
+            Arc::new(catalog)
+        };
+        let main_catalog=prepare(main,"{\"role\":\"main\"}");
+        let test_catalog=prepare(test.clone(),"{\"role\":\"unsaved test 😀\"}");
+        let mut evaluation=Evaluation::new("resources".into(),owner.clone(),1);evaluation.project=Some(model);
+        evaluation.project_operations=RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT;
+        evaluation.resource_catalog=Some(main_catalog.clone());evaluation.project_resource_catalogs.insert(test.clone(),test_catalog.clone());
+        let legacy=evaluation.resource_descriptor(&main_catalog,0);
+        assert!(legacy.get("membershipScope").is_none());assert!(legacy.get("ownerScope").is_none());
+        evaluation.project_operations|=project_operations(&json!({"capabilities":[PROJECT_INPUT_CAPABILITY],
+            "supportedOps":{PROJECT_INPUT_CAPABILITY:["projectInputs"]}}));
+        let selected=evaluation.resource_descriptor(&main_catalog,0);
+        assert_eq!(selected["membershipScope"],json!({"module":main_catalog.scope.module,"sourceSet":"main"}));
+        assert_eq!(selected["ownerScope"],json!({"state":"found","value":{"module":test.module,"sourceSet":"test"}}));
+        let token=evaluation.project_scope_token(&test);let mut read=store.begin(&index,"resources",&owner).unwrap();
+        let owner_inventory=evaluation.resource_inventory(&mut read,None).unwrap();
+        let sibling=evaluation.scoped_resource_inventory(&mut read,Some(&token),None).unwrap();
+        let identity=sibling["resources"][0]["id"].as_str().unwrap();
+        assert_ne!(owner_inventory["resources"][0]["id"],identity);
+        assert!(evaluation.resource_index(&main_catalog,identity).is_err());
+        assert!(evaluation.scoped_resource_inventory(&mut read,Some("foreign"),None).is_err());
+        let absent=evaluation.scoped_resource_lookup(&mut read,Some(&token),"ktlsp/absent.json",Some(ResourceAssociation::Source)).unwrap();
+        assert_eq!(absent["state"],"definitelyAbsent");
+        let params=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"resourceSnapshot","resource":identity}]});
+        for plan in evaluation.begin_resource_reads("analysis/readFacts",&params).unwrap() {
+            let prepared=crate::resource_inputs::prepare_resource_read(plan);
+            evaluation.resource_results.insert(prepared.token,prepared.content);
+        }
+        let bytes=evaluation.resource_snapshot(&mut read,identity,None).unwrap();
+        assert_eq!(bytes["value"]["text"]["value"],"{\"role\":\"unsaved test 😀\"}");
+        let pending=read.finish();assert_eq!(store.validate_pending(&pending),Ok(()));
+        flag.0.store(true,Ordering::Release);
+        assert_eq!(store.validate_pending(&pending),Err(ContractError::Stale));
+    }
+
+
+    #[test]
     fn resource_fourteen_mib_snapshot_after_metadata_prefix_finishes_without_raising_metadata_limit() {
         use base64::Engine;
         let scope=ProjectScope{module:"large-resource".into(),source_set:"main".into()};let owner="large-resource/Owner.kt";
@@ -2675,7 +3352,7 @@ mod initialize_stream_contract_tests {
         assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==JVM_CATALOG));
         assert_eq!(offered["supportedOps"][JVM_CATALOG],json!(["jvmCatalog","jvmClass"]));
         assert_eq!(project_operations(offered),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS|SOURCE_LOCATION);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS|SOURCE_LOCATION|SOURCE_FACTS|PROJECT_INPUTS|BINARY_ANNOTATIONS);
         let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][RESOURCES]=json!(["resourceSnapshot"]);
         assert_eq!(project_operations(&acknowledgement)&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT),RESOURCE_SNAPSHOT);
         for (operation,bit) in [("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)] {
@@ -2685,7 +3362,7 @@ mod initialize_stream_contract_tests {
         let mut legacy=offered.clone();
         legacy["capabilities"].as_array_mut().unwrap().retain(|capability|capability!=JVM_CATALOG);
         assert_eq!(project_operations(&legacy),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|SOURCE_LOCATION);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|SOURCE_LOCATION|SOURCE_FACTS|PROJECT_INPUTS|BINARY_ANNOTATIONS);
         let mut no_operations=offered.clone();no_operations["supportedOps"].as_object_mut().unwrap().remove(JVM_CATALOG);
         assert_eq!(project_operations(&no_operations)&(JVM_INVENTORY|JVM_CLASS),0);
     }
@@ -2827,5 +3504,203 @@ mod sdk_api_header_wire_tests {
         let params=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"classBytes","classIdentity":id}]});
         assert!(evaluation.begin_class_reads("analysis/readFacts",&params).unwrap().is_none(),
             "a header token must not schedule a raw byte read");
+    }
+}
+
+#[cfg(test)]
+mod source_facts_v2_tests {
+    use super::*;
+    use ktcore::{index::{Index,Tier},indexer,parser::KotlinParser};
+
+    #[test]
+    fn first_evaluation_can_read_v2_after_handshake_while_initial_input_stays_legacy() {
+        let file="/wire/Use.kt";
+        let text=r#"package wire
+annotation class At(val value: String, val ordinal: Int)
+class Use { @Example(method="ti\u0063k" + "()V",at=At(value="INVOKE",ordinal=1)) final fun probe() {} }"#;
+        let tree=KotlinParser::new().parse(text);
+        assert!(!tree.root_node().has_error());
+        let mut index=Index::new();
+        index.replace_file(file,indexer::extract_symbols(&tree,text,"wire"),Tier::Volatile);
+        let scope=indexer::TypeScope::with_default_imports("wire",Vec::new(),&["kotlin"]);
+        let declarations=ktcore::extensions::source::extract(&index,file,&tree,text,&scope);
+        let mut store=ExtensionStore::default();
+        store.configure_provider("wire-v2",true,Arc::from("{}"));
+        store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
+        let mut read=store.begin(&index,"wire-v2",file).unwrap();
+        let mut evaluation=Evaluation::new("wire-v2".into(),file.into(),1);
+        let initial=evaluation.source(&mut read).unwrap();
+        let probe=initial["declarations"].as_array().unwrap().iter().find(|value|value["name"]=="probe").unwrap();
+        assert!(probe.get("fullRange").is_none());assert!(probe.get("modifiers").is_none());
+        assert!(probe["annotations"][0].get("nameRange").is_none());
+        assert_eq!(probe["annotations"][0]["arguments"][0]["value"]["state"],"unknown");
+        assert_eq!(probe["annotations"][0]["arguments"][1]["value"]["state"],"unknown");
+        let query=json!({"evaluation":evaluation.id.to_string(),"queries":[{"op":"sourceFacts"}]});
+        assert!(evaluation.batch(&mut read,"analysis/readFacts",query.clone()).unwrap_err().contains("not negotiated"));
+        let offered=initialize_message("wire-v2",&Default::default());
+        assert_eq!(offered["params"]["supportedOps"][SOURCE_FACTS_V2],json!(["sourceFacts"]));
+        evaluation.project_operations=project_operations(&json!({"capabilities":["semantic-v1",SOURCE_FACTS_V2],
+            "supportedOps":{SOURCE_FACTS_V2:["sourceFacts"]}}));
+        assert_eq!(evaluation.project_operations,SOURCE_FACTS);
+        let response=evaluation.batch(&mut read,"analysis/readFacts",query).unwrap();
+        assert!(response["facts"][0].get("source").is_none(),"source text already accompanies the initial evaluation");
+        let rich=response["facts"][0]["declarations"].as_array().unwrap().iter().find(|value|value["name"]=="probe").unwrap();
+        assert_eq!(rich["nameRange"],rich["range"]);
+        assert_eq!(rich["modifiers"]["final"],json!({"state":"found","value":true}));
+        let args=&rich["annotations"][0]["arguments"];
+        assert_eq!(args[0]["value"]["value"]["kind"],"mappedString");
+        assert_eq!(args[0]["value"]["value"]["value"],"tick()V");
+        assert!(args[0]["value"]["value"].get("contentRange").is_none());
+        let nested=&args[1]["value"]["value"];
+        assert_eq!(nested["kind"],"annotation");
+        assert_eq!(nested["annotation"]["arguments"][1]["value"]["value"],json!({"kind":"integer","value":1,"type":"int"}));
+        let reference=nested["annotation"]["typeRef"].clone();
+        let result=evaluation.batch(&mut read,"analysis/readFacts",json!({"evaluation":evaluation.id.to_string(),
+            "queries":[{"op":"resolveTypeRef","reference":reference}]})).unwrap();
+        assert_eq!(result["facts"][0]["state"],"found");
+        assert_eq!(result["facts"][0]["value"]["qualifiedName"],"wire.At");
+    }
+
+    #[test]
+    fn v2_requires_both_acknowledgements_and_legacy_arrays_downgrade_each_new_value() {
+        use ktcore::extensions::source::AnnotationIntegerType;
+        assert_eq!(project_operations(&json!({"capabilities":[SOURCE_FACTS_V2]})),0);
+        assert_eq!(project_operations(&json!({"supportedOps":{SOURCE_FACTS_V2:["sourceFacts"]}})),0);
+        let mut evaluation=Evaluation::new("wire".into(),"/wire/Owner.kt".into(),1);
+        let argument=AnnotationArgument {name:None,range:0..1,value:Knowledge::Found(AnnotationValue::Array(vec![
+            AnnotationArgument {name:None,range:0..1,value:Knowledge::Found(AnnotationValue::Integer {value:1,ty:AnnotationIntegerType::Long})}]))};
+        let legacy=evaluation.argument(&argument,false,None);
+        assert_eq!(legacy["value"]["value"]["kind"],"array");
+        assert_eq!(legacy["value"]["value"]["values"][0]["value"]["state"],"unknown");
+        let rich=evaluation.argument(&argument,true,None);
+        assert_eq!(rich["value"]["value"]["values"][0]["value"]["value"],json!({"kind":"integer","value":1,"type":"long"}));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_source_facts_tests {
+    use super::*;
+    use ktcore::{index::{Index,Tier},project_model::{FileOrigin,ProjectScope,ScopeVisibility,SourceRepresentation}};
+    use crate::language::{self,LanguageParsers,SourceLanguage};
+
+    #[test]
+    fn foreign_java_and_kotlin_facts_keep_exact_snapshot_identity_and_source_scoped_read_only_types() {
+        for java in [false,true] {
+            let root=std::env::temp_dir().join("ktlsp-snapshot-wire");
+            let suffix=if java {"java"} else {"kt"};
+            let owner=crate::paths::file_key(&root.join(format!("main/Owner.{suffix}")));
+            let foreign=crate::paths::file_key(&root.join(format!("test/Foreign.{suffix}")));
+            let main_dep=crate::paths::file_key(&root.join(format!("deps/MainDep.{suffix}")));
+            let test_dep=crate::paths::file_key(&root.join(format!("deps/TestDep.{suffix}")));
+            let main=ProjectScope {module:"snapshot".into(),source_set:"main".into()};
+            let test=ProjectScope {module:"snapshot".into(),source_set:"test".into()};
+            let main_lib=ProjectScope {module:"main-lib".into(),source_set:"main".into()};
+            let test_lib=ProjectScope {module:"test-lib".into(),source_set:"main".into()};
+            let (owner_text,foreign_text,main_text,test_text)=if java {(
+                "package mainpkg; import mainlib.Dep; @interface Mark { Class<?> value(); } class Main { @Mark(Dep.class) void owner() {} }",
+                "package testpkg; import testlib.Dep; @interface Mark { Class<?> value(); } class Test { @Mark(Dep.class) Dep probe(int amount, Dep input) { return input; } private int count; }",
+                "package mainlib; public class Dep {}","package testlib; public class Dep {}",
+            )} else {(
+                "package mainpkg\nimport mainlib.Dep\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Main { @Mark(Dep::class) fun owner() {} }",
+                "package testpkg\nimport testlib.Dep\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Test { @Mark(Dep::class) fun probe(amount: Int, input: Dep): Dep = input\n private val count: Int = 1 }",
+                "package mainlib\nclass Dep","package testlib\nclass Dep",
+            )};
+            let inputs=[(&owner,owner_text,"app-main",main.clone()),(&foreign,foreign_text,"app-test",test.clone()),
+                (&main_dep,main_text,"main-lib",main_lib.clone()),(&test_dep,test_text,"test-lib",test_lib.clone())];
+            let mut index=Index::new();let mut parsers=LanguageParsers::new();
+            for (file,text,origin,scope) in &inputs {
+                let language=SourceLanguage::for_key(file);let tree=parsers.parse(language,text);
+                assert!(!tree.root_node().has_error(),"{file}: {}",tree.root_node().to_sexp());
+                index.replace_file(file,language::file_facts(language,&tree,text).symbols,Tier::Volatile);
+                index.set_file_origin(file,FileOrigin {origin_id:(*origin).into(),representation:SourceRepresentation::Source,project_scope:Some(scope.clone())});
+            }
+            index.replace_scope_visibilities(vec![
+                ScopeVisibility {scope:main.clone(),ordered_origins:vec!["app-main".into(),"main-lib".into()]},
+                ScopeVisibility {scope:test.clone(),ordered_origins:vec!["app-test".into(),"app-main".into(),"test-lib".into(),"main-lib".into()]},
+                ScopeVisibility {scope:main_lib,ordered_origins:vec!["main-lib".into()]},
+                ScopeVisibility {scope:test_lib,ordered_origins:vec!["test-lib".into()]},
+            ]);
+            let mut store=ExtensionStore::default();store.configure_provider("snapshot-wire",true,Arc::from("{}"));
+            for (file,text,_,_) in &inputs {
+                let language=SourceLanguage::for_key(file);let tree=parsers.parse(language,text);
+                let declarations=language::extension_source_facts(&index,file,&tree,text);
+                store.replace_source_declarations(&index,file,Arc::from(*text),Knowledge::Found(()),declarations).unwrap();
+            }
+            let mut read=store.begin(&index,"snapshot-wire",&owner).unwrap();
+            let source=read.source_inventory_for_scope(test.clone(),std::collections::BTreeSet::from([foreign.clone()])).unwrap().remove(0);
+            let mut evaluation=Evaluation::new("snapshot-wire".into(),owner.clone(),1);
+            evaluation.project_operations=SOURCE_FACTS|SOURCE_LOCATION|TYPE_JVM;
+            let token=evaluation.issue(Handle::Source(source.clone()));
+            let id=evaluation.id.to_string();
+            let params=|queries:Vec<Value>|json!({"evaluation":id,"queries":queries});
+            let result=evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"sourceFacts","source":token})])).unwrap();
+            let facts=&result["facts"][0];
+            assert_eq!(facts["source"]["id"],token);assert_eq!(facts["semanticScope"]["state"],"found");
+            let probe=facts["declarations"].as_array().unwrap().iter().find(|declaration|declaration["name"]=="probe").unwrap();
+            assert_eq!(probe["sourceKind"],"Function");
+            let class=facts["declarations"].as_array().unwrap().iter().find(|declaration|declaration["name"]=="Test").unwrap();
+            let field=facts["declarations"].as_array().unwrap().iter().find(|declaration|declaration["name"]=="count").unwrap();
+            assert_eq!(class["sourceKind"],"Class");assert_eq!(field["sourceKind"],"Property");
+            assert_eq!(probe["owner"],class["id"]);assert_eq!(field["owner"],class["id"]);
+            let declaration=probe["id"].as_str().unwrap();
+            match &evaluation.handles[declaration] {
+                Handle::SnapshotDeclaration {source,value}=>{assert_eq!(source.file(),foreign);assert_eq!(value.definition().file,foreign);},
+                _=>panic!("foreign facts must issue snapshot declarations"),
+            }
+            let annotation=&probe["annotations"][0];
+            let result=evaluation.batch(&mut read,"analysis/readFacts",params(vec![
+                json!({"op":"resolveTypeRef","reference":annotation["typeRef"]}),
+                json!({"op":"resolveTypeRef","reference":annotation["arguments"][0]["value"]["value"]["typeRef"]}),
+            ])).unwrap();
+            assert_eq!(result["facts"][0]["value"]["qualifiedName"],"testpkg.Mark");
+            assert_eq!(result["facts"][1]["value"]["qualifiedName"],"testlib.Dep");
+            assert_eq!(result["facts"][0]["value"]["readOnly"],true);
+            let ty=result["facts"][0]["value"]["id"].as_str().unwrap();
+            assert!(evaluation.ty(&json!(ty)).unwrap_err().contains("UnsupportedSource"));
+            assert!(evaluation.declaration(&json!(declaration)).unwrap_err().contains("UnsupportedSource"));
+            let result=evaluation.batch(&mut read,"analysis/readFacts",params(vec![
+                json!({"op":"sourceLocation","target":declaration}),json!({"op":"sourceLocation","target":ty}),
+                json!({"op":"declarationType","declaration":class["id"]}),json!({"op":"declarationMember","declaration":declaration}),
+                json!({"op":"typeJvm","target":ty}),json!({"op":"declaredMembers","target":ty}),
+                json!({"op":"declarationMember","declaration":field["id"]}),
+            ])).unwrap();
+            assert_eq!(result["facts"][0]["state"],"found");
+            assert_eq!(result["facts"][0]["value"]["documentUri"],tower_lsp_server::ls_types::Uri::from_file_path(&foreign).unwrap().to_string());
+            assert_eq!(result["facts"][0]["value"]["source"]["identity"]["revision"],source.revision().to_string());
+            assert_eq!(result["facts"][1]["state"],"found");
+            assert_eq!(result["facts"][2]["value"]["qualifiedName"],"testpkg.Test");
+            assert_eq!(result["facts"][2]["value"]["readOnly"],true);
+            let method=&result["facts"][3]["value"];
+            assert_eq!(result["facts"][3]["state"],"found");
+            assert_eq!(method["kind"],"method");assert_eq!(method["readOnly"],true);
+            assert_eq!(method["signature"]["value"]["descriptor"],"(ILtestlib/Dep;)Ltestlib/Dep;");
+            assert_eq!(result["facts"][6]["state"],"found");
+            assert_eq!(result["facts"][6]["value"]["kind"],"field");
+            assert_eq!(result["facts"][6]["value"]["signature"]["value"]["descriptor"],"I");
+            assert_eq!(result["facts"][4]["binaryName"]["reasons"][0]["code"],"UnsupportedSource");
+            assert_eq!(result["facts"][5]["coverage"]["reasons"][0]["code"],"UnsupportedSource");
+            let member=method["id"].as_str().unwrap();
+            match &evaluation.handles[member] {
+                Handle::SnapshotMember {source,value}=>{assert_eq!(source.file(),foreign);assert_eq!(value.definition().file,foreign);},
+                _=>panic!("snapshot member cannot escape as an owner member token"),
+            }
+            assert!(evaluation.ty(&json!(member)).unwrap_err().contains("UnsupportedSource"));
+            assert!(evaluation.declaration(&json!(member)).unwrap_err().contains("UnsupportedSource"));
+            let location=evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"sourceLocation","target":member})])).unwrap();
+            assert_eq!(location["facts"][0]["state"],"found");
+            assert_eq!(location["facts"][0]["value"]["documentUri"],tower_lsp_server::ls_types::Uri::from_file_path(&foreign).unwrap().to_string());
+            assert_eq!(read.source(),owner_text);assert!(!read.resolve_type("testlib.Dep").is_found());
+            assert!(evaluation.class_scope.is_none());assert!(evaluation.jvm_catalog.is_none());
+            assert!(evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"sourceFacts","source":"foreign"})])).is_err());
+            drop(read);
+            index.replace_scope_visibilities(vec![ScopeVisibility {scope:main,ordered_origins:vec!["app-main".into(),"main-lib".into()]}]);
+            let mut read=store.begin(&index,"snapshot-wire",&owner).unwrap();
+            assert!(evaluation.read_source_facts(&mut read,Some(&token)).is_err(),"snapshot token cannot cross read sessions");
+            let source=read.source_inventory_for_scope(test,std::collections::BTreeSet::from([foreign.clone()])).unwrap().remove(0);
+            let token=evaluation.issue(Handle::Source(source));
+            let result=evaluation.read_source_facts(&mut read,Some(&token)).unwrap();
+            assert_eq!(result["semanticScope"]["state"],"unknown");
+            assert!(result["declarations"].as_array().unwrap().is_empty());
+        }
     }
 }

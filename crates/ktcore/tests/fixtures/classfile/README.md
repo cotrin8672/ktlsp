@@ -221,3 +221,21 @@ check completion and exact navigation in Java and Kotlin, and reject an unrelate
 Rebuild with `javac --release 17 -encoding UTF-8 -proc:none -sourcepath ""`,
 using this fixture directory as `-classpath`, a fresh `-d` directory, and
 `sources/outerfixture/Outer.java` as input. The other two emitted class files remain byte-identical.
+
+
+## Typed binary declaration annotation fixture
+
+`annotationfixture/CustomPoint.class` is javac 21.0.3 output for the paired
+`sources/annotationfixture/CustomPoint.java`, compiled with
+`javac --release 17 -encoding UTF-8 -proc:none -g:source -d OUTPUT SOURCE`.
+It retains generic class bounds, visible/invisible class and member annotations,
+all primitive element tags, a UTF-16 surrogate char and exact unpaired high/low
+string code units, modified-UTF8 NUL and emoji,
+long max, signed zero, infinity, enum/class/nested annotation/array values.
+Only CustomPoint.class is needed by the metadata reader; referenced declarations
+are present in the source and compiled independently by javac. No MC libraries
+or runtime registration are involved. Tests inspect the actual explicit values
+and reject malformed payload mutations without requiring a JVM.
+
+Source SHA256 `a9002a6421df39fa3be1f43302f1b4bfc04d3de0e50e55d54f27dc136cc82800`.
+Class SHA256 `6bffcefe35579cb6408614540054344f0c493146806d0e47ea60ce514333ee1b` (1004 bytes, major61).

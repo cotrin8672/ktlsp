@@ -746,7 +746,7 @@ fn binary_inventory() -> BinaryInventoryIndex {
                 interfaces: Vec::new(),
                 signature: None,
                 source_file: Some(Arc::from(file)),
-                attribute_names: Vec::new(),
+                attribute_names: Vec::new(), annotations: Vec::new(),
                 inner_classes: Vec::new(),
                 fields: Vec::new(),
                 methods: methods
@@ -756,7 +756,7 @@ fn binary_inventory() -> BinaryInventoryIndex {
                         descriptor: Arc::from("()I"),
                         access_flags: 1,
                         signature: None,
-                        attribute_names: Vec::new(),
+                        attribute_names: Vec::new(), annotations: Vec::new(),
                     })
                     .collect(),
             }),

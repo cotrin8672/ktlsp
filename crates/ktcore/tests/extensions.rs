@@ -1,6 +1,7 @@
 //! Public-API tests of the pure contribution foundation, not an installed Mixin provider or LSP.
 //! Signatures/modifiers below are host facts established separately by compiler/runtime controls.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -155,7 +156,7 @@ fn requirement(
 #[test]
 fn normalized_source_rejects_foreign_owners_and_invalid_nested_ranges_atomically() {
     use ktcore::extensions::source::{
-        AnnotationArgument, AnnotationValue, SourceAnnotation, SourceDeclaration,
+        AnnotationArgument, AnnotationValue, SourceAnnotation,
     };
     let (index, mut store) = fixture();
     let entries = index.entries_for_file(MIXIN_FILE);
@@ -169,25 +170,27 @@ fn normalized_source_rejects_foreign_owners_and_invalid_nested_ranges_atomically
         .unwrap();
     let quoted = occurrence(MIXIN, "\"shadow$\"", 0);
     let annotation = occurrence(MIXIN, "@Shadow(prefix = \"shadow$\")", 0);
-    let valid = SourceDeclaration {
-        definition: def(MIXIN_FILE, &method.sym),
-        owner: Some(def(MIXIN_FILE, &owner.sym)),
-        member: None,
-        jvm_property: None,
-        annotations: vec![SourceAnnotation {
-            ty: ktcore::types::TypeRef::simple("Shadow"),
-            use_site_target: None,
-            range: annotation,
-            arguments: vec![AnnotationArgument {
-                name: Some("prefix".into()),
-                range: quoted.clone(),
-                value: Knowledge::Found(AnnotationValue::String {
-                    value: "shadow$".into(),
-                    content_range: quoted.start + 1..quoted.end - 1,
-                }),
-            }],
+    let tree = ktcore::parser::KotlinParser::new().parse(MIXIN);
+    let scope = ktcore::indexer::TypeScope::with_default_imports("oracle", Vec::new(), &["kotlin", "java.lang"]);
+    let mut valid = ktcore::extensions::source::extract(&index, MIXIN_FILE, &tree, MIXIN, &scope)
+        .into_iter().find(|declaration|declaration.definition == def(MIXIN_FILE, &method.sym)).unwrap();
+    valid.owner = Some(def(MIXIN_FILE, &owner.sym));
+    valid.member = None;
+    valid.jvm_property = None;
+    valid.annotations = vec![SourceAnnotation {
+        ty: ktcore::types::TypeRef::simple("Shadow"),
+        use_site_target: None,
+        range: annotation.clone(),
+        name_range: annotation.start+1..annotation.start+7,
+        arguments: vec![AnnotationArgument {
+            name: Some("prefix".into()),
+            range: quoted.clone(),
+            value: Knowledge::Found(AnnotationValue::String {
+                value: "shadow$".into(),
+                content_range: quoted.start+1..quoted.end-1,
+            }),
         }],
-    };
+    }];
     store
         .replace_source_declarations(
             &index,
@@ -3118,6 +3121,38 @@ fn nominal_archive_multiple_jvm_actual_declarations_stay_ambiguous() {
 
 
 #[test]
+fn host_authorized_source_memberships_keep_shared_snapshots_and_negative_reads_scoped() {
+    let mut index=Index::new();let mut store=ExtensionStore::default();
+    store.configure_provider("project-inputs",true,Arc::from("{}"));
+    let main=ProjectScope {module:"project".into(),source_set:"main".into()};
+    let test=ProjectScope {module:"project".into(),source_set:"test".into()};
+    let foreign=ProjectScope {module:"foreign".into(),source_set:"main".into()};
+    let publish=|index:&mut Index,store:&mut ExtensionStore,file:&str,text:&str,scope:&ProjectScope| {
+        index.replace_file(file,Vec::new(),Tier::Volatile);
+        index.set_file_origin(file,FileOrigin {origin_id:scope.module.clone(),representation:SourceRepresentation::Source,
+            project_scope:Some(scope.clone())});
+        store.replace_source(index,file,Arc::from(text),Knowledge::Found(()),Vec::new()).unwrap();
+    };
+    publish(&mut index,&mut store,"/project/Owner.kt","// owner",&main);
+    publish(&mut index,&mut store,"/project/Shared.java","// unsaved shared 😀",&main);
+    let mut read=store.begin(&index,"project-inputs","/project/Owner.kt").unwrap();
+    let sources=read.source_inventory_for_scope(test.clone(),BTreeSet::from(["/project/Shared.java".into(),"/project/Missing.java".into()])).unwrap();
+    assert_eq!(sources.len(),1);assert_eq!(sources[0].scope(),&test);
+    assert_eq!(read.source_snapshot(&sources[0]).unwrap().as_ref(),"// unsaved shared 😀");
+    let pending=read.finish();
+    publish(&mut index,&mut store,"/foreign/Other.kt","// independent",&foreign);
+    assert_eq!(store.validate_pending(&pending),Ok(()));
+    publish(&mut index,&mut store,"/project/Missing.java","// no declarations",&main);
+    assert_eq!(store.validate_pending(&pending),Err(ContractError::Stale));
+    let mut read=store.begin(&index,"project-inputs","/project/Owner.kt").unwrap();
+    assert_eq!(read.source_snapshot(&sources[0]),Err(ContractError::ForeignIdentity));
+    assert!(read.source_inventory_for_scope(test,BTreeSet::new()).unwrap().is_empty());
+    let negative=read.finish();
+    publish(&mut index,&mut store,"/project/NewShared.java","// new empty membership",&main);
+    assert_eq!(store.validate_pending(&negative),Err(ContractError::Stale));
+}
+
+#[test]
 fn scoped_source_snapshots_track_empty_membership_overlays_and_session_identity() {
     let mut index = Index::new();
     let mut store = ExtensionStore::default();
@@ -3355,4 +3390,167 @@ fn nonpublishing_reads_survive_semantic_evaluations_without_withdrawing_index_bi
     assert_eq!(store.commit(readonly), Err(ContractError::ForeignRequirement));
     assert_eq!(store.publication_revision(), revision);
     assert!(store.contributions("mixin-consumer", MIXIN_FILE).unwrap().binding_at(byte).is_some());
+}
+
+#[test]
+fn normalized_source_rejects_forged_decoded_maps_and_declaration_ranges_atomically() {
+    use ktcore::extensions::source::{self,AnnotationValue};
+    let file="/oracle/Mapped.kt";
+    let text=r#"package oracle
+class Mapped { @Probe("ti\u0063k" + "\uD83D\uDE00") fun probe() {} }"#;
+    let mut index=Index::new();
+    let tree=KotlinParser::new().parse(text);
+    assert!(!tree.root_node().has_error());
+    index.replace_file(file,extract_symbols(&tree,text,"oracle"),Tier::Volatile);
+    let scope=ktcore::indexer::TypeScope::with_default_imports("oracle",Vec::new(),&["kotlin"]);
+    let valid=source::extract(&index,file,&tree,text,&scope);
+    let method=valid.iter().position(|declaration|&text[declaration.name_range.clone()]=="probe").unwrap();
+    let mut store=ExtensionStore::default();
+    store.configure_provider("maps",true,Arc::from("{}"));
+    store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),valid.clone()).unwrap();
+    for mutation in 0..8 {
+        let mut invalid=valid.clone();
+        let declaration=&mut invalid[method];
+        match mutation {
+            0=>declaration.range.start+=1,
+            1=>declaration.header_range=declaration.name_range.clone(),
+            2=>declaration.annotations[0].name_range=0..1,
+            3=>if let Knowledge::Found(AnnotationValue::MappedString {value,..})=&mut declaration.annotations[0].arguments[0].value {
+                *value="wrong".into();
+            } else {panic!("mapped value required");},
+            4=>if let Knowledge::Found(AnnotationValue::MappedString {segments,..})=&mut declaration.annotations[0].arguments[0].value {
+                segments[2].source.start+=1;
+            },
+            5=>if let Knowledge::Found(AnnotationValue::MappedString {segments,..})=&mut declaration.annotations[0].arguments[0].value {
+                segments.last_mut().unwrap().decoded.end-=1;
+            },
+            6=>if let Knowledge::Found(AnnotationValue::MappedString {segments,..})=&mut declaration.annotations[0].arguments[0].value {
+                segments.push(segments[0].clone());
+            },
+            7=>declaration.kind=SymbolKind::Class,
+            _=>unreachable!(),
+        }
+        assert!(store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),invalid).is_err(),"mutation {mutation}");
+        let read=store.begin(&index,"maps",file).unwrap();
+        assert_eq!(read.declarations(),valid.as_slice(),"bad publication must preserve accepted facts");
+    }
+}
+
+const SNAPSHOT_MAIN:&str="/snapshot/main/Main.kt";
+const SNAPSHOT_TEST:&str="/snapshot/test/Test.kt";
+const SNAPSHOT_TEST_TEXT:&str="package testpkg\nimport testlib.Dep\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Test { @Mark(Dep::class) fun probe(amount: Int, input: Dep): Dep = input\n private val count: Int = 1 }\n";
+
+fn snapshot_view_fixture()->(Index,ExtensionStore,ProjectScope,ProjectScope) {
+    use ktcore::extensions::source;
+    let main=ProjectScope {module:"app".into(),source_set:"main".into()};
+    let test=ProjectScope {module:"app".into(),source_set:"test".into()};
+    let main_dep=ProjectScope {module:"main-dep".into(),source_set:"main".into()};
+    let test_dep=ProjectScope {module:"test-dep".into(),source_set:"main".into()};
+    let sources=[
+        (SNAPSHOT_MAIN,"package mainpkg\nimport mainlib.Dep\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Main { @Mark(Dep::class) fun owner() {} }\n","mainpkg","app-main",main.clone()),
+        (SNAPSHOT_TEST,SNAPSHOT_TEST_TEXT,"testpkg","app-test",test.clone()),
+        ("/snapshot/deps/MainDep.kt","package mainlib\nclass Dep\n","mainlib","main-dep",main_dep.clone()),
+        ("/snapshot/deps/TestDep.kt","package testlib\nclass Dep\n","testlib","test-dep",test_dep.clone()),
+    ];
+    let mut index=Index::new();
+    for (file,text,package,origin,scope) in &sources {
+        index_source(&mut index,file,text,package);
+        index.set_file_origin(file,FileOrigin {origin_id:(*origin).into(),representation:SourceRepresentation::Source,project_scope:Some(scope.clone())});
+    }
+    index.replace_scope_visibilities(vec![
+        ScopeVisibility {scope:main.clone(),ordered_origins:vec!["app-main".into(),"main-dep".into()]},
+        ScopeVisibility {scope:test.clone(),ordered_origins:vec!["app-test".into(),"app-main".into(),"test-dep".into(),"main-dep".into()]},
+        ScopeVisibility {scope:main_dep,ordered_origins:vec!["main-dep".into()]},
+        ScopeVisibility {scope:test_dep,ordered_origins:vec!["test-dep".into()]},
+    ]);
+    let mut store=ExtensionStore::default();
+    store.configure_provider("snapshots",true,Arc::from("{}"));
+    for (file,text,package,_,_) in sources {
+        let tree=KotlinParser::new().parse(text);
+        let scope=ktcore::indexer::TypeScope::with_default_imports(package,ktcore::parser::imports_of(&tree,text),&["kotlin","java.lang"]);
+        let declarations=source::extract(&index,file,&tree,text,&scope);
+        store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
+    }
+    (index,store,main,test)
+}
+
+#[test]
+fn snapshot_facts_resolve_in_their_own_package_and_dependencies_then_restore_owner_view() {
+    use ktcore::extensions::source::AnnotationValue;
+    let (index,mut store,_,test)=snapshot_view_fixture();
+    let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+    assert!(!read.resolve_type("testlib.Dep").is_found());
+    let sources=read.source_inventory_for_scope(test,std::collections::BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap();
+    let source=&sources[0];
+    let declarations=read.source_snapshot_declarations(source).unwrap();
+    let declaration=declarations.iter().find(|declaration|&SNAPSHOT_TEST_TEXT[declaration.name_range.clone()]=="probe").unwrap();
+    let annotation=&declaration.annotations[0];
+    let Knowledge::Found(annotation_type)=read.resolve_source_type_ref(source,&annotation.ty).unwrap() else {panic!("test annotation type");};
+    assert_eq!(annotation_type.qualified_name(),"testpkg.Mark");
+    let Knowledge::Found(AnnotationValue::Class(reference))=&annotation.arguments[0].value else {panic!("class reference");};
+    let Knowledge::Found(dependency)=read.resolve_source_type_ref(source,reference).unwrap() else {panic!("test dependency type");};
+    assert_eq!(dependency.qualified_name(),"testlib.Dep");
+    let Knowledge::Found(id)=read.source_snapshot_declaration(source,declaration.name_range.clone()).unwrap() else {panic!("snapshot declaration");};
+    assert_eq!(id.definition().file,SNAPSHOT_TEST);
+    let Knowledge::Found(member)=read.snapshot_declaration_member(source,&id).unwrap() else {panic!("snapshot method");};
+    assert_eq!(member.kind,MemberKind::Method);
+    assert!(matches!(&member.signature,Knowledge::Found(signature) if signature.descriptor()=="(ILtestlib/Dep;)Ltestlib/Dep;"));
+    let class=declarations.iter().find(|declaration|&SNAPSHOT_TEST_TEXT[declaration.name_range.clone()]=="Test").unwrap();
+    let Knowledge::Found(class_id)=read.source_snapshot_declaration(source,class.name_range.clone()).unwrap() else {panic!("snapshot class");};
+    let Knowledge::Found(class_type)=read.snapshot_declaration_type(source,&class_id).unwrap() else {panic!("snapshot class type");};
+    assert_eq!(class_type.qualified_name(),"testpkg.Test");
+    let field=declarations.iter().find(|declaration|&SNAPSHOT_TEST_TEXT[declaration.name_range.clone()]=="count").unwrap();
+    let Knowledge::Found(field_id)=read.source_snapshot_declaration(source,field.name_range.clone()).unwrap() else {panic!("snapshot field");};
+    let Knowledge::Found(field)=read.snapshot_declaration_member(source,&field_id).unwrap() else {panic!("snapshot field member");};
+    assert_eq!(field.kind,MemberKind::Field);
+    assert!(matches!(&field.signature,Knowledge::Found(signature) if signature.descriptor()=="I"));
+    let Knowledge::Found(member_location)=read.snapshot_member_location(source,&member.id).unwrap() else {panic!("snapshot member location");};
+    assert_eq!(member_location.definition,id.definition().clone());
+    let Knowledge::Found(location)=read.snapshot_declaration_location(source,&id).unwrap() else {panic!("snapshot location");};
+    assert_eq!(location.definition,id.definition().clone());
+    assert_eq!(location.text.as_ref(),SNAPSHOT_TEST_TEXT);
+    assert_eq!(read.source().get(..15),Some("package mainpkg"));
+    assert!(!read.resolve_type("testlib.Dep").is_found(),"foreign reads never widen the evaluation owner");
+    assert!(read.resolve_type("mainlib.Dep").is_found());
+    let target=read.resolve_type("mainpkg.Main");
+    assert!(matches!(read.require(MemberRequirement {target,authored:None,names:MemberNames::Exact(vec!["owner".into()]),
+        kind:MemberKind::Method,signature:member.signature,dispatch:member.dispatch,name_link:NameLink::Direct}),
+        Err(ContractError::ForeignIdentity)),"foreign descriptor reference proofs cannot authorize owner contributions");
+}
+
+#[test]
+fn snapshot_facts_reject_other_sessions_and_unavailable_compiler_scopes() {
+    let (mut index,mut store,main,test)=snapshot_view_fixture();
+    let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+    let source=read.source_inventory_for_scope(test.clone(),std::collections::BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap().remove(0);
+    drop(read);
+    let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+    assert!(matches!(read.source_snapshot_declarations(&source),Err(ContractError::ForeignIdentity)));
+    drop(read);
+    index.replace_scope_visibilities(vec![ScopeVisibility {scope:main,ordered_origins:vec!["app-main".into(),"main-dep".into()]}]);
+    let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+    let source=read.source_inventory_for_scope(test,std::collections::BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap().remove(0);
+    assert_eq!(read.source_snapshot(&source).unwrap().as_ref(),SNAPSHOT_TEST_TEXT,"membership still permits raw snapshots");
+    assert!(matches!(read.source_semantic_scope(&source).unwrap(),Knowledge::Unknown(_)));
+    assert!(matches!(read.resolve_source_type_ref(&source,&ktcore::types::TypeRef::simple("Test")).unwrap(),Knowledge::Unknown(_)));
+}
+
+#[test]
+fn snapshot_facts_track_unsaved_edits_and_selected_source_membership_changes() {
+    for membership in [false,true] {
+        let (mut index,mut store,_,test)=snapshot_view_fixture();
+        let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+        let source=read.source_inventory_for_scope(test.clone(),std::collections::BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap().remove(0);
+        read.source_snapshot_declarations(&source).unwrap();
+        let pending=read.finish();
+        let (file,text)=if membership {("/snapshot/test/New.kt","package testpkg\nclass New\n".to_string())}
+            else {(SNAPSHOT_TEST,format!("{SNAPSHOT_TEST_TEXT}// unsaved edit 😀\n"))};
+        index_source(&mut index,file,&text,"testpkg");
+        index.set_file_origin(file,FileOrigin {origin_id:"app-test".into(),representation:SourceRepresentation::Source,project_scope:Some(test)});
+        let tree=KotlinParser::new().parse(&text);
+        let scope=ktcore::indexer::TypeScope::with_default_imports("testpkg",ktcore::parser::imports_of(&tree,&text),&["kotlin","java.lang"]);
+        let declarations=ktcore::extensions::source::extract(&index,file,&tree,&text,&scope);
+        store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
+        assert!(matches!(store.resume(&index,SNAPSHOT_MAIN,pending),Err(ContractError::Stale)),"membership={membership}");
+    }
 }

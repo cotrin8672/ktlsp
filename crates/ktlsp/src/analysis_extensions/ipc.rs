@@ -623,6 +623,20 @@ impl AnalysisExtensions {
             })
     }
 
+    pub(crate) fn observe_ipc_project_inputs(&mut self,index:&dyn InferenceIndex,id:u64,
+        guard:Arc<dyn ktcore::extensions::HostInputGuard>)->Result<(),String> {
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        let pending=evaluation.pending.take().ok_or("Stale")?;
+        let owner=evaluation.owner.clone();
+        let mut read=self.store.resume(index,&owner,pending).map_err(|_|"Stale")?;
+        let result=read.observe_host_input(guard).map_err(|_|"Stale".to_owned());
+        evaluation.pending=Some(read.finish());result
+    }
+
+    pub(crate) fn set_ipc_project_index(&mut self,id:u64,state:Value) {
+        if let Some(evaluation)=self.ipc_evaluations.get_mut(&id) {evaluation.project_index=Some(state);}
+    }
+
     pub(crate) fn ipc_resource_owner(&self,id:u64)->Option<&str> {
         self.ipc_current(id).then(||self.ipc_evaluations.get(&id).map(|evaluation|evaluation.owner.as_str())).flatten()
     }
@@ -660,7 +674,11 @@ impl AnalysisExtensions {
             let observed=read.observe_host_input(catalog.guard.clone()).map_err(|_|"Stale".to_owned());
             evaluation.pending=Some(read.finish());
             observed?;
-            evaluation.resource_catalog=Some(catalog);Ok(())
+            let model=evaluation.project.as_ref().ok_or("Stale")?;
+            if !model.extension_project_scopes(std::path::Path::new(&owner)).contains(&catalog.scope) {return Err("foreign resource scope".into());}
+            let owner_scope=model.extension_project_context(std::path::Path::new(&owner)).map(|context|context.scope);
+            if owner_scope.as_ref()==Some(&catalog.scope) {evaluation.resource_catalog=Some(catalog.clone());}
+            evaluation.project_resource_catalogs.insert(catalog.scope.clone(),catalog);Ok(())
         })();
         self.ipc_evaluations.insert(id,evaluation);result
     }
@@ -680,7 +698,7 @@ impl AnalysisExtensions {
         let id=prepared.evaluation;
         let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;
         let result=(|| {
-            let catalog=evaluation.resource_catalog.as_ref().ok_or("Stale")?;
+            let catalog=evaluation.resource_catalog_for_identity(&prepared.token)?;
             if !Arc::ptr_eq(&catalog.model,&prepared.model) || !catalog.guard.is_current() {return Err("Stale".into());}
             let pending=evaluation.pending.take().ok_or("Stale")?;
             let owner=evaluation.owner.clone();

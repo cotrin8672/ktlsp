@@ -508,11 +508,20 @@ read-session borrow is held across child I/O. Cancellation stays cancellation;
 a cancelled caller leaves an owned worker to drain or close its existing child,
 and its result cannot be published later.
 
+Before dispatch, command preflight negotiates permissions and hydrates any
+selected closed-source snapshots required by the negotiated source APIs. It
+retires that preparatory read and opens a fresh checked evaluation, so populating
+the host's own source cache does not force a second client invocation. The
+original owner revision, document version and provider instance must still
+match. Preparation performs file I/O outside the workspace lock and never sends
+the child command; only the final evaluation dispatches it.
+
 `refreshProject:true` is an explicit host preparation step. The provider command
 must first be configured and acknowledged, and its root/document context must
 still match. The existing project controller is requested once. After a current
 accepted refresh, the host opens a fresh evaluation and dispatches the child
-command once. Failed model acquisition returns typed unavailability. Cancelling
+command once, preparing source snapshots for the refreshed model first. Failed
+model acquisition returns typed unavailability. Cancelling
 the wait does not dispatch the command. A refresh is never requested from an old
 read transaction, and child command results are never automatically replayed.
 Domain adapters can use this outer flag for their reindex/reload operations;
@@ -645,9 +654,9 @@ For a selected lower-release SDK, the checked `ct.sym` `.sig` can instead return
 actual signature input. `classHeader` uses the existing raw ABI shape: `identity`
 (`originId`, `internalName`, `contentSha256`), integer `majorVersion`, `minorVersion`,
 `accessFlags`, nullable strings `superName`, `signature`, `sourceFile`, string arrays
-`interfaces` and `attributeNames`, plus `innerClasses`, `fields` and `methods` arrays.
+`interfaces` and `attributeNames`, plus `innerClasses`, `fields`, `methods` and `annotations` arrays.
 Each inner-class entry is `{inner, outer, name, accessFlags}` (`outer` and `name` may
-be null); each member is `{name, descriptor, accessFlags, signature, attributeNames}`
+be null); each member is `{name, descriptor, accessFlags, signature, attributeNames, annotations}`
 with nullable `signature`. `hierarchy` projects the same superclass, interfaces,
 flags and generic signature. An oversized `classHeader` stays Unknown `MissingFacts`.
 The SDK reader rejects a `.sig` containing Code rather than granting executable
@@ -844,3 +853,204 @@ continuation-only batches do not consume metadata batches. Each class input and
 one prepared multi-class ABI read are bounded to16MiB. Split oversized batches
 on the existing recoverable split-query error; never reinterpret a quota failure
 or Unknown coverage as a complete empty catalog.
+
+
+### Typed binary declaration annotations
+
+Select `binary-annotations-v1` in the initialize response's `capabilities` array
+to include typed declaration annotations in the existing `jvmClass` ABI,
+`typeJvm` ABI, and `runtimeClass` API-header representations. This is a
+representation capability: it adds no query or `supportedOps` entry and grants
+no classpath or executable-byte authority. Without selection, class and member
+objects omit `annotations` and retain their existing representation.
+
+Selected ABI class and member objects expose `annotations`, an ordered array
+with `runtimeVisible`, a JVM object `descriptor`, and ordered explicit `elements`
+(`name`, `value`). Values have stable `kind` tags: `byte`, `char` (UTF-16 code unit),
+`double`, `float`, `int`, `long`, `short`, `boolean`, `string`, `enum`, `class`,
+`annotation`, and `array`. Scalars use `value`; `long` uses a decimal string to
+avoid JSON client precision loss. `float` and `double` use exact lowercase hex
+`bits` (8/16 digits), including signed zero and nonfinite values. Enum values
+carry `descriptor`/`name`; class values carry `descriptor` (including `V`); nested
+annotations carry `value` with `descriptor`/`elements`; arrays carry ordered
+`values`. String values containing unpaired surrogates instead carry exact `utf16`
+code-unit arrays with the same `kind:"string"`, without lossy replacement or a
+Unicode `value`. Defaults, parameter/type annotations and framework meanings are not
+expanded. Malformed declaration annotation payloads make that class read unknown
+rather than silently dropping values. Existing entry authority, content hash,
+source-current Unknown, read guards and runtime byte permission remain unchanged.
+
+### Normalized authored facts (`source-facts-v2`)
+
+Select `source-facts-v2` with `supportedOps:{"source-facts-v2":["sourceFacts"]}`.
+Then read `{"op":"sourceFacts"}` in `analysis/readFacts`. Its result is
+`{"declarations":[...]}` for the same owner and accepted source snapshot as the
+evaluation. Source text and configuration remain in the initial evaluation. The
+read works on the first evaluation after initialize; it does not wait for a
+second evaluation. Capability and operation acknowledgements are both required.
+
+The initial evaluation retains the legacy declaration/annotation schema for all
+children. New value variants are honest `unknown` there, recursively inside
+arrays. In particular an escaped or concatenated value is never sent as a
+legacy plain string with a false `contentRange`.
+
+The optional read retains declaration `range` as its indexed name identity and
+adds `fullRange`, `headerRange`, `nameRange`, nullable `bodyRange`, and `modifiers`
+with separate knowledge facts `visibility`, `static`, `final`, `abstract`.
+Ranges use UTF-8 source bytes. Java fields share the entire field declaration
+range, including multiple declarators. Explicit finality is known; unsupported
+implicit Kotlin finality and compiler projections remain unknown.
+
+Annotations add `nameRange`. Values additionally support:
+
+- `{"kind":"annotation","annotation":{...}}`, recursively using the same
+  annotation schema and exact name/full ranges. Kotlin constructor syntax needs
+  a uniquely resolved host annotation declaration; ordinary or unresolved calls
+  stay unknown.
+- `{"kind":"integer","type":"int"|"long","value":N}` for checked literal
+  values only. Arbitrary constants and arithmetic are unsupported.
+- `{"kind":"enum","typeRef":"<host token>","name":"ENTRY"}` only when the
+  host resolves one enum owner and one indexed enum entry. Source and binary-stub
+  enum facts follow the same index path. Unresolved or ambiguous values stay
+  unknown.
+- `{"kind":"mappedString","value":"...","segments":[{"decoded":{"start":0,
+  "end":1},"source":{"start":42,"end":48}}]}` for decoded quoted literals and
+  literal-only `+` folding. `decoded` uses UTF-16 code units; `source` uses UTF-8
+  bytes. Each segment is exactly one Unicode scalar or complete escape, including
+  both escapes for a surrogate pair. A supplementary scalar cannot be split
+  between edits. Quotes and concatenation syntax have no decoded segments.
+
+Unescaped plain strings keep the existing `kind:"string"` and `contentRange`.
+Interpolation, text blocks/raw strings, unresolved constants, and expressions
+other than literal-only concatenation remain unknown. Java Unicode escapes that
+would alter tokenization are conservatively unsupported. The host reruns the
+same literal decoder against actual source expressions before accepting decoded
+values/maps; range containment alone does not admit a forged mapping.
+Normalization bounds annotation input to 64 KiB, 4096 normalized nodes, and 128
+recursive levels; mapped strings additionally cap decoded scalars at 16,384.
+Unsupported values remain unknown and annotations exceeding the whole-annotation
+budget are withheld. Plain strings use their existing direct representation.
+
+The focused `KTLSP_IPC_MODE=source-facts-v2` real-child/Neovim scenario negotiates
+this read and checks the first owner evaluation, exact declaration/annotation
+ranges, decoded concatenation mapping, nested annotations, and typed Int/Long
+values. It waits for host acceptance of that evaluation and returns before the
+older source-location and mutation sweeps.
+
+
+## Optional owning-project input model
+
+`project-inputs-v1` negotiates only `projectInputs` (operation bit 8192).
+`analysis/readFacts` accepts `{ "op":"projectInputs", "after":null|opaqueCursor }`.
+The host selects the one Gradle project containing the already accepted command/evaluation
+owner. Providers cannot supply module names, filesystem roots, Gradle properties or project paths.
+
+The response has `records`, `next` and `coverage`. Pages preserve every supported record;
+an oversized record or exhausted quota returns an error rather than an incomplete successful list.
+`project` records identify the Gradle project/build, the owning source-set handle, original
+capture identity/time/Gradle version, applied plugin classes and an independently observed index
+state. The capture survives cache loads; a new Gradle dump gets a new capture identity.
+Legacy/invalid capture data stays Unknown. Index state comes from the actual Workspace generation,
+completion flags and revision. Its counts explicitly describe unique accepted workspace source inputs
+and dependency origins; source-set classpath counts describe ordered entries of that set.
+Neither count certifies compiler coverage, and no empty pending queue supplies completeness.
+
+`sourceSet` records issue evaluation-bound opaque scope handles for exported compiler source sets.
+`root`, `classpathEntry`, `compilerTask` and `sourceMembership` records preserve configured roles,
+entry order, available selected component identities and compiler task identities. Compile,
+runtime, class-output, resource-output and provided-artifact roles remain distinct.
+KGP logical source sets, their `dependsOn` edges, source/resource roots and current selected files
+appear separately as `kotlinLogicalSourceSet`, `logicalRoot` and `logicalMembership` records.
+These logical records grant no compiler/runtime authority. Uncaptured KGP models or non-JVM
+targets keep whole-project model coverage Unknown. The coverage domain is Java source sets and
+Kotlin logical source-set declarations, independently of source/resource inventory and semantic
+coverage. An exported JVM compilation list alone never proves every Kotlin logical set is covered.
+
+`sourceInventory`, `resourceInventory` and `resourceLookup` additionally accept optional `scope`
+with a source-set handle issued by `projectInputs`. Omitting it preserves owner-scoped behavior.
+Existing source/resource snapshot identities retain their issuing scope and generations. Cursors
+cannot cross scopes or evaluations. Source membership is derived from captured task selections and
+verified stock future-source policy; a shared membership does not choose an authoritative owner.
+When `project-inputs-v1` and `projectInputs` are negotiated, source descriptors expose
+separate `ownerScope`, `memberships` and `editable` facts. Unknown
+authored/generated policy keeps editability Unknown. Resource descriptors preserve their boolean
+editability and expose a separate authoritative `ownerScope` fact plus contextual `membershipScope`.
+These additional project fields are omitted without that negotiation; legacy source/resource
+descriptor schemas and fixed frames remain unchanged.
+
+Scoped source reads record source, selected-scope, same-module membership, missing-selected-file
+and model generations. Project model reads also observe the current overlay epoch and namespace.
+Resource inventories and absence retain the existing native leases/overlay epoch. Capture runs in
+the existing blocking worker; it does no filesystem work or Gradle execution under the Workspace
+lock. Runtime/compile class reads, `typeJvm`, semantic resolution and compiler views remain bound
+to the evaluation owner; issuing a sibling inventory handle does not merge their classpaths.
+
+A selected source set's resource classpath can contain output directories declared
+by another source set of the same project, such as test inheriting main resources.
+Captured output-directory declarations identify these entries without enumerating
+unselected paths. Their watched absence can be complete when the directory is
+empty or has never been created; the LSP does not run a build to create it.
+Missing classpath archives and undeclared inputs still make coverage unknown.
+
+Foreign normalized `sourceFacts` requires the separate `source-facts-v2`
+negotiation. Snapshot authority and the selected source's compiler scope govern
+its normalized declarations; unavailable scopes remain explicitly unknown.
+
+#### Reading normalized facts from another selected source
+
+`sourceFacts` accepts optional `source`, an existing host-issued source token.
+Omitting it preserves the evaluation-owner behavior. Obtain other tokens only
+through negotiated source inventories, including `projectInputs` source-set
+selection. The host shares `source_snapshot` authorization, accepted text and
+generation checks with `source_snapshot_declarations`; display paths grant no
+authority. The result adds the checked `source` descriptor and `semanticScope`.
+An unavailable or ambiguous compiler owner yields unknown semantic scope and no
+declarations, rather than a known empty normalized source.
+
+Snapshot declaration handles retain that file's exact definition and revision.
+V2 declarations additionally expose authored `sourceKind` (`Function`,
+`Property`, `Class`, and the other shared index kinds), so an unsupported
+descriptor does not erase whether the authored source is a callable or property.
+Type references from its annotations, nested annotations, class values and enum
+values retain the same source provenance. `resolveTypeRef` temporarily selects
+that file's verified compiler/caller view, using the existing core resolver and
+read set. It returns the correct qualified identity as a **read-only** snapshot
+type (`readOnly:true`), with its checked `contextSource` descriptor. This is the
+resolution context; the resolved type may be declared in a dependency. The original owner
+view is restored before processing another operation. Shared membership alone
+does not establish an authoritative compiler owner.
+
+`declarationType` and `declarationMember` also accept snapshot declaration
+handles and reuse the existing core algorithms in that same source view.
+Class types retain read-only snapshot type identities. Members retain read-only
+snapshot member identities plus their normalized kind, name, JVM signature,
+dispatch, visibility, synthetic status and mismatches. JVM method descriptors
+carry parameter and return descriptors; consumers need no Java/Kotlin parser to
+populate the supported Mixin member slice. Unsupported signatures stay unknown.
+
+With separately negotiated `sourceLocation`, snapshot declaration/type/member
+handles can produce exact locations and accepted-source revision/digest facts.
+They do not become ordinary owner-world semantic identities: `typeJvm` and
+`declaredMembers` still return explicit `UnsupportedSource` knowledge for
+snapshot types. Requirements and other generic identity-consuming operations
+reject snapshot identities as read-only, and generic signature reuse still
+checks every referenced type against the evaluation owner's view. Runtime bytes, JVM
+catalogs, and compile/runtime classpath selection remain bound to the evaluation
+owner; project snapshot access does not broaden those operations.
+
+Unsaved source edits, source membership changes, model changes and originating
+session checks invalidate these reads through the existing guards. Focused
+core/IPC cases cover Java and Kotlin main/test source contexts, own-package
+annotation/class names, different nominal parameter/return dependencies, exact
+foreign-file method/field descriptors and locations,
+unavailable/foreign scopes, owner-view restoration and stale reads. Supporting
+broader downstream semantic operations on snapshot handles remains a separate
+gap; this transport does not establish global Minecraft semantic completeness.
+
+The existing selected-project command probe also negotiates these source reads,
+captures normalized facts and declaration type/member reads for every issued
+main/test inventory source, and checks its own snapshot identity, name bytes,
+member descriptor/source context, source location URI and accepted-text
+digest. It consumes the normalized JSON schema and does not parse source code in
+the child. This disposable probe uses groups of eight normalized source reads;
+existing frame, handle and evaluation budgets still apply to larger projects.

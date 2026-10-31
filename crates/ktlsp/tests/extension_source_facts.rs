@@ -187,11 +187,11 @@ fn unsupported_or_unresolved_source_never_becomes_a_primitive_or_void_signature(
 }
 
 #[test]
-fn interpolation_and_escapes_remain_unknown_instead_of_issuing_false_edit_ranges() {
+fn interpolation_and_unsupported_escapes_remain_unknown_instead_of_issuing_false_edit_ranges() {
     for (file, source) in [
         (
             "Use.java",
-            r#"class Use { @Select(method = "twice\u0028I)I") void probe() {} }"#,
+            r#"class Use { @Select(method = "twice\q(I)I") void probe() {} }"#,
         ),
         (
             "Use.kt",
@@ -662,4 +662,185 @@ fn source_jvm_property_qualified_intrinsic_withholds_a_shadowed_package_prefix()
         named(&facts("Parent.kt", alias), alias, "field").jvm_property,
         Some(Knowledge::Unknown(_))
     ));
+}
+
+#[test]
+fn source_v2_keeps_whole_field_declarations_and_applied_explicit_modifiers() {
+    let source="class Owner { @Mark private static final int first=1, second=2; public final void run() {} }";
+    let declarations=facts("Owner.java",source);
+    let first=named(&declarations,source,"first");let second=named(&declarations,source,"second");
+    assert_eq!(first.range,second.range);
+    assert_eq!(&source[first.range.clone()],"@Mark private static final int first=1, second=2;");
+    assert_eq!(first.header_range,first.range);assert!(first.body_range.is_none());
+    for declaration in [first,second] {
+        assert_eq!(declaration.modifiers.visibility,Knowledge::Found(Visibility::Private));
+        assert_eq!(declaration.modifiers.is_static,Knowledge::Found(true));
+        assert_eq!(declaration.modifiers.is_final,Knowledge::Found(true));
+        assert_eq!(declaration.name_range,declaration.definition.start_byte..declaration.definition.end_byte);
+    }
+    let run=named(&declarations,source,"run");
+    assert_eq!(&source[run.header_range.clone()],"public final void run() ");
+    assert_eq!(&source[run.body_range.clone().unwrap()],"{}");
+    let source="class Owner { final fun explicit() {}\n fun implicit() {} }";
+    let declarations=facts("Owner.kt",source);
+    assert_eq!(named(&declarations,source,"explicit").modifiers.is_final,Knowledge::Found(true));
+    assert!(matches!(named(&declarations,source,"implicit").modifiers.is_final,Knowledge::Unknown(_)));
+}
+
+#[test]
+fn source_v2_nested_annotations_preserve_exact_names_ranges_and_typed_ordinal() {
+    use ktcore::extensions::source::AnnotationIntegerType;
+    for (file,source,types) in [
+        ("Use.java",r#"package oracle; class Use { @Example(method="tick()V", at=@At(value="INVOKE", target="Lpkg/C;m()V", ordinal=1)) void probe() {} }"#,
+            vec![("At.java","package oracle; public @interface At { String value(); String target(); int ordinal(); }")]),
+        ("Use.kt",r#"package oracle
+class Use { @Example(method="tick()V", at=At(value="INVOKE", target="Lpkg/C;m()V", ordinal=1)) fun probe() {} }"#,
+            vec![("At.kt","package oracle\nannotation class At(val value: String, val target: String, val ordinal: Int)")]),
+    ] {
+        let declarations=facts_with_types(file,source,&types);
+        let annotation=&named(&declarations,source,"probe").annotations[0];
+        assert_eq!(&source[annotation.name_range.clone()],"Example");
+        let argument=annotation.arguments.iter().find(|arg|arg.name.as_deref()==Some("at")).unwrap();
+        let Knowledge::Found(AnnotationValue::Annotation(nested))=&argument.value else {panic!("{file}: {argument:?}");};
+        assert_eq!(nested.ty.name,"At");
+        assert_eq!(&source[nested.name_range.clone()],"At");
+        assert_eq!(nested.range,argument.range);
+        assert_eq!(nested.arguments.len(),3);
+        assert_eq!(nested.arguments[2].value,Knowledge::Found(AnnotationValue::Integer {value:1,ty:AnnotationIntegerType::Int}));
+        assert!(matches!(&nested.arguments[1].value,Knowledge::Found(AnnotationValue::String {value,..}) if value=="Lpkg/C;m()V"));
+    }
+    let source="package oracle\nclass Use { @Example(at=At(1)) fun probe() {} }";
+    for types in [vec![],vec![("At.kt","package oracle\nclass At(val ordinal: Int)")]] {
+        let declarations=facts_with_types("Use.kt",source,&types);
+        assert!(matches!(named(&declarations,source,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)));
+    }
+}
+
+#[test]
+fn source_v2_enum_entries_require_one_resolved_enum_and_entry() {
+    for (file,source,types) in [
+        ("Use.java","package oracle; class Use { @Select(mode=Mode.INVOKE) void probe() {} }",
+            vec![("Mode.java","package oracle; enum Mode { INVOKE, HEAD }")]),
+        ("Use.kt","package oracle\nclass Use { @Select(mode=Mode.INVOKE) fun probe() {} }",
+            vec![("Mode.kt","package oracle\nenum class Mode { INVOKE, HEAD }")]),
+    ] {
+        let declarations=facts_with_types(file,source,&types);
+        assert!(matches!(&named(&declarations,source,"probe").annotations[0].arguments[0].value,
+            Knowledge::Found(AnnotationValue::Enum {ty,name}) if ty.name=="Mode" && name=="INVOKE"));
+        let declarations=facts(file,source);
+        assert!(matches!(named(&declarations,source,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)));
+        let absent=source.replace("Mode.INVOKE","Mode.MISSING");
+        let declarations=facts_with_types(file,&absent,&types);
+        assert!(matches!(named(&declarations,&absent,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)));
+    }
+    let source="package consumer\nimport one.*\nimport two.*\nclass Use { @Select(Mode.INVOKE) fun probe() {} }";
+    let declarations=facts_with_types("Use.kt",source,&[("One.kt","package one\nenum class Mode { INVOKE }"),
+        ("Two.kt","package two\nenum class Mode { INVOKE }")]);
+    assert!(matches!(named(&declarations,source,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)));
+    // Selected binary enum stubs re-enter the shared index through this same nested Java shape.
+    for (file,method) in [("Use.java","void probe() {}"),("Use.kt","fun probe() {}") ] {
+        let source=format!("package oracle{}class Use {{ @Select(At.Shift.AFTER) {method} }}",if file.ends_with("java") {"; "} else {"\n"});
+        let declarations=facts_with_types(file,&source,&[("At.java","package oracle; public class At { public enum Shift { BEFORE, AFTER } }")]);
+        assert!(matches!(&named(&declarations,&source,"probe").annotations[0].arguments[0].value,
+            Knowledge::Found(AnnotationValue::Enum {ty,name}) if ty.name=="Shift" && name=="AFTER"));
+    }
+}
+
+#[test]
+fn source_v2_nested_annotation_arrays_recurse_without_constant_interpretation() {
+    for (file,source,types) in [
+        ("Use.java",r#"class Use { @Example(at={@At(value="INVOKE",ordinal=1)}) void probe() {} }"#,
+            vec![("At.java","public @interface At { String value(); int ordinal(); }")]),
+        ("Use.kt",r#"class Use { @Example(at=[At(value="INVOKE",ordinal=1)]) fun probe() {} }"#,
+            vec![("At.kt","annotation class At(val value: String, val ordinal: Int)")]),
+    ] {
+        let declarations=facts_with_types(file,source,&types);
+        let argument=&named(&declarations,source,"probe").annotations[0].arguments[0];
+        let Knowledge::Found(AnnotationValue::Array(values))=&argument.value else {panic!("{file}: {argument:?}");};
+        assert_eq!(values.len(),1);
+        assert!(matches!(values[0].value,Knowledge::Found(AnnotationValue::Annotation(_))));
+    }
+}
+
+#[test]
+fn source_v2_decodes_escapes_and_folds_only_literal_strings_with_scalar_maps() {
+    for (file,source) in [
+        ("Use.java",r#"class Use { @Select(method="ti\u0063k" + "(\uD83D\uDE00)V") void probe() {} }"#),
+        ("Use.kt",r#"class Use { @Select(method="ti\u0063k" + "(\uD83D\uDE00)V") fun probe() {} }"#),
+    ] {
+        let declarations=facts(file,source);
+        let argument=&named(&declarations,source,"probe").annotations[0].arguments[0];
+        let Knowledge::Found(AnnotationValue::MappedString {value,segments})=&argument.value else {panic!("{file}: {argument:?}");};
+        assert_eq!(value,"tick(😀)V");
+        let mut cursor=0;
+        for (scalar,segment) in value.chars().zip(segments) {
+            assert_eq!(segment.decoded,cursor..cursor+scalar.len_utf16());cursor+=scalar.len_utf16();
+            assert!(argument.range.start<segment.source.start && segment.source.end<argument.range.end);
+        }
+        assert_eq!(segments.len(),value.chars().count());
+        assert_eq!(&source[segments[2].source.clone()],r"\u0063");
+        assert_eq!(segments[5].decoded,5..7);
+        assert_eq!(&source[segments[5].source.clone()],r"\uD83D\uDE00");
+        assert_eq!(cursor,value.encode_utf16().count());
+    }
+    for (file,source) in [
+        ("Use.java",r#"class Use { @Select("tick" + NAME) void probe() {} }"#),
+        ("Use.kt",r#"class Use { @Select("tick" + name) fun probe() {} }"#),
+        ("Use.java",r#"class Use { @Select("\u005cn") void probe() {} }"#),
+        ("Use.kt",r#"class Use { @Select("\uD800") fun probe() {} }"#),
+    ] {
+        let declarations=facts(file,source);
+        assert!(matches!(named(&declarations,source,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)),"{source}");
+    }
+}
+
+#[test]
+fn source_v2_integer_widths_and_unsupported_values_are_honest() {
+    use ktcore::extensions::source::AnnotationIntegerType::{Int,Long};
+    for (literal,expected) in [("1",Some((1,Int))),("1L",Some((1,Long))),("-1",Some((-1,Int))),
+        ("2147483647",Some((2147483647,Int))),("9223372036854775808L",None),("1+2",None),("1.5",None)] {
+        for (file,method) in [("Use.java","void probe() {}"),("Use.kt","fun probe() {}") ] {
+            let source=format!("class Use {{ @Select({literal}) {method} }}");
+            let declarations=facts(file,&source);
+            let actual=&named(&declarations,&source,"probe").annotations[0].arguments[0].value;
+            if let Some((value,ty))=expected {assert_eq!(actual,&Knowledge::Found(AnnotationValue::Integer {value,ty}),"{file}: {literal}");}
+            else {assert!(matches!(actual,Knowledge::Unknown(_)),"{file}: {literal}: {actual:?}");}
+        }
+    }
+}
+
+#[test]
+fn source_v2_bounds_literal_concatenation_depth_and_decoded_scalar_work() {
+    let deep=std::iter::repeat_n("\"x\"",200).collect::<Vec<_>>().join(" + ");
+    let large=format!("\"{}\" + \"x\"","x".repeat(16_384));
+    for expression in [deep,large] {
+        let source=format!("class Use {{ @Select({expression}) void probe() {{}} }}");
+        let declarations=facts("Use.java",&source);
+        assert!(matches!(named(&declarations,&source,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)));
+    }
+}
+
+#[test]
+fn source_v2_normalization_uses_the_authored_files_visible_enum_origins() {
+    use ktcore::project_model::{FileOrigin,ProjectScope,ScopeVisibility,SourceRepresentation};
+    let file="/consumer/Use.kt";
+    let source="package consumer\nimport one.*\nimport two.*\nclass Use { @Select(Mode.INVOKE) fun probe() {} }";
+    let mut index=Index::new();let mut parsers=LanguageParsers::new();
+    let scope=ProjectScope {module:"consumer".into(),source_set:"main".into()};
+    for (key,text,origin) in [(file,source,"consumer"),("/one/Mode.kt","package one\nenum class Mode { INVOKE }","one"),
+        ("/two/Mode.kt","package two\nenum class Mode { INVOKE }","two")] {
+        let tree=parsers.parse(SourceLanguage::Kotlin,text);
+        index.replace_file(key,language::file_facts(SourceLanguage::Kotlin,&tree,text).symbols,Tier::Volatile);
+        index.set_file_origin(key,FileOrigin {origin_id:origin.into(),representation:SourceRepresentation::Source,
+            project_scope:Some(if key==file {scope.clone()} else {ProjectScope {module:origin.into(),source_set:"main".into()}})});
+    }
+    index.replace_scope_visibilities(vec![ScopeVisibility {scope:scope.clone(),ordered_origins:vec!["consumer".into(),"one".into()]}]);
+    let tree=parsers.parse(SourceLanguage::Kotlin,source);
+    let declarations=language::extension_source_facts(&index,file,&tree,source);
+    assert!(matches!(named(&declarations,source,"probe").annotations[0].arguments[0].value,
+        Knowledge::Found(AnnotationValue::Enum {..})),"an unrelated source-set enum cannot introduce ambiguity");
+    index.replace_scope_visibilities(vec![ScopeVisibility {scope,ordered_origins:vec!["consumer".into(),"one".into(),"two".into()]}]);
+    let declarations=language::extension_source_facts(&index,file,&tree,source);
+    assert!(matches!(named(&declarations,source,"probe").annotations[0].arguments[0].value,Knowledge::Unknown(_)),
+        "two visible wildcard candidates remain genuinely ambiguous");
 }

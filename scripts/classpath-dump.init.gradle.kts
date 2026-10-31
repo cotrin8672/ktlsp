@@ -281,6 +281,8 @@ object KtlspCompilerConfiguration {
         "8.10.2" -> JavaGradleProfile("8.10.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.3.0" -> JavaGradleProfile("9.3.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
+        "9.8.2" -> JavaGradleProfile("9.8.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
+        "9.8.0" -> JavaGradleProfile("9.8.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
         else -> error("Unsupported Java recipe Gradle adapter")
     }
 
@@ -340,6 +342,12 @@ object KtlspCompilerConfiguration {
         val release8Utf8Jdk17 = profile.version == "7.4.2" && o.release.orNull == 8 &&
             task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" &&
             o.encoding == null && java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
+        val release8DefaultUtf8Jdk21 = profile.version == "9.8.2" && o.release.orNull == 8 &&
+            task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" &&
+            o.encoding == null && java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
+        check(profile.version != "9.8.2" || release8DefaultUtf8Jdk21) {
+            "Gradle 9.8.2 Java execution requires the selected JDK21 release8 default-UTF8 profile"
+        }
         val explicitUtf8Jdk17 = profile.version == "7.5" && o.release.orNull == null &&
             task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" && o.encoding == "UTF-8"
         val processors = o.annotationProcessorPath?.files?.toList().orEmpty()
@@ -357,7 +365,7 @@ object KtlspCompilerConfiguration {
         check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none")) { "Opaque Java compiler arguments are unhandled" }
         check(processors.isEmpty() || release17ProcessorsJdk17) { "Java annotation processing is unhandled" }
         check(o.sourcepath == null && o.bootstrapClasspath == null && o.extensionDirs == null &&
-            (o.release.orNull == null || release8Utf8Jdk17 || release17ProcessorsJdk17) &&
+            (o.release.orNull == null || release8Utf8Jdk17 || release8DefaultUtf8Jdk21 || release17ProcessorsJdk17) &&
             (o.encoding == null || explicitUtf8Jdk21 || explicitUtf8Jdk17)) { "Unsupported Java source/SDK/encoding policy" }
         check(o.javaModuleVersion.orNull == null && o.javaModuleMainClass.orNull == null &&
             task.source.files.none { it.name == "module-info.java" }) { "Java modules are unhandled" }
@@ -369,7 +377,7 @@ object KtlspCompilerConfiguration {
         check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
         val selected = when (profile.version) {
             "7.4.2", "7.5" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
-            "8.10.2", "9.6.1" -> task.javaCompiler.orNull
+            "8.10.2", "9.6.1", "9.8.2" -> task.javaCompiler.orNull
             else -> error("Unsupported Java compiler selector")
         } ?: error("Selected Java compiler is unavailable")
         check(selected.javaClass.name == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler") {
@@ -377,7 +385,7 @@ object KtlspCompilerConfiguration {
         }
         val metadata = selected.metadata
         val home = metadata.installationPath.asFile
-        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21 || defaultUtf8Target17Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
+        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21 || defaultUtf8Target17Jdk21 || release8DefaultUtf8Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
             home.canonicalFile == selectedHome.canonicalFile &&
             home.canonicalFile == java.io.File(System.getProperty("java.home")).canonicalFile) {
             "Java recipe requires the selected current SDK profile"
@@ -437,6 +445,7 @@ object KtlspCompilerConfiguration {
                 explicitUtf8Jdk21 -> "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
                 defaultUtf8Target17Jdk21 -> "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
                 release8Utf8Jdk17 -> "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+                release8DefaultUtf8Jdk21 -> "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
                 explicitUtf8Jdk17 -> "gradle-7.5-current-jdk17-utf8-javac-api-v1"
                 else -> "gradle-${profile.version}-current-jdk17-javac-api-v1"
             },
@@ -809,7 +818,7 @@ object KtlspCompilerConfiguration {
     private fun sdkSourceFacts(task: Task, language: String): Pair<Map<String, Any?>?, Map<String, Any?>?> {
         var claims: Map<String, Any?>? = null
         val policy = runCatching {
-        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1"))
+        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1", "9.8.0", "9.8.2"))
         val extension = task.project.extensions.findByName("kotlin")
         val targets = extension?.javaClass?.methods?.firstOrNull { it.name == "getTargets" && it.parameterCount == 0 }
             ?.invoke(extension) as? Iterable<*>
@@ -825,7 +834,7 @@ object KtlspCompilerConfiguration {
         if (compilation != null) {
             // JavaCompile belongs to Gradle's loader, which cannot see the project's KGP.
             val helper = Class.forName("org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapperKt", false, checkNotNull(extension).javaClass.classLoader)
-            check(task.project.gradle.gradleVersion == "9.3.0" &&
+            check(task.project.gradle.gradleVersion in listOf("9.3.0", "9.8.2") &&
                 helper.getMethod("getKotlinPluginVersion", Project::class.java).invoke(null, task.project) == "2.2.21")
         }
         val sets = task.project.extensions.findByType(SourceSetContainer::class.java)
@@ -869,7 +878,7 @@ object KtlspCompilerConfiguration {
         val treeType = Class.forName("org.gradle.api.internal.file.FileCollectionInternal", false, loader)
         val visitType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType", false, loader)
         // Verified Gradle 8/9 visitors removed Spec and default to Visit.
-        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1")) "Visit" else "Spec"
+        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1", "9.8.0", "9.8.2")) "Visit" else "Spec"
         val spec = visitType.enumConstants.single { (it as Enum<*>).name == visitName }
         val future = linkedSetOf<java.io.File>()
         val producerRoots = linkedSetOf<java.io.File>()
@@ -940,7 +949,7 @@ object KtlspCompilerConfiguration {
         val version = versionHelper.getMethod("getKotlinPluginVersion", Project::class.java)
             .invoke(null, task.project) as? String
         // These verified KGP layouts expose SDK options independently of dependency/plugin classpaths.
-        check(version in setOf("1.8.21", "1.9.25"))
+        check(version in setOf("1.8.21", "1.9.25", "2.2.21"))
         check(read(task, "getExecutionTimeFreeCompilerArgs\$kotlin_gradle_plugin_common") == null)
         val options = read(task, "getCompilerOptions") ?: error("Kotlin SDK options are unavailable")
         check(Class.forName("org.jetbrains.kotlin.gradle.dsl.KotlinJvmCompilerOptions", false, loader).isInstance(options))
@@ -1077,25 +1086,76 @@ object KtlspCompilerConfiguration {
                 // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
                 val recipe = kotlinCompilerRecipe(task, toolchain, javaHome, runtimes.get())
                 record["kotlin_compiler"] = recipe
+                var fragmentSourceRoles: Map<String, Any?>? = null
                 if ("-Xmulti-platform" in strings) {
-                    check(recipe["compiler_version"] == "2.2.21" && recipe["gradle_plugin_version"] == "2.2.21" &&
-                        strings.windowed(2).any { it == listOf("-language-version", "1.8") }) {
-                        "Unsupported Kotlin common-source argument profile"
+                    check(recipe["compiler_version"] == "2.2.21" && recipe["gradle_plugin_version"] == "2.2.21") {
+                        "Unsupported Kotlin source-valued argument profile"
                     }
-                    check(strings.none { it.startsWith("-Xcommon-sources") }) { "Unexpected serialized common-source arguments" }
-                    // KGP's source-valued contribution is omitted by the serialized options getter.
-                    val common = (read(task, "getCommonSourceSet\$kotlin_gradle_plugin_common") as FileCollection)
-                        .asFileTree.files.map { it.absolutePath }
+                    check(strings.none { it.startsWith("-Xcommon-sources") || it.startsWith("-Xfragment-sources") || it.startsWith("-Xfragment-dependencies") }) {
+                        "Unexpected serialized source-valued arguments"
+                    }
                     val selected = record["source_files"] as List<*>
-                    check(common.all { it in selected && it.endsWith(".kt") && ',' !in it && !it.any { ch -> java.lang.Character.isISOControl(ch) } }) {
-                        "Kotlin common sources differ from selected compiler sources"
+                    val loader = task.javaClass.classLoader
+                    val optionsType = Class.forName("org.jetbrains.kotlin.gradle.dsl.KotlinCommonCompilerOptions", false, loader)
+                    val optionsHelper = Class.forName("org.jetbrains.kotlin.gradle.dsl.KotlinCommonCompilerOptionsExtensionsKt", false, loader)
+                    val usesK2 = (optionsHelper.getMethod("getUsesK2", optionsType)
+                        .invoke(null, read(task, "getCompilerOptions")) as Provider<*>).orNull as? Boolean
+                        ?: error("Kotlin frontend source contribution is unavailable")
+                    // KGP's source contribution follows usesK2, not a particular language-version spelling.
+                    if (usesK2) {
+                        check(read(task, "getSeparateKmpCompilation\$kotlin_gradle_plugin_common") == false) {
+                            "Unsupported separate Kotlin fragment dependency inputs"
+                        }
+                        val structureType = Class.forName("org.jetbrains.kotlin.gradle.tasks.K2MultiplatformStructure", false, loader)
+                        val helper = Class.forName("org.jetbrains.kotlin.gradle.tasks.K2MultiplatformStructureKt", false, loader)
+                        val structure = read(task, "getMultiplatformStructure")
+                        fun values(name: String): List<String> = (helper.getMethod(name, structureType)
+                            .invoke(null, structure) as Array<*>).map { it as String }
+                        val fragments = values("getFragmentsCompilerArgs")
+                        val refines = values("getFragmentRefinesCompilerArgs")
+                        for ((flag, values) in listOf("-Xfragments=" to fragments, "-Xfragment-refines=" to refines)) {
+                            val captured = strings.filter { it.startsWith(flag) }
+                            check(captured == if (values.isEmpty()) emptyList<String>() else listOf(flag + values.joinToString(","))) {
+                                "Kotlin fragment structure differs from serialized arguments"
+                            }
+                        }
+                        val sources = (read(task, "getSources") as FileCollection).asFileTree.files.toList()
+                        val filterGetter = Class.forName("org.jetbrains.kotlin.gradle.tasks.AbstractKotlinCompileTool", false, loader)
+                            .getDeclaredMethod("getSourceFileFilter")
+                        check(filterGetter.returnType == org.gradle.api.tasks.util.PatternSet::class.java &&
+                            java.lang.reflect.Modifier.isProtected(filterGetter.modifiers) &&
+                            java.lang.reflect.Modifier.isFinal(filterGetter.modifiers)) { "Unsupported Kotlin source-filter getter ABI" }
+                        // KGP's own source contribution calls this protected final getter; public bean discovery omits it.
+                        filterGetter.isAccessible = true
+                        val filter = filterGetter.invoke(task) as org.gradle.api.tasks.util.PatternFilterable
+                        val roles = (helper.getMethod("fragmentSourcesCompilerArgs", structureType,
+                            java.util.Collection::class.java, org.gradle.api.tasks.util.PatternFilterable::class.java)
+                            .invoke(null, structure, sources, filter) as Array<*>).map { it as String }
+                        check(roles.all { role ->
+                            val fragment = role.substringBefore(':')
+                            val file = role.substringAfter(':', "")
+                            fragment in fragments && file in selected && file.endsWith(".kt") && java.io.File(file).isAbsolute &&
+                                ',' !in role && !role.any { java.lang.Character.isISOControl(it) }
+                        } && roles.map { it.substringAfter(':') }.toSet() == selected.filterIsInstance<String>().filter { it.endsWith(".kt") }.toSet()) {
+                            "Kotlin fragment sources differ from selected compiler sources"
+                        }
+                        fragmentSourceRoles = linkedMapOf("adapter" to "kgp-2.2.21-jvm-fragment-sources-v1",
+                            "task" to task.path, "fragments" to fragments, "refines" to refines, "sources" to roles)
+                        if (roles.isNotEmpty()) record["arguments"] = strings + "-Xfragment-sources=${roles.joinToString(",")}"
+                    } else {
+                        val common = (read(task, "getCommonSourceSet\$kotlin_gradle_plugin_common") as FileCollection)
+                            .asFileTree.files.map { it.absolutePath }
+                        check(common.all { it in selected && it.endsWith(".kt") && ',' !in it && !it.any { ch -> java.lang.Character.isISOControl(ch) } }) {
+                            "Kotlin common sources differ from selected compiler sources"
+                        }
+                        if (common.isNotEmpty()) record["arguments"] = strings + "-Xcommon-sources=${common.joinToString(",")}"
                     }
-                    if (common.isNotEmpty()) record["arguments"] = strings + "-Xcommon-sources=${common.joinToString(",")}"
                 }
                 val options = linkedMapOf<String, Any?>(
                     "sdkProducerClaims" to sdkSources.first,
                     "sdkSourcePolicy" to sdkSources.second,
                     "sdkSelection" to sdkSelection,
+                    "kotlinFragmentSourceRoles" to fragmentSourceRoles,
                     "kotlinClasspathSnapshotInputs" to kotlinClasspathSnapshotInputs(task, recipe),
                     "taskActionInventory" to producerActions(task, observerActions),
                     "taskOnlyIfInventory" to producerOnlyIf(task),
@@ -1187,6 +1247,34 @@ object KtlspBuildIdentity {
     }
 }
 
+object KtlspProjectInputs {
+    private fun read(value: Any, name: String): Any? = value.javaClass.methods
+        .firstOrNull { it.name==name && it.parameterCount==0 }?.invoke(value)
+
+    fun kotlinSourceSets(extension: Any): List<Map<String,Any?>>? = runCatching {
+        (read(extension,"getSourceSets") as Iterable<*>).map { item ->
+            val source=checkNotNull(item)
+            val kotlin=read(source,"getKotlin") as SourceDirectorySet
+            val resources=read(source,"getResources") as SourceDirectorySet
+            linkedMapOf("name" to (read(source,"getName") as String),
+                "depends_on" to (read(source,"getDependsOn") as Iterable<*>).map { read(checkNotNull(it),"getName") as String }.sorted(),
+                "source_roots" to kotlin.srcDirs.map { it.absolutePath },
+                "source_files" to kotlin.files.map { it.absolutePath },
+                "resource_roots" to resources.srcDirs.map { it.absolutePath },
+                "resource_files" to resources.files.map { it.absolutePath })
+        }.sortedBy { it["name"].toString() }
+    }.getOrNull()
+
+    fun kotlinTargets(extension: Any): List<Map<String,Any?>>? = runCatching {
+        val targets=(read(extension,"getTargets") as? Iterable<*>)
+            ?: listOf(checkNotNull(read(extension,"getTarget")))
+        targets.map { item -> val target=checkNotNull(item)
+            linkedMapOf("name" to (read(target,"getName") as String),
+                "platform_type" to checkNotNull(read(target,"getPlatformType")).toString())
+        }.sortedBy { it["name"].toString() }
+    }.getOrNull()
+}
+
 class KtlspDumpClasspathAction(
     private val projectPath: String,
     private val projectDirPath: String,
@@ -1201,6 +1289,18 @@ class KtlspDumpClasspathAction(
         out.append("PROJECT\t${projectPath}\t${projectDirPath}\n")
         val projectId = resolutionRoot.get().id as? ProjectComponentIdentifier
         out.append("BUILD\t${KtlspBuildIdentity.path(projectId?.build, currentBuildRoot, includedBuildRoots)}\n")
+        val javaSets=task.project.extensions.findByType(SourceSetContainer::class.java)?.names
+        val kotlinExtension=task.project.extensions.findByName("kotlin")
+        val capture=linkedMapOf("identity" to java.util.UUID.randomUUID().toString(),
+            "captured_at_unix_ms" to System.currentTimeMillis(),"gradle_version" to task.project.gradle.gradleVersion,
+            "build_identity" to KtlspBuildIdentity.path(projectId?.build,currentBuildRoot,includedBuildRoots),
+            "source_sets" to sourceSets.map { it.name },
+            "java_source_sets_complete" to (javaSets!=null && javaSets==sourceSets.map { it.name }.toSet()),
+            "plugin_classes" to task.project.plugins.map { it.javaClass.name }.sorted(),
+            "kotlin_present" to (kotlinExtension!=null),
+            "kotlin_source_sets" to kotlinExtension?.let(KtlspProjectInputs::kotlinSourceSets),
+            "kotlin_targets" to kotlinExtension?.let(KtlspProjectInputs::kotlinTargets))
+        out.append("PROJECT_INPUTS\t${JsonOutput.toJson(capture)}\n")
         classpathFiles.files.forEach {
             out.append("CP\t${it.absolutePath}\n")
         }
@@ -1496,6 +1596,12 @@ allprojects {
                         }
                     val actualClasspath = runCatching { sourceSet.compileClasspath.files }
                     val entries = actualClasspath.getOrElse { view.files.files }
+                    listOf("SOURCESET_CONFIGURATIONS\t${sourceSetName}\t${JsonOutput.toJson(linkedMapOf(
+                        "compile_classpath" to sourceSet.compileClasspathConfigurationName,
+                        "runtime_classpath" to sourceSet.runtimeClasspathConfigurationName,
+                        "annotation_processor" to sourceSet.annotationProcessorConfigurationName,
+                        "api_elements" to sourceSet.apiElementsConfigurationName,
+                        "runtime_elements" to sourceSet.runtimeElementsConfigurationName))}") +
                     listOf("RESOURCE_INPUTS\t${sourceSetName}\t${JsonOutput.toJson(KtlspResourceInputs.capture(project, sourceSet))}") +
                     listOf("RUNTIME_INPUTS\t${sourceSetName}\t${JsonOutput.toJson(KtlspRuntimeInputs.capture(sourceSet))}") +
                     roots.map { "SOURCE\t${sourceSetName}\t${it.absolutePath}" } +

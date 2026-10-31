@@ -23,11 +23,26 @@ fn tasks(source: &SourceSetClasspath) -> Option<(&CompilerTask, &CompilerTask)> 
     let kotlin = source.compiler_tasks.iter().find(|t| t.language == CompilerLanguage::Kotlin
         && Some(t.task.as_str()) == source.kotlin_compile_task.as_deref())?;
     let java = source.compiler_tasks.iter().find(|t| t.language == CompilerLanguage::Java)?;
-    // Nonempty Java producer bodies require their own replay. This slice proves the actual
-    // complete zero-Java inventory instead of inheriting any saved Java output directory.
+    let selected_java: BTreeSet<_> = kotlin.source_files.iter()
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("java"))
+        .map(|path| key(path)).collect();
+    let java_sources: BTreeSet<_> = java.source_files.iter().map(|path| key(path)).collect();
+    let mixed = !java.source_files.is_empty();
+    let source_roles = if mixed {
+        java.java_compiler_recipe().is_some_and(|recipe|
+            recipe.adapter == "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
+                && java.java_api_option_slots(&recipe).is_ok())
+            && selected_java == java_sources && java_sources.len() == java.source_files.len()
+            && java.source_files.iter().all(|path| path.extension().and_then(|e| e.to_str()) == Some("java"))
+            && kotlin.source_files.iter().any(|path| path.extension().and_then(|e| e.to_str()) == Some("kt"))
+            && kotlin.source_files.iter().all(|path| matches!(path.extension().and_then(|e| e.to_str()), Some("kt" | "java")))
+    } else {
+        kotlin.source_files.iter().all(|path| path.extension().and_then(|e| e.to_str()) == Some("kt"))
+    };
+    // A mixed producer must replay the checked Java body; only a proved zero inventory gets an empty slot.
     if !kotlin.complete || kotlin.problem.is_some() || !java.complete || java.problem.is_some()
-        || kotlin.source_files.is_empty() || !java.source_files.is_empty()
-        || kotlin.source_files.iter().any(|p| p.extension().and_then(|e| e.to_str()) != Some("kt"))
+        || kotlin.source_files.is_empty() || !source_roles
+        || kotlin.source_files.iter().map(|path| key(path)).collect::<BTreeSet<_>>().len() != kotlin.source_files.len()
         || !crate::classpath::sdk_producer_roots(kotlin).is_some_and(|(_, complete)| complete)
         || !crate::classpath::sdk_producer_roots(java).is_some_and(|(_, complete)| complete)
         || kotlin.output_roots.len() != 1 || java.output_roots.len() != 1
@@ -134,7 +149,7 @@ fn capture_dependencies(
     }).collect()
 }
 
-fn rewrite(task: &mut CompilerTask, bindings: &BTreeMap<String, PathBuf>) -> anyhow::Result<()> {
+fn rewrite(task: &mut CompilerTask, bindings: &BTreeMap<String, Vec<PathBuf>>) -> anyhow::Result<()> {
     let java_recipe = if task.language == CompilerLanguage::Java {
         if let Some(recipe) = task.java_compiler_recipe() {
             let slots = task.java_api_option_slots(&recipe)?;
@@ -148,11 +163,13 @@ fn rewrite(task: &mut CompilerTask, bindings: &BTreeMap<String, PathBuf>) -> any
             None
         }
     } else { None };
-    let replace = |p: &PathBuf| bindings.get(&key(p)).cloned().unwrap_or_else(|| p.clone());
+    anyhow::ensure!(bindings.values().all(|outputs| !outputs.is_empty()
+        && outputs.iter().all(|path| path.is_absolute())), "kotlin-producer-output-binding-unhandled");
+    let replace = |p: &PathBuf| bindings.get(&key(p)).cloned().unwrap_or_else(|| vec![p.clone()]);
     let before: BTreeSet<_> = task.classpath.iter().map(|p| key(p)).collect();
     anyhow::ensure!(before.len() == task.classpath.len(), "kotlin-producer-duplicate-classpath-slot");
-    task.classpath = task.classpath.iter().map(replace).collect();
-    task.declared_input_files = task.declared_input_files.iter().map(replace).collect();
+    task.classpath = task.classpath.iter().flat_map(replace).collect();
+    task.declared_input_files = task.declared_input_files.iter().flat_map(replace).collect();
     let existing: Vec<_> = task.classpath.iter().filter(|p| p.exists()).collect();
     let joined = std::env::join_paths(existing)?.to_str()
         .ok_or_else(|| anyhow::anyhow!("kotlin-producer-classpath-encoding"))?.to_owned();
@@ -169,7 +186,7 @@ fn rewrite(task: &mut CompilerTask, bindings: &BTreeMap<String, PathBuf>) -> any
 }
 
 pub(super) fn effective(
-    original: &KotlinDiagnosticRequest, bindings: &BTreeMap<String, PathBuf>,
+    original: &KotlinDiagnosticRequest, bindings: &BTreeMap<String, Vec<PathBuf>>,
     covered: &BTreeSet<String>,
 ) -> anyhow::Result<KotlinDiagnosticRequest> {
     // Validate before replacing any selected slots; rewriting must not normalize away an
@@ -187,7 +204,7 @@ struct CompiledProducer {
     environment: Arc<KotlinDiagnosticEnvironment>,
     outputs: sealed_output::SealedOutput,
     _owner: KotlinEditorOverlay,
-    bindings: Vec<(String, PathBuf)>,
+    bindings: Vec<(String, Vec<PathBuf>)>,
     source_keys: BTreeSet<String>,
 }
 
@@ -229,7 +246,7 @@ impl CompiledProducers {
         Ok(())
     }
 
-    fn bindings(&self) -> BTreeMap<String, PathBuf> {
+    fn bindings(&self) -> BTreeMap<String, Vec<PathBuf>> {
         self.nodes.iter().flat_map(|node| node.bindings.iter().cloned()).collect()
     }
 
@@ -276,10 +293,10 @@ pub(super) fn identity(request: &KotlinDiagnosticRequest) -> anyhow::Result<Vec<
 pub(super) fn output_bindings(
     request: &KotlinDiagnosticRequest, plan: &KotlinDependencyCompilation,
     kotlin_output: &Path, java_output: &Path,
-) -> anyhow::Result<Vec<(String, PathBuf)>> {
+) -> anyhow::Result<Vec<(String, Vec<PathBuf>)>> {
     let (kt, java) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
-    let mut bindings = vec![(key(&kt.output_roots[0]), kotlin_output.to_path_buf()),
-        (key(&java.output_roots[0]), java_output.to_path_buf())];
+    let mut bindings = vec![(key(&kt.output_roots[0]), vec![kotlin_output.to_path_buf()]),
+        (key(&java.output_roots[0]), vec![java_output.to_path_buf()])];
     // Only artifact slots actually selected by this closed plan are rebound. Capture
     // already proved their unique source owner; sources/artifact metadata stay unchanged.
     let reads: BTreeSet<_> = request.task.classpath.iter()
@@ -289,7 +306,7 @@ pub(super) fn output_bindings(
         .map(|p| key(p)).collect();
     bindings.extend(plan.source.provided_artifacts.iter()
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jar") && reads.contains(&key(p)))
-        .map(|p| (key(p), kotlin_output.to_path_buf())));
+        .map(|p| (key(p), vec![kotlin_output.to_path_buf(), java_output.to_path_buf()])));
     Ok(bindings)
 }
 
@@ -304,28 +321,33 @@ fn compile(
         environment.check_live()?;
         compiled.check_live()?;
         let producer = effective(&plan.request(request)?, &compiled.bindings(), &compiled.covered())?;
-        // Recheck complete capture before treating an empty Java slot as empty API authority.
-        let (kt, _) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
+        let (kt, java) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
+        let mixed = !java.source_files.is_empty();
         let producer_environment = KotlinDiagnosticEnvironment::prepare_with_invalidation(
             &producer, environment.wake.clone(), environment.invalid.clone())?;
         let roots = java_diagnostics::owned_membership_inputs(&producer)?;
         let read_plan = crate::compiled_watch::WatchPlan::read_inputs(&roots)?;
         producer_environment.watch.extend(read_plan.clone())?;
         java_diagnostics::owned_source_membership(&producer, &read_plan)?;
-        // The normal compiler, not signature generation, supplies the current Kotlin ABI.
-        // All current selected sources are Kotlin; the independently checked Java inventory
-        // above is empty, so no no-source javac invocation is used as a cleanliness shortcut.
-        let mut kotlin_only = producer.clone();
-        kotlin_only.java_task = None;
+        // Mixed sources use the existing required-clean Javac replay over normal Kotlin outputs.
+        let mut execution = producer.clone();
+        if !mixed { execution.java_task = None; }
         let started = Instant::now();
-        let (outcome, owner) = run_owned_kotlin_overlay(&kotlin_only, &producer_environment, false)?;
+        let (outcome, owner) = run_owned_kotlin_overlay(&execution, &producer_environment, mixed)?;
         anyhow::ensure!(matches!(outcome, KotlinDiagnosticOutcome::Verified { clean:true, ref diagnostics, .. }
             if diagnostics.iter().all(|d| d.severity != Severity::Error)), "kotlin-producer-compilation-not-clean");
         java_diagnostics::owned_source_membership(&producer, &read_plan)?;
         let kotlin_output = owner.directory.join("classes");
         anyhow::ensure!(kotlin_output.is_dir(), "kotlin-producer-normal-output-missing");
         let java_output = owner.directory.join("java-classes");
-        std::fs::create_dir(&java_output)?;
+        if mixed {
+            let entries = walkdir::WalkDir::new(&java_output).into_iter().collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(java_output.is_dir() && entries.iter().any(|entry| entry.file_type().is_file()
+                    && entry.path().extension().and_then(|extension| extension.to_str()) == Some("class")),
+                "kotlin-producer-java-normal-output-missing");
+        } else {
+            std::fs::create_dir(&java_output)?;
+        }
         let outputs = sealed_output::SealedOutput::seal(vec![kotlin_output.clone(), java_output.clone()])?;
         let bindings = output_bindings(request, plan, &kotlin_output, &java_output)?;
         compiled.nodes.push(CompiledProducer {
@@ -335,7 +357,8 @@ fn compile(
         });
         crate::trace::span("compiler.kotlin.producer-compiled", "compiler", started,
             serde_json::json!({"task":kt.task,"source_count":producer.sources.len(),
-                "output_slots":2,"normal_output":true,"java_complete_zero":true,"generation":request.generation}));
+                "output_slots":2,"normal_output":true,"java_complete_zero":!mixed,
+                "java_required_clean":mixed,"generation":request.generation}));
     }
     anyhow::ensure!(identity(request)? == compiled.identity, "kotlin-producer-source-changed-during-compile");
     compiled.check_live()?;

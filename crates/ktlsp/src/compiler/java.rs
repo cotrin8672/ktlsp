@@ -88,7 +88,10 @@ fn k2_normal(request: &KotlinDiagnosticRequest) -> bool {
 }
 
 fn header_assets(request: &KotlinDiagnosticRequest) -> Vec<(&'static str, &'static str)> {
-    if k2_normal(request) {
+    if kmp_release8_java(request) {
+        // This profile consumes the already checked normal Kotlin output; no header plugin runs.
+        vec![("JavacDiagnostics.java", JAVA_SOURCE)]
+    } else if k2_normal(request) {
         vec![
             ("K2CompleteHeaders.kt", K2_HEADER_SOURCE),
             ("JavacDiagnostics.java", JAVA_SOURCE),
@@ -110,7 +113,7 @@ fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &s
         Some("gradle-7.4.2-stock-actions-v1" | "gradle-7.5-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
         }
-        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1") => {
+        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1" | "gradle-9.8.2-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalTaskAction"
         }
         _ => return false,
@@ -133,12 +136,18 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
     };
     match fact.get("adapter").and_then(Value::as_str) {
         Some("gradle-7.4.2-stock-onlyif-v1" | "gradle-7.5-stock-onlyif-v1") => {}
-        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
+        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1") if !kapt => {}
         _ => return false,
     }
     let Some(predicates) = fact.get("predicates").and_then(Value::as_array) else {
         return false;
     };
+    if fact.get("adapter").and_then(Value::as_str) == Some("gradle-9.8.2-stock-onlyif-v1")
+        && predicates.first().and_then(|predicate| predicate.get("class")).and_then(Value::as_str)
+            != Some("org.gradle.api.internal.tasks.execution.SelfDescribingSpec")
+    {
+        return false;
+    }
     predicates.len() == (if kapt { 2 } else { 1 })
         && predicates[0]
             .get("stockEnabledPredicate")
@@ -574,6 +583,30 @@ pub(super) fn selected_tasks_supported(
     selected_tasks_supported_reason(primary, java, tasks).is_ok()
 }
 
+fn kmp_fragment_task(primary: &CompilerTask) -> bool {
+    primary.kotlin_compiler.as_ref().is_some_and(|runtime|
+        runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21"
+            && !runtime.run_via_build_tools_api
+            && runtime.execution_strategy == crate::classpath::KotlinCompilerExecutionStrategy::Daemon
+            && runtime.normalized_daemon_jvm_arguments.is_empty())
+        && ["-language-version", "-api-version", "-jvm-target"].iter().all(|flag| {
+            let values: Vec<_> = primary.arguments.windows(2)
+                .filter(|pair| pair[0] == *flag).map(|pair| pair[1].as_str()).collect();
+            values == [if *flag == "-jvm-target" { "1.8" } else { "2.1" }]
+                && primary.arguments.iter().filter(|argument| argument.as_str() == *flag).count() == 1
+        })
+        && kotlin_fragment_source_roles(primary, &primary.source_files)
+            .is_ok_and(|roles| roles.is_some())
+}
+
+fn kmp_release8_java(request: &KotlinDiagnosticRequest) -> bool {
+    kmp_fragment_task(&request.task)
+        && request.task.arguments.iter().filter(|argument| argument.starts_with("-Xjdk-release="))
+            .map(String::as_str).eq(["-Xjdk-release=8"])
+        && request.java_task.as_ref().and_then(CompilerTask::java_compiler_recipe).is_some_and(|recipe|
+            recipe.adapter == "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1")
+}
+
 pub(super) fn selected_tasks_supported_reason(
     primary: &CompilerTask,
     java: &CompilerTask,
@@ -585,13 +618,15 @@ pub(super) fn selected_tasks_supported_reason(
     let legacy = runtime.compiler_version == "1.8.21" && runtime.gradle_plugin_version == "1.8.21";
     let complete_k2 =
         runtime.compiler_version == "2.4.0" && runtime.gradle_plugin_version == "2.4.0";
-    // Stock source membership only; this does not admit a Gradle 9.3 Javac recipe.
-    let kmp_k2 = runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21"
+    // Stock source membership only; SDK/fragment facts do not admit a Javac execution recipe.
+    let kmp_runtime = runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21"
         && !runtime.run_via_build_tools_api
         && runtime.execution_strategy == crate::classpath::KotlinCompilerExecutionStrategy::Daemon
-        && primary.arguments.iter().any(|arg| arg == "-Xmulti-platform")
+        && primary.arguments.iter().any(|arg| arg == "-Xmulti-platform");
+    let kmp_k2 = kmp_runtime
         && ["-language-version", "-api-version"].iter().all(|flag|
             primary.arguments.windows(2).any(|pair| pair[0] == *flag && pair[1] == "1.8"));
+    let kmp_fragments = kmp_fragment_task(primary);
     let gradle75 = legacy
         && java
             .options
@@ -608,13 +643,15 @@ pub(super) fn selected_tasks_supported_reason(
         )
     } else if kmp_k2 {
         ("gradle-9.3.0-stock-actions-v1", "gradle-9.3.0-stock-onlyif-v1")
+    } else if kmp_fragments {
+        ("gradle-9.8.2-stock-actions-v1", "gradle-9.8.2-stock-onlyif-v1")
     } else {
         (
             "gradle-9.6.1-stock-actions-v1",
             "gradle-9.6.1-stock-onlyif-v1",
         )
     };
-    if (!legacy && !complete_k2 && !kmp_k2)
+    if (!legacy && !complete_k2 && !kmp_k2 && !kmp_fragments)
         || [primary, java].iter().any(|task| {
             task.options
                 .get("taskActionInventory")
@@ -682,7 +719,9 @@ fn explicit_utf8_recipe(recipe: &JavaCompilerRecipe) -> bool {
 }
 
 fn source_sdk_encoding_supported(task: &CompilerTask, recipe: &JavaCompilerRecipe) -> bool {
-    let release8 = recipe.adapter == "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1";
+    let release8 = matches!(recipe.adapter.as_str(),
+        "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+            | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1");
     let guide8 = recipe.adapter == "gradle-7.5-current-jdk17-utf8-javac-api-v1";
     let target17_jdk21 =
         recipe.adapter == "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1";
@@ -776,6 +815,7 @@ pub(super) fn configured_recipe(
         recipe.adapter.as_str(),
         "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
             | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+            | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
     );
     anyhow::ensure!(
         ((kotlin.compiler_version == "1.8.21"
@@ -802,7 +842,9 @@ pub(super) fn configured_recipe(
                         "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1",
                         crate::classpath::KotlinCompilerExecutionStrategy::InProcess
                     )
-                )))
+                ))
+            || (kmp_release8_java(request)
+                && selected_tasks_supported(&request.task, task, &[])))
             && kotlin.normalized_daemon_jvm_arguments.is_empty(),
         "java-header-compiler-version-unhandled"
     );
@@ -829,7 +871,8 @@ pub(super) fn configured_recipe(
     anyhow::ensure!(
         (task.annotation_processing_disabled()
             || ((k2_normal(request)
-                || recipe.adapter == "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1")
+                || recipe.adapter == "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
+                || kmp_release8_java(request))
                 && task.arguments.is_empty()))
             && task.annotation_processor_path.is_empty()
             && source_sdk_encoding_supported(task, &recipe),
@@ -886,7 +929,8 @@ pub(super) fn configured_recipe(
         "java-selected-source-membership-differs"
     );
     anyhow::ensure!(
-        request
+        // Producer copies are also checked against closed source membership before execution.
+        kmp_release8_java(request) || request
             .overlays
             .iter()
             .any(|source| source.key.ends_with(".java")
@@ -933,6 +977,9 @@ fn java_inputs(request: &KotlinDiagnosticRequest) -> anyhow::Result<Vec<PathBuf>
         sdk.join("lib/jrt-fs.jar"),
         sdk.join("conf"),
     ]);
+    if task.options.get("release") == Some(&serde_json::json!(8)) {
+        inputs.insert(sdk.join("lib/ct.sym"));
+    }
     for input in &inputs {
         path_text(input)?;
         anyhow::ensure!(
@@ -1193,7 +1240,7 @@ impl Tools {
         let source_root = self.owner.directory.join("assets");
         let recipe = &environment.key.recipe;
         let mut outputs = Vec::new();
-        if !k2_normal(request) {
+        if !k2_normal(request) && !kmp_release8_java(request) {
             let plugin_classes = self.owner.directory.join("classes/headers");
             std::fs::create_dir(&plugin_classes)?;
             let mut arguments = vec![
@@ -2478,10 +2525,11 @@ fn run_checked(
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
     let complete_k2 = k2_normal(request);
+    let canonical_only = kmp_release8_java(request);
     let kotlin_inventory_known = request.task.complete
         && crate::classpath::sdk_producer_roots(&request.task).is_some_and(|(_, complete)| complete);
     anyhow::ensure!(
-        !complete_k2 || (clean && canonical.iter().all(|d| d.severity != Severity::Error)),
+        !(complete_k2 || canonical_only) || (clean && canonical.iter().all(|d| d.severity != Severity::Error)),
         "java-k2-normal-compilation-required"
     );
     // run_kotlin_editor_compile creates this fresh output and calls us only after owned/EOF
@@ -2502,6 +2550,8 @@ fn run_checked(
     } else {
         None
     };
+    anyhow::ensure!(!canonical_only || canonical_outputs.is_some(),
+        "java-kmp-normal-output-required");
     let mut cached = environment
         .java_tools
         .lock()

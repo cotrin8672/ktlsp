@@ -8,7 +8,7 @@ use tree_sitter::{Node, Tree};
 use super::{
     DeclaredMemberFacts, Dispatch, Fact, IncompleteReason, JvmType, MemberSignature, Visibility,
 };
-use crate::index::InferenceIndex;
+use crate::index::{InferenceIndex, ScopedIndex};
 use crate::indexer::TypeScope;
 use crate::infer::{self, FileCtx};
 use crate::knowledge::Knowledge;
@@ -19,6 +19,12 @@ use crate::types::{Type, TypeRef};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceDeclaration {
     pub definition: Def,
+    pub kind: SymbolKind,
+    pub range: Range<usize>,
+    pub header_range: Range<usize>,
+    pub name_range: Range<usize>,
+    pub body_range: Option<Range<usize>>,
+    pub modifiers: SourceModifiers,
     pub owner: Option<Def>,
     pub annotations: Vec<SourceAnnotation>,
     pub member: Option<DeclaredMemberFacts>,
@@ -57,6 +63,7 @@ pub struct SourceAnnotation {
     pub use_site_target: Option<String>,
     pub arguments: Vec<AnnotationArgument>,
     pub range: Range<usize>,
+    pub name_range: Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +81,10 @@ pub enum AnnotationValue {
         content_range: Range<usize>,
     },
     Boolean(bool),
+    Integer { value: i64, ty: AnnotationIntegerType },
+    Enum { ty: TypeRef, name: String },
+    Annotation(Box<SourceAnnotation>),
+    MappedString { value: String, segments: Vec<StringSourceSegment> },
     Array(Vec<AnnotationArgument>),
 }
 
@@ -86,7 +97,8 @@ pub fn extract(
     text: &str,
     scope: &TypeScope,
 ) -> Vec<SourceDeclaration> {
-    extract_declarations(index, file, tree, text, scope, true)
+    let index = ScopedIndex::new(index, file);
+    extract_declarations(&index, file, tree, text, scope, true)
 }
 
 /// Declaration annotations may introduce members even with no framework provider registered.
@@ -146,7 +158,8 @@ fn extract_declarations(
                     && candidate.sym.package == symbol.package
             })
             .map(|entry| definition(file, &entry.sym));
-        let annotations = annotations(node, text, scope, java);
+        let ctx = FileCtx::new(symbol.package.clone(), Vec::new()).with_file(file);
+        let annotations = annotations(index, &ctx, node, text, scope, java);
         let jvm_property = (include_members && !java && symbol.kind == SymbolKind::Property)
             .then(|| kotlin_property_access(index, symbol, node, text, &annotations));
         let member = (include_members
@@ -166,8 +179,12 @@ fn extract_declarations(
                 jvm_property.as_ref(),
             )
         });
+        let (range, header_range, name_range, body_range) = declaration_ranges(node, symbol);
+        let modifiers = applied_modifiers(node, text, symbol, java, member.as_ref());
         result.push(SourceDeclaration {
             definition: definition(file, symbol),
+            kind: symbol.kind,
+            range, header_range, name_range, body_range, modifiers,
             owner,
             annotations,
             member,
@@ -193,7 +210,7 @@ fn container_name(symbol: &IndexedSymbol) -> String {
         .map_or_else(|| name.into(), |parent| format!("{parent}.{name}"))
 }
 
-fn declaration_node<'a>(tree: &'a Tree, symbol: &IndexedSymbol, java: bool) -> Option<Node<'a>> {
+pub(super) fn declaration_node<'a>(tree: &'a Tree, symbol: &IndexedSymbol, java: bool) -> Option<Node<'a>> {
     let mut node = tree
         .root_node()
         .descendant_for_byte_range(symbol.start_byte, symbol.end_byte)?;
@@ -496,161 +513,89 @@ pub fn kotlin_value_namespace(
     })
 }
 
-fn annotations(node: Node<'_>, text: &str, scope: &TypeScope, java: bool) -> Vec<SourceAnnotation> {
-    let Some(modifiers) = child_of_kind(node, "modifiers") else {
-        return Vec::new();
-    };
-    let mut cursor = modifiers.walk();
-    modifiers
-        .named_children(&mut cursor)
-        .filter_map(|node| {
-            if !matches!(node.kind(), "annotation" | "marker_annotation") {
-                return None;
-            }
-            let invocation = child_of_kind(node, "constructor_invocation").unwrap_or(node);
-            let name = if java {
-                node.child_by_field_name("name")
-            } else {
-                child_of_kind(invocation, "user_type")
-            }?;
-            let name_text = node_text(name, text);
-            // Type arguments and malformed annotation names are not type identities.
-            if !name_text.split('.').all(|part| {
-                !part.is_empty()
-                    && part
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-            }) {
-                return None;
-            }
-            let arguments = node
-                .child_by_field_name("arguments")
-                .or_else(|| child_of_kind(invocation, "value_arguments"));
-            let arguments = arguments
-                .map(|args| {
-                    let mut cursor = args.walk();
-                    args.named_children(&mut cursor)
-                        .map(|arg| annotation_argument(arg, text, scope, java))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(SourceAnnotation {
-                ty: scope.type_ref(name_text, false, Vec::new()),
-                use_site_target: child_of_kind(node, "use_site_target")
-                    .map(|n| node_text(n, text).trim_end_matches(':').into()),
-                arguments,
-                range: node.byte_range(),
-            })
-        })
-        .collect()
+fn annotations(index: &dyn InferenceIndex, ctx: &FileCtx, node: Node<'_>, text: &str,
+    scope: &TypeScope, java: bool) -> Vec<SourceAnnotation> {
+    let Some(modifiers) = child_of_kind(node, "modifiers") else {return Vec::new();};
+    modifiers.named_children(&mut modifiers.walk())
+        .filter(|node|matches!(node.kind(),"annotation"|"marker_annotation"))
+        .filter_map(|node| {let mut remaining=MAX_SOURCE_ANNOTATION_NODES;
+            source_annotation(index,ctx,node,text,scope,java,false,0,&mut remaining)}).collect()
 }
 
-fn annotation_argument(
-    node: Node<'_>,
-    text: &str,
-    scope: &TypeScope,
-    java: bool,
-) -> AnnotationArgument {
-    let (name, value) = if node.kind() == "element_value_pair" {
-        (
-            node.child_by_field_name("key")
-                .map(|n| node_text(n, text).into()),
-            node.child_by_field_name("value"),
-        )
-    } else if node.kind() == "value_argument" {
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        if children.len() == 2 && node_text(node, text).contains('=') {
-            (
-                Some(node_text(children[0], text).into()),
-                children.last().copied(),
-            )
-        } else {
-            (None, children.first().copied())
-        }
-    } else {
-        (None, Some(node))
-    };
-    let Some(value) = value else {
-        return AnnotationArgument {
-            name,
-            range: node.byte_range(),
-            value: unsupported(),
-        };
-    };
-    AnnotationArgument {
-        name,
-        range: value.byte_range(),
-        value: annotation_value(value, text, scope, java),
+fn source_annotation(index:&dyn InferenceIndex,ctx:&FileCtx,node:Node<'_>,text:&str,
+    scope:&TypeScope,java:bool,constructor:bool,depth:usize,remaining:&mut usize)->Option<SourceAnnotation> {
+    if depth>=MAX_SOURCE_ANNOTATION_DEPTH || *remaining==0 || node.byte_range().len()>MAX_SOURCE_ANNOTATION_BYTES
+        || node.has_error() || node.is_missing() {return None;}
+    *remaining-=1;
+    let invocation=child_of_kind(node,"constructor_invocation").unwrap_or(node);
+    let name=annotation_name_node(node,java)?;
+    let name_text=node_text(name,text);
+    if !name_text.split('.').all(|part|!part.is_empty()
+        && part.chars().all(|c|c.is_alphanumeric()||c=='_'||c=='$')) {return None;}
+    let ty=scope.type_ref(name_text,false,Vec::new());
+    if constructor && !java && !resolved_type_entry(index,&ty,ctx).is_some_and(|entry|entry.sym.is_annotation) {
+        return None;
     }
+    let arguments=node.child_by_field_name("arguments")
+        .or_else(||child_of_kind(invocation,"value_arguments"))
+        .or_else(||child_of_kind(invocation,"call_suffix").and_then(|suffix|child_of_kind(suffix,"value_arguments")));
+    if arguments.is_some_and(|args|args.named_child_count()>*remaining) {return None;}
+    let arguments=arguments.map(|args|args.named_children(&mut args.walk())
+        .filter(|n|!n.is_extra()).map(|arg|annotation_argument(index,ctx,arg,text,scope,java,depth+1,remaining)).collect())
+        .unwrap_or_default();
+    if *remaining==0 {return None;}
+    Some(SourceAnnotation {ty,use_site_target:child_of_kind(node,"use_site_target")
+        .map(|n|node_text(n,text).trim_end_matches(':').into()),arguments,
+        range:node.byte_range(),name_range:name.byte_range()})
 }
 
-fn annotation_value(
-    node: Node<'_>,
-    text: &str,
-    scope: &TypeScope,
-    java: bool,
-) -> Fact<AnnotationValue> {
-    if node.has_error() || node.is_missing() {
-        return unsupported();
+pub(super) fn annotation_name_node(node:Node<'_>,java:bool)->Option<Node<'_>> {
+    if java {node.child_by_field_name("name")}
+    else if node.kind()=="call_expression" {node.named_child(0)}
+    else {child_of_kind(child_of_kind(node,"constructor_invocation").unwrap_or(node),"user_type")}
+}
+
+fn annotation_argument(index:&dyn InferenceIndex,ctx:&FileCtx,node:Node<'_>,text:&str,
+    scope:&TypeScope,java:bool,depth:usize,remaining:&mut usize)->AnnotationArgument {
+    let (name,value)=if node.kind()=="element_value_pair" {
+        (node.child_by_field_name("key").map(|n|node_text(n,text).into()),node.child_by_field_name("value"))
+    } else if node.kind()=="value_argument" {
+        let children:Vec<_>=node.named_children(&mut node.walk()).filter(|n|!n.is_extra()).collect();
+        if children.len()==2 && node.children(&mut node.walk()).any(|child|child.kind()=="=") {
+            (Some(node_text(children[0],text).into()),children.last().copied())
+        } else {(None,children.first().copied())}
+    } else {(None,Some(node))};
+    let Some(value)=value else {return AnnotationArgument {name,range:node.byte_range(),value:unsupported()};};
+    AnnotationArgument {name,range:value.byte_range(),value:annotation_value(index,ctx,value,text,scope,java,depth,remaining)}
+}
+
+fn annotation_value(index:&dyn InferenceIndex,ctx:&FileCtx,node:Node<'_>,text:&str,
+    scope:&TypeScope,java:bool,depth:usize,remaining:&mut usize)->Fact<AnnotationValue> {
+    if depth>=MAX_SOURCE_ANNOTATION_DEPTH || *remaining==0 || node.has_error() || node.is_missing() {return unsupported();}
+    *remaining-=1;
+    let spelling=node_text(node,text);
+    if spelling=="true" || spelling=="false" {return Knowledge::Found(AnnotationValue::Boolean(spelling=="true"));}
+    if let Some(value)=decode_string_expression(node,text,java).or_else(||annotation_integer(node,text,java)) {
+        return Knowledge::Found(value);
     }
-    let spelling = node_text(node, text);
-    if spelling == "true" || spelling == "false" {
-        return Knowledge::Found(AnnotationValue::Boolean(spelling == "true"));
+    if matches!(node.kind(),"element_value_array_initializer"|"collection_literal") {
+        if node.named_child_count()>*remaining {return unsupported();}
+        return Knowledge::Found(AnnotationValue::Array(node.named_children(&mut node.walk())
+            .filter(|n|!n.is_extra()).map(|child|annotation_argument(index,ctx,child,text,scope,java,depth+1,remaining)).collect()));
     }
-    if node.kind() == "string_literal"
-        && spelling.len() >= 2
-        && !node.has_error()
-        && spelling.starts_with('"')
-        && spelling.ends_with('"')
-        && !spelling.starts_with("\"\"\"")
-    {
-        let value = &spelling[1..spelling.len() - 1];
-        // Escapes/interpolation need a source-to-value map before their subranges are editable.
-        let interpolation = !java && {
-            let mut cursor = node.walk();
-            let interpolated = node
-                .named_children(&mut cursor)
-                .any(|child| !matches!(child.kind(), "string_content"));
-            interpolated
-        };
-        if value.contains('\\') || interpolation {
-            return unsupported();
-        }
-        return Knowledge::Found(AnnotationValue::String {
-            value: value.into(),
-            content_range: node.start_byte() + 1..node.end_byte() - 1,
-        });
+    if java && matches!(node.kind(),"annotation"|"marker_annotation")
+        || !java && matches!(node.kind(),"call_expression"|"constructor_invocation") {
+        return source_annotation(index,ctx,node,text,scope,java,true,depth+1,remaining)
+            .map(|annotation|Knowledge::Found(AnnotationValue::Annotation(Box::new(annotation))))
+            .unwrap_or_else(unsupported);
     }
-    if matches!(
-        node.kind(),
-        "element_value_array_initializer" | "collection_literal"
-    ) {
-        let mut cursor = node.walk();
-        return Knowledge::Found(AnnotationValue::Array(
-            node.named_children(&mut cursor)
-                .map(|child| annotation_argument(child, text, scope, java))
-                .collect(),
-        ));
+    let class_name=if java && node.kind()=="class_literal" {spelling.strip_suffix(".class")}
+        else if !java && node.kind()=="navigation_expression" {spelling.strip_suffix("::class")} else {None};
+    if let Some(name)=class_name.filter(|name|name.split('.').all(|part|!part.is_empty()
+        && part.chars().all(|c|c.is_alphanumeric()||c=='_'))) {
+        return Knowledge::Found(AnnotationValue::Class(scope.type_ref(name,false,Vec::new())));
     }
-    let class_name = if java && node.kind() == "class_literal" {
-        spelling.strip_suffix(".class")
-    } else if !java && node.kind() == "navigation_expression" {
-        spelling.strip_suffix("::class")
-    } else {
-        None
-    };
-    if let Some(name) = class_name.filter(|name| {
-        name.split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_'))
-    }) {
-        return Knowledge::Found(AnnotationValue::Class(scope.type_ref(
-            name,
-            false,
-            Vec::new(),
-        )));
-    }
-    unsupported()
+    annotation_enum(index,node,text,scope,ctx).map(Knowledge::Found).unwrap_or_else(unsupported)
 }
 
 fn member_facts(
@@ -900,6 +845,7 @@ pub(super) fn reference_parse_count() -> usize {
 pub struct PreparedSourceReferences {
     pub(super) file: String,
     pub(super) text: std::sync::Arc<str>,
+    pub(super) tree: Tree,
     pub(super) ranges: std::collections::BTreeSet<(usize, usize)>,
 }
 
@@ -926,6 +872,7 @@ pub fn prepare_source_references(
     PreparedSourceReferences {
         file: file.into(),
         text,
+        tree: tree.clone(),
         ranges,
     }
 }
@@ -1139,4 +1086,230 @@ pub(crate) fn source_scalar_jvm_type(
 
 fn unsupported<T>() -> Fact<T> {
     Knowledge::Unknown(vec![IncompleteReason::UnsupportedSource])
+}
+
+pub(super) const MAX_SOURCE_ANNOTATION_DEPTH:usize=128;
+pub(super) const MAX_SOURCE_ANNOTATION_NODES:usize=4096;
+pub(super) const MAX_SOURCE_ANNOTATION_BYTES:usize=64*1024;
+const MAX_DECODED_STRING_SCALARS:usize=16_384;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceModifiers {
+    pub visibility: Fact<Visibility>,
+    pub is_static: Fact<bool>,
+    pub is_final: Fact<bool>,
+    pub is_abstract: Fact<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnotationIntegerType { Int, Long }
+
+/// Each segment is one decoded Unicode scalar (UTF-16 offsets), including a whole escape.
+/// A supplementary scalar's surrogate pair cannot be edited as two independent characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StringSourceSegment {
+    pub decoded: Range<usize>,
+    pub source: Range<usize>,
+}
+
+pub(super) fn declaration_ranges(node: Node<'_>, symbol: &IndexedSymbol)
+    -> (Range<usize>, Range<usize>, Range<usize>, Option<Range<usize>>)
+{
+    let body = node.children(&mut node.walk()).find(|child| matches!(child.kind(),
+        "block" | "function_body" | "class_body" | "interface_body" | "enum_body"
+        | "enum_class_body" | "annotation_type_body" | "constructor_body"))
+        .map(|body| body.byte_range());
+    (node.byte_range(), node.start_byte()..body.as_ref().map_or(node.end_byte(), |r|r.start),
+        symbol.start_byte..symbol.end_byte, body)
+}
+
+fn applied_modifiers(node: Node<'_>, text: &str, symbol: &IndexedSymbol, java: bool,
+    member: Option<&DeclaredMemberFacts>) -> SourceModifiers
+{
+    let mut words = Vec::new();
+    if let Some(modifiers) = child_of_kind(node, "modifiers") {
+        let mut pending: Vec<_> = modifiers.children(&mut modifiers.walk()).collect();
+        while let Some(child) = pending.pop() {
+            if matches!(child.kind(), "annotation" | "marker_annotation") { continue; }
+            if child.child_count() == 0 { words.push(node_text(child, text)); }
+            else { pending.extend(child.children(&mut child.walk())); }
+        }
+    }
+    let clean = !child_of_kind(node,"modifiers").is_some_and(|mods|mods.has_error());
+    let has = |word| words.contains(&word);
+    let interface = node.parent().is_some_and(|body|body.kind()=="interface_body"
+        || body.kind()=="annotation_type_body");
+    let visibility = if !clean || has("internal") { unsupported() }
+        else if let Some(member) = member.filter(|member|member.visibility.is_found()) { member.visibility.clone() }
+        else if let Some(value) = symbol.source_member.visibility() { Knowledge::Found(value) }
+        else { Knowledge::Found(if has("private") {Visibility::Private}
+            else if has("protected") {Visibility::Protected}
+            else if has("public") || !java || interface {Visibility::Public} else {Visibility::Package}) };
+    let is_static = if !clean { unsupported() }
+        else if let Some(member) = member.filter(|member|member.dispatch.is_found()) {
+            member.dispatch.clone().map_found(|dispatch|dispatch==Dispatch::Static)
+        } else if java && symbol.kind.is_type_like() && symbol.container.is_some() {
+            if has("static") {Knowledge::Found(true)} else {symbol.source_member.dispatch()
+                .map(|dispatch|Knowledge::Found(dispatch==Dispatch::Static)).unwrap_or_else(unsupported)}
+        } else if java { Knowledge::Found(has("static") || interface && symbol.kind==SymbolKind::Property) }
+        else if symbol.kind==SymbolKind::Function && !symbol.source_member.jvm_restricted() {
+            symbol.source_member.dispatch().map(|dispatch|Knowledge::Found(dispatch==Dispatch::Static)).unwrap_or_else(unsupported)
+        } else { unsupported() };
+    let is_final = if !clean { unsupported() }
+        else if has("final") || java && interface && symbol.kind==SymbolKind::Property { Knowledge::Found(true) }
+        else if has("open") || has("abstract") || symbol.kind==SymbolKind::Interface { Knowledge::Found(false) }
+        else if java && symbol.kind!=SymbolKind::EnumClass && node.kind()!="record_declaration" { Knowledge::Found(false) }
+        // shortcut: implicit Kotlin finality and compiler projections require a lowering witness.
+        else { unsupported() };
+    let is_abstract = if !clean { unsupported() }
+        else if has("abstract") || symbol.kind==SymbolKind::Interface { Knowledge::Found(true) }
+        else if let Some(implementation)=symbol.source_member.implementation() {
+            Knowledge::Found(implementation==crate::symbol::MemberImplementation::Abstract)
+        } else if java && symbol.kind!=SymbolKind::EnumClass { Knowledge::Found(false) } else { unsupported() };
+    SourceModifiers {visibility,is_static,is_final,is_abstract}
+}
+
+/// Shared by extraction and the source acceptance boundary; no client-supplied map is trusted.
+pub(super) fn decode_string_expression(node: Node<'_>, text: &str, java: bool) -> Option<AnnotationValue> {
+    if node.byte_range().len()>MAX_SOURCE_ANNOTATION_BYTES {return None;}
+    let spelling=node_text(node,text);
+    if node.kind()=="string_literal" && !node.has_error() && !node.is_missing() && spelling.len()>=2
+        && spelling.starts_with('"') && spelling.ends_with('"') && !spelling.starts_with("\"\"\"")
+        && !spelling.contains('\\') && !spelling[1..spelling.len()-1].contains(['"','\r','\n'])
+        && (java || !node.named_children(&mut node.walk()).any(|child|child.kind()=="interpolation")) {
+        return Some(AnnotationValue::String {value:spelling[1..spelling.len()-1].into(),
+            content_range:node.start_byte()+1..node.end_byte()-1});
+    }
+    fn append(node: Node<'_>, text: &str, java: bool, value: &mut String,
+        segments: &mut Vec<StringSourceSegment>, decoded: &mut usize, depth: usize,remaining:&mut usize) -> Option<()> {
+        if depth>MAX_SOURCE_ANNOTATION_DEPTH || *remaining==0 || node.has_error() || node.is_missing() { return None; }
+        *remaining-=1;
+        if matches!(node.kind(),"binary_expression"|"additive_expression") {
+            let children: Vec<_>=node.named_children(&mut node.walk()).filter(|n|!n.is_extra()).collect();
+            if children.len()!=2 || !node.children(&mut node.walk()).any(|n|n.kind()=="+") {return None;}
+            append(children[0],text,java,value,segments,decoded,depth+1,remaining)?;
+            return append(children[1],text,java,value,segments,decoded,depth+1,remaining);
+        }
+        if node.kind()=="parenthesized_expression" {
+            let children: Vec<_>=node.named_children(&mut node.walk()).filter(|n|!n.is_extra()).collect();
+            if children.len()!=1 {return None;}
+            return append(children[0],text,java,value,segments,decoded,depth+1,remaining);
+        }
+        let spelling=node_text(node,text);
+        if node.kind()!="string_literal" || !spelling.starts_with('"') || !spelling.ends_with('"')
+            || spelling.starts_with("\"\"\"") || spelling.len()<2 {return None;}
+        if !java && node.named_children(&mut node.walk()).any(|child|child.kind()=="interpolation") {return None;}
+        let end=node.end_byte()-1;
+        let mut position=node.start_byte()+1;
+        while position<end {
+            if segments.len()>=MAX_DECODED_STRING_SCALARS {return None;}
+            let start=position;
+            let mut ch=text.get(position..end)?.chars().next()?;
+            position+=ch.len_utf8();
+            if ch=='\\' {
+                let escaped=text.get(position..end)?.chars().next()?;
+                position+=escaped.len_utf8();
+                ch=match escaped {
+                    'b'=>'\u{8}', 't'=>'\t','n'=>'\n','r'=>'\r','\''=>'\'','"'=>'"','\\'=>'\\',
+                    '$' if !java=>'$', 'f' if java=>'\u{c}', 's' if java=>' ',
+                    'u'=> {
+                        if java { while text.get(position..end)?.starts_with('u') {position+=1;} }
+                        let unit=u16::from_str_radix(text.get(position..position.checked_add(4)?)?,16).ok()?;
+                        position+=4;
+                        if position>end {return None;}
+                        if (0xd800..=0xdbff).contains(&unit) {
+                            if !text.get(position..end)?.starts_with("\\u") {return None;}
+                            position+=2;
+                            if java {while text.get(position..end)?.starts_with('u') {position+=1;}}
+                            let low=u16::from_str_radix(text.get(position..position.checked_add(4)?)?,16).ok()?;
+                            position+=4;
+                            if position>end || !(0xdc00..=0xdfff).contains(&low) {return None;}
+                            char::from_u32(0x10000+((u32::from(unit)-0xd800)<<10)+(u32::from(low)-0xdc00))?
+                        } else {
+                            let scalar=char::from_u32(u32::from(unit))?;
+                            // Java Unicode escapes run before tokenization; these change its token stream.
+                            if java && matches!(scalar,'"'|'\\'|'\n'|'\r') {return None;}
+                            scalar
+                        }
+                    },
+                    '0'..='7' if java=> {
+                        let mut octal=escaped.to_digit(8)?;
+                        for _ in 1..if escaped<='3' {3} else {2} {
+                            let Some(next)=text.get(position..end)?.chars().next().and_then(|n|n.to_digit(8)) else {break;};
+                            octal=octal*8+next;position+=1;
+                        }
+                        char::from_u32(octal)?
+                    },
+                    _=>return None,
+                };
+            } else if matches!(ch,'"'|'\r'|'\n') {
+                return None;
+            }
+            let next=decoded.checked_add(ch.len_utf16())?;
+            segments.push(StringSourceSegment {decoded:*decoded..next,source:start..position});
+            value.push(ch);*decoded=next;
+        }
+        Some(())
+    }
+    let mut value=String::new();let mut segments=Vec::new();let mut decoded=0;
+    let mut remaining=MAX_SOURCE_ANNOTATION_NODES;
+    append(node,text,java,&mut value,&mut segments,&mut decoded,0,&mut remaining)?;
+    Some(AnnotationValue::MappedString {value,segments})
+}
+
+fn annotation_integer(node:Node<'_>,text:&str,java:bool)->Option<AnnotationValue> {
+    let mut literal=node;let mut negative=false;
+    if matches!(node.kind(),"unary_expression"|"prefix_expression") {
+        let children:Vec<_>=node.named_children(&mut node.walk()).filter(|n|!n.is_extra()).collect();
+        if children.len()!=1 {return None;}
+        let operator=text.get(node.start_byte()..children[0].start_byte())?.trim();
+        if !matches!(operator,"-"|"+") {return None;} negative=operator=="-";literal=children[0];
+    }
+    if !matches!(literal.kind(),"number_literal"|"integer_literal"|"long_literal"|"decimal_integer_literal"
+        |"hex_integer_literal"|"octal_integer_literal"|"binary_integer_literal") {return None;}
+    let spelling=node_text(literal,text).replace('_',"");
+    let long=spelling.ends_with('L') || java && spelling.ends_with('l');
+    let digits=if long {&spelling[..spelling.len()-1]} else {&spelling};
+    let (radix,digits)=if let Some(rest)=digits.strip_prefix("0x").or_else(||digits.strip_prefix("0X")) {(16,rest)}
+        else if let Some(rest)=digits.strip_prefix("0b").or_else(||digits.strip_prefix("0B")) {(2,rest)}
+        else if java && digits.len()>1 && digits.starts_with('0') {(8,&digits[1..])} else {(10,digits)};
+    let magnitude=i128::from_str_radix(digits,radix).ok()?;
+    let ty=if long || !java && (magnitude>i128::from(i32::MAX)+i128::from(negative)) {
+        AnnotationIntegerType::Long
+    } else {AnnotationIntegerType::Int};
+    let bits=if ty==AnnotationIntegerType::Long {64} else {32};
+    let mut value=if java && radix!=10 {
+        if magnitude >= 1i128<<bits {return None;}
+        if magnitude>=1i128<<(bits-1) {magnitude-(1i128<<bits)} else {magnitude}
+    } else {magnitude};
+    if negative { value=if java && radix!=10 && value==-(1i128<<(bits-1)) {value} else {-value}; }
+    if value < -(1i128<<(bits-1)) || value >= 1i128<<(bits-1) {return None;}
+    Some(AnnotationValue::Integer {value:i64::try_from(value).ok()?,ty})
+}
+
+fn resolved_type_entry<'a>(index:&'a dyn InferenceIndex,ty:&TypeRef,ctx:&FileCtx)->Option<&'a crate::index::Entry> {
+    let Type::Class {name,package:Some(package),container,..}=infer::declared_type(index,ty,ctx) else {return None;};
+    let candidates:Vec<_>=index.lookup_type(&name).into_iter().filter(|entry|
+        entry.sym.package==package && entry.sym.container==container).collect();
+    match candidates.as_slice() {[only]=>Some(*only),_=>None}
+}
+
+fn annotation_enum(index:&dyn InferenceIndex,node:Node<'_>,text:&str,scope:&TypeScope,ctx:&FileCtx)->Option<AnnotationValue> {
+    if !matches!(node.kind(),"field_access"|"navigation_expression"|"identifier"|"simple_identifier") {return None;}
+    let spelling=node_text(node,text);
+    let (owner,name)=spelling.rsplit_once('.').map_or((None,spelling),|(owner,name)|(Some(owner),name));
+    if !name.chars().all(|c|c.is_alphanumeric()||c=='_'||c=='$') || name.is_empty() {return None;}
+    let (ty,entry_name)=if let Some(owner)=owner {(scope.type_ref(owner,false,Vec::new()),name.to_string())}
+        else {
+            let imported=scope.type_ref(name,false,Vec::new());
+            (scope.type_ref(imported.qualification.as_deref()?,false,Vec::new()),imported.name)
+        };
+    let owner=resolved_type_entry(index,&ty,ctx)?;
+    if owner.sym.kind!=SymbolKind::EnumClass {return None;}
+    let owner_name=container_name(&owner.sym);
+    let entries:Vec<_>=index.members_of(&owner_name).iter().filter(|entry|entry.sym.name==entry_name
+        && entry.sym.kind==SymbolKind::EnumEntry && entry.sym.package==owner.sym.package
+        && entry.sym.container.as_deref()==Some(owner_name.as_str())).collect();
+    if entries.len()!=1 {return None;}
+    Some(AnnotationValue::Enum {ty,name:entry_name})
 }

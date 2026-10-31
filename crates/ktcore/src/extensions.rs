@@ -50,6 +50,7 @@ pub struct SourceHandle {
     file: String,
     generation: u64,
     scope: ProjectScope,
+    owner_scope: Option<ProjectScope>,
 }
 
 impl SourceHandle {
@@ -692,6 +693,9 @@ struct ReadSet {
     compiled: BTreeMap<String, u64>,
     missing_sources: BTreeSet<String>,
     source_inventories: BTreeMap<ProjectScope, u64>,
+    authorized_source_scopes: BTreeMap<ProjectScope, BTreeSet<String>>,
+    source_modules:BTreeMap<String,u64>,
+    missing_inventory_sources: BTreeSet<String>,
     host_inputs: Vec<Arc<dyn HostInputGuard>>,
 }
 
@@ -722,6 +726,7 @@ pub struct ExtensionStore {
     model_generation: u64,
     namespace_generation: u64,
     source_inventory_generations: BTreeMap<ProjectScope, u64>,
+    source_module_generations:BTreeMap<String,u64>,
     namespace_coverage: Fact<()>,
     publication_revision: u64,
     sources: BTreeMap<String, SourceFacts>,
@@ -739,6 +744,7 @@ impl Default for ExtensionStore {
             model_generation: 0,
             namespace_generation: 0,
             source_inventory_generations: BTreeMap::new(),
+            source_module_generations:BTreeMap::new(),
             namespace_coverage: unknown(IncompleteReason::IncompleteScope),
             publication_revision: 0,
             sources: BTreeMap::new(),
@@ -1040,6 +1046,16 @@ impl ExtensionStore {
         prepared: Option<source::PreparedSourceReferences>,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
+        let java = file.ends_with(".java");
+        let tree = if declarations.is_empty() { None } else if let Some(prepared) = &prepared {
+            Some(prepared.tree.clone())
+        } else if java {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_java::LANGUAGE.into()).map_err(|_| ContractError::InvalidRange)?;
+            parser.parse(text.as_ref(), None)
+        } else {
+            Some(crate::parser::KotlinParser::new().parse(&text))
+        };
         let mut seen = BTreeSet::new();
         for declaration in &declarations {
             if declaration.definition.file != file {
@@ -1050,6 +1066,14 @@ impl ExtensionStore {
                 .find(|entry| definition(entry) == declaration.definition)
                 .ok_or(ContractError::NotIndexedDeclaration)?;
             validate_entry(&text, entry)?;
+            if declaration.kind != entry.sym.kind {return Err(ContractError::NotIndexedDeclaration);}
+            let node = tree.as_ref().and_then(|tree|source::declaration_node(tree, &entry.sym, java))
+                .ok_or(ContractError::NotIndexedDeclaration)?;
+            let ranges = source::declaration_ranges(node, &entry.sym);
+            if ranges != (declaration.range.clone(), declaration.header_range.clone(),
+                declaration.name_range.clone(), declaration.body_range.clone()) {
+                return Err(ContractError::InvalidRange);
+            }
             if !seen.insert((
                 declaration.definition.start_byte,
                 declaration.definition.end_byte,
@@ -1068,6 +1092,11 @@ impl ExtensionStore {
                 if entry.sym.container.as_deref() != Some(owner_name.as_str()) {
                     return Err(ContractError::NotIndexedDeclaration);
                 }
+                let owner_node = tree.as_ref().and_then(|tree|source::declaration_node(tree, &owner_entry.sym, java))
+                    .ok_or(ContractError::NotIndexedDeclaration)?;
+                if declaration.range.start < owner_node.start_byte() || declaration.range.end > owner_node.end_byte() {
+                    return Err(ContractError::InvalidRange);
+                }
             }
             if declaration
                 .member
@@ -1077,16 +1106,16 @@ impl ExtensionStore {
                 return Err(ContractError::NotIndexedDeclaration);
             }
             for annotation in &declaration.annotations {
-                validate_range(&text, &annotation.range)?;
-                for argument in &annotation.arguments {
-                    validate_argument(&text, argument, &annotation.range)?;
-                }
+                let mut remaining=source::MAX_SOURCE_ANNOTATION_NODES;
+                validate_annotation(&text, annotation, &declaration.header_range, tree.as_ref().unwrap(), java, 0, &mut remaining)?;
             }
         }
         let members = declarations
             .iter()
             .filter_map(|declaration| declaration.member.clone())
             .collect();
+        let prepared = prepared.or_else(||tree.as_ref().map(|tree|
+            source::prepare_source_references(index, file, text.clone(), tree)));
         self.replace_source_impl(index, file, text, coverage, members, prepared)?;
         self.sources.get_mut(file).unwrap().declarations = declarations;
         Ok(())
@@ -1168,6 +1197,7 @@ impl ExtensionStore {
         if membership_changed {
             for changed in previous_scope.iter().chain(scope.iter()) {
                 self.source_inventory_generations.insert(changed.clone(), self.next_generation);
+                self.source_module_generations.insert(changed.module.clone(),self.next_generation);
             }
         }
         self.sources.insert(
@@ -1202,6 +1232,7 @@ impl ExtensionStore {
         if let Some(source) = self.sources.remove(file) {
             if let Some(scope) = source.scope {
                 self.next_generation += 1;
+                self.source_module_generations.insert(scope.module.clone(),self.next_generation);
                 self.source_inventory_generations.insert(scope, self.next_generation);
             }
             if !source.types.is_empty() {
@@ -1330,6 +1361,9 @@ impl ExtensionStore {
                 compiled: BTreeMap::new(),
                 missing_sources: BTreeSet::new(),
                 source_inventories: BTreeMap::new(),
+                authorized_source_scopes: BTreeMap::new(),
+                source_modules:BTreeMap::new(),
+                missing_inventory_sources: BTreeSet::new(),
                 host_inputs: Vec::new(),
             },
             set: ContributionSet::default(),
@@ -1394,7 +1428,10 @@ impl ExtensionStore {
                 .namespace
                 .is_none_or(|generation| generation == self.namespace_generation)
             && pending.reads.source_inventories.iter().all(|(scope, generation)|
-                self.source_inventory_generations.get(scope) == Some(generation))
+                self.source_inventory_generations.get(scope).copied().unwrap_or(0) == *generation)
+            && pending.reads.missing_inventory_sources.iter().all(|file|!self.sources.contains_key(file))
+            && pending.reads.source_modules.iter().all(|(module,generation)|
+                self.source_module_generations.get(module).copied().unwrap_or(0)==*generation)
             && pending.reads.files.iter().all(|(file, generation)| {
                 self.sources
                     .get(file)
@@ -1488,8 +1525,42 @@ impl ReadSession<'_> {
             }
             self.reads.files.insert(file.clone(), source.generation);
             sources.push(SourceHandle { host:self.store.host, session:self.session,
-                file:file.clone(), generation:source.generation, scope:scope.clone() });
+                file:file.clone(), generation:source.generation, scope:scope.clone(), owner_scope:source.scope.clone() });
         }
+        Ok(sources)
+    }
+
+    /// Accepted source keys for trusted host membership selection; these are not filesystem authority.
+    pub fn source_inventory_candidates(&self)->impl Iterator<Item=&str> {self.store.sources.keys().map(String::as_str)}
+
+    /// Record the accepted namespace used by a host index-status observation.
+    pub fn observe_project_namespace(&mut self) {self.reads.namespace=Some(self.store.namespace_generation);}
+
+    /// Reuse checked normalized declarations for one issued snapshot, without changing the caller's compiler scope.
+    pub fn source_snapshot_declarations(&mut self,source:&SourceHandle)->Result<Vec<source::SourceDeclaration>,ContractError> {
+        self.source_snapshot(source)?;
+        Ok(self.store.sources[&source.file].declarations.clone())
+    }
+
+    /// The trusted host supplies the current model's selected membership after validating an opaque scope.
+    /// This authorizes snapshots only, and never broadens the semantic index or classpath.
+    pub fn source_inventory_for_scope(&mut self, scope: ProjectScope, selected: BTreeSet<String>)
+        -> Result<Vec<SourceHandle>, ContractError> {
+        let generation=self.store.source_inventory_generations.get(&scope).copied().unwrap_or(0);
+        self.reads.source_inventories.insert(scope.clone(),generation);
+        self.reads.source_modules.insert(scope.module.clone(),self.store.source_module_generations.get(&scope.module).copied().unwrap_or(0));
+        for file in &selected {
+            if !self.store.sources.contains_key(file) {self.reads.missing_inventory_sources.insert(file.clone());}
+        }
+        let mut sources=Vec::new();
+        for (file,source) in &self.store.sources {
+            if !selected.contains(file)
+                || !(file.ends_with(".java") || file.ends_with(".kt")) {continue;}
+            self.reads.files.insert(file.clone(),source.generation);
+            sources.push(SourceHandle {host:self.store.host,session:self.session,file:file.clone(),
+                generation:source.generation,scope:scope.clone(),owner_scope:source.scope.clone()});
+        }
+        self.reads.authorized_source_scopes.insert(scope, sources.iter().map(|source|source.file.clone()).collect());
         Ok(sources)
     }
 
@@ -1499,14 +1570,91 @@ impl ReadSession<'_> {
             return Err(ContractError::ForeignIdentity);
         }
         let current = self.store.sources.get(&source.file).ok_or(ContractError::MissingSource)?;
-        if current.generation != source.generation || current.scope.as_ref() != Some(&source.scope) {
+        if current.generation != source.generation || current.scope != source.owner_scope {
             return Err(ContractError::Stale);
         }
         let scope = self.index.origin_facts().and_then(|facts| facts.file_origin(self.owner))
-            .and_then(|origin| origin.project_scope.as_ref()).ok_or(ContractError::ForeignFile)?;
-        if scope != &source.scope { return Err(ContractError::ForeignFile); }
+            .and_then(|origin| origin.project_scope.as_ref());
+        let authorized=self.reads.authorized_source_scopes.get(&source.scope)
+            .is_some_and(|files|files.contains(&source.file));
+        if scope != Some(&source.scope) && !authorized { return Err(ContractError::ForeignFile); }
         self.reads.files.insert(source.file.clone(), source.generation);
         Ok(current.text.clone())
+    }
+
+    /// A source membership grants snapshots; its authoritative compiler owner grants semantics.
+    pub fn source_semantic_scope(&mut self,source:&SourceHandle)->Result<Fact<()>,ContractError> {
+        self.source_snapshot(source)?;
+        let current=&self.store.sources[&source.file];
+        let origin=self.index.origin_facts().and_then(|facts|facts.file_origin(&source.file));
+        if current.scope.is_none() || origin.is_none_or(|origin|
+            origin.representation!=SourceRepresentation::Source || origin.project_scope!=current.scope) {
+            return Ok(unknown(IncompleteReason::IncompleteScope));
+        }
+        let index=self.index.for_file(&source.file);
+        Ok(if index.scope_is_complete() {Knowledge::Found(())} else {unknown(IncompleteReason::IncompleteScope)})
+    }
+
+    /// Only these read-only entry points switch views; the evaluation's owner view is restored.
+    fn with_source_view<T>(&mut self,source:&SourceHandle,
+        read:impl FnOnce(&mut Self)->Result<Fact<T>,ContractError>)->Result<Fact<T>,ContractError> {
+        let scope=self.source_semantic_scope(source)?;
+        match scope {
+            Knowledge::Found(())=>{},
+            Knowledge::Unknown(reasons)=>return Ok(Knowledge::Unknown(reasons)),
+            Knowledge::DefinitelyAbsent=>return Ok(Knowledge::DefinitelyAbsent),
+        }
+        let store=self.store;
+        let (file,_)=store.sources.get_key_value(&source.file).ok_or(ContractError::MissingSource)?;
+        let index=self.index.for_file(file);
+        let previous_index=std::mem::replace(&mut self.index,index);
+        let previous_owner=std::mem::replace(&mut self.owner,file.as_str());
+        let result=read(self);
+        self.owner=previous_owner;
+        self.index=previous_index;
+        result
+    }
+
+    pub fn source_snapshot_declaration(&mut self,source:&SourceHandle,range:Range<usize>)
+        ->Result<Fact<DeclarationId>,ContractError> {
+        self.with_source_view(source,|read|read.declaration(range).map(Knowledge::Found))
+    }
+
+    pub fn resolve_source_type_ref(&mut self,source:&SourceHandle,ty:&crate::types::TypeRef)
+        ->Result<Fact<TypeId>,ContractError> {
+        self.with_source_view(source,|read|Ok(read.resolve_type_ref(ty)))
+    }
+
+    pub fn snapshot_declaration_type(&mut self,source:&SourceHandle,declaration:&DeclarationId)
+        ->Result<Fact<TypeId>,ContractError> {
+        if declaration.definition.file!=source.file {return Err(ContractError::ForeignIdentity);}
+        self.with_source_view(source,|read|read.declaration_type(declaration))
+    }
+
+    pub fn snapshot_declaration_member(&mut self,source:&SourceHandle,declaration:&DeclarationId)
+        ->Result<Fact<MemberCandidate>,ContractError> {
+        if declaration.definition.file!=source.file {return Err(ContractError::ForeignIdentity);}
+        self.with_source_view(source,|read|read.declaration_member(declaration))
+    }
+
+    pub fn snapshot_declaration_location(&mut self,source:&SourceHandle,declaration:&DeclarationId)
+        ->Result<Fact<SourceLocation>,ContractError> {
+        if declaration.definition.file!=source.file {return Err(ContractError::ForeignIdentity);}
+        self.with_source_view(source,|read| {
+            read.check_declaration(declaration)?;
+            read.source_location(declaration.definition())
+        })
+    }
+
+    pub fn snapshot_type_location(&mut self,source:&SourceHandle,ty:&TypeId)
+        ->Result<Fact<SourceLocation>,ContractError> {
+        self.with_source_view(source,|read|read.type_source_location(ty))
+    }
+
+    pub fn snapshot_member_location(&mut self,source:&SourceHandle,member:&MemberId)
+        ->Result<Fact<SourceLocation>,ContractError> {
+        if member.definition().file!=source.file {return Err(ContractError::ForeignIdentity);}
+        self.with_source_view(source,|read|read.member_source_location(member))
     }
 
     pub fn type_source_location(&mut self, target: &TypeId) -> Result<Fact<SourceLocation>, ContractError> {
@@ -2814,34 +2962,60 @@ fn validate_range(text: &str, range: &Range<usize>) -> Result<(), ContractError>
     }
 }
 
-fn validate_argument(
-    text: &str,
-    argument: &source::AnnotationArgument,
-    parent: &Range<usize>,
-) -> Result<(), ContractError> {
-    validate_range(text, &argument.range)?;
-    if argument.range.start < parent.start || argument.range.end > parent.end {
+fn validate_child_range(text:&str,range:&Range<usize>,parent:&Range<usize>)->Result<(),ContractError> {
+    validate_range(text,range)?;
+    if range.start<parent.start || range.end>parent.end {return Err(ContractError::InvalidRange);}
+    Ok(())
+}
+
+fn source_expression<'a>(tree:&'a tree_sitter::Tree,range:&Range<usize>)->Option<tree_sitter::Node<'a>> {
+    let mut node=tree.root_node().descendant_for_byte_range(range.start,range.end)?;
+    for _ in 0..source::MAX_SOURCE_ANNOTATION_NODES {
+        if node.byte_range()==*range {return Some(node);}
+        if node.start_byte()<range.start || node.end_byte()>range.end {return None;}
+        node=node.parent()?;
+    }
+    None
+}
+
+fn validate_annotation(text:&str,annotation:&source::SourceAnnotation,parent:&Range<usize>,
+    tree:&tree_sitter::Tree,java:bool,depth:usize,remaining:&mut usize)->Result<(),ContractError> {
+    if depth>source::MAX_SOURCE_ANNOTATION_DEPTH || *remaining==0
+        || annotation.range.end.saturating_sub(annotation.range.start)>source::MAX_SOURCE_ANNOTATION_BYTES {
         return Err(ContractError::InvalidRange);
     }
+    *remaining-=1;
+    validate_child_range(text,&annotation.range,parent)?;
+    validate_child_range(text,&annotation.name_range,&annotation.range)?;
+    let node=source_expression(tree,&annotation.range).ok_or(ContractError::InvalidRange)?;
+    if annotation.name_range.is_empty()
+        || source::annotation_name_node(node,java).map(|name|name.byte_range()).as_ref()!=Some(&annotation.name_range) {
+        return Err(ContractError::InvalidRange);
+    }
+    for argument in &annotation.arguments {
+        validate_argument(text,argument,&annotation.range,tree,java,depth+1,remaining)?;
+    }
+    Ok(())
+}
+
+fn validate_argument(text:&str,argument:&source::AnnotationArgument,parent:&Range<usize>,
+    tree:&tree_sitter::Tree,java:bool,depth:usize,remaining:&mut usize)->Result<(),ContractError> {
+    if depth>source::MAX_SOURCE_ANNOTATION_DEPTH || *remaining==0 {return Err(ContractError::InvalidRange);}
+    *remaining-=1;
+    validate_child_range(text,&argument.range,parent)?;
     match &argument.value {
-        Knowledge::Found(source::AnnotationValue::String {
-            value,
-            content_range,
-        }) => {
-            validate_range(text, content_range)?;
-            if content_range.start < argument.range.start
-                || content_range.end > argument.range.end
-                || text.get(content_range.clone()) != Some(value.as_str())
-            {
+        Knowledge::Found(value @ (source::AnnotationValue::String {..}|source::AnnotationValue::MappedString {..}))=> {
+            let node=source_expression(tree,&argument.range).ok_or(ContractError::InvalidRange)?;
+            if source::decode_string_expression(node,text,java).as_ref()!=Some(value) {
                 return Err(ContractError::InvalidRange);
             }
-        }
-        Knowledge::Found(source::AnnotationValue::Array(values)) => {
-            for value in values {
-                validate_argument(text, value, &argument.range)?;
-            }
-        }
-        _ => {}
+        },
+        Knowledge::Found(source::AnnotationValue::Annotation(annotation))=>
+            validate_annotation(text,annotation,&argument.range,tree,java,depth+1,remaining)?,
+        Knowledge::Found(source::AnnotationValue::Array(values))=> {
+            for value in values {validate_argument(text,value,&argument.range,tree,java,depth+1,remaining)?;}
+        },
+        _=>{},
     }
     Ok(())
 }
@@ -2954,8 +3128,8 @@ mod nominal_reference_tests {
         );
         assert_eq!(
             after_upsert - start,
-            1,
-            "one additional eligibility parse per source update"
+            0,
+            "declaration validation tree supplies eligibility without an additional parse"
         );
         update(
             "package perf\n@JvmInline value class Self(val value: Int)\n",
@@ -2963,7 +3137,7 @@ mod nominal_reference_tests {
             &mut store,
         );
         let after_edit = source::reference_parse_count();
-        assert_eq!(after_edit - after_upsert, 1);
+        assert_eq!(after_edit - after_upsert, 0, "edited declaration validation tree supplies fresh eligibility");
         let mut read = store.begin(&index, PROVIDER, FILE).unwrap();
         let Knowledge::Found(owner) = read.resolve_type("perf.Self") else {
             panic!("edited identity")

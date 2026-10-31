@@ -311,6 +311,10 @@ mod tests {
             let mut archive=zip::ZipWriter::new(fs::File::create(path).unwrap());
             archive.start_file("pluginfixture/Person.class",zip::write::SimpleFileOptions::default()).unwrap();
             archive.write_all(class).unwrap();
+            if path==&first {
+                archive.start_file("annotationfixture/CustomPoint.class",zip::write::SimpleFileOptions::default()).unwrap();
+                archive.write_all(include_bytes!("../../ktcore/tests/fixtures/classfile/annotationfixture/CustomPoint.class")).unwrap();
+            }
             if path==&second {
                 // Physical entry pagination is not an assertion that these bodies form valid ABIs.
                 for number in 0..6000 {

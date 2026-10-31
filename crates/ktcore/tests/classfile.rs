@@ -247,7 +247,7 @@ fn repeated_large_pool_references_exhaust_a_bounded_text_budget() {
 #[test]
 fn every_compiler_fixture_truncation_is_rejected() {
     for bytes in [
-        PERSON, MODEL, COMPANION, SERIALIZER, NOARG_OFF, NOARG_ON, UNICODE,
+        PERSON, MODEL, COMPANION, SERIALIZER, NOARG_OFF, NOARG_ON, UNICODE, ANNOTATED,
     ] {
         for cut in 0..bytes.len() {
             assert!(
@@ -352,11 +352,10 @@ fn selected_signature_requires_exact_length_and_utf8_pool_type() {
 }
 
 #[test]
-fn future_code_and_annotation_payloads_are_opaque() {
+fn future_and_code_payloads_remain_opaque() {
     for name in [
         b"FutureAttribute".as_slice(),
-        b"Code",
-        b"RuntimeVisibleAnnotations",
+        b"Code", // Declaration metadata never interprets executable bytecode.
     ] {
         let (bytes, _) = metadata_class(b"read", b"()V", Some((name, &[255; 32])));
         let class = decode("origin", &bytes).unwrap();
@@ -719,5 +718,173 @@ fn erased_field_descriptor_types_preserve_nominal_identity_and_array_rank() {
         "Lmissing//Item;",
     ] {
         assert!(field_type(descriptor).is_none(), "{descriptor}");
+    }
+}
+
+const ANNOTATED: &[u8] = include_bytes!("fixtures/classfile/annotationfixture/CustomPoint.class");
+
+#[test]
+fn javac_declaration_annotations_preserve_typed_values_and_order() {
+    use ktcore::classfile::{Annotation, AnnotationElement, AnnotationValue as V, BinaryAnnotation};
+    let annotation = |descriptor: &str, elements: Vec<(&str, V)>| Annotation {
+        descriptor: descriptor.into(),
+        elements: elements.into_iter().map(|(name, value)|AnnotationElement {name:name.into(),value}).collect(),
+    };
+    let class = decode("compile-only:annotation-fixture", ANNOTATED).unwrap();
+    assert_eq!(class.super_name.as_deref(), Some("annotationfixture/InjectionPoint"));
+    assert_eq!(class.signature.as_deref(), Some("<T:Ljava/lang/Number;>Lannotationfixture/InjectionPoint;"));
+    assert_eq!(class.annotations, vec![
+        BinaryAnnotation {runtime_visible:true,annotation:annotation("Lannotationfixture/AtCode;",vec![
+            ("value", V::String("CUSTOM".into())), ("namespace", V::String("example".into())),
+        ])},
+        BinaryAnnotation {runtime_visible:false,annotation:annotation("Lannotationfixture/Invisible;",vec![
+            ("value", V::String("classInvisible".into())),
+        ])},
+    ]);
+    assert_eq!(class.fields[0].annotations, vec![BinaryAnnotation {
+        runtime_visible:false,annotation:annotation("Lannotationfixture/Invisible;",vec![
+            ("value", V::String("fieldInvisible".into())),
+        ]),
+    }]);
+    let nested=annotation("Lannotationfixture/Nested;",vec![("value",V::String("nestedValue".into()))]);
+    assert_eq!(method(&class,"probe","()V").annotations,vec![
+        BinaryAnnotation {runtime_visible:true,annotation:annotation("Lannotationfixture/Payload;",vec![
+            ("b",V::Byte(-7)), ("c",V::Char(0xd800)), ("d",V::DoubleBits(0x8000000000000000)),
+            ("f",V::FloatBits(0x7f800000)), ("i",V::Int(-17)), ("j",V::Long(i64::MAX)),
+            ("s",V::Short(-123)), ("z",V::Boolean(true)), ("text",V::String("nul\0😃".into())),
+            ("utf16",V::StringUtf16(vec![0xd800,120,0xdc00,0xd83d,0xde03,0].into())),
+            ("choice",V::Enum {descriptor:"Lannotationfixture/Choice;".into(),name:"SECOND".into()}),
+            ("type",V::Class("[[I".into())), ("nested",V::Annotation(Box::new(nested))),
+            ("array",V::Array(vec![V::Int(1),V::Int(-2),V::Int(3)])),
+        ])},
+        BinaryAnnotation {runtime_visible:false,annotation:annotation("Lannotationfixture/Invisible;",vec![
+            ("value",V::String("methodInvisible".into())),
+        ])},
+    ]);
+    assert!(method(&class,"<init>","()V").annotations.is_empty());
+    assert!(class.annotations.iter().map(|value|value.annotation.heap_size()).sum::<usize>()>0);
+}
+
+// Extend the existing metadata fixture's constant pool; this constructs bytes without parsing them.
+fn annotation_class(payload: &[u8]) -> Vec<u8> {
+    let (mut bytes,start)=metadata_class(b"read",b"()V",Some((b"RuntimeVisibleAnnotations",payload)));
+    let mut pool=Vec::new();
+    for text in ["Lfixture/Mark;","value"] { // 8, 9
+        pool.push(1);pool.extend_from_slice(&(text.len() as u16).to_be_bytes());pool.extend_from_slice(text.as_bytes());
+    }
+    pool.push(3);pool.extend_from_slice(&(-7i32).to_be_bytes()); // 10
+    for text in ["literal","I","V","FIRST","bad"] { // 11..15
+        pool.push(1);pool.extend_from_slice(&(text.len() as u16).to_be_bytes());pool.extend_from_slice(text.as_bytes());
+    }
+    pool.push(3);pool.extend_from_slice(&65536i32.to_be_bytes()); // 16, outside byte/char/short ranges
+    pool.push(3);pool.extend_from_slice(&2i32.to_be_bytes()); // 17
+    pool.push(5);pool.extend_from_slice(&i64::MIN.to_be_bytes()); // 18, reserved 19
+    pool.push(4);pool.extend_from_slice(&0x7fc12345u32.to_be_bytes()); // 20, noncanonical NaN
+    pool.push(6);pool.extend_from_slice(&0x7ff8000000001234u64.to_be_bytes()); // 21, reserved 22
+    bytes[8..10].copy_from_slice(&23u16.to_be_bytes());
+    bytes.splice(start..start,pool);
+    bytes
+}
+
+fn annotation_payload(tag: u8, index: u16) -> Vec<u8> {
+    let mut result=vec![0,1,0,8,0,1,0,9,tag];
+    result.extend_from_slice(&index.to_be_bytes());result
+}
+
+#[test]
+fn annotation_strings_preserve_and_intern_unpaired_utf16_without_loss() {
+    use ktcore::classfile::AnnotationValue as V;
+    let mut payload=vec![0,1,0,8,0,1,0,9,b'[',0,2];
+    payload.extend_from_slice(&[b's',0,11,b's',0,11]);
+    for (raw,expected) in [
+        (b"\xed\xa0\x80".as_slice(),vec![0xd800]),
+        (b"\xed\xb0\x80".as_slice(),vec![0xdc00]),
+        (b"\xed\xa0\x80x\xed\xb0\x80\xed\xa0\xbd\xed\xb8\x83\xc0\x80".as_slice(),vec![0xd800,120,0xdc00,0xd83d,0xde03,0]),
+    ] {
+        let mut bytes=annotation_class(&payload);
+        let at=bytes.windows(b"literal".len()).position(|value|value==b"literal").unwrap();
+        bytes[at-2..at].copy_from_slice(&(raw.len() as u16).to_be_bytes());
+        bytes.splice(at..at+7,raw.iter().copied());
+        let facts=decode("origin",&bytes).unwrap();
+        let V::Array(values)=&facts.methods[0].annotations[0].annotation.elements[0].value else {panic!("array expected")};
+        let (V::StringUtf16(first),V::StringUtf16(second))=(&values[0],&values[1]) else {panic!("exact UTF16 expected")};
+        assert_eq!(first.as_ref(),expected.as_slice());
+        assert!(std::sync::Arc::ptr_eq(first,second),"pool references share one UTF16 allocation");
+    }
+}
+
+#[test]
+fn declaration_annotation_rejects_malformed_payloads_instead_of_dropping_values() {
+    for name in [b"RuntimeVisibleAnnotations".as_slice(),b"RuntimeInvisibleAnnotations"] {
+        let (bytes,_)=metadata_class(b"read",b"()V",Some((name,&[255;32])));
+        assert!(decode("origin",&bytes).is_err());
+    }
+    let valid=annotation_payload(b'I',10);
+    assert!(decode("origin",&annotation_class(&valid)).is_ok());
+    for cut in 0..valid.len() {
+        assert!(decode("origin",&annotation_class(&valid[..cut])).is_err(),"accepted cut {cut}");
+    }
+    let mut invalid=Vec::new();
+    let mut trailing=valid.clone();trailing.push(0);invalid.push(trailing);
+    for (offset,value) in [(1,255),(3,0),(3,2),(3,12),(3,15),(7,0),(7,2),(7,8),(8,255),(10,0),(10,2),(10,11),(10,255)] {
+        let mut changed=valid.clone();changed[offset]=value;invalid.push(changed);
+    }
+    // Duplicate element names, even when the first value is otherwise valid.
+    let mut duplicate=valid.clone();duplicate[5]=2;duplicate.extend_from_slice(&valid[6..]);invalid.push(duplicate);
+    for (tag,index) in [(b'B',16),(b'C',10),(b'C',16),(b'S',16),(b'Z',17),(b'J',10),(b'J',19),(b'F',10),(b'D',10),(b's',10),(b'c',15),(b'c',6)] {
+        invalid.push(annotation_payload(tag,index));
+    }
+    let mut bad_enum=annotation_payload(b'e',12);bad_enum.extend_from_slice(&14u16.to_be_bytes());invalid.push(bad_enum);
+    let mut bad_enum=annotation_payload(b'e',8);bad_enum.extend_from_slice(&2u16.to_be_bytes());invalid.push(bad_enum);
+    invalid.push(vec![0,1,0,8,0,1,0,9,b'@',0,12,0,0]);
+    invalid.push(vec![0,1,0,8,0,1,0,9,b'[',255,255]);
+    let mut deep=vec![0,1,0,8,0,1,0,9];
+    for _ in 0..65 {deep.extend_from_slice(&[b'[',0,1]);}
+    deep.extend_from_slice(&[b'I',0,10]);invalid.push(deep);
+    for (number,payload) in invalid.iter().enumerate() {
+        assert!(decode("origin",&annotation_class(payload)).is_err(),"accepted mutation {number}: {payload:?}");
+    }
+    // Both primitive and void class literals are legal; CONSTANT_Class is never the element value.
+    for index in [12,13] {assert!(decode("origin",&annotation_class(&annotation_payload(b'c',index))).is_ok());}
+    // Nested arrays/annotations are structural values, including empty arrays.
+    for value in [vec![b'[',0,0],vec![b'@',0,8,0,0]] {
+        let mut payload=vec![0,1,0,8,0,1,0,9];payload.extend(value);
+        assert!(decode("origin",&annotation_class(&payload)).is_ok());
+    }
+    let mut bytes=annotation_class(&valid);
+    let last_attribute=bytes.len()-valid.len()-8;
+    bytes[last_attribute-1]=2; // method attributes_count, leaving the trailing class attributes_count intact.
+    let copy=bytes[last_attribute..bytes.len()-2].to_vec();
+    bytes.splice(bytes.len()-2..bytes.len()-2,copy);
+    assert!(decode("origin",&bytes).unwrap_err().to_string().contains("duplicate annotation attribute"));
+}
+
+#[test]
+fn annotation_floating_nan_bits_and_signed_long_remain_exact() {
+    use ktcore::classfile::AnnotationValue as V;
+    for (tag,index,expected) in [
+        (b'J',18,V::Long(i64::MIN)),
+        (b'F',20,V::FloatBits(0x7fc12345)),
+        (b'D',21,V::DoubleBits(0x7ff8000000001234)),
+    ] {
+        let facts=decode("origin",&annotation_class(&annotation_payload(tag,index))).unwrap();
+        assert_eq!(facts.methods[0].annotations[0].annotation.elements[0].value,expected);
+    }
+}
+
+#[test]
+fn annotation_node_and_text_work_are_bounded_without_partial_results() {
+    // A small pool can be referenced repeatedly by legal annotation payloads.
+    let mut payload=vec![0,1,0,8,0,1,0,9,b'[',255,255];
+    for _ in 0..65535 {payload.extend_from_slice(&[b'I',0,10]);}
+    assert!(decode("origin",&annotation_class(&payload)).unwrap_err().to_string().contains("annotation node limit"));
+    let mut payload=vec![0,1,0,8,0,1,0,9,b'[',3,232];
+    for _ in 0..1000 {payload.extend_from_slice(&[b's',0,11]);}
+    for raw in [vec![b'x';4096],[b"\xed\xa0\x80".as_slice(),&vec![b'x';4093]].concat()] {
+        let mut bytes=annotation_class(&payload);
+        let at=bytes.windows(b"literal".len()).position(|value|value==b"literal").unwrap();
+        bytes[at-2..at].copy_from_slice(&(raw.len() as u16).to_be_bytes());
+        bytes.splice(at..at+7,raw);
+        assert!(decode("origin",&bytes).unwrap_err().to_string().contains("metadata text budget"));
     }
 }
