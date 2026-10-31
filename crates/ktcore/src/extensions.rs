@@ -266,6 +266,7 @@ pub struct TypeId {
     package: String,
     container: String,
     model_generation: u64,
+    semantic_index_generation: u64,
 }
 
 /// Exact binary input attached by the host to a current authored source owner. Providers cannot
@@ -699,6 +700,7 @@ pub trait HostInputGuard: std::fmt::Debug + Send + Sync {
 #[derive(Clone, Debug)]
 struct ReadSet {
     model: u64,
+    semantic_index: Option<u64>,
     namespace: Option<u64>,
     files: BTreeMap<String, u64>,
     compiled: BTreeMap<String, u64>,
@@ -735,6 +737,7 @@ pub struct ExtensionStore {
     host: u64,
     next_generation: u64,
     model_generation: u64,
+    semantic_index_generation: u64,
     namespace_generation: u64,
     source_inventory_generations: BTreeMap<ProjectScope, u64>,
     source_module_generations:BTreeMap<String,u64>,
@@ -753,6 +756,7 @@ impl Default for ExtensionStore {
             host: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             next_generation: 0,
             model_generation: 0,
+            semantic_index_generation: 0,
             namespace_generation: 0,
             source_inventory_generations: BTreeMap::new(),
             source_module_generations:BTreeMap::new(),
@@ -824,6 +828,7 @@ impl ExtensionStore {
         let source = self.sources.get(file).ok_or(ContractError::MissingSource)?;
         if source.generation != owner.declaration.generation
             || owner.model_generation != self.model_generation
+            || owner.semantic_index_generation != self.semantic_index_generation
         {
             return Err(ContractError::Stale);
         }
@@ -898,6 +903,7 @@ impl ExtensionStore {
         let source = self.sources.get(file).ok_or(ContractError::MissingSource)?;
         if source.generation != owner.declaration.generation
             || owner.model_generation != self.model_generation
+            || owner.semantic_index_generation != self.semantic_index_generation
         {
             return Err(ContractError::Stale);
         }
@@ -1023,7 +1029,7 @@ impl ExtensionStore {
         coverage: Fact<()>,
         declarations: Vec<source::SourceDeclaration>,
     ) -> Result<(), ContractError> {
-        self.replace_source_declarations_impl(index, file, text, coverage, declarations, None)
+        self.replace_source_declarations_impl(index, file, text, coverage, declarations, None, false)
     }
 
     /// A background host parser may supply the same source eligibility without parsing again
@@ -1044,7 +1050,16 @@ impl ExtensionStore {
             coverage,
             declarations,
             Some(prepared),
+            false,
         )
+    }
+
+    /// Recompute index-dependent facts without replacing the validated source input.
+    pub fn refresh_prepared_source_declarations(&mut self,index:&dyn InferenceIndex,
+        prepared:source::PreparedSourceReferences,coverage:Fact<()>,declarations:Vec<source::SourceDeclaration>)
+        ->Result<(),ContractError> {
+        let file=prepared.file.clone();let text=prepared.text.clone();
+        self.replace_source_declarations_impl(index,&file,text,coverage,declarations,Some(prepared),true)
     }
 
     fn replace_source_declarations_impl(
@@ -1055,6 +1070,7 @@ impl ExtensionStore {
         coverage: Fact<()>,
         declarations: Vec<source::SourceDeclaration>,
         prepared: Option<source::PreparedSourceReferences>,
+        refresh: bool,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let java = file.ends_with(".java");
@@ -1143,7 +1159,7 @@ impl ExtensionStore {
             .collect();
         let prepared = prepared.or_else(||tree.as_ref().map(|tree|
             source::prepare_source_references(index, file, text.clone(), tree)));
-        self.replace_source_impl(index, file, text, coverage, members, prepared)?;
+        self.replace_source_impl(index, file, text, coverage, members, prepared, refresh)?;
         self.sources.get_mut(file).unwrap().declarations = declarations;
         Ok(())
     }
@@ -1158,7 +1174,7 @@ impl ExtensionStore {
         coverage: Fact<()>,
         members: Vec<DeclaredMemberFacts>,
     ) -> Result<(), ContractError> {
-        self.replace_source_impl(index, file, text, coverage, members, None)
+        self.replace_source_impl(index, file, text, coverage, members, None, false)
     }
 
     fn replace_source_impl(
@@ -1169,6 +1185,7 @@ impl ExtensionStore {
         coverage: Fact<()>,
         members: Vec<DeclaredMemberFacts>,
         prepared: Option<source::PreparedSourceReferences>,
+        refresh: bool,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let mut types: Vec<_> = entries
@@ -1220,6 +1237,13 @@ impl ExtensionStore {
             .and_then(|origin| origin.project_scope.clone());
         let previous_scope = self.sources.get(file).and_then(|source| source.scope.clone());
         let membership_changed = !self.sources.contains_key(file) || previous_scope != scope;
+        let input_generation=if refresh {
+            let previous=self.sources.get(file).ok_or(ContractError::MissingSource)?;
+            if previous.text!=text || previous.scope!=scope {return Err(ContractError::Stale);}
+            Some(previous.generation)
+        } else {None};
+        // Reads opened after the index change also precede these newly normalized facts.
+        if refresh {self.semantic_index_generation+=1;}
         self.next_generation += 1;
         if membership_changed {
             for changed in previous_scope.iter().chain(scope.iter()) {
@@ -1230,7 +1254,7 @@ impl ExtensionStore {
         self.sources.insert(
             file.into(),
             SourceFacts {
-                generation: self.next_generation,
+                generation: input_generation.unwrap_or(self.next_generation),
                 scope,
                 text,
                 coverage,
@@ -1272,6 +1296,12 @@ impl ExtensionStore {
     /// An accepted classpath/project-model change invalidates scoped and negative reads.
     pub fn invalidate_model(&mut self) {
         self.model_generation += 1;
+        self.invalidate_semantic_index();
+    }
+
+    /// Semantic hydration retires name/member/compiled reads, independently of project metadata.
+    pub fn invalidate_semantic_index(&mut self) {
+        self.semantic_index_generation += 1;
         for source in self.sources.values_mut() {
             self.next_generation += 1;
             source.compiled_revision = self.next_generation;
@@ -1383,6 +1413,7 @@ impl ExtensionStore {
             session: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             reads: ReadSet {
                 model: self.model_generation,
+                semantic_index: None,
                 namespace: None,
                 files: BTreeMap::from([(owner.into(), owner_generation)]),
                 compiled: BTreeMap::new(),
@@ -1457,6 +1488,9 @@ impl ExtensionStore {
         }
         if pending.reads.model!=self.model_generation {
             return mismatch("model",Some(pending.reads.model),Some(self.model_generation));
+        }
+        if let Some(expected)=pending.reads.semantic_index {
+            if expected!=self.semantic_index_generation {return mismatch("semantic-index",Some(expected),Some(self.semantic_index_generation));}
         }
         if let Some(expected)=pending.reads.namespace {
             if expected!=self.namespace_generation {return mismatch("namespace",Some(expected),Some(self.namespace_generation));}
@@ -1587,8 +1621,11 @@ impl ReadSession<'_> {
     /// Record the accepted namespace used by a host index-status observation.
     pub fn observe_project_namespace(&mut self) {self.reads.namespace=Some(self.store.namespace_generation);}
 
+    fn observe_semantic_index(&mut self) {self.reads.semantic_index=Some(self.store.semantic_index_generation);}
+
     /// Reuse checked normalized declarations for one issued snapshot, without changing the caller's compiler scope.
     pub fn source_snapshot_declarations(&mut self,source:&SourceHandle)->Result<Vec<source::SourceDeclaration>,ContractError> {
+        self.observe_semantic_index();
         self.source_snapshot(source)?;
         Ok(self.store.sources[&source.file].declarations.clone())
     }
@@ -1635,6 +1672,7 @@ impl ReadSession<'_> {
 
     /// A source membership grants snapshots; its authoritative compiler owner grants semantics.
     pub fn source_semantic_scope(&mut self,source:&SourceHandle)->Result<Fact<()>,ContractError> {
+        self.observe_semantic_index();
         self.source_snapshot(source)?;
         let current=&self.store.sources[&source.file];
         let origin=self.index.origin_facts().and_then(|facts|facts.file_origin(&source.file));
@@ -1729,6 +1767,7 @@ impl ReadSession<'_> {
     }
 
     fn source_location(&mut self, target: &Def) -> Result<Fact<SourceLocation>, ContractError> {
+        self.observe_semantic_index();
         self.reads.namespace = Some(self.store.namespace_generation);
         if self.index.origin_facts().and_then(|facts|facts.file_origin(&target.file))
             .is_none_or(|origin|origin.representation != SourceRepresentation::Source) {
@@ -2025,8 +2064,29 @@ impl ReadSession<'_> {
         Ok(())
     }
 
-    pub fn declarations(&self) -> &[source::SourceDeclaration] {
+    pub fn declarations(&mut self) -> &[source::SourceDeclaration] {
+        self.observe_semantic_index();
         &self.store.sources[self.owner].declarations
+    }
+
+    /// The initial transport envelope carries authored headers, without normalized member facts.
+    pub fn declaration_headers(&self)->Vec<source::SourceDeclaration> {
+        fn authored_argument(argument:&mut source::AnnotationArgument) {
+            match &mut argument.value {
+                Knowledge::Found(source::AnnotationValue::Enum {..}|source::AnnotationValue::Annotation(_))=>
+                    argument.value=unknown(IncompleteReason::UnsupportedSource),
+                Knowledge::Found(source::AnnotationValue::Array(values))=>for value in values {authored_argument(value);},
+                _=>{},
+            }
+        }
+        self.store.sources[self.owner].declarations.iter().cloned().map(|mut declaration| {
+            declaration.member=None;declaration.jvm_property=None;
+            declaration.parameters=unknown(IncompleteReason::UnsupportedSource);
+            for annotation in &mut declaration.annotations {
+                for argument in &mut annotation.arguments {authored_argument(argument);}
+            }
+            declaration
+        }).collect()
     }
 
     pub fn source(&self) -> &str {
@@ -2054,6 +2114,7 @@ impl ReadSession<'_> {
         &mut self,
         declaration: &DeclarationId,
     ) -> Result<Fact<TypeId>, ContractError> {
+        self.observe_semantic_index();
         self.check_declaration(declaration)?;
         self.reads.namespace = Some(self.store.namespace_generation);
         let entry = self
@@ -2082,6 +2143,7 @@ impl ReadSession<'_> {
         &mut self,
         declaration: &DeclarationId,
     ) -> Result<Fact<MemberCandidate>, ContractError> {
+        self.observe_semantic_index();
         self.check_declaration(declaration)?;
         self.reads.namespace = Some(self.store.namespace_generation);
         if !self.index.scope_is_complete() {
@@ -2152,6 +2214,7 @@ impl ReadSession<'_> {
     }
 
     pub fn resolve_type(&mut self, qualified_name: &str) -> Fact<TypeId> {
+        self.observe_semantic_index();
         self.reads.namespace = Some(self.store.namespace_generation);
         let name = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
         let entries = self
@@ -2196,6 +2259,7 @@ impl ReadSession<'_> {
     }
 
     pub fn resolve_type_ref(&mut self, ty: &crate::types::TypeRef) -> Fact<TypeId> {
+        self.observe_semantic_index();
         self.reads.namespace = Some(self.store.namespace_generation);
         let package = self
             .index
@@ -2579,6 +2643,7 @@ impl ReadSession<'_> {
         &mut self,
         requirement: MemberRequirement,
     ) -> Result<RequirementId, ContractError> {
+        self.observe_semantic_index();
         self.reads.namespace = Some(self.store.namespace_generation);
         if let Some(authored) = &requirement.authored {
             self.check_declaration(authored)?;
@@ -2838,6 +2903,7 @@ impl ReadSession<'_> {
                 |container| format!("{container}.{}", unquote(&entry.sym.name)),
             ),
             model_generation: self.store.model_generation,
+            semantic_index_generation: self.store.semantic_index_generation,
         })
     }
 
@@ -2877,8 +2943,10 @@ impl ReadSession<'_> {
     }
 
     fn check_type(&mut self, target: &TypeId) -> Result<(), ContractError> {
+        self.observe_semantic_index();
         self.check_declaration(&target.declaration)?;
-        if target.model_generation != self.store.model_generation {
+        if target.model_generation != self.store.model_generation
+            || target.semantic_index_generation != self.store.semantic_index_generation {
             return Err(ContractError::Stale);
         }
         self.reads.namespace = Some(self.store.namespace_generation);
@@ -3119,7 +3187,7 @@ mod nominal_reference_tests {
         }
         store.replace_source_declarations(&index,FILE,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
         let before=source::reference_parse_count();
-        let read=store.begin_read(&index,"parameters",FILE).unwrap();
+        let mut read=store.begin_read(&index,"parameters",FILE).unwrap();
         for _ in 0..4 {assert!(matches!(&read.declarations()[position].parameters,Knowledge::Found(parameters) if parameters[0].name=="slot"));}
         let pending=read.finish();assert_eq!(source::reference_parse_count(),before);
         let edited=text.replace("slot: Ref<String>","renamed: Ref<String>");
@@ -3128,8 +3196,9 @@ mod nominal_reference_tests {
         let declarations=source::extract(&index,FILE,&tree,&edited,&scope);
         store.replace_source_declarations(&index,FILE,Arc::from(edited.as_str()),Knowledge::Found(()),declarations).unwrap();
         assert_eq!(store.validate_pending(&pending),Err(ContractError::Stale));
-        let read=store.begin_read(&index,"parameters",FILE).unwrap();
-        let Knowledge::Found(parameters)=&read.declarations()[position].parameters else {panic!("updated parameters");};
+        let mut read=store.begin_read(&index,"parameters",FILE).unwrap();
+        let declarations=read.declarations().to_vec();
+        let Knowledge::Found(parameters)=&declarations[position].parameters else {panic!("updated parameters");};
         assert_eq!(parameters[0].name,"renamed");
         assert_eq!(&read.source()[parameters[0].name_range.clone()],"renamed");
     }

@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-11-01 (Asia/Tokyo). **Acceptance through84; extension follow-ups85/86/88 and Resilience4j89 verified.**
+Updated 2026-11-01 (Asia/Tokyo). **Qualified editing through89; CEM index-invalidation fix92 under runtime verification.**
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -73,7 +73,7 @@ evaluation for the same instance/source/version. Both commands still failed in D
 (`cem-project-20261101-024118400-adb6cf5b` in the mc-dev log directory): the fresh
 command passed source inventory/snapshots, then became stale at resource-inventory
 prepayment. Original CEM assertions remain0; no further retry is added. The exact
-pending-read guard responsible is the next investigation, separately from the fixed
+pending-read guard responsible was isolated in D6 below, separately from the fixed
 module comparison. No failed run is counted as passed or explains historical86 Stale.
 Removing unused compiler source capture in the consumer did not resolve this: D5
 also becomes stale during resource-inventory paging, with original assertions0.
@@ -84,6 +84,21 @@ once; core contains no logging or filesystem access. Core extension61 and comman
 lifetime/negative2 checks pass (`integrated-host90/main-ready.json`). This is
 observability evidence, not a stale-condition fix or a passing CEM run. The89
 workspace result is retained; the entire suite and old corpus were not repeated.
+D6 with that diagnostic host identifies the first command guard precisely: model
+30->31 immediately after `mark_index_changed`, and model31->32 after a fresh
+accepted evaluation. The successful resource read precedes the index-change event;
+neither source edits nor a native input guard caused that first failure.
+Host92 separates semantic-index dependencies from the accepted project model.
+Index-only normalization revalidates the same text/scope and preserves authored
+source revisions; full semantic facts, resolved types and member owners retain
+index freshness. Old resolved types are rejected even in a new read session and
+at compiler-input admission. Captured project-input index observations stay fixed
+across continuation pages. Metadata/native/source/provider/model guards remain.
+The paired metadata/semantic regression and old-type/new-type regression pass:
+core extension62, nominal3 and host analysis-extension25 checks,90 total
+(`integrated-host92/main-ready.json`). The prior91 candidate is held/superseded.
+Actual CEM success on92 remains pending; the89 full-workspace receipt is not
+presented as a full suite on92. No corpus or performance replay was added.
 Hierarchy, generic argument rendering,
 primitive class-literal descriptors and extract-local are outside that follow-up.
 

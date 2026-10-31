@@ -1015,6 +1015,13 @@ semantic module identity and must not be compared with that path. Join a members
 `id` to `projectInputs.sourceSets[].id`, verify the selected project handle and source-set
 `name`, and keep membership separate from `owningSourceSet`. Do not parse opaque identities.
 
+Index hydration retires semantic type/member/declaration-fact reads and resolved type
+handles, including use in a later read session. Project/resource metadata reads retain
+their model, source-namespace and native-input guards independently of that index
+progress. A paged `projectInputs` result preserves the index observation captured with
+its records; it does not attest a future index state. Authored source revisions remain
+stable when only normalized semantic facts are refreshed for identical text and scope.
+
 Scoped source reads record source, selected-scope, same-module membership, missing-selected-file
 and model generations. Project model reads also observe the current overlay epoch and namespace.
 Resource inventories and absence retain the existing native leases/overlay epoch. Capture runs in

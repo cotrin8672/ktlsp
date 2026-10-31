@@ -227,9 +227,9 @@ impl AnalysisExtensions {
         if !self.is_empty() && !self.pending_index {
             self.mark_published();
             self.clear_compiled();
-            self.store.invalidate_model();
+            self.store.invalidate_semantic_index();
             if crate::trace::enabled() {
-                crate::trace::span("extension.model_invalidated","extension",std::time::Instant::now(),
+                crate::trace::span("extension.semantic_index_invalidated","extension",std::time::Instant::now(),
                     serde_json::json!({"reason":"index-changed"}));
             }
             self.pending_index = true;
@@ -239,7 +239,9 @@ impl AnalysisExtensions {
     pub fn flush_index_changed(&mut self, index: &dyn InferenceIndex) {
         if self.pending_index {
             self.pending_index = false;
-            self.normalize_all(index);
+            for key in self.inputs.keys().cloned().collect::<Vec<_>>() {
+                let _ = self.normalize_input(index,&key,true);
+            }
             self.evaluate(index);
         }
     }
@@ -306,6 +308,10 @@ impl AnalysisExtensions {
     }
 
     fn normalize(&mut self, index: &dyn InferenceIndex, key: &str) -> Result<(), String> {
+        self.normalize_input(index,key,false)
+    }
+
+    fn normalize_input(&mut self,index:&dyn InferenceIndex,key:&str,refresh:bool)->Result<(),String> {
         let Some(input) = self.inputs.get(key) else {
             return Ok(());
         };
@@ -319,9 +325,11 @@ impl AnalysisExtensions {
                 &input.tree,
             )
         });
-        let replaced = self
-            .store
-            .replace_prepared_source_declarations(index, prepared, coverage, facts);
+        let replaced = if refresh {
+            self.store.refresh_prepared_source_declarations(index,prepared,coverage,facts)
+        } else {
+            self.store.replace_prepared_source_declarations(index,prepared,coverage,facts)
+        };
         if let Err(error) = replaced {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
             self.store.remove_source(key);

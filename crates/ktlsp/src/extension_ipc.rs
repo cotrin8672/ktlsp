@@ -834,6 +834,10 @@ impl Evaluation {
         }
     }
 
+    pub(crate) fn set_project_index_observation(&mut self,state:Value) {
+        if self.project_input_records.is_none() {self.project_index=Some(state);}
+    }
+
     fn project_records(&mut self) -> Result<Option<Arc<Vec<Value>>>,String> {
         if let Some(records)=&self.project_input_records {
             if self.project_input_index!=self.project_index {return Err("stale project index observation".into());}
@@ -1082,7 +1086,7 @@ impl Evaluation {
         json!({"name":argument.name,"range":range(&argument.range),"value":value})
     }
     fn source_declarations(&mut self,read:&mut ReadSession<'_>,v2:bool)->Result<Vec<Value>,String> {
-        let declarations=read.declarations().to_vec();
+        let declarations=if v2 {read.declarations().to_vec()} else {read.declaration_headers()};
         self.encode_source_declarations(read,declarations,None,None,v2)
     }
     fn encode_source_declarations(&mut self,read:&mut ReadSession<'_>,declarations:Vec<ktcore::extensions::source::SourceDeclaration>,

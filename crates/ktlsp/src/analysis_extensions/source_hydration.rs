@@ -52,8 +52,8 @@ mod tests {
             "library-probe"
         }
         fn analyze(&self, read: &mut ReadSession<'_>) -> Result<(), ContractError> {
-            let Some(authored) = read
-                .declarations()
+            let declarations=read.declarations().to_vec();
+            let Some(authored) = declarations
                 .iter()
                 .find(|d| {
                     read.source()

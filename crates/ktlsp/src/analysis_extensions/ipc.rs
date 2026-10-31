@@ -360,6 +360,45 @@ mod tests {
     }
 
     #[test]
+    fn command_metadata_survives_index_hydration_but_semantic_reads_go_stale() {
+        let (mut index, mut host) = host();
+        host.register_ipc_commands(&index, "test.ipc", vec!["fixture-child".into()], vec!["fixture.echo".into()]).unwrap();
+        let model = Arc::new(ProjectSnapshot::new(crate::classpath::parse_dump(
+            "PROJECT\t:selected\t/project\nSOURCE\tcustom\t/ipc\nSCP\tcustom\t/library.jar\nEND\t:selected\n",
+        )));
+        let metadata = host.begin_ipc_command(&index, Some(&model), "test.ipc", "/ipc/Owner.kt", "fixture.echo".into(), vec![], json!({})).unwrap();
+        let semantic = host.begin_ipc_command(&index, Some(&model), "test.ipc", "/ipc/Owner.kt", "fixture.echo".into(), vec![], json!({})).unwrap();
+
+        // Simulate a negotiated metadata-capable child while preserving the command's actual pending read.
+        let mut evaluation = host.ipc_evaluations.remove(&metadata.evaluation).unwrap();
+        evaluation.project_operations = u32::MAX;
+        let pending = evaluation.pending.take().unwrap();
+        let mut read = host.store.resume(&index, "/ipc/Owner.kt", pending).unwrap();
+        let result = evaluation.batch(&mut read, "analysis/readFacts", json!({
+            "evaluation":metadata.evaluation.to_string(), "queries":[{"op":"projectContext"},{"op":"projectInputs"}]
+        })).unwrap();
+        assert_eq!(result["facts"][0]["scope"]["state"], "found");
+        assert!(!result["facts"][1]["records"].as_array().unwrap().is_empty());
+        evaluation.pending = Some(read.finish());
+        host.ipc_evaluations.insert(metadata.evaluation, evaluation);
+
+        let result = host.ipc_batch(&index, semantic.evaluation, "analysis/readFacts", json!({
+            "evaluation":semantic.evaluation.to_string(), "queries":[{"op":"resolveType","name":"ipc.Target"}]
+        })).unwrap();
+        assert_eq!(result["facts"][0]["state"], "found");
+        let text = "package library\nclass Hydrated";
+        let tree = KotlinParser::new().parse(text);
+        index.replace_file("/library/Hydrated.kt", ktcore::indexer::extract_symbols(&tree, text, "library"), Tier::Volatile);
+        host.mark_index_changed();
+        assert!(host.ipc_current(metadata.evaluation));
+        assert!(!host.ipc_current(semantic.evaluation));
+        host.flush_index_changed(&index);
+        assert!(host.ipc_current(metadata.evaluation));
+        assert_eq!(host.finish_ipc_command(metadata.evaluation, Ok(json!({"metadata":"current"}))).unwrap(), json!({"metadata":"current"}));
+        assert_eq!(host.finish_ipc_command(semantic.evaluation, Ok(json!({"semantic":"obsolete"}))).unwrap_err(), "Stale");
+    }
+
+    #[test]
     fn command_negative_reads_source_model_disable_and_restart_reject_obsolete_results() {
         for change in ["source","model","disable","restart","negative"] {
             let (index,mut host)=host();
@@ -657,7 +696,7 @@ impl AnalysisExtensions {
     }
 
     pub(crate) fn set_ipc_project_index(&mut self,id:u64,state:Value) {
-        if let Some(evaluation)=self.ipc_evaluations.get_mut(&id) {evaluation.project_index=Some(state);}
+        if let Some(evaluation)=self.ipc_evaluations.get_mut(&id) {evaluation.set_project_index_observation(state);}
     }
 
     pub(crate) fn ipc_resource_owner(&self,id:u64)->Option<&str> {

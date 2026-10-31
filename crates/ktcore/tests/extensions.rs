@@ -3283,6 +3283,24 @@ impl HostInputGuard for TestHostInput {
 }
 
 #[test]
+fn resolved_type_authority_expires_across_semantic_index_change() {
+    let (index, mut store) = fixture();
+    let mut first = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(old_type) = first.resolve_type("oracle.Target") else { panic!("authored target"); };
+    assert!(first.declared_members(&old_type).is_ok());
+    let pending = first.finish();
+    store.invalidate_semantic_index();
+    assert_eq!(store.validate_pending(&pending), Err(ContractError::Stale));
+
+    let mut fresh = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    assert!(matches!(fresh.declared_members(&old_type), Err(ContractError::Stale)));
+    assert!(matches!(fresh.type_jvm(&old_type), Err(ContractError::Stale)));
+    let Knowledge::Found(new_type) = fresh.resolve_type("oracle.Target") else { panic!("fresh authored target"); };
+    assert!(fresh.declared_members(&new_type).is_ok());
+    assert!(fresh.type_jvm(&new_type).is_ok());
+}
+
+#[test]
 fn pending_validation_reports_first_failure_in_one_guard_pass() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -3488,7 +3506,7 @@ class Mapped { @Probe("ti\u0063k" + "\uD83D\uDE00") fun probe() {} }"#;
             _=>unreachable!(),
         }
         assert!(store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),invalid).is_err(),"mutation {mutation}");
-        let read=store.begin(&index,"maps",file).unwrap();
+        let mut read=store.begin(&index,"maps",file).unwrap();
         assert_eq!(read.declarations(),valid.as_slice(),"bad publication must preserve accepted facts");
     }
 }
