@@ -43,7 +43,7 @@ pub type Fact<T> = Knowledge<T, IncompleteReason>;
 
 /// A host-issued current source snapshot, valid only in the issuing read session.
 /// Its display path is not filesystem authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceHandle {
     host: u64,
     session: u64,
@@ -246,7 +246,7 @@ pub struct TypeJvmFacts {
     pub jvm_abi_coverage: Fact<()>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeclarationId {
     host: u64,
     generation: u64,
@@ -678,6 +678,8 @@ struct SourceFacts {
     types: Vec<String>,
     reference_types: BTreeSet<(usize, usize)>,
     declarations: Vec<source::SourceDeclaration>,
+    annotation_sites: source::AnnotationSiteInventory,
+    annotation_sites_revision: u64,
     compiled_revision: u64,
     compiled: Option<(TypeId, Arc<crate::classfile::ClassFileFacts>)>,
     compiler_classes: Vec<(TypeId, CompilerClassInput)>,
@@ -703,6 +705,7 @@ struct ReadSet {
     semantic_index: Option<u64>,
     namespace: Option<u64>,
     files: BTreeMap<String, u64>,
+    annotation_sites: BTreeMap<String,u64>,
     compiled: BTreeMap<String, u64>,
     missing_sources: BTreeSet<String>,
     source_inventories: BTreeMap<ProjectScope, u64>,
@@ -1062,6 +1065,23 @@ impl ExtensionStore {
         self.replace_source_declarations_impl(index,&file,text,coverage,declarations,Some(prepared),true)
     }
 
+    /// Bind annotation sites to the same validated AST, text and source scope used for normalization.
+    pub fn cache_annotation_sites(&mut self,index:&dyn InferenceIndex,prepared:&source::PreparedSourceReferences,
+        scope:&crate::indexer::TypeScope)->Result<(),ContractError> {
+        let current=self.sources.get(&prepared.file).ok_or(ContractError::MissingSource)?;
+        if current.text!=prepared.text {return Err(ContractError::InvalidRange);}
+        let inventory=source::annotation_sites(index,&prepared.file,&prepared.tree,&prepared.text,scope,&current.declarations);
+        let changed=current.annotation_sites!=inventory;
+        if changed {
+            self.next_generation+=1;
+            let current=self.sources.get_mut(&prepared.file).unwrap();
+            current.annotation_sites=inventory;
+            current.annotation_sites_revision=self.next_generation;
+            self.remove_stale_sets();
+        }
+        Ok(())
+    }
+
     fn replace_source_declarations_impl(
         &mut self,
         index: &dyn InferenceIndex,
@@ -1262,6 +1282,8 @@ impl ExtensionStore {
                 types,
                 reference_types,
                 declarations: Vec::new(),
+                annotation_sites:source::AnnotationSiteInventory {sites:Vec::new(),coverage:unknown(IncompleteReason::UnsupportedSource)},
+                annotation_sites_revision:self.next_generation,
                 compiled_revision: self.next_generation,
                 compiled: None,
                 compiler_classes: Vec::new(),
@@ -1304,6 +1326,11 @@ impl ExtensionStore {
         self.semantic_index_generation += 1;
         for source in self.sources.values_mut() {
             self.next_generation += 1;
+            let annotation_sites=source::AnnotationSiteInventory {sites:Vec::new(),coverage:unknown(IncompleteReason::IncompleteScope)};
+            if source.annotation_sites!=annotation_sites {
+                source.annotation_sites=annotation_sites;
+                source.annotation_sites_revision=self.next_generation;
+            }
             source.compiled_revision = self.next_generation;
             source.compiled = None;
             source.compiler_classes.clear();
@@ -1416,6 +1443,7 @@ impl ExtensionStore {
                 semantic_index: None,
                 namespace: None,
                 files: BTreeMap::from([(owner.into(), owner_generation)]),
+                annotation_sites:BTreeMap::new(),
                 compiled: BTreeMap::new(),
                 missing_sources: BTreeSet::new(),
                 source_inventories: BTreeMap::new(),
@@ -1509,6 +1537,10 @@ impl ExtensionStore {
         for (file,expected) in &pending.reads.files {
             let current=self.sources.get(file).map(|source|source.generation);
             if current!=Some(*expected) {return mismatch("source-file",Some(*expected),current);}
+        }
+        for (file,expected) in &pending.reads.annotation_sites {
+            let current=self.sources.get(file).map(|source|source.annotation_sites_revision);
+            if current!=Some(*expected) {return mismatch("annotation-sites",Some(*expected),current);}
         }
         for (file,expected) in &pending.reads.compiled {
             let current=self.sources.get(file).map(|source|source.compiled_revision);
@@ -1628,6 +1660,18 @@ impl ReadSession<'_> {
         self.observe_semantic_index();
         self.source_snapshot(source)?;
         Ok(self.store.sources[&source.file].declarations.clone())
+    }
+
+    pub fn annotation_sites(&mut self)->source::AnnotationSiteInventory {
+        self.observe_semantic_index();
+        let current=&self.store.sources[self.owner];
+        self.reads.annotation_sites.insert(self.owner.to_owned(),current.annotation_sites_revision);
+        current.annotation_sites.clone()
+    }
+
+    pub fn source_annotation_sites(&mut self,source:&SourceHandle)
+        ->Result<Fact<source::AnnotationSiteInventory>,ContractError> {
+        self.with_source_view(source,|read|Ok(Knowledge::Found(read.annotation_sites())))
     }
 
     /// The trusted host supplies the current model's selected membership after validating an opaque scope.
@@ -2091,6 +2135,11 @@ impl ReadSession<'_> {
 
     pub fn source(&self) -> &str {
         &self.store.sources[self.owner].text
+    }
+
+    pub fn source_input_snapshot(&self)->(u64,Arc<str>) {
+        let source=&self.store.sources[self.owner];
+        (source.generation,source.text.clone())
     }
 
     pub fn configuration(&self) -> &str {

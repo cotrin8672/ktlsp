@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectScope {
     pub module: String,
     pub source_set: String,

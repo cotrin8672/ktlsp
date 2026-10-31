@@ -78,6 +78,111 @@ pub struct SourceAnnotation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceAnnotationSite {
+    pub annotation: SourceAnnotation,
+    /// An exact declaration annotation match, never an enclosing or adjacent declaration.
+    pub owner: Option<Def>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnotationSiteInventory {
+    pub sites: Vec<SourceAnnotationSite>,
+    pub coverage: Fact<()>,
+}
+
+/// Written annotation syntax from the accepted tree, including complete sites under ERROR.
+/// Positive sites remain usable when malformed syntax or a work limit makes coverage unknown.
+/// The caller supplies its already normalized declarations and TypeScope; no source is reparsed.
+pub fn annotation_sites(index:&dyn InferenceIndex,file:&str,tree:&Tree,text:&str,
+    scope:&TypeScope,declarations:&[SourceDeclaration])->AnnotationSiteInventory {
+    let root=tree.root_node();
+    let java=match root.kind() {
+        "program"=>true,"source_file"=>false,
+        _=>return AnnotationSiteInventory {sites:Vec::new(),coverage:unsupported()},
+    };
+    if root.end_byte()>text.len() {
+        return AnnotationSiteInventory {sites:Vec::new(),coverage:unsupported()};
+    }
+    let index=ScopedIndex::new(index,file);
+    let package=index.entries_for_file(file).first().map(|entry|entry.sym.package.clone()).unwrap_or_default();
+    let ctx=FileCtx::new(package,Vec::new()).with_file(file);
+    let mut sites=Vec::new();
+    let mut complete=!root.has_error();
+    let mut walk_work=MAX_SOURCE_ANNOTATION_NODES;
+    let mut annotation_work=MAX_SOURCE_ANNOTATION_NODES;
+    let mut cursor=root.walk();
+    loop {
+        if walk_work==0 {complete=false;break;}
+        walk_work-=1;
+        let node=cursor.node();
+        let opaque=(node.is_extra() && !node.is_error()) || matches!(node.kind(),
+            "string_literal"|"character_literal"|"line_string_literal"|"multiline_string_literal");
+        if !opaque && (matches!(node.kind(),"annotation"|"marker_annotation")
+            || !java && node.kind()=="file_annotation") {
+            let grouped=!java && node.children(&mut node.walk()).any(|child|child.kind()=="[");
+            if grouped {
+                let target=if node.kind()=="file_annotation" {Some("file".into())} else {
+                    child_of_kind(node,"use_site_target").map(|target|node_text(target,text).trim_end_matches(':').into())
+                };
+                let mut count=0;
+                for payload in node.named_children(&mut node.walk()).filter(|child|!child.is_extra() && child.kind()!="use_site_target") {
+                    if annotation_work==0 {complete=false;break;}
+                    match source_annotation(&index,&ctx,payload,text,scope,java,false,0,&mut annotation_work) {
+                        Some(mut annotation)=>{
+                            annotation.use_site_target=target.clone();
+                            sites.push(SourceAnnotationSite {annotation,owner:None});count+=1;
+                        },
+                        None=>complete=false,
+                    }
+                }
+                if count==0 {complete=false;}
+            } else {
+                match source_annotation(&index,&ctx,node,text,scope,java,false,0,&mut annotation_work) {
+                    Some(mut annotation)=>{
+                        if node.kind()=="file_annotation" {annotation.use_site_target=Some("file".into());}
+                        sites.push(SourceAnnotationSite {annotation,owner:None});
+                    },
+                    None=>complete=false,
+                }
+            }
+        }
+        if !opaque && cursor.goto_first_child() {continue;}
+        loop {
+            if cursor.goto_next_sibling() {break;}
+            if !cursor.goto_parent() {return annotation_site_owners(sites,complete,file,declarations);}
+        }
+    }
+    annotation_site_owners(sites,complete,file,declarations)
+}
+
+fn annotation_site_owners(mut sites:Vec<SourceAnnotationSite>,mut complete:bool,file:&str,
+    declarations:&[SourceDeclaration])->AnnotationSiteInventory {
+    let mut owners=std::collections::BTreeMap::<_,Vec<_>>::new();
+    let mut remaining=MAX_SOURCE_ANNOTATION_NODES;
+    let mut owners_complete=true;
+    for declaration in declarations {
+        if remaining==0 {owners_complete=false;break;}
+        remaining-=1;
+        if declaration.definition.file!=file {continue;}
+        for annotation in &declaration.annotations {
+            if remaining==0 {owners_complete=false;break;}
+            remaining-=1;
+            owners.entry((annotation.range.start,annotation.range.end)).or_default()
+                .push((annotation,&declaration.definition));
+        }
+    }
+    if owners_complete {
+        for site in &mut sites {
+            if let Some(candidates)=owners.get(&(site.annotation.range.start,site.annotation.range.end)) {
+                let mut matches=candidates.iter().filter(|(annotation,_)|**annotation==site.annotation).map(|(_,owner)|*owner);
+                site.owner=matches.next().filter(|first|matches.all(|owner|owner==*first)).cloned();
+            }
+        }
+    } else {complete=false;}
+    AnnotationSiteInventory {sites,coverage:if complete {Knowledge::Found(())} else {unsupported()}}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnnotationArgument {
     pub name: Option<String>,
     pub range: Range<usize>,
@@ -640,6 +745,7 @@ fn source_annotation(index:&dyn InferenceIndex,ctx:&FileCtx,node:Node<'_>,text:&
 pub(super) fn annotation_name_node(node:Node<'_>,java:bool)->Option<Node<'_>> {
     if java {node.child_by_field_name("name")}
     else if node.kind()=="call_expression" {node.named_child(0)}
+    else if node.kind()=="user_type" {Some(node)}
     else {child_of_kind(child_of_kind(node,"constructor_invocation").unwrap_or(node),"user_type")}
 }
 

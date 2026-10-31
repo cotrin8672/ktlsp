@@ -889,6 +889,46 @@ evaluation. Source text and configuration remain in the initial evaluation. The
 read works on the first evaluation after initialize; it does not wait for a
 second evaluation. Capability and operation acknowledgements are both required.
 
+The same capability offers the independently selected `annotationSites` operation.
+Read `{"op":"annotationSites"}` for the accepted owner, or add `source` with an
+issued Source token for a checked foreign snapshot. Its result is:
+
+```json
+{
+  "source": {
+    "documentUri": {"state":"found","value":"file:///path/Use.java"},
+    "identity": {"kind":"source","revision":"host-source-revision"},
+    "sha256": "current-utf8-text-sha256"
+  },
+  "annotations": [{"owner":null,"range":{"start":0,"end":7},"nameRange":{"start":1,"end":7},"typeRef":"opaque-reference","useSiteTarget":null,"arguments":[]}],
+  "coverage": {"state":"unknown","reasons":[{"code":"UnsupportedSource"}]}
+}
+```
+
+Annotation ranges and values use the existing v2 encoding. A complete annotation
+inside an `ERROR` parent remains a positive site, including one written before a
+method declaration. `coverage` proves site enumeration, not type resolution or
+known argument values. Unknown coverage prohibits exhaustive/absence claims but
+does not discard valid returned sites. Resolve their TypeRefs normally; spelling
+alone does not establish an annotation type. Traversal and value limits remain bounded.
+
+`owner` references an exact declaration annotation. Within one evaluation and source
+view it reuses the declaration token returned by `sourceFacts`, in either call order.
+Normal owner declarations and read-only snapshot declarations are never combined.
+Null means no exact declaration-owner match; it can also represent parameter or
+nested sites, which may be correlated with existing facts by range. No enclosing
+class or synthetic handler is substituted. TypeRef tokens have no equality guarantee;
+compare checked resolution results in the same view.
+
+The footprint binds the exact current UTF-8 bytes, including CRLF. Its source revision
+is independent of editor versions and outer command revisions. For owner reads,
+validate it within the active accepted-owner evaluation; foreign reads retain the
+issued snapshot's identity, compiler scope and read-only provenance. There are no
+new top-level `semanticScope` or `readOnly` fields or additional authority grants.
+Index-dependent sites are recomputed with the existing prepared tree and language
+scope. Cache changes retire site readers through a per-source revision, without
+retiring unrelated type identities. The `sourceFacts` schema is unchanged.
+
 V2 declarations also carry `parameters`, a knowledge object. A supported ordinary
 method/function returns `{"state":"found","value":[...]}` in authored value-parameter
 order. Each row has `name`, `range`, `nameRange`, `typeRef`, and `annotations`.

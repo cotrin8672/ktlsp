@@ -258,6 +258,7 @@ return function(env)
   local catalog = vim.env.KTLSP_IPC_MODE == 'jvm-catalog'
   local locations = vim.env.KTLSP_IPC_MODE == 'source-locations'
   local source_v2 = vim.env.KTLSP_IPC_MODE == 'source-facts-v2'
+  local annotation_sites = vim.env.KTLSP_IPC_MODE == 'annotation-sites'
   local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots' or host_inputs
   local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts or catalog or locations
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
@@ -545,9 +546,17 @@ return function(env)
     vim.lsp.buf_attach_client(buf, client.id)
   end
   for key, file in pairs({ target = 'fixture/Target.java', mixin = 'fixture/CaseMixin.java', use = 'fixture/IpcUse.java' }) do
-    local path = vim.fs.abspath(env.project .. ((facts or source_v2) and '/modules/editing/src/main/java/' or '/') .. file)
+    local path = vim.fs.abspath(env.project .. ((facts or source_v2 or annotation_sites) and '/modules/editing/src/main/java/' or '/') .. file)
     paths[key],originals[key] = path,vim.fn.readfile(path)
     if not (locations and key=='target') then attach(key) end
+  end
+  if annotation_sites then
+    local marker=env.project .. '/modules/editing/src/main/java/refs/Marker.java'
+    assert(vim.fn.filereadable(marker)==1, 'copy the Marker fixture before source discovery')
+    vim.api.nvim_buf_set_lines(buffers.mixin,0,-1,false,{
+      'package fixture;', 'import refs.Marker;', 'public class CaseMixin {',
+      '    @Marker(value="is")', '}',
+    })
   end
   if source_v2 then
     for key,file in pairs({ parameter_ref='refs/LocalRef.java',parameter_decoy='decoy/LocalRef.java' }) do
@@ -605,6 +614,7 @@ return function(env)
       if source_facts then value.command[#value.command + 1] = '--source-snapshots' end
       if locations then value.command[#value.command + 1] = '--source-locations' end
       if source_v2 then value.command[#value.command + 1] = '--source-facts-v2' end
+      if annotation_sites then value.command[#value.command + 1] = '--annotation-sites' end
       if host_inputs then value.command[#value.command + 1] = '--host-inputs'; value.configuration.runtimeClasses={'java/util/List','vendor/Versioned','vendor/Added','app/Main'} end
       if catalog then value.command[#value.command + 1] = '--jvm-catalog' end
     end
@@ -616,7 +626,75 @@ return function(env)
       function(result) return probe.exact_definition(result, paths.target, { target_range }) end)
   end
   if inputs then inputs.setup() end
+  if annotation_sites then deliver() end
   settings(true)
+  if annotation_sites then
+    local ok, failure = xpcall(function()
+      local function capture(phase)
+        local path=barrier..'/annotation-sites-'..phase..'.json'
+        assert(vim.wait(30000,function() return vim.fn.filereadable(path)==1 end,25),phase..' annotation capture missing')
+        return vim.json.decode(table.concat(vim.fn.readfile(path),'\n'))
+      end
+      local function verify(label,observed,text,owned)
+        local inventory=observed.inventory
+        local site=assert(inventory.annotations[1],label..' missing annotation')
+        local function slice(range) return text:sub(range.start+1,range['end']) end
+        check(label..' uses exact source identity and bytes',inventory.source.sha256==vim.fn.sha256(text)
+          and inventory.source.identity.kind=='source' and type(inventory.source.identity.revision)=='string'
+          and inventory.source.documentUri.state=='found'
+          and probe.path_key(vim.uri_to_fname(inventory.source.documentUri.value))==probe.path_key(paths.mixin))
+        check(label..' preserves exact annotation ranges',#inventory.annotations==1
+          and slice(site.nameRange)=='Marker' and slice(site.range)=='@Marker(value="is")')
+        check(label..' resolves imported annotation type',observed.resolved.state=='found'
+          and observed.resolved.value.qualifiedName=='refs.Marker')
+        if owned then
+          local match=false
+          for _,declaration in ipairs(observed.declarations or {}) do
+            if declaration.id==site.owner and declaration.name=='injected' then match=true end
+          end
+          check(label..' annotation owner is the actual callable',match)
+          check(label..' complete syntax reports complete coverage',inventory.coverage.state=='found')
+        else
+          check(label..' orphan remains ownerless',site.owner==vim.NIL or site.owner==nil)
+          check(label..' incomplete parent keeps coverage unknown',inventory.coverage.state=='unknown')
+        end
+      end
+      local before=probe.buffer_full_text(buffers.mixin)
+      local initial=capture('initial'); verify('initial',initial,before,false)
+      vim.api.nvim_buf_set_lines(buffers.mixin,4,4,false,{'    public void injected() {}'})
+      deliver()
+      local after=probe.buffer_full_text(buffers.mixin)
+      check('edit changes the current source bytes',vim.fn.sha256(after)~=vim.fn.sha256(before))
+      local cancelled=vim.wait(30000,function() return vim.fn.filereadable(barrier..'/annotation-sites-cancelled')==1 end,25)
+      check('old evaluation is cancelled after the edit',cancelled)
+      assert(cancelled,'old annotation evaluation was not cancelled')
+      vim.fn.writefile({'release'},barrier..'/annotation-sites-release')
+      local stale=capture('stale')
+      check('old evaluation is denied after the edit',stale.evaluation==initial.evaluation and type(stale.error)=='string')
+      local edited=capture('edited');verify('edited',edited,after,true)
+      check('edited evaluation is fresh',edited.evaluation~=initial.evaluation)
+      local accepted=vim.wait(30000,function()
+        for _,line in ipairs(vim.fn.filereadable(vim.env.KTLSP_TRACE)==1 and vim.fn.readfile(vim.env.KTLSP_TRACE) or {}) do
+          local decoded,event=pcall(vim.json.decode,line)
+          if decoded and event.name=='extension.ipc.accepted' and event.args and event.args.provider==provider
+            and tostring(event.args.evaluation)==tostring(edited.evaluation)
+            and event.args.source_sha256==vim.fn.sha256(after) then proof.accepted=event.args;return true end
+        end
+        return false
+      end,25)
+      check('fresh evaluation is accepted for the current bytes',accepted)
+      proof.annotation_sites={initial=initial,stale=stale,edited=edited,beforeSha256=vim.fn.sha256(before),afterSha256=vim.fn.sha256(after)}
+      save()
+    end,debug.traceback)
+    vim.fn.writefile({'release'},barrier..'/annotation-sites-release')
+    settings(false)
+    for key,original in pairs(originals) do
+      vim.api.nvim_buf_set_lines(buffers[key],0,-1,false,original);vim.bo[buffers[key]].modified=false
+    end
+    deliver();client.handlers['textDocument/publishDiagnostics']=previous_diagnostics;save()
+    if not ok then error(failure) end
+    return
+  end
   if source_v2 then
     local ok, failure = xpcall(function()
       local evaluation

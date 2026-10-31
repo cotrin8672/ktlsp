@@ -325,11 +325,13 @@ impl AnalysisExtensions {
                 &input.tree,
             )
         });
+        let annotation_source=prepared.clone();
+        let annotation_scope=crate::language::source_type_scope(key,&input.tree,&input.text);
         let replaced = if refresh {
             self.store.refresh_prepared_source_declarations(index,prepared,coverage,facts)
         } else {
             self.store.replace_prepared_source_declarations(index,prepared,coverage,facts)
-        };
+        }.and_then(|_|self.store.cache_annotation_sites(index,&annotation_source,&annotation_scope));
         if let Err(error) = replaced {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
             self.store.remove_source(key);

@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-11-01 (Asia/Tokyo). **Qualified editing through89; CEM index-invalidation fix92 under runtime verification.**
+Updated 2026-11-01 (Asia/Tokyo). **Index-invalidation fix92 confirmed; annotation-sites93 editor proof passes, CEM consumer pending.**
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -8,14 +8,22 @@ The previously unseen mixed-language Okio repository now has eight accepted edit
 interop checks and three current canonical diagnostic states (valid, invalid,
 restored). Its reproduced Gradle/Kotlin and mixed-source producer gaps are fixed.
 MockK's reproduced diagnostic/producer-lifetime failure is also fixed and verified.
-The last full workspace suite, on89, passes1963 tests with16 existing ignores and no failures
-across42 test binaries. Production guards remain stable and the owned process reaches EOF/live0.
+The latest broad workspace93 run covers42 test binaries:1968 passed,16 existing
+ignored, and one old initialize-stream capability-mask expectation failed. Adding
+the independently negotiated annotation-sites bit to its two explicit masks makes
+that same test pass in the targeted repair. Production is unchanged by this
+test-only correction; no unrelated suite or editor replay was added. Preserve both
+`final-workspace93/receipt.json` and `final-workspace93-repair/receipt.json`; this is
+combined evidence, not a claim that the original broad command exited0.
 Release85 additionally passes the focused source-parameter native checks and30 real-editor checks.
 Release86 adds17 focused host checks, one child check and one real-editor root-file scenario.
 The readonly JVM-name follow-up passes36 real-editor checks on88. Host89 fixes the
 newly reproduced Resilience4j diagnostic gap and verifies error counts0/1/0 against
-the pinned compiler. The combined89 workspace suite passes; the earlier84 result
-is retained separately as historical evidence.
+the pinned compiler. CEM92 preflight now succeeds without a retry or stale command.
+The next original CEM completion exposed a genuine missing dangling-annotation
+fact. Generic annotationSites93 passes95 native and22 real-editor checks while
+the actual CEM consumer integration remains unverified. Earlier broad84/89 results
+are retained separately as historical evidence.
 Broader grammar, SDK/compiler-profile coverage and whole-project IDEA parity remain unmeasured;
 there is no invented completeness percentage or requirement for100% grammar.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
@@ -44,6 +52,7 @@ different releases and must not be presented as one same-binary corpus replay.
 
 | Workflow | Result and evidence under RUN | Scope / limit |
 |---|---|---|
+| Annotation sites while editing | Host93 focused95/95 and one real child/Neovim scenario22/22, including15 semantic checks: an imported annotation under an ERROR parent has no owner, retains exact source URI/revision/SHA/ranges and resolves to `refs.Marker`; an unsaved method edit cancels/rejects the old evaluation and returns the actual callable's shared declaration token with a fresh accepted SHA (`annotation-sites93/editor93/receipt.json`, `actual-annotation-sites.json`). | Java/Kotlin own/foreign, comment/string filtering, Unknown coverage, precise cache invalidation and source edits also have native coverage. Unknown enumeration coverage does not erase positive sites or prove absence. The dedicated editor fixture is Java; the original CEM254-byte orphan input has not yet passed its consumer case. TypeRef alias resolution was measured for the inventory ref only, not separately for the declaration alias. |
 | Unseen mixed repository: Okio | Repository61d53efb,313 Kotlin/28 Java source files. Eight real-editor completion/definition/applied unsaved interop checks retained in `okio-correlated77/artifacts/okio-unsaved-requests.json`. Release83 canonical validv3/invalidv4/restoredv5 all match current wire SHA and accepted result;0/1/0 diagnostics, with exact unresolved identifier range and certified absence for the two clean states (`okio-diagnostic83/artifacts/okio-diagnostic.json`). | The two selected project JARs remain absent. The trace proves required-clean Java output for the mixed samples producer. The probe does not independently certify whole-project producer closure;28 dependency source archives remain unavailable. |
 | Detailed normalized source input | Release81 real child/Neovim15/15: first-evaluation nested annotation, decoded strings/maps, typed integer facts and current source identity (`new-capability-editor81/`, proof at `C:/Users/gummy/.codex/ktlsp-api81/editor/source-facts-v2/editor/artifacts/extension-ipc-proof.json`). | Java live annotation fixture; shared Java/Kotlin normalization also has focused Rust coverage. No all-constant-expression or implicit Kotlin projection claim. |
 | Callable source parameters | Release85 real child/Neovim30/30: ordered parameters, exact ranges and explicit annotation values, imported `refs.LocalRef` with a visible decoy, zero-arity Found `[]`, legacy field omission and accepted unsaved source SHA (`C:/Users/gummy/.codex/ktlsp-parameters85/editor/artifacts/extension-ipc-proof.json`). Native admission1, source-facts30 plus repaired shadowing1, wire2 and foreign snapshot1 pass (`source-parameters/native85/`, `source-parameters/native85-repaired/`, sealed pair `integrated-host85/main-ready.json`). | Live parameter fixture is Java; native cases also cover Kotlin, import aliases, foreign read-only snapshots, edits/stale reads and forged facts. Nominal generic class identity is resolved; no public generic-argument binding or JVM parameter-index claim. The original Kotlin owner-type-variable negative was preserved and fixed by checking the lexical type before accepting an indexed import. |
@@ -52,7 +61,8 @@ different releases and must not be presented as one same-binary corpus replay.
 | Additional unseen repository: Resilience4j | At `aa9aacb8cb5333f2dee2590ff07f05f2c942d602`,1241 Java/48 Kotlin source files, sealed86 passes5 real-Neovim checks: existing Kotlin-to-Java completion/goto and unsaved Java method addition followed by Kotlin completion, inspected applied call and goto (`new-project88/editor-unsaved/artifacts/resilience-unsaved.json`). Host89 canonical errors are0/1/0 for valid/`releasePermissioNoSuch()`/restored. Every accepted response matches the wire SHA and current result ID; typo and restoration share one connection (`new-project88/editor-canonical89-oracle/artifacts/resilience-canonical.json`, `new-project88/editor-canonical89-final/artifacts/resilience-canonical.json`). Seven required-clean Java producers cover209 sources with no rejection. | Total diagnostic counts are1/1/1: the valid/restored states contain one existing warning, while the typo state contains only the exact unresolved-reference error. Both behaviors match the pinned Kotlin2.1.21 compiler using a reduced Java-signature/nullability fixture (`new-project88/warning-oracle89/receipt.json`, `invalid-receipt.json`); this is not a full project compiler build. Original7 outputs/JARs remain absent, no generation task ran, and351 dependency source archives remain unavailable. Whole-project producer closure is not independently certified. Prior metadata/admission failures and incorrect warning-invariance expectations are retained as failed receipts, not hidden or counted as passing. |
 | Owning-project and foreign-source input | Release82 real child/Neovim123/123; exactly one command, useful Java/Kotlin main/test types and exact members, source snapshots/provenance and complete main/test resource inventories (`C:/Users/gummy/.codex/ktlsp-api81/editor-project82/project-inputs/editor/artifacts/extension-command-proof.json`). | Provider readiness is correlated to the exact owner/digest. Missing inherited declared output directories are observed as currently empty through existing negative watches; missing JARs remain Unknown. No generated output is built by the host. |
 | Typed binary annotations | Release81 real child/Neovim29/29, selected/unselected metadata and compile-only executable-identity denial (`C:/Users/gummy/.codex/ktlsp-api81/editor-binary81/binary-annotations/editor/artifacts/extension-command-proof.json`). | `binary-annotations-v1` is a representation capability, not a new read operation or Code grant. Current unselected ABI shapes remain unchanged. |
-| Current full Rust suite89 | `final-workspace89/receipt.json`:42 test binaries,1963 passed/0 failed/16 existing ignored, stable production guards, EOF and no owned live processes. | One combined `cargo test --workspace --no-fail-fast` after the fixes. No sealed host/child rebuild, editor replay or benchmark was included. |
+| Workspace93 and targeted expectation repair | `final-workspace93/receipt.json`:42 test binaries,1968 passed/1 outdated-mask failure/16 existing ignored. `final-workspace93-repair/receipt.json`: the same initialize-stream test passes after explicitly including ANNOTATION_SITES in both expected masks. Source guards, EOF and no owned live processes are verified. | Only cfg(test) expectations changed after the broad run; host/child and production behavior remain93. The broad failed receipt is retained and is not relabeled as exit0. |
+| Historical full Rust suite89 | `final-workspace89/receipt.json`:42 test binaries,1963 passed/0 failed/16 existing ignored, stable production guards, EOF and no owned live processes. | One combined `cargo test --workspace --no-fail-fast` after those fixes. No sealed host/child rebuild, editor replay or benchmark was included. |
 | Historical full Rust baseline84 | `integrated-host84/main-ready.json`:42 test binaries,1938 passed/0 failed/16 existing ignored; release host and reused unchanged protocol child sealed, source guards stable, EOF and no owned live processes. | Initial failing suite receipts are retained in `final-workspace83` and `final-workspace83-repaired`. Obsolete extra-parse counts were corrected to exact zero while preserving semantic retraction tests. The actual Java-only header admission regression was fixed without changing its original test; complete/partial/ambiguous coverage controls pass. |
 
 The root-file capture discards stale attempts and acquires a fresh native lease
@@ -97,8 +107,21 @@ across continuation pages. Metadata/native/source/provider/model guards remain.
 The paired metadata/semantic regression and old-type/new-type regression pass:
 core extension62, nominal3 and host analysis-extension25 checks,90 total
 (`integrated-host92/main-ready.json`). The prior91 candidate is held/superseded.
-Actual CEM success on92 remains pending; the89 full-workspace receipt is not
-presented as a full suite on92. No corpus or performance replay was added.
+D7 observes that92 succeeds at preflightInfo on the first try, with no stale
+command, child error or retry. Its original2 calls/1 completion then reach an
+unowned `@Inject(method = "is")` written before any method declaration, and the
+consumer reports incomplete annotation inventory. This is a distinct editing gap,
+not a recurrence of model invalidation. Source254UTF-8 bytes/CRLF and SHA
+`7bd1004fdea0383b51e973c48f3a2e5162e359b9abc08eab559920e98e8df5a8`
+are preserved; no fake method or raw spelling-based official type is substituted.
+Generic annotationSites93 now supplies those sites through independently selected
+source-facts-v2 operations. Its source footprint, optional exact owner, current
+TypeRef resolution and per-source cache lifetime pass the native/editor checks
+above. The MC consumer has the immutable93 pair and actual serializer fixture;
+the unchanged original CEM case and its85 comparison remain pending. Three
+separate static MC requests (generic child refs, primitive/array class descriptors,
+source float/double bits) are backlog, not93 runtime failures or added acceptance
+scope. No corpus or performance replay was added.
 Hierarchy, generic argument rendering,
 primitive class-literal descriptors and extract-local are outside that follow-up.
 

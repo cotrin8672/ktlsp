@@ -173,6 +173,17 @@ rtk proxy bash dev/ktlsp-harness.sh corpus --root "$ipc_project" \
   --bin "$sealed_server" --no-build --run-dir "$scratch/source-facts-editor"
 ```
 
+`KTLSP_IPC_MODE=annotation-sites` uses the same corpus/IPC route with the nested,
+model-backed `:app` fixture described below. Copy the existing `fixture/CaseMixin.java`,
+`fixture/Target.java` and `fixture/IpcUse.java` into `modules/editing/src/main/java/fixture/`,
+and `project/refs/Marker.java` into `modules/editing/src/main/java/refs/` before source
+discovery. Use a matching host/child pair and fresh barrier/output/cache directories;
+the child selects `--annotation-sites`. The editor first sends an unsaved imported
+annotation with no method, checks positive facts and Unknown coverage, then adds a
+method in the disposable buffer and verifies exact declaration ownership, cancellation,
+stale denial and the fresh accepted source SHA. It runs this slice independently of
+the broader source-facts scenario. No project compilation or generation is needed.
+
 `KTLSP_IPC_MODE=root-files` uses that same corpus/IPC route with the disposable
 Gradle reload fixture described below: the registered workspace contains the
 accepted `:app` owner under `modules/editing`, and the child runs with

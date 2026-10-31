@@ -3276,6 +3276,69 @@ fn source_locations_keep_cross_file_overloads_private_members_and_stale_inputs()
     }
 }
 
+#[test]
+fn annotation_sites_keep_orphans_owned_edits_and_unknown_coverage() {
+    use ktcore::extensions::source::{self, AnnotationValue};
+    let file = "/oracle/Orphan.kt";
+    let mut index = Index::new();
+    for (text, owned) in [
+        ("package oracle\nimport fixture.Mark\nclass Use { val s = \"@Fake\"; // @Fake\n @Mark(\"is\")\n}", false),
+        ("package oracle\nimport fixture.Mark\nclass Use { val s = \"@Fake\"; // @Fake\n @Mark(\"is\") fun probe() {}\n}", true),
+    ] {
+        let tree = KotlinParser::new().parse(text);
+        index.replace_file(file, extract_symbols(&tree, text, "oracle"), Tier::Volatile);
+        let scope = ktcore::indexer::TypeScope::with_default_imports("oracle", ktcore::parser::imports_of(&tree, text), &["kotlin", "java.lang"]);
+        let declarations = source::extract(&index, file, &tree, text, &scope);
+        let inventory = source::annotation_sites(&index, file, &tree, text, &scope, &declarations);
+        assert_eq!(inventory.sites.len(), 1, "comments and strings are not annotation sites");
+        let site = &inventory.sites[0];
+        assert_eq!(&text[site.annotation.name_range.clone()], "Mark");
+        assert_eq!(&text[site.annotation.range.clone()], "@Mark(\"is\")");
+        assert!(matches!(&site.annotation.arguments[0].value,
+            Knowledge::Found(AnnotationValue::String { value, .. } | AnnotationValue::MappedString { value, .. }) if value == "is"));
+        assert_eq!(site.owner.is_some(), owned);
+        if let Some(owner) = &site.owner {
+            assert!(declarations.iter().any(|decl| decl.definition == *owner && &text[decl.name_range.clone()] == "probe"));
+        } else {
+            assert!(matches!(inventory.coverage, Knowledge::Unknown(_)));
+        }
+    }
+    let malformed = "package oracle\nclass Use { @Mark(\n}";
+    let tree = KotlinParser::new().parse(malformed);
+    let scope = ktcore::indexer::TypeScope::with_default_imports("oracle", Vec::new(), &["kotlin"]);
+    let inventory = source::annotation_sites(&index, file, &tree, malformed, &scope, &[]);
+    assert!(matches!(inventory.coverage, Knowledge::Unknown(_)));
+}
+
+#[test]
+fn late_annotation_site_cache_only_retires_site_readers() {
+    let (index, mut store) = fixture();
+    let mut type_read = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let Knowledge::Found(target) = type_read.resolve_type("oracle.Target") else { panic!("authored target"); };
+    assert!(type_read.declared_members(&target).is_ok());
+    let type_pending = type_read.finish();
+
+    let mut site_read = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    let before = site_read.annotation_sites();
+    assert!(before.sites.is_empty());
+    assert!(matches!(before.coverage, Knowledge::Unknown(_)));
+    let site_pending = site_read.finish();
+
+    let tree = KotlinParser::new().parse(MIXIN);
+    let scope = ktcore::indexer::TypeScope::with_default_imports(
+        "oracle.mixin", ktcore::parser::imports_of(&tree, MIXIN), &["kotlin", "java.lang"]);
+    let prepared = ktcore::extensions::source::prepare_source_references(&index, MIXIN_FILE, Arc::from(MIXIN), &tree);
+    store.cache_annotation_sites(&index, &prepared, &scope).unwrap();
+
+    assert_eq!(store.validate_pending(&type_pending), Ok(()));
+    assert_eq!(store.validate_pending(&site_pending), Err(ContractError::Stale));
+    let mut fresh = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    assert!(fresh.declared_members(&target).is_ok());
+    let after = fresh.annotation_sites();
+    assert!(after.sites.iter().any(|site| &MIXIN[site.annotation.name_range.clone()] == "Mixin"));
+    assert!(matches!(after.coverage, Knowledge::Found(())));
+}
+
 #[derive(Debug)]
 struct TestHostInput(std::sync::atomic::AtomicBool);
 impl HostInputGuard for TestHostInput {

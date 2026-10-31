@@ -611,6 +611,11 @@ or editor framework is needed.
 `KTLSP_IPC_MODE=source-facts-v2` also checks authored callable parameter order,
 ranges, annotations and imported type references, with legacy field omission.
 
+`KTLSP_IPC_MODE=annotation-sites` checks an annotation written before its method:
+exact source identity/ranges, imported type resolution, then an unsaved edit to
+an actual callable owner and rejection of the old evaluation. Use the model-backed
+nested fixture and Marker setup in the [external provider notes](dev/external-extension/README.md).
+
 The same corpus/IPC route has a `KTLSP_IPC_MODE=root-files` scenario for the
 host-registered workspace file domain, independent of Gradle resource selection.
 It checks filtered paging, exact disk/unsaved UTF-8 snapshots, native disk-change

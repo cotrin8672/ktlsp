@@ -681,6 +681,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source_locations = false;
     let mut project_inputs = false;
     let mut source_facts_v2 = false;
+    let mut annotation_sites = false;
     let mut binary_annotations = false;
     let mut root_files = false;
     while let Some(argument) = args.next() {
@@ -696,12 +697,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--source-locations" if !source_locations => source_locations = true,
             "--project-inputs" if !project_inputs => project_inputs = true,
             "--source-facts-v2" if !source_facts_v2 => source_facts_v2 = true,
+            "--annotation-sites" if !annotation_sites => annotation_sites = true,
             "--binary-annotations" if !binary_annotations => binary_annotations = true,
             "--root-files" if !root_files => root_files = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
     if host_inputs { project_facts=true; source_snapshots=true; }
+    if annotation_sites { source_facts_v2=true; }
     if project_inputs {source_snapshots=true;source_facts_v2=true;source_locations=true;}
     if source_locations { project_facts=true; }
     if (project_facts || source_snapshots || root_files) && barrier.is_none() {
@@ -750,6 +753,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("source-facts-v2"));
                     if result.get("supportedOps").is_none() {result["supportedOps"]=json!({});}
                     result["supportedOps"]["source-facts-v2"]=json!(["sourceFacts"]);
+                    if annotation_sites {
+                        if !offered["supportedOps"]["source-facts-v2"].as_array()
+                            .is_some_and(|values|values.iter().any(|value|value=="annotationSites")) {
+                            return Err("host did not offer annotation sites".into());
+                        }
+                        result["supportedOps"]["source-facts-v2"]=json!(["sourceFacts","annotationSites"]);
+                    }
                 }
                 if root_files {
                     let offered=&message["params"];
@@ -848,6 +858,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             Some("analysis/evaluate") => {
+                if annotation_sites {
+                    if message["params"]["owner"].as_str().is_some_and(|owner|owner.rsplit(['/', '\\']).next()
+                        .is_some_and(|name|name.eq_ignore_ascii_case("CaseMixin.java"))) {
+                        if let Err(error)=record_annotation_sites(&mut input,&mut output,&mut next,&message["params"],&barrier) {
+                            if !stale_read_error(&error) {return Err(error.into());}
+                            write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"error":{"code":-32801,"message":"Stale"}}))?;
+                            continue;
+                        }
+                    }
+                    write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":{"sites":[],"diagnostics":[]}}))?;
+                    continue;
+                }
                 if root_files {
                     let owner=message["params"]["owner"].as_str().unwrap_or_default();
                     if owner.rsplit(['/', '\\']).next().is_some_and(|name|name.eq_ignore_ascii_case("CaseMixin.java")) {
@@ -983,6 +1005,44 @@ mod source_inventory_client_tests {
         assert!(requests.len()+3<64,"leave room for the existing semantic queries");
         assert_eq!(input.position() as usize,input.get_ref().len());
     }
+}
+
+fn record_annotation_sites(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
+    params:&Value,barrier:&Option<PathBuf>)->Result<(),String> {
+    let directory=barrier.as_ref().ok_or("annotation sites need barrier")?;
+    std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+    let evaluation=&params["evaluation"];
+    let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+        "queries":[{"op":"annotationSites"},{"op":"sourceFacts"}]}))?;
+    let inventory=&result["facts"][0];
+    let site=inventory["annotations"].as_array().ok_or("annotation sites array")?.iter()
+        .find(|site|site["typeRef"].is_string()).ok_or("missing annotation site")?;
+    let resolved=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+        "queries":[{"op":"resolveTypeRef","reference":site["typeRef"]}]}))?;
+    let initial=!directory.join("annotation-sites-initial.json").exists();
+    let phase=if initial {"initial"} else {"edited"};
+    std::fs::write(directory.join(format!("annotation-sites-{phase}.json")),
+        serde_json::to_vec(&json!({"evaluation":evaluation,"inventory":inventory,
+            "declarations":result["facts"][1]["declarations"],"resolved":resolved["facts"][0]}))
+            .map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    if initial {
+        let cancellation=read_frame(input).map_err(|error|error.to_string())?.ok_or("host closed at annotation barrier")?;
+        if cancellation["method"]!="$/cancelRequest" || cancellation["params"]["id"]!=*evaluation {
+            return Err("expected cancellation of old annotation evaluation".into());
+        }
+        std::fs::write(directory.join("annotation-sites-cancelled"),b"1").map_err(|error|error.to_string())?;
+        while !directory.join("annotation-sites-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let error=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"annotationSites"}]})).err().ok_or("old annotation evaluation was accepted")?;
+        if !stale_read_error(&error) {return Err(error);}
+        std::fs::write(directory.join("annotation-sites-stale.json"),
+            serde_json::to_vec(&json!({"evaluation":evaluation,"error":error})).map_err(|error|error.to_string())?)
+            .map_err(|error|error.to_string())?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
