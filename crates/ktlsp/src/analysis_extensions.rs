@@ -228,6 +228,10 @@ impl AnalysisExtensions {
             self.mark_published();
             self.clear_compiled();
             self.store.invalidate_model();
+            if crate::trace::enabled() {
+                crate::trace::span("extension.model_invalidated","extension",std::time::Instant::now(),
+                    serde_json::json!({"reason":"index-changed"}));
+            }
             self.pending_index = true;
         }
     }

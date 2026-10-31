@@ -3283,6 +3283,63 @@ impl HostInputGuard for TestHostInput {
 }
 
 #[test]
+fn pending_validation_reports_first_failure_in_one_guard_pass() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingGuard { current: AtomicBool, checks: AtomicUsize }
+    impl HostInputGuard for CountingGuard {
+        fn is_current(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            self.current.load(Ordering::SeqCst)
+        }
+    }
+    let (index, mut store) = fixture();
+    let first = Arc::new(CountingGuard { current: AtomicBool::new(true), checks: AtomicUsize::new(0) });
+    let second = Arc::new(CountingGuard { current: AtomicBool::new(true), checks: AtomicUsize::new(0) });
+    let mut read = store.begin_read(&index, "mixin-consumer", MIXIN_FILE).unwrap();
+    read.observe_host_input(first.clone()).unwrap();
+    read.observe_host_input(second.clone()).unwrap();
+    let pending = read.finish();
+    first.checks.store(0, Ordering::SeqCst);
+    second.checks.store(0, Ordering::SeqCst);
+
+    assert_eq!(store.validate_pending_detailed(&pending), Ok(()));
+    assert_eq!(first.checks.swap(0, Ordering::SeqCst), 1);
+    assert_eq!(second.checks.swap(0, Ordering::SeqCst), 1);
+
+    first.current.store(false, Ordering::SeqCst);
+    store.invalidate_model();
+    let failure = store.validate_pending_detailed(&pending).unwrap_err();
+    assert_eq!(failure.error, ContractError::Stale);
+    assert_eq!((failure.reason, failure.expected, failure.current), ("host-input", Some(1), Some(0)));
+    assert_eq!(failure.host_input_index, Some(0));
+    assert_eq!(failure.host_input_type, Some(std::any::type_name::<CountingGuard>()));
+    assert_eq!(first.checks.swap(0, Ordering::SeqCst), 1);
+    assert_eq!(second.checks.swap(0, Ordering::SeqCst), 0);
+    assert_eq!(store.validate_pending(&pending), Err(ContractError::Stale));
+    assert_eq!(first.checks.swap(0, Ordering::SeqCst), 1);
+    assert_eq!(second.checks.swap(0, Ordering::SeqCst), 0);
+
+    first.current.store(true, Ordering::SeqCst);
+    let failure = store.validate_pending_detailed(&pending).unwrap_err();
+    assert_eq!((failure.error, failure.reason), (ContractError::Stale, "model"));
+    assert_eq!(failure.current, failure.expected.map(|value| value + 1));
+    assert!(failure.expected.is_some());
+    assert_eq!((failure.host_input_index, failure.host_input_type), (None, None));
+    assert_eq!(first.checks.swap(0, Ordering::SeqCst), 1);
+    assert_eq!(second.checks.swap(0, Ordering::SeqCst), 1);
+
+    store.configure_provider("mixin-consumer", true, Arc::from("changed"));
+    let failure = store.validate_pending_detailed(&pending).unwrap_err();
+    assert_eq!((failure.error, failure.reason), (ContractError::Stale, "provider"));
+    assert!(matches!((failure.expected, failure.current), (Some(expected), Some(current)) if current > expected));
+    assert_eq!((failure.host_input_index, failure.host_input_type), (None, None));
+    assert_eq!(first.checks.load(Ordering::SeqCst), 0);
+    assert_eq!(second.checks.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn host_input_guard_rejects_pending_and_withdraws_published_facts() {
     use std::sync::atomic::Ordering;
     let (index, mut store) = fixture();

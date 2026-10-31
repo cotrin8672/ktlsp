@@ -658,6 +658,16 @@ pub enum ContractError {
     OverlappingEdits,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingValidationFailure {
+    pub error: ContractError,
+    pub reason: &'static str,
+    pub expected: Option<u64>,
+    pub current: Option<u64>,
+    pub host_input_index: Option<usize>,
+    pub host_input_type: Option<&'static str>,
+}
+
 struct SourceFacts {
     generation: u64,
     scope: Option<ProjectScope>,
@@ -683,6 +693,7 @@ struct ProviderState {
 /// The guard owns its watcher/lease for the full pending and published read lifetime.
 pub trait HostInputGuard: std::fmt::Debug + Send + Sync {
     fn is_current(&self) -> bool;
+    fn diagnostic_type_name(&self) -> &'static str { std::any::type_name::<Self>() }
 }
 
 #[derive(Clone, Debug)]
@@ -1432,32 +1443,44 @@ impl ExtensionStore {
     }
 
     fn is_current(&self, pending: &PendingContributions) -> bool {
-        self.providers
-            .get(&pending.provider)
-            .is_some_and(|provider| {
-                provider.enabled && provider.generation == pending.provider_generation
-            })
-            && pending.reads.host_inputs.iter().all(|input| input.is_current())
-            && pending.reads.model == self.model_generation
-            && pending
-                .reads
-                .namespace
-                .is_none_or(|generation| generation == self.namespace_generation)
-            && pending.reads.source_inventories.iter().all(|(scope, generation)|
-                self.source_inventory_generations.get(scope).copied().unwrap_or(0) == *generation)
-            && pending.reads.missing_inventory_sources.iter().all(|file|!self.sources.contains_key(file))
-            && pending.reads.source_modules.iter().all(|(module,generation)|
-                self.source_module_generations.get(module).copied().unwrap_or(0)==*generation)
-            && pending.reads.files.iter().all(|(file, generation)| {
-                self.sources
-                    .get(file)
-                    .is_some_and(|source| source.generation == *generation)
-            })
-            && pending.reads.compiled.iter().all(|(file, revision)| {
-                self.sources
-                    .get(file)
-                    .is_some_and(|source| source.compiled_revision == *revision)
-            })
+        self.pending_mismatch(pending).is_none()
+    }
+
+    fn pending_mismatch(&self,pending:&PendingContributions)->Option<(&'static str,Option<u64>,Option<u64>,Option<usize>)> {
+        let mismatch=|reason,expected,current|Some((reason,expected,current,None));
+        let provider=self.providers.get(&pending.provider);
+        if !provider.is_some_and(|provider|provider.enabled && provider.generation==pending.provider_generation) {
+            return mismatch("provider",Some(pending.provider_generation),provider.map(|provider|provider.generation));
+        }
+        for (index,input) in pending.reads.host_inputs.iter().enumerate() {
+            if !input.is_current() {return Some(("host-input",Some(1),Some(0),Some(index)));}
+        }
+        if pending.reads.model!=self.model_generation {
+            return mismatch("model",Some(pending.reads.model),Some(self.model_generation));
+        }
+        if let Some(expected)=pending.reads.namespace {
+            if expected!=self.namespace_generation {return mismatch("namespace",Some(expected),Some(self.namespace_generation));}
+        }
+        for (scope,expected) in &pending.reads.source_inventories {
+            let current=self.source_inventory_generations.get(scope).copied().unwrap_or(0);
+            if current!=*expected {return mismatch("source-inventory",Some(*expected),Some(current));}
+        }
+        for file in &pending.reads.missing_inventory_sources {
+            if self.sources.contains_key(file) {return mismatch("missing-inventory-source",Some(0),Some(1));}
+        }
+        for (module,expected) in &pending.reads.source_modules {
+            let current=self.source_module_generations.get(module).copied().unwrap_or(0);
+            if current!=*expected {return mismatch("source-module",Some(*expected),Some(current));}
+        }
+        for (file,expected) in &pending.reads.files {
+            let current=self.sources.get(file).map(|source|source.generation);
+            if current!=Some(*expected) {return mismatch("source-file",Some(*expected),current);}
+        }
+        for (file,expected) in &pending.reads.compiled {
+            let current=self.sources.get(file).map(|source|source.compiled_revision);
+            if current!=Some(*expected) {return mismatch("compiled",Some(*expected),current);}
+        }
+        None
     }
 
     /// Withdraw externally invalidated facts without scanning valid source/model read sets.
@@ -1473,14 +1496,26 @@ impl ExtensionStore {
     }
 
     pub fn validate_pending(&self, pending: &PendingContributions) -> Result<(), ContractError> {
+        self.validate_pending_detailed(pending).map_err(|failure|failure.error)
+    }
+
+    /// The same validation pass, with metadata for its first failed guard.
+    pub fn validate_pending_detailed(&self,pending:&PendingContributions)->Result<(),PendingValidationFailure> {
+        let failure=|error,reason,expected,current,input|PendingValidationFailure {
+            error,reason,expected,current,host_input_index:input,
+            host_input_type:input.and_then(|index|pending.reads.host_inputs.get(index))
+                .map(|guard|guard.diagnostic_type_name()),
+        };
         if pending.host != self.host {
-            return Err(ContractError::ForeignIdentity);
+            return Err(failure(ContractError::ForeignIdentity,"host-identity",Some(pending.host),Some(self.host),None));
         }
         let registered = pending.read_only
             || self.evaluations.get(&(pending.provider.clone(), pending.owner.clone())) == Some(&pending.evaluation);
-        if !self.is_current(pending) || !registered
-        {
-            return Err(ContractError::Stale);
+        let mismatch=self.pending_mismatch(pending);
+        if mismatch.is_some() || !registered {
+            let (reason,expected,current,input)=mismatch.unwrap_or_else(||("registration",Some(pending.evaluation),
+                self.evaluations.get(&(pending.provider.clone(),pending.owner.clone())).copied(),None));
+            return Err(failure(ContractError::Stale,reason,expected,current,input));
         }
         Ok(())
     }

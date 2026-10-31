@@ -68,9 +68,23 @@ validation succeed. The consumer reports its comparison repair passes65 focused
 checks. Its next88 run instead encountered a real stale evaluation at sourceInventory
 prepayment, with current provider and unchanged workspace/document generations;
 the invalidation cause remains Unknown (`cem-root86-stale/d3-attribution.md`). The
-consumer is allowed one separate outer command only after observing a fresh accepted
-evaluation for the same instance/source/version. Actual CEM assertions remain pending;
-neither failed run is counted as passed or explains historical86 Stale. Hierarchy, generic argument rendering,
+consumer attempted one separate outer command after observing a fresh accepted
+evaluation for the same instance/source/version. Both commands still failed in D4
+(`cem-project-20261101-024118400-adb6cf5b` in the mc-dev log directory): the fresh
+command passed source inventory/snapshots, then became stale at resource-inventory
+prepayment. Original CEM assertions remain0; no further retry is added. The exact
+pending-read guard responsible is the next investigation, separately from the fixed
+module comparison. No failed run is counted as passed or explains historical86 Stale.
+Removing unused compiler source capture in the consumer did not resolve this: D5
+also becomes stale during resource-inventory paging, with original assertions0.
+Diagnostic host90 reports the first authoritative validation failure through the
+existing opt-in trace, including its reason, expected/current counters and failing
+host-input index/type. It preserves validation order and checks each dynamic guard
+once; core contains no logging or filesystem access. Core extension61 and command
+lifetime/negative2 checks pass (`integrated-host90/main-ready.json`). This is
+observability evidence, not a stale-condition fix or a passing CEM run. The89
+workspace result is retained; the entire suite and old corpus were not repeated.
+Hierarchy, generic argument rendering,
 primitive class-literal descriptors and extract-local are outside that follow-up.
 
 The84 production correction restores entry to the existing Java-header path;

@@ -589,7 +589,7 @@ impl AnalysisExtensions {
         let current=self.ipc_providers.get(&evaluation.provider).is_some_and(|slot|
             slot.enabled && slot.worker.id==evaluation.instance && !slot.worker.failed());
         let pending_validation=(evaluation.command && current && evaluation.failure.is_none())
-            .then(||evaluation.pending.as_ref().map(|pending|self.store.validate_pending(pending))).flatten();
+            .then(||evaluation.pending.as_ref().map(|pending|self.validate_ipc_pending(&evaluation,pending))).flatten();
         let valid=pending_validation.as_ref().is_some_and(Result::is_ok);
         if crate::trace::enabled() {
             let pending_error=pending_validation.as_ref().and_then(|result|result.as_ref().err());
@@ -608,11 +608,24 @@ impl AnalysisExtensions {
         result
     }
 
+    fn validate_ipc_pending(&self,evaluation:&Evaluation,pending:&ktcore::extensions::PendingContributions)
+        ->Result<(),ktcore::extensions::ContractError> {
+        if !crate::trace::enabled() {return self.store.validate_pending(pending);}
+        let start=std::time::Instant::now();
+        let result=self.store.validate_pending_detailed(pending);
+        if let Err(failure)=&result {
+            crate::trace::span("extension.ipc.pending_validation_failed","extension",start,serde_json::json!({
+                "evaluation":evaluation.id,"instance":evaluation.instance,"command":evaluation.command,
+                "reason":failure.reason,"expected":failure.expected,"current":failure.current,
+                "host_input_index":failure.host_input_index,
+                "host_input_type":failure.host_input_type.map(crate::extension_ipc::bounded_trace_text)}));
+        }
+        result.map_err(|failure|failure.error)
+    }
+
     pub(crate) fn ipc_current(&self, id: u64) -> bool {
-        self.ipc_evaluations
-            .get(&id)
-            .and_then(|evaluation| evaluation.pending.as_ref())
-            .is_some_and(|pending| self.store.validate_pending(pending).is_ok())
+        self.ipc_evaluations.get(&id).is_some_and(|evaluation|evaluation.pending.as_ref()
+            .is_some_and(|pending|self.validate_ipc_pending(evaluation,pending).is_ok()))
     }
 
     pub(crate) fn ipc_completion_pending(&self, owner: &str) -> bool {
