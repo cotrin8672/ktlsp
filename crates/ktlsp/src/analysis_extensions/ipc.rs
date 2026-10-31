@@ -588,8 +588,18 @@ impl AnalysisExtensions {
         let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;
         let current=self.ipc_providers.get(&evaluation.provider).is_some_and(|slot|
             slot.enabled && slot.worker.id==evaluation.instance && !slot.worker.failed());
-        let valid=evaluation.command && current && evaluation.failure.is_none()
-            && evaluation.pending.as_ref().is_some_and(|pending|self.store.validate_pending(pending).is_ok());
+        let pending_validation=(evaluation.command && current && evaluation.failure.is_none())
+            .then(||evaluation.pending.as_ref().map(|pending|self.store.validate_pending(pending))).flatten();
+        let valid=pending_validation.as_ref().is_some_and(Result::is_ok);
+        if crate::trace::enabled() {
+            let pending_error=pending_validation.as_ref().and_then(|result|result.as_ref().err());
+            crate::trace::span("extension.ipc.command_validation","extension",std::time::Instant::now(),serde_json::json!({
+                "evaluation":id,"instance":evaluation.instance,"command":evaluation.command,"provider_current":current,
+                "pending_present":evaluation.pending.is_some(),"pending_checked":pending_validation.is_some(),"pending_error":pending_error.map(|error| {
+                    let message=format!("{error:?}");crate::extension_ipc::bounded_trace_text(&message).to_owned()}),
+                "failure":evaluation.failure.as_deref().map(crate::extension_ipc::bounded_trace_text),"valid":valid,
+                "result_error":result.as_ref().err().map(|error|crate::extension_ipc::bounded_trace_text(error))}));
+        }
         if let Some(pending)=evaluation.pending.take() { let _=self.store.fail(pending); }
         if let Some(slot)=self.ipc_providers.get_mut(&evaluation.provider).filter(|slot|slot.worker.id==evaluation.instance) {
             slot.running_commands=slot.running_commands.saturating_sub(1);

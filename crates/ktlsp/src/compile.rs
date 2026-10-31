@@ -3656,7 +3656,7 @@ impl KotlinDependencyCompilation {
             !self.source.compiler_metadata_incomplete
                 && !self.source.classpath_incomplete
                 && self.source.unresolved.is_empty()
-                && self.source.compiler_tasks.len() == 2,
+                && matches!(self.source.compiler_tasks.len(),1 | 2),
             "kotlin-dependency-compilation-incomplete"
         );
         let primary = self
@@ -3664,8 +3664,10 @@ impl KotlinDependencyCompilation {
             .compiler_tasks
             .iter()
             .find(|task| {
-                task.language == CompilerLanguage::Kotlin
-                    && Some(task.task.as_str()) == self.source.kotlin_compile_task.as_deref()
+                (task.language == CompilerLanguage::Kotlin
+                    && Some(task.task.as_str()) == self.source.kotlin_compile_task.as_deref())
+                    || (self.source.compiler_tasks.len()==1 && self.source.kotlin_compile_task.is_none()
+                        && task.language==CompilerLanguage::Java)
             })
             .ok_or_else(|| anyhow::anyhow!("kotlin-dependency-primary-unknown"))?;
         let java = self
@@ -3679,11 +3681,13 @@ impl KotlinDependencyCompilation {
                 && primary.problem.is_none()
                 && java.complete
                 && java.problem.is_none()
-                && java_diagnostics::selected_tasks_supported(
+                && (if primary.language==CompilerLanguage::Java {
+                    java_diagnostics::java_producer_recipe(primary).is_ok()
+                } else {java_diagnostics::selected_tasks_supported(
                     primary,
                     java,
                     &self.source.compiler_tasks
-                )
+                )})
                 && (java.annotation_processing_disabled()
                     || (java.source_files.is_empty() && java.java_compiler_recipe().is_none()
                         && java.arguments.is_empty()))

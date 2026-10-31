@@ -88,8 +88,8 @@ fn k2_normal(request: &KotlinDiagnosticRequest) -> bool {
 }
 
 fn header_assets(request: &KotlinDiagnosticRequest) -> Vec<(&'static str, &'static str)> {
-    if kmp_release8_java(request) {
-        // This profile consumes the already checked normal Kotlin output; no header plugin runs.
+    if java_only(request) || kmp_release8_java(request) {
+        // These paths need only the checked Javac helper; no Kotlin header plugin runs.
         vec![("JavacDiagnostics.java", JAVA_SOURCE)]
     } else if k2_normal(request) {
         vec![
@@ -113,7 +113,7 @@ fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &s
         Some("gradle-7.4.2-stock-actions-v1" | "gradle-7.5-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
         }
-        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1" | "gradle-9.8.2-stock-actions-v1") => {
+        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.4.1-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1" | "gradle-9.8.2-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalTaskAction"
         }
         _ => return false,
@@ -136,13 +136,13 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
     };
     match fact.get("adapter").and_then(Value::as_str) {
         Some("gradle-7.4.2-stock-onlyif-v1" | "gradle-7.5-stock-onlyif-v1") => {}
-        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1") if !kapt => {}
+        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.4.1-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1") if !kapt => {}
         _ => return false,
     }
     let Some(predicates) = fact.get("predicates").and_then(Value::as_array) else {
         return false;
     };
-    if fact.get("adapter").and_then(Value::as_str) == Some("gradle-9.8.2-stock-onlyif-v1")
+    if matches!(fact.get("adapter").and_then(Value::as_str),Some("gradle-9.4.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1"))
         && predicates.first().and_then(|predicate| predicate.get("class")).and_then(Value::as_str)
             != Some("org.gradle.api.internal.tasks.execution.SelfDescribingSpec")
     {
@@ -607,6 +607,19 @@ fn kmp_release8_java(request: &KotlinDiagnosticRequest) -> bool {
             recipe.adapter == "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1")
 }
 
+fn gradle94_jvm21(primary: &CompilerTask) -> bool {
+    primary.kotlin_compiler.as_ref().is_some_and(|runtime|
+        runtime.compiler_version == "2.1.21" && runtime.gradle_plugin_version == "2.1.21"
+            && !runtime.run_via_build_tools_api
+            && runtime.execution_strategy == crate::classpath::KotlinCompilerExecutionStrategy::Daemon
+            && runtime.normalized_daemon_jvm_arguments.is_empty()
+            && primary.java_home.as_ref().is_some_and(|home|
+                same_path(home,&runtime.gradle_java_home) && same_path(home,&runtime.toolchain_java_home)))
+        && primary.arguments.windows(2).filter(|pair|pair[0]=="-jvm-target")
+            .map(|pair|pair[1].as_str()).eq(["21"])
+        && primary.arguments.iter().filter(|argument|argument.as_str()=="-jvm-target").count()==1
+}
+
 pub(super) fn selected_tasks_supported_reason(
     primary: &CompilerTask,
     java: &CompilerTask,
@@ -618,6 +631,7 @@ pub(super) fn selected_tasks_supported_reason(
     let legacy = runtime.compiler_version == "1.8.21" && runtime.gradle_plugin_version == "1.8.21";
     let complete_k2 =
         runtime.compiler_version == "2.4.0" && runtime.gradle_plugin_version == "2.4.0";
+    let jvm21 = gradle94_jvm21(primary);
     // Stock source membership only; SDK/fragment facts do not admit a Javac execution recipe.
     let kmp_runtime = runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21"
         && !runtime.run_via_build_tools_api
@@ -641,6 +655,8 @@ pub(super) fn selected_tasks_supported_reason(
             "gradle-7.4.2-stock-actions-v1",
             "gradle-7.4.2-stock-onlyif-v1",
         )
+    } else if jvm21 {
+        ("gradle-9.4.1-stock-actions-v1", "gradle-9.4.1-stock-onlyif-v1")
     } else if kmp_k2 {
         ("gradle-9.3.0-stock-actions-v1", "gradle-9.3.0-stock-onlyif-v1")
     } else if kmp_fragments {
@@ -651,7 +667,7 @@ pub(super) fn selected_tasks_supported_reason(
             "gradle-9.6.1-stock-onlyif-v1",
         )
     };
-    if (!legacy && !complete_k2 && !kmp_k2 && !kmp_fragments)
+    if (!legacy && !complete_k2 && !jvm21 && !kmp_k2 && !kmp_fragments)
         || [primary, java].iter().any(|task| {
             task.options
                 .get("taskActionInventory")
@@ -714,6 +730,7 @@ fn explicit_utf8_recipe(recipe: &JavaCompilerRecipe) -> bool {
     matches!(
         recipe.adapter.as_str(),
         "gradle-7.5-current-jdk17-utf8-javac-api-v1"
+            | "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1"
             | "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
     )
 }
@@ -745,6 +762,9 @@ fn source_sdk_encoding_supported(task: &CompilerTask, recipe: &JavaCompilerRecip
             || ["sourceCompatibility", "targetCompatibility"]
                 .iter()
                 .all(|key| task.options.get(*key).and_then(Value::as_str) == Some("17")))
+        && (recipe.adapter != "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1"
+            || ["sourceCompatibility", "targetCompatibility"].iter()
+                .all(|key| task.options.get(*key).and_then(Value::as_str)==Some("21")))
 }
 
 /// Retain the complete captured list, including -nowarn, duplicate -proc:none and empty sourcepath.
@@ -765,10 +785,13 @@ fn replay_options(
         .filter(|(_, path)| same_path(path, kotlin_output))
         .map(|(index, _)| index)
         .collect();
-    anyhow::ensure!(kotlin_slots.len() == 1, "java-kotlin-output-slot-unknown");
+    let java_only = task.language == crate::classpath::CompilerLanguage::Java
+        && task.output_roots.iter().any(|output| same_path(output, kotlin_output));
+    anyhow::ensure!(if java_only {kotlin_slots.is_empty()} else {kotlin_slots.len() == 1},
+        "java-kotlin-output-slot-unknown");
     for (index, path) in task.classpath.iter().enumerate() {
         anyhow::ensure!(
-            index == kotlin_slots[0]
+            kotlin_slots.first() == Some(&index)
                 || !paths_overlap(
                     &kotlin_path_key(&crate::paths::file_key(path)),
                     &kotlin_path_key(&crate::paths::file_key(kotlin_output))
@@ -777,7 +800,7 @@ fn replay_options(
         );
     }
     let mut paths = task.classpath.clone();
-    paths[kotlin_slots[0]] = private.join("lease");
+    if let Some(index) = kotlin_slots.first() {paths[*index] = private.join("lease");}
     let mut result = options.clone();
     for (index, directory) in [
         (destination, "java-classes"),
@@ -806,6 +829,13 @@ pub(super) fn configured_recipe(
     let recipe = task
         .java_compiler_recipe()
         .ok_or_else(|| anyhow::anyhow!("java-selected-recipe-unavailable"))?;
+    if java_only(request) {
+        java_producer_recipe(task)?;
+        anyhow::ensure!(request.sources == task.source_files && request.java_dependencies.is_empty()
+            && request.java_editor_sources.is_empty() && request.java_dependency_sources.is_empty(),
+            "java-producer-source-role-unhandled");
+        return Ok(recipe);
+    }
     let kotlin = request
         .task
         .kotlin_compiler
@@ -943,6 +973,46 @@ pub(super) fn configured_recipe(
         &request.task.output_roots[0],
         &request.project_dir,
     )?;
+    Ok(recipe)
+}
+
+fn java_only(request: &KotlinDiagnosticRequest) -> bool {
+    request.task.language == crate::classpath::CompilerLanguage::Java
+        && request.java_task.as_ref() == Some(&request.task)
+}
+
+/// An authored Java task is its own producer, with no invented Kotlin task or header authority.
+pub(super) fn java_producer_recipe(task: &CompilerTask) -> anyhow::Result<JavaCompilerRecipe> {
+    let recipe=task.java_compiler_recipe().ok_or_else(||anyhow::anyhow!("java-producer-recipe-unknown"))?;
+    let (actions,only_if,version)=match recipe.adapter.as_str() {
+        "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1" =>
+            ("gradle-9.4.1-stock-actions-v1","gradle-9.4.1-stock-onlyif-v1","21."),
+        _ => anyhow::bail!("java-producer-profile-unhandled"),
+    };
+    anyhow::ensure!(task.language==crate::classpath::CompilerLanguage::Java
+        && task.kotlin_compiler.is_none() && task.complete && task.problem.is_none()
+        && matches!(task.task_type.as_str(),"org.gradle.api.tasks.compile.JavaCompile" | "org.gradle.api.tasks.compile.JavaCompile_Decorated"),
+        "java-producer-task-unhandled");
+    anyhow::ensure!(stock_task_action(task,"org.gradle.api.tasks.compile.JavaCompile","compile") && stock_only_if(task,false)
+        && task.options.get("taskActionInventory").and_then(|fact|fact.get("adapter")).and_then(Value::as_str)==Some(actions)
+        && task.options.get("taskOnlyIfInventory").and_then(|fact|fact.get("adapter")).and_then(Value::as_str)==Some(only_if),
+        "java-producer-stock-task-unhandled");
+    task.java_api_option_slots(&recipe)?;
+    anyhow::ensure!(task.annotation_processing_disabled() && task.annotation_processor_path.is_empty(),
+        "java-producer-processing-unhandled");
+    anyhow::ensure!(source_sdk_encoding_supported(task,&recipe)
+        && recipe.gradle_java_version.starts_with(version) && recipe.java_runtime_version.starts_with(version)
+        && recipe.effective_charset=="UTF-8" && task.java_home.as_ref().is_some_and(|sdk|sdk.is_absolute())
+        && crate::classpath::sdk_producer_roots(task).is_some_and(|(_,complete)|complete),
+        "java-producer-sdk-or-source-roots-unhandled");
+    anyhow::ensure!(task.output_roots.len()==1 && task.output_roots[0].is_absolute(),
+        "java-producer-output-role-unhandled");
+    anyhow::ensure!(!task.source_files.is_empty()
+        && task.source_files.iter().all(|path|path.is_absolute() && path.extension().and_then(|e|e.to_str())==Some("java"))
+        && task.source_files.iter().map(|path|header_key(path)).collect::<BTreeSet<_>>().len()==task.source_files.len(),
+        "java-producer-source-inventory-unhandled");
+    // Validation only: this absolute placeholder is never created or written.
+    replay_options(task,&recipe,&task.output_roots[0],&task.output_roots[0])?;
     Ok(recipe)
 }
 
@@ -1099,7 +1169,7 @@ pub(super) struct Tools {
 }
 
 impl Tools {
-    fn check_live(&self) -> anyhow::Result<()> {
+    pub(super) fn check_live(&self) -> anyhow::Result<()> {
         for (path, stamp) in &self.stamps {
             anyhow::ensure!(
                 kotlin_input_stamp(path)? == *stamp,
@@ -1146,9 +1216,11 @@ impl Tools {
                 .any(|(original, _)| same_path(original, path))
         });
         let mut pins = BTreeSet::new();
-        pins.extend(environment.key.recipe.default_classpath.iter().cloned());
-        pins.extend(environment.key.recipe.current_jvm_tools_jar.iter().cloned());
-        pins.extend(kotlin_plugin_paths(&kotlin_analysis_arguments(&request.task.arguments)?)?);
+        if !java_only(request) {
+            pins.extend(environment.key.recipe.default_classpath.iter().cloned());
+            pins.extend(environment.key.recipe.current_jvm_tools_jar.iter().cloned());
+            pins.extend(kotlin_plugin_paths(&kotlin_analysis_arguments(&request.task.arguments)?)?);
+        }
         let mut pin_text = String::new();
         for path in pins {
             pin_text.push_str(&format!(
@@ -1240,7 +1312,7 @@ impl Tools {
         let source_root = self.owner.directory.join("assets");
         let recipe = &environment.key.recipe;
         let mut outputs = Vec::new();
-        if !k2_normal(request) && !kmp_release8_java(request) {
+        if !java_only(request) && !k2_normal(request) && !kmp_release8_java(request) {
             let plugin_classes = self.owner.directory.join("classes/headers");
             std::fs::create_dir(&plugin_classes)?;
             let mut arguments = vec![
@@ -2494,6 +2566,7 @@ pub(super) fn run(
         canonical,
         clean,
         false,
+        &environment.java_tools,
     )
 }
 
@@ -2511,7 +2584,27 @@ pub(super) fn run_for_producer(
         canonical,
         clean,
         true,
+        &environment.java_tools,
     )
+}
+
+pub(super) fn run_java_producer(
+    request: &KotlinDiagnosticRequest, environment: &KotlinDiagnosticEnvironment,
+) -> anyhow::Result<(KotlinEditorOverlay, Tools)> {
+    anyhow::ensure!(java_only(request),"java-producer-task-role-unhandled");
+    configured_recipe(request)?;
+    let roots=owned_membership_inputs(request)?;
+    let membership=crate::compiled_watch::WatchPlan::read_inputs(&roots)?;
+    environment.watch.extend(membership.clone())?;
+    owned_source_membership(request,&membership)?;
+    let overlay=KotlinEditorOverlay::create(request)?;
+    let cache=std::sync::Mutex::new(None);
+    run_checked(request,environment,&overlay,&[],true,true,&cache)?;
+    owned_source_membership(request,&membership)?;
+    let (tools,compiled)=cache.into_inner().map_err(|_|anyhow::anyhow!("java-tool-cache-poisoned"))?
+        .ok_or_else(||anyhow::anyhow!("java-producer-tools-missing"))?;
+    compiled.map_err(anyhow::Error::msg)?;
+    Ok((overlay,tools))
 }
 
 fn run_checked(
@@ -2521,6 +2614,7 @@ fn run_checked(
     canonical: &[CompileDiagnostic],
     clean: bool,
     require_clean: bool,
+    tools_cache: &std::sync::Mutex<Option<(Tools, Result<(), String>)>>,
 ) -> anyhow::Result<JavaDiagnostics> {
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
@@ -2532,8 +2626,8 @@ fn run_checked(
         !(complete_k2 || canonical_only) || (clean && canonical.iter().all(|d| d.severity != Severity::Error)),
         "java-k2-normal-compilation-required"
     );
-    // run_kotlin_editor_compile creates this fresh output and calls us only after owned/EOF
-    // selected_kotlin_output; clean=true means exit0 with no reported canonical errors.
+    // Kotlin callers arrive after owned/EOF canonical compilation. A Java-only producer
+    // instead has an authored zero-Kotlin inventory and a fresh empty Kotlin-output role.
     let canonical_outputs = if clean
         && canonical
             .iter()
@@ -2552,8 +2646,7 @@ fn run_checked(
     };
     anyhow::ensure!(!canonical_only || canonical_outputs.is_some(),
         "java-kmp-normal-output-required");
-    let mut cached = environment
-        .java_tools
+    let mut cached = tools_cache
         .lock()
         .map_err(|_| anyhow::anyhow!("java-tool-cache-poisoned"))?;
     if cached.is_none() {
@@ -2586,8 +2679,8 @@ fn run_checked(
         )?;
         (
             serde_json::json!({
-                "component": if complete_k2 { "canonical-k2-complete-output" } else { "canonical-k1-complete-output" },
-                "compilerVersion": environment.key.recipe.compiler_version,
+                "component": if java_only(request) {"java-only-no-kotlin-sources"} else if complete_k2 { "canonical-k2-complete-output" } else { "canonical-k1-complete-output" },
+                "compilerVersion": if java_only(request) {recipe.java_runtime_version.as_str()} else {environment.key.recipe.compiler_version.as_str()},
                 "sourceSha256": expected,
                 "outputInventory": before,
             }),

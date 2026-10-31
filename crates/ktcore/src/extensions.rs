@@ -1653,6 +1653,12 @@ impl ReadSession<'_> {
         self.with_source_view(source,|read|read.declaration_member(declaration))
     }
 
+    /// A snapshot may attest an eligible nominal name without granting compiled ABI authority.
+    pub fn snapshot_type_binary_name(&mut self,source:&SourceHandle,ty:&TypeId)
+        ->Result<Fact<JvmBinaryName>,ContractError> {
+        self.with_source_view(source,|read|read.type_binary_name(ty))
+    }
+
     pub fn snapshot_declaration_location(&mut self,source:&SourceHandle,declaration:&DeclarationId)
         ->Result<Fact<SourceLocation>,ContractError> {
         if declaration.definition.file!=source.file {return Err(ContractError::ForeignIdentity);}
@@ -2232,15 +2238,19 @@ impl ReadSession<'_> {
         })))
     }
 
-    pub fn type_jvm(&mut self, owner: &TypeId) -> Result<TypeJvmFacts, ContractError> {
-        let binary_name = match self.reference_type(owner)? {
+    fn type_binary_name(&mut self, owner: &TypeId) -> Result<Fact<JvmBinaryName>, ContractError> {
+        Ok(match self.reference_type(owner)? {
             Knowledge::Found(JvmType::Reference(reference)) => Knowledge::Found(JvmBinaryName {
                 descriptor: format!("L{};", reference.internal_name),
                 internal_name: reference.internal_name,
             }),
             Knowledge::Unknown(reasons) => Knowledge::Unknown(reasons),
             _ => unknown(IncompleteReason::MissingFacts),
-        };
+        })
+    }
+
+    pub fn type_jvm(&mut self, owner: &TypeId) -> Result<TypeJvmFacts, ContractError> {
+        let binary_name = self.type_binary_name(owner)?;
         let (declared_members, declared_members_coverage) = self.declared_members(owner)?;
         let mut inputs = self.compiler_classes(owner)?;
         if let Knowledge::Found(class) = self.compiled_class(owner)? {

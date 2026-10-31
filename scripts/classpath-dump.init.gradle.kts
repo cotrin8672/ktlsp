@@ -280,6 +280,7 @@ object KtlspCompilerConfiguration {
         "7.5" -> JavaGradleProfile("7.5", "isConfigurationCache", "IncrementalInputsTaskAction")
         "8.10.2" -> JavaGradleProfile("8.10.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.3.0" -> JavaGradleProfile("9.3.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
+        "9.4.1" -> JavaGradleProfile("9.4.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.8.2" -> JavaGradleProfile("9.8.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.8.0" -> JavaGradleProfile("9.8.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
@@ -333,8 +334,13 @@ object KtlspCompilerConfiguration {
         check(task.javaClass.name in listOf("org.gradle.api.tasks.compile.JavaCompile",
             "org.gradle.api.tasks.compile.JavaCompile_Decorated")) { "Unsupported Java recipe task type" }
         val o = task.options
-        val explicitUtf8Jdk21 = profile.version == "9.6.1" &&
+        val explicitUtf8Jdk21 = profile.version in listOf("9.4.1", "9.6.1") &&
             task.sourceCompatibility == "21" && task.targetCompatibility == "21" && o.encoding == "UTF-8"
+        val parametersJdk21 = profile.version == "9.4.1" && explicitUtf8Jdk21 &&
+            o.release.orNull == null && o.compilerArgs == listOf("-Xlint:unchecked", "-parameters")
+        check(profile.version != "9.4.1" || parametersJdk21) {
+            "Gradle 9.4.1 Java execution requires the selected JDK21 UTF8 parameters profile"
+        }
         val defaultUtf8Target17Jdk21 = profile.version == "9.6.1" &&
             task.sourceCompatibility == "17" && task.targetCompatibility == "17" &&
             o.release.orNull == null && o.encoding == null &&
@@ -362,7 +368,7 @@ object KtlspCompilerConfiguration {
             o.forkOptions.allJvmArgs.isNullOrEmpty() && o.forkOptions.memoryInitialSize == null &&
             o.forkOptions.memoryMaximumSize == null && o.forkOptions.tempDir == null) { "Unsupported Java compiler fork policy" }
         check(o.compilerArgumentProviders.isEmpty()) { "Java compiler argument providers are unhandled" }
-        check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none")) { "Opaque Java compiler arguments are unhandled" }
+        check(o.compilerArgs.isEmpty() || o.compilerArgs == listOf("-proc:none") || parametersJdk21) { "Opaque Java compiler arguments are unhandled" }
         check(processors.isEmpty() || release17ProcessorsJdk17) { "Java annotation processing is unhandled" }
         check(o.sourcepath == null && o.bootstrapClasspath == null && o.extensionDirs == null &&
             (o.release.orNull == null || release8Utf8Jdk17 || release8DefaultUtf8Jdk21 || release17ProcessorsJdk17) &&
@@ -377,7 +383,7 @@ object KtlspCompilerConfiguration {
         check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
         val selected = when (profile.version) {
             "7.4.2", "7.5" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
-            "8.10.2", "9.6.1", "9.8.2" -> task.javaCompiler.orNull
+            "8.10.2", "9.4.1", "9.6.1", "9.8.2" -> task.javaCompiler.orNull
             else -> error("Unsupported Java compiler selector")
         } ?: error("Selected Java compiler is unavailable")
         check(selected.javaClass.name == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler") {
@@ -442,6 +448,7 @@ object KtlspCompilerConfiguration {
         return linkedMapOf(
             "adapter" to when {
                 release17ProcessorsJdk17 -> "gradle-8.10.2-current-jdk17-release17-javac-api-with-processors-v1"
+                parametersJdk21 -> "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1"
                 explicitUtf8Jdk21 -> "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
                 defaultUtf8Target17Jdk21 -> "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
                 release8Utf8Jdk17 -> "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
@@ -818,7 +825,7 @@ object KtlspCompilerConfiguration {
     private fun sdkSourceFacts(task: Task, language: String): Pair<Map<String, Any?>?, Map<String, Any?>?> {
         var claims: Map<String, Any?>? = null
         val policy = runCatching {
-        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1", "9.8.0", "9.8.2"))
+        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.4.1", "9.6.1", "9.8.0", "9.8.2"))
         val extension = task.project.extensions.findByName("kotlin")
         val targets = extension?.javaClass?.methods?.firstOrNull { it.name == "getTargets" && it.parameterCount == 0 }
             ?.invoke(extension) as? Iterable<*>
@@ -878,7 +885,7 @@ object KtlspCompilerConfiguration {
         val treeType = Class.forName("org.gradle.api.internal.file.FileCollectionInternal", false, loader)
         val visitType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType", false, loader)
         // Verified Gradle 8/9 visitors removed Spec and default to Visit.
-        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1", "9.8.0", "9.8.2")) "Visit" else "Spec"
+        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.4.1", "9.6.1", "9.8.0", "9.8.2")) "Visit" else "Spec"
         val spec = visitType.enumConstants.single { (it as Enum<*>).name == visitName }
         val future = linkedSetOf<java.io.File>()
         val producerRoots = linkedSetOf<java.io.File>()

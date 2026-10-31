@@ -3519,13 +3519,67 @@ fn snapshot_facts_resolve_in_their_own_package_and_dependencies_then_restore_own
 }
 
 #[test]
+fn snapshot_facts_jvm_names_use_the_foreign_scope_and_existing_nominal_eligibility() {
+    let (mut index,mut store,main,test)=snapshot_view_fixture();
+    let main_choice="/snapshot/main/Choice.kt";
+    let test_choice="/snapshot/test/Choice.kt";
+    let foreign="/snapshot/test/Names.kt";
+    let text="package testpkg\nimport shared.Outer.Target as Selected\nclass Names { fun probe(input: Selected) {} }\nclass Plain\nclass Generic<T>\n@JvmInline value class Inline(val raw: Int)\n";
+    for (file,text,package,origin,scope) in [
+        (main_choice,"package shared\nclass Outer { class Target }\n","shared","app-main",main.clone()),
+        (test_choice,"package shared\nclass Outer { class Target }\n","shared","app-test",test.clone()),
+        (foreign,text,"testpkg","app-test",test.clone()),
+    ] {
+        index_source(&mut index,file,text,package);
+        index.set_file_origin(file,FileOrigin {origin_id:origin.into(),representation:SourceRepresentation::Source,project_scope:Some(scope)});
+        let tree=KotlinParser::new().parse(text);
+        let scope=ktcore::indexer::TypeScope::with_default_imports(package,ktcore::parser::imports_of(&tree,text),&["kotlin","java.lang"]);
+        let declarations=ktcore::extensions::source::extract(&index,file,&tree,text,&scope);
+        store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
+    }
+    // Independent compiler views deliberately contain different declarations of the same FQN.
+    index.replace_scope_visibilities(vec![
+        ScopeVisibility {scope:main,ordered_origins:vec!["app-main".into(),"main-dep".into()]},
+        ScopeVisibility {scope:test.clone(),ordered_origins:vec!["app-test".into(),"test-dep".into()]},
+    ]);
+    let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+    let Knowledge::Found(owner_type)=read.resolve_type("shared.Outer.Target") else {panic!("main type");};
+    assert_eq!(owner_type.definition().file,main_choice);
+    let source=read.source_inventory_for_scope(test,BTreeSet::from([foreign.into()])).unwrap().remove(0);
+    let declarations=read.source_snapshot_declarations(&source).unwrap();
+    let probe=declarations.iter().find(|declaration|&text[declaration.name_range.clone()]=="probe").unwrap();
+    let Knowledge::Found(parameters)=&probe.parameters else {panic!("parameters");};
+    let Knowledge::Found(target)=read.resolve_source_type_ref(&source,&parameters[0].ty).unwrap() else {panic!("import alias target");};
+    assert_eq!(target.definition().file,test_choice);
+    assert_eq!(read.snapshot_type_binary_name(&source,&target).unwrap(),Knowledge::Found(JvmBinaryName {
+        internal_name:"shared/Outer$Target".into(),descriptor:"Lshared/Outer$Target;".into(),
+    }));
+    let Knowledge::Found(plain)=read.resolve_source_type_ref(&source,&ktcore::types::TypeRef::simple("Plain")).unwrap() else {panic!("plain nominal");};
+    assert!(matches!(read.snapshot_type_binary_name(&source,&plain).unwrap(),Knowledge::Found(name) if name.internal_name=="testpkg/Plain"));
+    for name in ["Generic","Inline"] {
+        let Knowledge::Found(ty)=read.resolve_source_type_ref(&source,&ktcore::types::TypeRef::simple(name)).unwrap() else {panic!("{name}");};
+        assert!(matches!(read.snapshot_type_binary_name(&source,&ty).unwrap(),Knowledge::Unknown(_)),"{name}");
+    }
+    assert_eq!(read.snapshot_type_binary_name(&source,&owner_type),Err(ContractError::ForeignIdentity));
+    assert!(matches!(read.resolve_type("shared.Outer.Target"),Knowledge::Found(ty) if ty==owner_type),"restore owner after error and success");
+    assert_eq!(read.source().get(..15),Some("package mainpkg"));
+    assert!(matches!(read.require(MemberRequirement {target:Knowledge::Found(target),authored:None,
+        names:MemberNames::Exact(vec!["probe".into()]),kind:MemberKind::Method,
+        signature:Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),
+        dispatch:Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),name_link:NameLink::Direct}),
+        Err(ContractError::ForeignIdentity)),"name reads grant no foreign contribution authority");
+}
+
+#[test]
 fn snapshot_facts_reject_other_sessions_and_unavailable_compiler_scopes() {
     let (mut index,mut store,main,test)=snapshot_view_fixture();
     let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
     let source=read.source_inventory_for_scope(test.clone(),std::collections::BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap().remove(0);
+    let Knowledge::Found(ty)=read.resolve_source_type_ref(&source,&ktcore::types::TypeRef::simple("Test")).unwrap() else {panic!("snapshot type");};
     drop(read);
     let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
     assert!(matches!(read.source_snapshot_declarations(&source),Err(ContractError::ForeignIdentity)));
+    assert_eq!(read.snapshot_type_binary_name(&source,&ty),Err(ContractError::ForeignIdentity));
     drop(read);
     index.replace_scope_visibilities(vec![ScopeVisibility {scope:main,ordered_origins:vec!["app-main".into(),"main-dep".into()]}]);
     let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
@@ -3533,6 +3587,7 @@ fn snapshot_facts_reject_other_sessions_and_unavailable_compiler_scopes() {
     assert_eq!(read.source_snapshot(&source).unwrap().as_ref(),SNAPSHOT_TEST_TEXT,"membership still permits raw snapshots");
     assert!(matches!(read.source_semantic_scope(&source).unwrap(),Knowledge::Unknown(_)));
     assert!(matches!(read.resolve_source_type_ref(&source,&ktcore::types::TypeRef::simple("Test")).unwrap(),Knowledge::Unknown(_)));
+    assert!(matches!(read.snapshot_type_binary_name(&source,&ty).unwrap(),Knowledge::Unknown(_)));
 }
 
 #[test]
@@ -3542,9 +3597,11 @@ fn snapshot_facts_track_unsaved_edits_and_selected_source_membership_changes() {
         let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
         let source=read.source_inventory_for_scope(test.clone(),std::collections::BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap().remove(0);
         read.source_snapshot_declarations(&source).unwrap();
+        let Knowledge::Found(ty)=read.resolve_source_type_ref(&source,&ktcore::types::TypeRef::simple("Test")).unwrap() else {panic!("snapshot type");};
+        assert!(read.snapshot_type_binary_name(&source,&ty).unwrap().is_found());
         let pending=read.finish();
         let (file,text)=if membership {("/snapshot/test/New.kt","package testpkg\nclass New\n".to_string())}
-            else {(SNAPSHOT_TEST,format!("{SNAPSHOT_TEST_TEXT}// unsaved edit 😀\n"))};
+            else {(SNAPSHOT_TEST,SNAPSHOT_TEST_TEXT.replace("class Test {","class Edited {"))};
         index_source(&mut index,file,&text,"testpkg");
         index.set_file_origin(file,FileOrigin {origin_id:"app-test".into(),representation:SourceRepresentation::Source,project_scope:Some(test)});
         let tree=KotlinParser::new().parse(&text);
@@ -3552,5 +3609,14 @@ fn snapshot_facts_track_unsaved_edits_and_selected_source_membership_changes() {
         let declarations=ktcore::extensions::source::extract(&index,file,&tree,&text,&scope);
         store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
         assert!(matches!(store.resume(&index,SNAPSHOT_MAIN,pending),Err(ContractError::Stale)),"membership={membership}");
+        if !membership {
+            let mut read=store.begin(&index,"snapshots",SNAPSHOT_MAIN).unwrap();
+            let current=read.source_inventory_for_scope(source.scope().clone(),BTreeSet::from([SNAPSHOT_TEST.into()])).unwrap().remove(0);
+            assert_ne!(current.revision(),source.revision());
+            assert_eq!(read.snapshot_type_binary_name(&source,&ty),Err(ContractError::ForeignIdentity));
+            assert_eq!(read.snapshot_type_binary_name(&current,&ty),Err(ContractError::Stale));
+            let Knowledge::Found(edited)=read.resolve_source_type_ref(&current,&ktcore::types::TypeRef::simple("Edited")).unwrap() else {panic!("current unsaved class");};
+            assert!(matches!(read.snapshot_type_binary_name(&current,&edited).unwrap(),Knowledge::Found(name) if name.internal_name=="testpkg/Edited"));
+        }
     }
 }

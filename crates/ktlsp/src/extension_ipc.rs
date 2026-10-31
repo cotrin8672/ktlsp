@@ -63,6 +63,35 @@ fn root_read_batch(reads:Vec<crate::root_files::ReadPlan>)->impl Iterator<Item=c
     })
 }
 
+pub(crate) fn bounded_trace_text(text:&str)->&str {
+    let mut end=text.len().min(512);
+    while !text.is_char_boundary(end) {end-=1;}
+    &text[..end]
+}
+
+fn trace_command_state(work:&Work,workspace:&Arc<parking_lot::Mutex<crate::workspace::Workspace>>,
+    dispatch:bool,stage:&str,error:Option<&str>) {
+    if work.command.is_none() || !crate::trace::enabled() {return;}
+    let owner=work.params["owner"].as_str().unwrap_or_default();
+    let (generation,current,document)={let ws=workspace.lock();
+        (ws.analysis_generation(),ws.ipc_evaluation_current(work.evaluation),ws.owned_document_snapshot(owner))};
+    crate::trace::span("extension.ipc.command_state","extension",Instant::now(),json!({
+        "evaluation":work.evaluation,"instance":work.worker.id,"dispatch":dispatch,"stage":stage,
+        "provider":bounded_trace_text(&work.provider),"command":work.command.as_deref().map(bounded_trace_text),
+        "owner":bounded_trace_text(owner),"analysis_generation":generation,"evaluation_current":current,
+        "source_sha256":work.params["context"]["sourceSha256"].as_str().map(bounded_trace_text),
+        "expected_document_version":work.params["context"]["documentVersion"].as_i64(),
+        "expected_document_revision":work.params["context"]["documentRevision"].as_str().map(bounded_trace_text),
+        "current_document_version":document.as_ref().and_then(|doc|doc.document_version),
+        "current_document_revision":document.as_ref().map(|doc|doc.revision),
+        "error":error.map(bounded_trace_text)}));
+}
+
+fn child_error_trace_metadata(work:&Work,error:&Value,enabled:bool)->Option<Value> {
+    enabled.then(||json!({"evaluation":work.evaluation,"instance":work.worker.id,"command":work.command.is_some(),
+        "code":error["code"].as_i64(),"message":error["message"].as_str().map(bounded_trace_text)}))
+}
+
 fn semantic_response_error(error:&Value,host_stale:bool)->String {
     if host_stale && error["code"].as_i64()==Some(-32801) {"Stale".into()}
     else {format!("extension evaluation failed: {error}")}
@@ -1636,8 +1665,10 @@ impl Evaluation {
                             if self.project_operations & TYPE_JVM == 0 {
                                 return Err("typeJvm was not negotiated".into());
                             }
-                            if matches!(self.handles.get(&target),Some(Handle::SnapshotType {..})) {
-                                json!({"binaryName":unsupported_source_fact(),"classFlags":unsupported_source_fact(),
+                            if let Some(Handle::SnapshotType {source,value})=self.handles.get(&target) {
+                                let name=read.snapshot_type_binary_name(source,value).map_err(contract)?;
+                                json!({"binaryName":fact(&name,|name|json!({"internalName":name.internal_name,"descriptor":name.descriptor})),
+                                    "classFlags":unsupported_source_fact(),
                                     "declaredMembers":{"members":[],"coverage":unsupported_source_fact()},
                                     "abi":unsupported_source_fact(),"jvmAbiCoverage":unsupported_source_fact()})
                             } else {
@@ -2661,11 +2692,15 @@ impl Worker {
         workspace: &Arc<parking_lot::Mutex<crate::workspace::Workspace>>,
         after_batch: Arc<dyn Fn() + Send + Sync>, cancellation: &AtomicBool, dispatch: bool,
     ) -> Result<Value, String> {
+        trace_command_state(work,workspace,dispatch,"start",None);
         let queue_deadline = Instant::now() + EVALUATION_LIMIT;
         let mut transport = if work.command.is_some() {
             loop {
                 if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
-                if self.stopped.load(Ordering::Acquire) || !workspace.lock().ipc_evaluation_current(work.evaluation) { return Err("Stale".into()); }
+                if self.stopped.load(Ordering::Acquire) || !workspace.lock().ipc_evaluation_current(work.evaluation) {
+                    trace_command_state(work,workspace,dispatch,"queue",Some("Stale"));
+                    return Err("Stale".into());
+                }
                 match self.transport.try_lock() {
                     Ok(guard) => break guard,
                     Err(std::sync::TryLockError::WouldBlock) if Instant::now() < queue_deadline => std::thread::sleep(Duration::from_millis(10)),
@@ -2677,6 +2712,7 @@ impl Worker {
         if self.stopped.load(Ordering::Acquire) {
             return Err("extension stopped".into());
         }
+        let mut stage="initialize";
         let result = (|| {
             if transport.is_none() {
                 *transport = Some(Transport::spawn(
@@ -2717,6 +2753,7 @@ impl Worker {
                 if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
                 if !workspace.lock().ipc_evaluation_current(work.evaluation) { return Err("Stale".into()); }
             }
+            stage="source-capture";
             let mut source_prepared = false;
             if self.project_operations() & (SOURCE_INVENTORY | SOURCE_SNAPSHOT) != 0 {
                 let request = workspace.lock().begin_ipc_project_source_capture(
@@ -2736,6 +2773,7 @@ impl Worker {
                 if !source_prepared && !workspace.lock().ipc_evaluation_current(work.evaluation) { return Err("Stale".into()); }
                 return Ok(Value::Null);
             }
+            stage="resource-capture";
             if self.project_operations()&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT)!=0 {
                 let plans=workspace.lock().begin_ipc_resource_captures(work.evaluation,self.project_operations()&PROJECT_INPUTS!=0);
                 for plan in plans {
@@ -2743,6 +2781,7 @@ impl Worker {
                     workspace.lock().finish_ipc_resource_capture(prepared)?;
                 }
             }
+            stage="dispatch";
             let id = work.evaluation.to_string();
             transport.send(
                 work_message(work),
@@ -2751,6 +2790,7 @@ impl Worker {
             let mut cancelled = false;
             let mut stale_input = false;
             loop {
+                stage="receive";
                 let message = transport.receive(deadline, &self.stopped, || {
                     if !cancelled && (cancellation.load(Ordering::Acquire) || !workspace.lock().ipc_evaluation_current(work.evaluation)) {
                         cancelled = true;
@@ -2767,35 +2807,48 @@ impl Worker {
                     let Some(request_id) = message.get("id") else {
                         continue;
                     };
+                    let batch_start=Instant::now();
                     let prepared_inputs=(||->Result<(),String> {
                         let (roots,reads,class,jvm)={
                             let mut workspace=workspace.lock();
+                            stage="prepay-input";
                             workspace.prepay_ipc_input_read(work.evaluation,method,&message["params"])?;
+                            stage="plan-root-captures";
                             let roots=workspace.begin_ipc_root_captures(work.evaluation,method,&message["params"])?;
+                            stage="plan-resource-reads";
                             let reads=workspace.begin_ipc_resource_reads(work.evaluation,method,&message["params"])?;
+                            stage="plan-class-read";
                             let class=workspace.begin_ipc_class_reads(work.evaluation,method,&message["params"])?;
+                            stage="plan-jvm-read";
                             let jvm=workspace.begin_ipc_jvm_reads(work.evaluation,method,&message["params"])?;
                             (roots,reads,class,jvm)
                         };
                         for root in roots {
+                            stage="root-capture-prepare";
                             let prepared=crate::root_files::prepare(root,after_batch.clone());
+                            if prepared.catalog.is_ok() {stage="root-capture-attach";}
                             workspace.lock().finish_ipc_root_capture(prepared)?;
                         }
+                        stage="plan-root-reads";
                         let root_reads=workspace.lock().begin_ipc_root_reads(work.evaluation,method,&message["params"])?;
+                        stage="root-read";
                         for prepared in root_read_batch(root_reads) {
                             workspace.lock().finish_ipc_root_read(prepared)?;
                         }
                         let mut budget=64usize*1024*1024;
+                        stage="resource-read";
                         for mut read in reads {
                             read.byte_budget=read.byte_budget.min(budget);
                             let prepared=crate::resource_inputs::prepare_resource_read(read);
                             if let Ok(bytes)=&prepared.content {budget=budget.saturating_sub(bytes.bytes.len());}
                             workspace.lock().finish_ipc_resource_read(prepared)?;
                         }
+                        stage="class-read";
                         if let Some(class)=class {
                             let prepared=crate::runtime_bytes::prepare_class_read(class,after_batch.clone());
                             workspace.lock().finish_ipc_class_read(prepared)?;
                         }
+                        stage="jvm-read";
                         if let Some(jvm)=jvm {
                             let prepared=crate::jvm_catalog::prepare(jvm,after_batch.clone());
                             workspace.lock().finish_ipc_jvm_read(prepared)?;
@@ -2803,13 +2856,23 @@ impl Worker {
                         Ok(())
                     })();
                     if let Err(error)=&prepared_inputs {workspace.lock().fail_ipc_input_read(work.evaluation,error);}
-                    let result = prepared_inputs.and_then(|_|workspace.lock().ipc_batch(
+                    let result = prepared_inputs.and_then(|_|{stage="facts";workspace.lock().ipc_batch(
                         work.evaluation,
                         method,
                         message["params"].clone(),
-                    ));
+                    )});
+                    if crate::trace::enabled() && method=="analysis/readFacts" {
+                        let queries=message["params"]["queries"].as_array();
+                        let ops:Vec<_>=queries.into_iter().flatten().take(32)
+                            .map(|query|bounded_trace_text(query["op"].as_str().unwrap_or("invalid"))).collect();
+                        crate::trace::span("extension.ipc.read_facts","extension",batch_start,json!({
+                            "evaluation":work.evaluation,"instance":self.id,"command":work.command.is_some(),
+                            "stage":stage,"ops":ops,"query_count":queries.map_or(0,Vec::len),
+                            "ok":result.is_ok(),"error":result.as_ref().err().map(|error|bounded_trace_text(error))}));
+                    }
                     stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
                     if result.is_ok() && method == "analysis/readFacts" {
+                        stage="requested-source-capture";
                         let request=workspace.lock().begin_ipc_requested_source_capture(work.evaluation);
                         if let Some(request)=request {
                             let prepared=crate::workspace::prepare_ipc_source_capture(request);
@@ -2823,9 +2886,15 @@ impl Worker {
                             json!({"jsonrpc":"2.0","id":request_id,"error":{"code":if error=="Stale" {-32801} else {-32602},"message":error}})
                         }
                     };
+                    stage="account-reply";
                     workspace.lock().account_ipc_stream_reply(work.evaluation,&response)?;
                     transport.send(response)?;
                 } else if message["id"] == id {
+                    stage="child-response";
+                    if let Some(metadata)=message.get("error").and_then(|error|
+                        child_error_trace_metadata(work,error,crate::trace::enabled())) {
+                        crate::trace::span("extension.ipc.child_error","extension",Instant::now(),metadata);
+                    }
                     if work.command.is_some() {
                         if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
                         if cancelled || !workspace.lock().ipc_evaluation_current(work.evaluation) { return Err("Stale".into()); }
@@ -2853,6 +2922,7 @@ impl Worker {
                 }
             }
         })();
+        trace_command_state(work,workspace,dispatch,stage,result.as_ref().err().map(String::as_str));
         if result.as_ref().is_err_and(|error| !matches!(error.as_str(), "Stale" | "Cancelled" | "CommandUnavailable" | "CommandFailed")) {
             drop(transport.take());
         }
@@ -3199,6 +3269,21 @@ fn work_message(work:&Work)->Value {
 #[cfg(test)]
 mod provider_command_frame_tests {
     use super::*;
+    #[test]
+    fn command_error_trace_is_opt_in_bounded_utf8_and_preserves_original_error() {
+        let work=Work {command:Some("fixture.info".into()),evaluation:17,provider:"test.trace".into(),
+            worker:Worker::new(vec!["not-spawned".into()]),params:json!({})};
+        let error=json!({"code":-32099,"message":format!("{}😀hidden","x".repeat(510)),"data":{"secret":"never-log"}});
+        let original=error.clone();
+        assert!(child_error_trace_metadata(&work,&error,false).is_none());
+        let metadata=child_error_trace_metadata(&work,&error,true).unwrap();
+        assert_eq!(metadata["code"],-32099);assert_eq!(metadata["evaluation"],17);
+        assert_eq!(metadata["message"].as_str().unwrap(),"x".repeat(510));
+        assert!(metadata.get("data").is_none());assert_eq!(error,original);
+        assert_eq!(bounded_trace_text(&"x".repeat(513)).len(),512);
+        assert_eq!(bounded_trace_text("😀short"),"😀short");
+    }
+
     #[test]
     fn provider_command_frame_matches_the_production_serializer() {
         let work=Work {command:Some("example.complete".into()),evaluation:7,provider:"example.provider".into(),
@@ -3950,6 +4035,8 @@ mod snapshot_source_facts_tests {
             let test_dep=crate::paths::file_key(&root.join(format!("deps/TestDep.{suffix}")));
             let reference=crate::paths::file_key(&root.join(format!("deps/refs/LocalRef.{suffix}")));
             let decoy=crate::paths::file_key(&root.join(format!("deps/decoy/LocalRef.{suffix}")));
+            let nested=crate::paths::file_key(&root.join("test/ForeignJvmNames.java"));
+            let nested_text=include_str!("../../../dev/external-extension/project/fixture/ForeignJvmNames.java");
             let main=ProjectScope {module:"snapshot".into(),source_set:"main".into()};
             let test=ProjectScope {module:"snapshot".into(),source_set:"test".into()};
             let main_lib=ProjectScope {module:"main-lib".into(),source_set:"main".into()};
@@ -3967,7 +4054,8 @@ mod snapshot_source_facts_tests {
             let decoy_text=if java {"package decoy; public class LocalRef<T> {}"} else {"package decoy\nclass LocalRef<T>"};
             let inputs=[(&owner,owner_text,"app-main",main.clone()),(&foreign,foreign_text,"app-test",test.clone()),
                 (&main_dep,main_text,"main-lib",main_lib.clone()),(&test_dep,test_text,"test-lib",test_lib.clone()),
-                (&reference,reference_text,"main-lib",main_lib.clone()),(&decoy,decoy_text,"main-lib",main_lib.clone())];
+                (&reference,reference_text,"main-lib",main_lib.clone()),(&decoy,decoy_text,"main-lib",main_lib.clone()),
+                (&nested,nested_text,"app-test",test.clone())];
             let mut index=Index::new();let mut parsers=LanguageParsers::new();
             for (file,text,origin,scope) in &inputs {
                 let language=SourceLanguage::for_key(file);let tree=parsers.parse(language,text);
@@ -4087,7 +4175,11 @@ mod snapshot_source_facts_tests {
             assert_eq!(result["facts"][6]["state"],"found");
             assert_eq!(result["facts"][6]["value"]["kind"],"field");
             assert_eq!(result["facts"][6]["value"]["signature"]["value"]["descriptor"],"I");
-            assert_eq!(result["facts"][4]["binaryName"]["reasons"][0]["code"],"UnsupportedSource");
+            assert_eq!(result["facts"][4]["binaryName"],if java {
+                json!({"state":"unknown","reasons":[{"code":"unsupportedType","detail":"testpkg.Mark"}]})
+            } else {
+                json!({"state":"found","value":{"internalName":"testpkg/Mark","descriptor":"Ltestpkg/Mark;"}})
+            },"preserve each parser's existing nominal eligibility");
             assert_eq!(result["facts"][5]["coverage"]["reasons"][0]["code"],"UnsupportedSource");
             let member=method["id"].as_str().unwrap();
             match &evaluation.handles[member] {
@@ -4100,11 +4192,47 @@ mod snapshot_source_facts_tests {
             assert_eq!(location["facts"][0]["state"],"found");
             assert_eq!(location["facts"][0]["value"]["documentUri"],tower_lsp_server::ls_types::Uri::from_file_path(&foreign).unwrap().to_string());
             assert_eq!(read.source(),owner_text);assert!(!read.resolve_type("testlib.Dep").is_found());
+            let nested_source=read.source_inventory_for_scope(test.clone(),std::collections::BTreeSet::from([nested.clone()])).unwrap().remove(0);
+            let nested_token=evaluation.issue(Handle::Source(nested_source));
+            let nested_facts=evaluation.read_source_facts(&mut read,Some(&nested_token)).unwrap();
+            let parameter=nested_facts["declarations"].as_array().unwrap().iter()
+                .find(|declaration|declaration["name"]=="foreignJvmProbe").unwrap();
+            let resolved=evaluation.batch(&mut read,"analysis/readFacts",params(vec![
+                json!({"op":"resolveTypeRef","reference":parameter["parameters"]["value"][0]["typeRef"]}),
+            ])).unwrap();
+            let nominal=&resolved["facts"][0]["value"];
+            assert_eq!(resolved["facts"][0]["state"],"found");
+            assert_eq!(nominal["qualifiedName"],"fixture.ForeignJvmNames.Outer.Target");
+            assert_eq!(nominal["readOnly"],true);
+            assert_eq!(nominal["contextSource"]["identity"],nested_facts["source"]["identity"]);
+            let jvm_query=params(vec![json!({"op":"typeJvm","target":nominal["id"]})]);
+            let jvm=evaluation.batch(&mut read,"analysis/readFacts",jvm_query.clone()).unwrap();
+            assert_eq!(jvm["facts"][0],json!({
+                "binaryName":{"state":"found","value":{"internalName":"fixture/ForeignJvmNames$Outer$Target",
+                    "descriptor":"Lfixture/ForeignJvmNames$Outer$Target;"}},
+                "classFlags":unsupported_source_fact(),"abi":unsupported_source_fact(),"jvmAbiCoverage":unsupported_source_fact(),
+                "declaredMembers":{"members":[],"coverage":unsupported_source_fact()},
+            }));
+            assert!(evaluation.ty(&nominal["id"]).unwrap_err().contains("UnsupportedSource"));
+            let denied=evaluation.batch(&mut read,"analysis/require",json!({"evaluation":id,"requirements":[{
+                "target":{"state":"found","value":nominal["id"]},"authored":null,"names":{"kind":"exact","values":["probe"]},
+                "kind":"method","signature":unsupported_source_fact(),"dispatch":unsupported_source_fact(),"nameLink":{"kind":"direct"},
+            }]})).unwrap_err();
+            assert_eq!(denied,"UnsupportedSource: snapshot identities are read-only","java={java}, evaluation={id}");
+            let denied=evaluation.batch(&mut read,"analysis/finish",json!({"evaluation":id,"contributions":{"sites":[{
+                "requirement":nominal["id"],"fullRange":{"start":0,"end":1},"editableName":{"start":0,"end":1},"renameSubject":"target",
+            }]}})).unwrap_err();
+            assert_eq!(denied,"foreign requirement token","java={java}, evaluation={id}");
+            evaluation.project_operations&=!TYPE_JVM;
+            assert!(evaluation.batch(&mut read,"analysis/readFacts",jvm_query.clone()).unwrap_err().contains("not negotiated"));
+            evaluation.project_operations|=TYPE_JVM;
+            assert_eq!(read.source(),owner_text);assert!(!read.resolve_type("testlib.Dep").is_found());
             assert!(evaluation.class_scope.is_none());assert!(evaluation.jvm_catalog.is_none());
             assert!(evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"sourceFacts","source":"foreign"})])).is_err());
             drop(read);
             index.replace_scope_visibilities(vec![ScopeVisibility {scope:main,ordered_origins:vec!["app-main".into(),"main-lib".into()]}]);
             let mut read=store.begin(&index,"snapshot-wire",&owner).unwrap();
+            assert!(evaluation.batch(&mut read,"analysis/readFacts",jvm_query).is_err(),"snapshot JVM name cannot cross sessions");
             assert!(evaluation.batch(&mut read,"analysis/readFacts",params(vec![
                 json!({"op":"resolveTypeRef","reference":parameter_reference}),
             ])).is_err(),"parameter reference cannot cross snapshot read sessions");

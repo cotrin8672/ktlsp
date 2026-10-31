@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-11-01 (Asia/Tokyo). **Acceptance through84; extension follow-ups verified on85/86.**
+Updated 2026-11-01 (Asia/Tokyo). **Acceptance through84; extension follow-ups85/86/88 and Resilience4j89 verified.**
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -8,13 +8,15 @@ The previously unseen mixed-language Okio repository now has eight accepted edit
 interop checks and three current canonical diagnostic states (valid, invalid,
 restored). Its reproduced Gradle/Kotlin and mixed-source producer gaps are fixed.
 MockK's reproduced diagnostic/producer-lifetime failure is also fixed and verified.
-The last full workspace suite, on84, passes1938 tests with16 existing ignores and no failures.
+The last full workspace suite, on89, passes1963 tests with16 existing ignores and no failures
+across42 test binaries. Production guards remain stable and the owned process reaches EOF/live0.
 Release85 additionally passes the focused source-parameter native checks and30 real-editor checks.
 Release86 adds17 focused host checks, one child check and one real-editor root-file scenario.
-The combined workspace rerun is deferred until the final readonly JVM-name follow-up is finished;
-the84 suite is not presented as a full suite on85/86.
-No reproduced blocker remains in the recorded acceptance workflows. Broader grammar,
-SDK/compiler-profile coverage and whole-project IDEA parity remain unmeasured;
+The readonly JVM-name follow-up passes36 real-editor checks on88. Host89 fixes the
+newly reproduced Resilience4j diagnostic gap and verifies error counts0/1/0 against
+the pinned compiler. The combined89 workspace suite passes; the earlier84 result
+is retained separately as historical evidence.
+Broader grammar, SDK/compiler-profile coverage and whole-project IDEA parity remain unmeasured;
 there is no invented completeness percentage or requirement for100% grammar.
 User priority is valid-code Unknown/missing completion and false diagnostics, followed
 by editing UX. Warm speed is accepted provisionally; cold startup is lower priority.
@@ -35,7 +37,7 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Latest acceptance through86
+## Latest qualified acceptance through89
 
 Release artifacts are immutable and identified by their receipts; rows below span
 different releases and must not be presented as one same-binary corpus replay.
@@ -46,17 +48,29 @@ different releases and must not be presented as one same-binary corpus replay.
 | Detailed normalized source input | Release81 real child/Neovim15/15: first-evaluation nested annotation, decoded strings/maps, typed integer facts and current source identity (`new-capability-editor81/`, proof at `C:/Users/gummy/.codex/ktlsp-api81/editor/source-facts-v2/editor/artifacts/extension-ipc-proof.json`). | Java live annotation fixture; shared Java/Kotlin normalization also has focused Rust coverage. No all-constant-expression or implicit Kotlin projection claim. |
 | Callable source parameters | Release85 real child/Neovim30/30: ordered parameters, exact ranges and explicit annotation values, imported `refs.LocalRef` with a visible decoy, zero-arity Found `[]`, legacy field omission and accepted unsaved source SHA (`C:/Users/gummy/.codex/ktlsp-parameters85/editor/artifacts/extension-ipc-proof.json`). Native admission1, source-facts30 plus repaired shadowing1, wire2 and foreign snapshot1 pass (`source-parameters/native85/`, `source-parameters/native85-repaired/`, sealed pair `integrated-host85/main-ready.json`). | Live parameter fixture is Java; native cases also cover Kotlin, import aliases, foreign read-only snapshots, edits/stale reads and forged facts. Nominal generic class identity is resolved; no public generic-argument binding or JVM parameter-index claim. The original Kotlin owner-type-variable negative was preserved and fixed by checking the lexical type before accepting an indexed import. |
 | Filtered workspace files | Release86:17 host and1 child focused checks pass. One real child/Neovim scenario passes1148 assertions, including257 paged entries, registered workspace above the nested owner, configurations outside Gradle resources, exact current/new overlays and CRLF/UTF-8 text, native disk-only cancellation, rejected old evaluation and fresh accepted contents, and old/foreign/path-token denial (`C:/Users/gummy/.codex/ktlsp-root-files86b/editor/artifacts/extension-ipc-proof.json`; sealed pair `integrated-host86/main-ready.json`). | Assertions include per-entry paging checks, not1148 distinct programs. This is a root-file API scenario; unrelated completion/goto assertions are disabled. Windows native recursion is covered; unsupported platforms, symlinks, unreadable inputs and bounds remain Unknown/error. Only Gradle classpath/source metadata dumps ran. Prior failed receipts are retained under `root-files86/native86*` and the first editor run. |
+| Readonly foreign-source JVM name | Host88 real child/Neovim36/36: a closed foreign Java source resolves its nested nominal type to `fixture/ForeignJvmNames$Outer$Target` and the exact reference descriptor, retaining its source identity (`C:/Users/gummy/.codex/ktlsp-snapshot-jvm87/editor/artifacts/extension-ipc-proof.json`; raw serializer `snapshot-jvm87/foreign-jvm-actual88.json`). Core snapshot4 and the combined focused batch5 also pass. | Only the existing eligible nominal binary name is exposed. Source flags, ABI and member coverage remain UnsupportedSource; ordinary owner/require/binding authority is not granted. Generic/value-type lowering remains Unknown. |
+| Additional unseen repository: Resilience4j | At `aa9aacb8cb5333f2dee2590ff07f05f2c942d602`,1241 Java/48 Kotlin source files, sealed86 passes5 real-Neovim checks: existing Kotlin-to-Java completion/goto and unsaved Java method addition followed by Kotlin completion, inspected applied call and goto (`new-project88/editor-unsaved/artifacts/resilience-unsaved.json`). Host89 canonical errors are0/1/0 for valid/`releasePermissioNoSuch()`/restored. Every accepted response matches the wire SHA and current result ID; typo and restoration share one connection (`new-project88/editor-canonical89-oracle/artifacts/resilience-canonical.json`, `new-project88/editor-canonical89-final/artifacts/resilience-canonical.json`). Seven required-clean Java producers cover209 sources with no rejection. | Total diagnostic counts are1/1/1: the valid/restored states contain one existing warning, while the typo state contains only the exact unresolved-reference error. Both behaviors match the pinned Kotlin2.1.21 compiler using a reduced Java-signature/nullability fixture (`new-project88/warning-oracle89/receipt.json`, `invalid-receipt.json`); this is not a full project compiler build. Original7 outputs/JARs remain absent, no generation task ran, and351 dependency source archives remain unavailable. Whole-project producer closure is not independently certified. Prior metadata/admission failures and incorrect warning-invariance expectations are retained as failed receipts, not hidden or counted as passing. |
 | Owning-project and foreign-source input | Release82 real child/Neovim123/123; exactly one command, useful Java/Kotlin main/test types and exact members, source snapshots/provenance and complete main/test resource inventories (`C:/Users/gummy/.codex/ktlsp-api81/editor-project82/project-inputs/editor/artifacts/extension-command-proof.json`). | Provider readiness is correlated to the exact owner/digest. Missing inherited declared output directories are observed as currently empty through existing negative watches; missing JARs remain Unknown. No generated output is built by the host. |
 | Typed binary annotations | Release81 real child/Neovim29/29, selected/unselected metadata and compile-only executable-identity denial (`C:/Users/gummy/.codex/ktlsp-api81/editor-binary81/binary-annotations/editor/artifacts/extension-command-proof.json`). | `binary-annotations-v1` is a representation capability, not a new read operation or Code grant. Current unselected ABI shapes remain unchanged. |
-| Full Rust baseline84 | `integrated-host84/main-ready.json`:42 test binaries,1938 passed/0 failed/16 existing ignored; release host and reused unchanged protocol child sealed, source guards stable, EOF and no owned live processes. | Initial failing suite receipts are retained in `final-workspace83` and `final-workspace83-repaired`. Obsolete extra-parse counts were corrected to exact zero while preserving semantic retraction tests. The actual Java-only header admission regression was fixed without changing its original test; complete/partial/ambiguous coverage controls pass. |
+| Current full Rust suite89 | `final-workspace89/receipt.json`:42 test binaries,1963 passed/0 failed/16 existing ignored, stable production guards, EOF and no owned live processes. | One combined `cargo test --workspace --no-fail-fast` after the fixes. No sealed host/child rebuild, editor replay or benchmark was included. |
+| Historical full Rust baseline84 | `integrated-host84/main-ready.json`:42 test binaries,1938 passed/0 failed/16 existing ignored; release host and reused unchanged protocol child sealed, source guards stable, EOF and no owned live processes. | Initial failing suite receipts are retained in `final-workspace83` and `final-workspace83-repaired`. Obsolete extra-parse counts were corrected to exact zero while preserving semantic retraction tests. The actual Java-only header admission regression was fixed without changing its original test; complete/partial/ambiguous coverage controls pass. |
 
 The root-file capture discards stale attempts and acquires a fresh native lease
 before each bounded retry. An observed pre-attachment Stale now uses the existing
 host requeue while the child stays alive; it cannot publish a successful empty
 evaluation. The original failing native case is unchanged. The editor's initial
 LF assumption was corrected to compare exact actual Neovim text, including CRLF.
-Remaining planned work is the separately scoped readonly SnapshotType binary-name
-read, followed by one combined workspace run. Hierarchy, generic argument rendering,
+Remaining work is the actual CEM consumer check. CEM consumption of86 returned
+Stale at `mcdev.info`; its old cause remains unconfirmed.
+The instrumented88 rerun instead identifies a consumer error: the child compared a
+raw Gradle project path with a semantic membership module. Host reads and final
+validation succeed. The consumer reports its comparison repair passes65 focused
+checks. Its next88 run instead encountered a real stale evaluation at sourceInventory
+prepayment, with current provider and unchanged workspace/document generations;
+the invalidation cause remains Unknown (`cem-root86-stale/d3-attribution.md`). The
+consumer is allowed one separate outer command only after observing a fresh accepted
+evaluation for the same instance/source/version. Actual CEM assertions remain pending;
+neither failed run is counted as passed or explains historical86 Stale. Hierarchy, generic argument rendering,
 primitive class-literal descriptors and extract-local are outside that follow-up.
 
 The84 production correction restores entry to the existing Java-header path;

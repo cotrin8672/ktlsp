@@ -724,7 +724,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match message["method"].as_str() {
             Some("initialize") => {
                 let mut result = json!({"protocol":{"major":PROTOCOL_MAJOR,"minor":0},"capabilities":["semantic-v1"]});
-                if project_facts {
+                if project_facts || source_facts_v2 {
                     let offered = &message["params"];
                     let supports = offered["capabilities"].as_array().is_some_and(|values| {
                         values.iter().any(|value| value == "project-class-facts-v1")
@@ -789,7 +789,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("source-locations-v1"));
                     result["supportedOps"]["source-locations-v1"]=json!(["sourceLocation"]);
                 }
-                if source_snapshots {
+                if source_snapshots || source_facts_v2 {
                     let offered = &message["params"];
                     if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="source-snapshots-v1"))
                         || !["sourceInventory","sourceSnapshot"].iter().all(|op|offered["supportedOps"]["source-snapshots-v1"]
@@ -987,6 +987,8 @@ mod source_inventory_client_tests {
 
 fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
     params:&Value,barrier:&Option<PathBuf>,owner_evaluation:u64)->Result<(),String> {
+    if !params["owner"].as_str().is_some_and(|owner|owner.rsplit(['/', '\\']).next()
+        .is_some_and(|name|name.eq_ignore_ascii_case("CaseMixin.java"))) {return Ok(());}
     let Some(legacy)=params["declarations"].as_array().ok_or("initial declarations")?.iter()
         .find(|declaration|declaration["name"]=="sourceFactsProbe") else {return Ok(());};
     if legacy.get("fullRange").is_some() || legacy.get("modifiers").is_some() {
@@ -1034,11 +1036,35 @@ fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Writ
         {"op":"resolveTypeRef","reference":rich["annotations"][0]["typeRef"]},
         {"op":"resolveTypeRef","reference":nested["annotation"]["typeRef"]},
     ]}))?;
+    let (inventory,snapshots)=read_source_snapshots(input,output,next,&params["evaluation"])?;
+    let sources=inventory["sources"].as_array().ok_or("foreign JVM source inventory")?;
+    let position=sources.iter().position(|source|source["documentUri"]["value"].as_str()
+        .is_some_and(|uri|uri.ends_with("/fixture/ForeignJvmNames.java"))).ok_or("closed foreign JVM source")?;
+    let source=&sources[position];let snapshot=&snapshots[position];
+    if snapshot["state"]!="found" || snapshot["value"]["identity"]!=source["identity"] {
+        return Err("foreign JVM source snapshot unavailable or changed".into());
+    }
+    let foreign=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
+        "queries":[{"op":"sourceFacts","source":source["id"]}]}))?;
+    let foreign=&foreign["facts"][0];
+    let parameter=foreign["declarations"].as_array().ok_or("foreign JVM source declarations")?.iter()
+        .find(|declaration|declaration["name"]=="foreignJvmProbe").ok_or("foreign JVM parameter declaration")?;
+    let resolved=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
+        "queries":[{"op":"resolveTypeRef","reference":parameter["parameters"]["value"][0]["typeRef"]}]}))?;
+    let resolved=&resolved["facts"][0];
+    if resolved["state"]!="found" || resolved["value"]["readOnly"]!=true
+        || resolved["value"]["contextSource"]["identity"]!=source["identity"] {
+        return Err("foreign JVM parameter lost its read-only source context".into());
+    }
+    let jvm=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
+        "queries":[{"op":"typeJvm","target":resolved["value"]["id"]}]}))?;
+    let foreign_jvm=json!({"inventory":inventory,"source":source,"snapshot":snapshot,"facts":foreign,
+        "parameterDeclaration":parameter,"resolved":resolved,"jvm":jvm["facts"][0]});
     let directory=barrier.as_ref().ok_or("source facts fixture barrier")?;
     std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
     std::fs::write(directory.join(format!("source-facts-{}.json",params["evaluation"].as_str().ok_or("evaluation")?)),
         serde_json::to_vec(&json!({"evaluation":params["evaluation"],"ownerEvaluation":owner_evaluation,"legacy":legacy,"rich":rich,"types":types["facts"],
-            "parameterDeclaration":parameter_declaration,"parameterTypes":parameter_types["facts"]})).map_err(|error|error.to_string())?)
+            "parameterDeclaration":parameter_declaration,"parameterTypes":parameter_types["facts"],"foreignJvm":foreign_jvm})).map_err(|error|error.to_string())?)
         .map_err(|error|error.to_string())?;
     Ok(())
 }

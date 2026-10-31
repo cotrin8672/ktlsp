@@ -1010,6 +1010,11 @@ editability and expose a separate authoritative `ownerScope` fact plus contextua
 These additional project fields are omitted without that negotiation; legacy source/resource
 descriptor schemas and fixed frames remain unchanged.
 
+`projectContext.scope.module` is the raw Gradle project path; membership `module` is the
+semantic module identity and must not be compared with that path. Join a membership's issued
+`id` to `projectInputs.sourceSets[].id`, verify the selected project handle and source-set
+`name`, and keep membership separate from `owningSourceSet`. Do not parse opaque identities.
+
 Scoped source reads record source, selected-scope, same-module membership, missing-selected-file
 and model generations. Project model reads also observe the current overlay epoch and namespace.
 Resource inventories and absence retain the existing native leases/overlay epoch. Capture runs in
@@ -1062,9 +1067,16 @@ populate the supported Mixin member slice. Unsupported signatures stay unknown.
 
 With separately negotiated `sourceLocation`, snapshot declaration/type/member
 handles can produce exact locations and accepted-source revision/digest facts.
-They do not become ordinary owner-world semantic identities: `typeJvm` and
-`declaredMembers` still return explicit `UnsupportedSource` knowledge for
-snapshot types. Requirements and other generic identity-consuming operations
+They do not become ordinary owner-world semantic identities. For a snapshot type,
+the existing `typeJvm` operation can return only `binaryName`, when the same checked
+foreign source/compiler view proves an eligible nominal JVM name. It uses the
+existing host reference-type algorithm and accepted declaration ranges; it does
+not reconstruct nested names from a wire qualified name or resolve in the owner's
+scope. Class flags, ABI and coverage remain `Unknown(UnsupportedSource)`, as does
+`declaredMembers` coverage. Unsupported lowering or unavailable eligibility remains
+Unknown for the name as well. The linked equivalent is
+`ReadSession::snapshot_type_binary_name`; no new operation or capability is added.
+Requirements and other generic identity-consuming operations
 reject snapshot identities as read-only, and generic signature reuse still
 checks every referenced type against the evaluation owner's view. Runtime bytes, JVM
 catalogs, and compile/runtime classpath selection remain bound to the evaluation

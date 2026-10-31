@@ -201,7 +201,8 @@ impl CompilerTask {
                     | "gradle-8.10.2-current-jdk17-release17-javac-api-with-processors-v1"
                     | "gradle-9.6.1-current-jdk17-javac-api-v1",
                 "17"
-            ) | ("gradle-9.6.1-current-jdk21-utf8-javac-api-v1", "21")
+            ) | ("gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
+                | "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1", "21")
                 | (
                     "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
                         | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1",
@@ -256,13 +257,23 @@ impl CompilerTask {
                 &["-encoding", "UTF-8"],
                 false,
             ),
+            "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1" => {
+                anyhow::ensure!(task.arguments == ["-Xlint:unchecked", "-parameters"],
+                    "java-api-raw-arguments-unhandled");
+                // Gradle's captured deprecation warning flag precedes the explicit encoding.
+                let decoration: &[&str] = if options.get(6).is_some_and(|option|option=="-deprecation") {
+                    &["-deprecation", "-encoding", "UTF-8"]
+                } else {&["-encoding", "UTF-8"]};
+                (&["-source", "21", "-target", "21"], decoration, false)
+            }
             _ => anyhow::bail!("java-api-options-adapter-unhandled"),
         };
         let destination = levels.len() + 1;
         let header = levels.len() + 2 + decoration.len();
         let classpath = header + 10;
+        let parameters = recipe.adapter == "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1";
         anyhow::ensure!(
-            options.len() == header + 11 + usize::from(raw_proc),
+            options.len() == header + 11 + usize::from(raw_proc) + if parameters {2} else {0},
             "java-api-options-shape-unhandled"
         );
         for (index, expected) in levels.iter().enumerate() {
@@ -301,6 +312,8 @@ impl CompilerTask {
             !raw_proc || options[classpath + 1] == "-proc:none",
             "java-api-raw-processor-argument-differs"
         );
+        anyhow::ensure!(!parameters || options[classpath + 1..] == ["-Xlint:unchecked", "-parameters"],
+            "java-api-raw-arguments-differ");
         anyhow::ensure!(
             task.output_roots.len() == 1
                 && same_java_api_path(Path::new(&options[destination]), &task.output_roots[0]),
@@ -331,11 +344,12 @@ impl CompilerTask {
         if self.arguments.len() == 1 && self.arguments[0] == "-proc:none" {
             return true;
         }
-        if !self.arguments.is_empty() || !self.annotation_processor_path.is_empty() {
+        if !self.annotation_processor_path.is_empty() {
             return false;
         }
         self.java_compiler_recipe().is_some_and(|recipe| {
-            self.java_api_option_slots(&recipe)
+            (self.arguments.is_empty() || recipe.adapter == "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1")
+                && self.java_api_option_slots(&recipe)
                 .is_ok_and(|slots| !slots.explicit_processor_argument)
         })
     }

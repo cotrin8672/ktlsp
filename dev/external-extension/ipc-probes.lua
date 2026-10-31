@@ -364,6 +364,54 @@ return function(env)
       check(label..' parameter type resolves through host facts '..name,observed.parameterTypes[i].state=='found'
         and observed.parameterTypes[i].value.qualifiedName==name)
     end
+    local foreign = observed.foreignJvm
+    local foreign_path = vim.fs.abspath(env.project .. '/modules/editing/src/main/java/fixture/ForeignJvmNames.java')
+    local foreign_buf = vim.fn.bufnr(foreign_path)
+    check(label .. ' foreign source remains closed', foreign_buf == -1)
+    local fixture_path = env.repo .. '/dev/external-extension/project/fixture/ForeignJvmNames.java'
+    local file = assert(io.open(fixture_path, 'rb')); local expected = assert(file:read('*a')); file:close()
+    local source, snapshot, facts = foreign.source, foreign.snapshot, foreign.facts
+    local uri = source.documentUri
+    local uri_path = uri and uri.state == 'found' and type(uri.value) == 'string' and vim.uri_to_fname(uri.value)
+    local inventory_matches = 0
+    for _, candidate in ipairs(foreign.inventory.sources or {}) do
+      if candidate.id == source.id and vim.deep_equal(candidate.identity, source.identity) then
+        inventory_matches = inventory_matches + 1
+      end
+    end
+    check(label .. ' foreign inventory includes exact closed source', foreign.inventory.coverage.state == 'found'
+      and uri_path and probe.path_key(uri_path) == probe.path_key(foreign_path)
+      and type(source.id) == 'string' and type(source.identity.revision) == 'string' and inventory_matches == 1)
+    check(label .. ' foreign snapshot matches committed bytes and identity', snapshot.state == 'found'
+      and snapshot.value.id == source.id and vim.deep_equal(snapshot.value.identity, source.identity)
+      and snapshot.value.text == expected and snapshot.value.sha256 == vim.fn.sha256(expected))
+    check(label .. ' foreign facts preserve source identity and scope', facts.semanticScope.state == 'found'
+      and facts.source.id == source.id and vim.deep_equal(facts.source.identity, source.identity))
+    local foreign_text = snapshot.value.text
+    local function foreign_slice(range) return foreign_text:sub(range.start + 1, range['end']) end
+    local declaration = foreign.parameterDeclaration
+    local parameters = declaration.parameters
+    local declaration_matches = 0
+    for _, candidate in ipairs(facts.declarations or {}) do
+      if candidate.id == declaration.id and candidate.name == declaration.name then declaration_matches = declaration_matches + 1 end
+    end
+    check(label .. ' foreign declaration ranges use foreign snapshot bytes', declaration.name == 'foreignJvmProbe'
+      and foreign_slice(declaration.nameRange) == 'foreignJvmProbe' and parameters.state == 'found'
+      and declaration_matches == 1 and #parameters.value == 1 and foreign_slice(parameters.value[1].nameRange) == 'target'
+      and foreign_slice(parameters.value[1].range):find('ForeignJvmNames.Outer.Target target', 1, true) ~= nil)
+    local resolved, jvm = foreign.resolved, foreign.jvm
+    check(label .. ' foreign type keeps its read-only source context', resolved.state == 'found'
+      and resolved.value.readOnly == true and resolved.value.qualifiedName == 'fixture.ForeignJvmNames.Outer.Target'
+      and type(resolved.value.id) == 'string' and vim.deep_equal(resolved.value.contextSource.identity, source.identity))
+    check(label .. ' foreign nested JVM name is exact', vim.deep_equal(jvm.binaryName,
+      { state = 'found', value = { internalName = 'fixture/ForeignJvmNames$Outer$Target',
+        descriptor = 'Lfixture/ForeignJvmNames$Outer$Target;' } }))
+    local unknown = { state = 'unknown', reasons = { { code = 'UnsupportedSource' } } }
+    check(label .. ' foreign ABI and members remain unknown', vim.deep_equal(jvm.classFlags, unknown)
+      and vim.deep_equal(jvm.abi, unknown) and vim.deep_equal(jvm.jvmAbiCoverage, unknown)
+      and vim.deep_equal(jvm.declaredMembers.coverage, unknown) and #jvm.declaredMembers.members == 0)
+    proof.sourceRootAlias = { fixture = fixture_path, project = foreign_path, sha256 = vim.fn.sha256(expected),
+      source = source, snapshot = snapshot, semanticScope = facts.semanticScope }
     proof.source_facts_v2=proof.source_facts_v2 or {};proof.source_facts_v2[label]=observed;save()
   end
 
@@ -497,13 +545,13 @@ return function(env)
     vim.lsp.buf_attach_client(buf, client.id)
   end
   for key, file in pairs({ target = 'fixture/Target.java', mixin = 'fixture/CaseMixin.java', use = 'fixture/IpcUse.java' }) do
-    local path = vim.fs.abspath(env.project .. (facts and '/modules/editing/src/main/java/' or '/') .. file)
+    local path = vim.fs.abspath(env.project .. ((facts or source_v2) and '/modules/editing/src/main/java/' or '/') .. file)
     paths[key],originals[key] = path,vim.fn.readfile(path)
     if not (locations and key=='target') then attach(key) end
   end
   if source_v2 then
     for key,file in pairs({ parameter_ref='refs/LocalRef.java',parameter_decoy='decoy/LocalRef.java' }) do
-      local path=vim.fs.abspath(env.project .. '/' .. file)
+      local path=vim.fs.abspath(env.project .. '/modules/editing/src/main/java/' .. file)
       paths[key],originals[key]=path,vim.fn.readfile(path)
       attach(key)
     end

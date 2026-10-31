@@ -1,4 +1,4 @@
-//! Current normal outputs for the bounded plain Kotlin producer closure.
+//! Current normal outputs for the bounded plain JVM producer closure.
 use super::*;
 use crate::classpath::{CompilerLanguage, CompilerTask, ProjectSnapshot, SourceSetClasspath};
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,13 +9,27 @@ const MAX_PRODUCERS: usize = 16;
 
 fn key(path: &Path) -> String { kotlin_path_key(&crate::paths::file_key(path)) }
 
-fn rejected<T>(task: &str, reason: &'static str) -> Option<T> {
+fn rejected<T>(task: &str, reason: &str) -> Option<T> {
     crate::trace::span("compiler.kotlin.producer-rejected", "compiler", Instant::now(),
         serde_json::json!({"task":task,"reason":reason}));
     None
 }
 
 fn tasks(source: &SourceSetClasspath) -> Option<(&CompilerTask, &CompilerTask)> {
+    if !source.compiler_metadata_incomplete && !source.classpath_incomplete && source.unresolved.is_empty()
+        && source.kotlin_compile_task.is_none() {
+        if let [java] = source.compiler_tasks.as_slice() {
+            match java_diagnostics::java_producer_recipe(java) {
+                Ok(_) => {
+                    // Both roles reference the same actual Java task; no Kotlin task is synthesized.
+                    return Some((java,java));
+                }
+                Err(error) => return rejected(&java.task,&error.to_string()),
+            }
+        }
+        return rejected(source.compiler_tasks.first().map(|task|task.task.as_str()).unwrap_or("unknown"),
+            "producer-java-task-count-unhandled");
+    }
     if source.compiler_metadata_incomplete || source.classpath_incomplete
         || !source.unresolved.is_empty() || source.compiler_tasks.len() != 2 {
         return rejected(source.kotlin_compile_task.as_deref().unwrap_or("unknown"), "producer-model-incomplete");
@@ -191,7 +205,9 @@ pub(super) fn effective(
 ) -> anyhow::Result<KotlinDiagnosticRequest> {
     // Validate before replacing any selected slots; rewriting must not normalize away an
     // unsupported argument or mismatched captured classpath.
-    kotlin_editor_arguments(original, Path::new("unused-private-output"), &[])?;
+    if original.task.language == CompilerLanguage::Java {
+        java_diagnostics::configured_recipe(original)?;
+    } else {kotlin_editor_arguments(original, Path::new("unused-private-output"), &[])?;}
     let mut result = original.clone();
     rewrite(&mut result.task, bindings)?;
     if let Some(java) = &mut result.java_task { rewrite(java, bindings)?; }
@@ -201,9 +217,10 @@ pub(super) fn effective(
 }
 
 struct CompiledProducer {
-    environment: Arc<KotlinDiagnosticEnvironment>,
+    environment: Option<Arc<KotlinDiagnosticEnvironment>>,
     outputs: sealed_output::SealedOutput,
     _owner: KotlinEditorOverlay,
+    _java_tools: Option<java_diagnostics::Tools>,
     bindings: Vec<(String, Vec<PathBuf>)>,
     source_keys: BTreeSet<String>,
 }
@@ -234,13 +251,14 @@ impl CompiledProducers {
 
     pub(super) fn epochs_live(&self) -> bool {
         self.nodes.iter().all(|node|
-            !node.environment.invalid.load(std::sync::atomic::Ordering::Acquire)
+            node.environment.as_ref().is_none_or(|environment| !environment.invalid.load(std::sync::atomic::Ordering::Acquire))
                 && node.outputs.epoch_live())
     }
 
     pub(super) fn check_live(&self) -> anyhow::Result<()> {
         for node in &self.nodes {
-            node.environment.check_live()?;
+            if let Some(environment)=&node.environment {environment.check_live()?;}
+            if let Some(tools)=&node._java_tools {tools.check_live()?;}
             node.outputs.check_live()?;
         }
         Ok(())
@@ -268,7 +286,7 @@ impl Drop for CompiledProducers {
             environment.close();
         }
         // All dependent watches retire before any earlier producer's private output is deleted.
-        for node in &self.nodes { node.environment.close(); }
+        for node in &self.nodes { if let Some(environment)=&node.environment {environment.close();} }
     }
 }
 
@@ -295,8 +313,12 @@ pub(super) fn output_bindings(
     kotlin_output: &Path, java_output: &Path,
 ) -> anyhow::Result<Vec<(String, Vec<PathBuf>)>> {
     let (kt, java) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
-    let mut bindings = vec![(key(&kt.output_roots[0]), vec![kotlin_output.to_path_buf()]),
-        (key(&java.output_roots[0]), vec![java_output.to_path_buf()])];
+    let outputs = if kt.language == CompilerLanguage::Java {vec![java_output.to_path_buf()]}
+        else {vec![kotlin_output.to_path_buf(), java_output.to_path_buf()]};
+    let mut bindings = if kt.language == CompilerLanguage::Java {
+        vec![(key(&java.output_roots[0]),outputs.clone())]
+    } else {vec![(key(&kt.output_roots[0]), vec![kotlin_output.to_path_buf()]),
+        (key(&java.output_roots[0]), vec![java_output.to_path_buf()])]};
     // Only artifact slots actually selected by this closed plan are rebound. Capture
     // already proved their unique source owner; sources/artifact metadata stay unchanged.
     let reads: BTreeSet<_> = request.task.classpath.iter()
@@ -306,7 +328,7 @@ pub(super) fn output_bindings(
         .map(|p| key(p)).collect();
     bindings.extend(plan.source.provided_artifacts.iter()
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jar") && reads.contains(&key(p)))
-        .map(|p| (key(p), vec![kotlin_output.to_path_buf(), java_output.to_path_buf()])));
+        .map(|p| (key(p), outputs.clone())));
     Ok(bindings)
 }
 
@@ -322,6 +344,22 @@ fn compile(
         compiled.check_live()?;
         let producer = effective(&plan.request(request)?, &compiled.bindings(), &compiled.covered())?;
         let (kt, java) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
+        if kt.language == CompilerLanguage::Java {
+            // Reuse the retained input epoch and the same checked Javac helper. Its private
+            // tools stay alive with this output so their watched deletion cannot cancel a live reader.
+            let (owner,tools)=java_diagnostics::run_java_producer(&producer,environment)?;
+            let output=owner.directory.join("java-classes");
+            let outputs=sealed_output::SealedOutput::seal(vec![output.clone()])?;
+            let bindings=output_bindings(request,plan,&owner.directory.join("classes"),&output)?;
+            compiled.nodes.push(CompiledProducer {_owner:owner,_java_tools:Some(tools),
+                environment:None,outputs,bindings,
+                source_keys:producer.sources.iter().map(|p|crate::paths::file_key(p)).collect()});
+            crate::trace::span("compiler.kotlin.producer-compiled","compiler",Instant::now(),
+                serde_json::json!({"task":java.task,"source_count":producer.sources.len(),
+                    "output_slots":1,"normal_output":true,"language":"java","java_required_clean":true,
+                    "generation":request.generation}));
+            continue;
+        }
         let mixed = !java.source_files.is_empty();
         let producer_environment = KotlinDiagnosticEnvironment::prepare_with_invalidation(
             &producer, environment.wake.clone(), environment.invalid.clone())?;
@@ -351,7 +389,7 @@ fn compile(
         let outputs = sealed_output::SealedOutput::seal(vec![kotlin_output.clone(), java_output.clone()])?;
         let bindings = output_bindings(request, plan, &kotlin_output, &java_output)?;
         compiled.nodes.push(CompiledProducer {
-            _owner: owner, environment: producer_environment, outputs,
+            _owner: owner, _java_tools:None, environment: Some(producer_environment), outputs,
             bindings,
             source_keys: producer.sources.iter().map(|p| crate::paths::file_key(p)).collect(),
         });

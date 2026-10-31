@@ -153,10 +153,18 @@ headers/lowerings, forged metadata, edits/stale reads and foreign snapshot
 contexts have focused Rust cases; these additions require a newly sealed native
 pair before their new assertions are acceptance evidence.
 
+This mode also negotiates the existing source snapshot and project class fact
+reads. Keep `fixture/ForeignJvmNames.java` closed in the disposable project's
+accepted compiler source set. The same first-evaluation capture records its
+inventory identity, exact snapshot bytes, foreign parameter facts, read-only
+resolved type and nested JVM binary name. Other JVM metadata remains Unknown;
+an unbound folder cannot supply this compiler-scoped proof.
+
 ```sh
 rtk proxy mkdir -p "$ipc_project/refs" "$ipc_project/decoy"
 rtk proxy cp "$repo/dev/external-extension/project/refs/LocalRef.java" "$ipc_project/refs/LocalRef.java"
 rtk proxy cp "$repo/dev/external-extension/project/decoy/LocalRef.java" "$ipc_project/decoy/LocalRef.java"
+rtk proxy cp "$repo/dev/external-extension/project/fixture/ForeignJvmNames.java" "$ipc_project/fixture/ForeignJvmNames.java"
 KTLSP_CORPUS_EXTRA_PROBES="$repo/dev/external-extension/ipc-probes.lua" \
 KTLSP_IPC_MODE=source-facts-v2 KTLSP_IPC_CHILD="$sealed_child" \
 KTLSP_IPC_BARRIER="$scratch/source-facts-barrier" \

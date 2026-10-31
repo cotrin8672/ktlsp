@@ -1844,6 +1844,234 @@ fn selected_k2(request: &mut KotlinDiagnosticRequest) {
     request.java_task.as_mut().unwrap().arguments.clear();
 }
 
+fn captured_gradle941_jvm21(request: &mut KotlinDiagnosticRequest) {
+    let runtime=request.task.kotlin_compiler.as_mut().unwrap();
+    runtime.compiler_version="2.1.21".into();runtime.gradle_plugin_version="2.1.21".into();
+    runtime.execution_strategy=crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+    let target=request.task.arguments.iter().position(|argument|argument=="-jvm-target").unwrap();
+    request.task.arguments[target+1]="21".into();
+    for task in [&mut request.task,request.java_task.as_mut().unwrap()] {
+        task.options.get_mut("taskActionInventory").unwrap()["adapter"]=json!("gradle-9.4.1-stock-actions-v1");
+        task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"]=
+            json!("org.gradle.api.internal.project.taskfactory.IncrementalTaskAction");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"]=json!("gradle-9.4.1-stock-onlyif-v1");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"]=
+            json!("org.gradle.api.internal.tasks.execution.SelfDescribingSpec");
+    }
+    let mut recipe=request.java_task.as_ref().unwrap().java_compiler_recipe().unwrap();
+    recipe.adapter="gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1".into();
+    recipe.language_version="21".into();recipe.java_runtime_version="21.0.3+7".into();recipe.gradle_java_version="21.0.3".into();
+    assert_eq!(recipe.api_options.pop().unwrap(),"-proc:none");
+    recipe.api_options[1]="21".into();recipe.api_options[3]="21".into();
+    recipe.api_options.splice(6..6,["-encoding".into(),"UTF-8".into()]);
+    recipe.api_options.extend(["-Xlint:unchecked".into(),"-parameters".into()]);
+    let java=request.java_task.as_mut().unwrap();
+    java.arguments=vec!["-Xlint:unchecked".into(),"-parameters".into()];
+    for key in ["sourceCompatibility","targetCompatibility"] {java.options.insert(key.into(),json!("21"));}
+    java.options.insert("encoding".into(),json!("UTF-8"));
+    set_recipe(request,recipe);
+}
+
+#[test]
+fn gradle94_jvm21_profile_requires_captured_stock_actions_and_exact_java_options() {
+    let (_owner,mut request)=fixture();
+    captured_gradle941_jvm21(&mut request);
+    let target=request.task.arguments.iter().position(|argument|argument=="-jvm-target").unwrap();
+    let recipe=request.java_task.as_ref().unwrap().java_compiler_recipe().unwrap();
+    let java=request.java_task.as_ref().unwrap();
+    let slots=java.java_api_option_slots(&recipe).unwrap();
+    assert_eq!(&recipe.api_options[slots.classpath+1..],java.arguments);
+    assert!(java.annotation_processing_disabled());
+    assert!(source_sdk_encoding_supported(java,&recipe));
+    assert!(selected_tasks_supported(&request.task,java,&[request.task.clone(),java.clone()]));
+    let replayed=replay_options(java,&recipe,&request.task.output_roots[0],&request.project_dir.join("private")).unwrap();
+    assert_eq!(&replayed[slots.classpath+1..],java.arguments,"preserve selected flag order and values");
+    for mutation in 0..14 {
+        let mut changed=request.clone();
+        match mutation {
+            0=>changed.task.kotlin_compiler.as_mut().unwrap().compiler_version="2.1.20".into(),
+            1=>changed.task.kotlin_compiler.as_mut().unwrap().gradle_plugin_version="2.1.20".into(),
+            2=>changed.task.kotlin_compiler.as_mut().unwrap().run_via_build_tools_api=true,
+            3=>changed.task.kotlin_compiler.as_mut().unwrap().execution_strategy=crate::classpath::KotlinCompilerExecutionStrategy::InProcess,
+            4=>changed.task.kotlin_compiler.as_mut().unwrap().normalized_daemon_jvm_arguments.push("-Dcustom=true".into()),
+            5=>changed.task.arguments[target+1]="17".into(),
+            6=>{changed.task.options.insert("taskActionInventory".into(),Value::Null);},
+            7=>changed.task.options.get_mut("taskActionInventory").unwrap()["actions"].as_array_mut().unwrap().push(json!({"class":"custom.Action"})),
+            8=>changed.task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["method"]=json!("custom"),
+            9=>changed.task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["stockEnabledPredicate"]=json!(false),
+            10=>changed.task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"]=json!("custom.Spec"),
+            11=>changed.java_task.as_mut().unwrap().options.get_mut("taskActionInventory").unwrap()["adapter"]=json!("gradle-9.6.1-stock-actions-v1"),
+            12=>{changed.task.options.remove("taskActionInventory");},
+            13=>{changed.task.options.insert("taskOnlyIfInventory".into(),Value::Null);},
+            _=>unreachable!(),
+        }
+        assert!(!selected_tasks_supported(&changed.task,changed.java_task.as_ref().unwrap(),&[]),"mutation {mutation}");
+    }
+    for mutation in 0..4 {
+        let mut changed=java.clone();
+        match mutation {
+            0=>changed.arguments.push("-processor:custom".into()),
+            1=>changed.arguments.reverse(),
+            2=>{changed.options.get_mut("javaCompilerRecipe").unwrap()["api_options"].as_array_mut().unwrap().pop();},
+            3=>changed.options.get_mut("javaCompilerRecipe").unwrap()["api_options"].as_array_mut().unwrap().reverse(),
+            _=>unreachable!(),
+        }
+        assert!(!changed.annotation_processing_disabled(),"raw option mutation {mutation}");
+    }
+    let mut changed=java.clone();changed.options.insert("encoding".into(),json!("MS932"));
+    assert!(!source_sdk_encoding_supported(&changed,&recipe));
+    changed=java.clone();changed.options.insert("targetCompatibility".into(),json!("17"));
+    assert!(!source_sdk_encoding_supported(&changed,&recipe));
+}
+
+#[test]
+fn gradle941_deprecation_option_preserves_exact_replay_and_rejects_malformed_slots() {
+    let (_owner,mut selected)=fixture();captured_gradle941_jvm21(&mut selected);
+    for deprecated in [false,true] {
+        let mut task=selected.java_task.as_ref().unwrap().clone();
+        let mut recipe=task.java_compiler_recipe().unwrap();
+        if deprecated {recipe.api_options.insert(6,"-deprecation".into());}
+        task.options.insert("javaCompilerRecipe".into(),serde_json::to_value(&recipe).unwrap());
+        let slots=task.java_api_option_slots(&recipe).unwrap();
+        assert!(task.annotation_processing_disabled());
+        assert_eq!(slots.headers,if deprecated {10} else {9});
+        assert_eq!(slots.classpath,if deprecated {19} else {18});
+        let private=selected.project_dir.join("private");
+        let replayed=replay_options(&task,&recipe,&selected.task.output_roots[0],&private).unwrap();
+        assert_eq!(replayed.iter().filter(|option|option.as_str()=="-deprecation").count(),usize::from(deprecated));
+        for index in 0..recipe.api_options.len() {
+            if ![slots.destination,slots.headers,slots.generated,slots.classpath].contains(&index) {
+                assert_eq!(replayed[index],recipe.api_options[index],"preserve every captured non-path option");
+            }
+        }
+        assert_eq!(Path::new(&replayed[slots.destination]),private.join("java-classes"));
+        assert_eq!(Path::new(&replayed[slots.headers]),private.join("java-headers"));
+        assert_eq!(Path::new(&replayed[slots.generated]),private.join("java-generated"));
+    }
+    let task=selected.java_task.as_ref().unwrap();
+    let mut captured=task.java_compiler_recipe().unwrap();captured.api_options.insert(6,"-deprecation".into());
+    for mutation in 0..5 {
+        let mut recipe=captured.clone();
+        match mutation {
+            0=>recipe.api_options.insert(6,"-deprecation".into()),
+            1=>recipe.api_options.swap(6,7),
+            2=>recipe.api_options[6]="-nowarn".into(),
+            3=>recipe.api_options[14]="-proc:only".into(),
+            4=>{recipe.api_options.pop();},
+            _=>unreachable!(),
+        }
+        let mut changed=task.clone();changed.options.insert("javaCompilerRecipe".into(),serde_json::to_value(&recipe).unwrap());
+        assert!(changed.java_api_option_slots(&recipe).is_err(),"mutation {mutation}");
+        assert!(!changed.annotation_processing_disabled(),"mutation {mutation} cannot grant processor-disabled authority");
+    }
+}
+
+#[test]
+fn java_only_producers_close_current_java_inputs_before_kotlin_consumers() {
+    let (owner,_) = fixture();
+    let mut consumer=request(&owner.directory.join("consumer"));
+    captured_gradle941_jvm21(&mut consumer);
+    consumer.task.source_files.retain(|path|path.extension().and_then(|e|e.to_str())==Some("kt"));
+    consumer.sources=consumer.task.source_files.clone();
+    consumer.overlays.retain(|source|source.key.ends_with(".kt"));
+    consumer.overlays[0]=KotlinSourceOverlay::new(consumer.overlays[0].key.clone(),
+        "package fixture\nfun selectedJavaBody(): Int = api.Main().value()\n".into(),1);
+    consumer.java_task.as_mut().unwrap().source_files.clear();
+    let mut modules=Vec::new();
+    let mut java_sources=Vec::new();
+    let mut slots=Vec::new();
+    for name in ["base","api"] {
+        let root=owner.directory.join(name);
+        let mut selected=request(&root);captured_gradle941_jvm21(&mut selected);
+        let mut java=selected.java_task.take().unwrap();java.task=format!(":{name}:compileJava");
+        java.classpath=slots.clone();
+        java.declared_input_files=java.source_files.iter().chain(&java.classpath).cloned().collect();
+        let mut recipe=java.java_compiler_recipe().unwrap();
+        recipe.api_options.insert(6,"-deprecation".into());
+        let cp=recipe.api_options.iter().position(|arg|arg=="-classpath").unwrap()+1;
+        recipe.api_options[cp]=crate::classpath::joined_java_api_classpath(&java.classpath).unwrap();
+        java.options.insert("javaCompilerRecipe".into(),serde_json::to_value(recipe).unwrap());
+        java.options.insert("sdkProducerClaims".into(),json!({"adapter":"gradle-producing-source-trees-v1",
+            "language":"java","task":java.task,"complete":true,"roots":[root.join("src")]}));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let body=if name=="base" {"package base; public class Main { public int saved() { return 1; } }"}
+            else {"package api; public class Main { public int value() { return new base.Main().saved(); } }"};
+        std::fs::write(&java.source_files[0],body).unwrap();
+        java_sources.push(java.source_files[0].clone());
+        slots.push(java.output_roots[0].clone());
+        modules.push(ModuleClasspath {module:format!(":{name}"),project_dir:root,build:"java-producer-test".into(),
+            entries:Vec::new(),unresolved:Vec::new(),source_sets:vec![SourceSetClasspath {
+                name:"main".into(),source_roots:selected.source_roots,output_roots:java.output_roots.clone(),
+                provided_artifacts:java.output_roots.clone(),compiler_tasks:vec![java],..Default::default()}]});
+    }
+    consumer.task.classpath=vec![slots[1].clone()];
+    let java=consumer.java_task.as_mut().unwrap();java.classpath=consumer.task.classpath.clone();
+    java.classpath.extend(consumer.task.output_roots.clone());
+    let mut recipe=java.java_compiler_recipe().unwrap();
+    let cp=recipe.api_options.iter().position(|arg|arg=="-classpath").unwrap()+1;
+    recipe.api_options[cp]=crate::classpath::joined_java_api_classpath(&java.classpath).unwrap();
+    java.options.insert("javaCompilerRecipe".into(),serde_json::to_value(recipe).unwrap());
+    // Both dependency outputs are deliberately absent, as in a fresh checkout.
+    assert!(slots.iter().all(|slot|!slot.exists()));
+    modules.push(ModuleClasspath {module:":consumer".into(),project_dir:consumer.project_dir.clone(),build:"java-producer-test".into(),
+        entries:Vec::new(),unresolved:Vec::new(),source_sets:vec![SourceSetClasspath {name:"main".into(),
+            source_roots:consumer.source_roots.clone(),output_roots:consumer.task.output_roots.clone(),
+            kotlin_compile_task:Some(consumer.task.task.clone()),compiler_tasks:vec![consumer.task.clone(),java.clone()],..Default::default()}]});
+    let model=ProjectSnapshot::new(modules.clone());
+    let capture=|model:&ProjectSnapshot|crate::compile::kotlin_producers::capture(model,&model.modules[2].source_sets[0],
+        &consumer.task,consumer.java_task.as_ref().unwrap());
+    consumer.kotlin_producers=capture(&model).expect("ordinary Java dependency closure");
+    assert_eq!(consumer.kotlin_producers.len(),2);
+    assert!(consumer.kotlin_producers[0].scope.module.ends_with(":base"));
+    assert!(consumer.kotlin_producers[1].scope.module.ends_with(":api"));
+    let before=crate::compile::kotlin_producers::identity(&consumer).unwrap();
+    let unsaved="package base; public class Main { public int saved() { return 2; } public int currentUnsaved() { return 3; } }";
+    consumer.dependency_overlays.push(KotlinSourceOverlay::new(crate::paths::file_key(&java_sources[0]),unsaved.into(),2));
+    assert_ne!(crate::compile::kotlin_producers::identity(&consumer).unwrap(),before);
+    let mut bindings=BTreeMap::new();let mut covered=BTreeSet::new();
+    for (i,plan) in consumer.kotlin_producers.iter().enumerate() {
+        let producer=plan.request(&consumer).unwrap();
+        assert_eq!(producer.task.language,crate::classpath::CompilerLanguage::Java);
+        assert_eq!(producer.java_task.as_ref(),Some(&producer.task),"retain the real Java task, without a synthetic Kotlin task");
+        configured_recipe(&producer).unwrap();
+        let effective=crate::compile::kotlin_producers::effective(&producer,&bindings,&covered).unwrap();
+        let roots=owned_membership_inputs(&effective).unwrap();
+        let watch=crate::compiled_watch::WatchPlan::read_inputs(&roots).unwrap();
+        owned_source_membership(&effective,&watch).unwrap();
+        if i==0 {
+            let copies=KotlinEditorOverlay::create_in(&effective,&owner.directory.join("copies")).unwrap();
+            assert_eq!(std::fs::read_to_string(&copies.sources[0]).unwrap(),unsaved);
+            let late=plan.source.source_roots[0].join("Late.java");std::fs::write(&late,"class Late {}").unwrap();
+            assert!(owned_source_membership(&effective,&watch).is_err(),"a saved source absent from the captured task retracts closure");
+            std::fs::remove_file(late).unwrap();
+        } else {
+            assert_eq!(effective.task.classpath,vec![owner.directory.join("private-0")]);
+        }
+        let output=owner.directory.join(format!("private-{i}"));std::fs::create_dir(&output).unwrap();
+        let selected=crate::compile::kotlin_producers::output_bindings(&consumer,plan,&owner.directory.join("unused"),&output).unwrap();
+        assert_eq!(selected.len(),1);assert_eq!(selected[0].1,vec![output]);
+        bindings.extend(selected);covered.extend(producer.sources.iter().map(|path|crate::paths::file_key(path)));
+    }
+    let effective=crate::compile::kotlin_producers::effective(&consumer,&bindings,&covered).unwrap();
+    assert_eq!(effective.task.classpath,vec![owner.directory.join("private-1")]);
+    assert!(effective.dependency_overlays.is_empty(),"unsaved Java bytes were consumed by their fresh producer");
+    for mutation in 0..6 {
+        let mut changed=modules.clone();let source=&mut changed[0].source_sets[0];
+        match mutation {
+            0=>source.compiler_metadata_incomplete=true,
+            1=>{source.compiler_tasks[0].options.remove("javaCompilerRecipe");},
+            2=>source.compiler_tasks[0].complete=false,
+            3=>{source.compiler_tasks[0].options.insert("sdkProducerClaims".into(),Value::Null);},
+            4=>{source.compiler_tasks[0].options.get_mut("sdkProducerClaims").unwrap()["complete"]=json!(false);},
+            5=>{source.compiler_tasks[0].options.get_mut("taskActionInventory").unwrap()["actions"].as_array_mut().unwrap().push(json!({"class":"custom.Action"}));},
+            _=>unreachable!(),
+        }
+        let changed=ProjectSnapshot::new(changed);
+        assert!(crate::compile::kotlin_producers::capture(&changed,&changed.modules[2].source_sets[0],
+            &consumer.task,consumer.java_task.as_ref().unwrap()).is_none(),"mutation {mutation} cannot certify a current producer");
+    }
+}
+
 #[test]
 fn k2_normal_profile_reuses_exact_options_and_rejects_auxiliary_and_mixed_profiles() {
     let (_owner, mut request) = fixture();
