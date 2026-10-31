@@ -33,6 +33,7 @@ pub(crate) struct WatchPlan {
     memberships: BTreeSet<String>,
     delegated_sources: BTreeSet<String>,
     delegated_outputs: BTreeSet<String>,
+    filtered_roots: Vec<(String, BTreeSet<String>)>,
 }
 
 impl WatchPlan {
@@ -92,6 +93,30 @@ impl WatchPlan {
         Ok(plan)
     }
 
+    /// Arm root coverage without enumerating before the lease exists. The caller then
+    /// performs its bounded filtered walk; unsupported native recursion stays Unknown.
+    pub(crate) fn filtered_root(root: &Path, excluded: &BTreeSet<String>) -> anyhow::Result<Self> {
+        anyhow::ensure!(root.is_absolute() && !root.components().any(|part|
+            matches!(part,std::path::Component::ParentDir|std::path::Component::CurDir)), "root-watch-relative-path");
+        anyhow::ensure!(excluded.len()<=128 && excluded.iter().all(|name|
+            !name.is_empty() && name.len()<=256 && name!="." && name!=".."
+                && !name.chars().any(|ch|ch.is_control() || matches!(ch,'/'|'\\'|':'|'*'|'?'|'['|']'))),
+            "root-watch-exclusion-unhandled");
+        let metadata = std::fs::symlink_metadata(root)?;
+        anyhow::ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(), "root-watch-unknown-root");
+        #[cfg(not(windows))]
+        anyhow::bail!("bounded-root-recursion-unavailable");
+        #[cfg(windows)]
+        {
+            let mut plan = Self::default();
+            plan.trees.insert(key(root));
+            plan.guard_parents(root, true)?;
+            plan.add_recursive_directory(root)?;
+            plan.filtered_roots.push((key(root), excluded.iter().map(|name|name.to_lowercase()).collect()));
+            Ok(plan)
+        }
+    }
+
     /// A bounded copied inventory: exact file reads plus direct-child membership changes.
     pub(crate) fn read_source_inventory(
         files: &[PathBuf],
@@ -135,8 +160,16 @@ impl WatchPlan {
         {
             return false;
         }
-        self.trees.iter().any(|root| path_under(&path, root))
+        self.trees.iter().any(|root| path_under(&path, root) && !self.excluded_descendant(root,&path)
+            && !(directory && self.filtered_roots.iter().any(|(filtered,excluded)|filtered==root && !excluded.is_empty())))
             || (!directory && (self.exact.contains(&path) || self.is_delegated_source(&path)))
+    }
+
+    fn excluded_descendant(&self, root: &str, path: &str) -> bool {
+        self.filtered_roots.iter().any(|(filtered,excluded)|filtered==root
+            && path.strip_prefix(root).and_then(|relative|relative.strip_prefix('/'))
+                .and_then(|relative|relative.rsplit_once('/')).is_some_and(|(parents,_)|
+                    parents.split('/').any(|segment|excluded.contains(segment))))
     }
 
     fn is_delegated_source(&self, path: &str) -> bool {
@@ -262,6 +295,9 @@ impl WatchPlan {
     }
 
     fn merge(&mut self, next: Self) -> anyhow::Result<()> {
+        // A root-file domain owns its lease; another domain must not inherit its exclusions.
+        anyhow::ensure!(self.filtered_roots.is_empty() && next.filtered_roots.is_empty(),
+            "filtered-root-watch-not-composable");
         self.exact.extend(next.exact);
         self.trees.extend(next.trees);
         self.ancestors.extend(next.ancestors);
@@ -282,6 +318,7 @@ impl WatchPlan {
     }
 
     fn affected(&self, event: &Event) -> bool {
+        use notify::event::{CreateKind,ModifyKind,RemoveKind};
         if event.need_rescan() {
             return true;
         }
@@ -306,6 +343,11 @@ impl WatchPlan {
                 | EventKind::Remove(_)
                 | EventKind::Modify(notify::event::ModifyKind::Name(_))
         );
+        let filterable = matches!(event.kind,
+            EventKind::Create(CreateKind::File|CreateKind::Folder)
+                | EventKind::Remove(RemoveKind::File|RemoveKind::Folder)
+                | EventKind::Modify(ModifyKind::Data(_)|ModifyKind::Metadata(_))
+                | EventKind::Access(_));
         event.paths.iter().any(|path| {
             let parent = path.parent().map(key);
             let key = key(path);
@@ -334,8 +376,9 @@ impl WatchPlan {
             {
                 return false;
             }
-            self.trees.iter().any(|root| path_under(&key, root))
-                || (ancestor_change && self.ancestors.contains(&key))
+            self.trees.iter().any(|root| path_under(&key, root)
+                && !(filterable && self.excluded_descendant(root,&key)))
+                || ((ancestor_change || !self.filtered_roots.is_empty()) && self.ancestors.contains(&key))
                 || (ancestor_change
                     && parent
                         .as_ref()
@@ -500,6 +543,21 @@ impl NativeInputWatch {
                 signal.invalidate();
                 return Err(error.into());
             }
+        }
+        // A root/ancestor can be replaced between planning and native arming; no walk has run yet.
+        let root_ready = (|| -> anyhow::Result<()> {
+            for (root, _) in &plan.filtered_roots {
+                for path in Path::new(root).ancestors() {
+                    let metadata = std::fs::symlink_metadata(path)?;
+                    anyhow::ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(),
+                        "root-watch-changed-during-arm");
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = root_ready {
+            signal.invalidate();
+            return Err(error);
         }
         crate::trace::span(
             "compiler.native_watch_plan",
@@ -1422,6 +1480,154 @@ mod tests {
             .add_path(root.join("project/src/Consumer.java"))
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod filtered_root_watch_tests {
+    use super::*;
+    #[cfg(windows)]
+    use ktcore::extensions::HostInputGuard;
+    use notify::event::{CreateKind,DataChange,MetadataKind,ModifyKind,RemoveKind,RenameMode};
+
+    fn root_fixture() -> PathBuf {
+        let root=std::env::temp_dir().join(format!("ktlsp-filtered-root-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();root
+    }
+    fn plan(root: &Path) -> WatchPlan {
+        WatchPlan {trees:BTreeSet::from([key(root)]),
+            ancestors:root.ancestors().skip(1).map(key).collect(),
+            filtered_roots:vec![(key(root),BTreeSet::from(["vendor".into()]))],
+            ..WatchPlan::default()}
+    }
+
+    #[test]
+    fn filtered_root_events_keep_ambiguity_boundaries_and_read_roles_conservative() {
+        let root=std::env::temp_dir().join("ktlsp-filtered-root-plan-only");let plan=plan(&root);
+        let excluded=root.join("vendor/nested/config.json");
+        for kind in [EventKind::Create(CreateKind::File),EventKind::Remove(RemoveKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),EventKind::Create(CreateKind::Folder)] {
+            assert!(!plan.affected(&Event::new(kind).add_path(excluded.clone())),"{kind:?}");
+        }
+        for kind in [EventKind::Any,EventKind::Other,EventKind::Create(CreateKind::Any),
+            EventKind::Remove(RemoveKind::Any),EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Other),EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),EventKind::Modify(ModifyKind::Name(RenameMode::Both))] {
+            assert!(plan.affected(&Event::new(kind).add_path(excluded.clone())),"{kind:?}");
+        }
+        assert!(plan.affected(&Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(excluded.clone()).set_flag(notify::event::Flag::Rescan)));
+        assert!(plan.affected(&Event::new(EventKind::Other)));
+        for path in [root.clone(),root.join("vendor"),root.parent().unwrap().to_path_buf()] {
+            assert!(plan.affected(&Event::new(EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))).add_path(path)));
+        }
+        for path in [root.join("src/config.json"),root.join("build/config.json"),root.join(".gradle/config.json"),root.join("other/vendor-copy/config.json")] {
+            assert!(plan.affected(&Event::new(EventKind::Create(CreateKind::File)).add_path(path)));
+        }
+        assert!(plan.affected(&Event::new(EventKind::Create(CreateKind::File))
+            .add_path(excluded.clone()).add_path(root.join("included.json"))));
+        assert!(plan.covers_read(&key(&root.join("included.json")),false));
+        assert!(!plan.covers_read(&key(&excluded),false));
+        assert!(!plan.covers_read(&key(&root),true),"filtered coverage is not an unfiltered directory read proof");
+        assert!(!plan.covers_read(&key(&root.join("included")),true));
+    }
+
+    #[test]
+    fn filtered_root_plans_reject_composition_in_both_directions() {
+        let root=std::env::temp_dir().join("ktlsp-filtered-root-merge-only");
+        let plain=WatchPlan {trees:BTreeSet::from([key(&root)]),..WatchPlan::default()};
+        let mut filtered=plan(&root);
+        assert!(filtered.merge(plain.clone()).is_err());
+        let mut unfiltered=plain.clone();assert!(unfiltered.merge(plan(&root)).is_err());
+        let mut other=plan(&root);other.filtered_roots[0].1.clear();
+        assert!(filtered.merge(other).is_err());
+        assert!(!filtered.affected(&Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("vendor/file.json"))),
+            "rejected composition must leave the original domain intact");
+        assert!(unfiltered.affected(&Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("vendor/file.json"))));
+        unfiltered.merge(plain).unwrap();
+    }
+
+    #[test]
+    fn filtered_root_constructor_bounds_policy_and_native_registrations() {
+        let base=root_fixture();let root=base.join("project");
+        std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
+        std::fs::write(root.join("vendor/nested/config.json"),b"excluded").unwrap();
+        for excluded in [BTreeSet::from(["..".into()]),BTreeSet::from(["a/b".into()]),
+            BTreeSet::from(["a\\b".into()]),BTreeSet::from(["*".into()]),
+            (0..129).map(|index|format!("dir{index}")).collect()] {
+            assert!(WatchPlan::filtered_root(&root,&excluded).is_err());
+        }
+        assert!(WatchPlan::filtered_root(Path::new("relative"),&BTreeSet::new()).is_err());
+        assert!(WatchPlan::filtered_root(&base.join("absent"),&BTreeSet::new()).is_err());
+        let result=WatchPlan::filtered_root(&root,&BTreeSet::from(["VENDOR".into()]));
+        #[cfg(windows)] {
+            let plan=result.unwrap();
+            assert_eq!(plan.recursive,BTreeSet::from([root.clone()]));
+            assert_eq!(plan.directories,BTreeSet::from([root.clone(),base.clone()]));
+            assert!(plan.exact.is_empty() && plan.memberships.is_empty());
+            assert!(plan.excluded_descendant(&key(&root),&key(&root.join("vendor/nested/config.json"))));
+        }
+        #[cfg(not(windows))]
+        assert!(result.err().unwrap().to_string().contains("bounded-root-recursion-unavailable"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filtered_root_native_lease_precedes_walk_and_observes_add_change_delete_rename_and_replacement() {
+        for operation in 0..5 {
+            let base=root_fixture();let root=base.join("project");
+            std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
+            std::fs::create_dir(root.join("included")).unwrap();
+            let file=root.join("included/config.json");std::fs::write(&file,b"before").unwrap();
+            let excluded=root.join("vendor/nested/cache.json");std::fs::write(&excluded,b"before").unwrap();
+            let plan=WatchPlan::filtered_root(&root,&BTreeSet::from(["vendor".into()])).unwrap();
+            let (observed,events)=std::sync::mpsc::channel();
+            let lease=HostInputLease::new(plan,Arc::new(move || {let _=observed.send(());})).unwrap();
+            assert!(lease.is_current());
+            // The first traversal happens after this mutation, with the lease already armed.
+            match operation {
+                0=>std::fs::write(root.join("included/new.json"),b"new").unwrap(),
+                1=>std::fs::write(&file,b"changed").unwrap(),
+                2=>std::fs::remove_file(&file).unwrap(),
+                3=>std::fs::rename(&file,root.join("included/renamed.json")).unwrap(),
+                _=>{std::fs::rename(&root,base.join("old-project")).unwrap();std::fs::create_dir(&root).unwrap();}
+            }
+            let _walked=walkdir::WalkDir::new(&root).follow_links(false).into_iter().collect::<Result<Vec<_>,_>>().unwrap();
+            events.recv_timeout(std::time::Duration::from_secs(5)).expect("relevant edit before traversal must retire the lease");
+            assert!(!lease.is_current());
+            lease.watch.as_ref().unwrap().close();drop(lease);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filtered_root_native_ambiguous_excluded_write_still_retires_the_lease() {
+        let base=root_fixture();let root=base.join("project");
+        std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
+        let excluded=root.join("vendor/nested/cache.json");std::fs::write(&excluded,b"before").unwrap();
+        let plan=WatchPlan::filtered_root(&root,&BTreeSet::from(["vendor".into()])).unwrap();
+        let (observed,events)=std::sync::mpsc::channel();
+        let lease=HostInputLease::new(plan,Arc::new(move || {let _=observed.send(());})).unwrap();
+        // The vendored Windows backend emits Modify(Any), not a proven data-only notification.
+        std::fs::write(&excluded,b"changed").unwrap();
+        events.recv_timeout(std::time::Duration::from_secs(5)).expect("ambiguous native events must stay conservative");
+        assert!(!lease.is_current());lease.watch.as_ref().unwrap().close();drop(lease);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filtered_root_replacement_between_plan_and_arm_cannot_mint_a_current_lease() {
+        let base=root_fixture();let root=base.join("project");std::fs::create_dir(&root).unwrap();
+        let plan=WatchPlan::filtered_root(&root,&BTreeSet::new()).unwrap();
+        std::fs::remove_dir(&root).unwrap();std::fs::write(&root,b"now a file").unwrap();
+        let (observed,events)=std::sync::mpsc::channel();
+        assert!(HostInputLease::new(plan,Arc::new(move || {let _=observed.send(());})).is_err());
+        events.recv_timeout(std::time::Duration::from_secs(5)).expect("failed arm must invalidate its owner");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
 

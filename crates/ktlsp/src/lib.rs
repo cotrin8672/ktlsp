@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod classpath;
 pub mod resource_model;
 mod resource_inputs;
+mod root_files;
 mod runtime_bytes;
 mod jvm_catalog;
 pub mod commands;

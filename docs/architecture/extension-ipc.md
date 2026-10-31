@@ -1086,3 +1086,76 @@ member descriptor/source context, source location URI and accepted-text
 digest. It consumes the normalized JSON schema and does not parse source code in
 the child. This disposable probe uses groups of eight normalized source reads;
 existing frame, handle and evaluation budgets still apply to larger projects.
+
+### Filtered workspace files (`root-files-v1`)
+
+This optional capability independently negotiates `rootFileInventory` and
+`rootFileSnapshot` through `analysis/readFacts`:
+
+```json
+{"op":"rootFileInventory","filter":{"basenames":[],"extensions":["json","json5"],"excludedDirectories":["build",".gradle","node_modules"]},"after":null}
+{"op":"rootFileSnapshot","file":"<issued file token>","after":null}
+```
+
+The host selects its registered LSP workspace root containing the current
+accepted owner/module. Shared files above the module remain inside that workspace
+domain. An unregistered, ambiguous or unavailable owner/root gives Unknown.
+Children cannot select a root, path or semantic scope. Workspace file access
+does not expand the owner's classpath, source/type identities or executable-code
+authority, and the read does not run a build or refresh the project model.
+
+Filters are generic literal basenames, final extensions without a leading dot,
+and excluded directory-name segments. All three sets are case insensitive.
+Basename or extension matches include a regular file; both positive sets empty
+select all regular files. There are no implicit hidden-directory or Gradle
+exclusions. Use a separate filter/domain when build or Gradle-cache files are
+needed. At most128 literals of256 UTF-8 bytes each are accepted; path/glob syntax
+is rejected. Raw filter spelling is echoed and continuation cursors bind that
+exact request, catalog revision and evaluation.
+
+An inventory page contains `root`, `filter`, `files`, `next`, `coverage` and
+`problems`. Its root is `{identity, uri, rootKind:"workspace", revision}`;
+`identity` is an opaque JSON string, `revision` a decimal JSON string, and `uri`
+a file-URI string. Each descriptor is `{file, uri, relativePath}`, with an opaque
+issued `file` token. `problems` is a string array. Follow every opaque `next`
+cursor; only terminal `coverage:{state:"found",value:true}` proves absence or
+uniqueness within that domain. Unavailable root/catalog capture returns null root
+and Unknown coverage, including when no positive files were available.
+Distinct matching paths keep distinct tokens even when their basenames match.
+
+A snapshot is a Knowledge value. Its Found value has `file`, `root`, `uri`,
+`relativePath`, `identity:{kind:"rootFile",revision,sha256}`, `documentVersion`,
+`size`, `offset`, `text` and `next`. The revision is a decimal string;
+`documentVersion` is an i32 JSON integer or null. Size and offset are nonnegative
+UTF-8 byte counts. Text chunks preserve Unicode scalar boundaries and are at
+most96 KiB, shrinking further for the encoded frame budget. Every chunk carries
+the complete text's size, identity and lowercase SHA-256. Reassemble contiguous
+chunks and verify that hash. A legitimate empty file has Found empty text;
+unsupported or unavailable bodies remain Unknown.
+Disk revisions identify the captured catalog; overlays retain the owned document
+revision and editor version.
+
+The host arms a native root/ancestor lease before walking the filtered domain,
+prunes excluded subtrees, and merges current arbitrary-language buffers including
+new unsaved files. Disk changes, additions, deletions, renames and overlays retire
+observed reads through the existing checked evaluation/source/model/provider
+lifetimes. Ambiguous native events may conservatively retire excluded churn.
+Symlinks, unreadable paths, unsupported watch coverage and bounds never establish
+a complete empty domain. Current native recursive coverage is implemented on
+Windows; unsupported platforms return Unknown.
+
+An acquisition invalidated during the walk discards its entire partial catalog
+and tries a fresh lease, at most three times. Logical source/overlay cancellation
+stops immediately; exhausted stale acquisition returns the existing `-32801`.
+An inner stale read retires that evaluation: the child responds to the outer
+evaluation with `-32801` and waits for the host's fresh evaluation. It must not
+retry the old read or turn the failure into an empty success. The host uses its
+existing requeue only with an observed stale input, cancellation or invalid read;
+an unsolicited child error does not authorize a blind retry.
+
+The bounds are8 domains per evaluation,100000 visited entries,16000 matching
+files,256 descriptors per page,16 MiB per body and64 MiB of accepted cached root
+text. Existing frame, stream, continuation and handle limits also apply. Tokens
+cannot be exchanged with source/resource handles or reused across evaluations.
+The existing external-child `root-files` corpus scenario exercises this contract;
+the fork acceptance record distinguishes authored checks from executed evidence.

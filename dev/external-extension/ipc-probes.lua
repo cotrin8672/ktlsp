@@ -1,4 +1,254 @@
 return function(env)
+  if vim.env.KTLSP_IPC_MODE == 'root-files' then
+    local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
+    local client, check = env.client, env.check
+    local root = vim.fs.abspath(env.project)
+    local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
+    local provider = 'fixture.ipc-shadow'
+    local proof = { mode = 'root-files', phases = {}, ordering = {} }
+    local owner = root .. '/modules/editing/src/main/java/fixture/CaseMixin.java'
+    local client_path = root .. '/modules/editing/src/main/java/fixture/CLIENT-CONFIG.JSON'
+    local shared = root .. '/shared/root-config.json'
+    local hidden = root .. '/build/.root-files/hidden-config.json'
+    local gradle_hidden = root .. '/.gradle/gradle-hidden.json'
+    local duplicate_a, duplicate_b = root .. '/shared/a/duplicate.json', root .. '/shared/b/duplicate.json'
+    local removed, renamed = root .. '/shared/delete-config.json', root .. '/shared/renamed-config.json'
+    local added, unsaved = root .. '/shared/added-config.json', root .. '/shared/unsaved-config.json'
+    local large, excluded = root .. '/shared/large-config.json', root .. '/ExClUdEd-RoOt/skip-config.json'
+    local extension_only = root .. '/shared/EXTENSION.JSON'
+    local pager = root .. '/root-file-pages'
+    local filter = { basenames = { 'added-config.json', 'client-config.json', 'delete-config.json',
+      'duplicate.json', 'gradle-hidden.json', 'hidden-config.json', 'large-config.json', 'renamed-config.json',
+      'root-config.json', 'unsaved-config.json' }, extensions = { 'json', 'rootfixture' },
+      excludedDirectories = { '.git', '.kotlin', 'excluded-root' } }
+    local function save() vim.fn.writefile({ vim.json.encode(proof) }, env.artifacts .. '/extension-ipc-proof.json') end
+    local function must(label, value)
+      check(label, value, nil, 'semantic', value and 'matched' or 'mismatch')
+      assert(value, label)
+    end
+    local function read(path)
+      local file = assert(io.open(path, 'rb')); local text = assert(file:read('*a')); file:close(); return text
+    end
+    local function write(path, text)
+      local file = assert(io.open(path, 'wb')); assert(file:write(text)); file:close()
+    end
+    local function path_key(path) return probe.path_key(vim.fs.abspath(path)) end
+    local function same_uri(uri, path)
+      if type(uri) ~= 'string' then return false end
+      local ok, decoded = pcall(vim.uri_to_fname, uri)
+      return ok and type(decoded) == 'string' and path_key(decoded) == path_key(path)
+    end
+    local function event(name, evaluation)
+      for _, line in ipairs(vim.fn.filereadable(vim.env.KTLSP_TRACE) == 1 and vim.fn.readfile(vim.env.KTLSP_TRACE) or {}) do
+        local ok, item = pcall(vim.json.decode, line)
+        if ok and item.name == name and item.args and item.args.provider == provider
+          and tostring(item.args.evaluation) == tostring(evaluation) then return item end
+      end
+    end
+    local function capture(phase, except, require_accepted)
+      local found, accepted
+      local ready = vim.wait(120000, function()
+        for _, file in ipairs(vim.fn.glob(barrier .. '/root-files-' .. phase .. '-*.json', false, true)) do
+          local item = vim.json.decode(table.concat(vim.fn.readfile(file), '\n'))
+          if type(item.owner) == 'string' and path_key(item.owner) == path_key(owner)
+            and tostring(item.evaluation) ~= tostring(except) then
+            local publication = event('extension.ipc.accepted', item.evaluation)
+            if not require_accepted or publication then found, accepted = item, publication; return true end
+          end
+        end
+        return false
+      end, 25)
+      check(phase .. ' capture reaches host barrier', ready, nil, 'operational')
+      assert(ready, phase .. ' capture unavailable')
+      return found, accepted
+    end
+    local function settings(phase, pause, token)
+      local configuration = { target = 'fixture.Target', rootFilePhase = phase,
+        rootFileFilter = filter, rootFilePause = pause }
+      if token then configuration.rootFileProbeToken = token end
+      client:notify('workspace/didChangeConfiguration', { settings = { analysisProviders = {
+        [provider] = { enabled = true, configuration = configuration,
+          command = { assert(vim.env.KTLSP_IPC_CHILD), '--barrier', barrier, '--root-files' } },
+      } } })
+    end
+    local function disable()
+      client:notify('workspace/didChangeConfiguration', { settings = { analysisProviders = { [provider] = { enabled = false } } } })
+    end
+    local function attach(path, filetype)
+      local buf = vim.fn.bufadd(path); vim.fn.bufload(buf); vim.bo[buf].filetype = filetype
+      assert(vim.lsp.buf_attach_client(buf, client.id)); return buf
+    end
+    local owner_buf = attach(owner, 'java')
+    local client_buf = attach(client_path, 'json')
+    assert(vim.fn.filereadable(unsaved) == 0 and vim.fn.filereadable(added) == 0 and vim.fn.filereadable(renamed) == 0)
+    local new_buf = attach(unsaved, 'json')
+    local initial_shared, original_client, original_removed = read(shared), read(client_path), read(removed)
+    local original_duplicate = read(duplicate_a)
+    local originals = { [shared] = initial_shared, [client_path] = original_client, [removed] = original_removed,
+      [duplicate_a] = original_duplicate }
+    local created = { large, added, renamed }
+    local notifications = {}
+    local old_notify = client.rpc.notify
+    client.rpc.notify = function(method, params)
+      local sent = old_notify(method, params)
+      if sent and method == 'textDocument/didChange' then
+        notifications[params.textDocument.uri] = params.textDocument.version
+      end
+      return sent
+    end
+    local function edit(buf, text)
+      vim.bo[buf].eol = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text:gsub('\n$', ''), '\n', { plain = true }))
+      require('vim.lsp._changetracking').flush(client)
+      local uri, version = vim.uri_from_bufnr(buf), vim.lsp.util.buf_versions[buf]
+      local actual = probe.buffer_full_text(buf)
+      assert(notifications[uri] == version and actual:gsub('\r\n', '\n') == text, 'overlay was not delivered')
+      return version, actual
+    end
+    local function pause_file(phase, suffix) return barrier .. '/root-files-' .. phase .. '-' .. suffix end
+    local function wait_file(path, label)
+      local ready = vim.wait(120000, function() return vim.fn.filereadable(path) == 1 end, 25)
+      check(label, ready, nil, 'operational'); assert(ready, label)
+    end
+    local function inspect(label, capture_value, expected, versions, pages)
+      local inventory = capture_value.inventory
+      must(label .. ' exact query filter', vim.deep_equal(inventory.filter, filter)
+        and vim.deep_equal(capture_value.filter, filter))
+      must(label .. ' uses registered workspace root', inventory.root and inventory.root.rootKind == 'workspace'
+        and same_uri(inventory.root.uri, root) and type(inventory.root.identity) == 'string'
+        and type(inventory.root.revision) == 'string')
+      must(label .. ' terminal inventory is complete', inventory.coverage.state == 'found'
+        and inventory.coverage.value == true and #inventory.problems == 0 and inventory.pages >= pages)
+      must(label .. ' absent basename is a complete empty domain', capture_value.absent.coverage.state == 'found'
+        and capture_value.absent.coverage.value == true and #capture_value.absent.files == 0
+        and #capture_value.absent.problems == 0 and same_uri(capture_value.absent.root.uri, root)
+        and vim.deep_equal(capture_value.absent.filter, { basenames = { 'ktlsp-root-files-guaranteed-absent.fixture' },
+          extensions = {}, excludedDirectories = filter.excludedDirectories }))
+      local seen, ids, snapshots = {}, {}, {}
+      for _, item in ipairs(inventory.files) do
+        local key = path_key(vim.uri_to_fname(item.uri))
+        must(label .. ' unique root file ' .. key, not seen[key] and not ids[item.file]
+          and expected[key] ~= nil and type(item.file) == 'string'
+          and same_uri(item.uri, root .. '/' .. item.relativePath))
+        seen[key], ids[item.file] = item, true
+      end
+      for path in pairs(expected) do must(label .. ' expected inventory path ' .. path, seen[path] ~= nil) end
+      must(label .. ' excluded directory omitted', seen[path_key(excluded)] == nil)
+      for _, item in ipairs(capture_value.snapshots) do
+        local key = path_key(vim.uri_to_fname(item.uri)); local want = expected[key]
+        must(label .. ' snapshot has issued identity ' .. key, seen[key] and seen[key].file == item.file
+          and snapshots[key] == nil and type(want) == 'string' and item.text == want
+          and item.sha256 == vim.fn.sha256(want) and #item.chunks > 0)
+        snapshots[key] = item
+        for _, chunk in ipairs(item.chunks) do
+          local value = chunk.value
+          must(label .. ' snapshot current content ' .. key, chunk.state == 'found' and value
+            and value.file == item.file and same_uri(value.uri, key) and value.root.identity == inventory.root.identity
+            and value.identity.kind == 'rootFile' and value.identity.sha256 == item.sha256
+            and type(value.identity.revision) == 'string' and value.size == #want
+            and (versions[key] == nil or value.documentVersion == versions[key]))
+        end
+      end
+      for path, text in pairs(expected) do
+        if type(text) == 'string' then must(label .. ' expected snapshot ' .. path, snapshots[path] ~= nil) end
+      end
+      must(label .. ' large UTF-8 snapshot spans chunks', snapshots[path_key(large)] and #snapshots[path_key(large)].chunks > 1)
+      return seen
+    end
+    local ok, failure = xpcall(function()
+      assert(vim.fn.filereadable(excluded) == 1 and vim.fn.filereadable(extension_only) == 1, 'filter fixtures missing')
+      local owner_source, model_path
+      for _, path in ipairs(vim.fn.glob(vim.env.KTLSP_CACHE_DIR .. '/classpath/*.json', false, true)) do
+        local model = vim.json.decode(table.concat(vim.fn.readfile(path), '\n'))
+        for _, module in ipairs(model.modules or {}) do
+          if module.module == ':app' and path_key(module.project_dir) == path_key(root .. '/modules/editing') then
+            for _, source in ipairs(module.source_sets or {}) do
+              if source.name == 'main' then owner_source, model_path = source, path end
+            end
+          end
+        end
+      end
+      local resources = owner_source and owner_source.resources
+      must('nested owner has complete Gradle resource facts', resources and resources.complete == true)
+      local selected = false
+      for _, path in ipairs({ shared, client_path, hidden, gradle_hidden, duplicate_a, duplicate_b, removed }) do
+        local key = path_key(path)
+        for _, base in ipairs(resources.roots or {}) do
+          local prefix = path_key(base):gsub('/+$', '') .. '/'
+          if key:sub(1, #prefix) == prefix then selected = true end
+        end
+        for _, file in ipairs(resources.files or {}) do if path_key(file.path) == key then selected = true end end
+      end
+      must('root configs are outside the nested owner resource selection', not selected)
+      proof.owner_model = { path = model_path, resource_roots = resources.roots, resource_files = #resources.files }
+      vim.fn.mkdir(pager, 'p')
+      local expected = {}
+      expected[path_key(extension_only)] = true
+      for i = 1, 257 do
+        local path = ('%s/page-%03d.rootfixture'):format(pager, i)
+        write(path, ('page-%03d\n'):format(i)); created[#created + 1] = path; expected[path_key(path)] = true
+      end
+      local big = '{"text":"' .. string.rep('漢😀', 20000) .. '"}\n'
+      write(large, big)
+      local client_text = '{"scope":"java-client","value":"overlay-初"}\n'
+      local new_text = '{"scope":"new-unsaved","value":"初"}\n'
+      local client_version, new_version
+      client_version, client_text = edit(client_buf, client_text)
+      new_version, new_text = edit(new_buf, new_text)
+      for _, path in ipairs({ shared, hidden, gradle_hidden, duplicate_a, duplicate_b, removed, large }) do expected[path_key(path)] = read(path) end
+      expected[path_key(client_path)], expected[path_key(unsaved)] = client_text, new_text
+      settings('initial', true)
+      wait_file(pause_file('initial', 'paused'), 'initial evaluation paused after capture')
+      local initial = capture('initial', nil, false)
+      must('initial capture belongs to nested owner', type(initial.owner) == 'string'
+        and path_key(initial.owner) == path_key(owner))
+      must('paused capture matches barrier evaluation', tostring(initial.evaluation) == table.concat(vim.fn.readfile(pause_file('initial', 'paused')), ''))
+      local seen = inspect('initial', initial, expected, { [path_key(client_path)] = client_version, [path_key(unsaved)] = new_version }, 2)
+      proof.phases.initial = initial; proof.ordering[#proof.ordering + 1] = 'initial-capture'; save()
+      local stale_token = seen[path_key(shared)].file
+      local fresh_shared = '{"scope":"workspace","value":"changed"}\n'
+      write(shared, fresh_shared); assert(vim.uv.fs_unlink(removed)); assert(vim.uv.fs_rename(duplicate_a, renamed))
+      write(added, '{"scope":"added"}\n')
+      wait_file(pause_file('initial', 'cancelled'), 'stale evaluation cancelled after native disk changes')
+      must('old evaluation not published before release', event('extension.ipc.accepted', initial.evaluation) == nil)
+      client_text = '{"scope":"java-client","value":"overlay-更新"}\n'
+      client_version, client_text = edit(client_buf, client_text)
+      vim.fn.writefile({ 'release' }, pause_file('initial', 'release'))
+      local rejected = vim.wait(30000, function() return event('extension.ipc.rejected', initial.evaluation) ~= nil end, 25)
+      must('old evaluation rejected after release', rejected and event('extension.ipc.accepted', initial.evaluation) == nil)
+      expected[path_key(shared)], expected[path_key(client_path)] = fresh_shared, client_text
+      expected[path_key(removed)], expected[path_key(duplicate_a)] = nil, nil
+      expected[path_key(renamed)], expected[path_key(added)] = original_duplicate, read(added)
+      local fresh, accepted = capture('initial', initial.evaluation, true)
+      must('fresh accepted evaluation uses nested owner', accepted and same_uri(vim.uri_from_fname(accepted.args.owner), owner))
+      local fresh_seen = inspect('fresh', fresh, expected, { [path_key(client_path)] = client_version, [path_key(unsaved)] = new_version }, 2)
+      proof.phases.fresh = fresh; proof.ordering[#proof.ordering + 1] = 'stale-rejected-and-fresh-accepted'; save()
+      must('fresh provider session is identified', type(accepted.args.instance) == 'number')
+      local old_token = fresh_seen[path_key(shared)].file
+      must('fresh session uses a new opaque file token', old_token ~= stale_token)
+      for _, test in ipairs({ { 'old', old_token }, { 'foreign', 'root-file-foreign-token' }, { 'escape', '../shared/root-config.json' } }) do
+        disable(); settings(test[1], false, test[2])
+        local negative = capture(test[1], nil, false)
+        local rejected_negative = vim.wait(30000, function() return event('extension.ipc.rejected', negative.evaluation) ~= nil end, 25)
+        must(test[1] .. ' token rejected without publication', rejected_negative and negative.negative
+          and negative.negative.file == test[2] and negative.negative.error.code == -32602
+          and event('extension.ipc.accepted', negative.evaluation) == nil)
+        proof.phases[test[1]] = negative; save()
+      end
+    end, debug.traceback)
+    disable(); client.rpc.notify = old_notify
+    for path, text in pairs(originals) do write(path, text) end
+    for _, path in ipairs(created) do if vim.fn.filereadable(path) == 1 then assert(vim.uv.fs_unlink(path)) end end
+    vim.fn.delete(pager, 'd')
+    vim.api.nvim_buf_set_lines(client_buf, 0, -1, false, vim.split(original_client:gsub('\n$', ''), '\n', { plain = true }))
+    vim.bo[client_buf].modified = false; vim.bo[new_buf].modified = false
+    vim.lsp.buf_detach_client(new_buf, client.id); vim.api.nvim_buf_delete(new_buf, { force = true })
+    require('vim.lsp._changetracking').flush(client)
+    for path, text in pairs(originals) do assert(read(path) == text, 'fixture restoration failed') end
+    assert(vim.fn.filereadable(unsaved) == 0, 'unsaved fixture reached disk')
+    save(); if not ok then error(failure) end
+    return
+  end
   if vim.env.KTLSP_IPC_MODE == 'provider-commands' or vim.env.KTLSP_IPC_MODE == 'project-inputs'
     or vim.env.KTLSP_IPC_MODE == 'binary-annotations' then return dofile(env.repo .. '/dev/external-extension/command-probes.lua')(env) end
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')

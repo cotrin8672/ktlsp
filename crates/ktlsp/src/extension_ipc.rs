@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,35 +22,53 @@ pub(crate) const READ_FACTS_RESPONSE_BUDGET_EXCEEDED: &str =
 const MAX_BATCH: usize = 256;
 const MAX_HANDLES: usize = 16_384;
 const MAX_STREAM_CONTINUATIONS: usize = 256;
-const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const EVALUATION_LIMIT: Duration = Duration::from_secs(30);
 static NEXT_EVALUATION: AtomicU64 = AtomicU64::new(1);
 const PROJECT_FACTS: &str = "project-class-facts-v1";
-const PROJECT_CONTEXT: u16 = 1;
-const TYPE_JVM: u16 = 2;
+const PROJECT_CONTEXT: u32 = 1;
+const TYPE_JVM: u32 = 2;
 const SOURCE_SNAPSHOTS: &str = "source-snapshots-v1";
-const SOURCE_INVENTORY: u16 = 4;
-const SOURCE_SNAPSHOT: u16 = 8;
+const SOURCE_INVENTORY: u32 = 4;
+const SOURCE_SNAPSHOT: u32 = 8;
 const RESOURCES: &str = "owned-resources-v1";
-const RESOURCE_INVENTORY:u16=16;
-const RESOURCE_LOOKUP:u16=32;
-const RESOURCE_SNAPSHOT:u16=64;
+const RESOURCE_INVENTORY:u32=16;
+const RESOURCE_LOOKUP:u32=32;
+const RESOURCE_SNAPSHOT:u32=64;
 const RUNTIME_CLASSES: &str = "runtime-class-bytes-v1";
-const RUNTIME_CLASS: u16 = 128;
-const CLASS_BYTES: u16 = 256;
+const RUNTIME_CLASS: u32 = 128;
+const CLASS_BYTES: u32 = 256;
 const JVM_CATALOG: &str = "jvm-catalog-v1";
-const JVM_INVENTORY: u16 = 512;
-const JVM_CLASS: u16 = 1024;
+const JVM_INVENTORY: u32 = 512;
+const JVM_CLASS: u32 = 1024;
 const SOURCE_LOCATIONS: &str = "source-locations-v1";
-const SOURCE_LOCATION: u16 = 2048;
+const SOURCE_LOCATION: u32 = 2048;
 const PROJECT_INPUT_CAPABILITY: &str = "project-inputs-v1";
-pub(crate) const PROJECT_INPUTS: u16 = 8192;
+pub(crate) const PROJECT_INPUTS: u32 = 8192;
 const SOURCE_FACTS_V2: &str = "source-facts-v2";
-const SOURCE_FACTS: u16 = 4096;
+const SOURCE_FACTS: u32 = 4096;
 const BINARY_ANNOTATION_CAPABILITY: &str = "binary-annotations-v1";
-const BINARY_ANNOTATIONS: u16 = 16384;
+const BINARY_ANNOTATIONS: u32 = 16384;
+const ROOT_FILES: &str = "root-files-v1";
+pub(crate) const ROOT_FILE_INVENTORY: u32 = 32768;
+pub(crate) const ROOT_FILE_SNAPSHOT: u32 = 65536;
 
-fn project_operations(result: &Value) -> u16 {
+fn root_read_batch(reads:Vec<crate::root_files::ReadPlan>)->impl Iterator<Item=crate::root_files::PreparedRead> {
+    let remaining=reads.first().map_or(0,|read|read.byte_budget).min(MAX_STREAM_BYTES);
+    reads.into_iter().scan(remaining,|remaining,mut read| {
+        read.byte_budget=read.byte_budget.min(*remaining);
+        let prepared=crate::root_files::read(read);
+        if let Ok(body)=&prepared.body {*remaining=(*remaining).saturating_sub(body.text.len());}
+        Some(prepared)
+    })
+}
+
+fn semantic_response_error(error:&Value,host_stale:bool)->String {
+    if host_stale && error["code"].as_i64()==Some(-32801) {"Stale".into()}
+    else {format!("extension evaluation failed: {error}")}
+}
+
+fn project_operations(result: &Value) -> u32 {
     let mut selected = if result["capabilities"].as_array().is_some_and(|values|
         values.iter().any(|value|value==BINARY_ANNOTATION_CAPABILITY)) {BINARY_ANNOTATIONS} else {0};
     for (capability, operations) in [
@@ -62,6 +80,7 @@ fn project_operations(result: &Value) -> u16 {
         (SOURCE_LOCATIONS, &[("sourceLocation",SOURCE_LOCATION)][..]),
         (PROJECT_INPUT_CAPABILITY, &[("projectInputs",PROJECT_INPUTS)][..]),
         (SOURCE_FACTS_V2, &[("sourceFacts",SOURCE_FACTS)][..]),
+        (ROOT_FILES, &[("rootFileInventory",ROOT_FILE_INVENTORY),("rootFileSnapshot",ROOT_FILE_SNAPSHOT)][..]),
     ] {
         if !result["capabilities"].as_array().is_some_and(|values|
             values.iter().any(|value| value == capability)) { continue; }
@@ -77,11 +96,11 @@ fn project_operations(result: &Value) -> u16 {
 fn initialize_message(provider:&str,commands:&std::collections::BTreeSet<String>)->Value {
     json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{
         "protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":provider,
-        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,SOURCE_LOCATIONS,SOURCE_FACTS_V2,PROJECT_INPUT_CAPABILITY,BINARY_ANNOTATION_CAPABILITY,"provider-commands-v1"],
+        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,SOURCE_LOCATIONS,SOURCE_FACTS_V2,PROJECT_INPUT_CAPABILITY,BINARY_ANNOTATION_CAPABILITY,ROOT_FILES,"provider-commands-v1"],
         "commands":commands,"supportedOps":{
             PROJECT_FACTS:["projectContext","typeJvm"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"],
             RESOURCES:["resourceInventory","resourceLookup","resourceSnapshot"],RUNTIME_CLASSES:["runtimeClass","classBytes"],
-            JVM_CATALOG:["jvmCatalog","jvmClass"],SOURCE_LOCATIONS:["sourceLocation"],PROJECT_INPUT_CAPABILITY:["projectInputs"],SOURCE_FACTS_V2:["sourceFacts"]
+            JVM_CATALOG:["jvmCatalog","jvmClass"],SOURCE_LOCATIONS:["sourceLocation"],PROJECT_INPUT_CAPABILITY:["projectInputs"],SOURCE_FACTS_V2:["sourceFacts"],ROOT_FILES:["rootFileInventory","rootFileSnapshot"]
         }}})
 }
 
@@ -241,6 +260,10 @@ enum Handle {
     ResourceCatalog {revision:u64},
     ResourceInventory { revision:u64,next:usize },
     ResourceBytes { resource:String,bytes:Arc<crate::resource_inputs::ResourceBytes>,next:usize },
+    RootCatalog {revision:u64},
+    RootFile {revision:u64,index:usize},
+    RootInventory {filter:crate::root_files::Filter,revision:u64,next:usize},
+    RootBytes {file:String,body:Arc<crate::root_files::Body>,next:usize},
     SourceInventory { sources: Arc<Vec<SourceHandle>>, next: usize, scope:Option<ktcore::project_model::ProjectScope> },
     Declaration(DeclarationId),
     TypeRef(ktcore::types::TypeRef),
@@ -262,13 +285,17 @@ pub(crate) struct Evaluation {
     pub failure: Option<String>,
     pub committed_revision: Option<u64>,
     pub project: Option<Arc<crate::classpath::ProjectSnapshot>>,
-    pub project_operations: u16,
+    pub project_operations: u32,
     pub command: bool,
     pub(crate) project_index:Option<Value>,
     project_input_index:Option<Value>,
     project_input_records:Option<Arc<Vec<Value>>>,
     project_source_tokens:BTreeMap<ktcore::project_model::ProjectScope,String>,
     pub(crate) project_resource_catalogs:BTreeMap<ktcore::project_model::ProjectScope,Arc<crate::resource_inputs::ResourceCatalog>>,
+    pub(crate) root_catalogs:BTreeMap<crate::root_files::Filter,Result<Arc<crate::root_files::Catalog>,String>>,
+    pub(crate) root_results:BTreeMap<String,Result<Arc<crate::root_files::Body>,String>>,
+    root_catalog_tokens:BTreeMap<u64,String>,
+    root_file_tokens:BTreeMap<(u64,usize),String>,
     resource_catalog_tokens:BTreeMap<u64,String>,
     pub(crate) resource_catalog:Option<Arc<crate::resource_inputs::ResourceCatalog>>,
     resource_catalog_token:Option<String>,
@@ -302,6 +329,8 @@ impl Evaluation {
             command: false,
             project_index:None,project_input_index:None,project_input_records:None,
             project_source_tokens:BTreeMap::new(),project_resource_catalogs:BTreeMap::new(),resource_catalog_tokens:BTreeMap::new(),
+            root_catalogs:BTreeMap::new(),root_results:BTreeMap::new(),root_catalog_tokens:BTreeMap::new(),
+            root_file_tokens:BTreeMap::new(),
             resource_catalog:None,resource_catalog_token:None,resource_results:BTreeMap::new(),
             class_scope: None,
             class_results: BTreeMap::new(),
@@ -565,6 +594,16 @@ impl Evaluation {
                     if self.class_offset(&identity, Some(after))? >= length { return Err("invalid class byte cursor".into()); }
                     continuations += 1;
                 }
+                ReadQuery::RootFileInventory {filter,after:Some(after),extra}=>{
+                    if self.project_operations&ROOT_FILE_INVENTORY==0 {return Err("rootFileInventory was not negotiated".into());}
+                    if !extra.is_empty() {return Err("unknown root-file query field".into());}filter.validate()?;
+                    self.root_page(filter,after)?;continuations+=1;
+                },
+                ReadQuery::RootFileSnapshot {file,after:Some(after),extra}=>{
+                    if self.project_operations&ROOT_FILE_SNAPSHOT==0 {return Err("rootFileSnapshot was not negotiated".into());}
+                    if !extra.is_empty() {return Err("unknown root-file query field".into());}
+                    self.root_stream_cursor(file,after)?;continuations+=1;
+                },
                 ReadQuery::ResourceSnapshot { resource, after: Some(after) } => {
                     if self.project_operations & RESOURCE_SNAPSHOT == 0 { return Err("resourceSnapshot was not negotiated".into()); }
                     self.resource_stream_cursor(resource, after)?;
@@ -1340,6 +1379,161 @@ impl Evaluation {
             "utf8":body.utf8,"text":text,"next":next}}))
     }
 
+    fn root_file_index(&self,file:&str)->Result<(Arc<crate::root_files::Catalog>,usize),String> {
+        let Some(Handle::RootFile {revision,index})=self.handles.get(file) else {return Err("foreign root-file token".into());};
+        let catalog=self.root_catalogs.values().filter_map(|catalog|catalog.as_ref().ok())
+            .find(|catalog|catalog.revision==*revision).cloned().ok_or("foreign root-file domain")?;
+        if !self.root_catalog_tokens.get(revision).and_then(|token|self.handles.get(token))
+            .is_some_and(|handle|matches!(handle,Handle::RootCatalog {revision:expected} if expected==revision)) {
+            return Err("foreign root-file domain identity".into());
+        }
+        if !catalog.guard.is_current() {return Err("Stale".into());}
+        if *index>=catalog.entries.len() {return Err("invalid root-file index".into());}
+        Ok((catalog,*index))
+    }
+    pub(crate) fn root_catalog_for_file(&self,file:&str)->Result<Arc<crate::root_files::Catalog>,String> {
+        self.root_file_index(file).map(|(catalog,_)|catalog)
+    }
+    fn root_page(&self,filter:&crate::root_files::Filter,after:&str)->Result<usize,String> {
+        let Some(Ok(catalog))=self.root_catalogs.get(filter) else {return Err("foreign root-file domain".into());};
+        if !catalog.guard.is_current() {return Err("Stale".into());}
+        match self.handles.get(after) {
+            Some(Handle::RootInventory {filter:expected,revision,next}) if expected==filter && *revision==catalog.revision=>Ok(*next),
+            _=>Err("invalid root-file inventory cursor".into()),
+        }
+    }
+    fn root_stream_cursor(&self,file:&str,after:&str)->Result<(),String> {
+        self.root_file_index(file)?;
+        match self.handles.get(after) {
+            Some(Handle::RootBytes {file:expected,..}) if expected==file=>Ok(()),
+            _=>Err("invalid root-file snapshot cursor".into()),
+        }
+    }
+    pub(crate) fn begin_root_captures(&mut self,method:&str,params:&Value)->Result<Vec<crate::root_files::Filter>,String> {
+        if method!="analysis/readFacts" {return Ok(Vec::new());}
+        if params["evaluation"].as_str()!=Some(&self.id.to_string()) {return Err("foreign evaluation".into());}
+        self.ensure_input_read_budget(params)?;
+        let queries:Vec<ReadQuery>=serde_json::from_value(params["queries"].clone()).map_err(|error|error.to_string())?;
+        if queries.len()>MAX_BATCH {return Err("extension batch too large".into());}
+        let mut missing=std::collections::BTreeSet::new();
+        for query in queries {
+            match query {
+                ReadQuery::RootFileInventory {filter,after,extra}=>{
+                    if self.project_operations&ROOT_FILE_INVENTORY==0 {return Err("rootFileInventory was not negotiated".into());}
+                    if !extra.is_empty() {return Err("unknown root-file query field".into());}filter.validate()?;
+                    if let Some(after)=after {self.root_page(&filter,&after)?;}
+                    else if let Some(Ok(catalog))=self.root_catalogs.get(&filter) {
+                        if !catalog.guard.is_current() {return Err("Stale".into());}
+                    } else if !self.root_catalogs.contains_key(&filter) {missing.insert(filter);}
+                },
+                ReadQuery::RootFileSnapshot {file,after,extra}=>{
+                    if self.project_operations&ROOT_FILE_SNAPSHOT==0 {return Err("rootFileSnapshot was not negotiated".into());}
+                    if !extra.is_empty() {return Err("unknown root-file query field".into());}
+                    self.root_file_index(&file)?;
+                    if let Some(after)=after {self.root_stream_cursor(&file,&after)?;}
+                },
+                _=>{},
+            }
+        }
+        if self.root_catalogs.len()+missing.len()>8 {return Err("root-file domain limit".into());}
+        Ok(missing.into_iter().collect())
+    }
+    pub(crate) fn begin_root_reads(&self,method:&str,params:&Value)->Result<Vec<crate::root_files::ReadPlan>,String> {
+        if method!="analysis/readFacts" {return Ok(Vec::new());}
+        if params["evaluation"].as_str()!=Some(&self.id.to_string()) {return Err("foreign evaluation".into());}
+        self.ensure_input_read_budget(params)?;
+        let queries:Vec<ReadQuery>=serde_json::from_value(params["queries"].clone()).map_err(|error|error.to_string())?;
+        if queries.len()>MAX_BATCH {return Err("extension batch too large".into());}
+        let used:usize=self.root_results.values().filter_map(|body|body.as_ref().ok()).map(|body|body.text.len()).sum();
+        let mut reads=BTreeMap::new();
+        for query in queries {
+            if let ReadQuery::RootFileSnapshot {file,after,extra}=query {
+                if self.project_operations&ROOT_FILE_SNAPSHOT==0 {return Err("rootFileSnapshot was not negotiated".into());}
+                if !extra.is_empty() {return Err("unknown root-file query field".into());}
+                let (catalog,index)=self.root_file_index(&file)?;
+                if let Some(after)=after {self.root_stream_cursor(&file,&after)?;continue;}
+                if !self.root_results.contains_key(&file) {
+                    reads.entry(file.clone()).or_insert(crate::root_files::ReadPlan {evaluation:self.id,file,catalog,index,
+                        byte_budget:MAX_STREAM_BYTES.saturating_sub(used)});
+                }
+            }
+        }
+        Ok(reads.into_values().collect())
+    }
+    fn root_descriptor(&mut self,catalog:&crate::root_files::Catalog)->Value {
+        let identity=match self.root_catalog_tokens.get(&catalog.revision) {
+            Some(token)=>token.clone(),None=>{
+                let token=self.issue(Handle::RootCatalog {revision:catalog.revision});
+                self.root_catalog_tokens.insert(catalog.revision,token.clone());token
+            },
+        };
+        json!({"identity":identity,"uri":catalog.uri,"rootKind":"workspace","revision":catalog.revision.to_string()})
+    }
+    fn root_inventory(&mut self,read:&mut ReadSession<'_>,filter:crate::root_files::Filter,after:Option<&str>)->Result<Value,String> {
+        filter.validate()?;
+        let catalog=match self.root_catalogs.get(&filter) {
+            Some(Ok(catalog))=>catalog.clone(),
+            missing=>return Ok(json!({"root":null,"filter":filter,"files":[],"next":null,"coverage":missing_fact(),
+                "problems":[missing.and_then(|catalog|catalog.as_ref().err()).map(String::as_str).unwrap_or("root-file-domain-unavailable")]})),
+        };
+        read.observe_host_input(catalog.guard.clone()).map_err(contract)?;
+        let start=after.map(|after|self.root_page(&filter,after)).transpose()?.unwrap_or(0);
+        if start>catalog.entries.len() {return Err("invalid root-file inventory cursor".into());}
+        if !self.root_catalog_tokens.contains_key(&catalog.revision) && self.handles.len()>=MAX_HANDLES {
+            return Err("extension evaluation limit".into());
+        }
+        let root=self.root_descriptor(&catalog);let mut files=Vec::new();let mut end=start;
+        let mut used=serde_json::to_vec(&json!({"root":root,"filter":filter,"files":[],"next":"x".repeat(128),
+            "coverage":missing_fact(),"problems":catalog.problems})).map_err(|error|error.to_string())?.len();
+        while end<catalog.entries.len() && files.len()<MAX_BATCH {
+            let entry=&catalog.entries[end];
+            let mut value=json!({"file":"x".repeat(128),"uri":entry.uri,"relativePath":entry.relative});
+            let length=serde_json::to_vec(&value).map_err(|error|error.to_string())?.len()+1;
+            if used+length>MAX_FRAME/2-1024 {break;}
+            if self.handles.len()+2>MAX_HANDLES {return Err("extension evaluation limit".into());}
+            let token=match self.root_file_tokens.get(&(catalog.revision,end)) {
+                Some(token)=>token.clone(),None=>{
+                    let token=self.issue(Handle::RootFile {revision:catalog.revision,index:end});
+                    self.root_file_tokens.insert((catalog.revision,end),token.clone());token
+                },
+            };
+            value["file"]=json!(token);files.push(value);end+=1;used+=length;
+        }
+        if end==start && end<catalog.entries.len() {return Ok(json!({"root":root,"filter":filter,"files":[],"next":null,
+            "coverage":missing_fact(),"problems":["root-file-descriptor-size-limit"]}));}
+        let next=(end<catalog.entries.len()).then(||self.issue(Handle::RootInventory {filter:filter.clone(),revision:catalog.revision,next:end}));
+        Ok(json!({"root":root,"filter":filter,"files":files,"next":next,"problems":catalog.problems,
+            "coverage":if end==catalog.entries.len() && catalog.complete {json!({"state":"found","value":true})} else {missing_fact()}}))
+    }
+    fn root_snapshot(&mut self,read:&mut ReadSession<'_>,file:&str,after:Option<&str>)->Result<Value,String> {
+        let (catalog,index)=self.root_file_index(file)?;read.observe_host_input(catalog.guard.clone()).map_err(contract)?;
+        let (body,start)=match after {
+            Some(after)=>match self.handles.get(after) {
+                Some(Handle::RootBytes {file:expected,body,next}) if expected==file=>(body.clone(),*next),
+                _=>return Err("invalid root-file snapshot cursor".into()),
+            },
+            None=>match self.root_results.get(file) {Some(Ok(body))=>(body.clone(),0),_=>return Ok(missing_fact())},
+        };
+        if start>body.text.len() || !body.text.is_char_boundary(start) {return Err("invalid root-file text cursor".into());}
+        let root=self.root_descriptor(&catalog);let entry=&catalog.entries[index];
+        let mut end=(start+96*1024).min(body.text.len());
+        while !body.text.is_char_boundary(end) {end-=1;}
+        let mut value;
+        loop {
+            value=json!({"file":file,"root":root,"uri":entry.uri,"relativePath":entry.relative,
+                "identity":{"kind":"rootFile","revision":body.revision.to_string(),"sha256":body.sha256},
+                "documentVersion":body.document_version,"size":body.text.len(),"offset":start,"text":&body.text[start..end],
+                "next":if end<body.text.len() {json!("x".repeat(128))} else {Value::Null}});
+            if serde_json::to_vec(&value).map_err(|error|error.to_string())?.len()<=MAX_FRAME/2-1024 {break;}
+            if end==start {return Ok(missing_fact());}
+            end=start+(end-start)/2;while !body.text.is_char_boundary(end) {end-=1;}
+        }
+        if end==start && start<body.text.len() {return Ok(missing_fact());}
+        if end<body.text.len() && self.handles.len()>=MAX_HANDLES {return Err("extension evaluation limit".into());}
+        let next=(end<body.text.len()).then(||self.issue(Handle::RootBytes {file:file.into(),body:body.clone(),next:end}));
+        value["next"]=json!(next);Ok(json!({"state":"found","value":value}))
+    }
+
     pub fn batch(
         &mut self,
         read: &mut ReadSession<'_>,
@@ -1378,6 +1572,16 @@ impl Evaluation {
                 let mut remaining = MAX_FRAME / 2;
                 for query in queries {
                     let value = match query {
+                        ReadQuery::RootFileInventory {filter,after,extra}=>{
+                            if self.project_operations&ROOT_FILE_INVENTORY==0 {return Err("rootFileInventory was not negotiated".into());}
+                            if !extra.is_empty() {return Err("unknown root-file query field".into());}
+                            self.root_inventory(read,filter,after.as_deref())?
+                        },
+                        ReadQuery::RootFileSnapshot {file,after,extra}=>{
+                            if self.project_operations&ROOT_FILE_SNAPSHOT==0 {return Err("rootFileSnapshot was not negotiated".into());}
+                            if !extra.is_empty() {return Err("unknown root-file query field".into());}
+                            self.root_snapshot(read,&file,after.as_deref())?
+                        },
                         ReadQuery::JvmCatalog{prefix,after}=>{
                             if self.project_operations&JVM_INVENTORY==0 {return Err("jvmCatalog was not negotiated".into());}
                             self.jvm_inventory(read,&prefix,after.as_deref())?
@@ -1861,6 +2065,8 @@ pub(crate) fn assert_jvm_catalog_wire(catalog:Arc<crate::jvm_catalog::JvmCatalog
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum ReadQuery {
+    RootFileInventory {filter:crate::root_files::Filter,#[serde(default)] after:Option<String>,#[serde(flatten)] extra:BTreeMap<String,Value>},
+    RootFileSnapshot {file:String,#[serde(default)] after:Option<String>,#[serde(flatten)] extra:BTreeMap<String,Value>},
     JvmCatalog { #[serde(default)] prefix:String, #[serde(default)] after:Option<String> },
     JvmClass { entry:String },
     ResourceInventory { #[serde(default)] after:Option<String>, #[serde(default)] scope:Option<String> },
@@ -2397,7 +2603,7 @@ pub(crate) struct Worker {
     command: Vec<String>,
     stopped: AtomicBool,
     failed: Arc<AtomicBool>,
-    project_operations: AtomicU16,
+    project_operations: AtomicU32,
     commands: std::collections::BTreeSet<String>,
     negotiated_commands: Mutex<std::collections::BTreeSet<String>>,
     transport: Mutex<Option<Transport>>,
@@ -2413,7 +2619,7 @@ impl Worker {
             command,
             stopped: AtomicBool::new(false),
             failed: Arc::new(AtomicBool::new(false)),
-            project_operations: AtomicU16::new(0),
+            project_operations: AtomicU32::new(0),
             commands,
             negotiated_commands: Mutex::new(std::collections::BTreeSet::new()),
             transport: Mutex::new(None),
@@ -2425,7 +2631,7 @@ impl Worker {
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
-    pub(crate) fn project_operations(&self) -> u16 {
+    pub(crate) fn project_operations(&self) -> u32 {
         self.project_operations.load(Ordering::Acquire)
     }
     pub(crate) fn command_acknowledged(&self, command: &str) -> bool {
@@ -2543,6 +2749,7 @@ impl Worker {
             )?;
             let deadline = Instant::now() + EVALUATION_LIMIT;
             let mut cancelled = false;
+            let mut stale_input = false;
             loop {
                 let message = transport.receive(deadline, &self.stopped, || {
                     if !cancelled && (cancellation.load(Ordering::Acquire) || !workspace.lock().ipc_evaluation_current(work.evaluation)) {
@@ -2561,14 +2768,23 @@ impl Worker {
                         continue;
                     };
                     let prepared_inputs=(||->Result<(),String> {
-                        let (reads,class,jvm)={
+                        let (roots,reads,class,jvm)={
                             let mut workspace=workspace.lock();
                             workspace.prepay_ipc_input_read(work.evaluation,method,&message["params"])?;
+                            let roots=workspace.begin_ipc_root_captures(work.evaluation,method,&message["params"])?;
                             let reads=workspace.begin_ipc_resource_reads(work.evaluation,method,&message["params"])?;
                             let class=workspace.begin_ipc_class_reads(work.evaluation,method,&message["params"])?;
                             let jvm=workspace.begin_ipc_jvm_reads(work.evaluation,method,&message["params"])?;
-                            (reads,class,jvm)
+                            (roots,reads,class,jvm)
                         };
+                        for root in roots {
+                            let prepared=crate::root_files::prepare(root,after_batch.clone());
+                            workspace.lock().finish_ipc_root_capture(prepared)?;
+                        }
+                        let root_reads=workspace.lock().begin_ipc_root_reads(work.evaluation,method,&message["params"])?;
+                        for prepared in root_read_batch(root_reads) {
+                            workspace.lock().finish_ipc_root_read(prepared)?;
+                        }
                         let mut budget=64usize*1024*1024;
                         for mut read in reads {
                             read.byte_budget=read.byte_budget.min(budget);
@@ -2592,6 +2808,7 @@ impl Worker {
                         method,
                         message["params"].clone(),
                     ));
+                    stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
                     if result.is_ok() && method == "analysis/readFacts" {
                         let request=workspace.lock().begin_ipc_requested_source_capture(work.evaluation);
                         if let Some(request)=request {
@@ -2603,7 +2820,7 @@ impl Worker {
                     let response = match result {
                         Ok(value) => json!({"jsonrpc":"2.0","id":request_id,"result":value}),
                         Err(error) => {
-                            json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":error}})
+                            json!({"jsonrpc":"2.0","id":request_id,"error":{"code":if error=="Stale" {-32801} else {-32602},"message":error}})
                         }
                     };
                     workspace.lock().account_ipc_stream_reply(work.evaluation,&response)?;
@@ -2619,8 +2836,9 @@ impl Worker {
                         if serde_json::to_vec(&value).map_err(|error|error.to_string())?.len()>MAX_FRAME/2 { return Err("provider command result limit".into()); }
                         return Ok(value);
                     }
-                    if message.get("error").is_some() {
-                        return Err(format!("extension evaluation failed: {}", message["error"]));
+                    if let Some(error)=message.get("error") {
+                        return Err(semantic_response_error(error,stale_input || cancelled
+                            || !workspace.lock().ipc_evaluation_current(work.evaluation)));
                     }
                     return workspace
                         .lock()
@@ -3360,21 +3578,149 @@ mod initialize_stream_contract_tests {
         assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==JVM_CATALOG));
         assert_eq!(offered["supportedOps"][JVM_CATALOG],json!(["jvmCatalog","jvmClass"]));
         assert_eq!(project_operations(offered),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS|SOURCE_LOCATION|SOURCE_FACTS|PROJECT_INPUTS|BINARY_ANNOTATIONS);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS|SOURCE_LOCATION|SOURCE_FACTS|PROJECT_INPUTS|BINARY_ANNOTATIONS|ROOT_FILE_INVENTORY|ROOT_FILE_SNAPSHOT);
         let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][RESOURCES]=json!(["resourceSnapshot"]);
         assert_eq!(project_operations(&acknowledgement)&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT),RESOURCE_SNAPSHOT);
         for (operation,bit) in [("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)] {
             let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][JVM_CATALOG]=json!([operation]);
             assert_eq!(project_operations(&acknowledgement)&(JVM_INVENTORY|JVM_CLASS),bit);
         }
+        assert_eq!(offered["supportedOps"][ROOT_FILES],json!(["rootFileInventory","rootFileSnapshot"]));
+        assert_eq!(project_operations(&json!({"capabilities":[ROOT_FILES]})),0);
+        assert_eq!(project_operations(&json!({"supportedOps":{ROOT_FILES:["rootFileInventory","rootFileSnapshot"]}})),0);
+        for (operation,bit) in [("rootFileInventory",ROOT_FILE_INVENTORY),("rootFileSnapshot",ROOT_FILE_SNAPSHOT)] {
+            assert_eq!(project_operations(&json!({"capabilities":[ROOT_FILES],"supportedOps":{ROOT_FILES:[operation]}})),bit);
+        }
         let mut legacy=offered.clone();
         legacy["capabilities"].as_array_mut().unwrap().retain(|capability|capability!=JVM_CATALOG);
         assert_eq!(project_operations(&legacy),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|SOURCE_LOCATION|SOURCE_FACTS|PROJECT_INPUTS|BINARY_ANNOTATIONS);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|SOURCE_LOCATION|SOURCE_FACTS|PROJECT_INPUTS|BINARY_ANNOTATIONS|ROOT_FILE_INVENTORY|ROOT_FILE_SNAPSHOT);
         let mut no_operations=offered.clone();no_operations["supportedOps"].as_object_mut().unwrap().remove(JVM_CATALOG);
         assert_eq!(project_operations(&no_operations)&(JVM_INVENTORY|JVM_CLASS),0);
     }
 
+}
+
+#[cfg(test)]
+mod root_file_wire_tests {
+    use super::*;
+    #[derive(Debug)] struct Flag(AtomicBool);
+    impl HostInputGuard for Flag {fn is_current(&self)->bool {!self.0.load(Ordering::Acquire)}}
+
+    #[test]
+    fn stale_root_preparation_before_guard_attachment_requeues_without_stopping_provider() {
+        use crate::analysis_extensions::AnalysisExtensions;
+        use ktcore::{index::{Index,Tier},indexer,parser::KotlinParser};
+        let mut index=Index::new();let mut host=AnalysisExtensions::new(Vec::new());
+        host.register_ipc(&index,"root-recovery",vec!["not-spawned".into()]).unwrap();
+        let owner="/root-recovery/CaseMixin.kt";let text="package retry\nclass Owner";
+        let tree=KotlinParser::new().parse(text);
+        index.replace_file(owner,indexer::extract_symbols(&tree,text,"retry"),Tier::Volatile);
+        host.replace_sources(&index,vec![(owner.into(),Arc::from(text),tree)]);
+        let work=host.take_ipc_work(&index,None).pop().unwrap();let instance=work.worker.id;
+        let revision=host.revision();host.fail_ipc_input_read(work.evaluation,"Stale");
+        assert!(host.ipc_current(work.evaluation),"failed capture had not attached its stale guard");
+        let error=json!({"code":-32801,"message":"Stale"});
+        assert_ne!(semantic_response_error(&error,false),"Stale","unsolicited stale responses must not create a retry loop");
+        host.finish_ipc_work(work.evaluation,Err(semantic_response_error(&error,true)));
+        assert_eq!(host.revision(),revision,"a failed read must not commit an empty contribution");
+        assert!(host.ipc_publication(work.evaluation).is_none());
+        let mut fresh=host.take_ipc_work(&index,None);assert_eq!(fresh.len(),1);
+        let fresh=fresh.pop().unwrap();assert_ne!(fresh.evaluation,work.evaluation);
+        assert_eq!(fresh.worker.id,instance);assert!(!fresh.worker.failed());
+        assert!(host.take_ipc_work(&index,None).is_empty(),"the existing running gate schedules only one fresh evaluation");
+    }
+
+    #[test]
+    fn root_read_batch_spends_remaining_budget_before_reading_the_next_body() {
+        let root=std::env::temp_dir().join(format!("root-read-budget-{}-{}",std::process::id(),NEXT_EVALUATION.fetch_add(1,Ordering::Relaxed)));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut entries=Vec::new();
+        for (relative,text) in [("first.json","one"),("second.json","{}"),("third.json","")] {
+            let path=root.join(relative);std::fs::write(&path,text).unwrap();
+            entries.push(crate::root_files::Entry {uri:crate::root_files::uri(&path).unwrap(),path,relative:relative.into(),document:None});
+        }
+        let catalog=Arc::new(crate::root_files::Catalog {revision:900,root:root.clone(),uri:crate::root_files::uri(&root).unwrap(),
+            filter:Default::default(),entries,complete:true,problems:Default::default(),guard:Arc::new(Flag(AtomicBool::new(false)))});
+        let reads=(0..3).map(|index|crate::root_files::ReadPlan {evaluation:1,file:format!("file-{index}"),catalog:catalog.clone(),index,byte_budget:4}).collect();
+        let prepared:Vec<_>=root_read_batch(reads).collect();
+        assert_eq!(prepared[0].body.as_ref().unwrap().text.as_ref(),"one");
+        assert!(prepared[1].body.is_err(),"the two-byte second body cannot consume the one remaining byte");
+        assert_eq!(prepared[2].body.as_ref().unwrap().text.as_ref(),"");
+        assert_eq!(prepared.iter().filter_map(|read|read.body.as_ref().ok()).map(|body|body.text.len()).sum::<usize>(),3);
+        drop(prepared);drop(catalog);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issued_root_files_page_stream_and_retire_without_resource_authority() {
+        use ktcore::index::Index;
+        use sha2::{Digest,Sha256};
+        let index=Index::new();let mut store=ExtensionStore::default();
+        let owner="/root-wire/Owner.kt";store.configure_provider("root-wire",true,Arc::from("{}"));
+        store.replace_source(&index,owner,Arc::from(""),Knowledge::Found(()),Vec::new()).unwrap();
+        let mut read=store.begin_read(&index,"root-wire",owner).unwrap();
+        let mut evaluation=Evaluation::new("root-wire".into(),owner.into(),1);
+        evaluation.project_operations=ROOT_FILE_INVENTORY|ROOT_FILE_SNAPSHOT;
+        let filter:crate::root_files::Filter=serde_json::from_value(json!({"basenames":["config.json"],"extensions":["rootfixture"],"excludedDirectories":["copy"]})).unwrap();
+        let root=std::env::temp_dir().join("root-files-wire");let flag=Arc::new(Flag(AtomicBool::new(false)));
+        let entries=(0..257).map(|index| {
+            let relative=match index {0=>"first/config.json".into(),1=>"second/config.json".into(),_=>format!("pages/{index:03}.rootfixture")};
+            let path=root.join(&relative);crate::root_files::Entry {uri:crate::root_files::uri(&path).unwrap(),path,relative,document:None}
+        }).collect();
+        let catalog=Arc::new(crate::root_files::Catalog {revision:42,root:root.clone(),uri:crate::root_files::uri(&root).unwrap(),
+            filter:filter.clone(),entries,complete:true,problems:Default::default(),guard:flag.clone()});
+        evaluation.root_catalogs.insert(filter.clone(),Ok(catalog.clone()));
+        let id=evaluation.id.to_string();let query=|queries:Value|json!({"evaluation":id,"queries":queries});
+        let first=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileInventory","filter":filter}]))).unwrap();
+        let first=&first["facts"][0];assert_eq!(first["root"]["rootKind"],"workspace");
+        assert_eq!(first["files"].as_array().unwrap().len(),256);assert_eq!(first["coverage"]["state"],"unknown");
+        assert_eq!(first["files"][0]["relativePath"],"first/config.json");assert_eq!(first["files"][1]["relativePath"],"second/config.json");
+        assert_ne!(first["files"][0]["file"],first["files"][1]["file"]);
+        let second=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileInventory","filter":filter,"after":first["next"]}]))).unwrap();
+        assert_eq!(second["facts"][0]["files"].as_array().unwrap().len(),1);
+        assert_eq!(second["facts"][0]["coverage"],json!({"state":"found","value":true}));
+        assert_eq!(second["facts"][0]["root"],first["root"]);assert!(second["facts"][0]["next"].is_null());
+        assert!(evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileInventory","filter":{},"after":first["next"]}]))).is_err());
+        assert!(evaluation.begin_root_captures("analysis/readFacts",&query(json!([{"op":"rootFileInventory","filter":filter,"root":"C:/foreign"}]))).is_err());
+        let file=first["files"][0]["file"].as_str().unwrap();let other=first["files"][1]["file"].as_str().unwrap();
+        assert!(evaluation.root_catalog_for_file(first["root"]["identity"].as_str().unwrap()).is_err());
+        assert!(evaluation.root_catalog_for_file("/root-wire/config.json").is_err());
+        let foreign=Evaluation::new("root-wire".into(),owner.into(),2);assert!(foreign.root_catalog_for_file(file).is_err());
+        let text=format!("{}{}","\0".repeat(100_000),"😃".repeat(10_000));let hash=format!("{:x}",Sha256::digest(text.as_bytes()));
+        evaluation.root_results.insert(file.into(),Ok(Arc::new(crate::root_files::Body {text:Arc::from(text.as_str()),sha256:hash.clone(),revision:9,document_version:Some(7)})));
+        let mut after=Value::Null;let mut assembled=String::new();let mut pages=0;
+        loop {
+            let result=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileSnapshot","file":file,"after":after}]))).unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len()<MAX_FRAME/2);
+            let value=&result["facts"][0]["value"];assert_eq!(value["offset"],json!(assembled.len()));
+            assert_eq!(value["identity"]["sha256"],hash);assert_eq!(value["identity"]["revision"],"9");assert_eq!(value["documentVersion"],7);
+            assembled.push_str(value["text"].as_str().unwrap());pages+=1;after=value["next"].clone();
+            if after.is_null() {break;}
+            assert_eq!(evaluation.read_charge(&query(json!([{"op":"rootFileSnapshot","file":file,"after":after}]))).unwrap(),(false,1));
+            assert!(evaluation.root_stream_cursor(other,after.as_str().unwrap()).is_err());
+        }
+        assert!(pages>1);assert_eq!(assembled,text);assert!(evaluation.resource_catalog.is_none());
+        assert_eq!(read.source(),"");let pending=read.finish();flag.0.store(true,Ordering::Release);
+        assert!(store.validate_pending(&pending).is_err());assert!(evaluation.root_catalog_for_file(file).is_err());
+    }
+
+    #[test]
+    fn root_domains_are_independent_bounded_and_unavailable_is_not_known_empty() {
+        use ktcore::index::Index;
+        let index=Index::new();let mut store=ExtensionStore::default();store.configure_provider("root-wire",true,Arc::from("{}"));
+        store.replace_source(&index,"/root-wire/Owner.kt",Arc::from(""),Knowledge::Found(()),Vec::new()).unwrap();
+        let mut read=store.begin_read(&index,"root-wire","/root-wire/Owner.kt").unwrap();
+        let mut evaluation=Evaluation::new("root-wire".into(),"/root-wire/Owner.kt".into(),1);let id=evaluation.id.to_string();
+        let params=|queries:Value|json!({"evaluation":id,"queries":queries});
+        assert!(evaluation.begin_root_captures("analysis/readFacts",&params(json!([{"op":"rootFileInventory","filter":{}}]))).is_err());
+        evaluation.project_operations=ROOT_FILE_INVENTORY;
+        let too_many:Vec<_>=(0..9).map(|index|json!({"op":"rootFileInventory","filter":{"basenames":[format!("{index}.json")]}})).collect();
+        assert!(evaluation.begin_root_captures("analysis/readFacts",&params(json!(too_many))).is_err());
+        let unavailable=evaluation.batch(&mut read,"analysis/readFacts",params(json!([{"op":"rootFileInventory","filter":{}}]))).unwrap();
+        assert_eq!(unavailable["facts"][0]["coverage"]["state"],"unknown");assert!(unavailable["facts"][0]["root"].is_null());
+        assert!(evaluation.begin_root_reads("analysis/readFacts",&params(json!([{"op":"rootFileSnapshot","file":"foreign"}]))).is_err());
+        assert!(evaluation.batch(&mut read,"analysis/readFacts",params(json!([{"op":"resourceInventory"}]))).is_err());
+    }
 }
 
 #[cfg(test)]

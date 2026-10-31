@@ -165,6 +165,33 @@ rtk proxy bash dev/ktlsp-harness.sh corpus --root "$ipc_project" \
   --bin "$sealed_server" --no-build --run-dir "$scratch/source-facts-editor"
 ```
 
+`KTLSP_IPC_MODE=root-files` uses that same corpus/IPC route with the disposable
+Gradle reload fixture described below: the registered workspace contains the
+accepted `:app` owner under `modules/editing`, and the child runs with
+`--barrier DIR --root-files`. Keep the barrier and harness output outside the
+registered workspace. The mode itself configures only `semantic-v1` and
+`root-files-v1` and compares the returned workspace URI with that registered root.
+
+Prepare these files from `project/root-file-fixtures/` before discovery:
+
+| Template | Disposable workspace destinations |
+|---|---|
+| `shared.json` | `shared/root-config.json`, `shared/a/duplicate.json`, `shared/b/duplicate.json` |
+| `client.json` | `modules/editing/src/main/java/fixture/CLIENT-CONFIG.JSON`, `shared/delete-config.json` |
+| `hidden.json` | `build/.root-files/hidden-config.json`, `.gradle/gradle-hidden.json`, `shared/EXTENSION.JSON` |
+| `excluded.json` | `ExClUdEd-RoOt/skip-config.json` |
+
+The probe generates its 257 tiny paging files and large Unicode body in the
+disposable workspace, attaches current/new JSON buffers, and restores mutations
+on exit. Its one paused mutation phase changes disk files and waits for native
+cancellation before editing an overlay and releasing the child. A fresh accepted
+evaluation must return all current contents; old, foreign and path-shaped tokens
+must be rejected. No manual watched-file notification substitutes for the native
+invalidation check. The root-only manifest may disable unrelated completion and
+definition assertions; this scenario proves the file API, not additional Java
+completion coverage. See the [root-file wire contract](../../docs/architecture/extension-ipc.md#filtered-workspace-files-root-files-v1)
+for exact types, filters, budgets and unavailable coverage.
+
 `KTLSP_IPC_MODE=project-inputs` uses the existing disposable Gradle reload fixture
 and `host-inputs-manifest.json`, prepared as in the root README's host-inputs
 recipe. The copied Java IPC inputs belong under

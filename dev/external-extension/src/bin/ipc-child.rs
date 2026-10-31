@@ -31,6 +31,23 @@ fn request(
     }
 }
 
+fn stale_read_error(error:&str)->bool {
+    serde_json::from_str::<Value>(error).is_ok_and(|error|error["code"].as_i64()==Some(-32801)
+        || (error["code"].as_i64()==Some(-32602) && error["message"]=="Stale"))
+}
+
+#[cfg(test)]
+mod stale_read_tests {
+    use super::*;
+    #[test]
+    fn only_typed_or_exact_legacy_stale_reads_retire_the_fixture_evaluation() {
+        assert!(stale_read_error(r#"{"code":-32801,"message":"Stale"}"#));
+        assert!(stale_read_error(r#"{"code":-32602,"message":"Stale"}"#));
+        assert!(!stale_read_error(r#"{"code":-32602,"message":"foreign root-file token"}"#));
+        assert!(!stale_read_error("host closed"));
+    }
+}
+
 fn read_source_snapshots(
     input: &mut impl std::io::BufRead, output: &mut impl Write,
     next: &mut u64, evaluation: &Value,
@@ -91,6 +108,114 @@ fn read_scoped_source_snapshots(
 
 /// Test consumer: read only host-issued resource identities. The barrier directory
 /// records RPC evidence; resource display paths are never opened by the child.
+fn read_root_pages(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
+    evaluation:&Value,filter:&Value)->Result<Value,String> {
+    let mut files=Vec::new();let mut cursors=std::collections::BTreeSet::new();
+    let mut tokens=std::collections::BTreeSet::new();let mut paths=std::collections::BTreeSet::new();
+    let mut after=Value::Null;let mut root=None;let mut canonical=None;let mut pages=0usize;
+    loop {
+        let result=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"rootFileInventory","filter":filter,"after":after}]}))?;
+        let page=&result["facts"][0];pages+=1;
+        if pages>256 {return Err("root-file inventory continuation limit".into());}
+        if let Some(expected)=&root {if page["root"]!=*expected {return Err("root-file domain changed between pages".into());}}
+        else {root=Some(page["root"].clone());canonical=Some(page["filter"].clone());}
+        if Some(&page["filter"])!=canonical.as_ref() {return Err("root-file filter changed between pages".into());}
+        for file in page["files"].as_array().ok_or("root-file descriptors")? {
+            if !tokens.insert(file["file"].as_str().ok_or("issued root-file identity")?.to_owned())
+                || !paths.insert(file["relativePath"].as_str().ok_or("root-file relative path")?.to_owned()) {
+                return Err("duplicate root-file inventory entry".into());
+            }
+            files.push(file.clone());
+        }
+        after=page["next"].clone();
+        if after.is_null() {return Ok(json!({"root":root,"filter":canonical,"files":files,"pages":pages,
+            "coverage":page["coverage"],"problems":page["problems"]}));}
+        if page["coverage"]["state"]=="found" {return Err("nonterminal root inventory claimed complete coverage".into());}
+        if !cursors.insert(after.as_str().ok_or("issued root-file cursor")?.to_owned()) {return Err("repeated root-file cursor".into());}
+    }
+}
+
+fn read_root_snapshot(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
+    evaluation:&Value,descriptor:&Value,root:&Value)->Result<Value,String> {
+    use sha2::{Digest,Sha256};
+    let file=&descriptor["file"];let mut after=Value::Null;let mut chunks=Vec::new();let mut text=String::new();
+    let mut identity=None;let mut size=None;let mut version=None;let mut cursors=std::collections::BTreeSet::new();
+    loop {
+        let response=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"rootFileSnapshot","file":file,"after":after}]}))?;
+        let fact=response["facts"][0].clone();
+        if fact["state"]!="found" {
+            chunks.push(fact);return Ok(json!({"file":file,"uri":descriptor["uri"],"relativePath":descriptor["relativePath"],
+                "chunks":chunks,"text":null,"sha256":null}));
+        }
+        let value=&fact["value"];let chunk=value["text"].as_str().ok_or("root-file UTF8 text chunk")?;
+        if value["file"]!=*file || value["uri"]!=descriptor["uri"] || value["root"]!=*root
+            || value["offset"].as_u64()!=Some(text.len() as u64) || chunk.len()>96*1024 {
+            return Err("root-file snapshot identity/offset changed".into());
+        }
+        if let Some(expected)=&identity {
+            if value["identity"]!=*expected || Some(&value["size"])!=size.as_ref()
+                || Some(&value["documentVersion"])!=version.as_ref() {return Err("root-file snapshot revision changed".into());}
+        } else {identity=Some(value["identity"].clone());size=Some(value["size"].clone());version=Some(value["documentVersion"].clone());}
+        let empty=chunk.is_empty();text.push_str(chunk);if text.len()>16*1024*1024 {return Err("root-file consumer body bound".into());}
+        after=value["next"].clone();chunks.push(fact);
+        if after.is_null() {break;}
+        if empty || chunks.len()>=256 || !cursors.insert(after.as_str().ok_or("root-file stream cursor")?.to_owned()) {
+            return Err("invalid root-file text continuation".into());
+        }
+    }
+    let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+    if size.as_ref().and_then(Value::as_u64)!=Some(text.len() as u64)
+        || identity.as_ref().and_then(|value|value["sha256"].as_str())!=Some(digest.as_str()) {
+        return Err("root-file snapshot content/hash changed".into());
+    }
+    Ok(json!({"file":file,"uri":descriptor["uri"],"relativePath":descriptor["relativePath"],"chunks":chunks,"text":text,"sha256":digest}))
+}
+
+fn record_root_files(input:&mut impl std::io::BufRead,output:&mut impl Write,next:&mut u64,
+    params:&Value,barrier:&Option<PathBuf>)->Result<(),String> {
+    let phase=params["configuration"]["rootFilePhase"].as_str().unwrap_or("initial");
+    if phase.is_empty() || phase.len()>64 || !phase.bytes().all(|byte|byte.is_ascii_alphanumeric() || matches!(byte,b'-'|b'_')) {
+        return Err("invalid root-file fixture phase".into());
+    }
+    let evaluation=&params["evaluation"];let directory=barrier.as_ref().ok_or("root files require evidence directory")?;
+    std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+    let mut capture=json!({"phase":phase,"evaluation":evaluation,"owner":params["owner"]});
+    if let Some(file)=params["configuration"]["rootFileProbeToken"].as_str() {
+        let error=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+            "queries":[{"op":"rootFileSnapshot","file":file}]})).err().ok_or("foreign root-file token was accepted")?;
+        capture["negative"]=json!({"file":file,"error":serde_json::from_str::<Value>(&error).map_err(|error|error.to_string())?});
+    } else {
+        let filter=params["configuration"].get("rootFileFilter").ok_or("root files require an explicit fixture filter")?;
+        let inventory=read_root_pages(input,output,next,evaluation,filter)?;
+        let names=filter["basenames"].as_array();let mut snapshots=Vec::new();
+        for descriptor in inventory["files"].as_array().ok_or("root-file inventory")? {
+            let path=descriptor["relativePath"].as_str().ok_or("root-file relative path")?;
+            let basename=path.rsplit('/').next().unwrap_or(path);
+            let selected=names.is_some_and(|names|names.iter().any(|name|name.as_str().is_some_and(|name|name.to_lowercase()==basename.to_lowercase())));
+            if selected || (names.is_none_or(Vec::is_empty) && snapshots.len()<8) {
+                snapshots.push(read_root_snapshot(input,output,next,evaluation,descriptor,&inventory["root"])?);
+            }
+        }
+        let absent_filter=json!({"basenames":["ktlsp-root-files-guaranteed-absent.fixture"],"extensions":[],
+            "excludedDirectories":filter.get("excludedDirectories").cloned().unwrap_or(json!([]))});
+        let absent=read_root_pages(input,output,next,evaluation,&absent_filter)?;
+        capture["filter"]=filter.clone();capture["inventory"]=inventory;capture["snapshots"]=json!(snapshots);capture["absent"]=absent;
+    }
+    std::fs::write(directory.join(format!("root-files-{phase}-{}.json",evaluation.as_str().ok_or("evaluation")?)),
+        serde_json::to_vec(&capture).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    let release=directory.join(format!("root-files-{phase}-release"));
+    if params["configuration"]["rootFilePause"]==true && !release.exists() {
+        std::fs::write(directory.join(format!("root-files-{phase}-paused")),evaluation.as_str().ok_or("evaluation")?).map_err(|error|error.to_string())?;
+        let message=read_frame(input).map_err(|error|error.to_string())?.ok_or("host closed at root-file barrier")?;
+        if message["method"]!="$/cancelRequest" || message["params"]["id"]!=*evaluation {return Err("expected root-file evaluation cancellation".into());}
+        std::fs::write(directory.join(format!("root-files-{phase}-cancelled")),b"1").map_err(|error|error.to_string())?;
+        while !release.exists() {std::thread::sleep(std::time::Duration::from_millis(10));}
+    }
+    Ok(())
+}
+
 fn read_owned_resources(
     input:&mut impl std::io::BufRead,output:&mut impl std::io::Write,next:&mut u64,evaluation:&Value,
 )->Result<Value,String> {
@@ -557,6 +682,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut project_inputs = false;
     let mut source_facts_v2 = false;
     let mut binary_annotations = false;
+    let mut root_files = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--barrier" if barrier.is_none() => {
@@ -571,13 +697,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--project-inputs" if !project_inputs => project_inputs = true,
             "--source-facts-v2" if !source_facts_v2 => source_facts_v2 = true,
             "--binary-annotations" if !binary_annotations => binary_annotations = true,
+            "--root-files" if !root_files => root_files = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
     if host_inputs { project_facts=true; source_snapshots=true; }
     if project_inputs {source_snapshots=true;source_facts_v2=true;source_locations=true;}
     if source_locations { project_facts=true; }
-    if (project_facts || source_snapshots) && barrier.is_none() {
+    if (project_facts || source_snapshots || root_files) && barrier.is_none() {
         return Err("project facts fixture needs its barrier".into());
     }
     let mut input = BufReader::new(std::io::stdin().lock());
@@ -623,6 +750,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("source-facts-v2"));
                     if result.get("supportedOps").is_none() {result["supportedOps"]=json!({});}
                     result["supportedOps"]["source-facts-v2"]=json!(["sourceFacts"]);
+                }
+                if root_files {
+                    let offered=&message["params"];
+                    if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="root-files-v1"))
+                        || !["rootFileInventory","rootFileSnapshot"].iter().all(|operation|offered["supportedOps"]["root-files-v1"]
+                            .as_array().is_some_and(|values|values.iter().any(|value|value==*operation))) {
+                        return Err("host did not offer root-file operations".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("root-files-v1"));
+                    if result.get("supportedOps").is_none() {result["supportedOps"]=json!({});}
+                    result["supportedOps"]["root-files-v1"]=json!(["rootFileInventory","rootFileSnapshot"]);
                 }
                 if binary_annotations {
                     if !message["params"]["capabilities"].as_array().is_some_and(|values|
@@ -710,6 +848,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             Some("analysis/evaluate") => {
+                if root_files {
+                    let owner=message["params"]["owner"].as_str().unwrap_or_default();
+                    if owner.rsplit(['/', '\\']).next().is_some_and(|name|name.eq_ignore_ascii_case("CaseMixin.java")) {
+                        if let Err(error)=record_root_files(&mut input,&mut output,&mut next,&message["params"],&barrier) {
+                            if !stale_read_error(&error) {return Err(error.into());}
+                            write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],
+                                "error":{"code":-32801,"message":"Stale"}}))?;
+                            continue;
+                        }
+                    }
+                    write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":{"sites":[],"diagnostics":[]}}))?;
+                    continue;
+                }
                 if provider_commands {
                     write_frame(&mut output,&json!({"jsonrpc":"2.0","id":message["id"],"result":{"sites":[],"diagnostics":[]}}))?;
                     continue;

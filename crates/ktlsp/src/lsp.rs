@@ -3485,6 +3485,7 @@ impl LanguageServer for Backend {
                     .and_then(|folder| uri_to_key(&folder.uri))
             })
             .map(PathBuf::from);
+        self.ws.lock().register_extension_workspace_root(root.clone());
         if let Some(root) = root {
             let gradle_project = crate::deps::gradle_root(&root).is_some();
             *self.gradle_project.lock() = gradle_project;
@@ -3641,6 +3642,7 @@ impl LanguageServer for Backend {
     async fn shutdown(&self) -> Result<()> {
         self.close_project_refresh();
         self.close_compiler_jobs();
+        self.ws.lock().register_extension_workspace_root(None);
         let workers = self.ws.lock().stop_ipc_workers();
         let _ = tokio::task::spawn_blocking(move || {
             for worker in workers {

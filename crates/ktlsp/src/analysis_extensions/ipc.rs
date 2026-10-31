@@ -710,6 +710,53 @@ impl AnalysisExtensions {
         self.ipc_evaluations.insert(id,evaluation);result
     }
 
+    pub(crate) fn begin_ipc_root_captures(&mut self,id:u64,method:&str,params:&Value)
+        ->Result<Vec<crate::root_files::Filter>,String> {
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance)
+            .map_or(0,|slot|slot.worker.project_operations());
+        evaluation.begin_root_captures(method,params)
+    }
+
+    pub(crate) fn record_ipc_root_error(&mut self,id:u64,filters:Vec<crate::root_files::Filter>,error:String)->Result<(),String> {
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        for filter in filters {evaluation.root_catalogs.insert(filter,Err(error.clone()));}
+        Ok(())
+    }
+
+    pub(crate) fn attach_ipc_root_catalog(&mut self,index:&dyn InferenceIndex,prepared:crate::root_files::PreparedCatalog)->Result<(),String> {
+        let id=prepared.evaluation;
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        if let Ok(catalog)=&prepared.catalog {self.observe_ipc_project_inputs(index,id,catalog.guard.clone())?;}
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        if !evaluation.project.as_ref().is_some_and(|model|Arc::ptr_eq(model,&prepared.model)) {return Err("Stale".into());}
+        evaluation.root_catalogs.insert(prepared.filter,prepared.catalog);Ok(())
+    }
+
+    pub(crate) fn begin_ipc_root_reads(&mut self,id:u64,method:&str,params:&Value)
+        ->Result<Vec<crate::root_files::ReadPlan>,String> {
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance)
+            .map_or(0,|slot|slot.worker.project_operations());
+        evaluation.begin_root_reads(method,params)
+    }
+
+    pub(crate) fn finish_ipc_root_read(&mut self,index:&dyn InferenceIndex,prepared:crate::root_files::PreparedRead)->Result<(),String> {
+        let id=prepared.evaluation;
+        if !self.ipc_current(id) {return Err("Stale".into());}
+        let current=self.ipc_evaluations.get(&id).ok_or("Stale")?.root_catalog_for_file(&prepared.file)?;
+        if !Arc::ptr_eq(&current,&prepared.catalog) || !current.guard.is_current() {return Err("Stale".into());}
+        crate::root_files::validate_cached_read(&self.ipc_evaluations.get(&id).ok_or("Stale")?.root_results,
+            &prepared.file,&prepared.body,crate::extension_ipc::MAX_STREAM_BYTES)?;
+        self.observe_ipc_project_inputs(index,id,current.guard.clone())?;
+        self.ipc_evaluations.get_mut(&id).ok_or("Stale")?.root_results.insert(prepared.file,prepared.body);Ok(())
+    }
+
     pub(crate) fn begin_ipc_class_reads(&mut self, id: u64, method: &str, params: &Value)
         -> Result<Option<crate::runtime_bytes::ClassReadPlan>, String>
     {

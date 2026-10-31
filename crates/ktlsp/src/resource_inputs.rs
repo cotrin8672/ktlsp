@@ -319,7 +319,7 @@ pub(crate) fn prepare_resource_read(plan:ResourceReadPlan)->PreparedResourceRead
     PreparedResourceRead {evaluation:plan.evaluation,model:plan.model,token:plan.token,content}
 }
 
-fn read_current(reader:&mut impl Read,guard:&dyn HostInputGuard,limit:u64)->Result<Vec<u8>,&'static str> {
+pub(crate) fn read_current(reader:&mut impl Read,guard:&dyn HostInputGuard,limit:u64)->Result<Vec<u8>,&'static str> {
     let mut bytes=Vec::new();let mut chunk=[0;64*1024];
     loop {
         if !guard.is_current() {return Err("stale-resource-input");}

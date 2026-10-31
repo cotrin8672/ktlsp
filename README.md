@@ -608,6 +608,18 @@ hashes after a Unicode unsaved target edit/model change. It uses the same
 `ipc-probes.lua` and manifest; no second client
 or editor framework is needed.
 
+`KTLSP_IPC_MODE=source-facts-v2` also checks authored callable parameter order,
+ranges, annotations and imported type references, with legacy field omission.
+
+The same corpus/IPC route has a `KTLSP_IPC_MODE=root-files` scenario for the
+host-registered workspace file domain, independent of Gradle resource selection.
+It checks filtered paging, exact disk/unsaved UTF-8 snapshots, native disk-change
+cancellation and fresh results, and rejected stale/foreign file tokens. Use the
+nested Gradle fixture and setup in the
+[external provider notes](dev/external-extension/README.md); the flat IPC fixture
+alone does not establish the required accepted owner model. Unsupported watch
+coverage remains Unknown; current native recursive coverage is Windows.
+
 `KTLSP_IPC_MODE=host-inputs` adds current resource bytes and document versions, a complete
 14 MiB resource stream, independently decoded runtime class bytes, selected SDK runtime bytes,
 raw JSON/AW/AT commands, and native resource add/replace/delete invalidation. It retains

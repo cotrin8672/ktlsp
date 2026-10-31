@@ -122,6 +122,8 @@ pub struct Workspace {
     raw_command_sources: BTreeSet<String>,
     resource_catalogs:BTreeMap<ktcore::project_model::ProjectScope,Arc<crate::resource_inputs::ResourceCatalog>>,
     resource_overlay_epoch:Arc<std::sync::atomic::AtomicBool>,
+    extension_workspace_root:Option<std::path::PathBuf>,
+    root_file_inputs_active:bool,
     owned_document_revision: u64,
     parsers: LanguageParsers,
     salsa: RefCell<SalsaState>,
@@ -193,6 +195,8 @@ impl Workspace {
             owned_documents: HashMap::new(),
             raw_command_sources: BTreeSet::new(),
             resource_catalogs:BTreeMap::new(),resource_overlay_epoch:Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            extension_workspace_root:None,
+            root_file_inputs_active:false,
             owned_document_revision: 0,
             parsers: LanguageParsers::new(),
             salsa: RefCell::new(SalsaState::new()),
@@ -820,7 +824,7 @@ impl Workspace {
         self.owned_document_revision=self.owned_document_revision.wrapping_add(1).max(1);
         self.owned_documents.insert(key.to_owned(),OwnedDocumentSnapshot {text,document_version:Some(version),language_id,revision:self.owned_document_revision});
         self.withdraw_raw_command_source(key);
-        if !matches!(Path::new(key).extension().and_then(|extension|extension.to_str()),Some("java"|"kt"))
+        if self.root_file_inputs_active || !matches!(Path::new(key).extension().and_then(|extension|extension.to_str()),Some("java"|"kt"))
             || self.project_model.as_ref().is_some_and(|model|matches!(model.resource_owner_context(Path::new(key)),ktcore::knowledge::Knowledge::Found(_))) {
             self.invalidate_resource_overlay();
         }
@@ -939,6 +943,68 @@ impl Workspace {
         self.resource_catalogs.clear();
         self.analysis_extensions.refresh_host_inputs();
         if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
+    }
+
+    /// Only Backend's accepted initialize root may authorize the root-file domain.
+    pub(crate) fn register_extension_workspace_root(&mut self,root:Option<std::path::PathBuf>) {
+        if self.extension_workspace_root==root {return;}
+        self.extension_workspace_root=root;
+        self.invalidate_resource_overlay();
+        self.analysis_extensions.model_changed(&self.index);
+        if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
+    }
+
+    fn ipc_root_selection(&self,evaluation:u64)->Result<(Arc<crate::classpath::ProjectSnapshot>,std::path::PathBuf),String> {
+        if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) {return Err("Stale".into());}
+        let owner=self.analysis_extensions.ipc_resource_owner(evaluation).ok_or("Stale")?;
+        self.registered_root_for_owner(owner)
+    }
+
+    fn registered_root_for_owner(&self,owner:&str)->Result<(Arc<crate::classpath::ProjectSnapshot>,std::path::PathBuf),String> {
+        let root=self.extension_workspace_root.as_ref().ok_or("unregistered-workspace-root")?;
+        let model=self.project_model.as_ref().ok_or("unknown-root-file-owner")?;
+        let module=model.extension_project_module(Path::new(owner)).ok_or("unknown-root-file-owner")?;
+        if !root.is_absolute() || !Path::new(owner).starts_with(root) || !module.project_dir.starts_with(root)
+            || root.components().any(|part|matches!(part,std::path::Component::ParentDir|std::path::Component::CurDir)) {
+            return Err("unattested-workspace-root".into());
+        }
+        Ok((model.clone(),root.clone()))
+    }
+
+    pub(crate) fn begin_ipc_root_captures(&mut self,evaluation:u64,method:&str,params:&serde_json::Value)
+        ->Result<Vec<crate::root_files::CapturePlan>,String> {
+        let filters=self.analysis_extensions.begin_ipc_root_captures(evaluation,method,params)?;
+        if filters.is_empty() {return Ok(Vec::new());}
+        self.root_file_inputs_active=true;
+        let (model,root)=match self.ipc_root_selection(evaluation) {
+            Ok(selection)=>selection,
+            Err(error) if error=="Stale"=>return Err(error),
+            Err(error)=>{self.analysis_extensions.record_ipc_root_error(evaluation,filters,error)?;return Ok(Vec::new());}
+        };
+        Ok(filters.into_iter().map(|filter|crate::root_files::CapturePlan {
+            evaluation,generation:self.analysis_generation,model:model.clone(),root:root.clone(),filter,
+            overlays:self.owned_documents.iter().map(|(key,document)|(key.clone(),document.clone())).collect(),
+            epoch:self.resource_overlay_epoch.clone(),
+        }).collect())
+    }
+
+    pub(crate) fn finish_ipc_root_capture(&mut self,prepared:crate::root_files::PreparedCatalog)->Result<(),String> {
+        let (model,root)=self.ipc_root_selection(prepared.evaluation)?;
+        if prepared.generation!=self.analysis_generation || !Arc::ptr_eq(&model,&prepared.model) || root!=prepared.root
+            || prepared.catalog.as_ref().is_ok_and(|catalog|!catalog.guard.is_current())
+            || prepared.catalog.as_ref().is_err_and(|error|error=="Stale") {return Err("Stale".into());}
+        self.analysis_extensions.attach_ipc_root_catalog(&self.index,prepared)
+    }
+
+    pub(crate) fn begin_ipc_root_reads(&mut self,evaluation:u64,method:&str,params:&serde_json::Value)
+        ->Result<Vec<crate::root_files::ReadPlan>,String> {
+        self.analysis_extensions.begin_ipc_root_reads(evaluation,method,params)
+    }
+
+    pub(crate) fn finish_ipc_root_read(&mut self,prepared:crate::root_files::PreparedRead)->Result<(),String> {
+        let (_,root)=self.ipc_root_selection(prepared.evaluation)?;
+        if root!=prepared.catalog.root || prepared.body.as_ref().is_err_and(|error|error=="Stale") {return Err("Stale".into());}
+        self.analysis_extensions.finish_ipc_root_read(&self.index,prepared)
     }
 
     pub(crate) fn begin_ipc_resource_capture(&mut self,evaluation:u64)->Option<crate::resource_inputs::ResourceCapturePlan> {
@@ -5059,6 +5125,36 @@ fn is_generated_source_file(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_root_file_domain_keeps_nested_semantic_owner_and_retires_overlays() {
+        use crate::classpath::{ModuleClasspath,ProjectSnapshot,SourceSetClasspath};
+        let root=std::env::temp_dir().join("ktlsp-root-files-registered-domain");
+        let module=root.join("modules/mod");let task=crate::compile::kotlin_test_request(&module).task;
+        let owner=crate::paths::file_key(&task.source_files[0]);
+        let model=Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+            module:":mod".into(),project_dir:module.clone(),build:":".into(),entries:Vec::new(),unresolved:Vec::new(),
+            source_sets:vec![SourceSetClasspath {name:"main".into(),source_roots:vec![module.join("src")],
+                kotlin_compile_task:Some(task.task.clone()),compiler_tasks:vec![task],..Default::default()}],
+        }]));
+        let mut ws=Workspace::new();ws.set_project_model(model.clone());
+        assert!(ws.registered_root_for_owner(&owner).is_err(),"a module alone cannot attest workspace coverage");
+        ws.register_extension_workspace_root(Some(root.clone()));
+        let (accepted,selected)=ws.registered_root_for_owner(&owner).unwrap();
+        assert_eq!(selected,root);assert!(Arc::ptr_eq(&accepted,&model));
+        assert_eq!(accepted.extension_project_module(Path::new(&owner)).unwrap().project_dir,module);
+        assert!(accepted.modules[0].source_sets[0].resources.is_none());
+        assert!(ws.registered_root_for_owner(&crate::paths::file_key(&root.join("outside-owner.kt"))).is_err());
+        ws.root_file_inputs_active=true;
+        let before=ws.resource_overlay_epoch.clone();
+        ws.record_owned_document(&owner,Some("class Unsaved {}".into()),1,Some("kotlin".into()));
+        assert!(before.load(std::sync::atomic::Ordering::Acquire),"source overlays retire filtered root snapshots too");
+        let before=ws.resource_overlay_epoch.clone();ws.close_owned_document(&owner);
+        assert!(before.load(std::sync::atomic::Ordering::Acquire));
+        let before=ws.resource_overlay_epoch.clone();ws.register_extension_workspace_root(None);
+        assert!(before.load(std::sync::atomic::Ordering::Acquire));
+        assert!(ws.registered_root_for_owner(&owner).is_err());
+    }
 
     #[test]
     fn test_resource_inventory_accepts_inherited_empty_main_output_but_not_missing_jar() {

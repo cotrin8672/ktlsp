@@ -730,6 +730,7 @@ dependencies = [
  "ktcore",
  "ktlsp",
  "serde_json",
+ "sha2",
  "tokio",
  "tower-lsp-server",
  "tracing-subscriber",
