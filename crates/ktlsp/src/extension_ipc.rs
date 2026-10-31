@@ -41,6 +41,8 @@ const CLASS_BYTES: u16 = 256;
 const JVM_CATALOG: &str = "jvm-catalog-v1";
 const JVM_INVENTORY: u16 = 512;
 const JVM_CLASS: u16 = 1024;
+const SOURCE_LOCATIONS: &str = "source-locations-v1";
+const SOURCE_LOCATION: u16 = 2048;
 
 fn project_operations(result: &Value) -> u16 {
     let mut selected = 0;
@@ -50,6 +52,7 @@ fn project_operations(result: &Value) -> u16 {
         (RESOURCES, &[("resourceInventory",RESOURCE_INVENTORY),("resourceLookup",RESOURCE_LOOKUP),("resourceSnapshot",RESOURCE_SNAPSHOT)][..]),
         (RUNTIME_CLASSES, &[("runtimeClass",RUNTIME_CLASS),("classBytes",CLASS_BYTES)][..]),
         (JVM_CATALOG, &[("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)][..]),
+        (SOURCE_LOCATIONS, &[("sourceLocation",SOURCE_LOCATION)][..]),
     ] {
         if !result["capabilities"].as_array().is_some_and(|values|
             values.iter().any(|value| value == capability)) { continue; }
@@ -65,11 +68,11 @@ fn project_operations(result: &Value) -> u16 {
 fn initialize_message(provider:&str,commands:&std::collections::BTreeSet<String>)->Value {
     json!({"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{
         "protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":provider,
-        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,"provider-commands-v1"],
+        "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,SOURCE_LOCATIONS,"provider-commands-v1"],
         "commands":commands,"supportedOps":{
             PROJECT_FACTS:["projectContext","typeJvm"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"],
             RESOURCES:["resourceInventory","resourceLookup","resourceSnapshot"],RUNTIME_CLASSES:["runtimeClass","classBytes"],
-            JVM_CATALOG:["jvmCatalog","jvmClass"]
+            JVM_CATALOG:["jvmCatalog","jvmClass"],SOURCE_LOCATIONS:["sourceLocation"]
         }}})
 }
 
@@ -226,8 +229,6 @@ enum Handle {
     Declaration(DeclarationId),
     TypeRef(ktcore::types::TypeRef),
     Signature(MemberSignature),
-    #[allow(dead_code)]
-    // Keep returned member tokens owned and typed even before a member query uses them.
     Member(MemberId),
     Requirement(RequirementId),
 }
@@ -784,6 +785,27 @@ impl Evaluation {
         json!({"id":id,"name":candidate.name,"kind":kind(candidate.kind),"signature":self.signature_fact(&candidate.signature),"dispatch":fact(&candidate.dispatch,|value|json!(dispatch(*value))),"visibility":fact(&candidate.visibility,|value|json!(format!("{value:?}"))),"synthetic":fact(&candidate.synthetic,|value|json!(value)),"mismatches":candidate.mismatches.iter().map(|value|format!("{value:?}")).collect::<Vec<_>>()})
     }
 
+    fn source_location(&self, read: &mut ReadSession<'_>, target: &str) -> Result<Value,String> {
+        use sha2::{Digest, Sha256};
+        let location = match self.handles.get(target) {
+            Some(Handle::Type(value)) => read.type_source_location(value),
+            Some(Handle::Member(value)) => read.member_source_location(value),
+            _ => return Err("foreign source-location target".into()),
+        }.map_err(contract)?;
+        let Knowledge::Found(location) = location else { return Ok(fact(&location, |_|Value::Null)); };
+        if !std::path::Path::new(&location.definition.file).is_absolute() {return Ok(missing_fact());}
+        let Some(uri) = tower_lsp_server::ls_types::Uri::from_file_path(&location.definition.file) else {
+            return Ok(missing_fact());
+        };
+        let index = crate::text::LineIndex::new(&location.text);
+        let (start_line,start_character) = index.position(&location.text,location.definition.start_byte);
+        let (end_line,end_character) = index.position(&location.text,location.definition.end_byte);
+        Ok(json!({"state":"found","value":{"target":target,"documentUri":uri.to_string(),
+            "range":{"start":{"line":start_line,"character":start_character},"end":{"line":end_line,"character":end_character}},
+            "source":{"identity":{"kind":"source","revision":location.revision.to_string()},
+                "sha256":format!("{:x}",Sha256::digest(location.text.as_bytes()))}}}))
+    }
+
     fn type_jvm(&mut self, facts: &TypeJvmFacts) -> Value {
         let abi = match &facts.abi {
             Knowledge::Found(class) => class_abi(class)
@@ -1070,6 +1092,10 @@ impl Evaluation {
                             let (members,coverage) = read.declared_members(&self.ty(&json!(target))?).map_err(contract)?;
                             json!({"members":members.iter().map(|member|self.member(member)).collect::<Vec<_>>(),"coverage":fact(&coverage, |_|Value::Null)})
                         }
+                        ReadQuery::SourceLocation {target} => {
+                            if self.project_operations & SOURCE_LOCATION == 0 {return Err("sourceLocation was not negotiated".into());}
+                            self.source_location(read,&target)?
+                        }
                     };
                     let size = serde_json::to_vec(&value).map_err(|error|error.to_string())?.len();
                     remaining = remaining.checked_sub(size.saturating_add(1))
@@ -1302,6 +1328,70 @@ enum ReadQuery {
     DeclarationType { declaration: String },
     DeclarationMember { declaration: String },
     DeclaredMembers { target: String },
+    SourceLocation { target: String },
+}
+
+#[cfg(test)]
+mod source_location_tests {
+    use super::*;
+    use ktcore::{index::{Index,Tier},project_model::{FileOrigin,ProjectScope,ScopeVisibility,SourceRepresentation}};
+
+    #[test]
+    fn source_location_negotiates_exact_targets_utf16_and_current_body_identity() {
+        let offered=initialize_message("locations",&Default::default());
+        assert_eq!(offered["params"]["supportedOps"][SOURCE_LOCATIONS],json!(["sourceLocation"]));
+        assert_eq!(project_operations(&json!({"capabilities":[SOURCE_LOCATIONS],"supportedOps":{SOURCE_LOCATIONS:["sourceLocation"]}})),SOURCE_LOCATION);
+        assert_eq!(project_operations(&json!({"supportedOps":{SOURCE_LOCATIONS:["sourceLocation"]}})),0);
+        let root=std::env::current_dir().unwrap();
+        let owner=crate::paths::file_key(&root.join("LocationOwner.kt"));
+        let target=crate::paths::file_key(&root.join("LocationTarget.kt"));
+        let text="package location\nclass Target {\n    /* 😀 */ fun twice(value: Int): Int = value\n    private val secret: Int = 1\n    fun twice(value: String): String = value\n}\n";
+        let mut index=Index::new();let mut store=ExtensionStore::default();
+        store.configure_provider("locations",true,Arc::from("{}"));
+        store.set_namespace_coverage(Knowledge::Found(()));
+        for (file,text) in [(&owner,"package location\nclass Owner\n"),(&target,text)] {
+            let tree=ktcore::parser::KotlinParser::new().parse(text);
+            index.replace_file(file,ktcore::indexer::extract_symbols(&tree,text,"location"),Tier::Volatile);
+            index.set_file_origin(file,FileOrigin {origin_id:"locations".into(),representation:SourceRepresentation::Source,
+                project_scope:Some(ProjectScope{module:"locations".into(),source_set:"main".into()})});
+            let scope=ktcore::indexer::TypeScope::with_default_imports("location",Vec::new(),&["kotlin","java.lang"]);
+            let declarations=ktcore::extensions::source::extract(&index,file,&tree,text,&scope);
+            store.replace_source_declarations(&index,file,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
+        }
+        index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope:ProjectScope{module:"locations".into(),source_set:"main".into()},ordered_origins:vec!["locations".into()],
+        }]);
+        let mut read=store.begin(&index,"locations",&owner).unwrap();
+        let mut evaluation=Evaluation::new("locations".into(),owner.clone(),1);
+        evaluation.project_operations=SOURCE_LOCATION;
+        let evaluation_id=evaluation.id.to_string();
+        let query=|queries|json!({"evaluation":evaluation_id,"queries":queries});
+        let resolved=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"resolveType","name":"location.Target"}]))).unwrap();
+        let target_token=resolved["facts"][0]["value"]["id"].clone();
+        let members=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"declaredMembers","target":target_token}]))).unwrap();
+        let selected:Vec<_>=members["facts"][0]["members"].as_array().unwrap().iter()
+            .filter(|member|member["name"]=="twice" || member["name"]=="secret").collect();
+        assert_eq!(selected.len(),3);
+        let mut utf16_checked=false;
+        for member in selected {
+            let result=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"sourceLocation","target":member["id"]}]))).unwrap();
+            let value=&result["facts"][0]["value"];
+            assert_eq!(result["facts"][0]["state"],"found");
+            assert_eq!(value["documentUri"],tower_lsp_server::ls_types::Uri::from_file_path(&target).unwrap().to_string());
+            assert_eq!(value["target"],member["id"]);
+            if member["signature"]["value"]["descriptor"]=="(I)I" {
+                utf16_checked=true;
+                assert_eq!(value["range"]["start"],json!({"line":2,"character":17}));
+                assert_eq!(value["range"]["end"],json!({"line":2,"character":22}));
+            }
+            use sha2::{Digest,Sha256};
+            assert_eq!(value["source"]["sha256"],format!("{:x}",Sha256::digest(text.as_bytes())));
+            assert!(value["source"]["identity"]["revision"].is_string());
+        }
+        assert!(utf16_checked,"the known integer overload must prove UTF-16 coordinates");
+        let foreign=query(json!([{"op":"sourceLocation","target":"foreign"}]));
+        assert!(evaluation.batch(&mut read,"analysis/readFacts",foreign).is_err());
+    }
 }
 
 fn source_inventory_complete(
@@ -1885,6 +1975,13 @@ impl Worker {
                         method,
                         message["params"].clone(),
                     ));
+                    if result.is_ok() && method == "analysis/readFacts" {
+                        let request=workspace.lock().begin_ipc_requested_source_capture(work.evaluation);
+                        if let Some(request)=request {
+                            let prepared=crate::workspace::prepare_ipc_source_capture(request);
+                            workspace.lock().finish_ipc_source_capture(prepared);
+                        }
+                    }
                     after_batch();
                     let response = match result {
                         Ok(value) => json!({"jsonrpc":"2.0","id":request_id,"result":value}),
@@ -2578,7 +2675,7 @@ mod initialize_stream_contract_tests {
         assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==JVM_CATALOG));
         assert_eq!(offered["supportedOps"][JVM_CATALOG],json!(["jvmCatalog","jvmClass"]));
         assert_eq!(project_operations(offered),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS|SOURCE_LOCATION);
         let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][RESOURCES]=json!(["resourceSnapshot"]);
         assert_eq!(project_operations(&acknowledgement)&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT),RESOURCE_SNAPSHOT);
         for (operation,bit) in [("jvmCatalog",JVM_INVENTORY),("jvmClass",JVM_CLASS)] {
@@ -2588,7 +2685,7 @@ mod initialize_stream_contract_tests {
         let mut legacy=offered.clone();
         legacy["capabilities"].as_array_mut().unwrap().retain(|capability|capability!=JVM_CATALOG);
         assert_eq!(project_operations(&legacy),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
-            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES);
+            |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|SOURCE_LOCATION);
         let mut no_operations=offered.clone();no_operations["supportedOps"].as_object_mut().unwrap().remove(JVM_CATALOG);
         assert_eq!(project_operations(&no_operations)&(JVM_INVENTORY|JVM_CLASS),0);
     }

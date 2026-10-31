@@ -110,6 +110,14 @@ independent executable also passes the unchanged90 first-response requests and
 owned processes. Evidence: `external-public140-30/cargo-receipt.json` and
 `external-public140-30/editor-receipt.json` under the same run directory.
 Existing manifests/probe bytes and their denominators stay unchanged.
+The focused `KTLSP_IPC_MODE=source-locations` IPC group uses the same child and
+probe with `source-locations-v1`. Its initial type/member reads target a Java file
+that has never been opened or attached to the LSP client, and compare its exact
+file URI, UTF-16 ranges and SHA-256 against disk bytes. It then opens that target,
+adds unsaved non-BMP prefixes, and checks fresh locations after stale-evaluation
+cancellation and the accepted model refresh. The proof records the initial
+unopened state separately in `extension-ipc-proof.json`; this describes the probe,
+not a completed run or production MC definition integration.
 Nominal identities do not establish generated enum/record members or
 object-owned callable lowering. Nullable, generic and value-class ABI shapes
 remain unsupported. Production Mixin integration, runtime/remapping, MixinExtras,

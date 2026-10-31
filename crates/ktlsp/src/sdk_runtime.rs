@@ -34,6 +34,7 @@ pub(crate) struct SelectedSdkRuntime {
     archives: Vec<(PathBuf, &'static str)>,
     revisions: Vec<String>,
     lease: Arc<HostInputLease>,
+    feature: u16,
 }
 
 impl SelectedSdkRuntime {
@@ -50,6 +51,8 @@ impl SelectedSdkRuntime {
         {
             return Err(invalid("SDK selection has no normal-runtime identity"));
         }
+        let release=selection.home.join("release");
+        let release_revision=crate::classpath::file_origin_id(&release);
         let archives = runtime_archives(selection)?;
         let mut files = vec![selection.home.join("release"), selection.archive.clone()];
         files.extend(archives.iter().map(|(path, _)| path.clone()));
@@ -84,11 +87,16 @@ impl SelectedSdkRuntime {
             .iter()
             .map(|(path, _)| crate::classpath::file_origin_id(path))
             .collect();
+        let feature=runtime_feature(selection)?;
+        if crate::classpath::file_origin_id(&release)!=release_revision || !lease.is_current() {
+            return Err(SdkClassUnavailable::ChangedInput);
+        }
         Ok(Self {
             selection: selection.clone(),
             archives,
             revisions,
             lease,
+            feature,
         })
     }
 
@@ -97,6 +105,7 @@ impl SelectedSdkRuntime {
     }
 
     pub(crate) fn archives(&self) -> &[(PathBuf, &'static str)] { &self.archives }
+    pub(crate) fn feature(&self) -> u16 {self.feature}
 
     pub(crate) fn read_class(
         &self,
@@ -147,8 +156,8 @@ impl SelectedSdkRuntime {
             if crate::classpath::file_origin_id(archive) != *revision {
                 return Err(SdkClassUnavailable::ChangedInput);
             }
-            let entry = format!("{prefix}{internal_name}.class");
-            let bytes = crate::jar::read_class_bytes(archive, &entry).map_err(invalid)?;
+            let bytes = crate::jar::read_effective_class_bytes(archive,internal_name,prefix,Some(self.feature),||self.lease.is_current())
+                .map_err(|error|if error=="Stale" {SdkClassUnavailable::ChangedInput} else {invalid(error)})?;
             if let Some(bytes) = bytes {
                 if found.is_some() {
                     return Err(SdkClassUnavailable::AmbiguousClass);
@@ -188,6 +197,11 @@ fn invalid(message: impl Into<String>) -> SdkClassUnavailable {
 fn runtime_archives(
     selection: &SdkApiSelection,
 ) -> Result<Vec<(PathBuf, &'static str)>, SdkClassUnavailable> {
+    let feature=runtime_feature(selection)?;
+    runtime_archives_for_feature(selection,feature)
+}
+
+pub(crate) fn runtime_feature(selection:&SdkApiSelection)->Result<u16,SdkClassUnavailable> {
     let mut release = Vec::new();
     fs::File::open(selection.home.join("release"))
         .map_err(|error| invalid(error.to_string()))?
@@ -197,10 +211,14 @@ fn runtime_archives(
     if release.len() > 64 * 1024 {
         return Err(invalid("SDK release input too large"));
     }
-    let feature = std::str::from_utf8(&release)
+    std::str::from_utf8(&release)
         .ok()
         .and_then(crate::classpath::sdk_feature_version)
-        .ok_or_else(|| invalid("SDK release input is invalid"))?;
+        .ok_or_else(|| invalid("SDK release input is invalid"))
+}
+
+fn runtime_archives_for_feature(selection:&SdkApiSelection,feature:u16)
+    ->Result<Vec<(PathBuf,&'static str)>,SdkClassUnavailable> {
     let mut legacy = Vec::new();
     for relative in ["jre/lib/rt.jar", "lib/rt.jar"] {
         let path = selection.home.join(relative);

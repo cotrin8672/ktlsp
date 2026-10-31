@@ -295,6 +295,26 @@ fn record_host_inputs(
         "resourceCount":resources["inventory"]["resources"].as_array().map(Vec::len),"runtimeClassCount":runtime.len()}))
 }
 
+fn record_source_locations(
+    input:&mut impl std::io::BufRead, output:&mut impl Write, next:&mut u64,
+    evaluation:&Value, target:&Value, barrier:&Option<PathBuf>,
+) -> Result<(),String> {
+    let members=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+        "queries":[{"op":"declaredMembers","target":target["value"]["id"]}]}))?;
+    let member=members["facts"][0]["members"].as_array().ok_or("location target members")?.iter()
+        .find(|member|member["name"]=="twice" && member["signature"]["value"]["descriptor"]=="(I)I")
+        .ok_or("location fixture requires exact twice(I)I")?;
+    let locations=request(input,output,next,"analysis/readFacts",json!({"evaluation":evaluation,
+        "queries":[{"op":"sourceLocation","target":target["value"]["id"]},
+            {"op":"sourceLocation","target":member["id"]}]}))?;
+    let directory=barrier.as_ref().ok_or("source locations require barrier")?;
+    std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
+    std::fs::write(directory.join(format!("locations-{}.json",evaluation.as_str().ok_or("evaluation identity")?)),
+        serde_json::to_vec(&json!({"evaluation":evaluation,"type":target,"member":member,"facts":locations["facts"]}))
+            .map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    Ok(())
+}
+
 fn analyze(
     input: &mut impl std::io::BufRead,
     output: &mut impl Write,
@@ -305,6 +325,7 @@ fn analyze(
     source_snapshots: bool,
     host_inputs: bool,
     jvm_catalog: bool,
+    source_locations: bool,
 ) -> Result<Value, String> {
     let evaluation = params["evaluation"].clone();
     let declarations = params["declarations"]
@@ -336,6 +357,7 @@ fn analyze(
         .ok_or("shadow name")?
         .trim_matches('`');
     let member = &read["facts"][1]["value"];
+    if source_locations {record_source_locations(input,output,next,&evaluation,&target,barrier)?;}
     if project_facts {
         let facts = request(
             input,
@@ -429,6 +451,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut provider_commands = false;
     let mut host_inputs = false;
     let mut jvm_catalog = false;
+    let mut source_locations = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--barrier" if barrier.is_none() => {
@@ -439,10 +462,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--provider-commands" if !provider_commands => provider_commands = true,
             "--host-inputs" if !host_inputs => host_inputs = true,
             "--jvm-catalog" if !jvm_catalog => jvm_catalog = true,
+            "--source-locations" if !source_locations => source_locations = true,
             _ => return Err("invalid child arguments".into()),
         }
     }
     if host_inputs { project_facts=true; source_snapshots=true; }
+    if source_locations { project_facts=true; }
     if (project_facts || source_snapshots) && barrier.is_none() {
         return Err("project facts fixture needs its barrier".into());
     }
@@ -477,6 +502,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result["capabilities"] = json!(["semantic-v1", "project-class-facts-v1"]);
                     result["supportedOps"] =
                         json!({"project-class-facts-v1":["projectContext","typeJvm"]});
+                }
+                if source_locations {
+                    let offered=&message["params"];
+                    if !offered["capabilities"].as_array().is_some_and(|values|values.iter().any(|value|value=="source-locations-v1"))
+                        || !offered["supportedOps"]["source-locations-v1"].as_array()
+                            .is_some_and(|values|values.iter().any(|value|value=="sourceLocation")) {
+                        return Err("host did not offer source locations".into());
+                    }
+                    result["capabilities"].as_array_mut().ok_or("capabilities")?.push(json!("source-locations-v1"));
+                    result["supportedOps"]["source-locations-v1"]=json!(["sourceLocation"]);
                 }
                 if source_snapshots {
                     let offered = &message["params"];
@@ -551,6 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     source_snapshots,
                     host_inputs,
                     jvm_catalog,
+                    source_locations,
                 );
                 let response = match result {
                     Ok(value) => json!({"jsonrpc":"2.0","id":message["id"],"result":value}),

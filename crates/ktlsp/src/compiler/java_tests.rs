@@ -3122,7 +3122,9 @@ fn k2_platform_origin_rejects_release_and_patched_system_modules() {
 // methodCalls attribution facts. Explicitly run with the captured SDK17, never auto-skip.
 #[test]
 fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
-    for stock75_producers in [false, true] {
+    for profile in [0, 1, 2] {
+    let stock75_producers = profile == 1;
+    let kmp_producers = profile == 2;
     let (owner, _) = fixture();
     let mut requests = Vec::new();
     let mut modules = Vec::new();
@@ -3131,15 +3133,34 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
         let root = owner.directory.join(name);
         let mut selected = request(&root);
         if stock75_producers { selected_captured_legacy_profile(&mut selected, false); }
+        if kmp_producers {
+            let runtime = selected.task.kotlin_compiler.as_mut().unwrap();
+            runtime.compiler_version = "2.2.21".into();
+            runtime.gradle_plugin_version = "2.2.21".into();
+            runtime.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+            selected.task.arguments.extend(["-Xmulti-platform", "-Xexpect-actual-classes",
+                "-language-version", "1.8", "-api-version", "1.8"].map(str::to_owned));
+            for task in [&mut selected.task, selected.java_task.as_mut().unwrap()] {
+                task.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!("gradle-9.3.0-stock-actions-v1");
+                task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] = json!("org.gradle.api.internal.project.taskfactory.IncrementalTaskAction");
+                task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!("gradle-9.3.0-stock-onlyif-v1");
+                if task.language == crate::classpath::CompilerLanguage::Java {
+                    task.options.remove("javaCompilerRecipe");
+                    task.arguments.clear();
+                }
+            }
+        }
         selected.scope.module = format!(":{name}");
         selected.task.task = format!(":{name}:compileKotlin");
         selected.task.classpath.clear();
         let java = selected.java_task.as_mut().unwrap();
         java.task = format!(":{name}:compileJava");
         java.classpath = selected.task.output_roots.clone();
-        if name != "consumer" {
+        if name != "consumer" || kmp_producers {
             selected.task.source_files.retain(|path| path.extension().and_then(|e| e.to_str()) == Some("kt"));
+            selected.task.declared_input_files.retain(|path| path.extension().and_then(|e| e.to_str()) != Some("java"));
             java.source_files.clear();
+            java.declared_input_files.retain(|path| path.extension().and_then(|e| e.to_str()) != Some("java"));
             if stock75_producers { captured_gradle75_zero_java_options(java); }
             selected.sources = selected.task.source_files.clone();
             selected.overlays.retain(|source| source.key.ends_with(".kt"));
@@ -3161,19 +3182,27 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
     };
     let base_slots = slots(&requests[1]);
     let all_slots: Vec<_> = requests[..3].iter().flat_map(&slots).collect();
+    let jars: Vec<_> = requests[..3].iter().map(|r| r.project_dir.join("build/libs/selected-jvm.jar")).collect();
+    let external = owner.directory.join("external-stdlib.jar");
+    if kmp_producers { std::fs::write(&external, []).unwrap(); }
     for slot in &all_slots { std::fs::create_dir_all(slot).unwrap(); }
     for (i, selected) in requests.iter_mut().enumerate() {
-        let dependencies = match i { 0 | 2 => base_slots.clone(), 3 => all_slots.clone(), _ => Vec::new() };
+        let mut dependencies = if kmp_producers {
+            match i { 0 | 2 => vec![jars[1].clone()], 3 => jars.clone(), _ => Vec::new() }
+        } else { match i { 0 | 2 => base_slots.clone(), 3 => all_slots.clone(), _ => Vec::new() } };
+        if kmp_producers { dependencies.push(external.clone()); }
         selected.task.classpath = dependencies.clone();
         let java = selected.java_task.as_mut().unwrap();
         java.classpath = dependencies;
         java.classpath.extend(selected.task.output_roots.iter().cloned());
-        let mut recipe = java.java_compiler_recipe().unwrap();
-        let cp = recipe.api_options.iter().position(|arg| arg == "-classpath").unwrap() + 1;
-        recipe.api_options[cp] = joined_classpath(&java.classpath).unwrap();
-        java.options.insert("javaCompilerRecipe".into(), serde_json::to_value(recipe).unwrap());
+        if let Some(mut recipe) = java.java_compiler_recipe() {
+            let cp = recipe.api_options.iter().position(|arg| arg == "-classpath").unwrap() + 1;
+            recipe.api_options[cp] = joined_classpath(&java.classpath).unwrap();
+            java.options.insert("javaCompilerRecipe".into(), serde_json::to_value(recipe).unwrap());
+        }
         if !selected.task.classpath.is_empty() {
-            selected.task.arguments.extend(["-classpath".into(), joined_classpath(&selected.task.classpath).unwrap()]);
+            let existing: Vec<_> = selected.task.classpath.iter().filter(|p| p.exists()).cloned().collect();
+            selected.task.arguments.extend(["-classpath".into(), joined_classpath(&existing).unwrap()]);
         }
         let compiler_tasks = vec![selected.task.clone(), java.clone()];
         let selected_slots = slots(selected);
@@ -3181,7 +3210,7 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
             module:selected.scope.module.clone(), project_dir:selected.project_dir.clone(), build:"producer-test".into(),
             entries:Vec::new(), unresolved:Vec::new(), source_sets:vec![SourceSetClasspath {
                 name:"main".into(), source_roots:selected.source_roots.clone(),
-                output_roots:selected_slots.clone(), provided_artifacts:selected_slots,
+                output_roots:selected_slots.clone(), provided_artifacts:if kmp_producers && i < 3 { vec![jars[i].clone()] } else { selected_slots },
                 kotlin_compile_task:Some(selected.task.task.clone()),
                 compiler_tasks, ..Default::default()
             }],
@@ -3194,6 +3223,25 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
         &model, consumer_source, &consumer.task, consumer.java_task.as_ref().unwrap()).unwrap();
     assert_eq!(consumer.kotlin_producers.len(), 3);
     assert_eq!(consumer.kotlin_producers[0].scope.module, "gradle:producer-test|:base");
+    if kmp_producers {
+        assert!(jars.iter().all(|p| !p.exists()), "fresh sources must work without checkout JARs");
+        for plan in &consumer.kotlin_producers { assert!(plan.request(&consumer).is_ok()); }
+        let mut ambiguous = modules.clone();
+        ambiguous[1].source_sets[0].provided_artifacts.push(jars[0].clone());
+        let ambiguous = ProjectSnapshot::new(ambiguous);
+        assert!(crate::compile::kotlin_producers::capture(&ambiguous, &ambiguous.modules[3].source_sets[0],
+            &consumer.task, consumer.java_task.as_ref().unwrap()).is_none());
+        for fact in ["taskActionInventory", "taskOnlyIfInventory"] {
+            let mut custom = modules.clone();
+            let inventory = custom[1].source_sets[0].compiler_tasks[0].options.get_mut(fact).unwrap();
+            if fact == "taskActionInventory" {
+                inventory["actions"].as_array_mut().unwrap().push(json!({"class":"custom.Action"}));
+            } else { inventory["predicates"][0]["stockEnabledPredicate"] = json!(false); }
+            let custom = ProjectSnapshot::new(custom);
+            assert!(crate::compile::kotlin_producers::capture(&custom, &custom.modules[3].source_sets[0],
+                &consumer.task, consumer.java_task.as_ref().unwrap()).is_none(), "{fact}");
+        }
+    }
     consumer.dependency_overlays = requests[..3].iter().flat_map(|r| r.overlays.clone()).collect();
     let identity = crate::compile::kotlin_producers::identity(&consumer).unwrap();
     consumer.dependency_overlays[0].text.push_str("\n// unsaved API edit");
@@ -3206,22 +3254,47 @@ fn three_kotlin_producers_bind_both_languages_and_track_unsaved_inputs() {
         std::fs::create_dir(&output).unwrap();
         bindings.insert(kotlin_path_key(&crate::paths::file_key(slot)), output);
     }
+    if kmp_producers {
+        for plan in &consumer.kotlin_producers {
+            let kt = plan.source.compiler_tasks.iter().find(|t| t.language == crate::classpath::CompilerLanguage::Kotlin).unwrap();
+            let java = plan.source.compiler_tasks.iter().find(|t| t.language == crate::classpath::CompilerLanguage::Java).unwrap();
+            let private_kt = bindings[&kotlin_path_key(&crate::paths::file_key(&kt.output_roots[0]))].clone();
+            let private_java = bindings[&kotlin_path_key(&crate::paths::file_key(&java.output_roots[0]))].clone();
+            bindings.extend(crate::compile::kotlin_producers::output_bindings(&consumer, plan, &private_kt, &private_java).unwrap());
+        }
+    }
     let covered = consumer.dependency_overlays.iter().map(|s| s.key.clone()).collect();
+    if kmp_producers {
+        let mut mixed = consumer.clone();
+        mixed.java_task.as_mut().unwrap().source_files.push(mixed.project_dir.join("src/Main.java"));
+        assert!(crate::compile::kotlin_producers::effective(&mixed, &bindings, &covered).err().expect("mixed Java must be rejected")
+            .to_string().contains("kotlin-producer-java-recipe-unknown"),
+            "Gradle 9.3 source membership does not prove a mixed Java execution recipe");
+        for claim in [json!(null), json!({"adapter":"gradle-producing-source-trees-v1",
+            "complete":false,"language":"java","task":consumer.java_task.as_ref().unwrap().task,
+            "roots":[consumer.project_dir.join("src")]})] {
+            let mut unknown = consumer.clone();
+            unknown.java_task.as_mut().unwrap().options.insert("sdkProducerClaims".into(), claim);
+            assert!(crate::compile::kotlin_producers::effective(&unknown, &bindings, &covered).is_err(),
+                "an unknown Java recipe requires a complete zero-Java source claim");
+        }
+    }
     let effective = crate::compile::kotlin_producers::effective(&consumer, &bindings, &covered).unwrap();
     for slot in &all_slots {
         assert!(!effective.task.classpath.contains(slot));
         assert!(!effective.java_task.as_ref().unwrap().classpath.contains(slot));
     }
-    assert_eq!(effective.task.classpath.len(), 6);
+    assert_eq!(effective.task.classpath.len(), if kmp_producers { 4 } else { 6 });
     let kotlin_cp = effective.task.arguments.iter().position(|arg| arg == "-classpath").unwrap() + 1;
     assert_eq!(effective.task.arguments[kotlin_cp], joined_classpath(&effective.task.classpath).unwrap());
     assert!(effective.dependency_overlays.is_empty());
     let java = effective.java_task.as_ref().unwrap();
-    let recipe = java.java_compiler_recipe().unwrap();
-    let cp = java.java_api_option_slots(&recipe).unwrap().classpath;
-    assert_eq!(recipe.api_options[cp], joined_classpath(&java.classpath).unwrap());
+    if let Some(recipe) = java.java_compiler_recipe() {
+        let cp = java.java_api_option_slots(&recipe).unwrap().classpath;
+        assert_eq!(recipe.api_options[cp], joined_classpath(&java.classpath).unwrap());
+    } else { assert!(kmp_producers); }
     // The primary compiler must not bootstrap its current ABI from its own saved output.
-    for slot in slots(&requests[1]) {
+    for slot in slots(&requests[1]).into_iter().chain(kmp_producers.then(|| jars[1].clone())) {
         let mut self_read = modules.clone();
         self_read[1].source_sets[0].compiler_tasks[0].classpath.push(slot);
         let self_read = ProjectSnapshot::new(self_read);

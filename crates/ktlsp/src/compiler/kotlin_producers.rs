@@ -32,7 +32,9 @@ fn tasks(source: &SourceSetClasspath) -> Option<(&CompilerTask, &CompilerTask)> 
         || !crate::classpath::sdk_producer_roots(java).is_some_and(|(_, complete)| complete)
         || kotlin.output_roots.len() != 1 || java.output_roots.len() != 1
         || !java_diagnostics::selected_tasks_supported(kotlin, java, &source.compiler_tasks)
-        || !java.annotation_processing_disabled() || !java.annotation_processor_path.is_empty()
+        || !(java.annotation_processing_disabled()
+            || (java.java_compiler_recipe().is_none() && java.arguments.is_empty()))
+        || !java.annotation_processor_path.is_empty()
     { return rejected(&kotlin.task, "producer-recipe-or-inventory-unhandled"); }
     let outputs = [&kotlin.output_roots[0], &java.output_roots[0]];
     if outputs.iter().any(|p| !p.is_absolute())
@@ -80,14 +82,16 @@ fn capture_dependencies(
                     }
                 }
                 [(_, (_, source))] if std::ptr::eq(*source, own) => {
-                    if primary_read && primary.output_roots.iter().chain(&java.output_roots)
+                    if primary_read && primary.output_roots.iter().chain(&java.output_roots).chain(&source.provided_artifacts)
                         .any(|output| paths_overlap(&read_key, &key(output))) {
                         return rejected(&primary.task, "primary-reads-own-normal-output");
                     }
                 }
                 [(index, (_, source))] => {
                     let (kt, j) = tasks(source)?;
-                    if !kt.output_roots.iter().chain(&j.output_roots).any(|p| key(p) == read_key) {
+                    let provided_jar = source.provided_artifacts.iter().any(|p|
+                        p.extension().and_then(|e| e.to_str()) == Some("jar") && key(p) == read_key);
+                    if !provided_jar && !kt.output_roots.iter().chain(&j.output_roots).any(|p| key(p) == read_key) {
                         return rejected(&primary.task, "producer-read-not-normal-output");
                     }
                     found.insert(*index);
@@ -132,9 +136,17 @@ fn capture_dependencies(
 
 fn rewrite(task: &mut CompilerTask, bindings: &BTreeMap<String, PathBuf>) -> anyhow::Result<()> {
     let java_recipe = if task.language == CompilerLanguage::Java {
-        let recipe = task.java_compiler_recipe().ok_or_else(|| anyhow::anyhow!("kotlin-producer-java-recipe-unknown"))?;
-        let slots = task.java_api_option_slots(&recipe)?;
-        Some((recipe, slots.classpath))
+        if let Some(recipe) = task.java_compiler_recipe() {
+            let slots = task.java_api_option_slots(&recipe)?;
+            Some((recipe, slots.classpath))
+        } else {
+            anyhow::ensure!(task.complete && task.problem.is_none()
+                && task.source_files.is_empty() && task.arguments.is_empty()
+                && task.annotation_processor_path.is_empty()
+                && crate::classpath::sdk_producer_roots(task).is_some_and(|(_, complete)| complete),
+                "kotlin-producer-java-recipe-unknown");
+            None
+        }
     } else { None };
     let replace = |p: &PathBuf| bindings.get(&key(p)).cloned().unwrap_or_else(|| p.clone());
     let before: BTreeSet<_> = task.classpath.iter().map(|p| key(p)).collect();
@@ -172,9 +184,9 @@ pub(super) fn effective(
 }
 
 struct CompiledProducer {
-    _owner: KotlinEditorOverlay,
     environment: Arc<KotlinDiagnosticEnvironment>,
     outputs: sealed_output::SealedOutput,
+    _owner: KotlinEditorOverlay,
     bindings: Vec<(String, PathBuf)>,
     source_keys: BTreeSet<String>,
 }
@@ -182,9 +194,27 @@ struct CompiledProducer {
 pub(super) struct CompiledProducers {
     identity: Vec<u8>,
     nodes: Vec<CompiledProducer>,
+    consumer_environment: std::sync::Mutex<Option<Arc<KotlinDiagnosticEnvironment>>>,
 }
 
 impl CompiledProducers {
+    fn consumer_environment(
+        &self, request: &KotlinDiagnosticRequest, parent: &KotlinDiagnosticEnvironment,
+    ) -> anyhow::Result<Arc<KotlinDiagnosticEnvironment>> {
+        let mut retained = self.consumer_environment.lock()
+            .map_err(|_| anyhow::anyhow!("kotlin-producer-consumer-cache-poisoned"))?;
+        if let Some(environment) = retained.as_ref() {
+            anyhow::ensure!(environment.matches(request), "kotlin-producer-consumer-inputs-changed");
+            environment.check_live()?;
+            return Ok(environment.clone());
+        }
+        let environment = KotlinDiagnosticEnvironment::prepare_with_invalidation(
+            request, parent.wake.clone(), parent.invalid.clone())?;
+        // Dropping this watch on a Kotlin-only return would cancel the parent's shared input epoch.
+        *retained = Some(environment.clone());
+        Ok(environment)
+    }
+
     pub(super) fn epochs_live(&self) -> bool {
         self.nodes.iter().all(|node|
             !node.environment.invalid.load(std::sync::atomic::Ordering::Acquire)
@@ -214,6 +244,17 @@ impl CompiledProducers {
     }
 }
 
+impl Drop for CompiledProducers {
+    fn drop(&mut self) {
+        if let Some(environment) = self.consumer_environment.get_mut()
+            .unwrap_or_else(|error| error.into_inner()).as_ref() {
+            environment.close();
+        }
+        // All dependent watches retire before any earlier producer's private output is deleted.
+        for node in &self.nodes { node.environment.close(); }
+    }
+}
+
 pub(super) fn identity(request: &KotlinDiagnosticRequest) -> anyhow::Result<Vec<u8>> {
     let mut sources = BTreeMap::new();
     for plan in &request.kotlin_producers {
@@ -232,18 +273,39 @@ pub(super) fn identity(request: &KotlinDiagnosticRequest) -> anyhow::Result<Vec<
     Ok(serde_json::to_vec(&(&request.kotlin_producers, sources))?)
 }
 
+pub(super) fn output_bindings(
+    request: &KotlinDiagnosticRequest, plan: &KotlinDependencyCompilation,
+    kotlin_output: &Path, java_output: &Path,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let (kt, java) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
+    let mut bindings = vec![(key(&kt.output_roots[0]), kotlin_output.to_path_buf()),
+        (key(&java.output_roots[0]), java_output.to_path_buf())];
+    // Only artifact slots actually selected by this closed plan are rebound. Capture
+    // already proved their unique source owner; sources/artifact metadata stay unchanged.
+    let reads: BTreeSet<_> = request.task.classpath.iter()
+        .chain(request.java_task.iter().flat_map(|t| &t.classpath))
+        .chain(request.kotlin_producers.iter().flat_map(|p|
+            p.source.compiler_tasks.iter().flat_map(|t| &t.classpath)))
+        .map(|p| key(p)).collect();
+    bindings.extend(plan.source.provided_artifacts.iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jar") && reads.contains(&key(p)))
+        .map(|p| (key(p), kotlin_output.to_path_buf())));
+    Ok(bindings)
+}
+
 fn compile(
     request: &KotlinDiagnosticRequest, environment: &KotlinDiagnosticEnvironment,
     expected_identity: Vec<u8>,
 ) -> anyhow::Result<Arc<CompiledProducers>> {
-    let mut compiled = CompiledProducers { identity: expected_identity, nodes: Vec::new() };
+    let mut compiled = CompiledProducers { identity: expected_identity, nodes: Vec::new(),
+        consumer_environment: std::sync::Mutex::new(None) };
     for plan in &request.kotlin_producers {
         request.check_live()?;
         environment.check_live()?;
         compiled.check_live()?;
         let producer = effective(&plan.request(request)?, &compiled.bindings(), &compiled.covered())?;
         // Recheck complete capture before treating an empty Java slot as empty API authority.
-        let (kt, java) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
+        let (kt, _) = tasks(&plan.source).ok_or_else(|| anyhow::anyhow!("kotlin-producer-recipe-unhandled"))?;
         let producer_environment = KotlinDiagnosticEnvironment::prepare_with_invalidation(
             &producer, environment.wake.clone(), environment.invalid.clone())?;
         let roots = java_diagnostics::owned_membership_inputs(&producer)?;
@@ -265,9 +327,10 @@ fn compile(
         let java_output = owner.directory.join("java-classes");
         std::fs::create_dir(&java_output)?;
         let outputs = sealed_output::SealedOutput::seal(vec![kotlin_output.clone(), java_output.clone()])?;
+        let bindings = output_bindings(request, plan, &kotlin_output, &java_output)?;
         compiled.nodes.push(CompiledProducer {
             _owner: owner, environment: producer_environment, outputs,
-            bindings: vec![(key(&kt.output_roots[0]), kotlin_output), (key(&java.output_roots[0]), java_output)],
+            bindings,
             source_keys: producer.sources.iter().map(|p| crate::paths::file_key(p)).collect(),
         });
         crate::trace::span("compiler.kotlin.producer-compiled", "compiler", started,
@@ -287,15 +350,24 @@ pub(super) fn run(
     let current = identity(request)?;
     let mut cache = environment.kotlin_producer_cache.lock()
         .map_err(|_| anyhow::anyhow!("kotlin-producer-cache-poisoned"))?;
-    let cached = cache.as_ref().filter(|c| c.identity == current && c.check_live().is_ok()).cloned();
-    let producers = if let Some(cached) = cached { cached }
-        else { compile(request, environment, current)? };
+    let producers = if let Some(cached) = cache.as_ref() {
+        if cached.identity != current || cached.check_live().is_err() {
+            // Replacing child watches inside this epoch would cancel its newly compiled replacement.
+            environment.invalid.store(true, std::sync::atomic::Ordering::Release);
+            let _ = environment.wake.try_send(());
+            anyhow::bail!("kotlin-producer-inputs-changed");
+        }
+        cached.clone()
+    } else {
+        let compiled = compile(request, environment, current)?;
+        *cache = Some(compiled.clone());
+        compiled
+    };
     let effective = effective(request, &producers.bindings(), &producers.covered())?;
     anyhow::ensure!(effective.dependency_overlays.iter().all(|s|
         std::fs::read_to_string(&s.key).ok().as_deref() == Some(s.text.as_str())),
         "kotlin-producer-unclosed-wire-dependency");
-    let consumer_environment = KotlinDiagnosticEnvironment::prepare_with_invalidation(
-        &effective, environment.wake.clone(), environment.invalid.clone())?;
+    let consumer_environment = producers.consumer_environment(&effective, environment)?;
     let (mut outcome, _owner) = run_owned_kotlin_overlay(&effective, &consumer_environment, false)?;
     request.check_live()?;
     environment.check_live()?;
@@ -306,6 +378,55 @@ pub(super) fn run(
         proof.body_environment = Some(consumer_environment);
         proof.producer_outputs = Some(producers.clone());
     }
-    *cache = Some(producers);
     Ok(outcome)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn producer_consumer_watch_survives_kotlin_only_return_and_reuses_same_inputs() {
+        let base = std::env::temp_dir().join("ktlsp-producer-consumer-watch");
+        let owner = KotlinEditorOverlay::empty_in(&kotlin_test_request(&base.join("unused")), &base.join("runs")).unwrap();
+        let mut request = kotlin_test_request(&owner.directory.join("project"));
+        request.task.arguments.retain(|argument| !argument.starts_with("-Xplugin="));
+        let runtime = request.task.kotlin_compiler.as_ref().unwrap();
+        let sdk = runtime.gradle_java_home.clone();
+        // No JVM runs: these are only watched input bytes for the existing environment boundary.
+        for directory in [sdk.join("bin"), sdk.join("conf")] { std::fs::create_dir_all(directory).unwrap(); }
+        let inputs = runtime.default_classpath.iter().chain(&request.task.classpath).cloned()
+            .chain([sdk.join("release"), sdk.join("lib/modules"), sdk.join("lib/jvm.cfg"), sdk.join("lib/jrt-fs.jar")]);
+        for input in inputs {
+            std::fs::create_dir_all(input.parent().unwrap()).unwrap();
+            std::fs::write(input, b"watched input").unwrap();
+        }
+        let selected_library = request.task.classpath[0].clone();
+        let (wake, mut events) = tokio::sync::mpsc::channel(1);
+        let parent = KotlinDiagnosticEnvironment::prepare(&request, wake).unwrap();
+        let compiled = CompiledProducers { identity:Vec::new(), nodes:Vec::new(),
+            consumer_environment:std::sync::Mutex::new(None) };
+        let first = compiled.consumer_environment(&request, &parent).unwrap();
+        let identity = Arc::as_ptr(&first);
+        drop(first);
+        assert!(!parent.invalid.load(Ordering::Acquire), "returning a Kotlin-only result must retain its input watch");
+        assert!(matches!(events.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+            "normal return must not enqueue a new diagnostic generation");
+        let second = compiled.consumer_environment(&request, &parent).unwrap();
+        assert_eq!(Arc::as_ptr(&second), identity, "same inputs reuse the retained consumer watch");
+        drop(second);
+        std::fs::write(selected_library, b"actual selected library edit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut woken = false;
+        while !woken && Instant::now() < deadline {
+            woken = events.try_recv().is_ok();
+            if !woken { std::thread::sleep(Duration::from_millis(10)); }
+        }
+        assert!(woken, "real selected input changes must still wake the diagnostic owner");
+        assert!(parent.invalid.load(Ordering::Acquire), "real selected input changes still invalidate the shared epoch");
+        assert!(parent.check_live().is_err());
+        parent.close();
+        drop(compiled);
+    }
 }

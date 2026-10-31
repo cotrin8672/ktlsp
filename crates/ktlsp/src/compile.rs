@@ -3684,7 +3684,9 @@ impl KotlinDependencyCompilation {
                     java,
                     &self.source.compiler_tasks
                 )
-                && java.annotation_processing_disabled()
+                && (java.annotation_processing_disabled()
+                    || (java.source_files.is_empty() && java.java_compiler_recipe().is_none()
+                        && java.arguments.is_empty()))
                 && java.annotation_processor_path.is_empty()
                 && java
                     .source_files
@@ -4386,6 +4388,7 @@ fn kotlin_editor_arguments(
     let mut explicit_classpath = false;
     let mut jvm_abi_output = false;
     let mut jdk_release = None;
+    let mut common_sources = false;
     let path_separator = if cfg!(windows) { ';' } else { ':' };
     for path in &request.task.classpath {
         anyhow::ensure!(path.is_absolute(), "kotlin-relative-target-classpath");
@@ -4535,6 +4538,35 @@ fn kotlin_editor_arguments(
             | "-Xjsr305=strict"
             | "-opt-in=kotlin.RequiresOptIn"
             | "-Xexplicit-api=strict" => result.push(argument.clone()),
+            _ if argument.starts_with("-Xcommon-sources=") => {
+                anyhow::ensure!(!common_sources && request.task.arguments.iter().any(|a| a == "-Xmulti-platform"),
+                    "kotlin-common-source-role-unhandled");
+                let roles = argument.strip_prefix("-Xcommon-sources=").unwrap();
+                let mut seen = std::collections::BTreeSet::new();
+                let mut private = Vec::new();
+                for role in roles.split(',') {
+                    let original = Path::new(role);
+                    anyhow::ensure!(original.is_absolute() && original.extension().and_then(|e| e.to_str()) == Some("kt")
+                        && !role.chars().any(char::is_control)
+                        && !original.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)),
+                        "kotlin-common-source-path-unhandled");
+                    let key = kotlin_path_key(role);
+                    anyhow::ensure!(seen.insert(key.clone()) && request.task.source_files.iter().any(|p|
+                        kotlin_path_key(&crate::paths::file_key(p)) == key), "kotlin-common-source-not-selected");
+                    let positions: Vec<_> = request.sources.iter().enumerate().filter(|(_, p)|
+                        kotlin_path_key(&crate::paths::file_key(p)) == key).map(|(i, _)| i).collect();
+                    let [position] = positions.as_slice() else { anyhow::bail!("kotlin-common-source-not-owned"); };
+                    // Empty sources are validation-only calls before private copies exist.
+                    if !sources.is_empty() {
+                        let path = sources.get(*position).ok_or_else(|| anyhow::anyhow!("kotlin-common-source-copy-missing"))?;
+                        let path = path.to_str().ok_or_else(|| anyhow::anyhow!("kotlin-common-source-copy-encoding"))?;
+                        anyhow::ensure!(!path.contains(',') && !path.chars().any(char::is_control), "kotlin-common-source-copy-unhandled");
+                        private.push(path);
+                    }
+                }
+                if !private.is_empty() { result.push(format!("-Xcommon-sources={}", private.join(","))); }
+                common_sources = true;
+            }
             _ if argument.starts_with("-Xjdk-release=") => {
                 let value = argument.strip_prefix("-Xjdk-release=").unwrap();
                 let feature = crate::classpath::kotlin_jdk_release_feature(value)
@@ -5701,6 +5733,8 @@ mod kotlin_editor_compile_tests {
         recipe.gradle_plugin_version = "2.2.21".into();
         recipe.run_via_build_tools_api = false;
         recipe.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+        request.sources = vec![root.join("common/Expected.kt"), root.join("jvm/Actual.kt")];
+        request.task.source_files = request.sources.clone();
         let output = root.join("private/classes");
         let sources = [root.join("private/common/Expected.kt"), root.join("private/jvm/Actual.kt")];
         let mut expected = kotlin_editor_arguments(&request, &output, &sources).unwrap();
@@ -5714,6 +5748,26 @@ mod kotlin_editor_compile_tests {
         assert_eq!(request.task.arguments, selected);
         let current = KotlinEnvironmentKey::new(&request).unwrap();
         assert!(current != baseline);
+        let role = format!("-Xcommon-sources={}", request.sources[0].display());
+        request.task.arguments.push(role.clone());
+        let remapped = kotlin_editor_arguments(&request, &output, &sources).unwrap();
+        assert!(remapped.iter().any(|arg| arg == &format!("-Xcommon-sources={}", sources[0].display())));
+        assert!(!remapped.contains(&role));
+        let common_key = KotlinEnvironmentKey::new(&request).unwrap();
+        assert!(common_key != current);
+        let mut changed = request.clone();
+        *changed.task.arguments.last_mut().unwrap() = format!("-Xcommon-sources={}", request.sources[1].display());
+        assert!(KotlinEnvironmentKey::new(&changed).unwrap() != common_key);
+        for roles in [root.join("unowned.kt").display().to_string(),
+            format!("{},{}", request.sources[0].display(), request.sources[0].display())] {
+            let mut changed = request.clone();
+            *changed.task.arguments.last_mut().unwrap() = format!("-Xcommon-sources={roles}");
+            assert!(kotlin_editor_arguments(&changed, &output, &sources).is_err());
+        }
+        let mut changed = request.clone();
+        changed.sources.remove(0);
+        assert!(kotlin_editor_arguments(&changed, &output, &sources).is_err());
+        request.task.arguments.pop();
         for flag in flags {
             let mut changed = request.clone();
             changed.task.arguments.retain(|argument| argument != flag);

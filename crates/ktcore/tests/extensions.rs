@@ -1314,7 +1314,7 @@ fn compiled_host_type(index: &Index, store: &mut ExtensionStore, file: &str) -> 
 
 #[test]
 fn type_jvm_preserves_raw_class_metadata_and_tracks_missing_or_replaced_inputs() {
-    let (index, mut store, class) = compiled_host_fixture();
+    let (mut index, mut store, class) = compiled_host_fixture();
     let owner = compiled_host_type(&index, &mut store, COMPILED_HOST_A);
     let mut read = store.begin(&index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A).unwrap();
     let source = read.type_jvm(&owner).unwrap();
@@ -1347,6 +1347,38 @@ fn type_jvm_preserves_raw_class_metadata_and_tracks_missing_or_replaced_inputs()
     let (other_index, mut other_store, _) = compiled_host_fixture();
     let mut other = other_store.begin(&other_index, COMPILED_HOST_PROVIDER, COMPILED_HOST_A).unwrap();
     assert_eq!(other.type_jvm(&owner).err(), Some(ContractError::ForeignIdentity));
+
+    assert!(class.methods.iter().any(|method|method.name.as_ref()=="getName"));
+    assert!(!class.methods.iter().any(|method|method.name.as_ref()=="newMember"));
+    store.replace_compiled_input(&index,&owner,Some(class.clone())).unwrap();
+    let edited="package pluginfixture;\npublic final class Person { private String name; public int newMember() { return 1; } }\n";
+    let symbols:Vec<_>=[("Person",SymbolKind::Class),("name",SymbolKind::Property),("newMember",SymbolKind::Function)]
+        .into_iter().map(|(name,kind)| {
+            let range=occurrence(edited,name,0);
+            IndexedSymbol::new(name,kind,"pluginfixture",(kind!=SymbolKind::Class).then(||"Person".into()),range.start,range.end)
+        }).collect();
+    let members=symbols.iter().filter(|symbol|symbol.kind!=SymbolKind::Class).map(|symbol|DeclaredMemberFacts {
+        definition:def(COMPILED_HOST_A,symbol),
+        signature:Knowledge::Found(if symbol.name=="name" {MemberSignature::field(&JvmType::String).unwrap()} else {method(&[],&JvmType::Int)}),
+        dispatch:Knowledge::Found(Dispatch::Instance),
+        visibility:Knowledge::Found(if symbol.name=="name" {Visibility::Private} else {Visibility::Public}),
+        synthetic:Knowledge::Found(false),
+    }).collect();
+    index.replace_file(COMPILED_HOST_A,symbols,Tier::Volatile);
+    store.replace_source(&index,COMPILED_HOST_A,Arc::from(edited),Knowledge::Unknown(vec![IncompleteReason::MissingFacts]),members).unwrap();
+    let mut read=store.begin(&index,COMPILED_HOST_PROVIDER,COMPILED_HOST_A).unwrap();
+    assert!(matches!(read.type_jvm(&owner),Err(ContractError::Stale)));
+    let Knowledge::Found(current)=read.resolve_type("pluginfixture.Person") else {panic!("current edited owner")};
+    let current_facts=read.type_jvm(&current).unwrap();
+    let mut names:Vec<_>=current_facts.declared_members.iter().map(|member|member.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names,vec!["name","newMember"]);
+    assert!(matches!(current_facts.declared_members_coverage,Knowledge::Unknown(_)),"direct authored members do not certify generated members");
+    assert!(matches!(current_facts.abi,Knowledge::Unknown(_)),"source replacement withdraws the old compiled attachment");
+    let member=current_facts.declared_members.iter().find(|member|member.name=="newMember").unwrap();
+    let Knowledge::Found(location)=read.member_source_location(&member.id).unwrap() else {panic!("current authored member location")};
+    assert_eq!(location.text.as_ref(),edited);
+    assert_eq!(&location.text[location.definition.start_byte..location.definition.end_byte],"newMember");
 }
 
 fn compiled_host_getter_pending(
@@ -3131,6 +3163,82 @@ fn scoped_source_snapshots_track_empty_membership_overlays_and_session_identity(
     store.remove_source("/source/Added.java");
     assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)),
         "source deletion invalidates inventory even without semantic declarations");
+}
+
+#[test]
+fn source_locations_keep_cross_file_overloads_private_members_and_stale_inputs() {
+    for java in [false,true] {
+        let (mut index,mut store) = fixture();
+        let file = if java {"/oracle/JavaTarget.java"} else {TARGET_FILE};
+        let text = if java {
+            "package oracle; class JavaTarget { private int secret; int twice(int value) { return value; } String twice(String value) { return value; } }".to_owned()
+        } else { TARGET.replace("    fun numbers", "    @JvmName(\"binaryNumbers\")\n    fun numbers") };
+        let symbols = if java {
+            let mut symbols=Vec::new();
+            for (name,kind,ordinal) in [("JavaTarget",SymbolKind::Class,0),("secret",SymbolKind::Property,0),
+                ("twice",SymbolKind::Function,0),("twice",SymbolKind::Function,1)] {
+                let range=occurrence(&text,name,ordinal);
+                let mut symbol=IndexedSymbol::new(name,kind,"oracle",(kind!=SymbolKind::Class).then(||"JavaTarget".into()),range.start,range.end);
+                if kind==SymbolKind::Function {symbol.params=vec![ktcore::types::TypeRef::simple(if ordinal==0 {"Int"} else {"String"})];}
+                symbols.push(symbol);
+            }
+            index.replace_file(file,symbols.clone(),Tier::Volatile);symbols
+        } else { index_source(&mut index,file,&text,"oracle") };
+        for source in [file,MIXIN_FILE] {
+            index.set_file_origin(source,FileOrigin {origin_id:"location-test".into(),representation:SourceRepresentation::Source,
+                project_scope:Some(ProjectScope{module:"location-test".into(),source_set:"main".into()})});
+        }
+        index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope:ProjectScope{module:"location-test".into(),source_set:"main".into()},ordered_origins:vec!["location-test".into()],
+        }]);
+        store.remove_source(file);
+        let mut read=store.begin(&index,"mixin-consumer",MIXIN_FILE).unwrap();
+        assert!(matches!(read.resolve_type(if java {"oracle.JavaTarget"} else {"oracle.Target"}),Knowledge::Unknown(_)));
+        let missing=read.finish();
+        assert!(missing.requested_source_files().contains(file));
+        assert!(store.validate_pending(&missing).is_ok());
+        store.replace_source(&index,file,Arc::from(text.as_str()),Knowledge::Found(()),facts(file,&symbols)).unwrap();
+        assert!(matches!(store.validate_pending(&missing),Err(ContractError::Stale)));
+        let mut read=store.begin(&index,"mixin-consumer",MIXIN_FILE).unwrap();
+        let Knowledge::Found(target)=read.resolve_type(if java {"oracle.JavaTarget"} else {"oracle.Target"}) else {panic!("target")};
+        let Knowledge::Found(location)=read.type_source_location(&target).unwrap() else {panic!("source type")};
+        assert_eq!(location.definition,*target.definition());
+        let (members,_)=read.declared_members(&target).unwrap();
+        let mut overloads=Vec::new();
+        for member in members.iter().filter(|member|matches!(member.name.as_str(),"twice"|"secret"|"numbers")) {
+            let Knowledge::Found(location)=read.member_source_location(&member.id).unwrap() else {panic!("source member")};
+            assert_eq!(location.definition,*member.id.definition());
+            assert_eq!(location.definition.file,file);
+            assert_eq!(&location.text[location.definition.start_byte..location.definition.end_byte],member.name);
+            if member.name=="twice" {overloads.push(location.definition.start_byte);}
+            if member.name=="secret" {assert_eq!(member.visibility,Knowledge::Found(Visibility::Private));}
+            if member.name=="numbers" {assert!(location.text.contains("@JvmName(\"binaryNumbers\")"));}
+        }
+        assert_eq!(overloads.len(),2);assert_ne!(overloads[0],overloads[1]);
+        let pending=read.finish();
+        let changed=text.replace("return value", "return  value").replace("41", "42");
+        let changed_symbols=if java {
+            let mut changed_symbols=symbols.clone();
+            let second=occurrence(&changed,"twice",1);
+            let method=changed_symbols.iter_mut().filter(|symbol|symbol.name=="twice").nth(1).unwrap();
+            method.start_byte=second.start;method.end_byte=second.end;
+            index.replace_file(file,changed_symbols.clone(),Tier::Volatile);changed_symbols
+        } else {index_source(&mut index,file,&changed,"oracle")};
+        store.replace_source(&index,file,Arc::from(changed),Knowledge::Found(()),facts(file,&changed_symbols)).unwrap();
+        assert!(matches!(store.validate_pending(&pending),Err(ContractError::Stale)));
+        let mut read=store.begin(&index,"mixin-consumer",MIXIN_FILE).unwrap();
+        assert!(matches!(read.type_source_location(&target),Err(ContractError::Stale)));
+        let Knowledge::Found(current)=read.resolve_type(if java {"oracle.JavaTarget"} else {"oracle.Target"}) else {panic!("current")};
+        drop(read);
+        index.set_file_origin(file,FileOrigin {origin_id:"location-test".into(),representation:SourceRepresentation::Stub,
+            project_scope:Some(ProjectScope{module:"location-test".into(),source_set:"main".into()})});
+        let mut read=store.begin(&index,"mixin-consumer",MIXIN_FILE).unwrap();
+        assert!(matches!(read.type_source_location(&current).unwrap(),Knowledge::Unknown(_)));
+        drop(read);
+        store.invalidate_model();
+        let mut read=store.begin(&index,"mixin-consumer",MIXIN_FILE).unwrap();
+        assert!(matches!(read.type_source_location(&current),Err(ContractError::Stale)));
+    }
 }
 
 #[derive(Debug)]

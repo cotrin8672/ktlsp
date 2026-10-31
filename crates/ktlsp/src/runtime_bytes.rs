@@ -184,24 +184,23 @@ impl RuntimeClassScope {
             crate::sdk_runtime::SdkClassLookup::CodeUnavailable =>
                 return Err(ClassBytesUnavailable::InvalidInput("selected SDK bytecode is unavailable".into())),
         }
-        read_ordered_class(&self.entries, internal_name, ||self.is_current())
+        read_ordered_class(&self.entries, internal_name, Some(self.sdk.feature()), ||self.is_current())
     }
 }
 
-fn read_ordered_class(entries: &[RuntimeEntry], internal_name: &str, is_current: impl Fn() -> bool)
+fn read_ordered_class(entries: &[RuntimeEntry], internal_name: &str, feature:Option<u16>, is_current: impl Fn() -> bool)
     -> Result<Option<RuntimeClassBytes>, ClassBytesUnavailable>
 {
     if !valid_internal_name(internal_name) { return Err(ClassBytesUnavailable::InvalidInternalName); }
     if !is_current() { return Err(ClassBytesUnavailable::ChangedInput); }
-        let entry_name = format!("{internal_name}.class");
         for entry in entries {
             let bytes = match std::fs::symlink_metadata(&entry.path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(ClassBytesUnavailable::InvalidInput(error.to_string())),
                 Ok(metadata) if metadata.file_type().is_symlink() =>
                     return Err(ClassBytesUnavailable::InvalidInput("runtime symlink".into())),
-                Ok(_) => crate::jar::read_class_bytes(&entry.path, &entry_name)
-                    .map_err(ClassBytesUnavailable::InvalidInput)?,
+                Ok(_) => crate::jar::read_effective_class_bytes(&entry.path,internal_name,"",feature,&is_current)
+                    .map_err(|error|if error=="Stale" {ClassBytesUnavailable::ChangedInput} else {ClassBytesUnavailable::InvalidInput(error)})?,
             };
             let Some(bytes) = bytes else { continue };
             let class = ktcore::classfile::decode(&entry.origin, &bytes)
@@ -235,21 +234,21 @@ mod tests {
         fs::write(second.join("pluginfixture/Person.class"), b"invalid later owner").unwrap();
         let entries = vec![RuntimeEntry {path:first.clone(),origin:"first-runtime".into()},
             RuntimeEntry {path:second.clone(),origin:"second-runtime".into()}];
-        let found = read_ordered_class(&entries, "pluginfixture/Person", ||true).unwrap().unwrap();
+        let found = read_ordered_class(&entries, "pluginfixture/Person", Some(21), ||true).unwrap().unwrap();
         assert_eq!(&*found.bytes, bytes);
         assert_eq!(found.class.identity.origin_id, "first-runtime");
         fs::write(first.join("pluginfixture/Person.class"), b"invalid earlier owner").unwrap();
         fs::write(second.join("pluginfixture/Person.class"), bytes).unwrap();
-        assert!(read_ordered_class(&entries, "pluginfixture/Person", ||true).is_err(),
+        assert!(read_ordered_class(&entries, "pluginfixture/Person", Some(21), ||true).is_err(),
             "an invalid earlier runtime owner cannot fall through to a valid later class");
         fs::remove_file(first.join("pluginfixture/Person.class")).unwrap();
-        let found = read_ordered_class(&entries, "pluginfixture/Person", ||true).unwrap().unwrap();
+        let found = read_ordered_class(&entries, "pluginfixture/Person", Some(21), ||true).unwrap().unwrap();
         assert_eq!(found.class.identity.origin_id, "second-runtime");
         let checks = Cell::new(0);
-        assert!(matches!(read_ordered_class(&entries, "pluginfixture/Person", || {
+        assert!(matches!(read_ordered_class(&entries, "pluginfixture/Person", Some(21), || {
             checks.set(checks.get()+1); checks.get()==1
         }), Err(ClassBytesUnavailable::ChangedInput)), "retirement after IO rejects publication");
-        assert!(read_ordered_class(&entries,"pluginfixture/Missing",||true).unwrap().is_none());
+        assert!(read_ordered_class(&entries,"pluginfixture/Missing",Some(21),||true).unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

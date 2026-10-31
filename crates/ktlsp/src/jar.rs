@@ -37,6 +37,113 @@ pub(crate) fn read_class_file(
         .transpose()
 }
 
+/// A physical entry selected by the JDK's MR-JAR view, never a guessed binary name.
+pub(crate) struct SelectedClassEntry {
+    pub index: usize,
+    pub name: String,
+    pub internal_name: String,
+    pub size: u64,
+    pub version: u16,
+}
+
+/// JAR specification / JarFile(File,boolean,int,Runtime.Version): canonical N>=9,
+/// main-section opt-in, highest N<=feature. META-INF resources are never versioned.
+/// An unknown profile can read ordinary JARs but cannot authorize an MR class view.
+pub(crate) fn selected_class_entries<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>, prefix: &str, feature: Option<u16>,
+    current: impl Fn() -> bool,
+) -> Result<Vec<SelectedClassEntry>, String> {
+    if archive.len()>MAX_SOURCE_FILES {return Err("class archive entry limit".into());}
+    if archive.has_duplicate_names() {return Err("ambiguous class archive entries".into());}
+    let mut manifests=Vec::new();
+    for index in 0..archive.len() {
+        if !current() {return Err("Stale".into());}
+        let entry=archive.by_index(index).map_err(|error|error.to_string())?;
+        if prefix.is_empty() && entry.name().map_err(|error|error.to_string())?.eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
+            manifests.push(index);
+        }
+    }
+    if manifests.len()>1 {return Err("ambiguous JAR manifest".into());}
+    let multi_release=if let Some(index)=manifests.first() {
+        let mut entry=archive.by_index(*index).map_err(|error|error.to_string())?;
+        let mut bytes=Vec::new();entry.by_ref().take(64*1024+1).read_to_end(&mut bytes).map_err(|error|error.to_string())?;
+        if bytes.len()>64*1024 {return Err("JAR manifest limit".into());}
+        let text=std::str::from_utf8(&bytes).map_err(|_|"invalid JAR manifest encoding")?;
+        let mut attributes=std::collections::BTreeMap::<String,String>::new();
+        let mut last=None::<String>;
+        // Continuation lines belong to the preceding main attribute, including Multi-Release.
+        let lines=text.replace("\r\n","\n").replace('\r',"\n");
+        for line in lines.split('\n') {
+            if line.is_empty() {break;}
+            if let Some(value)=line.strip_prefix(' ') {
+                let name=last.as_ref().ok_or("orphan JAR manifest continuation")?;
+                attributes.get_mut(name).ok_or("invalid JAR manifest continuation")?.push_str(value);
+            } else {
+                let (name,value)=line.split_once(": ").ok_or("invalid JAR manifest attribute")?;
+                if name.is_empty() || !name.bytes().all(|ch|ch.is_ascii_alphanumeric() || matches!(ch,b'-'|b'_')) {
+                    return Err("invalid JAR manifest attribute name".into());
+                }
+                let name=name.to_ascii_lowercase();
+                if attributes.insert(name.clone(),value.into()).is_some() {return Err("duplicate JAR manifest attribute".into());}
+                last=Some(name);
+            }
+        }
+        attributes.get("multi-release").is_some_and(|value|value.eq_ignore_ascii_case("true"))
+    } else {false};
+    let mut selected=std::collections::BTreeMap::<String,SelectedClassEntry>::new();
+    let mut variants=BTreeSet::new();
+    for index in 0..archive.len() {
+        if !current() {return Err("Stale".into());}
+        let entry=archive.by_index(index).map_err(|error|error.to_string())?;
+        if entry.is_dir() {continue;}
+        let name=entry.name().map_err(|error|error.to_string())?.into_owned();
+        let Some(relative)=name.strip_prefix(prefix) else {continue;};
+        let (version,relative)=if let Some(versioned)=relative.strip_prefix("META-INF/versions/") {
+            if !multi_release {continue;}
+            let Some((version,relative))=versioned.split_once('/') else {continue;};
+            if version.starts_with('0') || version.is_empty() || !version.bytes().all(|ch|ch.is_ascii_digit()) {continue;}
+            let Ok(version)=version.parse::<u16>() else {continue;};
+            if version<9 {continue;}
+            if relative.starts_with("META-INF/") || !relative.ends_with(".class") {continue;}
+            let feature=feature.ok_or("MR-JAR selection profile unavailable")?;
+            if version>feature {continue;}
+            (version,relative)
+        } else {(0,relative)};
+        if relative.starts_with("META-INF/") {continue;}
+        let Some(internal_name)=relative.strip_suffix(".class") else {continue;};
+        if !crate::runtime_bytes::valid_internal_name(internal_name) {return Err("invalid class archive path".into());}
+        if !variants.insert((internal_name.to_owned(),version)) {return Err("ambiguous class archive variant".into());}
+        if selected.get(internal_name).is_none_or(|previous|previous.version<version) {
+            selected.insert(internal_name.into(),SelectedClassEntry {index,name:name.clone(),internal_name:internal_name.into(),size:entry.size(),version});
+        }
+    }
+    if !current() {return Err("Stale".into());}
+    Ok(selected.into_values().collect())
+}
+
+/// The same selection feeds catalog ABI reads and exact runtime Code reads.
+pub(crate) fn read_effective_class_bytes(path:&Path, internal_name:&str, prefix:&str,
+    feature:Option<u16>, current:impl Fn()->bool) -> Result<Option<Vec<u8>>,String> {
+    if !crate::runtime_bytes::valid_internal_name(internal_name) {return Err("invalid JVM internal name".into());}
+    if !current() {return Err("Stale".into());}
+    if path.is_dir() || !prefix.is_empty() {
+        return read_class_bytes(path,&format!("{prefix}{internal_name}.class"));
+    }
+    let mut archive=zip::ZipArchive::new(fs::File::open(path).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    let selected=selected_class_entries(&mut archive,prefix,feature,&current)?.into_iter().find(|entry|entry.internal_name==internal_name);
+    let Some(selected)=selected else {return Ok(None);};
+    let limit=ktcore::classfile::MAX_CLASS_FILE_BYTES;
+    if selected.size>limit as u64 {return Err("class entry too large".into());}
+    let mut entry=archive.by_index(selected.index).map_err(|error|error.to_string())?;
+    let mut bytes=Vec::new();entry.by_ref().take(limit as u64+1).read_to_end(&mut bytes).map_err(|error|error.to_string())?;
+    if bytes.len()!=selected.size as usize || bytes.len()>limit {return Err("class entry size mismatch".into());}
+    if selected.version>0 && (bytes.len()<8 || u32::from(u16::from_be_bytes([bytes[6],bytes[7]]))>u32::from(selected.version)+44) {
+        return Err("versioned class exceeds its Java release".into());
+    }
+    if !current() {return Err("Stale".into());}
+    Ok(Some(bytes))
+}
+
 /// Read one selected entry without rewriting attributes or loading the whole archive.
 /// Runtime-role and accepted-identity checks belong to the host's class read plan.
 pub(crate) fn read_class_bytes(
@@ -3053,6 +3160,62 @@ mod tests {
             extract_class_stubs(&jar, &output).is_err(),
             "CRC failure cannot publish member facts"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn effective_mr_entries_match_profile_and_preserve_exact_bytes() {
+        let base=include_bytes!("../tests/fixtures/multi-release/8/Api.class");
+        let v11=include_bytes!("../tests/fixtures/multi-release/11/Api.class");
+        let v17=include_bytes!("../tests/fixtures/multi-release/17/Api.class");
+        let v21=include_bytes!("../tests/fixtures/multi-release/21/Api.class");
+        let only=include_bytes!("../tests/fixtures/multi-release/11/Only.class");
+        let module=include_bytes!("../tests/fixtures/multi-release/module-info.class");
+        let root=std::env::temp_dir().join(format!("ktlsp_mr_reader_{}_{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&root).unwrap();let path=root.join("input.jar");
+        let entries:Vec<(&str,&[u8])>=vec![("mr/Api.class",base),
+            ("META-INF/versions/11/mr/Api.class",v11),("META-INF/versions/17/mr/Api.class",v17),
+            ("META-INF/versions/21/mr/Api.class",v21),("META-INF/versions/11/mr/Only.class",only),
+            ("META-INF/versions/9/module-info.class",module),
+            ("META-INF/versions/22/mr/Api.class",b"inactive future bytes"),
+            ("META-INF/versions/09/mr/Api.class",b"noncanonical version bytes"),
+            ("META-INF/versions/8/mr/Api.class",b"ignored pre9 version bytes"),
+            ("META-INF/versions/17/META-INF/Fake.class",b"nonversionable resource")];
+        for manifest in [None,Some("Manifest-Version: 1.0\r\nMulti-Release: false\r\n\r\n"),
+            Some("Manifest-Version: 1.0\r\nMulti-Release: tr\r\n ue\r\n\r\n")] {
+            let mut entries=entries.clone();
+            if let Some(manifest)=manifest {entries.push(("META-INF/MANIFEST.MF",manifest.as_bytes()));}
+            write_binary_jar(&path,&entries);
+            let enabled=manifest.is_some_and(|text|text.contains("Multi-Release: tr"));
+            for (feature,expected) in [(8,&base[..]),(11,&v11[..]),(17,&v17[..]),(21,&v21[..])] {
+                let expected=if enabled {expected} else {&base[..]};
+                let bytes=read_effective_class_bytes(&path,"mr/Api","",Some(feature),||true).unwrap().unwrap();
+                assert_eq!(bytes,expected,"manifest={manifest:?}, feature={feature}");
+                let facts=ktcore::classfile::decode("selected-mr",&bytes).unwrap();
+                assert_eq!(facts.identity.internal_name,"mr/Api");
+                assert!(facts.methods.iter().any(|method|method.attribute_names.iter().any(|name|name.as_ref()=="Code")));
+                let selected_only=read_effective_class_bytes(&path,"mr/Only","",Some(feature),||true).unwrap();
+                assert_eq!(selected_only.as_deref(),(enabled && feature>=11).then_some(&only[..]));
+                let mut archive=zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+                let selected=selected_class_entries(&mut archive,"",Some(feature),||true).unwrap();
+                assert!(selected.iter().all(|entry|!entry.internal_name.starts_with("META-INF/")));
+                assert_eq!(selected.iter().filter(|entry|entry.internal_name=="mr/Api").count(),1);
+            }
+            assert_eq!(read_effective_class_bytes(&path,"mr/Api","",None,||true).is_err(),enabled);
+        }
+        write_binary_jar(&path,&[("META-INF/MANIFEST.MF",b"Manifest-Version: 1.0\nMulti-Release: true\n\n"),
+            ("META-INF/versions/17/mr/../Api.class",base)]);
+        assert!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).is_err());
+        // Reuse the existing duplicate-name fixture pattern: ZipWriter itself rejects duplicates.
+        write_binary_jar(&path,&[("META-INF/MANIFEST.MF",b"Manifest-Version: 1.0\nMulti-Release: true\n\n"),
+            ("META-INF/versions/17/mr/Api.class",v17),("META-INF/versions/17/mr/Bpi.class",v17)]);
+        let mut bytes=fs::read(&path).unwrap();let from=b"/mr/Bpi.class";let to=b"/mr/Api.class";
+        let positions:Vec<_>=bytes.windows(from.len()).enumerate().filter_map(|(at,bytes)|(bytes==from).then_some(at)).collect();
+        assert_eq!(positions.len(),2);for at in positions {bytes[at..at+from.len()].copy_from_slice(to);}
+        fs::write(&path,bytes).unwrap();
+        assert!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).unwrap_err().contains("ambiguous"));
+        assert_eq!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||false).unwrap_err(),"Stale");
         fs::remove_dir_all(root).unwrap();
     }
 

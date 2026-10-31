@@ -1006,6 +1006,20 @@ impl Workspace {
         self.analysis_extensions.finish_ipc_class_read(&self.index,prepared)
     }
 
+    pub(crate) fn begin_ipc_requested_source_capture(&self, evaluation: u64) -> Option<IpcSourceCapture> {
+        let requested=self.analysis_extensions.ipc_requested_sources(evaluation)?;
+        crate::trace::span("extension.ipc.requested_sources", "extension", std::time::Instant::now(),
+            serde_json::json!({"evaluation":evaluation,"requested_files":requested}));
+        if requested.is_empty() { return None; }
+        let owner=self.analysis_extensions.ipc_resource_owner(evaluation)?;
+        let mut capture=self.begin_ipc_source_capture(evaluation,owner)?;
+        capture.expected.retain(|key,_|requested.contains(key));
+        crate::trace::span("extension.ipc.project_source_demand", "extension", std::time::Instant::now(),
+            serde_json::json!({"evaluation":evaluation,"owner":owner,"requested_files":requested,
+                "eligible_files":capture.expected.keys().collect::<Vec<_>>()}));
+        (!capture.expected.is_empty()).then_some(capture)
+    }
+
     pub(crate) fn begin_ipc_source_capture(&self, evaluation: u64, owner: &str) -> Option<IpcSourceCapture> {
         if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) { return None; }
         let model = self.project_model.as_ref()?;
@@ -6435,7 +6449,7 @@ mod tests {
 
     #[test]
     fn ipc_source_capture_after_late_registration_preserves_closed_inputs_and_current_wire() {
-        for scenario in ["current", "wire", "model", "disk"] {
+        for scenario in ["current", "requested", "wire", "model", "disk"] {
             let root = unique_tmp(&format!("ipc-source-capture-{scenario}"));
             let selected = root.join("selected");
             let other = root.join("other");
@@ -6446,7 +6460,7 @@ mod tests {
             let empty = crate::paths::file_key(&selected.join("Empty.java"));
             let foreign = crate::paths::file_key(&other.join("Foreign.java"));
             let owner_text = "package ipc\nclass Owner";
-            let closed_text = "package ipc; class Closed {}";
+            let closed_text = "package ipc; class Closed { private int secret; int twice(int value) { return value; } }";
             std::fs::write(&owner, owner_text).unwrap();
             std::fs::write(&closed, closed_text).unwrap();
             std::fs::write(&empty, "").unwrap();
@@ -6475,18 +6489,30 @@ mod tests {
             ws.register_ipc_provider("test.sources",vec!["fixture-child".into()]).unwrap();
             assert!(ws.extension_source_input_identity(&closed).is_none());
             let work=ws.take_ipc_work().remove(0);
-            let request=ws.begin_ipc_source_capture(work.evaluation,&owner).unwrap();
-            assert_eq!(request.expected.keys().cloned().collect::<BTreeSet<_>>(),[closed.clone(),empty.clone()].into_iter().collect());
+            assert!(!ws.open_docs.contains_key(&closed),"the target has never been opened");
+            let missing=ws.ipc_batch(work.evaluation,"analysis/readFacts",serde_json::json!({
+                "evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Closed"}]
+            })).unwrap();
+            assert_eq!(missing["facts"][0],serde_json::json!({"state":"unknown","reasons":[{"code":"MissingSource"}]}));
+            assert_eq!(ws.analysis_extensions.ipc_requested_sources(work.evaluation).unwrap(),&BTreeSet::from([closed.clone()]));
+            let request=if scenario=="requested" {
+                ws.begin_ipc_requested_source_capture(work.evaluation).unwrap()
+            } else {ws.begin_ipc_source_capture(work.evaluation,&owner).unwrap()};
+            let expected=if scenario=="requested" {BTreeSet::from([closed.clone()])}
+                else {BTreeSet::from([closed.clone(),empty.clone()])};
+            assert_eq!(request.expected.keys().cloned().collect::<BTreeSet<_>>(),expected);
             if scenario=="disk" { std::fs::write(&closed,"package ipc; class Edited {}").unwrap(); }
             let prepared=prepare_ipc_source_capture(request);
             if scenario=="wire" { ws.open(&closed,"package ipc; class Unsaved {}".into()); }
             if scenario=="model" { ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules))); }
             let count=ws.finish_ipc_source_capture(prepared);
             match scenario {
-                "current" => {
-                    assert_eq!(count,2);
+                "current" | "requested" => {
+                    assert_eq!(count,if scenario=="requested" {1} else {2});
                     assert_eq!(ws.extension_source_input_identity(&closed).unwrap().as_ref(),closed_text);
-                    assert_eq!(ws.extension_source_input_identity(&empty).unwrap().as_ref(),"");
+                    if scenario=="current" {assert_eq!(ws.extension_source_input_identity(&empty).unwrap().as_ref(),"");}
+                    else {assert!(ws.extension_source_input_identity(&empty).is_none(),"unrequested project inputs are not captured");}
+                    assert!(!ws.ipc_evaluation_current(work.evaluation),"hydration must retire the missing-source evaluation");
                 }
                 "wire" => {
                     assert_eq!(ws.extension_source_input_identity(&closed).unwrap().as_ref(),"package ipc; class Unsaved {}");
@@ -6497,9 +6523,21 @@ mod tests {
             }
             assert!(ws.extension_source_input_identity(&foreign).is_none());
             ws.finish_ipc_work(work.evaluation,Err("Stale".into()));
-            if scenario=="current" {
+            if matches!(scenario,"current" | "requested") {
                 let next=ws.take_ipc_work().remove(0);
-                assert!(ws.begin_ipc_source_capture(next.evaluation,next.params["owner"].as_str().unwrap()).is_none(),"accepted closed inputs are not reparsed");
+                if scenario=="current" {
+                    assert!(ws.begin_ipc_source_capture(next.evaluation,next.params["owner"].as_str().unwrap()).is_none(),"accepted closed inputs are not reparsed");
+                } else {assert!(ws.begin_ipc_requested_source_capture(next.evaluation).is_none(),"new evaluations have no unresolved project demand");}
+                assert!(!ws.open_docs.contains_key(&closed),"capture must not open the target");
+                let resolved=ws.ipc_batch(next.evaluation,"analysis/readFacts",serde_json::json!({
+                    "evaluation":next.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Closed"}]
+                })).unwrap();
+                assert_eq!(resolved["facts"][0]["state"],"found","{resolved}");
+                let members=ws.ipc_batch(next.evaluation,"analysis/readFacts",serde_json::json!({
+                    "evaluation":next.evaluation.to_string(),"queries":[{"op":"declaredMembers","target":resolved["facts"][0]["value"]["id"]}]
+                })).unwrap();
+                assert!(members["facts"][0]["members"].as_array().unwrap().iter().any(|member|
+                    member["name"]=="twice" && member["signature"]["value"]["descriptor"]=="(I)I"),"{members}");
             }
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -9554,7 +9592,7 @@ impl Workspace {
         // Existing domain-only dependency facts do not prove that project producer ABIs are current.
         let java_body_eligible = java_inputs.as_ref().is_some_and(|(_, dependencies, imports_verified, _)|
             *imports_verified && dependencies.is_empty());
-        let (java_task, java_dependencies, kotlin_producers) = match java_inputs {
+        let (java_task, java_dependencies, mut kotlin_producers) = match java_inputs {
             Some((task, dependencies, _, producers)) => (Some(task), dependencies, producers),
             None if crate::compile::compiler_api_candidate(task) => {
                 let java: Vec<_> = source
@@ -9577,9 +9615,25 @@ impl Workspace {
             }
             None => (None, Vec::new(), Vec::new()),
         };
+        if compiler_sources_supported && kotlin_producers.is_empty() {
+            let java: Vec<_> = source.compiler_tasks.iter().filter(|t|
+                t.language == CompilerLanguage::Java && t.complete && t.problem.is_none()).collect();
+            if let [java] = java.as_slice() {
+                // Kotlin-only producer execution needs complete stock source ownership,
+                // not a Javac body recipe for the consumer's independent Java task.
+                kotlin_producers = crate::compile::kotlin_producers::capture(&model, source, task, java)
+                    .unwrap_or_default();
+            }
+        }
         let dependency_compilation = (compiler_sources_supported && kotlin_producers.is_empty())
             .then(|| Self::kotlin_dependency_compilation(&model, task, &dependency_overlays))
             .flatten();
+        if kotlin_producers.is_empty() && dependency_compilation.is_none() && task.classpath.iter().any(|read|
+            !read.exists() && model.modules.iter().flat_map(|m| &m.source_sets).any(|producer|
+                producer.provided_artifacts.iter().any(|artifact|
+                    crate::paths::file_key(artifact) == crate::paths::file_key(read)))) {
+            return Err("project-kotlin-producer-closure-unhandled");
+        }
         let java_dependency_sources = if compiler_sources_supported
             && kotlin_producers.is_empty() && dependency_compilation.is_none() {
             self.kotlin_java_dependency_sources(&model, task, &dependency_overlays, &visible_origins)

@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-10-28 (Asia/Tokyo). **Goal ACTIVE; completion declaration RETRACTED.**
+Updated 2026-10-31 (Asia/Tokyo). **Goal ACTIVE after human resumption; completion declaration RETRACTED.**
 The earlier completion declaration overstated what the selected cases establish.
 Qualified CEM38, five-project50, the 1896-test suite and actual67's three editor RPCs
 remain finite evidence, not completion of the original Java/Kotlin editing goal.
@@ -43,23 +43,69 @@ fixed and qualified below; this does not certify the whole SDK. Tests and
 benchmarks are assigned to GPT-6.1 Terra/high; implementation fixes are assigned
 to GPT-6.1 Sol/high. No further optimization is scheduled.
 
-Two Terra verification roles have checked previously untested medium-sized
-`mockk/mockk` at `c2fb66f841973e725b367650e69c4bac9babba20` (332 Kotlin and 22 Java
-files). Its real model contains10 JVM projects. Seven selected completion/navigation
-checks and two inspected applied calls pass on catalog batch2. Invalid-code
-canonical diagnostics now match the independent Kotlin2.2.21 result atv3,
-generation1 and the exact range, after two compiler-flag corrections and a full
-seven-plugin compiler oracle. However, the first pull after restoring validv4
-returns two false unresolved `MockKAgentLogger` diagnostics. Its known project
-source is in `commonMain`; the selected dependency JAR has not been built and the
-current-source producer closure did not supply that ABI. That concrete gap is being fixed next. MockK acceptance
-is **not achieved**. `line/armeria` was cloned only, not tested; there is no speed gate.
+The previously unseen mixed-language `mockk/mockk` at
+`c2fb66f841973e725b367650e69c4bac9babba20` (332 Kotlin and22 Java files,10 JVM
+projects) now passes both canonical diagnostic edits on sealed host77. Invalidv3
+returns exactly the independently expected `noSuchMockkProbe` error at line135,
+with matching source hash and generation1:2:1. Restoredv4 returns zero diagnostics
+at generation1:3:2 with certified absence. Evidence:
+`RUN/mockk-diagnostic2-batch77/artifacts/mockk-diagnostic2.json` and its controller
+receipt. Source restoration, both absent selected project JARs, binary hashes,
+EOF and zero live processes are verified. Retain the earlier seven completion/
+navigation checks and two inspected applied calls from batch2; they were not replayed.
+This qualifies these MockK cases, not all grammar or IDEA parity.
+
+The fixes supply separately compiled, sealed current pure-Kotlin dependency ABI
+for the exact selected missing-JAR slots, preserving common-source roles and
+closed zero-Java guards. The first actual run exposed a second bug: a Kotlin-only
+return dropped its consumer watch and canceled the shared parent epoch. Retaining
+and reusing that environment, then closing all dependent watches before deleting
+producer outputs, removes the loop. Host77 compiled each producer once, recorded
+no native-watch invalidation, rejected one initial stale result, and stored both
+current results. Real library edits still invalidate in the focused native regression.
+`line/armeria` was cloned only, not tested; there is no speed gate. Another unseen
+medium-sized mixed project is the next acceptance-loop step.
 
 The earlier claim that two compiler plugins were missing is retracted: a Python
 MAX_PATH observation produced false negatives. Real Gradle/file observations and
 the full compiler oracle establish that all seven plugin inputs are present.
 Preserve those earlier failed observations as setup evidence, not missing-plugin
 production failures.
+
+The verified native batch also contains exact source locations for selected
+type/member identities and multi-release JAR selection for the raw selected-SDK-home
+view. Source locations return authored URI/range/revision/hash; binary stubs stay
+Unknown. `declaredMembers.coverage=Found` covers the selected representation's
+direct declarations, not a complete callable/generated JVM API or source authority.
+Focused native evidence: four source-location/initialize cases in batch74;13 MR/
+catalog/runtime/SDK/argument cases in75 with3 existing ignored cases; the corrected
+producer case in76; four demand-capture/lifetime cases in77. Unaffected cases were
+carried rather than replayed. The MR duplicate fix reuses ZIP9.1.1's existing
+`has_duplicate_names()` guard. Batches72/73's compile/fixture failures and all later
+failed observations remain in their raw artifacts; they are not counted as passes.
+
+The real editor first exposed missing unopened-project-source hydration. Host77 now
+loads only exact requested keys through accepted source membership and existing
+off-lock capture guards, retires the old evaluation, and requeues it. The trace
+attributes this to the requested closed `Target.java`, not namespace-only absence.
+`RUN/source-location-uri77/receipt.json` and its proof qualify **55/55** checks:
+unopened target, identities, UTF16 ranges, source hashes/revisions, unsaved Unicode,
+cancellation, stale rejection and fresh binding. Both Windows URI spellings were
+independently consumed by Neovim's `show_document`; the four URI comparisons now
+check decoded existing file identity. Production URI serialization is unchanged.
+A subsequent test-only nil guard preserves the successful branch; it was reviewed
+without another editor run, recorded in `source-location-uri77-nil-guard-adjudication.json`.
+Host77 and reused child76 are sealed; init SHA is1a42853328e4363cc6f32e71a738340a361c83c6c7f13b5b3ecbb0fe0935ae19.
+All reported native/editor stages reached EOF and owned live-process count0.
+
+The independent mc-dev integration exposed further concrete input gaps: all source
+sets' source/resource inventories within the owning project, nested/typed annotation
+values, declaration ranges/modifiers, decoded string/source maps, and typed annotation
+payloads from compile-only binary headers. These are pending host work, not completed
+extension capabilities. Source facts and their scoped foreign-source bridge,
+project inputs, and binary annotation decoding now have prepared implementation
+patches under RUN, but are not applied or Rust/editor validated. Javac oracles and
+syntax/patch checks are preparation evidence only. No new Code access is proposed.
 
 The generic physical JVM catalog now passes actual independent-child verification:
 **46/46 semantic and10/10 operational**, zero mismatched/unmeasured checks
@@ -718,11 +764,12 @@ semantics are not certified by the test extension.
    MC policy stays in mc-dev; later capabilities are scoped additions with no
    communication waits under Workspace locks. Keep large-source handler/budget
    proof distinct from complete large-project editor proof.
-6. The user requires a conditional stop when Codex remaining usage reaches 50% or
-   less in the first available window. ROOT monitors each major checkpoint;
-   record the checkpoint and pause the goal at that threshold, never declare it
-   complete. Unavailable windows remain unknown. At the latest checkpoint,
-   weekly usage was 18% (82% remaining); the secondary window was unavailable.
+6. The previous requested pause at50% remaining was fulfilled with all five agents
+   finished and no owned native processes left live. The human subsequently set
+   the goal active and explicitly resumed work on2026-10-31, revoking that pause.
+   At resumption weekly usage was54% (46% remaining), secondary unavailable.
+   Preserve the historical checkpoint `RUN/checkpoint-usage50-20261029.md` rather
+   than applying the fulfilled threshold again or declaring completion.
 
 The human permits ongoing API-contract, implementation-commit and verification-result
 sharing with the same mc-dev task within this goal. That scoped technical coordination

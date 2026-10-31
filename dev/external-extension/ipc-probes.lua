@@ -5,11 +5,12 @@ return function(env)
   local linked = vim.env.KTLSP_IPC_MODE == 'linked'
   local host_inputs = vim.env.KTLSP_IPC_MODE == 'host-inputs'
   local catalog = vim.env.KTLSP_IPC_MODE == 'jvm-catalog'
+  local locations = vim.env.KTLSP_IPC_MODE == 'source-locations'
   local source_facts = vim.env.KTLSP_IPC_MODE == 'source-snapshots' or host_inputs
-  local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts or catalog
+  local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts or catalog or locations
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
   local paths, buffers, originals = {}, {}, {}
-  local proof = { mode = source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
+  local proof = { mode = locations and 'source-locations' or source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
   local provider = linked and 'fixture.external-shadow' or 'fixture.ipc-shadow'
   local fresh_diagnostic = false
   local previous_diagnostics = client.handlers['textDocument/publishDiagnostics'] or vim.lsp.handlers['textDocument/publishDiagnostics']
@@ -27,6 +28,32 @@ return function(env)
   local inputs = host_inputs and dofile(env.repo .. '/dev/external-extension/host-input-probes.lua')(env, proof, save) or nil
   local catalog_probe = catalog and dofile(env.repo .. '/dev/external-extension/jvm-catalog-probes.lua')(env, proof, save) or nil
   local function record(event) proof.ordering[#proof.ordering + 1] = event; save() end
+  local function source_locations(label,evaluation)
+    local observed=vim.json.decode(table.concat(vim.fn.readfile(barrier..'/locations-'..evaluation..'.json'),'\n'))
+    assert(#observed.facts==2,'exact type/member location pair required')
+    local text
+    if buffers.target then text=probe.buffer_full_text(buffers.target) else
+      local target_buffer=vim.fn.bufnr(paths.target)
+      local attached=target_buffer~=-1 and vim.lsp.buf_is_attached(target_buffer,client.id)
+      check('initial source-location target is never opened or attached',target_buffer==-1 and not attached)
+      assert(target_buffer==-1 and not attached,'source-location target must remain unopened until the initial capture')
+      local file=assert(io.open(paths.target,'rb'));text=file:read('*a');file:close()
+      observed.unopened_target={path=paths.target,buffer=target_buffer,attached=attached,sha256=vim.fn.sha256(text)}
+    end
+    local target_lines=vim.split(text,'\n',{plain=true})
+    -- Equivalent file URIs may encode the Windows drive colon differently.
+    local expected_path = vim.uv.fs_realpath(vim.uri_to_fname(vim.uri_from_fname(paths.target)))
+    for i,entry in ipairs({{'public class Target','Target',observed.type.value.id},{'public int twice','twice',observed.member.id}}) do
+      local _,range=probe.find(target_lines,entry[1],entry[2])
+      local fact=observed.facts[i];local value=fact.value
+      local actual_path = type(value)=='table' and type(value.documentUri)=='string' and vim.uv.fs_realpath(vim.uri_to_fname(value.documentUri))
+      check(label..' exact cross-owner source location '..entry[2],fact.state=='found' and value.target==entry[3]
+        and actual_path and expected_path and probe.path_key(actual_path)==probe.path_key(expected_path) and vim.deep_equal(value.range,range))
+      check(label..' current source identity for '..entry[2],fact.state=='found' and value.source.sha256==vim.fn.sha256(text)
+        and type(value.source.identity.revision)=='string')
+    end
+    proof.source_locations=proof.source_locations or {};proof.source_locations[label]=observed;save()
+  end
   local function model_state()
     local requested, accepted
     local file = io.open(vim.env.KTLSP_TRACE, 'r')
@@ -149,12 +176,17 @@ return function(env)
     save()
     return source.entries
   end
-  for key, file in pairs({ target = 'fixture/Target.java', mixin = 'fixture/CaseMixin.java', use = 'fixture/IpcUse.java' }) do
-    local path = vim.fs.abspath(env.project .. (facts and '/modules/editing/src/main/java/' or '/') .. file)
+  local function attach(key)
+    local path=paths[key]
     local buf = vim.fn.bufadd(path); vim.fn.bufload(buf); vim.bo[buf].filetype = 'java'
-    paths[key], buffers[key], originals[key] = path, buf, vim.fn.readfile(path)
+    buffers[key] = buf
     env.sources[path] = env.sources[path] or { buf = buf, disk = originals[key], sha256 = vim.fn.sha256(table.concat(originals[key], '\n')) }
     vim.lsp.buf_attach_client(buf, client.id)
+  end
+  for key, file in pairs({ target = 'fixture/Target.java', mixin = 'fixture/CaseMixin.java', use = 'fixture/IpcUse.java' }) do
+    local path = vim.fs.abspath(env.project .. (facts and '/modules/editing/src/main/java/' or '/') .. file)
+    paths[key],originals[key] = path,vim.fn.readfile(path)
+    if not (locations and key=='target') then attach(key) end
   end
   local empty_path, empty_buffer
   if source_facts then
@@ -189,6 +221,7 @@ return function(env)
       value.command = { assert(vim.env.KTLSP_IPC_CHILD), '--barrier', barrier }
       if facts then value.command[#value.command + 1] = '--project-facts' end
       if source_facts then value.command[#value.command + 1] = '--source-snapshots' end
+      if locations then value.command[#value.command + 1] = '--source-locations' end
       if host_inputs then value.command[#value.command + 1] = '--host-inputs'; value.configuration.runtimeClasses={'java/util/List','vendor/Versioned','vendor/Added','app/Main'} end
       if catalog then value.command[#value.command + 1] = '--jvm-catalog' end
     end
@@ -254,9 +287,16 @@ return function(env)
       project_facts('initial', proof.paused_evaluation)
       if catalog_probe then catalog_probe.capture('initial', proof.paused_evaluation) end
       if source_facts then source_snapshots('initial', proof.paused_evaluation) end
+      if locations then source_locations('initial',proof.paused_evaluation) end
       if inputs then inputs.capture('initial', proof.paused_evaluation); inputs.change_wire() end
       proof.initial_model_generation = model_state()
       assert(proof.initial_model_generation, 'initial accepted model generation is missing')
+      if locations then
+        attach('target')
+        local changed=vim.api.nvim_buf_get_lines(buffers.target,0,-1,false)
+        changed[2]='/* 😀 */ '..changed[2];changed[3]='/* 😀 */ '..changed[3]
+        vim.api.nvim_buf_set_lines(buffers.target,0,-1,false,changed);deliver()
+      end
       if source_facts then
         local changed = vim.api.nvim_buf_get_lines(buffers.target, 0, -1, false)
         changed[#changed + 1] = '// 未保存 source snapshot 😀'
@@ -331,6 +371,7 @@ return function(env)
     local entries = project_facts('fresh', tostring(accepted.args.evaluation))
     if catalog_probe then catalog_probe.capture('fresh', tostring(accepted.args.evaluation)) end
     if source_facts then source_snapshots('fresh', tostring(accepted.args.evaluation)) end
+    if locations then source_locations('fresh',tostring(accepted.args.evaluation)) end
     if inputs then inputs.capture('fresh',tostring(accepted.args.evaluation)); inputs.native_lifecycle() end
     local initial = proof.project_facts.initial.selected.entries
     local added = env.project .. '/home/.m2/repository/fixture/reload/added/1.0/added-1.0.jar'

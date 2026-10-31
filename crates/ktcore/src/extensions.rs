@@ -58,6 +58,14 @@ impl SourceHandle {
     pub fn scope(&self) -> &ProjectScope { &self.scope }
 }
 
+/// An exact indexed source definition and the accepted text used for its coordinates.
+#[derive(Clone, Debug)]
+pub struct SourceLocation {
+    pub definition: Def,
+    pub text: Arc<str>,
+    pub revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemberKind {
     Method,
@@ -1499,6 +1507,43 @@ impl ReadSession<'_> {
         if scope != &source.scope { return Err(ContractError::ForeignFile); }
         self.reads.files.insert(source.file.clone(), source.generation);
         Ok(current.text.clone())
+    }
+
+    pub fn type_source_location(&mut self, target: &TypeId) -> Result<Fact<SourceLocation>, ContractError> {
+        self.check_type(target)?;
+        self.source_location(target.definition())
+    }
+
+    pub fn member_source_location(&mut self, target: &MemberId) -> Result<Fact<SourceLocation>, ContractError> {
+        self.check_declaration(&target.declaration)?;
+        let (members, _) = self.declared_members(&target.owner)?;
+        if members.iter().filter(|member|member.id == *target).count() != 1 {
+            return Ok(unknown(IncompleteReason::AmbiguousMember));
+        }
+        self.source_location(target.definition())
+    }
+
+    fn source_location(&mut self, target: &Def) -> Result<Fact<SourceLocation>, ContractError> {
+        self.reads.namespace = Some(self.store.namespace_generation);
+        if self.index.origin_facts().and_then(|facts|facts.file_origin(&target.file))
+            .is_none_or(|origin|origin.representation != SourceRepresentation::Source) {
+            return Ok(unknown(IncompleteReason::UnsupportedSource));
+        }
+        let Some(source) = self.store.sources.get(&target.file) else {
+            return Ok(unknown(IncompleteReason::MissingSource));
+        };
+        self.reads.files.insert(target.file.clone(), source.generation);
+        let entries: Vec<_> = self.index.entries_for_file(&target.file).into_iter()
+            .filter(|entry|definition(entry) == *target).collect();
+        if entries.len() != 1 {
+            return Ok(unknown(IncompleteReason::AmbiguousMember));
+        }
+        if validate_entry(&source.text, &entries[0]).is_err() {
+            return Ok(unknown(IncompleteReason::MissingSource));
+        }
+        Ok(Knowledge::Found(SourceLocation {
+            definition:target.clone(), text:source.text.clone(), revision:source.generation,
+        }))
     }
 
     pub fn compiler_classes(

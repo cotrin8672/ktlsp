@@ -279,6 +279,7 @@ object KtlspCompilerConfiguration {
         "7.4.2" -> JavaGradleProfile("7.4.2", "isConfigurationCache", "IncrementalInputsTaskAction")
         "7.5" -> JavaGradleProfile("7.5", "isConfigurationCache", "IncrementalInputsTaskAction")
         "8.10.2" -> JavaGradleProfile("8.10.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
+        "9.3.0" -> JavaGradleProfile("9.3.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         else -> error("Unsupported Java recipe Gradle adapter")
     }
@@ -323,6 +324,7 @@ object KtlspCompilerConfiguration {
     private fun javaCompilerRecipe(task: JavaCompile, selectedHome: java.io.File?): Map<String, Any?> {
         // shortcut: pinned Gradle/current-SDK profiles; other policies remain unavailable.
         val profile = javaGradleProfile(task)
+        check(profile.version != "9.3.0") { "Gradle 9.3.0 Java execution recipe remains unsupported" }
         check(read(task.project.gradle.startParameter, profile.configurationCacheGetter) == false) {
             "Java recipe capture requires configuration cache disabled"
         }
@@ -807,12 +809,36 @@ object KtlspCompilerConfiguration {
     private fun sdkSourceFacts(task: Task, language: String): Pair<Map<String, Any?>?, Map<String, Any?>?> {
         var claims: Map<String, Any?>? = null
         val policy = runCatching {
-        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.6.1"))
-        val sets = task.project.extensions.findByType(SourceSetContainer::class.java) ?: return@runCatching null
-        val sourceSet = sets.filter {
+        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1"))
+        val extension = task.project.extensions.findByName("kotlin")
+        val targets = extension?.javaClass?.methods?.firstOrNull { it.name == "getTargets" && it.parameterCount == 0 }
+            ?.invoke(extension) as? Iterable<*>
+        val compilations: List<Any> = (targets ?: emptyList<Any>()).filterNotNull().filter {
+            read(it, "getPlatformType").toString() == "jvm"
+        }.flatMap { (read(it, "getCompilations") as Iterable<*>).filterNotNull() }.filter { compilation ->
+            val compiler = if (language == "java") runCatching { read(compilation, "getCompileJavaTaskProvider") }.getOrNull()
+                else read(compilation, "getCompileTaskProvider")
+            compiler is Task && compiler.path == task.path
+        }
+        check(compilations.size <= 1) { "Ambiguous JVM compilation source owner" }
+        val compilation = compilations.singleOrNull()
+        if (compilation != null) {
+            // JavaCompile belongs to Gradle's loader, which cannot see the project's KGP.
+            val helper = Class.forName("org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapperKt", false, checkNotNull(extension).javaClass.classLoader)
+            check(task.project.gradle.gradleVersion == "9.3.0" &&
+                helper.getMethod("getKotlinPluginVersion", Project::class.java).invoke(null, task.project) == "2.2.21")
+        }
+        val sets = task.project.extensions.findByType(SourceSetContainer::class.java)
+        val sourceSet: SourceSet = compilation?.let {
+            // KGP 2.2.21's typed backing SourceSet, tied to the public compilation task above.
+            val owner = read(it, "getDefaultJavaSourceSet\$kotlin_gradle_plugin_common") as SourceSet
+            val java = read(it, "getCompileJavaTaskProvider") as JavaCompile
+            check(owner.compileJavaTaskName == java.name && java.project.path == task.project.path)
+            owner
+        } ?: sets?.filter {
             if (language == "java") it.compileJavaTaskName == task.name
             else primaryKotlinCompileTask(task.project, it)?.path == task.path
-        }.singleOrNull() ?: return@runCatching null
+        }?.singleOrNull() ?: return@runCatching null
         val kotlinExtension = sourceSet.extensions.findByName("kotlin")
         val kotlin = when (kotlinExtension) {
             is SourceDirectorySet -> kotlinExtension
@@ -821,7 +847,12 @@ object KtlspCompilerConfiguration {
                 it.name == "getKotlin" && it.parameterCount == 0 && SourceDirectorySet::class.java.isAssignableFrom(it.returnType)
             }?.invoke(kotlinExtension) as? SourceDirectorySet
         }
-        val authored = (sourceSet.java.srcDirs + (kotlin?.srcDirs ?: emptySet())).map { it.absoluteFile.normalize() }.toSet()
+        val commonRoots: List<java.io.File> = compilation?.let {
+            (read(it, "getAllKotlinSourceSets") as Iterable<*>).filterNotNull().flatMap { set ->
+                (read(set, "getKotlin") as SourceDirectorySet).srcDirs
+            }
+        }.orEmpty()
+        val authored = (sourceSet.java.srcDirs + (kotlin?.srcDirs ?: emptySet()) + commonRoots).map { it.absoluteFile.normalize() }.toSet()
         val generated = linkedSetOf<java.io.File>()
         generated.addAll(sourceSet.output.generatedSourcesDirs.files)
         val compileJava = task.project.tasks.findByName(sourceSet.compileJavaTaskName) as? JavaCompile
@@ -838,7 +869,7 @@ object KtlspCompilerConfiguration {
         val treeType = Class.forName("org.gradle.api.internal.file.FileCollectionInternal", false, loader)
         val visitType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType", false, loader)
         // Verified Gradle 8/9 visitors removed Spec and default to Visit.
-        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.6.1")) "Visit" else "Spec"
+        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.6.1")) "Visit" else "Spec"
         val spec = visitType.enumConstants.single { (it as Enum<*>).name == visitName }
         val future = linkedSetOf<java.io.File>()
         val producerRoots = linkedSetOf<java.io.File>()
@@ -1046,6 +1077,21 @@ object KtlspCompilerConfiguration {
                 // Assign only a complete recipe; capture failures retain source ownership and an explicit problem.
                 val recipe = kotlinCompilerRecipe(task, toolchain, javaHome, runtimes.get())
                 record["kotlin_compiler"] = recipe
+                if ("-Xmulti-platform" in strings) {
+                    check(recipe["compiler_version"] == "2.2.21" && recipe["gradle_plugin_version"] == "2.2.21" &&
+                        strings.windowed(2).any { it == listOf("-language-version", "1.8") }) {
+                        "Unsupported Kotlin common-source argument profile"
+                    }
+                    check(strings.none { it.startsWith("-Xcommon-sources") }) { "Unexpected serialized common-source arguments" }
+                    // KGP's source-valued contribution is omitted by the serialized options getter.
+                    val common = (read(task, "getCommonSourceSet\$kotlin_gradle_plugin_common") as FileCollection)
+                        .asFileTree.files.map { it.absolutePath }
+                    val selected = record["source_files"] as List<*>
+                    check(common.all { it in selected && it.endsWith(".kt") && ',' !in it && !it.any { ch -> java.lang.Character.isISOControl(ch) } }) {
+                        "Kotlin common sources differ from selected compiler sources"
+                    }
+                    if (common.isNotEmpty()) record["arguments"] = strings + "-Xcommon-sources=${common.joinToString(",")}"
+                }
                 val options = linkedMapOf<String, Any?>(
                     "sdkProducerClaims" to sdkSources.first,
                     "sdkSourcePolicy" to sdkSources.second,

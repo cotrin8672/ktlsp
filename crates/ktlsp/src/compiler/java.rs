@@ -110,7 +110,7 @@ fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &s
         Some("gradle-7.4.2-stock-actions-v1" | "gradle-7.5-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
         }
-        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1") => {
+        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalTaskAction"
         }
         _ => return false,
@@ -133,7 +133,7 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
     };
     match fact.get("adapter").and_then(Value::as_str) {
         Some("gradle-7.4.2-stock-onlyif-v1" | "gradle-7.5-stock-onlyif-v1") => {}
-        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
+        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1") if !kapt => {}
         _ => return false,
     }
     let Some(predicates) = fact.get("predicates").and_then(Value::as_array) else {
@@ -585,6 +585,13 @@ pub(super) fn selected_tasks_supported_reason(
     let legacy = runtime.compiler_version == "1.8.21" && runtime.gradle_plugin_version == "1.8.21";
     let complete_k2 =
         runtime.compiler_version == "2.4.0" && runtime.gradle_plugin_version == "2.4.0";
+    // Stock source membership only; this does not admit a Gradle 9.3 Javac recipe.
+    let kmp_k2 = runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21"
+        && !runtime.run_via_build_tools_api
+        && runtime.execution_strategy == crate::classpath::KotlinCompilerExecutionStrategy::Daemon
+        && primary.arguments.iter().any(|arg| arg == "-Xmulti-platform")
+        && ["-language-version", "-api-version"].iter().all(|flag|
+            primary.arguments.windows(2).any(|pair| pair[0] == *flag && pair[1] == "1.8"));
     let gradle75 = legacy
         && java
             .options
@@ -599,13 +606,15 @@ pub(super) fn selected_tasks_supported_reason(
             "gradle-7.4.2-stock-actions-v1",
             "gradle-7.4.2-stock-onlyif-v1",
         )
+    } else if kmp_k2 {
+        ("gradle-9.3.0-stock-actions-v1", "gradle-9.3.0-stock-onlyif-v1")
     } else {
         (
             "gradle-9.6.1-stock-actions-v1",
             "gradle-9.6.1-stock-onlyif-v1",
         )
     };
-    if (!legacy && !complete_k2)
+    if (!legacy && !complete_k2 && !kmp_k2)
         || [primary, java].iter().any(|task| {
             task.options
                 .get("taskActionInventory")

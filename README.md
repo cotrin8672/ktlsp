@@ -598,6 +598,13 @@ The existing `corpus`/IPC probe route uses the fixture child's `--project-facts`
 with a disposable Gradle project to check model selection, stale evaluation rejection,
 and fresh contributions after a real dependency change.
 
+The same fixture recipe below also supports `KTLSP_IPC_MODE=source-locations`.
+The child negotiates `source-locations-v1` and first reads a target never opened
+in Neovim, then checks exact cross-file type/member URIs, UTF-16 ranges and source
+hashes after a Unicode unsaved target edit/model change. It uses the same
+`ipc-probes.lua` and manifest; no second client
+or editor framework is needed.
+
 `KTLSP_IPC_MODE=host-inputs` adds current resource bytes and document versions, a complete
 14 MiB resource stream, independently decoded runtime class bytes, selected SDK runtime bytes,
 raw JSON/AW/AT commands, and native resource add/replace/delete invalidation. It retains

@@ -189,6 +189,60 @@ JVM descriptors are host-validated facts, not a license to erase unresolved or g
 types to Object. Facts use distinct Found, Unknown-with-reasons and DefinitelyAbsent
 variants. Coverage/inventory reads are explicit; an incomplete list cannot prove absence.
 
+### Exact source locations (`source-locations-v1`)
+
+Negotiate `source-locations-v1` and
+`supportedOps:{"source-locations-v1":["sourceLocation"]}` independently of source
+inventory or JVM catalog access. With the current evaluation, send
+`{"op":"sourceLocation","target":"<host type or member token>"}` through
+`analysis/readFacts`. The target must be a type/member identity already issued by
+`resolveType`, `declarationType`, `declaredMembers`, `declarationMember` or a checked
+requirement binding. Declaration/signature/catalog/runtime tokens and foreign
+evaluation tokens are invalid; the child supplies no name, path or guessed JVM
+descriptor to select a definition.
+
+When a semantic read records an exact indexed source key whose body is missing,
+the host can hydrate that closed project input outside the Workspace lock. It
+requires current compiler-task membership, selected scope/origin, accepted model,
+source stamp and content hash; current open buffers win. Only requested eligible
+files are read. Installing the body invalidates and requeues the old evaluation,
+so an initial Unknown cannot publish an obsolete empty result. Namespace coverage
+Unknown alone never grants a guessed file read. No source-inventory capability is
+needed for this shared semantic hydration.
+
+Found is a single exact normalized source definition:
+
+```json
+{"state":"found","value":{"target":"<same token>","documentUri":"file:///project/Target.kt","range":{"start":{"line":2,"character":17},"end":{"line":2,"character":22}},"source":{"identity":{"kind":"source","revision":"<opaque revision>"},"sha256":"<full current source SHA-256>"}}}
+```
+
+The range uses zero-based UTF-16 LSP coordinates, converted with the same shared
+text index as ordinary navigation from the exact retained source body. Revision
+is a host source revision, not an LSP document version. The URI is an authentic
+absolute source file URI, not a filesystem write grant. Private members and
+overloads retain their exact issued declaration/signature correspondence; no
+same-name search, source reparsing, bytecode-line guessing or child LSP proxy is
+performed. Normalized JVM projections retain their actual source definition.
+
+Binary-only/non-source inputs, unavailable source bodies, ambiguous correspondence
+and unrepresentable source URIs remain typed Unknown; no successful empty
+location list is returned. Stale identities remain stale request errors, not
+current Unknown. Existing file/model/namespace reads and provider/evaluation
+lifetime checks apply through final validation. The source can include current
+unsaved text. Reads use accepted in-memory source snapshots and hold no borrow
+across child I/O. This operation adds no general all-document version query or
+generation/cache-validation contract.
+
+Opening a target in the editor is not required. Issuing its type/member identity
+already requires an accepted source snapshot. A not-yet-retained target is
+requested through the existing `resolveType` missing-source read set and host
+source hydration; its initial result stays Unknown until those inputs arrive.
+
+The focused source/wire regressions and actual child/editor proof for this new
+capability must be qualified separately; older source/catalog checks do not prove
+the new operation. Existing frame, aggregate fact-response and query/handle limits
+apply.
+
 `analysis/require` expresses the current MemberRequirement fields: target knowledge,
 optional authored declaration, exact/prefix names, kind, signature and dispatch knowledge,
 and name link. The host uses `ReadSession::require` and `resolution`; the child cannot
@@ -736,11 +790,24 @@ Missing model/SDK selections, unresolved classpaths, unreadable/unsupported entr
 and the200000-class bound prevent complete coverage. With no usable catalog, the
 response has an empty list, null continuation and Unknown coverage with reason
 `JVM_CATALOG_UNAVAILABLE`; that is not successful absence. `problems` contains
-bounded diagnostic strings, not a stable enum. Ordinary versioned classes under
-`META-INF/versions/` are not resolved as a multi-release selection and make coverage
-Unknown. Recognized module-only artifacts/module descriptors may be excluded from
-the ordinary class inventory; that exception does not support arbitrary multi-release
-class selection.
+bounded diagnostic strings, not a stable enum. Recognized module-only artifacts
+and module descriptors may be excluded from the ordinary class inventory.
+
+For classpath JARs, `jvmCatalog` / `jvmClass` use the selected SDK **home's Java
+feature version**, matching `runtimeClass` / `classBytes`. A main-manifest
+`Multi-Release: true` selects the highest canonical `META-INF/versions/N/` class
+with `9 <= N <= home feature`, including version-only classes; inactive versions
+and non-versionable `META-INF` resources do not become class candidates. Duplicate
+variants, invalid active class paths, or an unavailable home profile cannot
+establish complete coverage. The `compileClasspath` association identifies an
+input's provenance: this is raw `selectedPhysicalJvmInputs` authority for exact
+JVM/private/bridge ABI, not a compiler front-end or source-callable view. For
+example, home21 selects raw MR21 even when a Kotlin compiler reads the base class
+or javac `--release 17` reads MR17. Shared source bindings still use existing
+normalized type/member facts, and `sourceCurrent` remains unknown. Selected-release
+`ct.sym` entries retain their separate `sdk-api-header` authority and never grant
+Code. Selection follows the [JDK JAR specification](https://docs.oracle.com/en/java/javase/21/docs/specs/jar/jar.html#multi-release-jar-files)
+and [version-configured JarFile](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/jar/JarFile.html).
 
 `{"op":"jvmClass","entry":"<entry>"}` reads precisely the issued entry and
 returns a typed fact. Found is

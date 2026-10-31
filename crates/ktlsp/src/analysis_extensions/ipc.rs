@@ -299,6 +299,7 @@ mod tests {
         let result=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Unopened"}]})).unwrap();
         assert_eq!(result["facts"][0]["state"], "unknown");
         assert!(host.wanted_ipc_sources().contains(file));
+        assert_eq!(host.ipc_requested_sources(work.evaluation).unwrap(),&BTreeSet::from([file.into()]));
         assert!(host
             .store
             .requested_source_files_for("/ipc/Owner.kt")
@@ -307,6 +308,7 @@ mod tests {
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         host.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
         assert!(!host.ipc_current(work.evaluation));
+        assert!(host.ipc_requested_sources(work.evaluation).is_none());
         assert!(host
             .ipc_batch(
                 &index,
@@ -320,6 +322,18 @@ mod tests {
         assert!(host.ipc_providers["test.ipc"]
             .queued
             .contains("/ipc/Owner.kt"));
+    }
+
+    #[test]
+    fn missing_source_namespace_coverage_does_not_request_a_guessed_project_file() {
+        let (index,mut host)=host();
+        host.store.set_namespace_coverage(Knowledge::Unknown(vec![IncompleteReason::MissingSource]));
+        let work=host.take_ipc_work(&index,None).remove(0);
+        let result=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({
+            "evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Absent"}]
+        })).unwrap();
+        assert_eq!(result["facts"][0],json!({"state":"unknown","reasons":[{"code":"MissingSource"}]}));
+        assert!(host.ipc_requested_sources(work.evaluation).unwrap().is_empty());
     }
 
     #[test]
@@ -863,6 +877,12 @@ impl AnalysisExtensions {
                 slot.queued.clear();
             }
         }
+    }
+
+    pub(crate) fn ipc_requested_sources(&self, id: u64) -> Option<&BTreeSet<String>> {
+        let pending=self.ipc_evaluations.get(&id)?.pending.as_ref()?;
+        self.store.validate_pending(pending).ok()?;
+        Some(pending.requested_source_files())
     }
 
     pub(super) fn wanted_ipc_sources(&self) -> BTreeSet<String> {
