@@ -27,9 +27,20 @@ pub struct SourceDeclaration {
     pub modifiers: SourceModifiers,
     pub owner: Option<Def>,
     pub annotations: Vec<SourceAnnotation>,
+    /// Authored value-parameter order, never a claim about lowered JVM parameter indices.
+    pub parameters: Fact<Vec<SourceParameter>>,
     pub member: Option<DeclaredMemberFacts>,
     /// Current authored property lowering; not a complete method inventory.
     pub jvm_property: Option<Fact<JvmPropertyAccess>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceParameter {
+    pub name: String,
+    pub range: Range<usize>,
+    pub name_range: Range<usize>,
+    pub ty: TypeRef,
+    pub annotations: Vec<SourceAnnotation>,
 }
 
 /// JVM value namespace facts are distinct from generated accessor/callable inventory.
@@ -160,6 +171,7 @@ fn extract_declarations(
             .map(|entry| definition(file, &entry.sym));
         let ctx = FileCtx::new(symbol.package.clone(), Vec::new()).with_file(file);
         let annotations = annotations(index, &ctx, node, text, scope, java);
+        let parameters = callable_parameters(index, file, &ctx, symbol, node, text, scope, java);
         let jvm_property = (include_members && !java && symbol.kind == SymbolKind::Property)
             .then(|| kotlin_property_access(index, symbol, node, text, &annotations));
         let member = (include_members
@@ -187,11 +199,87 @@ fn extract_declarations(
             range, header_range, name_range, body_range, modifiers,
             owner,
             annotations,
+            parameters,
             member,
             jvm_property,
         });
     }
     result
+}
+
+pub(super) struct ParameterLayout<'a> {
+    pub parameter: SourceParameter,
+    pub annotation_nodes: Vec<Node<'a>>,
+}
+
+/// One shared AST layout for extraction and admission; types come from the indexer's parameter list.
+pub(super) fn parameter_layout<'a>(index:&dyn InferenceIndex,file:&str,symbol:&IndexedSymbol,node:Node<'a>,text:&str,java:bool)
+    ->Option<Vec<ParameterLayout<'a>>> {
+    if symbol.kind!=SymbolKind::Function || (java && node.kind()!="method_declaration")
+        || (!java && (node.kind()!="function_declaration" || symbol.ext_receiver.is_some()
+            || child_of_kind(node,"context_parameters").is_some() || unsupported_kotlin_owner(node,text))) {
+        return None;
+    }
+    if !java && child_of_kind(node,"modifiers").is_some_and(|modifiers|modifiers.children(&mut modifiers.walk())
+        .any(|modifier|matches!(node_text(modifier,text),"suspend"|"inline"|"expect"|"external"))) {return None;}
+    let list=if java {node.child_by_field_name("parameters").or_else(||child_of_kind(node,"formal_parameters"))}
+        else {child_of_kind(node,"function_value_parameters")}?;
+    let header=declaration_ranges(node,symbol).1;
+    if list.has_error() || list.is_missing() || symbol.params.len()>255
+        || (!java && list.children(&mut list.walk()).any(|child|child.kind()=="="))
+        || node.named_children(&mut node.walk()).any(|child|child.start_byte()<header.end
+            && child.kind()!="function_body" && child.kind()!="block" && (child.has_error()||child.is_missing())) {return None;}
+    let type_parameters=member_type_parameters(index,file,symbol);
+    let mut layouts=Vec::new();let mut pending=None;
+    for child in list.named_children(&mut list.walk()).filter(|child|!child.is_extra()) {
+        if !java && child.kind()=="parameter_modifiers" {
+            if pending.is_some() || child.named_children(&mut child.walk()).any(|modifier|modifier.kind()!="annotation") {return None;}
+            pending=Some(child);continue;
+        }
+        if child.kind()!=if java {"formal_parameter"} else {"parameter"} {return None;}
+        if java && child_of_kind(child,"dimensions").is_some() {return None;}
+        let name=if java {child.child_by_field_name("name")} else {child.named_child(0)}?;
+        if !matches!(name.kind(),"identifier"|"simple_identifier") || name.is_missing() {return None;}
+        let name_text=node_text(name,text).trim_matches('`');
+        if name_text.is_empty() || layouts.iter().any(|layout:&ParameterLayout<'_>|layout.parameter.name==name_text) {return None;}
+        let ty=symbol.params.get(layouts.len())?;
+        fn supported(ty:&TypeRef,type_parameters:&[String],depth:usize)->bool {
+            depth<64 && !ty.name.is_empty() && ty.projection==crate::types::Projection::Invariant
+                && !(ty.qualification.is_none() && type_parameters.contains(&ty.name))
+                && ty.args.iter().all(|ty|supported(ty,type_parameters,depth+1))
+                && ty.owner.as_deref().is_none_or(|ty|supported(ty,type_parameters,depth+1))
+        }
+        // An enclosing Kotlin type parameter can shadow a file import retained by the indexer.
+        if !java && !type_parameters.is_empty()
+            && !supported(&crate::indexer::value_type_of(child,text)?,&type_parameters,0) {return None;}
+        if !supported(ty,&type_parameters,0) {return None;}
+        let modifiers=if java {child_of_kind(child,"modifiers")} else {pending.take()};
+        let annotation_nodes:Vec<_>=modifiers.map(|modifiers|modifiers.named_children(&mut modifiers.walk())
+            .filter(|node|matches!(node.kind(),"annotation"|"marker_annotation"))
+            .take(MAX_SOURCE_ANNOTATION_NODES+1).collect()).unwrap_or_default();
+        if annotation_nodes.len()>MAX_SOURCE_ANNOTATION_NODES {return None;}
+        layouts.push(ParameterLayout {parameter:SourceParameter {name:name_text.into(),
+            range:modifiers.map_or(child.start_byte(),|modifiers|modifiers.start_byte())..child.end_byte(),
+            name_range:name.byte_range(),ty:ty.clone(),annotations:Vec::new()},annotation_nodes});
+    }
+    if pending.is_some() || layouts.len()!=symbol.params.len() || symbol.arity!=Some(layouts.len() as u8) {return None;}
+    Some(layouts)
+}
+
+fn callable_parameters(index:&dyn InferenceIndex,file:&str,ctx:&FileCtx,symbol:&IndexedSymbol,node:Node<'_>,text:&str,
+    scope:&TypeScope,java:bool)->Fact<Vec<SourceParameter>> {
+    let Some(layouts)=parameter_layout(index,file,symbol,node,text,java) else {return unsupported();};
+    let mut parameters=Vec::with_capacity(layouts.len());
+    for layout in layouts {
+        let mut parameter=layout.parameter;
+        for node in layout.annotation_nodes {
+            let mut remaining=MAX_SOURCE_ANNOTATION_NODES;
+            let Some(annotation)=source_annotation(index,ctx,node,text,scope,java,false,0,&mut remaining) else {return unsupported();};
+            parameter.annotations.push(annotation);
+        }
+        parameters.push(parameter);
+    }
+    Knowledge::Found(parameters)
 }
 
 fn definition(file: &str, symbol: &IndexedSymbol) -> Def {

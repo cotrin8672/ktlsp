@@ -139,7 +139,24 @@ ranges, nested annotations, typed Int/Long values, a decoded escaped string
 concatenation with a whole-escape UTF-16/source-byte map, and honest legacy
 Unknown downgrade. The child never parses Java or Kotlin.
 
+The same focused mode additionally checks authored callable parameters on that
+first evaluation: ordered names, complete/name byte ranges, `Local`/`Share`/
+`Cancellable` annotations, explicit booleans/integers/string arrays and nested
+annotation values, resolved parameter/annotation type references, and a known
+empty parameter list for the ordinary zero-arity method. Initial legacy input
+must omit the parameter field. The generic parameter imports `refs.LocalRef<String>`;
+the visible `decoy.LocalRef` fixture prevents a unique-short-name fallback from
+passing that resolution. Include both small source directories when preparing
+the disposable IPC project (the full project-copy recipe already includes them).
+Generic TypeRefs, Kotlin equivalents/aliases, unsupported
+headers/lowerings, forged metadata, edits/stale reads and foreign snapshot
+contexts have focused Rust cases; these additions require a newly sealed native
+pair before their new assertions are acceptance evidence.
+
 ```sh
+rtk proxy mkdir -p "$ipc_project/refs" "$ipc_project/decoy"
+rtk proxy cp "$repo/dev/external-extension/project/refs/LocalRef.java" "$ipc_project/refs/LocalRef.java"
+rtk proxy cp "$repo/dev/external-extension/project/decoy/LocalRef.java" "$ipc_project/decoy/LocalRef.java"
 KTLSP_CORPUS_EXTRA_PROBES="$repo/dev/external-extension/ipc-probes.lua" \
 KTLSP_IPC_MODE=source-facts-v2 KTLSP_IPC_CHILD="$sealed_child" \
 KTLSP_IPC_BARRIER="$scratch/source-facts-barrier" \

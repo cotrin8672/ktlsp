@@ -86,6 +86,34 @@ return function(env)
     end
     check(label..' nested ordinal is typed Int',vim.deep_equal(nested.arguments[3].value.value,{kind='integer',type='int',value=1}))
     check(label..' long literal is typed Long',vim.deep_equal(arguments[3].value.value,{kind='integer',type='long',value=2}))
+    check(label..' ordinary zero-arity callable has known empty parameters',declaration.parameters.state=='found' and #declaration.parameters.value==0)
+    local callable=observed.parameterDeclaration
+    check(label..' callable exposes ordered authored parameters',callable.parameters.state=='found'
+      and vim.deep_equal(vim.tbl_map(function(parameter) return parameter.name end,callable.parameters.value),{'text','slot','ci'}))
+    local parameters=callable.parameters.value
+    for _,parameter in ipairs(parameters) do
+      check(label..' exact parameter and annotation ranges '..parameter.name,slice(parameter.nameRange)==parameter.name
+        and slice(parameter.range):sub(1,1)=='@' and parameter.range.start<=parameter.annotations[1].range.start
+        and parameter.annotations[1].range['end']<=parameter.nameRange.start
+        and parameter.nameRange['end']<=parameter.range['end'] and type(parameter.typeRef)=='string')
+    end
+    local local_args=parameters[1].annotations[1].arguments
+    check(label..' parameter annotation has explicit boolean and integer values',vim.deep_equal(local_args[1].value.value,{kind='boolean',value=true})
+      and vim.deep_equal(local_args[2].value.value,{kind='integer',type='int',value=0}))
+    local names=local_args[3].value.value
+    check(label..' parameter annotation preserves string array',names.kind=='array' and #names.values==1
+      and names.values[1].value.value.kind=='string' and names.values[1].value.value.value=='text')
+    local at=local_args[4].value.value
+    check(label..' parameter annotation preserves nested explicit values',at.kind=='annotation'
+      and at.annotation.arguments[1].value.value.value=='INVOKE'
+      and at.annotation.arguments[2].value.value.value=='Lpkg/C;m()V'
+      and at.annotation.arguments[3].value.value.value==1)
+    check(label..' share and marker parameter annotations stay distinct',parameters[2].annotations[1].arguments[1].value.value.value=='slot'
+      and #parameters[3].annotations[1].arguments==0)
+    for i,name in ipairs({'refs.LocalRef','fixture.CallbackInfo','fixture.Local','fixture.Share','fixture.Cancellable','fixture.SourceFactsAt'}) do
+      check(label..' parameter type resolves through host facts '..name,observed.parameterTypes[i].state=='found'
+        and observed.parameterTypes[i].value.qualifiedName==name)
+    end
     proof.source_facts_v2=proof.source_facts_v2 or {};proof.source_facts_v2[label]=observed;save()
   end
 
@@ -224,12 +252,23 @@ return function(env)
     if not (locations and key=='target') then attach(key) end
   end
   if source_v2 then
+    for key,file in pairs({ parameter_ref='refs/LocalRef.java',parameter_decoy='decoy/LocalRef.java' }) do
+      local path=vim.fs.abspath(env.project .. '/' .. file)
+      paths[key],originals[key]=path,vim.fn.readfile(path)
+      attach(key)
+    end
+    vim.api.nvim_buf_set_lines(buffers.mixin,1,1,false,{'import refs.LocalRef;'})
     vim.api.nvim_buf_set_lines(buffers.mixin, -1, -1, false, {
       '@interface SourceFactsAt { String value(); String target(); int ordinal(); }',
       '@interface SourceFactsExample { String method(); SourceFactsAt at(); long index(); }',
+      '@interface Local { boolean argsOnly(); int ordinal(); String[] name(); SourceFactsAt at(); }',
+      '@interface Share { String value(); }',
+      '@interface Cancellable {}',
+      'class CallbackInfo {}',
       'class SourceFactsProbe {',
       [=[  @SourceFactsExample(method="ti\u0063k" + "()V", at=@SourceFactsAt(value="INVOKE", target="Lpkg/C;m()V", ordinal=1), index=2L)]=],
       '  public static final void sourceFactsProbe() {}',
+      [=[  public void parameterFactsProbe(@Local(argsOnly=true,ordinal=0,name={"text"},at=@SourceFactsAt(value="INVOKE",target="Lpkg/C;m()V",ordinal=1)) String text,@Share("slot") LocalRef<String> slot,@Cancellable CallbackInfo ci) {}]=],
       '}',
     })
   end

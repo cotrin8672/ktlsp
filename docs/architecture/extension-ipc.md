@@ -889,6 +889,38 @@ evaluation. Source text and configuration remain in the initial evaluation. The
 read works on the first evaluation after initialize; it does not wait for a
 second evaluation. Capability and operation acknowledgements are both required.
 
+V2 declarations also carry `parameters`, a knowledge object. A supported ordinary
+method/function returns `{"state":"found","value":[...]}` in authored value-parameter
+order. Each row has `name`, `range`, `nameRange`, `typeRef`, and `annotations`.
+Both ranges are half-open UTF-8 byte offsets in the same accepted source;
+`range` covers the complete parameter, including declaration annotations and
+modifiers, and `nameRange` covers its authored identifier spelling. Backticked
+Kotlin names retain their exact source range while `name` uses the indexed name.
+`typeRef` is an existing opaque reference token preserving the indexed type and
+generic arguments. Resolve it with the existing `resolveTypeRef` operation;
+unresolved identities retain the operation's ordinary Unknown result. Parameter
+annotations use the same v2 type references, exact ranges and explicit value
+representations as declaration annotations, including nested values and arrays.
+
+A supported zero-arity callable returns Found `[]`. Noncallables, constructors,
+Java receiver/vararg/post-name-array forms, incomplete headers, Kotlin extension,
+context/suspend/default/vararg/unsupported-owner forms, projections, and unbound
+method/class type-parameter references return Unknown for `parameters`. A type
+parameter must not resolve as an unrelated nominal class imported under its name.
+The list supplies no JVM parameter indices, local slots, generated/default
+parameters, or lowering claim. Existing `declarationMember` signature coverage
+remains independent. Parameter normalization is bounded to 255 authored entries
+and 64 type-reference levels; the existing annotation budgets also apply.
+
+This is additive metadata in the already optional v2 read, with no new operation
+or capability. Legacy initial evaluation declarations omit `parameters` entirely.
+Consumers supporting older v2 hosts treat an absent parameter field as Unknown.
+Foreign snapshot parameters and their annotation references use the same checked
+source view/session, source generations and read-only snapshot handles as other
+v2 source facts. No standalone parameter identity or contribution authority is
+issued. Parameters are retained from accepted trees and indexed parameter types;
+reading them does not start a parser.
+
 The initial evaluation retains the legacy declaration/annotation schema for all
 children. New value variants are honest `unknown` there, recursively inside
 arrays. In particular an escaped or concatenated value is never sent as a

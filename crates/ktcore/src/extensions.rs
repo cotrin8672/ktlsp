@@ -1109,6 +1109,22 @@ impl ExtensionStore {
                 let mut remaining=source::MAX_SOURCE_ANNOTATION_NODES;
                 validate_annotation(&text, annotation, &declaration.header_range, tree.as_ref().unwrap(), java, 0, &mut remaining)?;
             }
+            if let Knowledge::Found(parameters)=&declaration.parameters {
+                let layouts=source::parameter_layout(index,file,&entry.sym,node,&text,java).ok_or(ContractError::InvalidRange)?;
+                if parameters.len()!=layouts.len() {return Err(ContractError::InvalidRange);}
+                for (parameter,layout) in parameters.iter().zip(layouts) {
+                    let expected=layout.parameter;
+                    if parameter.name!=expected.name || parameter.range!=expected.range || parameter.name_range!=expected.name_range
+                        || parameter.ty!=expected.ty || parameter.annotations.len()!=layout.annotation_nodes.len() {
+                        return Err(ContractError::InvalidRange);
+                    }
+                    for (annotation,node) in parameter.annotations.iter().zip(layout.annotation_nodes) {
+                        if annotation.range!=node.byte_range() {return Err(ContractError::InvalidRange);}
+                        let mut remaining=source::MAX_SOURCE_ANNOTATION_NODES;
+                        validate_annotation(&text,annotation,&parameter.range,tree.as_ref().unwrap(),java,0,&mut remaining)?;
+                    }
+                }
+            }
         }
         let members = declarations
             .iter()
@@ -3034,6 +3050,44 @@ fn validate_entry(text: &str, entry: &Entry) -> Result<(), ContractError> {
 mod nominal_reference_tests {
     use super::*;
     use crate::{index::Index, index::Tier, indexer, parser::KotlinParser};
+
+    #[test]
+    fn source_parameter_admission_rejects_forged_facts_and_edits_retire_the_old_read() {
+        const FILE:&str="/parameters/Use.kt";
+        let text="package parameters\nannotation class Tag(val value: String)\nclass Ref<T>\nclass Use { fun h(@Tag(\"slot\") slot: Ref<String>) {} }";
+        let mut index=Index::new();let tree=KotlinParser::new().parse(text);
+        assert!(!tree.root_node().has_error());
+        index.replace_file(FILE,indexer::extract_symbols(&tree,text,"parameters"),Tier::Volatile);
+        let scope=indexer::TypeScope::with_default_imports("parameters",Vec::new(),&["kotlin"]);
+        let declarations=source::extract(&index,FILE,&tree,text,&scope);
+        let mut store=ExtensionStore::default();store.configure_provider("parameters",true,Arc::from("{}"));
+        let position=declarations.iter().position(|declaration|&text[declaration.name_range.clone()]=="h").unwrap();
+        for forged in 0..3 {
+            let mut changed=declarations.clone();
+            let Knowledge::Found(parameters)=&mut changed[position].parameters else {panic!("ordinary parameters");};
+            match forged {
+                0=>parameters[0].name_range.start+=1,
+                1=>parameters[0].ty.name="Wrong".into(),
+                _=>parameters[0].annotations[0].range.start+=1,
+            }
+            assert_eq!(store.replace_source_declarations(&index,FILE,Arc::from(text),Knowledge::Found(()),changed),Err(ContractError::InvalidRange));
+        }
+        store.replace_source_declarations(&index,FILE,Arc::from(text),Knowledge::Found(()),declarations).unwrap();
+        let before=source::reference_parse_count();
+        let read=store.begin_read(&index,"parameters",FILE).unwrap();
+        for _ in 0..4 {assert!(matches!(&read.declarations()[position].parameters,Knowledge::Found(parameters) if parameters[0].name=="slot"));}
+        let pending=read.finish();assert_eq!(source::reference_parse_count(),before);
+        let edited=text.replace("slot: Ref<String>","renamed: Ref<String>");
+        let tree=KotlinParser::new().parse(&edited);
+        index.replace_file(FILE,indexer::extract_symbols(&tree,&edited,"parameters"),Tier::Volatile);
+        let declarations=source::extract(&index,FILE,&tree,&edited,&scope);
+        store.replace_source_declarations(&index,FILE,Arc::from(edited.as_str()),Knowledge::Found(()),declarations).unwrap();
+        assert_eq!(store.validate_pending(&pending),Err(ContractError::Stale));
+        let read=store.begin_read(&index,"parameters",FILE).unwrap();
+        let Knowledge::Found(parameters)=&read.declarations()[position].parameters else {panic!("updated parameters");};
+        assert_eq!(parameters[0].name,"renamed");
+        assert_eq!(&read.source()[parameters[0].name_range.clone()],"renamed");
+    }
 
     #[test]
     fn prepared_reference_eligibility_applies_without_reparsing_and_keeps_generic_unknown() {

@@ -1043,6 +1043,14 @@ impl Evaluation {
                 value["headerRange"]=range(&declaration.header_range);
                 value["nameRange"]=range(&declaration.name_range);
                 value["bodyRange"]=declaration.body_range.as_ref().map_or(Value::Null,range);
+                value["parameters"]=fact(&declaration.parameters,|parameters|json!(parameters.iter().map(|parameter| {
+                    let reference=self.issue(match source {
+                        Some(source)=>Handle::SnapshotTypeRef {source:source.clone(),value:parameter.ty.clone()},
+                        None=>Handle::TypeRef(parameter.ty.clone()),
+                    });
+                    json!({"name":parameter.name,"range":range(&parameter.range),"nameRange":range(&parameter.name_range),
+                        "typeRef":reference,"annotations":parameter.annotations.iter().map(|annotation|self.annotation(annotation,true,source)).collect::<Vec<_>>()})
+                }).collect::<Vec<_>>()));
                 let modifiers=&declaration.modifiers;
                 value["modifiers"]=json!({"visibility":fact(&modifiers.visibility,|visibility|json!(format!("{visibility:?}"))),
                     "static":fact(&modifiers.is_static,|value|json!(value)),
@@ -3530,6 +3538,7 @@ class Use { @Example(method="ti\u0063k" + "()V",at=At(value="INVOKE",ordinal=1))
         let mut read=store.begin(&index,"wire-v2",file).unwrap();
         let mut evaluation=Evaluation::new("wire-v2".into(),file.into(),1);
         let initial=evaluation.source(&mut read).unwrap();
+        assert!(initial["declarations"].as_array().unwrap().iter().all(|value|value.get("parameters").is_none()));
         let probe=initial["declarations"].as_array().unwrap().iter().find(|value|value["name"]=="probe").unwrap();
         assert!(probe.get("fullRange").is_none());assert!(probe.get("modifiers").is_none());
         assert!(probe["annotations"][0].get("nameRange").is_none());
@@ -3546,6 +3555,7 @@ class Use { @Example(method="ti\u0063k" + "()V",at=At(value="INVOKE",ordinal=1))
         assert!(response["facts"][0].get("source").is_none(),"source text already accompanies the initial evaluation");
         let rich=response["facts"][0]["declarations"].as_array().unwrap().iter().find(|value|value["name"]=="probe").unwrap();
         assert_eq!(rich["nameRange"],rich["range"]);
+        assert_eq!(rich["parameters"],json!({"state":"found","value":[]}));
         assert_eq!(rich["modifiers"]["final"],json!({"state":"found","value":true}));
         let args=&rich["annotations"][0]["arguments"];
         assert_eq!(args[0]["value"]["value"]["kind"],"mappedString");
@@ -3592,21 +3602,26 @@ mod snapshot_source_facts_tests {
             let foreign=crate::paths::file_key(&root.join(format!("test/Foreign.{suffix}")));
             let main_dep=crate::paths::file_key(&root.join(format!("deps/MainDep.{suffix}")));
             let test_dep=crate::paths::file_key(&root.join(format!("deps/TestDep.{suffix}")));
+            let reference=crate::paths::file_key(&root.join(format!("deps/refs/LocalRef.{suffix}")));
+            let decoy=crate::paths::file_key(&root.join(format!("deps/decoy/LocalRef.{suffix}")));
             let main=ProjectScope {module:"snapshot".into(),source_set:"main".into()};
             let test=ProjectScope {module:"snapshot".into(),source_set:"test".into()};
             let main_lib=ProjectScope {module:"main-lib".into(),source_set:"main".into()};
             let test_lib=ProjectScope {module:"test-lib".into(),source_set:"main".into()};
             let (owner_text,foreign_text,main_text,test_text)=if java {(
-                "package mainpkg; import mainlib.Dep; @interface Mark { Class<?> value(); } class Main { @Mark(Dep.class) void owner() {} }",
-                "package testpkg; import testlib.Dep; @interface Mark { Class<?> value(); } class Test { @Mark(Dep.class) Dep probe(int amount, Dep input) { return input; } private int count; }",
+                "package mainpkg; import mainlib.Dep; import refs.LocalRef; @interface Mark { Class<?> value(); } class Main { @Mark(Dep.class) void owner() {} void ownerParameter(LocalRef<String> input) {} }",
+                "package testpkg; import testlib.Dep; import refs.LocalRef; @interface Mark { Class<?> value(); } class Test { @Mark(Dep.class) Dep probe(int amount, Dep input) { return input; } void parameterProbe(@Mark(Dep.class) LocalRef<String> input) {} private int count; }",
                 "package mainlib; public class Dep {}","package testlib; public class Dep {}",
             )} else {(
-                "package mainpkg\nimport mainlib.Dep\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Main { @Mark(Dep::class) fun owner() {} }",
-                "package testpkg\nimport testlib.Dep\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Test { @Mark(Dep::class) fun probe(amount: Int, input: Dep): Dep = input\n private val count: Int = 1 }",
+                "package mainpkg\nimport mainlib.Dep\nimport refs.LocalRef as ImportedRef\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Main { @Mark(Dep::class) fun owner() {}\n fun ownerParameter(input: ImportedRef<String>) {} }",
+                "package testpkg\nimport testlib.Dep\nimport refs.LocalRef as ImportedRef\nannotation class Mark(val value: kotlin.reflect.KClass<*>)\nclass Test { @Mark(Dep::class) fun probe(amount: Int, input: Dep): Dep = input\n fun parameterProbe(@Mark(Dep::class) input: ImportedRef<String>) {}\n private val count: Int = 1 }",
                 "package mainlib\nclass Dep","package testlib\nclass Dep",
             )};
+            let reference_text=if java {"package refs; public class LocalRef<T> {}"} else {"package refs\nclass LocalRef<T>"};
+            let decoy_text=if java {"package decoy; public class LocalRef<T> {}"} else {"package decoy\nclass LocalRef<T>"};
             let inputs=[(&owner,owner_text,"app-main",main.clone()),(&foreign,foreign_text,"app-test",test.clone()),
-                (&main_dep,main_text,"main-lib",main_lib.clone()),(&test_dep,test_text,"test-lib",test_lib.clone())];
+                (&main_dep,main_text,"main-lib",main_lib.clone()),(&test_dep,test_text,"test-lib",test_lib.clone()),
+                (&reference,reference_text,"main-lib",main_lib.clone()),(&decoy,decoy_text,"main-lib",main_lib.clone())];
             let mut index=Index::new();let mut parsers=LanguageParsers::new();
             for (file,text,origin,scope) in &inputs {
                 let language=SourceLanguage::for_key(file);let tree=parsers.parse(language,text);
@@ -3633,6 +3648,17 @@ mod snapshot_source_facts_tests {
             let token=evaluation.issue(Handle::Source(source.clone()));
             let id=evaluation.id.to_string();
             let params=|queries:Vec<Value>|json!({"evaluation":id,"queries":queries});
+            let owned=evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"sourceFacts"})])).unwrap();
+            let owned=owned["facts"][0]["declarations"].as_array().unwrap().iter().find(|declaration|declaration["name"]=="ownerParameter").unwrap();
+            assert_eq!(owned["parameters"]["state"],"found");
+            let owner_reference=owned["parameters"]["value"][0]["typeRef"].clone();
+            match &evaluation.handles[owner_reference.as_str().unwrap()] {
+                Handle::TypeRef(value)=>{assert_eq!(value.name,"LocalRef");assert_eq!(value.qualification.as_deref(),Some("refs"));
+                    assert_eq!(value.args.len(),1);assert_eq!(value.args[0].name,"String");},
+                _=>panic!("owner parameter keeps its existing ordinary generic reference"),
+            }
+            let owned=evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"resolveTypeRef","reference":owner_reference})])).unwrap();
+            assert_eq!(owned["facts"][0]["state"],"found");assert_eq!(owned["facts"][0]["value"]["qualifiedName"],"refs.LocalRef");
             let result=evaluation.batch(&mut read,"analysis/readFacts",params(vec![json!({"op":"sourceFacts","source":token})])).unwrap();
             let facts=&result["facts"][0];
             assert_eq!(facts["source"]["id"],token);assert_eq!(facts["semanticScope"]["state"],"found");
@@ -3648,13 +3674,51 @@ mod snapshot_source_facts_tests {
                 _=>panic!("foreign facts must issue snapshot declarations"),
             }
             let annotation=&probe["annotations"][0];
+            assert_eq!(probe["parameters"]["state"],"found");
+            let parameters=probe["parameters"]["value"].as_array().unwrap();
+            assert_eq!(parameters.len(),2);
+            assert_eq!(parameters[0]["name"],"amount");assert_eq!(parameters[1]["name"],"input");
+            let parameter_reference=parameters[1]["typeRef"].clone();
+            match &evaluation.handles[parameter_reference.as_str().unwrap()] {
+                Handle::SnapshotTypeRef {source,value}=>{assert_eq!(source.file(),foreign);assert_eq!(value.name,"Dep");},
+                _=>panic!("foreign parameter reference must retain its snapshot context"),
+            }
             let result=evaluation.batch(&mut read,"analysis/readFacts",params(vec![
                 json!({"op":"resolveTypeRef","reference":annotation["typeRef"]}),
                 json!({"op":"resolveTypeRef","reference":annotation["arguments"][0]["value"]["value"]["typeRef"]}),
+                json!({"op":"resolveTypeRef","reference":parameter_reference}),
             ])).unwrap();
             assert_eq!(result["facts"][0]["value"]["qualifiedName"],"testpkg.Mark");
             assert_eq!(result["facts"][1]["value"]["qualifiedName"],"testlib.Dep");
             assert_eq!(result["facts"][0]["value"]["readOnly"],true);
+            assert_eq!(result["facts"][2]["value"]["qualifiedName"],"testlib.Dep");
+            assert_eq!(result["facts"][2]["value"]["readOnly"],true);
+            assert_eq!(result["facts"][2]["value"]["contextSource"]["identity"],facts["source"]["identity"]);
+            assert!(evaluation.ty(&result["facts"][2]["value"]["id"]).unwrap_err().contains("UnsupportedSource"));
+            let annotated=facts["declarations"].as_array().unwrap().iter().find(|declaration|declaration["name"]=="parameterProbe").unwrap();
+            assert_eq!(annotated["parameters"]["state"],"found");
+            let generic_reference=annotated["parameters"]["value"][0]["typeRef"].clone();
+            match &evaluation.handles[generic_reference.as_str().unwrap()] {
+                Handle::SnapshotTypeRef {source,value}=>{
+                    assert_eq!(source.file(),foreign);assert_eq!(value.name,"LocalRef");
+                    assert_eq!(value.qualification.as_deref(),Some("refs"));
+                    assert_eq!(value.args.len(),1);assert_eq!(value.args[0].name,"String");
+                },
+                _=>panic!("foreign generic parameter keeps its snapshot reference and arguments"),
+            }
+            let annotation=&annotated["parameters"]["value"][0]["annotations"][0];
+            let parameter_annotations=evaluation.batch(&mut read,"analysis/readFacts",params(vec![
+                json!({"op":"resolveTypeRef","reference":annotation["typeRef"]}),
+                json!({"op":"resolveTypeRef","reference":annotation["arguments"][0]["value"]["value"]["typeRef"]}),
+                json!({"op":"resolveTypeRef","reference":generic_reference}),
+            ])).unwrap();
+            assert_eq!(parameter_annotations["facts"][0]["value"]["qualifiedName"],"testpkg.Mark");
+            assert_eq!(parameter_annotations["facts"][1]["value"]["qualifiedName"],"testlib.Dep");
+            assert_eq!(parameter_annotations["facts"][1]["value"]["readOnly"],true);
+            assert_eq!(parameter_annotations["facts"][2]["state"],"found");
+            assert_eq!(parameter_annotations["facts"][2]["value"]["qualifiedName"],"refs.LocalRef");
+            assert_eq!(parameter_annotations["facts"][2]["value"]["readOnly"],true);
+            assert_eq!(parameter_annotations["facts"][2]["value"]["contextSource"]["identity"],facts["source"]["identity"]);
             let ty=result["facts"][0]["value"]["id"].as_str().unwrap();
             assert!(evaluation.ty(&json!(ty)).unwrap_err().contains("UnsupportedSource"));
             assert!(evaluation.declaration(&json!(declaration)).unwrap_err().contains("UnsupportedSource"));
@@ -3695,6 +3759,9 @@ mod snapshot_source_facts_tests {
             drop(read);
             index.replace_scope_visibilities(vec![ScopeVisibility {scope:main,ordered_origins:vec!["app-main".into(),"main-lib".into()]}]);
             let mut read=store.begin(&index,"snapshot-wire",&owner).unwrap();
+            assert!(evaluation.batch(&mut read,"analysis/readFacts",params(vec![
+                json!({"op":"resolveTypeRef","reference":parameter_reference}),
+            ])).is_err(),"parameter reference cannot cross snapshot read sessions");
             assert!(evaluation.read_source_facts(&mut read,Some(&token)).is_err(),"snapshot token cannot cross read sessions");
             let source=read.source_inventory_for_scope(test,std::collections::BTreeSet::from([foreign.clone()])).unwrap().remove(0);
             let token=evaluation.issue(Handle::Source(source));

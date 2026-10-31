@@ -841,6 +841,9 @@ fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Writ
     if legacy.get("fullRange").is_some() || legacy.get("modifiers").is_some() {
         return Err("v2 metadata leaked into the legacy initial payload".into());
     }
+    if params["declarations"].as_array().ok_or("legacy declarations")?.iter().any(|declaration|declaration.get("parameters").is_some()) {
+        return Err("parameter facts leaked into the legacy initial payload".into());
+    }
     let legacy_annotation=&legacy["annotations"][0];
     if legacy_annotation.get("nameRange").is_some()
         || !legacy_annotation["arguments"].as_array().ok_or("legacy arguments")?.iter()
@@ -851,6 +854,18 @@ fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Writ
         "queries":[{"op":"sourceFacts"}]}))?;
     let rich=result["facts"][0]["declarations"].as_array().ok_or("source facts declarations")?.iter()
         .find(|declaration|declaration["name"]=="sourceFactsProbe").ok_or("v2 probe declaration")?;
+    let parameter_declaration=result["facts"][0]["declarations"].as_array().ok_or("source facts declarations")?.iter()
+        .find(|declaration|declaration["name"]=="parameterFactsProbe").ok_or("parameter probe declaration")?;
+    let parameters=parameter_declaration["parameters"]["value"].as_array().ok_or("known parameter facts")?;
+    if parameters.len()!=3 {return Err("parameter fact order/count".into());}
+    let parameter_types=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],"queries":[
+        {"op":"resolveTypeRef","reference":parameters[1]["typeRef"]},
+        {"op":"resolveTypeRef","reference":parameters[2]["typeRef"]},
+        {"op":"resolveTypeRef","reference":parameters[0]["annotations"][0]["typeRef"]},
+        {"op":"resolveTypeRef","reference":parameters[1]["annotations"][0]["typeRef"]},
+        {"op":"resolveTypeRef","reference":parameters[2]["annotations"][0]["typeRef"]},
+        {"op":"resolveTypeRef","reference":parameters[0]["annotations"][0]["arguments"][3]["value"]["value"]["annotation"]["typeRef"]},
+    ]}))?;
     if rich["nameRange"]!=legacy["range"] || rich["modifiers"]["static"]!=json!({"state":"found","value":true})
         || rich["modifiers"]["final"]!=json!({"state":"found","value":true}) {
         return Err("source facts declaration ranges/modifiers were not normalized".into());
@@ -871,7 +886,8 @@ fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Writ
     let directory=barrier.as_ref().ok_or("source facts fixture barrier")?;
     std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
     std::fs::write(directory.join(format!("source-facts-{}.json",params["evaluation"].as_str().ok_or("evaluation")?)),
-        serde_json::to_vec(&json!({"evaluation":params["evaluation"],"ownerEvaluation":owner_evaluation,"legacy":legacy,"rich":rich,"types":types["facts"]})).map_err(|error|error.to_string())?)
+        serde_json::to_vec(&json!({"evaluation":params["evaluation"],"ownerEvaluation":owner_evaluation,"legacy":legacy,"rich":rich,"types":types["facts"],
+            "parameterDeclaration":parameter_declaration,"parameterTypes":parameter_types["facts"]})).map_err(|error|error.to_string())?)
         .map_err(|error|error.to_string())?;
     Ok(())
 }

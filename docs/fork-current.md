@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-10-31 (Asia/Tokyo). **Requested acceptance workflows verified through84.**
+Updated 2026-10-31 (Asia/Tokyo). **Acceptance through84; source-parameter follow-up verified on85.**
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -8,7 +8,10 @@ The previously unseen mixed-language Okio repository now has eight accepted edit
 interop checks and three current canonical diagnostic states (valid, invalid,
 restored). Its reproduced Gradle/Kotlin and mixed-source producer gaps are fixed.
 MockK's reproduced diagnostic/producer-lifetime failure is also fixed and verified.
-The final workspace suite passes1938 tests with16 existing ignores and no failures.
+The last full workspace suite, on84, passes1938 tests with16 existing ignores and no failures.
+Release85 additionally passes the focused source-parameter native checks and30 real-editor checks.
+The combined workspace rerun is deferred until the current extension follow-ups are finished;
+the84 suite is not presented as a full suite on85.
 No reproduced blocker remains in the recorded acceptance workflows. Broader grammar,
 SDK/compiler-profile coverage and whole-project IDEA parity remain unmeasured;
 there is no invented completeness percentage or requirement for100% grammar.
@@ -31,7 +34,7 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Latest acceptance through84
+## Latest acceptance through85
 
 Release artifacts are immutable and identified by their receipts; rows below span
 different releases and must not be presented as one same-binary corpus replay.
@@ -40,6 +43,7 @@ different releases and must not be presented as one same-binary corpus replay.
 |---|---|---|
 | Unseen mixed repository: Okio | Repository61d53efb,313 Kotlin/28 Java source files. Eight real-editor completion/definition/applied unsaved interop checks retained in `okio-correlated77/artifacts/okio-unsaved-requests.json`. Release83 canonical validv3/invalidv4/restoredv5 all match current wire SHA and accepted result;0/1/0 diagnostics, with exact unresolved identifier range and certified absence for the two clean states (`okio-diagnostic83/artifacts/okio-diagnostic.json`). | The two selected project JARs remain absent. The trace proves required-clean Java output for the mixed samples producer. The probe does not independently certify whole-project producer closure;28 dependency source archives remain unavailable. |
 | Detailed normalized source input | Release81 real child/Neovim15/15: first-evaluation nested annotation, decoded strings/maps, typed integer facts and current source identity (`new-capability-editor81/`, proof at `C:/Users/gummy/.codex/ktlsp-api81/editor/source-facts-v2/editor/artifacts/extension-ipc-proof.json`). | Java live annotation fixture; shared Java/Kotlin normalization also has focused Rust coverage. No all-constant-expression or implicit Kotlin projection claim. |
+| Callable source parameters | Release85 real child/Neovim30/30: ordered parameters, exact ranges and explicit annotation values, imported `refs.LocalRef` with a visible decoy, zero-arity Found `[]`, legacy field omission and accepted unsaved source SHA (`C:/Users/gummy/.codex/ktlsp-parameters85/editor/artifacts/extension-ipc-proof.json`). Native admission1, source-facts30 plus repaired shadowing1, wire2 and foreign snapshot1 pass (`source-parameters/native85/`, `source-parameters/native85-repaired/`, sealed pair `integrated-host85/main-ready.json`). | Live parameter fixture is Java; native cases also cover Kotlin, import aliases, foreign read-only snapshots, edits/stale reads and forged facts. Nominal generic class identity is resolved; no public generic-argument binding or JVM parameter-index claim. The original Kotlin owner-type-variable negative was preserved and fixed by checking the lexical type before accepting an indexed import. |
 | Owning-project and foreign-source input | Release82 real child/Neovim123/123; exactly one command, useful Java/Kotlin main/test types and exact members, source snapshots/provenance and complete main/test resource inventories (`C:/Users/gummy/.codex/ktlsp-api81/editor-project82/project-inputs/editor/artifacts/extension-command-proof.json`). | Provider readiness is correlated to the exact owner/digest. Missing inherited declared output directories are observed as currently empty through existing negative watches; missing JARs remain Unknown. No generated output is built by the host. |
 | Typed binary annotations | Release81 real child/Neovim29/29, selected/unselected metadata and compile-only executable-identity denial (`C:/Users/gummy/.codex/ktlsp-api81/editor-binary81/binary-annotations/editor/artifacts/extension-command-proof.json`). | `binary-annotations-v1` is a representation capability, not a new read operation or Code grant. Current unselected ABI shapes remain unchanged. |
 | Final Rust suite and distribution | `integrated-host84/main-ready.json`:42 test binaries,1938 passed/0 failed/16 existing ignored; release host and reused unchanged protocol child sealed, source guards stable, EOF and no owned live processes. | Initial failing suite receipts are retained in `final-workspace83` and `final-workspace83-repaired`. Obsolete extra-parse counts were corrected to exact zero while preserving semantic retraction tests. The actual Java-only header admission regression was fixed without changing its original test; complete/partial/ambiguous coverage controls pass. |

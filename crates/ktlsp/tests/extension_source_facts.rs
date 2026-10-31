@@ -39,6 +39,117 @@ fn descriptor(fact: &SourceDeclaration) -> &str {
 }
 
 #[test]
+fn callable_parameters_preserve_authored_order_ranges_types_and_annotation_values() {
+    let java=r#"package parameters; // UTF-8 😃
+@interface Nest { String value(); }
+@interface Local { boolean argsOnly(); int ordinal(); String[] name(); Nest at(); }
+@interface Share { String value(); }
+@interface Cancellable {}
+class LocalRef<T> {}
+class T {}
+class CallbackInfo {}
+class Use {
+ void h(@Local(argsOnly=true,ordinal=0,name={"text"},at=@Nest("inside")) String text,
+        @Share("slot") LocalRef<String> slot,@Cancellable CallbackInfo ci) {}
+ void none() {}
+ void receiver(Use this) {}
+ void spread(String... values) {}
+ void projected(LocalRef<? extends String> values) {}
+ void post(String values[]) {}
+ <T> void shadow(T value) {}
+}"#;
+    let kotlin=r#"package parameters // UTF-8 😃
+annotation class Nest(val value: String)
+annotation class Local(val argsOnly: Boolean, val ordinal: Int, val name: Array<String>, val at: Nest)
+annotation class Share(val value: String)
+annotation class Cancellable
+class LocalRef<T>
+class T
+class CallbackInfo
+class Use {
+ fun h(@Local(argsOnly=true,ordinal=0,name=["text"],at=Nest("inside")) text: String,
+       @Share("slot") slot: LocalRef<String>,@Cancellable ci: CallbackInfo) {}
+ fun none() {}
+ fun escaped(`odd name`: Int) {}
+ fun defaulted(value: Int = 1) {}
+ suspend fun suspended(value: Int) {}
+ context(ctx: String) fun contextual(value: Int) {}
+ fun String.receiver(value: Int) {}
+ fun spread(vararg values: String) {}
+ fun projected(values: LocalRef<out String>) {}
+ fun <T> shadow(value: T) {}
+}
+"#;
+    for (file,text,unsupported) in [
+        ("Parameters.java",java,&["receiver","spread","projected","post","shadow"][..]),
+        ("Parameters.kt",kotlin,&["defaulted","suspended","contextual","receiver","spread","projected","shadow"][..]),
+    ] {
+        let declarations=facts(file,text);
+        let Knowledge::Found(parameters)=&named(&declarations,text,"h").parameters else {panic!("{file}: parameters");};
+        assert_eq!(parameters.iter().map(|parameter|parameter.name.as_str()).collect::<Vec<_>>(),["text","slot","ci"]);
+        for parameter in parameters {
+            assert_eq!(&text[parameter.name_range.clone()],parameter.name);
+            assert!(parameter.range.start<=parameter.name_range.start && parameter.name_range.end<=parameter.range.end);
+            assert!(text[parameter.range.clone()].starts_with('@'));
+            assert_eq!(parameter.annotations.len(),1);
+            assert!(parameter.annotations[0].range.start>=parameter.range.start);
+            assert!(parameter.annotations[0].range.end<=parameter.name_range.start);
+        }
+        assert_eq!(parameters[1].ty.name,"LocalRef");
+        assert_eq!(parameters[1].ty.args.len(),1);
+        assert_eq!(parameters[1].ty.args[0].name,"String");
+        let local=&parameters[0].annotations[0];
+        assert_eq!(local.ty.name,"Local");
+        assert_eq!(local.arguments[0].value,Knowledge::Found(AnnotationValue::Boolean(true)));
+        assert!(matches!(&local.arguments[1].value,Knowledge::Found(AnnotationValue::Integer {value:0,..})));
+        let Knowledge::Found(AnnotationValue::Array(names))=&local.arguments[2].value else {panic!("parameter names");};
+        assert!(matches!(&names[0].value,Knowledge::Found(AnnotationValue::String {value,..}) if value=="text"));
+        let Knowledge::Found(AnnotationValue::Annotation(nested))=&local.arguments[3].value else {panic!("nested parameter annotation");};
+        assert_eq!(nested.ty.name,"Nest");
+        assert!(matches!(&nested.arguments[0].value,Knowledge::Found(AnnotationValue::String {value,..}) if value=="inside"));
+        assert_eq!(named(&declarations,text,"none").parameters,Knowledge::Found(Vec::new()));
+        if file.ends_with(".kt") {
+            let Knowledge::Found(parameters)=&named(&declarations,text,"escaped").parameters else {panic!("backticked parameter");};
+            assert_eq!(parameters[0].name,"odd name");
+            assert_eq!(&text[parameters[0].name_range.clone()],"`odd name`");
+        }
+        assert!(matches!(named(&declarations,text,"Use").parameters,Knowledge::Unknown(_)));
+        for name in unsupported {assert!(matches!(named(&declarations,text,name).parameters,Knowledge::Unknown(_)),"{file}: {name}");}
+    }
+}
+
+#[test]
+fn callable_type_parameters_never_resolve_as_the_shadowed_import() {
+    for (file,text) in [
+        ("Shadow.java","package parameters; import unrelated.T; class Use { <T> void h(T value) {} } class Box<T> { void owner(T value) {} void qualified(unrelated.T value) {} }"),
+        ("Shadow.kt","package parameters\nimport unrelated.T\nclass Use { fun <T> h(value: T) {} }\nclass Box<T> { fun owner(value: T) {}\n fun qualified(value: unrelated.T) {} }"),
+    ] {
+        let declarations=facts_with_types(file,text,&[("T.java","package unrelated; public class T {}")]);
+        for name in ["h","owner"] {assert!(matches!(named(&declarations,text,name).parameters,Knowledge::Unknown(_)),"{file}: {name}");}
+        let Knowledge::Found(parameters)=&named(&declarations,text,"qualified").parameters else {panic!("{file}: qualified nominal type");};
+        assert_eq!(parameters.len(),1);
+        assert_eq!(parameters[0].ty.name,"T");assert_eq!(parameters[0].ty.qualification.as_deref(),Some("unrelated"));
+    }
+}
+
+#[test]
+fn incomplete_parameter_headers_never_claim_known_empty_parameters() {
+    for (file,text) in [("Broken.java","class Use { void broken(String value, ) {} }"),
+        ("Broken.kt","class Use { fun broken(value: ) {} }")] {
+        let mut index=Index::new();let mut parsers=LanguageParsers::new();
+        let language=SourceLanguage::for_key(file);let tree=parsers.parse(language,text);
+        let symbols=language::file_facts(language,&tree,text).symbols;
+        let indexed=symbols.iter().any(|symbol|symbol.name=="broken");
+        index.replace_file(file,symbols,Tier::Volatile);
+        let declarations=language::extension_source_facts(&index,file,&tree,text);
+        match declarations.iter().find(|declaration|&text[declaration.name_range.clone()]=="broken") {
+            Some(declaration)=>assert!(matches!(declaration.parameters,Knowledge::Unknown(_)),"{file}: incomplete parameters must be unknown"),
+            None=>assert!(!indexed || tree.root_node().has_error(),"{file}: only an unindexed or unsupported parse may omit the incomplete callable"),
+        }
+    }
+}
+
+#[test]
 fn java_authored_identity_flags_and_exact_jvm_signatures() {
     let source = r#"package oracle;
 import java.lang.String;
