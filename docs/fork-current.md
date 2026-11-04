@@ -93,8 +93,14 @@ descriptors cannot replace its exact correspondence. This is not evidence of a
 the contract inspection; that Drill attempt never reached the Kotlin phase.
 The consumer's later NeoForge/explicit-Kotlin-root profile reaches eight of the
 original32 assertions, then stops at a current completion's child-response
-`CommandFailed`. Its raw normalized facts/error detail were not saved, so this is
-an unclassified separate consumer failure. Evidence for the original Drill attempt:
+`CommandFailed`. Later inspection found its saved child error was
+`-32602: evaluation batch limit`; raw normalized facts were not saved. The full
+NeoForge Java profile on103 reaches the same limit before `declarationMember`.
+Both evaluations spent most batches on56 resource-inventory pages. The consumer
+is batching independent queries and removing redundant reads; host quotas and
+read guards are unchanged. Neither failed attempt establishes the original
+handler's erasure result. A requested raw-DTO diagnostic was cancelled after
+input extraction, before any build or capture. Evidence for the original Drill attempt:
 MC `build/rust-test-logs/kotlin-drill-native-20261105/recovery-and-run-receipt.json`;
 implementation boundaries are `crates/ktcore/src/extensions.rs` functions
 `declaration_member`, `source_member_signature` and `source_jvm_type`.
@@ -115,8 +121,10 @@ the verification child SHA-256 is
 `629ee0376b6ff97fbca9af36f4d12c01ae7e27fe6607f71840f4427b32ab66cf`.
 Both were independently checked; code/fixture guards are stable. The previously
 completed workspace1977 and original CEM85 were not replayed. The original
-incomplete Drill profile and later Kotlin child-response `CommandFailed` remain
-separate failed/unfinished consumer cases, not host103 acceptance conditions.
+incomplete Drill profile and later Java/Kotlin quota failures remain separate
+failed/unfinished consumer cases, not host103 acceptance conditions. Quota
+evidence is in MC `build/rust-test-logs/java-only-host103-native-20261105/`
+and `build/rust-test-logs/kotlin-only-classpath-native-20261105/`.
 
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable
