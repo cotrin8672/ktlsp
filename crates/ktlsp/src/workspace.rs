@@ -74,14 +74,17 @@ pub(crate) struct ModelSourceUpdate {
 pub(crate) struct IpcSourceCapture {
     evaluation: u64,
     started: std::time::Instant,
-    model: Arc<crate::classpath::ProjectSnapshot>,
+    model: Option<Arc<crate::classpath::ProjectSnapshot>>,
     generation: u64,
     expected: BTreeMap<String, (SourceStamp, [u8; 32], ktcore::project_model::FileOrigin)>,
+    libraries: Vec<crate::analysis_extensions::SourceRequest>,
+    pub(crate) waiting: Vec<tokio::sync::watch::Receiver<bool>>,
 }
 
 pub(crate) struct PreparedIpcSources {
     request: IpcSourceCapture,
     sources: Vec<ProjectFileIndex>,
+    libraries: Vec<crate::analysis_extensions::PreparedSource>,
 }
 
 struct ProjectClassInput {
@@ -755,6 +758,13 @@ impl Workspace {
         keys
     }
 
+    #[cfg(test)]
+    pub(crate) fn extension_test_inputs(
+        &mut self,
+    ) -> (&Index, &mut crate::analysis_extensions::AnalysisExtensions) {
+        (&self.index, &mut self.analysis_extensions)
+    }
+
     /// Test helper for fixtures that intentionally model a closed source world.
     pub fn assume_index_complete_for_tests(&mut self) {
         self.completeness = resolve::CompletenessFacts::complete();
@@ -1098,18 +1108,24 @@ impl Workspace {
         self.analysis_extensions.finish_ipc_class_read(&self.index,prepared)
     }
 
-    pub(crate) fn begin_ipc_requested_source_capture(&self, evaluation: u64) -> Option<IpcSourceCapture> {
-        let requested=self.analysis_extensions.ipc_requested_sources(evaluation)?;
+    pub(crate) fn begin_ipc_requested_source_capture(&mut self, evaluation: u64) -> Option<IpcSourceCapture> {
+        if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) { return None; }
+        let requested=self.analysis_extensions.ipc_requested_sources(evaluation)?.clone();
         crate::trace::span("extension.ipc.requested_sources", "extension", std::time::Instant::now(),
             serde_json::json!({"evaluation":evaluation,"requested_files":requested}));
         if requested.is_empty() { return None; }
         let owner=self.analysis_extensions.ipc_resource_owner(evaluation)?;
-        let mut capture=self.begin_ipc_source_capture(evaluation,owner)?;
+        let mut capture=self.begin_ipc_source_capture(evaluation,owner).unwrap_or_else(|| IpcSourceCapture {
+            evaluation, started: std::time::Instant::now(), model: self.project_model.clone(),
+            generation: self.analysis_generation, expected: BTreeMap::new(), libraries: Vec::new(), waiting: Vec::new(),
+        });
         capture.expected.retain(|key,_|requested.contains(key));
         crate::trace::span("extension.ipc.project_source_demand", "extension", std::time::Instant::now(),
             serde_json::json!({"evaluation":evaluation,"owner":owner,"requested_files":requested,
                 "eligible_files":capture.expected.keys().collect::<Vec<_>>()}));
-        (!capture.expected.is_empty()).then_some(capture)
+        capture.waiting=self.analysis_extensions.source_waits_for(&self.index,&requested);
+        capture.libraries=self.analysis_extensions.take_source_requests_for(&self.index,&requested);
+        (!capture.expected.is_empty() || !capture.libraries.is_empty() || !capture.waiting.is_empty()).then_some(capture)
     }
 
     pub(crate) fn begin_ipc_source_capture(&self,evaluation:u64,owner:&str)->Option<IpcSourceCapture> {
@@ -1134,16 +1150,28 @@ impl Workspace {
             expected.insert(key, (*stamp, *content, origin.clone()));
         }
         (!expected.is_empty()).then(|| IpcSourceCapture {
-            evaluation, started: std::time::Instant::now(), model: model.clone(), generation: self.analysis_generation, expected,
+            evaluation, started: std::time::Instant::now(), model: Some(model.clone()), generation: self.analysis_generation, expected,
+            libraries: Vec::new(), waiting: Vec::new(),
         })
     }
 
     pub(crate) fn finish_ipc_source_capture(&mut self, prepared: PreparedIpcSources) -> usize {
         let prepared_count = prepared.sources.len();
+        let prepared_libraries = prepared.libraries.len();
         let request = prepared.request;
-        if !self.ipc_evaluation_current(request.evaluation)
-            || self.project_refresh_pending || self.analysis_generation != request.generation
-            || !self.project_model.as_ref().is_some_and(|model| Arc::ptr_eq(model, &request.model)) { return 0; }
+        let current=self.ipc_evaluation_current(request.evaluation)
+            && !self.project_refresh_pending && self.analysis_generation == request.generation
+            && match (&self.project_model, &request.model) {
+                (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+                (None, None) => true,
+                _ => false,
+            };
+        // Library acceptance checks live demand and its own stamp, releasing cancelled attempts too.
+        let library_changed=self.analysis_extensions.accept_sources(&self.index,prepared.libraries);
+        if !current {
+            if library_changed { self.bump_index_revision(); }
+            return usize::from(library_changed);
+        }
         let mut sources = Vec::new();
         for batch in prepared.sources {
             let Some((stamp, content, origin)) = request.expected.get(&batch.key) else { continue; };
@@ -1159,12 +1187,15 @@ impl Workspace {
         let count = sources.len();
         if count > 0 {
             self.analysis_extensions.replace_sources(&self.index, sources);
+        }
+        if count > 0 || library_changed {
             self.bump_index_revision();
         }
         crate::trace::span("extension.ipc.source_capture", "extension", request.started,
             serde_json::json!({"evaluation":request.evaluation,"generation":request.generation,
-                "requested":request.expected.len(),"prepared":prepared_count,"accepted":count}));
-        count
+                "requested":request.expected.len(),"prepared":prepared_count,"accepted":count,
+                "prepared_library_sources":prepared_libraries,"accepted_library_batch":library_changed}));
+        count + usize::from(library_changed)
     }
 
     pub(crate) fn ipc_evaluation_current(&self, evaluation: u64) -> bool {
@@ -4864,10 +4895,11 @@ fn source_stamp(path: &Path) -> Option<SourceStamp> {
     })
 }
 
-pub(crate) fn prepare_ipc_source_capture(request: IpcSourceCapture) -> PreparedIpcSources {
+pub(crate) fn prepare_ipc_source_capture(mut request: IpcSourceCapture) -> PreparedIpcSources {
     let paths = request.expected.keys().map(std::path::PathBuf::from).collect();
     let sources = parse_project_files(paths);
-    PreparedIpcSources { request, sources }
+    let libraries=crate::analysis_extensions::prepare_sources(std::mem::take(&mut request.libraries));
+    PreparedIpcSources { request, sources, libraries }
 }
 
 pub(crate) fn prepare_model_sources(
@@ -6734,6 +6766,114 @@ mod tests {
                 assert!(members["facts"][0]["members"].as_array().unwrap().iter().any(|member|
                     member["name"]=="twice" && member["signature"]["value"]["descriptor"]=="(I)I"),"{members}");
             }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ipc_requested_binary_capture_completes_command_demand_before_retiring_its_view() {
+        use std::io::Write;
+        use serde_json::json;
+
+        for scenario in ["current", "inflight", "edited", "disabled"] {
+            let root=unique_tmp(&format!("ipc-binary-source-{scenario}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let binary=root.join("fixture.jar");
+            let mut zip=zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+            for (entry,bytes) in [
+                ("org/spongepowered/asm/mixin/Mixin.class",include_bytes!("../../ktcore/tests/fixtures/classfile/mixin087/Mixin.class").as_slice()),
+                ("org/spongepowered/asm/mixin/injection/Inject.class",include_bytes!("../../ktcore/tests/fixtures/classfile/mixin087/Inject.class").as_slice()),
+                ("arrayfixture/Item.class",include_bytes!("../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class").as_slice()),
+            ] {
+                zip.start_file(entry,zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+            let mut ws=Workspace::new();
+            ws.register_ipc_provider_commands("test.binary",vec!["fixture-child".into()],vec!["fixture.types".into()]).unwrap();
+            for batch in crate::deps::resolve_local_jar_stubs(&binary,&root.join("extract"),
+                &mut crate::parser::KotlinParser::new(),&mut crate::java::JavaParser::new()).unwrap() {
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.bump_index_revision();
+            let owner=crate::paths::file_key(&root.join("Owner.java"));
+            ws.open(&owner,"import org.spongepowered.asm.mixin.Mixin; @Mixin(arrayfixture.Item.class) class Owner {}".into());
+            let begin=|ws:&mut Workspace|ws.begin_provider_command("test.binary",&owner,"fixture.types".into(),Vec::new(),json!({})).unwrap();
+            let work=begin(&mut ws);
+            let other=begin(&mut ws);
+            let demand=|ws:&mut Workspace,evaluation:u64,names:&[&str]|ws.ipc_batch(evaluation,"analysis/readFacts",json!({
+                "evaluation":evaluation.to_string(),"queries":names.iter().map(|name|json!({"op":"resolveType","name":name})).collect::<Vec<_>>()
+            })).unwrap();
+            let missing=demand(&mut ws,work.evaluation,&["org.spongepowered.asm.mixin.Mixin","arrayfixture.Item"]);
+            assert!(missing["facts"].as_array().unwrap().iter().all(|fact|*fact==json!({"state":"unknown","reasons":[{"code":"MissingSource"}]})),"{missing}");
+            demand(&mut ws,other.evaluation,&["org.spongepowered.asm.mixin.injection.Inject"]);
+            let selected:BTreeSet<_>=["Mixin","Item"].into_iter().map(|name|ws.index.lookup_type(name)[0].path.to_string()).collect();
+            let unrelated=ws.index.lookup_type("Inject")[0].path.to_string();
+            assert!(selected.iter().all(|file|!Path::new(file).exists()));
+            assert!(!Path::new(&unrelated).exists());
+            let background=if scenario=="inflight" {
+                ws.analysis_extensions.take_source_requests_for(&ws.index,&selected)
+            } else { Vec::new() };
+            let shared=parking_lot::Mutex::new(ws);
+            let mut request=shared.lock().begin_ipc_requested_source_capture(work.evaluation).unwrap();
+            assert!(request.expected.is_empty(),"archive demand does not require project compiler tasks");
+            assert_eq!(request.libraries.len(),if scenario=="inflight" {0} else {2},"only this command's selected libraries are captured");
+            assert_eq!(request.waiting.len(),if scenario=="inflight" {2} else {0});
+            let waiting=std::mem::take(&mut request.waiting);
+            assert!(selected.iter().all(|file|!Path::new(file).exists()),"capturing a request performs no archive I/O");
+            // The worker owns the request without a workspace guard during materialization/parsing.
+            let prepared=prepare_ipc_source_capture(request);
+            if scenario=="inflight" {
+                assert!(waiting.iter().all(|ready|!*ready.borrow()));
+                let background=crate::analysis_extensions::prepare_sources(background);
+                assert!(waiting.iter().all(|ready|!*ready.borrow()),"successful preparation must wait for workspace acceptance");
+                let runtime=tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_time().build().unwrap();
+                std::thread::scope(|scope| {
+                    let waiter=scope.spawn(move|| {
+                        let _entered=runtime.enter();
+                        crate::extension_ipc::wait_for_requested_sources(waiting,std::time::Instant::now()+std::time::Duration::from_secs(5))
+                    });
+                    shared.lock().finish_extension_source_batch(background);
+                    waiter.join().unwrap().unwrap();
+                });
+            } else {
+                assert!(waiting.is_empty());
+            }
+            let mut ws=shared.try_lock().expect("source preparation must leave the workspace available");
+            assert!(selected.iter().all(|file|Path::new(file).is_file()));
+            assert!(!Path::new(&unrelated).exists(),"another active command's demand is not eagerly loaded");
+            if scenario=="edited" {ws.open(&owner,"class Edited {}".into());}
+            if scenario=="disabled" {ws.configure_analysis_provider("test.binary",false,"{}".into());}
+            let changed=ws.finish_ipc_source_capture(prepared);
+            assert!(!ws.ipc_evaluation_current(work.evaluation));
+            assert!(ws.ipc_batch(work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[]})).is_err());
+            assert_eq!(ws.analysis_extensions.finish_ipc_command(work.evaluation,Ok(json!({"obsolete":true}))).unwrap_err(),"Stale");
+            for file in &selected {
+                assert!(ws.extension_source_input_identity(file).is_none(),"a binary preview never becomes authored input");
+                assert_eq!(ws.index.file_origin(file).unwrap().representation,ktcore::project_model::SourceRepresentation::Stub);
+            }
+            if matches!(scenario,"current" | "inflight") {
+                if scenario=="current" {assert!(changed>0);} else {assert_eq!(changed,0);}
+                let fresh=begin(&mut ws);
+                let found=demand(&mut ws,fresh.evaluation,&["org.spongepowered.asm.mixin.Mixin","arrayfixture.Item"]);
+                assert!(found["facts"].as_array().unwrap().iter().all(|fact|fact["state"]=="found"),"{found}");
+                let members=ws.ipc_batch(fresh.evaluation,"analysis/readFacts",json!({"evaluation":fresh.evaluation.to_string(),"queries":[
+                    {"op":"declaredMembers","target":found["facts"][0]["value"]["id"]}
+                ]})).unwrap();
+                assert_eq!(members["facts"][0]["coverage"]["state"],"unknown","{members}");
+                assert!(members["facts"][0]["members"].as_array().unwrap().is_empty());
+                assert_eq!(ws.analysis_extensions.finish_ipc_command(fresh.evaluation,Ok(found.clone())).unwrap(),found);
+            } else {
+                assert_eq!(changed,0,"stale or disabled demand cannot accept the late source batch");
+                if scenario=="edited" {
+                    let fresh=begin(&mut ws);
+                    demand(&mut ws,fresh.evaluation,&["org.spongepowered.asm.mixin.Mixin"]);
+                    assert!(ws.begin_ipc_requested_source_capture(fresh.evaluation).is_some(),"cancelled capture must remain retryable");
+                }
+            }
+            assert!(!Path::new(&unrelated).exists());
+            drop(ws);
+            drop(shared);
             std::fs::remove_dir_all(root).unwrap();
         }
     }

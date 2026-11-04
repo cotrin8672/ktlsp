@@ -2701,6 +2701,20 @@ pub(crate) struct Work {
     pub params: Value,
 }
 
+pub(crate) fn wait_for_requested_sources(
+    waiting: Vec<tokio::sync::watch::Receiver<bool>>, deadline: Instant,
+) -> Result<(),String> {
+    if waiting.is_empty() { return Ok(()); }
+    tokio::runtime::Handle::current().block_on(async {
+        for mut ready in waiting {
+            tokio::time::timeout_at(deadline.into(),ready.wait_for(|ready|*ready)).await
+                .map(|_|())
+                .map_err(|_|"extension evaluation timed out".to_owned())?;
+        }
+        Ok(())
+    })
+}
+
 pub(crate) struct Worker {
     pub id: u64,
     command: Vec<String>,
@@ -2946,9 +2960,12 @@ impl Worker {
                     if result.is_ok() && method == "analysis/readFacts" {
                         stage="requested-source-capture";
                         let request=workspace.lock().begin_ipc_requested_source_capture(work.evaluation);
-                        if let Some(request)=request {
+                        if let Some(mut request)=request {
+                            let waiting=std::mem::take(&mut request.waiting);
                             let prepared=crate::workspace::prepare_ipc_source_capture(request);
                             workspace.lock().finish_ipc_source_capture(prepared);
+                            stage="requested-source-wait";
+                            wait_for_requested_sources(waiting,deadline)?;
                         }
                     }
                     after_batch();

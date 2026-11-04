@@ -30,7 +30,7 @@
     "bytes": 450
   },
   {
-    "file": "unicodefixture/\u540d\u524d.class",
+    "file": "unicodefixture/名前.class",
     "sha256": "710b7f8954c101eef00c5aaac10ae841fe2d11c814d6becd119cdd1c2ab95f06",
     "bytes": 298
   },
@@ -303,5 +303,15 @@
     "file": "sources/outerfixture/Outer.java",
     "sha256": "c531b450a113b8f81d5d77ca6bd627a16e4e90ce2f826b4d769ca263ea82249d",
     "bytes": 373
+  },
+  {
+    "file": "mixin087/Mixin.class",
+    "sha256": "8012b9210e51cf30f846a6dafb179eccd8ad61940891408d0eb4985bdefc7bad",
+    "bytes": 619
+  },
+  {
+    "file": "mixin087/Inject.class",
+    "sha256": "c6aae65ac0b9fe8a57dccd5b56ffc8b8537781b9615c1bd7b138a835de6f5aba",
+    "bytes": 1127
   }
 ]

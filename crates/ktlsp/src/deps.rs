@@ -63,6 +63,7 @@ pub struct LibrarySource {
     dest: PathBuf,
     jar: Option<PathBuf>,
     fingerprint: Option<String>,
+    binary_content: Option<[u8; 32]>,
     origin_id: String,
     policy: Result<SourceTextPolicy, String>,
 }
@@ -73,6 +74,7 @@ impl LibrarySource {
             dest: dest.into(),
             jar: Some(src_zip.into()),
             fingerprint: Some(fingerprint.into()),
+            binary_content: None,
             origin_id: crate::classpath::jdk_origin_id(src_zip),
             policy: Ok(SourceTextPolicy::default()),
         }
@@ -83,6 +85,24 @@ impl LibrarySource {
             return false;
         };
         jar_fingerprint(jar).as_ref() == Some(expected) && policy.validate().is_ok()
+    }
+
+    pub(crate) fn has_binary_type(&self, file: &Path) -> bool {
+        let Some(jar) = &self.jar else { return false; };
+        let Some(name) = file.strip_prefix(&self.dest).ok()
+            .and_then(|relative| relative.to_str())
+            .and_then(|relative| relative.strip_suffix(".java")) else { return false; };
+        let name = name.replace('\\', "/");
+        let Ok(Some(bytes)) = jar::read_effective_class_bytes(jar, &name, "", None, || self.is_current())
+        else { return false; };
+        ktcore::classfile::decode(&self.origin_id, &bytes)
+            .is_ok_and(|class| class.identity.internal_name == name)
+    }
+
+    pub(crate) fn content_is_current(&self) -> bool {
+        self.binary_content.is_none_or(|expected| {
+            self.jar.as_deref().and_then(file_content_digest) == Some(expected)
+        })
     }
     fn stamp_batches(&self, mut batches: Vec<FileSymbols>) -> Vec<FileSymbols> {
         let source = std::sync::Arc::new(self.clone());
@@ -99,6 +119,10 @@ impl LibrarySource {
             format!("jar:{}", jar.to_string_lossy())
         } else {
             format!("extracted:{}", self.dest.to_string_lossy())
+        };
+        let original = match self.binary_content {
+            Some(content) => format!("{original}:binary:{content:?}"),
+            None => original,
         };
         match &self.policy {
             Ok(policy) => format!("source:{}", policy.cache_key(&original)),
@@ -1179,6 +1203,7 @@ fn selected_coordinate_source(
             .join(&coord.version),
         jar: Some(jar),
         fingerprint,
+        binary_content: None,
         origin_id: crate::classpath::maven_origin_id(coord),
         policy,
     }
@@ -1256,6 +1281,7 @@ fn legacy_coordinate_source(coord: &Coordinate, extract_root: &Path) -> Option<L
         dest,
         jar: None,
         fingerprint: None,
+        binary_content: None,
         origin_id: crate::classpath::maven_origin_id(coord),
         policy: Ok(SourceTextPolicy::default()),
     })
@@ -1450,6 +1476,7 @@ pub(crate) fn resolve_local_jar_stubs_for_origin_while_current(
         let source = LibrarySource {
             dest: extract_root.join("local-jars").join(&fingerprint),
             fingerprint: jar_fingerprint(&sources),
+            binary_content: None,
             jar: Some(sources),
             origin_id: origin_id.to_string(),
             policy: Ok(SourceTextPolicy::default()),
@@ -1584,13 +1611,21 @@ fn resolve_local_jar_stubs_unowned(
         anyhow::bail!("local artifact {} is missing", jar_path.display());
     }
     let dest = extract_root.join("local-jars").join(&fingerprint);
+    let source = LibrarySource {
+        dest: dest.clone(),
+        jar: Some(jar_path.to_path_buf()),
+        fingerprint: jar_fingerprint(jar_path),
+        binary_content: Some(file_content_digest(jar_path).context("read selected binary content")?),
+        origin_id: crate::classpath::file_origin_id(jar_path),
+        policy: Ok(SourceTextPolicy::default()),
+    };
 
     if let Some(cached) = symcache_load(&fingerprint, &dest) {
         anyhow::ensure!(
             live() && current(),
             "binary artifact changed while loading cached symbols"
         );
-        return Ok(cached);
+        return Ok(source.stamp_batches(cached));
     }
 
     let marker = prepare_lazy_binary_dir(jar_path, &dest)?;
@@ -1622,7 +1657,7 @@ fn resolve_local_jar_stubs_unowned(
         "binary artifact changed while indexing"
     );
     symcache_store(&fingerprint, &symbols);
-    Ok(symbols)
+    Ok(source.stamp_batches(symbols))
 }
 
 /// Resolve the local classpath jar that declares `import_fqn`, using sources when available.
@@ -2980,6 +3015,7 @@ mod tests {
             dest: tmp.join("extracted"),
             jar: Some(jar.clone()),
             fingerprint: None,
+            binary_content: None,
             origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -3059,6 +3095,7 @@ mod tests {
             dest: tmp.join("extracted"),
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
+            binary_content: None,
             origin_id: "maven:fixture:getter:1".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -3135,6 +3172,7 @@ mod tests {
             dest: tmp.join("extracted"),
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
+            binary_content: None,
             origin_id: "maven:fixture:constants:1".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -3209,6 +3247,7 @@ mod tests {
             dest: tmp.join("extracted"),
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
+            binary_content: None,
             origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -3252,6 +3291,7 @@ mod tests {
             dest: tmp.join("extracted"),
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
+            binary_content: None,
             origin_id: "maven:fixture:snapshot:1-SNAPSHOT".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -4534,6 +4574,7 @@ public class ParameterUse<Iterable> {
             dest: tmp.join("extract"),
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
+            binary_content: None,
             origin_id: "maven:vendor:api:1".to_string(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -6404,6 +6445,7 @@ public class ParameterUse<Iterable> {
             dest: root.join("sources"),
             jar: None,
             fingerprint: None,
+            binary_content: None,
             origin_id: "test-extracted-library".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -6458,6 +6500,7 @@ public class ParameterUse<Iterable> {
             dest: tmp.join("extract/library"),
             jar: Some(jar.clone()),
             fingerprint: jar_fingerprint(&jar),
+            binary_content: None,
             origin_id: "test-library".into(),
             policy: Ok(SourceTextPolicy::default()),
         };
@@ -6578,6 +6621,7 @@ public class ParameterUse<Iterable> {
             dest: root.join("source"),
             jar: Some(jar),
             fingerprint: Some(fingerprint.clone()),
+            binary_content: None,
             origin_id: "fixture:cancel-source".into(),
             policy: Ok(SourceTextPolicy::default()),
         };

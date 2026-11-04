@@ -385,7 +385,143 @@ mod tests {
         fs::remove_file(&fixture.sources).unwrap();
         let mut ws = fixture.workspace();
         assert!(!bound(&mut ws));
-        assert_eq!(drain(&mut ws), 0);
+        assert_eq!(drain(&mut ws), 2);
+        assert!(!bound(&mut ws), "nominal hydration cannot certify preview members");
+        let (index, host) = ws.extension_test_inputs();
+        for name in ["Factory", "Item"] {
+            let entry = index.lookup_type(name).into_iter()
+                .find(|entry| entry.sym.package == "arrayfixture").unwrap();
+            assert_eq!(index.file_origin(&entry.path).unwrap().representation, SourceRepresentation::Stub);
+            assert_eq!(host.store.source_declarations(&entry.path), Some([].as_slice()));
+            assert!(!host.inputs.contains_key(entry.path.as_ref()));
+            let mut read = host.store.begin(index, "library-probe", "Owner.java").unwrap();
+            let Knowledge::Found(ty) = read.resolve_type(&format!("arrayfixture.{name}")) else {
+                panic!("decoded binary type identity must be available");
+            };
+            assert!(matches!(read.declared_members(&ty).unwrap().1, Knowledge::Unknown(_)));
+        }
+    }
+
+    #[test]
+    fn binary_annotation_refs_hydrate_exact_identity_without_authored_source_facts() {
+        const MIXIN: &[u8] = include_bytes!("../../../ktcore/tests/fixtures/classfile/mixin087/Mixin.class");
+        const INJECT: &[u8] = include_bytes!("../../../ktcore/tests/fixtures/classfile/mixin087/Inject.class");
+        let fixture = Fixture::new();
+        fs::remove_file(&fixture.sources).unwrap();
+        Fixture::zip(&fixture.binary, &[
+            ("org/spongepowered/asm/mixin/Mixin.class", MIXIN),
+            ("org/spongepowered/asm/mixin/injection/Inject.class", INJECT),
+            ("decoy/Mixin.class", MIXIN),
+        ]);
+        for (file, text) in [
+            ("ItemMixin.java", "import net.minecraft.world.item.Item;\r\nimport org.spongepowered.asm.mixin.Mixin;\r\nimport org.spongepowered.asm.mixin.injection.Inject;\r\n@Mixin(Item.class) class ItemMixin { @Inject(method=\"is\") }\r\n"),
+            ("ItemMixin.kt", "import org.spongepowered.asm.mixin.Mixin\nimport org.spongepowered.asm.mixin.injection.Inject\n@Mixin(Any::class) class ItemMixin { @Inject(method=[\"is\"]) fun probe() {} }"),
+        ] {
+            // The second language also exercises the warm symbol-cache path for this exact jar.
+            let mut ws = Workspace::with_analysis_providers(vec![Arc::new(Probe)]);
+            let batches = crate::deps::resolve_local_jar_stubs(
+                &fixture.binary, &fixture.extract, &mut KotlinParser::new(), &mut JavaParser::new(),
+            ).unwrap();
+            assert_eq!(batches.len(), 3);
+            for batch in batches {
+                assert!(batch.library_source.is_some());
+                assert_eq!(batch.origin.as_ref().unwrap().representation, SourceRepresentation::Stub);
+                assert!(!Path::new(&batch.file).is_file());
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.bump_index_revision();
+            ws.open(file, text.into());
+            let (index, host) = ws.extension_test_inputs();
+            let mut read = host.store.begin(index, "library-probe", file).unwrap();
+            let declarations = read.declarations().to_vec();
+            let sites = read.annotation_sites().sites;
+            assert!(declarations.iter().flat_map(|declaration| &declaration.annotations)
+                .any(|annotation| annotation.ty.name == "Mixin"));
+            assert!(sites.iter().any(|site| site.annotation.ty.name == "Inject"));
+            let references: Vec<_> = declarations.iter().flat_map(|declaration| &declaration.annotations)
+                .map(|annotation| annotation.ty.clone())
+                .chain(sites.iter().map(|site| site.annotation.ty.clone())).collect();
+            for reference in &references {
+                assert!(matches!(read.resolve_type_ref(reference), Knowledge::Unknown(_)));
+            }
+            assert!(matches!(read.resolve_type("decoy.Mixin"), Knowledge::Unknown(_)));
+            let pending = read.finish();
+            host.store.commit(pending).unwrap();
+            assert_eq!(drain(&mut ws), 3);
+            let (index, host) = ws.extension_test_inputs();
+            let mut read = host.store.begin(index, "library-probe", file).unwrap();
+            let mut resolved_files = std::collections::BTreeSet::new();
+            for reference in &references {
+                let expected = match reference.name.as_str() {
+                    "Mixin" => "org.spongepowered.asm.mixin.Mixin",
+                    "Inject" => "org.spongepowered.asm.mixin.injection.Inject",
+                    name => panic!("unexpected annotation {name}"),
+                };
+                let Knowledge::Found(ty) = read.resolve_type_ref(reference) else {
+                    panic!("{file}: indexed binary annotation {expected} must resolve");
+                };
+                assert_eq!(ty.qualified_name(), expected);
+                assert!(matches!(read.declared_members(&ty).unwrap().1, Knowledge::Unknown(_)));
+                assert_eq!(index.file_origin(&ty.definition().file).unwrap().representation, SourceRepresentation::Stub);
+                resolved_files.insert(ty.definition().file.clone());
+            }
+            assert!(matches!(read.resolve_type("decoy.Mixin"), Knowledge::Unknown(_)),
+                "a class entry with a different decoded internal name cannot attest the preview");
+            drop(read);
+            for dependency in resolved_files {
+                assert_eq!(host.store.source_declarations(&dependency), Some([].as_slice()));
+                assert!(!host.inputs.contains_key(&dependency));
+            }
+
+            host.register_ipc_commands(index, "annotation-wire", vec!["unused-test-child".into()],
+                vec!["fixture.annotations".into()]).unwrap();
+            let work = host.begin_ipc_command(index, None, "annotation-wire", file,
+                "fixture.annotations".into(), Vec::new(), serde_json::json!({})).unwrap();
+            // Simulate the existing capability handshake; retain the command's real read lifetime.
+            let mut evaluation = host.ipc_evaluations.remove(&work.evaluation).unwrap();
+            evaluation.project_operations = u32::MAX;
+            let pending = evaluation.pending.take().unwrap();
+            let mut read = host.store.resume(index, file, pending).unwrap();
+            let packet = evaluation.batch(&mut read, "analysis/readFacts", serde_json::json!({
+                "evaluation":work.evaluation.to_string(),
+                "queries":[{"op":"sourceFacts"},{"op":"annotationSites"}]
+            })).unwrap();
+            evaluation.pending = Some(read.finish());
+            host.ipc_evaluations.insert(work.evaluation, evaluation);
+            let references: Vec<_> = packet["facts"][0]["declarations"].as_array().unwrap().iter()
+                .flat_map(|declaration| declaration["annotations"].as_array().unwrap())
+                .chain(packet["facts"][1]["annotations"].as_array().unwrap())
+                .map(|annotation| serde_json::json!({"op":"resolveTypeRef","reference":annotation["typeRef"]}))
+                .collect();
+            assert!(references.len() >= 3, "both sourceFacts and orphan-capable sites issue type refs");
+            let result = host.ipc_batch(index, work.evaluation, "analysis/readFacts", serde_json::json!({
+                "evaluation":work.evaluation.to_string(),"queries":references,
+            })).unwrap();
+            for fact in result["facts"].as_array().unwrap() {
+                assert_eq!(fact["state"], "found");
+                assert!(matches!(fact["value"]["qualifiedName"].as_str(),
+                    Some("org.spongepowered.asm.mixin.Mixin" | "org.spongepowered.asm.mixin.injection.Inject")));
+            }
+            assert!(host.ipc_current(work.evaluation));
+            assert_eq!(host.finish_ipc_command(work.evaluation, Ok(result.clone())).unwrap(), result);
+            assert!(ws.begin_extension_source_batch().is_empty());
+            // Re-run from the original lazy state, retaining the shared parsed-symbol cache.
+            for entry in ws.index.lookup_type("Mixin").into_iter().chain(ws.index.lookup_type("Inject")) {
+                let _ = fs::remove_file(entry.path.as_ref());
+            }
+        }
+        let source = crate::deps::resolve_local_jar_stubs(
+            &fixture.binary, &fixture.extract, &mut KotlinParser::new(), &mut JavaParser::new(),
+        ).unwrap().remove(0).library_source.unwrap();
+        assert!(source.content_is_current());
+        let modified = fs::metadata(&fixture.binary).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&fixture.binary).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&fixture.binary, bytes).unwrap();
+        fs::File::options().write(true).open(&fixture.binary).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+        assert!(source.is_current(), "the metadata-only identity is deliberately unchanged");
+        assert!(!source.content_is_current(), "binary hydration must also check selected content");
     }
 
     #[test]
@@ -493,12 +629,21 @@ mod tests {
         );
         let epoch = host.source_epoch;
         let stamp = host.source_stamp(&index, &batch.file).unwrap();
+        let selected = std::collections::BTreeSet::from([batch.file.clone()]);
+        assert!(host.source_waits_for(&index, &selected).is_empty());
+        assert!(host.source_producers.is_empty());
         let old = host
             .source_producer(&batch.file, stamp.clone())
             .ready
             .subscribe();
+        assert!(host.source_waits_for(&index, &selected).is_empty(), "queued work is not an attempted input");
         host.attempted_sources
             .insert(batch.file.clone(), stamp.clone());
+        let waiting = host.source_waits_for(&index, &selected);
+        assert_eq!(waiting.len(), 1);
+        assert!(waiting[0].same_channel(&old));
+        assert!(host.source_waits_for(&index, &std::collections::BTreeSet::from(["unrelated.java".into()])).is_empty());
+        assert_eq!(host.attempted_sources.len(), 1);
         // Re-publishing identical authority must preserve the active producer and its attempt.
         host.select_library_source(
             &index,
@@ -511,6 +656,7 @@ mod tests {
         // The selected representation can disappear without advancing the model generation.
         host.select_library_source(&index, &batch.file, None, None);
         assert!(*old.borrow());
+        assert!(host.source_waits_for(&index, &selected).is_empty());
         assert_eq!(host.source_epoch, epoch);
         assert!(!host.attempted_sources.contains_key(&batch.file));
         host.select_library_source(
@@ -603,6 +749,12 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
         .into_iter()
         .filter_map(|request| {
             let path = Path::new(&request.file);
+            // A name-only preview is not proof that the selected archive declares this type.
+            if request.stamp.origin.representation == SourceRepresentation::Stub
+                && (!request.source.content_is_current() || !request.source.has_binary_type(path))
+            {
+                return None;
+            }
             if !request.source.is_current() || !crate::deps::materialize_source_file(path) {
                 return None;
             }
@@ -624,7 +776,7 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
                 Tier::Volatile,
             );
             let references = prepare_source_references(&local, &request.file, text.clone(), &tree);
-            if !request.source.is_current() {
+            if !request.source.is_current() || !request.source.content_is_current() {
                 return None;
             }
             Some(PreparedSource {
@@ -640,8 +792,10 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
 impl AnalysisExtensions {
     fn source_stamp(&self, index: &Index, file: &str) -> Option<SourceStamp> {
         let (origin, source) = self.library_sources.get(file)?;
-        // Synthetic previews cannot certify an authored source inventory.
-        if origin.representation != SourceRepresentation::Source || origin.project_scope.is_some() {
+        // Stub identities are usable, but never acquire authored project-source ownership.
+        if !matches!(origin.representation, SourceRepresentation::Source | SourceRepresentation::Stub)
+            || origin.project_scope.is_some()
+        {
             return None;
         }
         if index.file_origin(file) != Some(origin) {
@@ -744,6 +898,41 @@ impl AnalysisExtensions {
     }
 
     pub(crate) fn take_source_requests(&mut self, index: &Index) -> Vec<SourceRequest> {
+        self.take_source_requests_matching(index, None)
+    }
+
+    pub(crate) fn source_waits_for(
+        &self,
+        index: &Index,
+        selected: &std::collections::BTreeSet<String>,
+    ) -> Vec<tokio::sync::watch::Receiver<bool>> {
+        if self.suspended {
+            return Vec::new();
+        }
+        selected.iter().filter_map(|file| {
+            let stamp = self.source_stamp(index, file)?;
+            let producer = self.source_producers.get(file)?;
+            (self.attempted_sources.get(file) == Some(&stamp)
+                && producer.stamp == stamp
+                && producer.epoch == self.source_epoch
+                && !*producer.ready.borrow())
+                .then(|| producer.ready.subscribe())
+        }).collect()
+    }
+
+    pub(crate) fn take_source_requests_for(
+        &mut self,
+        index: &Index,
+        selected: &std::collections::BTreeSet<String>,
+    ) -> Vec<SourceRequest> {
+        self.take_source_requests_matching(index, Some(selected))
+    }
+
+    fn take_source_requests_matching(
+        &mut self,
+        index: &Index,
+        selected: Option<&std::collections::BTreeSet<String>>,
+    ) -> Vec<SourceRequest> {
         if self.suspended {
             return Vec::new();
         }
@@ -760,6 +949,9 @@ impl AnalysisExtensions {
             if let Some(producer) = self.source_producers.remove(&file) {
                 producer.ready.send_replace(true);
             }
+        }
+        if let Some(selected) = selected {
+            wanted.retain(|file| selected.contains(file));
         }
         let priority: std::collections::BTreeSet<_> = self
             .source_producers
@@ -818,16 +1010,30 @@ impl AnalysisExtensions {
                 }
                 continue;
             }
-            self.inputs.insert(
-                file.clone(),
-                SourceInput {
-                    text: source.text,
-                    tree: source.tree,
-                    compiled: None,
-                    compiler_classes: Vec::new(),
-                    prepared_references: Some(source.references),
-                },
-            );
+            if source.request.stamp.origin.representation == SourceRepresentation::Stub {
+                // Only nominal identities: preview declarations/members are not authored facts.
+                if self.store.replace_prepared_source_declarations(
+                    index,
+                    source.references,
+                    ktcore::knowledge::Knowledge::Unknown(vec![
+                        ktcore::extensions::IncompleteReason::UnsupportedSource,
+                    ]),
+                    Vec::new(),
+                ).is_err() {
+                    continue;
+                }
+            } else {
+                self.inputs.insert(
+                    file.clone(),
+                    SourceInput {
+                        text: source.text,
+                        tree: source.tree,
+                        compiled: None,
+                        compiler_classes: Vec::new(),
+                        prepared_references: Some(source.references),
+                    },
+                );
+            }
             self.hydrated_sources
                 .insert(file.clone(), source.request.stamp);
             accepted.push(file.clone());

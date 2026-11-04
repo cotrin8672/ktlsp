@@ -1,9 +1,22 @@
 # Current fork state
 
-Updated 2026-11-01 (Asia/Tokyo). **Index-invalidation fix92 confirmed; annotation-sites93 editor proof passes, CEM consumer pending.**
+Updated 2026-11-05 (Asia/Tokyo). **Binary annotation resolution94 passes focused checks; original CEM integration and one additional repository are being checked.**
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
+The original CEM D9 completion exposed two actually queried annotation references
+returning `Unknown(MissingSource)` in the same view. The selected dependency had
+classfiles without a sources JAR: its indexed Stub lacked a hydration input.
+Fix94 associates the selected binary on cold/cache paths and verifies its decoded
+class identity and content before admitting nominal types. Stub previews retain
+empty authored declarations, unknown member coverage and no project-source input.
+IPC prepares only the requesting command's selected dependency sources outside
+the workspace lock, waits for existing producers, and rejects the obsolete view.
+The focused repair run passes hydration10, IPC12 and the workspace IPC lifecycle
+case1 (23 total); the locked release binary is sealed with stable input hashes.
+Evidence: `annotation-resolve94/native94-repair/{receipt,main-ready}.json`.
+The failed first compile is retained under `annotation-resolve94/native94`.
+This is not yet a claim that the original CEM completion/85-member comparison passes.
 The previously unseen mixed-language Okio repository now has eight accepted editor
 interop checks and three current canonical diagnostic states (valid, invalid,
 restored). Its reproduced Gradle/Kotlin and mixed-source producer gaps are fixed.
